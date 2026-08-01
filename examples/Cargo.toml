@@ -1,0 +1,42 @@
+[workspace]
+
+[package]
+name = "pi-examples"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.45", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+
+# Path dependencies to sibling crates in the pi-rs repo. This crate is not
+# part of the workspace so it can be moved/compiled independently.
+pi-agent = { path = "../crates/pi-agent" }
+pi-ai = { path = "../crates/pi-ai" }
+pi-coding = { path = "../crates/pi-coding" }
+pi-cli = { path = "../crates/pi-cli" }
+
+[[bin]]
+name = "json_events"
+path = "src/bin/json_events.rs"
+
+[[bin]]
+name = "rpc_client"
+path = "src/bin/rpc_client.rs"
+
+[[bin]]
+name = "prompt_template"
+path = "src/bin/prompt_template.rs"
+
+[[bin]]
+name = "custom_tool"
+path = "src/bin/custom_tool.rs"
+
+[[bin]]
+name = "process_extension"
+path = "src/bin/process_extension.rs"

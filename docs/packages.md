@@ -1,0 +1,180 @@
+# Packages
+
+`pi` supports local-directory and git-based packages. The npm backend is
+deliberately deferred and cannot be installed.
+
+Source: `crates/pi-coding/src/packages.rs:1-5` and
+`crates/pi-coding/src/packages.rs:842-845`.
+
+## Package sources
+
+Valid package sources:
+
+- A plain filesystem path, relative to the current working directory or
+  absolute. The stored identity becomes `local:<canonical path>`.
+  - Example: `./my-pi-tools`
+- A git URL using `https`, `http`, `ssh`, or `git` as the scheme.
+  - Examples: `https://github.com/owner/repo`,
+    `git@github.com:owner/repo`, `ssh://git@github.com/owner/repo`,
+    `git:https://github.com/owner/repo`
+- A `git:` shorthand using a host with a domain or `localhost`:
+  `git:github.com/owner/repo`. The shorthand must include host, owner, and
+  repository.
+- A git ref pinned with `@ref`: `git:github.com/owner/repo@v1.2`.
+- `npm:package[@version]` — **not implemented**; rejected with a clear error.
+
+Source: `crates/pi-coding/src/packages.rs:810-903`.
+
+## Install, remove, list, config, update
+
+```sh
+# Install globally (stored in agent settings)
+pi install git:github.com/owner/pi-my-tools
+
+# Install into project settings (requires project trust)
+pi install ./my-pi-tools --local
+
+# Remove a configured package
+pi remove git:github.com/owner/pi-my-tools
+
+# List configured packages and their install status
+pi list
+
+# Toggle enabled package resources for global or project scope
+pi config
+pi config -l            # project scope; requires project trust
+
+# Update pi itself (default when no package flags are given)
+pi update
+pi update --self
+
+# Update every configured package (also accepts --all)
+pi update --extensions
+pi update --all
+
+# Update one configured package by source identity
+pi update git:github.com/owner/pi-my-tools
+pi update github.com/owner/pi-my-tools
+
+# Update packages and pi itself
+pi update --self --extensions
+
+# Reinstall self-update even when version and checksum match
+pi update --self --force
+```
+
+Source: `crates/pi-cli/src/args.rs:244-285` and
+`crates/pi-cli/src/lib.rs:62-120`.
+
+`pi list` shows the scope (`global` or `project`), source, status
+(`installed`, `missing`, or `unsupported`), whether a git source is pinned to
+a ref, and the on-disk path for installed packages.
+
+Source: `crates/pi-cli/src/package_commands.rs:34-66` and
+`crates/pi-coding/src/packages.rs:777-800`.
+
+`pi config` discovers resources declared by each package's
+`package.json#pi` manifest and lets you enable or disable individual extensions,
+skills, prompts, and themes. In a headless environment (stdout is not a TTY) it
+prints deterministic JSON and never blocks. Project scope is refused when the
+project is not trusted.
+
+Source: `crates/pi-cli/src/package_config.rs:1-16` and
+`crates/pi-cli/src/package_config.rs:542-550`.
+
+`pi update --extensions` reconciles every configured git/local package. Pinned
+git refs are fetched and reset to the configured ref; unpinned sources follow the
+remote default branch. `npm:` entries are skipped. `pi update PACKAGE` reconciles
+one configured package by identity; matching `npm:` sources produce the deferred
+error.
+
+Source: `crates/pi-coding/src/packages.rs:495-545`.
+
+Git packages are cloned into a content-addressed directory under the scope root
+(`<agent-dir>/git/...` for global packages, `<workspace>/.pi/git/...` for
+project packages). Local packages are referenced by path. Atomic checkout
+swapping, serialized operations, and atomic settings/state writes prevent
+partial installs.
+
+Source: `crates/pi-coding/src/packages.rs:57-77`,
+`crates/pi-coding/src/packages.rs:408-530`,
+`crates/pi-coding/src/packages.rs:711-770`, and
+`crates/pi-coding/src/packages.rs:1867-1954`.
+
+## `settings.json` packages field
+
+The `packages` array holds either a source string or a filtered object:
+
+```json
+{
+  "packages": [
+    "git:github.com/owner/pi-my-tools",
+    {
+      "source": "git:github.com/owner/pi-skills",
+      "autoload": true,
+      "extensions": ["pi-my-ext"],
+      "skills": ["rust-review"],
+      "prompts": ["custom-prompt"],
+      "themes": ["solarized"]
+    }
+  ]
+}
+```
+
+Source: `crates/pi-coding/src/settings.rs:34-45`.
+
+- `autoload: true` enables all resources from the package by default.
+- `extensions`, `skills`, `prompts`, `themes` are resource-filter lists. They
+  may contain exact resource names, glob patterns, `!` exclusions, and `+` / `-`
+  force-include/exclude tokens used by `pi config`.
+- Project entries win over global entries with the same package identity.
+
+Source: `crates/pi-coding/src/packages.rs:524-550` and
+`crates/pi-cli/src/package_config.rs:1-16`.
+
+## Package manifest (`package.json#pi`)
+
+A package root may contain a `package.json` whose `pi` field declares its
+resources:
+
+```json
+{
+  "name": "pi-my-tools",
+  "pi": {
+    "schemaVersion": 1,
+    "extensions": ["extensions/*"],
+    "skills": ["skills/**/*.md"],
+    "prompts": ["prompts/**/*.md"],
+    "themes": ["themes/*.json"]
+  }
+}
+```
+
+Source: `crates/pi-coding/src/packages.rs:139-165`.
+
+Without a manifest, the package manager discovers resources under standard
+subdirectories:
+
+- `extensions/` — files named `pi-extension.json`.
+- `skills/` — `SKILL.md` or `.md` files.
+- `prompts/` — `.md` files.
+- `themes/` — `.json` files.
+
+Hidden entries, symlinks, and `node_modules` are ignored during discovery.
+
+Source: `crates/pi-coding/src/packages.rs:1303-1453`.
+
+## Trust and scope
+
+- Global packages are always loaded.
+- Project packages are loaded only when the project is trusted.
+- Project resources win over global resources with the same name.
+
+Source: `crates/pi-coding/src/packages.rs:524-550`.
+
+## What is not supported
+
+- `npm:` sources.
+- `package.json` lifecycle hooks or registry metadata.
+- A `local:` scheme prefix. Local packages are written as plain filesystem
+  paths.

@@ -1,0 +1,468 @@
+name: Release
+
+# On tag push v*, build the `pi` binary for the five supported native targets,
+# package per-target archives named pi-rs-<version>-<target-triple>.{tar.gz|zip}
+# (each containing a root pi/pi.exe plus LICENSE), generate SHA256SUMS, and
+# publish as a GitHub Release. install.sh / install.ps1 resolve these exact
+# asset names.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail before packaging if debug metadata accidentally inflates a
+  # distribution binary. The release-dist profile strips symbols and disables
+  # debuginfo; `pi` is a full agent CLI, so allow up to 64 MiB per native binary.
+  MAX_RELEASE_BINARY_BYTES: "67108864"
+
+jobs:
+  build-linux:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            expected_arch: x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            expected_arch: aarch64
+    # Both GNU binaries are built and smoke-tested natively on Ubuntu 20.04
+    # (glibc 2.31), establishing the documented minimum Linux runtime baseline.
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ubuntu:20.04
+    steps:
+      - name: Install Ubuntu 20.04 build and runtime tools
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install --no-install-recommends -y \
+            binutils \
+            build-essential \
+            ca-certificates \
+            coreutils \
+            curl \
+            git \
+            grep \
+            gzip \
+            libc-bin \
+            sed \
+            tar
+          rm -rf /var/lib/apt/lists/*
+
+          glibc_version="$(getconf GNU_LIBC_VERSION)"
+          echo "Linux build baseline: $glibc_version"
+          if [ "$glibc_version" != "glibc 2.31" ]; then
+            echo "Expected the Ubuntu 20.04 glibc 2.31 baseline" >&2
+            exit 1
+          fi
+
+          actual_arch="$(uname -m)"
+          echo "Linux build architecture: $actual_arch"
+          if [ "$actual_arch" != "${{ matrix.expected_arch }}" ]; then
+            echo "Expected native ${{ matrix.expected_arch }} execution" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Check tag matches Cargo.toml workspace version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          file_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml workspace version ($file_version)" >&2
+            exit 1
+          fi
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add --toolchain 1.88.0 "${{ matrix.target }}"
+
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *)
+              echo "Expected rustc 1.88.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: ubuntu-20.04-${{ matrix.target }}
+
+      - name: Build pi (release-dist)
+        run: cargo +1.88.0 build --profile release-dist --locked --target ${{ matrix.target }}
+
+      - name: Verify stripped release binary
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release-dist/pi"
+          [ -f "$src" ] || { echo "pi binary not found at $src" >&2; exit 1; }
+
+          bytes="$(wc -c < "$src" | tr -d '[:space:]')"
+          echo "release binary: $src ($bytes bytes; limit $MAX_RELEASE_BINARY_BYTES)"
+          if [ "$bytes" -gt "$MAX_RELEASE_BINARY_BYTES" ]; then
+            echo "release binary exceeds the 64 MiB distribution limit" >&2
+            exit 1
+          fi
+
+          sections="$RUNNER_TEMP/pi-sections.txt"
+          readelf -SW "$src" > "$sections"
+          if grep -Eq '\.(z)?debug_|\.gnu_debuglink' "$sections"; then
+            echo "Linux release binary still contains debug sections" >&2
+            exit 1
+          fi
+
+      - name: Smoke-test on glibc 2.31 baseline
+        shell: bash
+        run: target/${{ matrix.target }}/release-dist/pi --version
+
+      - name: Package archive (tar.gz)
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="pi-rs-${version}-${{ matrix.target }}.tar.gz"
+          staging="$(mktemp -d)"
+          src="target/${{ matrix.target }}/release-dist/pi"
+          [ -f LICENSE ] || { echo "LICENSE is required in release archives" >&2; exit 1; }
+          cp "$src" "$staging/pi"
+          chmod 0755 "$staging/pi"
+          cp LICENSE "$staging/"
+          [ ! -f NOTICE ] || cp NOTICE "$staging/"
+          tar -C "$staging" -czf "$archive" .
+          sha256sum "$archive"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  build-native:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Check tag matches Cargo.toml workspace version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          file_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml workspace version ($file_version)" >&2
+            exit 1
+          fi
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+          rustup target add --toolchain 1.88.0 "${{ matrix.target }}"
+
+          rustc_version="$(rustc +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *)
+              echo "Expected rustc 1.88.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build pi (release-dist)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo +1.88.0 build --profile release-dist --locked --target ${{ matrix.target }}
+
+      - name: Verify stripped release binary
+        shell: bash
+        run: |
+          suffix=""
+          if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
+          src="target/${{ matrix.target }}/release-dist/pi${suffix}"
+          [ -f "$src" ] || { echo "pi binary not found at $src" >&2; exit 1; }
+
+          bytes="$(wc -c < "$src" | tr -d '[:space:]')"
+          echo "release binary: $src ($bytes bytes; limit $MAX_RELEASE_BINARY_BYTES)"
+          if [ "$bytes" -gt "$MAX_RELEASE_BINARY_BYTES" ]; then
+            echo "release binary exceeds the 64 MiB distribution limit" >&2
+            exit 1
+          fi
+
+      - name: Smoke-test the native binary (macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: target/${{ matrix.target }}/release-dist/pi --version
+
+      - name: Smoke-test the native binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $src = "target/${{ matrix.target }}/release-dist/pi.exe"
+          if (-not (Test-Path -LiteralPath $src)) { throw "pi binary not found at $src" }
+          & $src --version
+          if ($LASTEXITCODE -ne 0) { throw "pi --version exited $LASTEXITCODE" }
+
+      - name: Package archive (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="pi-rs-${version}-${{ matrix.target }}.tar.gz"
+          staging="$(mktemp -d)"
+          src="target/${{ matrix.target }}/release-dist/pi"
+          [ -f LICENSE ] || { echo "LICENSE is required in release archives" >&2; exit 1; }
+          cp "$src" "$staging/pi"
+          chmod 0755 "$staging/pi"
+          cp LICENSE "$staging/"
+          [ ! -f NOTICE ] || cp NOTICE "$staging/"
+          tar -C "$staging" -czf "$archive" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive"
+          else
+            shasum -a 256 "$archive"
+          fi
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Package archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $archive = "pi-rs-$version-${{ matrix.target }}.zip"
+          $staging = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "staging") -Force
+          if (-not (Test-Path -Path LICENSE -PathType Leaf)) {
+            throw "LICENSE is required in release archives"
+          }
+          Copy-Item "target/${{ matrix.target }}/release-dist/pi.exe" (Join-Path $staging "pi.exe")
+          Copy-Item LICENSE $staging
+          if (Test-Path -Path NOTICE -PathType Leaf) { Copy-Item NOTICE $staging }
+          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $archive
+          Get-FileHash -Algorithm SHA256 $archive
+          Add-Content -Path $env:GITHUB_ENV -Value "ARCHIVE=$archive"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    needs: [build-linux, build-native]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-publication
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify exact local inventory and generate SHA256SUMS
+        working-directory: dist
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # A prerelease tag (semver with a '-' prerelease segment, ignoring
+          # '+build' metadata) is published as prerelease=true, make_latest=false,
+          # so /releases/latest (the installer default) never resolves to it.
+          base="${version%%+*}"
+          case "$base" in
+            *-*) echo "IS_PRERELEASE=true"  >> "$GITHUB_ENV" ;;
+            *)   echo "IS_PRERELEASE=false" >> "$GITHUB_ENV" ;;
+          esac
+          expected=(
+            "pi-rs-${version}-aarch64-apple-darwin.tar.gz"
+            "pi-rs-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "pi-rs-${version}-x86_64-apple-darwin.tar.gz"
+            "pi-rs-${version}-x86_64-pc-windows-msvc.zip"
+            "pi-rs-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          )
+
+          printf '%s\n' "${expected[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/expected-assets.txt"
+          find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$RUNNER_TEMP/actual-assets.txt"
+          if ! diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"; then
+            echo "Local release inventory is not exactly the five expected archives" >&2
+            exit 1
+          fi
+
+          for asset in "${expected[@]}"; do
+            [ -f "$asset" ] && [ -s "$asset" ] || {
+              echo "Expected a nonempty regular file: $asset" >&2
+              exit 1
+            }
+          done
+
+          sha256sum "${expected[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Refuse published release and remove stale draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          release_rows="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | [.id, .tag_name, .draft] | @tsv'
+          )"
+          draft_ids=""
+          published_exists=false
+          while IFS=$'\t' read -r release_id tag is_draft; do
+            [ "$tag" = "$GITHUB_REF_NAME" ] || continue
+            if [ "$is_draft" = "true" ]; then
+              draft_ids="${draft_ids}${release_id} "
+            else
+              published_exists=true
+            fi
+          done <<< "$release_rows"
+
+          if [ "$published_exists" = true ]; then
+            echo "Release $GITHUB_REF_NAME is already published; refusing to replace its assets" >&2
+            exit 1
+          fi
+
+          set -- $draft_ids
+          draft_count="$#"
+          if [ "$draft_count" -gt 1 ]; then
+            echo "Found multiple drafts for $GITHUB_REF_NAME; refusing ambiguous cleanup" >&2
+            exit 1
+          fi
+          if [ "$draft_count" -eq 1 ]; then
+            stale_draft_id="$1"
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${stale_draft_id}"
+          fi
+
+      - name: Create or update draft release
+        id: draft_release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          files: dist/*
+          draft: true
+          prerelease: ${{ env.IS_PRERELEASE == 'true' }}
+          make_latest: false
+          overwrite_files: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## pi `${{ github.ref_name }}`
+
+            ### Install
+
+            ```sh
+            # macOS / Linux
+            curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/${{ github.ref_name }}/install.sh | sh
+            ```
+
+            ```powershell
+            # Windows PowerShell
+            irm https://raw.githubusercontent.com/0x8f701/pi-rs/${{ github.ref_name }}/install.ps1 | iex
+            ```
+
+            Pin a release:
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/${{ github.ref_name }}/install.sh | bash -s -- --version ${{ github.ref_name }}
+            ```
+
+      - name: Verify remote draft inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          expected=(
+            SHA256SUMS
+            "pi-rs-${version}-aarch64-apple-darwin.tar.gz"
+            "pi-rs-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "pi-rs-${version}-x86_64-apple-darwin.tar.gz"
+            "pi-rs-${version}-x86_64-pc-windows-msvc.zip"
+            "pi-rs-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          release_id="${{ steps.draft_release.outputs.id }}"
+          case "$release_id" in
+            ''|*[!0-9]*)
+              echo "Release action returned an invalid draft release ID: $release_id" >&2
+              exit 1
+              ;;
+          esac
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+
+          if ! jq -e --arg tag "$GITHUB_REF_NAME" --arg ispre "$IS_PRERELEASE" \
+            '(.tag_name == $tag) and (.draft == true) and (.prerelease == ($ispre == "true")) and
+             (.assets | length == 6) and all(.assets[]; .size > 0)' \
+            <<< "$release_json" >/dev/null; then
+            echo "Remote release is not a draft with six nonempty assets" >&2
+            exit 1
+          fi
+
+          printf '%s\n' "${expected[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/expected-remote-assets.txt"
+          jq -r '.assets[].name' <<< "$release_json" | LC_ALL=C sort > "$RUNNER_TEMP/actual-remote-assets.txt"
+          if ! diff -u "$RUNNER_TEMP/expected-remote-assets.txt" "$RUNNER_TEMP/actual-remote-assets.txt"; then
+            echo "Remote draft inventory is not exactly the five archives plus SHA256SUMS" >&2
+            exit 1
+          fi
+
+          verify_dir="$(mktemp -d)"
+          jq -r '.assets[] | [.name, .url] | @tsv' <<< "$release_json" |
+            while IFS=$'\t' read -r asset_name asset_api_url; do
+              gh api -H 'Accept: application/octet-stream' "$asset_api_url" \
+                > "$verify_dir/$asset_name"
+            done
+          (cd "$verify_dir" && sha256sum -c SHA256SUMS)
+
+      - name: Publish verified release and set latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.id }}
+        shell: bash
+        run: |
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            MAKE_LATEST=false
+          else
+            MAKE_LATEST=true
+          fi
+          # Stable releases become the latest; prereleases stay non-latest so
+          # the installers' /releases/latest default keeps resolving to stable.
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -f draft=false \
+            -F prerelease="$IS_PRERELEASE" \
+            -f make_latest="$MAKE_LATEST" >/dev/null
