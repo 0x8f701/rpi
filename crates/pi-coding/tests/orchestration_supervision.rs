@@ -276,10 +276,11 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     assert!(running_jobs.iter().all(|job| job.status == JobStatus::Running));
     assert_eq!(controlled.peak.load(Ordering::SeqCst), 2);
 
-    // 3) Inter-agent IRC while both are running: delivery is Queued (not woken).
+    // 3) Inter-agent IRC while both are running: the active child bridge accepts
+    // the message immediately, so it is not retained in Beta's mailbox.
     let alpha_to_beta = controlled.runtime.send("Alpha", "Beta", "alpha-to-beta", None);
     assert_eq!(alpha_to_beta.len(), 1);
-    assert_eq!(alpha_to_beta[0].outcome, DeliveryOutcome::Queued);
+    assert_eq!(alpha_to_beta[0].outcome, DeliveryOutcome::Woken);
     assert!(alpha_to_beta[0].error.is_none());
     let beta_to_main = controlled
         .runtime
@@ -289,8 +290,7 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
 
     // Mail to Main must remain queued and must not be drained by job wait.
     assert_eq!(controlled.runtime.inbox("Main", true).len(), 1);
-    assert_eq!(controlled.runtime.inbox("Beta", true).len(), 1);
-    assert_eq!(controlled.runtime.inbox("Beta", true)[0].body, "alpha-to-beta");
+    assert!(controlled.runtime.inbox("Beta", true).is_empty());
 
     // 4) hub wait on Alpha must not return while Alpha is still running, and
     //    must not consume Main's unrelated mailbox message.
@@ -403,7 +403,8 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     assert_eq!(messages[0]["body"], "beta-status-update");
     assert!(controlled.runtime.inbox("Main", true).is_empty());
 
-    // 7) Roster via hub list — Alpha idle with unread IRC from earlier, Beta aborted.
+    // 7) Roster via hub list — Alpha idle, Beta aborted. The earlier IRC was
+    // delivered directly to Beta's active Session rather than retained.
     let list = (hub.execute)(context("main-list", json!({ "op": "list" })))
         .await
         .expect("hub list");
@@ -418,12 +419,7 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
         .expect("beta peer");
     assert_eq!(alpha_peer["status"], "idle");
     assert_eq!(beta_peer["status"], "aborted");
-    // Beta was aborted mid-run; Alpha still holds the queued IRC message.
-    assert_eq!(
-        controlled.runtime.inbox("Beta", true).len(),
-        1,
-        "aborted agent retains queued mail until drained"
-    );
+    assert!(controlled.runtime.inbox("Beta", true).is_empty());
 
     // 8) Parked delivery is truthful: mail queues without claiming execution revival.
     // Status stays Parked because no live session resumes.
@@ -539,10 +535,10 @@ async fn owner_shutdown_cancels_inflight_and_clears_roster() {
         .job_id;
     wait_for_count(&current, &started, 1, "linger running").await;
 
-    // Mail while running is Queued.
+    // Mail while running is injected into the active child Session.
     assert_eq!(
         runtime.send("Main", "Linger", "ping", None)[0].outcome,
-        DeliveryOutcome::Queued
+        DeliveryOutcome::Woken
     );
 
     let wait = (hub.execute)(context(

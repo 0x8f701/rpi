@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, bail};
-use pi_coding::{Application, GoalLifecycle, GoalState};
+use pi_coding::{Application, GoalActivationOutcome, GoalLifecycle, GoalState};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InteractiveGoalCommand {
@@ -14,14 +14,16 @@ pub enum InteractiveGoalCommand {
     Drop,
 }
 
+
 pub fn parse_interactive_goal_command(argument: Option<&str>) -> Result<InteractiveGoalCommand> {
     let argument = argument.unwrap_or_default().trim();
-    if argument.is_empty() || argument == "show" || argument == "get" {
+    if argument.is_empty() || argument == "show" || argument == "get" || argument == "inspect" {
         return Ok(InteractiveGoalCommand::Show);
     }
     let mut parts = argument.split_whitespace();
     let operation = parts.next().unwrap_or_default();
     match operation {
+        "show" | "get" | "inspect" => no_trailing(parts, InteractiveGoalCommand::Show),
         "pause" => no_trailing(parts, InteractiveGoalCommand::Pause),
         "resume" => no_trailing(parts, InteractiveGoalCommand::Resume),
         "complete" => no_trailing(parts, InteractiveGoalCommand::Complete),
@@ -33,7 +35,7 @@ pub fn parse_interactive_goal_command(argument: Option<&str>) -> Result<Interact
 
 fn no_trailing<'a>(mut parts: impl Iterator<Item = &'a str>, command: InteractiveGoalCommand) -> Result<InteractiveGoalCommand> {
     if parts.next().is_some() {
-        bail!("usage: /goal [show|create [--tokens N] <objective>|pause|resume|complete|drop]");
+        bail!("usage: /goal [show|inspect|create [--tokens N] <objective>|pause|resume|complete|drop]");
     }
     Ok(command)
 }
@@ -70,36 +72,37 @@ fn parse_create(argument: &str) -> Result<InteractiveGoalCommand> {
     })
 }
 
-pub fn execute_interactive_goal_command(
+pub async fn execute_interactive_goal_command(
     application: &Application,
     command: InteractiveGoalCommand,
 ) -> Result<String> {
-    match command {
-        InteractiveGoalCommand::Show => Ok(format_goal_state(&application.goal_state())),
+    let activation = match command {
+        InteractiveGoalCommand::Show => None,
         InteractiveGoalCommand::Create {
             objective,
             token_budget,
-        } => {
-            application.goal_create(objective, token_budget)?;
-            Ok(format_goal_state(&application.goal_state()))
-        }
+        } => Some(application.activate_goal(objective, token_budget).await?),
         InteractiveGoalCommand::Pause => {
             application.goal_pause()?;
-            Ok(format_goal_state(&application.goal_state()))
+            None
         }
-        InteractiveGoalCommand::Resume => {
-            application.goal_resume()?;
-            Ok(format_goal_state(&application.goal_state()))
-        }
+        InteractiveGoalCommand::Resume => Some(application.resume_goal_work().await?),
         InteractiveGoalCommand::Complete => {
             application.goal_complete()?;
-            Ok(format_goal_state(&application.goal_state()))
+            None
         }
         InteractiveGoalCommand::Drop => {
             application.goal_drop()?;
-            Ok(format_goal_state(&application.goal_state()))
+            None
         }
-    }
+    };
+    let state = format_goal_state(&application.goal_state());
+    Ok(match activation {
+        Some(GoalActivationOutcome::Started) => format!("Goal work started · {state}"),
+        Some(GoalActivationOutcome::Queued) => format!("Goal work queued · {state}"),
+        Some(GoalActivationOutcome::AlreadyActive) => format!("Goal work already active · {state}"),
+        None => state,
+    })
 }
 
 #[must_use]
@@ -120,10 +123,30 @@ pub fn format_goal_state(state: &GoalState) -> String {
     format!("{lifecycle} · {budget} · {}", goal.objective)
 }
 
+#[must_use]
+pub fn format_goal_details(state: &GoalState) -> String {
+    let Some(goal) = &state.current else {
+        return "No goal is active. Choose Create goal to set an objective.".to_owned();
+    };
+    let lifecycle = match goal.lifecycle {
+        GoalLifecycle::Active => "active",
+        GoalLifecycle::Paused => "paused",
+        GoalLifecycle::Completed => "completed",
+        GoalLifecycle::Dropped => "dropped",
+    };
+    let tokens = goal.token_budget.map_or_else(
+        || format!("{} (no budget)", goal.usage.tokens_used),
+        |budget| format!("{} / {budget}", goal.usage.tokens_used),
+    );
+    format!(
+        "Objective: {}\nStatus: {lifecycle}\nTokens: {tokens}\nTime spent: {}s",
+        goal.objective, goal.usage.active_time_seconds
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn parses_goal_create_and_lifecycle_commands() {
         assert_eq!(
@@ -137,6 +160,25 @@ mod tests {
             parse_interactive_goal_command(Some("pause")).unwrap(),
             InteractiveGoalCommand::Pause
         );
+        assert_eq!(
+            parse_interactive_goal_command(Some("inspect")).unwrap(),
+            InteractiveGoalCommand::Show
+        );
+        assert_eq!(
+            parse_interactive_goal_command(Some("show")).unwrap(),
+            InteractiveGoalCommand::Show
+        );
+        assert_eq!(
+            parse_interactive_goal_command(Some("get")).unwrap(),
+            InteractiveGoalCommand::Show
+        );
         assert!(parse_interactive_goal_command(Some("create --tokens 0 no")).is_err());
+        assert!(parse_interactive_goal_command(Some("inspect extra")).is_err());
+    }
+
+    #[test]
+    fn formats_empty_goal_details_for_overlay() {
+        let details = format_goal_details(&GoalState::default());
+        assert_eq!(details, "No goal is active. Choose Create goal to set an objective.");
     }
 }

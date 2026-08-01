@@ -63,6 +63,9 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions) -> String {
             "{}{append_section}{context_section}{skills_section}{workspace_section}",
             opts.custom_prompt
         );
+        if !prompt.ends_with('\n') {
+            prompt.push('\n');
+        }
         prompt.push_str("\nCurrent working directory: ");
         prompt.push_str(&prompt_cwd);
         return prompt;
@@ -160,7 +163,7 @@ fn build_workspace_section(additional_roots: &[String]) -> String {
         return String::new();
     }
     let mut section = String::from(
-        "\n\n<workspace_roots>\nFiles may be accessed only under the current working directory or these explicitly trusted additional roots:\n",
+        "\n\n<workspace_roots>\nThese additional roots extend scoped ls/find/grep/glob tools and @file expansion beyond the current working directory. They do not restrict normal coding-tool read, write, or edit paths, which may use other filesystem locations:\n",
     );
     for root in additional_roots.iter().take(MAX_ROOTS) {
         let normalized = root.replace('\\', "/");
@@ -206,7 +209,7 @@ mod tests {
         let mut tool_snippets = HashMap::new();
         tool_snippets.extend([
             snippet("read", "Read file contents"),
-            snippet("bash", "Execute bash commands (ls, grep, find, etc.)"),
+            snippet("bash", "Execute finite foreground shell commands, or supervised long-running commands with background=true"),
             snippet("edit", "Make precise file edits with exact text replacement, including multiple disjoint edits in one call"),
             snippet("write", "Create or overwrite files"),
         ]);
@@ -228,7 +231,7 @@ mod tests {
     fn default_prompt_golden_shape() {
         let opts = base_opts();
         let got = build_system_prompt(opts);
-        assert!(got.starts_with("You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n- read: Read file contents\n- bash: Execute bash commands (ls, grep, find, etc.)\n- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n- write: Create or overwrite files\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n"));
+        assert!(got.starts_with("You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n- read: Read file contents\n- bash: Execute finite foreground shell commands, or supervised long-running commands with background=true\n- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n- write: Create or overwrite files\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n"));
         assert!(got.contains("Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):"));
         assert!(got.contains("- Main documentation: /pkg/README.md"));
         assert!(got.contains("- Additional docs: /pkg/docs"));
@@ -253,6 +256,7 @@ mod tests {
         ];
         let prompt = build_system_prompt(opts);
         assert!(prompt.contains("<workspace_roots>"));
+        assert!(prompt.contains("They do not restrict normal coding-tool read, write, or edit paths"));
         assert!(prompt.contains("- /tmp/agent-loader"));
         assert!(!prompt.contains(&"x".repeat(4_097)));
     }

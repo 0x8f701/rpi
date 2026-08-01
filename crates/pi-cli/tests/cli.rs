@@ -1,4 +1,4 @@
-//! CLI integration tests that drive the `pi` binary as a subprocess.
+//! CLI integration tests that drive the `rpi` binary as a subprocess.
 //!
 //! Covers: help/version/model and session subcommands, import dispatch, native
 //! continuation, and unified native/OMP/Codex/Claude/Grok/Droid resume by path
@@ -12,9 +12,9 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
-/// Path to the freshly built `pi` binary (set by cargo for integration tests).
-fn pi_bin() -> String {
-    env!("CARGO_BIN_EXE_pi").to_owned()
+/// Path to the freshly built `rpi` binary (set by cargo for integration tests).
+fn rpi_bin() -> String {
+    env!("CARGO_BIN_EXE_rpi").to_owned()
 }
 
 /// A codex rollout fixture with one user + one assistant message.
@@ -88,7 +88,7 @@ fn foreign_fixture(home: &Path, cwd: &Path, source: &str, id: &str) -> PathBuf {
 }
 
 fn command(home: &Path) -> Command {
-    let mut command = Command::new(pi_bin());
+    let mut command = Command::new(rpi_bin());
     command
         .env("HOME", home)
         .env("SESSIONS_HOME", home)
@@ -109,14 +109,14 @@ fn run_stdin(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> (bool, Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn pi");
+        .expect("spawn rpi");
     child
         .stdin
         .as_mut()
         .expect("child stdin")
         .write_all(stdin.as_bytes())
         .expect("write stdin");
-    let output = child.wait_with_output().expect("wait for pi");
+    let output = child.wait_with_output().expect("wait for rpi");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -129,7 +129,7 @@ fn run(home: &std::path::Path, args: &[&str]) -> (bool, String, String) {
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .expect("run pi");
+        .expect("run rpi");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -254,7 +254,7 @@ fn version_is_emitted() {
     let home = TempDir::new().unwrap();
     let (ok, out, _) = run(home.path(), &["--version"]);
     assert!(ok, "--version must exit 0");
-    assert!(out.starts_with("pi "), "--version prints \"pi <version>\"");
+    assert!(out.starts_with("rpi "), "--version prints \"rpi <version>\"");
 }
 
 #[test]
@@ -354,13 +354,13 @@ fn models_empty_filter_is_silent() {
 fn sessions_empty_for_fresh_dir() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
-    let output = Command::new(pi_bin())
+    let output = Command::new(rpi_bin())
         .arg("sessions")
         .env("HOME", home.path())
         .current_dir(cwd.path())
         .stdin(Stdio::null())
         .output()
-        .expect("run pi sessions");
+        .expect("run rpi sessions");
     assert!(output.status.success(), "sessions exits 0");
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("No sessions"), "empty dir reports no sessions");
@@ -408,12 +408,12 @@ fn sessions_honors_global_cwd_flag() {
 #[test]
 fn empty_non_tty_prompt_uses_print_mode_and_requires_content() {
     let home = TempDir::new().unwrap();
-    let output = Command::new(pi_bin())
+    let output = Command::new(rpi_bin())
         .args(["-m", "faux/faux-1", ""])
         .env("HOME", home.path())
         .stdin(Stdio::null())
         .output()
-        .expect("run pi with empty prompt");
+        .expect("run rpi with empty prompt");
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "non-TTY empty prompt must fail");
     assert!(
@@ -443,7 +443,7 @@ fn import_session_codex_fixture_succeeds() {
     let out_dir = TempDir::new().unwrap();
     let fixture = codex_fixture(fixtures.path(), "imp1");
 
-    let output = Command::new(pi_bin())
+    let output = Command::new(rpi_bin())
         .args(["import-session", "codex"])
         .arg(&fixture)
         .args(["--output"])
@@ -475,7 +475,7 @@ fn import_session_no_convertible_fails() {
     let out_dir = TempDir::new().unwrap();
     let fixture = codex_empty_fixture(fixtures.path(), "empty1");
 
-    let output = Command::new(pi_bin())
+    let output = Command::new(rpi_bin())
         .args(["import-session", "codex"])
         .arg(&fixture)
         .args(["--output"])
@@ -514,7 +514,7 @@ fn unified_resume_honors_sessions_home_for_native_and_foreign() {
     );
 
     for input in ["sessions-home-native", "sessions-home-droid"] {
-        let output = Command::new(pi_bin())
+        let output = Command::new(rpi_bin())
             .args([
                 "-m",
                 "faux/faux-1",
@@ -717,7 +717,7 @@ fn resume_native_restores_faux_model_and_message_count() {
     // model_change record rather than defaulting to anthropic.
     let (ok, out, err) = run(home.path(), &["--resume", path.to_str().unwrap()]);
     assert!(ok, "--resume must exit 0: {err}");
-    assert!(out.contains("(rs)"), "REPL header printed: {out}");
+    assert!(out.contains("rpi ·"), "REPL header printed: {out}");
     assert!(
         out.contains("faux/faux-1"),
         "REPL header restores the faux model from model_change: {out}"

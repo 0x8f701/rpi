@@ -1,4 +1,4 @@
-//! `pi` — Rust port of the pi coding agent CLI binary.
+//! `rpi` — Rust port of the pi coding agent CLI binary.
 //!
 //! A thin entrypoint over the [`pi_cli`] library so integration tests can
 //! drive the same code paths. Parses arguments, dispatches, and reports any

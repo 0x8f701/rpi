@@ -5,6 +5,7 @@
 //! or export presentation.
 
 mod analysis;
+mod inline;
 mod mermaid;
 mod render;
 mod table;
@@ -14,11 +15,12 @@ pub use analysis::{
     AnalysisMode, ListItem, ListMarker, MarkdownBlock, MarkdownDocument, analyze_markdown,
     analyze_markdown_with_mode,
 };
+pub use inline::{InlineStyle, InlineStyleRange};
 pub use mermaid::{
     DEFAULT_MAX_MERMAID_EDGES, DEFAULT_MAX_MERMAID_NODES, DEFAULT_MAX_MERMAID_OUTPUT_CELLS,
     FlowDirection, MAX_MERMAID_SOURCE_BYTES, MermaidArt, MermaidDiagnostic,
-    MermaidDiagnosticKind, MermaidEdge, MermaidFlowchart, MermaidLimits, MermaidNode,
-    MermaidNodeShape, parse_mermaid, render_mermaid_unicode,
+    MermaidDiagnosticKind, MermaidDiagramKind, MermaidEdge, MermaidFlowchart, MermaidLimits,
+    MermaidNode, MermaidNodeShape, parse_mermaid, render_mermaid_unicode,
 };
 pub use render::{
     LineRole, MarkdownRenderOptions, MarkdownRenderOutput, NeutralLine, RenderDiagnostic,

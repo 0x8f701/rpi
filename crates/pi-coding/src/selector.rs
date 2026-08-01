@@ -140,8 +140,107 @@ struct CandidateScore {
     hit: SelectionHit,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExactAgentMention {
+    None,
+    Unique(String),
+    Ambiguous(Vec<String>),
+}
+
+impl ExactAgentMention {
+    pub(crate) fn ambiguity_message(&self) -> Option<String> {
+        let Self::Ambiguous(names) = self else {
+            return None;
+        };
+        Some(format!(
+            "exact agent mention is ambiguous between {}; pass the intended name in task.agent or rename agents so their normalized names are unique",
+            names
+                .iter()
+                .map(|name| format!("{name:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
+#[must_use]
+pub(crate) fn exact_agent_mention(
+    request: &str,
+    agents: &[AgentDefinition],
+) -> ExactAgentMention {
+    let request_tokens = normalized_tokens(request);
+    exact_agent_mention_for_phrase(&request_tokens.join(" "), agents)
+}
+
+fn exact_agent_mention_for_phrase(
+    request_phrase: &str,
+    agents: &[AgentDefinition],
+) -> ExactAgentMention {
+    let names = agents
+        .iter()
+        .filter(|agent| agent.trusted)
+        .filter_map(|agent| {
+            let name_phrase = normalized_tokens(&agent.name).join(" ");
+            (!name_phrase.is_empty() && contains_phrase(request_phrase, &name_phrase))
+                .then(|| agent.name.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    match names.as_slice() {
+        [] => ExactAgentMention::None,
+        [name] => ExactAgentMention::Unique(name.clone()),
+        _ => ExactAgentMention::Ambiguous(names),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExactSkillMention {
+    None,
+    Unique(String),
+    Ambiguous(Vec<String>),
+}
+
+/// Token-boundary match of a visible trusted skill's full normalized name.
+///
+/// Cross-kind task routing uses a unique exact skill mention to avoid promoting
+/// an overlapping agent via description ranking. Exact agent mentions still win.
+#[must_use]
+pub(crate) fn exact_skill_mention(request: &str, skills: &[Skill]) -> ExactSkillMention {
+    let request_phrase = normalized_tokens(request).join(" ");
+    let names = skills
+        .iter()
+        .filter(|skill| skill.trusted && !skill.hidden && !skill.disable_model_invocation)
+        .filter_map(|skill| {
+            let name_phrase = normalized_tokens(&skill.name).join(" ");
+            (!name_phrase.is_empty() && contains_phrase(&request_phrase, &name_phrase))
+                .then(|| skill.name.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    match names.as_slice() {
+        [] => ExactSkillMention::None,
+        [name] => ExactSkillMention::Unique(name.clone()),
+        _ => ExactSkillMention::Ambiguous(names),
+    }
+}
+
+
 #[must_use]
 pub fn select_deterministic(input: SelectionInput<'_>) -> SelectionPlan {
+    let exact_agent_mention = if input.settings.enabled {
+        exact_agent_mention(input.request, input.agents)
+    } else {
+        ExactAgentMention::None
+    };
+    select_deterministic_with_exact_agent(input, exact_agent_mention)
+}
+
+fn select_deterministic_with_exact_agent(
+    input: SelectionInput<'_>,
+    exact_agent_mention: ExactAgentMention,
+) -> SelectionPlan {
     if !input.settings.enabled {
         return SelectionPlan {
             request: input.request.to_owned(),
@@ -172,7 +271,16 @@ pub fn select_deterministic(input: SelectionInput<'_>) -> SelectionPlan {
         input.agents,
         input.settings,
     );
-    let selected_agent = select_default_agent(&agents, input.settings);
+    let selected_agent = match &exact_agent_mention {
+        ExactAgentMention::Unique(name) => Some(name.clone()),
+        ExactAgentMention::Ambiguous(_) => None,
+        ExactAgentMention::None => match exact_skill_mention(input.request, input.skills) {
+            // Unique/ambiguous exact skill names must not auto-select an agent
+            // via description ranking (e.g. skill `research` vs agent `researcher`).
+            ExactSkillMention::Unique(_) | ExactSkillMention::Ambiguous(_) => None,
+            ExactSkillMention::None => select_default_agent(&agents, input.settings),
+        },
+    };
     let mut autoload_skills = Vec::new();
     let mut seen_autoload_skills = BTreeSet::new();
     for skill in input.skills.iter().filter(|skill| {
@@ -182,14 +290,16 @@ pub fn select_deterministic(input: SelectionInput<'_>) -> SelectionPlan {
             autoload_skills.push(skill.name.clone());
         }
     }
-    for hit in skills.iter().filter(|hit| {
-        hit.score >= input.settings.autoload_threshold
-            && input.skills.iter().any(|skill| {
-                skill.name == hit.name && skill.trusted && !skill.disable_model_invocation
-            })
-    }) {
-        if seen_autoload_skills.insert(hit.name.clone()) {
-            autoload_skills.push(hit.name.clone());
+    if matches!(exact_agent_mention, ExactAgentMention::None) {
+        for hit in skills.iter().filter(|hit| {
+            hit.score >= input.settings.autoload_threshold
+                && input.skills.iter().any(|skill| {
+                    skill.name == hit.name && skill.trusted && !skill.disable_model_invocation
+                })
+        }) {
+            if seen_autoload_skills.insert(hit.name.clone()) {
+                autoload_skills.push(hit.name.clone());
+            }
         }
     }
     if let Some(name) = selected_agent.as_deref()
@@ -209,8 +319,10 @@ pub fn select_deterministic(input: SelectionInput<'_>) -> SelectionPlan {
             }
         }
     }
-    let fallback_reason = (skills.is_empty() && agents.is_empty())
-        .then(|| "no metadata match met the threshold".to_owned());
+    let fallback_reason = exact_agent_mention.ambiguity_message().or_else(|| {
+        (skills.is_empty() && agents.is_empty())
+            .then(|| "no metadata match met the threshold".to_owned())
+    });
     SelectionPlan {
         request: input.request.to_owned(),
         skills,
@@ -228,7 +340,12 @@ pub async fn select(
 ) -> SelectionPlan {
     let classifier_enabled = input.settings.enabled && input.settings.classifier.enabled;
     let classifier_settings = input.settings.classifier.clone();
-    let mut plan = select_deterministic(input);
+    let exact_agent_mention = exact_agent_mention(input.request, input.agents);
+    let ambiguous_exact_agent = matches!(exact_agent_mention, ExactAgentMention::Ambiguous(_));
+    let mut plan = select_deterministic_with_exact_agent(input, exact_agent_mention);
+    if ambiguous_exact_agent {
+        return plan;
+    }
     if !classifier_enabled {
         return plan;
     }
@@ -679,7 +796,7 @@ pub fn load_autoload_skill_bodies(
         let Ok(body) = crate::read_resource_text(&path, "autoload skill") else {
             continue;
         };
-        let body = strip_frontmatter(&body);
+        let body = crate::resources::strip_skill_frontmatter(&body);
         let Some(next_total) = total_bytes.checked_add(body.len()) else {
             break;
         };
@@ -777,16 +894,6 @@ fn longest_shared_phrase(request: &[String], candidate: &[String]) -> Option<Vec
     (!best.is_empty()).then_some(best)
 }
 
-fn strip_frontmatter(content: &str) -> String {
-    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
-    normalized
-        .strip_prefix("---\n")
-        .and_then(|rest| rest.split_once("\n---"))
-        .map_or_else(
-            || normalized.clone(),
-            |(_, body)| body.trim_start_matches("\n---").trim_start().to_owned(),
-        )
-}
 
 const fn skill_source_name(source: SkillSource) -> &'static str {
     match source {
@@ -978,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn ranked_skills_autoload_in_rank_order_and_dedupe_agent_declarations() {
+    fn exact_agent_mention_suppresses_ranked_skills_but_keeps_agent_declarations() {
         let rust = skill("rust-review", "Review Rust code for memory safety");
         let security = skill("security-audit", "Audit security vulnerabilities");
         let mut reviewer = agent("reviewer", "Review Rust security patches");
@@ -997,9 +1104,138 @@ mod tests {
             settings: &settings,
         });
         assert_eq!(plan.selected_agent.as_deref(), Some("reviewer"));
+        assert_eq!(plan.autoload_skills, vec!["rust-review"]);
+    }
+
+    #[test]
+    fn generic_ranked_skills_autoload_in_rank_order_and_dedupe_agent_declarations() {
+        let rust = skill("rust-review", "Review Rust code for memory safety");
+        let security = skill("security-audit", "Audit security vulnerabilities");
+        let mut reviewer = agent("reviewer", "Review Rust security patches");
+        reviewer.autoload_skills = vec!["rust-review".to_owned()];
+        let settings = SelectorSettings {
+            autoload_threshold: 1,
+            auto_select_threshold: 1,
+            confidence_margin: 0,
+            min_score: 0,
+            ..SelectorSettings::default()
+        };
+        let plan = select_deterministic(SelectionInput {
+            request: "audit security vulnerabilities in Rust code",
+            skills: &[rust, security],
+            agents: &[reviewer],
+            settings: &settings,
+        });
+        assert_eq!(plan.selected_agent.as_deref(), Some("reviewer"));
         assert_eq!(plan.autoload_skills, vec!["security-audit", "rust-review"]);
     }
 
+    #[test]
+    fn exact_agent_mention_wins_over_overlapping_skill_and_suppresses_ranked_autoload() {
+        let research = skill("research", "Research topics for a researcher study");
+        let policy = {
+            let mut skill = skill("policy", "Always applied policy");
+            skill.always_apply = true;
+            skill
+        };
+        let mut researcher = agent("researcher", "Research and study assigned topics");
+        researcher.autoload_skills = vec!["policy".to_owned()];
+        let settings = SelectorSettings {
+            autoload_threshold: 1,
+            auto_select_threshold: 1,
+            confidence_margin: 0,
+            min_score: 0,
+            ..SelectorSettings::default()
+        };
+        let plan = select_deterministic(SelectionInput {
+            request: "Have researcher study this",
+            skills: &[research, policy],
+            agents: &[researcher],
+            settings: &settings,
+        });
+        assert_eq!(plan.selected_agent.as_deref(), Some("researcher"));
+        assert_eq!(plan.autoload_skills, vec!["policy"]);
+        assert!(plan.skills.iter().any(|hit| hit.name == "research"));
+    }
+
+    #[test]
+    fn exact_skill_name_still_autoloads_without_an_exact_agent_mention() {
+        let settings = SelectorSettings {
+            autoload_threshold: 1,
+            min_score: 0,
+            ..SelectorSettings::default()
+        };
+        let research = skill("research", "Research assigned topics");
+        let plan = select_deterministic(SelectionInput {
+            request: "Use research for this",
+            skills: &[research],
+            agents: &[agent("researcher", "Study assigned topics")],
+            settings: &settings,
+        });
+        assert_eq!(plan.skills[0].name, "research");
+        assert_eq!(plan.autoload_skills, vec!["research"]);
+        assert!(plan.selected_agent.is_none());
+    }
+
+    #[test]
+    fn exact_skill_mention_suppresses_overlapping_agent_auto_select() {
+        let settings = SelectorSettings {
+            autoload_threshold: 1,
+            auto_select_threshold: 1,
+            confidence_margin: 0,
+            min_score: 0,
+            ..SelectorSettings::default()
+        };
+        let research = skill("research", "Research topics for a researcher study");
+        let researcher = agent("researcher", "Research and study assigned topics");
+        assert!(matches!(
+            exact_skill_mention("Use research for this", &[research.clone()]),
+            ExactSkillMention::Unique(name) if name == "research"
+        ));
+        assert!(matches!(
+            exact_agent_mention("Use research for this", &[researcher.clone()]),
+            ExactAgentMention::None
+        ));
+        let plan = select_deterministic(SelectionInput {
+            request: "Use research for this",
+            skills: &[research],
+            agents: &[researcher],
+            settings: &settings,
+        });
+        assert_eq!(plan.skills[0].name, "research");
+        assert!(
+            plan.selected_agent.is_none(),
+            "exact skill mention must not auto-select overlapping researcher: {:?}",
+            plan.selected_agent
+        );
+        assert_eq!(plan.autoload_skills, vec!["research"]);
+    }
+
+
+    #[test]
+    fn ambiguous_exact_normalized_agent_names_fail_without_silent_selection() {
+        let settings = SelectorSettings {
+            auto_select_threshold: 1,
+            confidence_margin: 0,
+            min_score: 0,
+            ..SelectorSettings::default()
+        };
+        let plan = select_deterministic(SelectionInput {
+            request: "Have Research Agent study this",
+            skills: &[],
+            agents: &[
+                agent("Research-Agent", "First researcher"),
+                agent("research-agent", "Second researcher"),
+            ],
+            settings: &settings,
+        });
+        assert!(plan.selected_agent.is_none());
+        let message = plan.fallback_reason.expect("actionable ambiguity error");
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(message.contains("Research-Agent"), "{message}");
+        assert!(message.contains("research-agent"), "{message}");
+        assert!(message.contains("task.agent"), "{message}");
+    }
 
     #[test]
     fn skill_uri_rejects_traversal_but_allows_hidden() {

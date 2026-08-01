@@ -1,3 +1,6 @@
 /target
 /examples/target
 *.log
+/.pi/artifacts/
+/diagram-output/
+session.html

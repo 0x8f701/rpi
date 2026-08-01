@@ -1996,6 +1996,23 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn openai_strict_tools_require_typed_root_and_complete_required_list() {
+        let mut optional = Schema::string();
+        optional.nullable = true;
+        let mut parameters = Schema::object_ordered(vec![("value".to_owned(), optional, true)]);
+        parameters.additional_properties = Some(json!(false));
+        let model = Model { provider: "openai".into(), ..Model::default() };
+        let tools = convert_openai_tools(&model, &[Tool {
+            name: "strict_tool".into(), description: "strict schema".into(), parameters,
+            constrained_sampling: Some(ConstrainedSampling::json_schema(ConstrainedSamplingStrictness::Prefer)),
+        }]).expect("strict tool payload");
+        assert_eq!(tools[0]["function"]["strict"], true);
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+        assert_eq!(tools[0]["function"]["parameters"]["required"], json!(["value"]));
+        assert_eq!(tools[0]["function"]["parameters"]["properties"]["value"]["type"], json!(["string", "null"]));
+    }
     #[test]
     fn openai_grammar_sampling_uses_custom_tools_only_when_supported() {
         let context = Context {

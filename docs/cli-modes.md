@@ -1,11 +1,11 @@
 # CLI modes and commands
 
-`pi` is a single binary that switches between non-interactive, headless, and interactive modes based on the flags you pass.
+`rpi` is a single binary that switches between non-interactive, headless, and interactive modes based on the flags you pass.
 
 ## Top-level syntax
 
 ```text
-pi [OPTIONS] [PROMPT]...
+rpi [OPTIONS] [PROMPT]...
 ```
 
 When no subcommand is given, a top-level run is selected by the flags:
@@ -15,7 +15,7 @@ When no subcommand is given, a top-level run is selected by the flags:
 3. `stdout` is a terminal and raw mode works → TUI.
 4. Otherwise → line REPL.
 
-Multiple positional `[PROMPT]` arguments are joined with a single space. An empty joined prompt (for example `pi ""`) does **not** force print mode and enters the interactive session instead, matching the upstream behavior.
+Multiple positional `[PROMPT]` arguments are joined with a single space. An empty joined prompt (for example `rpi ""`) does **not** force print mode and enters the interactive session instead, matching the upstream behavior.
 
 ## Top-level flags
 
@@ -66,20 +66,20 @@ Short aliases are normalized before clap parses: `-v` maps to `--version`, `-xt`
 
 ## Subcommands
 
-### `pi models [FILTER]`
+### `rpi models [FILTER]`
 
 List available models. Provider headers are printed in bold. The filter is case-sensitive and matches against provider name or model id.
 
-### `pi sessions`
+### `rpi sessions`
 
 List native Pi v3 sessions for the configured working directory, newest first. Honors the global `-C` / `--cwd` flag in any position:
 
 ```sh
-pi --cwd /path sessions
-pi sessions -C /path
+rpi --cwd /path sessions
+rpi sessions -C /path
 ```
 
-### `pi import-session <SOURCE> <INPUT> [--output PATH]`
+### `rpi import-session <SOURCE> <INPUT> [--output PATH]`
 
 Convert an external session to native Pi v3 JSONL.
 
@@ -94,39 +94,39 @@ Supported `SOURCE` values:
 
 With `--output` the file is written to that path (or into the directory if the path is an existing directory). Without `--output` the file is placed under the per-cwd session directory and the command prints the emitted path and message count.
 
-### `pi login [PROVIDER]` / `pi logout [PROVIDER]`
+### `rpi login [PROVIDER]` / `rpi logout [PROVIDER]`
 
 Configure or remove stored credentials in `auth.json`. When run in an interactive terminal with no provider, a list of configured providers is shown. Outside a terminal the provider argument is required.
 
-### `pi reload`
+### `rpi reload`
 
 Validate the active settings/resource snapshot and print a JSON summary to stdout.
 
-### `pi export <SESSION_PATH> [--output PATH] [--jsonl]`
+### `rpi export <SESSION_PATH> [--output PATH] [--jsonl]`
 
 Export a native Pi v3 session file to a self-contained HTML file (default) or to a current-branch JSONL file with `--jsonl`. No model, auth, or network access is required. Prints the output path to stdout.
 
-### `pi install <SOURCE> [--local]` / `pi remove <SOURCE> [--local]` / `pi uninstall <SOURCE> [--local]` / `pi list`
+### `rpi install <SOURCE> [--local]` / `rpi remove <SOURCE> [--local]` / `rpi uninstall <SOURCE> [--local]` / `rpi list`
 
 Install, remove, or list local/git Pi packages. `--local` persists the package in the project's `.pi/settings.json` instead of the global agent settings. Project packages are only loaded when the project is trusted.
 
-### `pi config [-l|--local]`
+### `rpi config [-l|--local]`
 
 Configure enabled package resources (extensions, skills, prompts, themes) for global or project scope. In a terminal it opens an interactive selector; with non-TTY stdout it prints deterministic JSON. Project scope is refused unless the project is trusted.
 
-### `pi update [--self|--extensions] [PACKAGE]`
+### `rpi update [--self|--extensions] [PACKAGE]`
 
 Update the managed installation or configured extensions.
 
-- no arguments or `--self`: update the managed `pi` installation from GitHub releases.
+- no arguments or `--self`: update the managed `rpi` installation from GitHub releases.
 - `--extensions`: reconcile every configured package (git refs and local paths).
-- `--self --extensions`: update packages, then update `pi`.
+- `--self --extensions`: update packages, then update `rpi`.
 - positional `PACKAGE`: update one configured package by source identity.
 - `--force` (with `--self`): reinstall even when version and checksum match.
 
 `--self`, `--extensions`, and `PACKAGE` are mutually exclusive; `--force` is only valid with `--self`.
 
-### `pi llama <COMMAND>`
+### `rpi llama <COMMAND>`
 
 Manage a llama.cpp router and local GGUF downloads:
 

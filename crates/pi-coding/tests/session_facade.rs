@@ -59,6 +59,8 @@ fn configure_fast_retry(session: &Session, enabled: bool, max_retries: usize) {
         enabled,
         max_retries,
         base_delay_ms: 10,
+        model_fallback: false,
+        fallback_chains: Default::default(),
     });
 }
 
@@ -540,7 +542,7 @@ async fn auto_retry_disabled_does_not_schedule_and_exhaustion_is_bounded() {
         }
     }
     assert_eq!(starts, [(1, 10), (2, 20)]);
-    assert_eq!(terminal, Some((2, Some("503 final".to_owned()))));
+    assert_eq!(terminal, Some((2, Some("503 first | 503 second | 503 final".to_owned()))));
     exhausted_registration.unregister();
 }
 
@@ -548,7 +550,7 @@ async fn auto_retry_disabled_does_not_schedule_and_exhaustion_is_bounded() {
 async fn abort_retry_interrupts_scheduled_sleep() {
     let _guard = REGISTRY_LOCK.lock().expect("registry lock");
     let (session, registration) = make_session(vec![FauxResponse::error("503 Service unavailable")]);
-    session.set_retry_settings(RetrySettings { enabled: true, max_retries: 3, base_delay_ms: 30_000 });
+    session.set_retry_settings(RetrySettings { enabled: true, max_retries: 3, base_delay_ms: 30_000 , ..Default::default() });
     let mut events = session.subscribe_session_events();
     let running = session.clone();
     let task = tokio::spawn(async move { running.run("abort retry", vec![]).await });

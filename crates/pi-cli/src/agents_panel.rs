@@ -647,6 +647,7 @@ fn thinking_label(level: pi_agent::ThinkingLevel) -> String {
         pi_agent::ThinkingLevel::Medium => "medium".to_owned(),
         pi_agent::ThinkingLevel::High => "high".to_owned(),
         pi_agent::ThinkingLevel::Xhigh => "xhigh".to_owned(),
+        pi_agent::ThinkingLevel::Max => "max".to_owned(),
     }
 }
 

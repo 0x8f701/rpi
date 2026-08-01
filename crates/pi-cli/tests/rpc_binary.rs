@@ -30,6 +30,8 @@ impl RpcSession {
             .env("HOME", home.path())
             .env("PI_OFFLINE", "1")
             .env("PI_SKIP_VERSION_CHECK", "1")
+            // Deterministic offline assistant text for prompt-driven contracts.
+            .env("PI_FAUX_RESPONSE", "rpc-binary-faux-reply")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -674,6 +676,20 @@ fn concurrent_ids_correlate_independently() {
     assert_success(a, "get_state", "a");
     assert_success(b, "get_commands", "b");
     assert_success(c, "get_session_stats", "c");
+    let command_names = b["data"]["commands"]
+        .as_array()
+        .expect("get_commands returns an array")
+        .iter()
+        .map(|command| command["name"].as_str().expect("command name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        command_names,
+        [
+            "settings", "model", "branch", "resume", "fork", "export", "agents",
+            "compact", "ps", "loop", "goal", "workflow",
+        ],
+        "RPC command discovery must match TUI and REPL primary slash surface"
+    );
 
     assert!(a["data"].is_object(), "get_state data: {a}");
     assert!(
@@ -865,4 +881,266 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+const FAUX_REPLY: &str = "rpc-binary-faux-reply";
+
+/// Contract: `get_available_models` returns the offline faux catalog entry so
+/// CI can discover models without credentials or network.
+#[test]
+fn get_available_models_includes_offline_faux() {
+    let (lines, output) = run_rpc(br#"{"type":"get_available_models","id":"models-1"}
+"#);
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = find_response(&lines, "models-1");
+    assert_success(response, "get_available_models", "models-1");
+    let models = response["data"]["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("models array missing: {response}"));
+    assert!(
+        models.iter().any(|model| {
+            model.get("provider").and_then(Value::as_str) == Some("faux")
+                && model.get("id").and_then(Value::as_str) == Some("faux-1")
+        }),
+        "available models must include faux/faux-1: {response}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains('\u{1b}'),
+        "no ANSI on get_available_models stdout"
+    );
+}
+
+/// Contract: thinking controls round-trip on the public wire — list levels,
+/// set an explicit level, and observe the effective level in the response and
+/// subsequent `get_state`.
+#[test]
+fn thinking_controls_list_and_set_round_trip() {
+    let mut session = RpcSession::spawn();
+    let deadline = Instant::now() + Duration::from_secs(20);
+
+    session.write_line(r#"{"type":"get_available_thinking_levels","id":"think-levels"}"#);
+    let (_events, levels_response) = session.read_until(deadline, |line| {
+        is_response(line) && line.get("id").and_then(Value::as_str) == Some("think-levels")
+    });
+    assert_success(
+        &levels_response,
+        "get_available_thinking_levels",
+        "think-levels",
+    );
+    let levels = levels_response["data"]["levels"]
+        .as_array()
+        .unwrap_or_else(|| panic!("levels array: {levels_response}"));
+    assert!(
+        !levels.is_empty(),
+        "thinking level list must not be empty: {levels_response}"
+    );
+    assert!(
+        levels.iter().any(|level| level.as_str() == Some("off")),
+        "levels must include off: {levels_response}"
+    );
+
+    session.write_line(r#"{"type":"set_thinking_level","id":"think-set","level":"high"}"#);
+    let (_events, set_response) = session.read_until(deadline, |line| {
+        is_response(line) && line.get("id").and_then(Value::as_str) == Some("think-set")
+    });
+    assert_success(&set_response, "set_thinking_level", "think-set");
+    assert_eq!(
+        set_response["data"]["requested"].as_str(),
+        Some("high"),
+        "requested level: {set_response}"
+    );
+    let effective = set_response["data"]["level"]
+        .as_str()
+        .expect("effective level string");
+    assert!(
+        !effective.is_empty(),
+        "effective thinking level must be present: {set_response}"
+    );
+
+    session.write_line(r#"{"type":"get_state","id":"think-state"}"#);
+    let (_events, state) = session.read_until(deadline, |line| {
+        is_response(line) && line.get("id").and_then(Value::as_str) == Some("think-state")
+    });
+    assert_success(&state, "get_state", "think-state");
+    assert_eq!(
+        state["data"]["thinkingLevel"].as_str(),
+        Some(effective),
+        "get_state must reflect set_thinking_level: {state}"
+    );
+
+    let output = session.finish();
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Contract: after a faux prompt settles, session stats and last-assistant-text
+/// reflect the recorded exchange on the public response envelope.
+#[test]
+fn session_stats_and_last_assistant_text_after_prompt() {
+    let mut session = RpcSession::spawn();
+    session.write_line(r#"{"type":"prompt","id":"stats-prompt","message":"stats prompt"}"#);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_prompt_ok = false;
+    loop {
+        let value = session.read_json_deadline(deadline);
+        if is_response(&value) && value.get("id").and_then(Value::as_str) == Some("stats-prompt")
+        {
+            assert_success(&value, "prompt", "stats-prompt");
+            saw_prompt_ok = true;
+        }
+        if value.get("type").and_then(Value::as_str) == Some("agent_settled") {
+            break;
+        }
+    }
+    assert!(saw_prompt_ok, "prompt must succeed before stats queries");
+
+    session.write_line(r#"{"type":"get_session_stats","id":"stats-1"}"#);
+    let (_events, stats) = session.read_until(deadline, |line| {
+        is_response(line) && line.get("id").and_then(Value::as_str) == Some("stats-1")
+    });
+    assert_success(&stats, "get_session_stats", "stats-1");
+    let data = &stats["data"];
+    assert!(
+        data["userMessages"].as_u64().unwrap_or(0) >= 1,
+        "userMessages after prompt: {stats}"
+    );
+    assert!(
+        data["assistantMessages"].as_u64().unwrap_or(0) >= 1,
+        "assistantMessages after prompt: {stats}"
+    );
+    assert!(
+        data["totalMessages"].as_u64().unwrap_or(0) >= 2,
+        "totalMessages after prompt: {stats}"
+    );
+    assert!(
+        data.get("tokens").is_some_and(Value::is_object),
+        "tokens object required: {stats}"
+    );
+    assert!(
+        data.get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty()),
+        "sessionId present: {stats}"
+    );
+
+    session.write_line(r#"{"type":"get_last_assistant_text","id":"last-1"}"#);
+    let (_events, last) = session.read_until(deadline, |line| {
+        is_response(line) && line.get("id").and_then(Value::as_str) == Some("last-1")
+    });
+    assert_success(&last, "get_last_assistant_text", "last-1");
+    assert_eq!(
+        last["data"]["text"].as_str(),
+        Some(FAUX_REPLY),
+        "last assistant text must match faux reply: {last}"
+    );
+
+    let output = session.finish();
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Contract: `abort` is accepted on an idle connection and does not poison
+/// later commands. A subsequent prompt still settles with agent_settled.
+#[test]
+fn abort_idle_then_prompt_still_settles() {
+    let mut session = RpcSession::spawn();
+    let deadline = Instant::now() + Duration::from_secs(20);
+
+    session.write_line(r#"{"type":"abort","id":"abort-idle"}"#);
+    let (_events, abort_response) = session.read_until(deadline, |line| {
+        is_response(line) && line.get("id").and_then(Value::as_str) == Some("abort-idle")
+    });
+    assert_success(&abort_response, "abort", "abort-idle");
+    assert!(
+        abort_response.get("data").is_none() || abort_response.get("data") == Some(&Value::Null),
+        "abort success data must be null/omitted: {abort_response}"
+    );
+
+    session.write_line(r#"{"type":"prompt","id":"after-abort","message":"still works"}"#);
+    let mut saw_prompt = false;
+    let mut settled = false;
+    while Instant::now() < deadline {
+        let value = session.read_json_deadline(deadline);
+        if is_response(&value) && value.get("id").and_then(Value::as_str) == Some("after-abort") {
+            assert_success(&value, "prompt", "after-abort");
+            saw_prompt = true;
+        }
+        if value.get("type").and_then(Value::as_str) == Some("agent_settled") {
+            settled = true;
+            break;
+        }
+    }
+    assert!(saw_prompt, "prompt after abort must succeed");
+    assert!(settled, "prompt after abort must emit agent_settled");
+
+    let output = session.finish();
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Contract: foreground `bash` runs a deterministic local command, returns
+/// exit code and captured output on the response envelope, and keeps stdout
+/// free of ANSI / plain diagnostics.
+#[test]
+fn foreground_bash_returns_output_and_exit_code() {
+    let (lines, output) = run_rpc(
+        br#"{"type":"bash","id":"bash-1","command":"printf 'hello-rpc-bash'"}
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = find_response(&lines, "bash-1");
+    assert_success(response, "bash", "bash-1");
+    let data = &response["data"];
+    assert_eq!(
+        data.get("output").and_then(Value::as_str),
+        Some("hello-rpc-bash"),
+        "bash output: {response}"
+    );
+    assert_eq!(
+        data.get("exitCode").and_then(Value::as_i64),
+        Some(0),
+        "bash exitCode: {response}"
+    );
+    assert_eq!(
+        data.get("cancelled").and_then(Value::as_bool),
+        Some(false),
+        "bash cancelled flag: {response}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "ANSI must not appear on bash RPC stdout: {stdout:?}"
+    );
+    for line in stdout.lines() {
+        assert!(
+            !line.starts_with("Warning:") && !line.starts_with("Error:"),
+            "plain diagnostic on stdout: {line}"
+        );
+    }
+    // stderr is the diagnostics channel; presence is allowed, leakage is not.
+    let _ = output.stderr;
 }

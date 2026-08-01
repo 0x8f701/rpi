@@ -9,7 +9,7 @@ use nix::pty::{Winsize, openpty};
 use nix::sys::termios::Termios;
 use tempfile::TempDir;
 
-fn pi_bin() -> String { env!("CARGO_BIN_EXE_pi").to_owned() }
+fn rpi_bin() -> String { env!("CARGO_BIN_EXE_rpi").to_owned() }
 
 #[test]
 fn pty_bun_extension_select_then_input() {
@@ -34,7 +34,7 @@ export default function (pi: any) {
     let pty = openpty(Some(&Winsize { ws_row: 24, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 }), None::<&Termios>).unwrap();
     let slave_in = pty.slave.try_clone().unwrap();
     let slave_out = pty.slave.try_clone().unwrap();
-    let mut child = Command::new(pi_bin()).env_clear().env("HOME", home.path()).env("PATH", std::env::var("PATH").unwrap_or_default()).env("TERM", "xterm-256color").env("PI_OFFLINE", "1").env("PI_SKIP_VERSION_CHECK", "1").args(["--model", "faux/faux-1", "--extension", extension.to_str().unwrap()]).current_dir(cwd.path()).stdin(Stdio::from(slave_in)).stdout(Stdio::from(slave_out)).stderr(Stdio::from(pty.slave)).spawn().unwrap();
+    let mut child = Command::new(rpi_bin()).env_clear().env("HOME", home.path()).env("PATH", std::env::var("PATH").unwrap_or_default()).env("TERM", "xterm-256color").env("PI_OFFLINE", "1").env("PI_SKIP_VERSION_CHECK", "1").args(["--model", "faux/faux-1", "--extension", extension.to_str().unwrap()]).current_dir(cwd.path()).stdin(Stdio::from(slave_in)).stdout(Stdio::from(slave_out)).stderr(Stdio::from(pty.slave)).spawn().unwrap();
     let mut writer = std::fs::File::from(pty.master.try_clone().unwrap());
     let mut reader = std::fs::File::from(pty.master);
     let output = Arc::new(Mutex::new(String::new()));

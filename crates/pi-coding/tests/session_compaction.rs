@@ -409,7 +409,7 @@ async fn manual_compaction_retries_transient_summary_and_emits_ordered_events() 
     let session = Session::new(SessionOptions { model, cwd: cwd.path().to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off,
         api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4 }),
         stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None, stream_fn: None, auth_resolver: None }).expect("build session");
-    session.set_retry_settings(RetrySettings { enabled: true, max_retries: 1, base_delay_ms: 1 });
+    session.set_retry_settings(RetrySettings { enabled: true, max_retries: 1, base_delay_ms: 1 , ..Default::default() });
     session.load_history(vec![Message::user_text("older request ".repeat(20), 1), Message::Assistant({ let mut message = AssistantMessage::pending(&session.model().expect("model")); message.content = vec![ContentBlock::text("older response ".repeat(20))]; message.stop_reason = StopReason::Stop; message.timestamp = 2; message }), Message::user_text("recent", 3)]).await.expect("load");
     let mut events = session.subscribe_session_events();
     let result = session.compact(None).await.expect("retried compact");

@@ -13,6 +13,7 @@ use tokio::sync::{Notify, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{Session, Skill};
 
@@ -28,6 +29,8 @@ pub const DEFAULT_MAX_TOOLS_PER_AGENT: usize = 16;
 pub const DEFAULT_IDLE_TTL_SECS: u64 = 300;
 pub const DEFAULT_MAX_RETAINED_JOBS: usize = 256;
 pub const DEFAULT_RETAINED_JOB_TTL_SECS: u64 = 24 * 60 * 60;
+/// Stable custom-message type for orchestration mailbox deliveries.
+pub const ORCHESTRATION_MESSAGE_TYPE: &str = "orchestration_message";
 const MAX_AUTOLOAD_SKILL_BYTES: u64 = 256 * 1024;
 const MAX_AUTOLOAD_PROMPT_BYTES: usize = 1024 * 1024;
 const CHILD_ABORT_GRACE: Duration = Duration::from_secs(2);
@@ -37,6 +40,57 @@ pub type AgentSelectorFn = Arc<
 pub type ParentModelProvider = Arc<dyn Fn() -> pi_ai::Model + Send + Sync>;
 pub type ChildSessionFactory =
     Arc<dyn Fn(ChildSessionRequest) -> BoxFuture<Result<Session>> + Send + Sync>;
+#[derive(Clone)]
+pub struct ChildSession {
+    session: Session,
+}
+
+impl ChildSession {
+    #[must_use]
+    pub fn new(session: Session) -> Self {
+        Self { session }
+    }
+
+    async fn steer(&self, message: &MailboxMessage) {
+        self.session
+            .steer(pi_ai::Message::Custom(pi_ai::CustomMessage {
+                custom_type: ORCHESTRATION_MESSAGE_TYPE.to_owned(),
+                content: format_orchestration_message(message).into(),
+                display: true,
+                details: Some(serde_json::json!({
+                    "id": message.id,
+                    "from": message.from,
+                    "to": message.to,
+                    "body": message.body,
+                    "replyTo": message.reply_to,
+                })),
+                timestamp: i64::try_from(message.timestamp).unwrap_or(i64::MAX),
+            }))
+            .await;
+    }
+
+    async fn run(&self, assignment: &str) -> Result<crate::RunResult> {
+        self.session.run(assignment, Vec::new()).await
+    }
+
+    async fn abort(&self) {
+        self.session.abort().await;
+    }
+
+    fn last_assistant_text(&self) -> String {
+        self.session.last_assistant_text()
+    }
+
+    fn history(&self) -> Vec<pi_ai::Message> {
+        self.session.history()
+    }
+}
+
+impl From<Session> for ChildSession {
+    fn from(session: Session) -> Self {
+        Self::new(session)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestrationSkill {
     pub name: String,
@@ -302,8 +356,14 @@ impl OrchestrationConfig {
     ) -> Self {
         self.selector_settings = Some(settings.clone());
         self.default_agent_selector = Some(Arc::new(move |request, agents| {
-            let ranked = crate::rank_agents(request, agents, &settings);
-            crate::select_default_agent(&ranked, &settings)
+            match crate::selector::exact_agent_mention(request, agents) {
+                crate::selector::ExactAgentMention::Unique(name) => Some(name),
+                crate::selector::ExactAgentMention::Ambiguous(_) => None,
+                crate::selector::ExactAgentMention::None => {
+                    let ranked = crate::rank_agents(request, agents, &settings);
+                    crate::select_default_agent(&ranked, &settings)
+                }
+            }
         }));
         self
     }
@@ -450,6 +510,12 @@ pub enum OrchestrationEvent {
         group_id: String,
         agent: AgentSnapshot,
     },
+    /// Live projection of a message successfully delivered to Main.
+    /// Does not drain the mailbox; presentation-only for parent TUI/human UI.
+    MessageDelivered {
+        group_id: String,
+        message: MailboxMessage,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +543,9 @@ pub enum DeliveryOutcome {
 pub struct DeliveryReceipt {
     pub to: String,
     pub outcome: DeliveryOutcome,
+    /// Original `to` when it differed from the canonical agent id (e.g. job UUID).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -488,7 +557,57 @@ pub struct TaskItem {
     pub id: String,
     pub agent: String,
     pub assignment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_task_id: Option<String>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowRuntimeScope {
+    pub workflow_id: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowJobSnapshot {
+    pub workflow_id: String,
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_task_id: Option<String>,
+    pub job: JobSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrchestrationConcurrencyGate {
+    semaphore: Arc<Semaphore>,
+    limit: usize,
+}
+
+impl OrchestrationConcurrencyGate {
+    pub fn new(limit: usize) -> Result<Self> {
+        if limit == 0 {
+            bail!("workflow orchestration global concurrency must be greater than zero");
+        }
+        Ok(Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+            limit,
+        })
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl PartialEq for OrchestrationConcurrencyGate {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.semaphore, &other.semaphore)
+    }
+}
+
+impl Eq for OrchestrationConcurrencyGate {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -531,6 +650,8 @@ struct RuntimeInner {
     active_changed: Notify,
     park_timers: Mutex<HashMap<String, JoinHandle<()>>>,
     jobs: JobManager,
+    workflow_scope: Mutex<Option<WorkflowRuntimeScope>>,
+    global_concurrency: Mutex<Option<OrchestrationConcurrencyGate>>,
     events: broadcast::Sender<OrchestrationEvent>,
 }
 
@@ -544,6 +665,8 @@ struct AgentEntry {
     mailbox: Mutex<VecDeque<MailboxMessage>>,
     mailbox_capacity: usize,
     message_ready: Notify,
+    active_delivery: Mutex<Option<tokio::sync::mpsc::UnboundedSender<MailboxMessage>>>,
+    cancellation: Mutex<Option<CancellationToken>>,
     idle_park_token: Mutex<Option<CancellationToken>>,
     artifact_path: Mutex<Option<PathBuf>>,
     history_path: Mutex<Option<PathBuf>>,
@@ -595,6 +718,8 @@ impl OrchestrationRuntime {
                 active_changed: Notify::new(),
                 park_timers: Mutex::new(HashMap::new()),
                 jobs,
+                workflow_scope: Mutex::new(None),
+                global_concurrency: Mutex::new(None),
                 events,
             }),
             owner: true,
@@ -757,6 +882,62 @@ impl OrchestrationRuntime {
     pub fn max_recursion_depth(&self) -> usize {
         self.inner.config.max_recursion_depth
     }
+    #[must_use]
+    pub fn max_concurrency(&self) -> usize {
+        self.inner.config.max_concurrency
+    }
+
+    pub fn set_workflow_scope(&self, scope: WorkflowRuntimeScope) -> Result<()> {
+        if scope.workflow_id.trim().is_empty() {
+            bail!("workflow id must not be empty");
+        }
+        let _spawn_guard = self.inner.jobs.lock_spawns();
+        if self.jobs(None).iter().any(|job| !job.status.is_settled()) {
+            bail!("cannot change workflow scope while orchestration jobs are active");
+        }
+        *self.inner.workflow_scope.lock() = Some(scope);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn workflow_scope(&self) -> Option<WorkflowRuntimeScope> {
+        self.inner.workflow_scope.lock().clone()
+    }
+
+    pub fn set_global_concurrency_gate(&self, gate: OrchestrationConcurrencyGate) -> Result<()> {
+        let _spawn_guard = self.inner.jobs.lock_spawns();
+        if self.jobs(None).iter().any(|job| !job.status.is_settled()) {
+            bail!("cannot change global concurrency gate while orchestration jobs are active");
+        }
+        let mut current = self.inner.global_concurrency.lock();
+        if current.as_ref().is_some_and(|configured| configured != &gate) {
+            bail!("orchestration runtime already uses a different global concurrency gate");
+        }
+        *current = Some(gate);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn global_concurrency_gate(&self) -> Option<OrchestrationConcurrencyGate> {
+        self.inner.global_concurrency.lock().clone()
+    }
+
+    #[must_use]
+    pub fn workflow_jobs(&self, workflow_id: &str, generation: u64) -> Vec<WorkflowJobSnapshot> {
+        self.jobs(None)
+            .into_iter()
+            .filter(|job| {
+                job.workflow_id.as_deref() == Some(workflow_id)
+                    && job.workflow_generation == Some(generation)
+            })
+            .map(|job| WorkflowJobSnapshot {
+                workflow_id: workflow_id.to_owned(),
+                generation,
+                todo_task_id: job.todo_task_id.clone(),
+                job,
+            })
+            .collect()
+    }
 
     #[must_use]
     pub fn active_child_count(&self) -> usize {
@@ -775,6 +956,28 @@ impl OrchestrationRuntime {
             group_id: self.inner.group_id.clone(),
             agent: presentation_agent_snapshot(agent),
         });
+    }
+
+    fn publish_message_delivered(&self, message: MailboxMessage) {
+        let _ = self.inner.events.send(OrchestrationEvent::MessageDelivered {
+            group_id: self.inner.group_id.clone(),
+            message,
+        });
+    }
+
+    /// Human-facing label for an agent id; falls back to the stable id.
+    #[must_use]
+    pub fn resolve_agent_display_name(&self, agent_id: &str) -> String {
+        self.agent_snapshot(agent_id)
+            .map(|agent| {
+                let name = agent.display_name.trim();
+                if name.is_empty() {
+                    agent.id
+                } else {
+                    agent.display_name
+                }
+            })
+            .unwrap_or_else(|| agent_id.to_owned())
     }
 
     fn agent_snapshot(&self, id: &str) -> Option<AgentSnapshot> {
@@ -804,16 +1007,39 @@ impl OrchestrationRuntime {
         body: &str,
         reply_to: Option<String>,
     ) -> Vec<DeliveryReceipt> {
-        let targets = if to == "all" {
-            REGISTRY
-                .list(&self.inner.group_id, from)
-                .into_iter()
-                .filter(|entry| entry.status != AgentStatus::Aborted)
-                .map(|entry| entry.id)
-                .collect::<Vec<_>>()
+        let (targets, requested_alias) = if to == "all" {
+            (
+                REGISTRY
+                    .list(&self.inner.group_id, from)
+                    .into_iter()
+                    .filter(|entry| entry.status != AgentStatus::Aborted)
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                None,
+            )
         } else {
-            vec![to.to_owned()]
+            match self.inner.jobs.resolve_agent_id(to) {
+                Ok(agent_id) => {
+                    let requested = (agent_id != to).then(|| to.to_owned());
+                    (vec![agent_id], requested)
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    if message.starts_with("ambiguous orchestration job or agent id") {
+                        return vec![DeliveryReceipt {
+                            to: to.to_owned(),
+                            outcome: DeliveryOutcome::Failed,
+                            requested: None,
+                            error: Some(message),
+                        }];
+                    }
+                    // Unknown to the job table: treat as a bare agent id.
+                    (vec![to.to_owned()], None)
+                }
+            }
         };
+        let main_id = self.main_agent_id().to_owned();
+        let group_id = self.inner.group_id.clone();
         targets
             .into_iter()
             .map(|target| {
@@ -825,15 +1051,25 @@ impl OrchestrationRuntime {
                     timestamp: now_millis(),
                     reply_to: reply_to.clone(),
                 };
-                match REGISTRY.enqueue(&self.inner.group_id, &target, message) {
-                    Ok(outcome) => DeliveryReceipt {
-                        to: target,
-                        outcome,
-                        error: None,
-                    },
+                match REGISTRY.enqueue(&group_id, &target, message.clone()) {
+                    Ok(outcome) => {
+                        if target == main_id {
+                            let _ = self.inner.events.send(OrchestrationEvent::MessageDelivered {
+                                group_id: group_id.clone(),
+                                message,
+                            });
+                        }
+                        DeliveryReceipt {
+                            to: target,
+                            outcome,
+                            requested: requested_alias.clone(),
+                            error: None,
+                        }
+                    }
                     Err(error) => DeliveryReceipt {
                         to: target,
                         outcome: DeliveryOutcome::Failed,
+                        requested: requested_alias.clone(),
                         error: Some(error.to_string()),
                     },
                 }
@@ -853,6 +1089,13 @@ impl OrchestrationRuntime {
         timeout: Option<Duration>,
         abort: Option<pi_agent::AbortSignal>,
     ) -> Result<Option<MailboxMessage>> {
+        let from = from.map(|identifier| {
+            self.inner
+                .jobs
+                .resolve_agent_id(identifier)
+                .unwrap_or_else(|_| identifier.to_owned())
+        });
+        let from = from.as_deref();
         let entry = REGISTRY
             .get(&self.inner.group_id, agent_id)
             .ok_or_else(|| anyhow!("unknown orchestration agent {agent_id:?}"))?;
@@ -1003,20 +1246,11 @@ impl OrchestrationRuntime {
             bail!("task batch must contain at least one item");
         }
         let _spawn_guard = self.inner.jobs.lock_spawns();
-        let mut seen = std::collections::BTreeSet::new();
+        let mut reserved = std::collections::BTreeSet::new();
         let mut prepared = Vec::with_capacity(items.len());
         let available_models = crate::available_models();
-        for item in items {
-            validate_agent_id(&item.id)?;
-            if !seen.insert(item.id.clone()) {
-                bail!("duplicate child agent id {:?}", item.id);
-            }
-            if REGISTRY.get(&self.inner.group_id, &item.id).is_some() {
-                bail!("child agent id {:?} is already registered", item.id);
-            }
-            if self.inner.jobs.contains_identifier(&item.id) {
-                bail!("child agent id {:?} conflicts with an existing job identifier", item.id);
-            }
+        for mut item in items {
+            item.id = self.allocate_unique_agent_id(&item.id, &mut reserved)?;
             let definition = self
                 .inner
                 .config
@@ -1077,15 +1311,16 @@ impl OrchestrationRuntime {
             let job_id = loop {
                 let candidate = Uuid::now_v7().to_string();
                 if !self.inner.jobs.contains_identifier(&candidate)
-                    && !seen.contains(&candidate)
+                    && !reserved.contains(&candidate)
                 {
+                    reserved.insert(candidate.clone());
                     break candidate;
                 }
             };
             let cancel = CancellationToken::new();
             let agent_snapshot = AgentSnapshot {
                 id: item.id.clone(),
-                display_name: format!("{}: {}", definition.name, one_line(&item.assignment)),
+                display_name: definition.name.clone(),
                 parent_id: Some(parent_id.to_owned()),
                 status: AgentStatus::Queued,
                 created_at,
@@ -1100,6 +1335,7 @@ impl OrchestrationRuntime {
                 self.inner.config.mailbox_capacity,
             )?;
             self.publish_agent(agent_snapshot);
+            let workflow_scope = self.inner.workflow_scope.lock().clone();
             let job_snapshot = self.inner.jobs.insert(
                 JobSnapshot {
                     id: job_id.clone(),
@@ -1107,6 +1343,13 @@ impl OrchestrationRuntime {
                     agent: item.agent.clone(),
                     parent_id: parent_id.to_owned(),
                     description: Some(one_line(&item.assignment)),
+                    todo_task_id: item.todo_task_id.clone(),
+                    workflow_id: workflow_scope
+                        .as_ref()
+                        .map(|scope| scope.workflow_id.clone()),
+                    workflow_generation: workflow_scope
+                        .as_ref()
+                        .map(|scope| scope.generation),
                     status: JobStatus::Queued,
                     created_at,
                     started_at: None,
@@ -1182,6 +1425,7 @@ impl OrchestrationRuntime {
         let _active_guard = ActiveChildGuard {
             inner: self.inner.clone(),
             id: item.id.clone(),
+            group_id: self.inner.group_id.clone(),
         };
         let artifact_ref = format!("agent://{}", item.id);
         let history_ref = format!("history://{}", item.id);
@@ -1196,12 +1440,24 @@ impl OrchestrationRuntime {
             .config
             .artifact_dir
             .join(format!("{}-{job_id}.history.json", item.id));
-        let permit = tokio::select! {
+        let local_permit = tokio::select! {
             permit = self.inner.semaphore.clone().acquire_owned() => match permit {
                 Ok(permit) => permit,
                 Err(_) => return self.failed_result(&item, job_id, AgentStatus::Aborted, "orchestration semaphore closed"),
             },
             () = cancel.cancelled() => return self.failed_result(&item, job_id, AgentStatus::Aborted, "task cancelled before start"),
+        };
+        let global_gate = self.inner.global_concurrency.lock().clone();
+        let global_permit = if let Some(gate) = global_gate {
+            Some(tokio::select! {
+                permit = gate.semaphore.acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return self.failed_result(&item, job_id, AgentStatus::Aborted, "workflow orchestration global semaphore closed"),
+                },
+                () = cancel.cancelled() => return self.failed_result(&item, job_id, AgentStatus::Aborted, "task cancelled before start"),
+            })
+        } else {
+            None
         };
         let _ = REGISTRY.set_status(&self.inner.group_id, &item.id, AgentStatus::Running);
         if let Some(agent) = self.agent_snapshot(&item.id) {
@@ -1247,32 +1503,58 @@ impl OrchestrationRuntime {
             max_tools_per_agent: self.inner.config.max_tools_per_agent,
             model: resolved_model.model,
         };
-        let session = tokio::select! {
+        let child = tokio::select! {
             result = (self.inner.factory)(request) => match result {
-                Ok(session) => session,
+                Ok(session) => ChildSession::new(session),
                 Err(error) => return self.failed_result(&item, job_id, AgentStatus::Idle, &error.to_string()),
             },
             () = cancel.cancelled() => return self.failed_result(&item, job_id, AgentStatus::Aborted, "task cancelled during child session creation"),
         };
-        let mut run = Box::pin(session.run(&item.assignment, Vec::new()));
-        let outcome = tokio::select! {
-            result = &mut run => result.map_err(|error| error.to_string()),
-            () = cancel.cancelled() => {
-                let drain = async {
-                    session.abort().await;
-                    let _ = (&mut run).await;
-                };
-                if tokio::time::timeout(CHILD_ABORT_GRACE, drain).await.is_err() {
-                    Err(format!(
-                        "task cancellation timed out after {}s",
-                        CHILD_ABORT_GRACE.as_secs()
-                    ))
-                } else {
-                    Err("task cancelled".to_owned())
+        let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
+        let pre_run = match REGISTRY.register_active_delivery(
+            &self.inner.group_id,
+            &item.id,
+            delivery_tx,
+            cancel.clone(),
+        ) {
+            Ok(messages) => messages,
+            Err(error) => {
+                return self.failed_result(&item, job_id, AgentStatus::Idle, &error.to_string());
+            }
+        };
+        for message in &pre_run {
+            child.steer(message).await;
+        }
+        let mut run = Box::pin(child.run(&item.assignment));
+        let outcome = loop {
+            tokio::select! {
+                result = &mut run => break result.map_err(|error| error.to_string()),
+                message = delivery_rx.recv() => {
+                    match message {
+                        Some(message) => child.steer(&message).await,
+                        None => break Err("active child delivery bridge closed".to_owned()),
+                    }
+                }
+                () = cancel.cancelled() => {
+                    REGISTRY.unregister_active_delivery(&self.inner.group_id, &item.id);
+                    let drain = async {
+                        child.abort().await;
+                        let _ = (&mut run).await;
+                    };
+                    break if tokio::time::timeout(CHILD_ABORT_GRACE, drain).await.is_err() {
+                        Err(format!(
+                            "task cancellation timed out after {}s",
+                            CHILD_ABORT_GRACE.as_secs()
+                        ))
+                    } else {
+                        Err("task cancelled".to_owned())
+                    };
                 }
             }
         };
-        drop(permit);
+        REGISTRY.unregister_active_delivery(&self.inner.group_id, &item.id);
+        drop(global_permit);
+        drop(local_permit);
         let status = if cancel.is_cancelled() {
             AgentStatus::Aborted
         } else {
@@ -1281,7 +1563,7 @@ impl OrchestrationRuntime {
         let (output, error, usage) = match outcome {
             Ok(result) => (result.text, result.error_message, result.usage),
             Err(error) => (
-                session.last_assistant_text(),
+                child.last_assistant_text(),
                 Some(error),
                 pi_ai::Usage::default(),
             ),
@@ -1295,7 +1577,7 @@ impl OrchestrationRuntime {
             .with_context(|| format!("writing subagent artifact {}", artifact_path.display()))
             .err();
         let artifact_written = artifact_error.is_none();
-        let history_error = serde_json::to_vec_pretty(&session.history())
+        let history_error = serde_json::to_vec_pretty(&child.history())
             .context("serializing subagent history")
             .and_then(|bytes| {
                 write_new_artifact(&history_path, &bytes)
@@ -1428,7 +1710,7 @@ impl OrchestrationRuntime {
         let plan = crate::select_deterministic(crate::SelectionInput {
             request: assignment,
             skills: &selector_skills,
-            agents: &[],
+            agents: std::slice::from_ref(definition),
             settings: &selector_settings,
         });
         let mut autoload_names = Vec::new();
@@ -1486,29 +1768,183 @@ impl OrchestrationRuntime {
 
     #[must_use]
     pub fn select_agent(&self, assignment: &str, explicit: Option<&str>) -> String {
-        if let Some(explicit) = explicit.filter(|name| !name.trim().is_empty()) {
-            return explicit.to_owned();
+        match self.resolve_task_agent(assignment, explicit) {
+            Ok(name) => name,
+            Err(_) => {
+                if let Some(explicit) = explicit.filter(|name| !name.trim().is_empty()) {
+                    return explicit.to_owned();
+                }
+                self.select_ranked_or_default_agent(assignment)
+            }
         }
+    }
+
+    /// Resolve the agent for a task assignment.
+    ///
+    /// Precedence: explicit `task.agent` override, then unique exact trusted
+    /// agent-name mention (including disabled/untrusted rejection), then ranked
+    /// metadata selection / default. Ambiguous exact mentions return an error.
+    pub fn resolve_task_agent(&self, assignment: &str, explicit: Option<&str>) -> Result<String> {
+        if let Some(explicit) = explicit.filter(|name| !name.trim().is_empty()) {
+            self.ensure_agent_enabled(explicit)?;
+            return Ok(explicit.to_owned());
+        }
+        match self.exact_agent_mention_in_catalog(assignment) {
+            crate::selector::ExactAgentMention::Unique(name) => {
+                self.ensure_agent_enabled(&name)?;
+                if !self
+                    .enabled_agents()
+                    .iter()
+                    .any(|agent| agent.name == name)
+                {
+                    bail!(
+                        "exact agent mention {:?} is not available for spawning",
+                        name
+                    );
+                }
+                Ok(name)
+            }
+            crate::selector::ExactAgentMention::Ambiguous(_) => Err(anyhow!(
+                "{}",
+                self.exact_agent_ambiguity(assignment).unwrap_or_else(|| {
+                    "exact agent mention is ambiguous".to_owned()
+                })
+            )),
+            crate::selector::ExactAgentMention::None => {
+                Ok(self.select_ranked_or_default_agent(assignment))
+            }
+        }
+    }
+
+    /// Spawn a child when the request carries a delegation verb and a unique
+    /// exact trusted agent name. Generic skill/semantic text returns `Ok(None)`
+    /// so the caller can keep selection recommendations without spawning.
+    pub fn spawn_from_natural_language(
+        &self,
+        parent_id: &str,
+        parent_depth: usize,
+        request: &str,
+    ) -> Result<Option<Vec<TaskSpawn>>> {
+        if !request_has_delegation_verb(request) {
+            return Ok(None);
+        }
+        match self.exact_agent_mention_in_catalog(request) {
+            crate::selector::ExactAgentMention::None => Ok(None),
+            crate::selector::ExactAgentMention::Ambiguous(_) => {
+                bail!(
+                    "{}",
+                    self.exact_agent_ambiguity(request).unwrap_or_else(|| {
+                        "exact agent mention is ambiguous".to_owned()
+                    })
+                );
+            }
+            crate::selector::ExactAgentMention::Unique(name) => {
+                self.ensure_agent_enabled(&name)?;
+                if !self
+                    .enabled_agents()
+                    .iter()
+                    .any(|agent| agent.name == name)
+                {
+                    bail!(
+                        "exact agent mention {:?} is not available for spawning",
+                        name
+                    );
+                }
+                let spawns = self.spawn_tasks(
+                    parent_id,
+                    parent_depth,
+                    vec![TaskItem {
+                        index: 0,
+                        id: name.clone(),
+                        agent: name,
+                        assignment: request.to_owned(),
+                        todo_task_id: None,
+                    }],
+                )?;
+                Ok(Some(spawns))
+            }
+        }
+    }
+
+    fn select_ranked_or_default_agent(&self, assignment: &str) -> String {
         let enabled_owned = self
             .enabled_agents()
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
+        // Cross-kind: unique/ambiguous exact skill mention keeps the configured
+        // default rather than promoting an overlapping agent via ranking.
+        if !matches!(
+            self.exact_skill_mention_in_catalog(assignment),
+            crate::selector::ExactSkillMention::None
+        ) {
+            return self.configured_default_agent(&enabled_owned);
+        }
         if let Some(selector) = &self.inner.config.default_agent_selector
             && let Some(selected) = selector(assignment, &enabled_owned)
         {
             return selected;
         }
-        if enabled_owned
+        self.configured_default_agent(&enabled_owned)
+    }
+
+    fn configured_default_agent(&self, enabled: &[AgentDefinition]) -> String {
+        if enabled
             .iter()
             .any(|agent| agent.name == self.inner.config.default_agent)
         {
             return self.inner.config.default_agent.clone();
         }
-        enabled_owned
+        enabled
             .first()
             .map(|agent| agent.name.clone())
             .unwrap_or_else(|| self.inner.config.default_agent.clone())
+    }
+
+    fn exact_skill_mention_in_catalog(
+        &self,
+        assignment: &str,
+    ) -> crate::selector::ExactSkillMention {
+        let skills = self
+            .inner
+            .config
+            .skills
+            .iter()
+            .map(|skill| Skill {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                file_path: skill.file_path.to_string_lossy().into_owned(),
+                base_dir: skill.base_dir.to_string_lossy().into_owned(),
+                globs: skill.globs.clone(),
+                always_apply: skill.always_apply,
+                hidden: skill.hidden,
+                disable_model_invocation: skill.disable_model_invocation,
+                source: skill.source,
+                trusted: skill.trusted,
+            })
+            .collect::<Vec<_>>();
+        crate::selector::exact_skill_mention(assignment, &skills)
+    }
+
+    fn exact_agent_mention_in_catalog(
+        &self,
+        assignment: &str,
+    ) -> crate::selector::ExactAgentMention {
+        let trusted = self
+            .inner
+            .config
+            .catalog
+            .agents()
+            .iter()
+            .filter(|agent| agent.trusted)
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::selector::exact_agent_mention(assignment, &trusted)
+    }
+
+    pub(crate) fn exact_agent_ambiguity(&self, assignment: &str) -> Option<String> {
+        self.exact_agent_mention_in_catalog(assignment)
+            .ambiguity_message()
     }
 
     pub fn read_uri_resolver(&self) -> crate::InternalUriResolverFn {
@@ -1614,10 +2050,12 @@ impl OrchestrationRuntime {
 struct ActiveChildGuard {
     inner: Arc<RuntimeInner>,
     id: String,
+    group_id: String,
 }
 
 impl Drop for ActiveChildGuard {
     fn drop(&mut self) {
+        REGISTRY.unregister_active_delivery(&self.group_id, &self.id);
         self.inner.active.lock().remove(&self.id);
         self.inner.active_changed.notify_waiters();
     }
@@ -1679,6 +2117,8 @@ impl GlobalRegistry {
                 mailbox: Mutex::new(VecDeque::new()),
                 mailbox_capacity,
                 message_ready: Notify::new(),
+                active_delivery: Mutex::new(None),
+                cancellation: Mutex::new(None),
                 idle_park_token: Mutex::new(None),
                 artifact_path: Mutex::new(None),
                 history_path: Mutex::new(None),
@@ -1717,26 +2157,54 @@ impl GlobalRegistry {
         let entry = self
             .get(group, target)
             .ok_or_else(|| anyhow!("unknown orchestration agent {target:?}"))?;
-        {
-            let snapshot = entry.snapshot.lock();
+        let outcome = {
+            if entry
+                .cancellation
+                .lock()
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                bail!("orchestration agent {target:?} is cancelling");
+            }
+            let mut snapshot = entry.snapshot.lock();
             if snapshot.status == AgentStatus::Aborted {
                 bail!("orchestration agent {target:?} is aborted");
             }
-        }
-        let mut mailbox = entry.mailbox.lock();
-        if mailbox.len() >= entry.mailbox_capacity {
-            bail!("orchestration mailbox for {target:?} is full");
-        }
-        mailbox.push_back(message);
-        drop(mailbox);
-        let outcome = {
-            let mut snapshot = entry.snapshot.lock();
             snapshot.last_activity = now_millis();
             match snapshot.status {
-                AgentStatus::Queued | AgentStatus::Running | AgentStatus::Parked => {
+                AgentStatus::Running => {
+                    let delivered = entry
+                        .active_delivery
+                        .lock()
+                        .as_ref()
+                        .is_some_and(|sender| sender.send(message.clone()).is_ok());
+                    if delivered {
+                        DeliveryOutcome::Woken
+                    } else {
+                        let mut mailbox = entry.mailbox.lock();
+                        if mailbox.len() >= entry.mailbox_capacity {
+                            bail!("orchestration mailbox for {target:?} is full");
+                        }
+                        mailbox.push_back(message);
+                        DeliveryOutcome::Queued
+                    }
+                }
+                AgentStatus::Queued | AgentStatus::Parked => {
+                    let mut mailbox = entry.mailbox.lock();
+                    if mailbox.len() >= entry.mailbox_capacity {
+                        bail!("orchestration mailbox for {target:?} is full");
+                    }
+                    mailbox.push_back(message);
                     DeliveryOutcome::Queued
                 }
-                AgentStatus::Idle => DeliveryOutcome::Woken,
+                AgentStatus::Idle => {
+                    let mut mailbox = entry.mailbox.lock();
+                    if mailbox.len() >= entry.mailbox_capacity {
+                        bail!("orchestration mailbox for {target:?} is full");
+                    }
+                    mailbox.push_back(message);
+                    DeliveryOutcome::Woken
+                }
                 AgentStatus::Aborted => DeliveryOutcome::Failed,
             }
         };
@@ -1747,6 +2215,33 @@ impl GlobalRegistry {
         }
         entry.message_ready.notify_waiters();
         Ok(outcome)
+    }
+
+    fn register_active_delivery(
+        &self,
+        group: &str,
+        id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<MailboxMessage>,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<MailboxMessage>> {
+        let entry = self
+            .get(group, id)
+            .ok_or_else(|| anyhow!("unknown orchestration agent {id:?}"))?;
+        let mut active = entry.active_delivery.lock();
+        if active.is_some() {
+            bail!("orchestration agent {id:?} already has an active delivery bridge");
+        }
+        let messages = entry.mailbox.lock().drain(..).collect();
+        *active = Some(sender);
+        *entry.cancellation.lock() = Some(cancellation);
+        Ok(messages)
+    }
+
+    fn unregister_active_delivery(&self, group: &str, id: &str) {
+        if let Some(entry) = self.get(group, id) {
+            entry.active_delivery.lock().take();
+            entry.cancellation.lock().take();
+        }
     }
 
     fn park_if_idle(&self, group: &str, id: &str, main_id: &str) -> Option<AgentSnapshot> {
@@ -1854,6 +2349,90 @@ fn take_matching_message(entry: &AgentEntry, from: Option<&str>) -> Option<Mailb
     mailbox.remove(index)
 }
 
+fn format_orchestration_message(message: &MailboxMessage) -> String {
+    let reply = message
+        .reply_to
+        .as_deref()
+        .map_or(String::new(), |id| format!("\nReplying to message: {id}"));
+    format!(
+        "<orchestration-message id=\"{}\" from=\"{}\">\n{}{}\n</orchestration-message>",
+        escape_xml(&message.id),
+        escape_xml(&message.from),
+        message.body,
+        reply,
+    )
+}
+
+
+/// Typed view over an orchestration IRC custom message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrchestrationMessageView {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub body: String,
+    pub reply_to: Option<String>,
+}
+
+/// Extract a typed orchestration message view without leaking the raw XML wrapper.
+#[must_use]
+pub fn orchestration_message_view(message: &pi_ai::CustomMessage) -> Option<OrchestrationMessageView> {
+    if message.custom_type != ORCHESTRATION_MESSAGE_TYPE {
+        return None;
+    }
+    let details = message.details.as_ref()?;
+    let id = details.get("id")?.as_str()?.to_owned();
+    let from = details.get("from")?.as_str()?.to_owned();
+    let to = details.get("to")?.as_str()?.to_owned();
+    let reply_to = details
+        .get("replyTo")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let body = details
+        .get("body")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .or_else(|| extract_orchestration_body_from_content(&message.content))?;
+    Some(OrchestrationMessageView {
+        id,
+        from,
+        to,
+        body,
+        reply_to,
+    })
+}
+
+fn extract_orchestration_body_from_content(content: &pi_ai::CustomMessageContent) -> Option<String> {
+    let text = match content {
+        pi_ai::CustomMessageContent::Text(text) => text.clone(),
+        pi_ai::CustomMessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                pi_ai::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    extract_orchestration_body_from_wrapper(&text)
+}
+
+fn extract_orchestration_body_from_wrapper(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let open = "<orchestration-message";
+    let close = "</orchestration-message>";
+    let start = trimmed.find(open)?;
+    let after_open = &trimmed[start + open.len()..];
+    let body_start = after_open.find('>')? + 1;
+    let inner = &after_open[body_start..];
+    let end = inner.rfind(close)?;
+    let mut body = inner[..end].trim().to_owned();
+    if let Some(index) = body.rfind("\nReplying to message:") {
+        body.truncate(index);
+        body = body.trim_end().to_owned();
+    }
+    Some(body)
+}
 fn remove_retained_file(path: &Path) -> bool {
     match fs::remove_file(path) {
         Ok(()) => true,
@@ -2007,6 +2586,27 @@ fn presentation_text(text: &str, max_chars: usize) -> String {
     output
 }
 
+/// True when the request uses an explicit natural-language delegation verb.
+/// Used to gate parent prompt-time auto-spawn; the task tool does not require it.
+#[must_use]
+fn request_has_delegation_verb(request: &str) -> bool {
+    const VERBS: &[&str] = &[
+        "have", "ask", "tell", "get", "let", "make", "please", "delegate", "assign", "spawn",
+        "run", "send", "kick", "dispatch",
+    ];
+    let tokens = request
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    tokens
+        .iter()
+        .any(|token| VERBS.iter().any(|verb| token == verb))
+}
+
 fn one_line(value: &str) -> String {
     let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.chars().take(80).collect()
@@ -2025,6 +2625,46 @@ impl OrchestrationRuntime {
     pub(crate) fn generated_agent_id(&self, index: usize) -> String {
         let suffix = Uuid::now_v7().simple().to_string();
         format!("Agent{}-{}", index + 1, &suffix[..8])
+    }
+
+    /// Prefer `requested` as the agent id; on collision with registry entries,
+    /// live/retained job identifiers, or ids already claimed in this batch,
+    /// allocate `{base}_2`, `{base}_3`, … under the caller-held spawn lock.
+    fn allocate_unique_agent_id(
+        &self,
+        requested: &str,
+        reserved: &mut std::collections::BTreeSet<String>,
+    ) -> Result<String> {
+        validate_agent_id(requested)?;
+        let base = requested;
+        let mut suffix = 2u32;
+        loop {
+            let candidate = if suffix == 2 && !self.agent_id_is_taken(base, reserved) {
+                base.to_owned()
+            } else {
+                let candidate = format!("{base}_{suffix}");
+                validate_agent_id(&candidate)?;
+                if self.agent_id_is_taken(&candidate, reserved) {
+                    suffix = suffix
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("exhausted unique agent id suffixes for {base:?}"))?;
+                    continue;
+                }
+                candidate
+            };
+            reserved.insert(candidate.clone());
+            return Ok(candidate);
+        }
+    }
+
+    fn agent_id_is_taken(
+        &self,
+        id: &str,
+        reserved: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        reserved.contains(id)
+            || REGISTRY.get(&self.inner.group_id, id).is_some()
+            || self.inner.jobs.contains_identifier(id)
     }
 
     pub(crate) fn task_spawns_text(spawns: &[TaskSpawn]) -> String {
@@ -2151,6 +2791,9 @@ mod prompt_size_tests {
                     agent: "task".to_owned(),
                     parent_id: "Main".to_owned(),
                     description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
                     status: JobStatus::Queued,
                     created_at: timestamp,
                     started_at: None,
@@ -2202,6 +2845,9 @@ mod prompt_size_tests {
                     agent: "task".to_owned(),
                     parent_id: "Main".to_owned(),
                     description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
                     status: JobStatus::Queued,
                     created_at: 2,
                     started_at: None,
@@ -2269,6 +2915,9 @@ mod prompt_size_tests {
                     agent: "task".to_owned(),
                     parent_id: "Main".to_owned(),
                     description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
                     status: JobStatus::Queued,
                     created_at: 1,
                     started_at: None,
@@ -2288,6 +2937,9 @@ mod prompt_size_tests {
                     agent: "task".to_owned(),
                     parent_id: "Main".to_owned(),
                     description: None,
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
                     status: JobStatus::Queued,
                     created_at: 1,
                     started_at: None,
@@ -2368,5 +3020,91 @@ mod prompt_size_tests {
         let definition = runtime.catalog().get("bounded").expect("agent");
         let error = runtime.child_system_prompt(definition, "work").expect_err("oversized rejected").to_string();
         assert!(error.contains("exceeds maximum size"));
+    }
+    #[test]
+    fn workflow_scope_is_optional_and_serializes_compatibly() {
+        let legacy = JobSnapshot {
+            id: "job".to_owned(),
+            agent_id: "Worker".to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: None,
+            todo_task_id: Some("todo-1".to_owned()),
+            workflow_id: None,
+            workflow_generation: None,
+            status: JobStatus::Queued,
+            created_at: 1,
+            started_at: None,
+            finished_at: None,
+            result: None,
+        };
+        let legacy_wire = serde_json::to_value(&legacy).expect("serialize legacy job");
+        assert!(legacy_wire.get("workflowId").is_none());
+        assert!(legacy_wire.get("workflowGeneration").is_none());
+
+        let scoped = JobSnapshot {
+            workflow_id: Some("workflow-a".to_owned()),
+            workflow_generation: Some(7),
+            ..legacy
+        };
+        let scoped_wire = serde_json::to_value(&scoped).expect("serialize scoped job");
+        assert_eq!(scoped_wire["workflowId"], "workflow-a");
+        assert_eq!(scoped_wire["workflowGeneration"], 7);
+    }
+
+    #[test]
+    fn workflow_scope_and_global_gate_are_fail_closed_after_jobs_start() {
+        let root = tempfile::tempdir().expect("root");
+        let now = Arc::new(AtomicU64::new(1));
+        let runtime = retention_runtime(root.path(), now, 8, Duration::from_secs(60));
+        runtime
+            .set_workflow_scope(WorkflowRuntimeScope {
+                workflow_id: "workflow-a".to_owned(),
+                generation: 1,
+            })
+            .expect("initial workflow scope");
+        let gate = OrchestrationConcurrencyGate::new(2).expect("gate");
+        runtime
+            .set_global_concurrency_gate(gate.clone())
+            .expect("initial gate");
+        runtime
+            .set_global_concurrency_gate(gate)
+            .expect("same shared gate is idempotent");
+
+        runtime
+            .inner
+            .jobs
+            .insert(
+                JobSnapshot {
+                    id: "job".to_owned(),
+                    agent_id: "Worker".to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: None,
+                    todo_task_id: Some("todo-1".to_owned()),
+                    workflow_id: Some("workflow-a".to_owned()),
+                    workflow_generation: Some(1),
+                    status: JobStatus::Queued,
+                    created_at: 1,
+                    started_at: None,
+                    finished_at: None,
+                    result: None,
+                },
+                CancellationToken::new(),
+            )
+            .expect("active job");
+        let scope_error = runtime
+            .set_workflow_scope(WorkflowRuntimeScope {
+                workflow_id: "workflow-b".to_owned(),
+                generation: 2,
+            })
+            .expect_err("active job blocks scope replacement");
+        assert!(scope_error.to_string().contains("jobs are active"));
+        let gate_error = runtime
+            .set_global_concurrency_gate(
+                OrchestrationConcurrencyGate::new(1).expect("replacement gate"),
+            )
+            .expect_err("active job blocks gate replacement");
+        assert!(gate_error.to_string().contains("jobs are active"));
     }
 }

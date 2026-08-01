@@ -1,6 +1,6 @@
 # Local / self-hosted models with llama.cpp
 
-`pi` has first-class support for a local [llama.cpp](https://github.com/ggerganov/llama.cpp)
+`rpi` has first-class support for a local [llama.cpp](https://github.com/ggerganov/llama.cpp)
 router. When a router is configured, its live models are merged into the
 catalog under the `llama.cpp` provider and can be selected like any other
 model.
@@ -8,13 +8,13 @@ model.
 ## Configure a router
 
 ```sh
-pi llama configure http://localhost:8080 [--api-key TOKEN]
+rpi llama configure http://localhost:8080 [--api-key TOKEN]
 ```
 
 Source: `crates/pi-cli/src/args.rs:307-314`,
 `crates/pi-cli/src/llama_commands.rs:14-27`.
 
-`pi llama configure` validates the router by calling its `/v1/models` endpoint
+`rpi llama configure` validates the router by calling its `/v1/models` endpoint
 before persisting the settings. The base URL is normalized: a trailing `/v1` is
 stripped, query strings and fragments are removed, embedded credentials are
 rejected, and only `http`/`https` schemes are allowed. The configuration is
@@ -33,11 +33,11 @@ Source: `crates/pi-coding/src/llama.rs:130-159`.
 Once configured, local models appear as `llama.cpp/<MODEL_ID>`:
 
 ```sh
-pi -m llama.cpp/<model-id> --print "Hello"
+rpi -m llama.cpp/<model-id> --print "Hello"
 ```
 
 Router models are refreshed automatically at startup unless `PI_OFFLINE` is
-set. If the router is unreachable, `pi` falls back to the cached catalog with a
+set. If the router is unreachable, `rpi` falls back to the cached catalog with a
 warning and continues using the last successfully observed snapshot.
 Source: `crates/pi-cli/src/session_run.rs:284-299`.
 
@@ -45,11 +45,11 @@ Source: `crates/pi-cli/src/session_run.rs:284-299`.
 
 | Subcommand | Purpose |
 |------------|---------|
-| `pi llama status` | Show configured router and live models |
-| `pi llama status --reload` | Ask the router to rescan its model directory |
-| `pi llama refresh` | Refresh live models; fall back to cache |
-| `pi llama load MODEL` | Load a model through the router |
-| `pi llama unload MODEL` | Unload a model through the router |
+| `rpi llama status` | Show configured router and live models |
+| `rpi llama status --reload` | Ask the router to rescan its model directory |
+| `rpi llama refresh` | Refresh live models; fall back to cache |
+| `rpi llama load MODEL` | Load a model through the router |
+| `rpi llama unload MODEL` | Unload a model through the router |
 
 Source: `crates/pi-cli/src/args.rs:316-332`,
 `crates/pi-cli/src/llama_commands.rs:24-69`.
@@ -79,16 +79,16 @@ Source: `crates/pi-cli/src/interactive_commands.rs:260-264`,
 
 ```sh
 # Search
-pi llama search "meta-llama/Llama-3.1-8B"
+rpi llama search "meta-llama/Llama-3.1-8B"
 
 # List quantizations and file checksums
-pi llama details meta-llama/Llama-3.1-8B-GGUF
+rpi llama details meta-llama/Llama-3.1-8B-GGUF
 
 # Download a quantization (or the first available one if -q is omitted)
-pi llama download meta-llama/Llama-3.1-8B-GGUF -q Q4_K_M
+rpi llama download meta-llama/Llama-3.1-8B-GGUF -q Q4_K_M
 
 # List local downloads
-pi llama installed
+rpi llama installed
 ```
 
 Source: `crates/pi-cli/src/args.rs:333-353`,
@@ -128,7 +128,7 @@ Source: `crates/pi-coding/src/llama.rs:130-159`,
 
 | Variable | Purpose |
 |----------|---------|
-| `LLAMA_BASE_URL` | Router base URL (skips `pi llama configure`) |
+| `LLAMA_BASE_URL` | Router base URL (skips `rpi llama configure`) |
 | `LLAMA_API_KEY` | Router bearer token |
 | `HF_TOKEN` | Hugging Face token for GGUF search/download |
 | `HF_ENDPOINT` | Custom Hugging Face API endpoint |

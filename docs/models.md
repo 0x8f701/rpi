@@ -2,7 +2,7 @@
 
 ## Built-in catalog
 
-`pi` ships with an embedded model catalog in
+`rpi` ships with an embedded model catalog in
 [`crates/pi-ai/src/models_catalog.json`](crates/pi-ai/src/models_catalog.json).
 The catalog is loaded once on first use and restored for built-in provider ids
 when a custom `models.json` is reloaded.
@@ -10,8 +10,8 @@ when a custom `models.json` is reloaded.
 List available models with:
 
 ```sh
-pi models
-pi models claude
+rpi models
+rpi models claude
 ```
 
 The filter is case-sensitive and matches provider name or model id. The list
@@ -40,7 +40,7 @@ the built-in provider set are (source:
 
 ## Model spec resolution
 
-When you write `pi -m <spec>` or use `/model` in the REPL, `pi` resolves it
+When you write `rpi -m <spec>` or use `/model` in the REPL, `rpi` resolves it
 with the following algorithm (source: `crates/pi-coding/src/resolve.rs`):
 
 1. If the text before the first `/` matches a known provider id (exactly,
@@ -52,7 +52,7 @@ with the following algorithm (source: `crates/pi-coding/src/resolve.rs`):
 3. Case-insensitive substring matching on model `id` and `name`. Aliases (ids
    ending in `-latest` or without a `-YYYYMMDD` date suffix) are preferred over
    dated versions; otherwise the latest dated version by descending id is used.
-4. If the provider is known but the id is not, `pi` synthesizes a custom-id
+4. If the provider is known but the id is not, `rpi` synthesizes a custom-id
    model by cloning that provider's default template (`defaultModelPerProvider`),
    or the provider's first model if no default is defined. A warning is emitted.
 
@@ -68,11 +68,11 @@ When no spec is given, the default is `anthropic/claude-sonnet-4-5`.
 Examples:
 
 ```sh
-pi -m anthropic/claude-sonnet-4-5
-pi -m claude-sonnet-4-5:high
-pi -m openrouter/ai21/jamba-large-1.7
-pi -m my-provider/my-custom-model:low
-pi -m llama.cpp/llama-3.1-8b
+rpi -m anthropic/claude-sonnet-4-5
+rpi -m claude-sonnet-4-5:high
+rpi -m openrouter/ai21/jamba-large-1.7
+rpi -m my-provider/my-custom-model:low
+rpi -m llama.cpp/llama-3.1-8b
 ```
 
 ## Custom providers via `models.json`
@@ -210,16 +210,16 @@ Rules:
 
 ## The `llama.cpp` provider
 
-When a llama.cpp router is configured (`pi llama configure URL` or
+When a llama.cpp router is configured (`rpi llama configure URL` or
 `LLAMA_BASE_URL`), live router models are merged into the catalog under the
 provider id `llama.cpp`. Select them with:
 
 ```sh
-pi -m llama.cpp/llama-3.1-8b
+rpi -m llama.cpp/llama-3.1-8b
 ```
 
-At startup `pi` refreshes the live router catalog unless `PI_OFFLINE=1|true|yes`
-is set. If the router is unavailable, `pi` falls back to the cached catalog
+At startup `rpi` refreshes the live router catalog unless `PI_OFFLINE=1|true|yes`
+is set. If the router is unavailable, `rpi` falls back to the cached catalog
 stored in the agent directory. Router configuration and the cache are written
 atomically; the settings file must not be readable by group or other users on
 Unix. See [`local-llama.md`](local-llama.md) for router setup and GGUF

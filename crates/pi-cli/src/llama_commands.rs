@@ -24,7 +24,7 @@ pub async fn run(command: LlamaCommand) -> Result<()> {
         }
         LlamaCommand::Status { reload } => {
             let settings = manager.effective_settings()?.ok_or_else(|| {
-                anyhow!("llama.cpp router is not configured; run `pi llama configure URL` or set LLAMA_BASE_URL")
+                anyhow!("llama.cpp router is not configured; run `rpi llama configure URL` or set LLAMA_BASE_URL")
             })?;
             println!("router {}", settings.base_url);
             let models = manager.router_models(reload).await?;
@@ -44,7 +44,7 @@ pub async fn run(command: LlamaCommand) -> Result<()> {
                 ),
                 CatalogSource::Cache => {
                     eprintln!(
-                        "pi: llama.cpp router unavailable; using cached catalog{}",
+                        "rpi: llama.cpp router unavailable; using cached catalog{}",
                         refreshed
                             .warning
                             .as_deref()
@@ -160,7 +160,7 @@ pub async fn run_slash(line: &str) -> Result<String> {
     match action {
         "status" => {
             let settings = manager.effective_settings()?.ok_or_else(|| {
-                anyhow!("llama.cpp router is not configured; use `pi llama configure URL` or set LLAMA_BASE_URL")
+                anyhow!("llama.cpp router is not configured; use `rpi llama configure URL` or set LLAMA_BASE_URL")
             })?;
             let models = manager.router_models(false).await?;
             let lines = models

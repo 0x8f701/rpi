@@ -162,7 +162,7 @@ impl LlamaManager {
     pub fn configured_client(&self) -> Result<LlamaRouterClient> {
         let settings = self.effective_settings()?.ok_or_else(|| {
             anyhow!(
-                "llama.cpp router is not configured; run `pi llama configure {}` or set LLAMA_BASE_URL",
+                "llama.cpp router is not configured; run `rpi llama configure {}` or set LLAMA_BASE_URL",
                 pi_ai::DEFAULT_LLAMA_SERVER_URL
             )
         })?;

@@ -1255,3 +1255,58 @@ fn native_no_copy_resume_accepts_safe_ad_hoc_path() {
     assert_eq!(resolved.path, path);
     assert_eq!(resolved.id, "ad-hoc-native");
 }
+
+#[test]
+fn catalog_prepares_native_resume_under_root_and_appends() {
+    let fixture = Fixture::new();
+    let target_cwd = fixture.root.join("catalog-target");
+    let catalog = fixture.catalog();
+    let path = write_native(
+        &catalog,
+        "--tmp-catalog--",
+        "catalog.jsonl",
+        "catalog-id",
+        target_cwd.to_str().expect("utf-8 target cwd"),
+        "catalog message",
+    );
+
+    let prepared = catalog
+        .prepare_native_resume(&path)
+        .expect("prepare native catalog session");
+    assert_eq!(prepared.path(), path);
+    assert_eq!(prepared.target_cwd(), target_cwd);
+    assert_eq!(prepared.tree().header.id, "catalog-id");
+    let recorder = prepared.into_recorder().expect("build recorder");
+    recorder
+        .record_message(&pi_ai::Message::user_text("catalog appended", 0))
+        .expect("append catalog session");
+    recorder.close().expect("close catalog session");
+    let tree = crate::load_session_tree(&path).expect("reload catalog session");
+    assert_eq!(tree.entries.len(), 2);
+}
+
+#[test]
+#[cfg(unix)]
+fn catalog_prepared_resume_rejects_final_symlink_replacement() {
+    let fixture = Fixture::new();
+    let target_cwd = fixture.root.join("symlink-target");
+    let catalog = fixture.catalog();
+    let target = write_native(
+        &catalog,
+        "--tmp-catalog--",
+        "target.jsonl",
+        "target-id",
+        target_cwd.to_str().expect("utf-8 target cwd"),
+        "target message",
+    );
+    let link = target.with_file_name("link.jsonl");
+    std::os::unix::fs::symlink(&target, &link).expect("create final symlink");
+
+    let error = catalog
+        .prepare_native_resume(&link)
+        .expect_err("catalog final symlink must fail");
+    assert!(matches!(
+        error,
+        CatalogError::Import(ImportSessionError::InvalidInput { .. })
+    ));
+}

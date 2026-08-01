@@ -88,7 +88,7 @@ pub fn list_sessions(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `pi import-session SOURCE INPUT [--output PATH]`.
+/// `rpi import-session SOURCE INPUT [--output PATH]`.
 ///
 /// Converts an external session to native Pi v3 JSONL and prints the emitted
 /// path plus the number of converted messages. Fails loudly on an unknown
@@ -142,7 +142,7 @@ pub fn resolve_model_spec(spec: &str) -> Result<(pi_ai::Model, String)> {
     Ok((resolved.model, resolved.thinking_level))
 }
 
-/// `pi export SESSION_PATH [--output PATH] [--jsonl]`.
+/// `rpi export SESSION_PATH [--output PATH] [--jsonl]`.
 ///
 /// Exports a session file to a self-contained HTML file (or current-branch
 /// JSONL with `--jsonl`). No model, auth, or network access is required.

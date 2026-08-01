@@ -161,29 +161,52 @@ pub(crate) fn resolve_scoped_path(
     Ok(resolved.to_string_lossy().into_owned())
 }
 
+/// Resolves a normal coding-tool mutation path against the primary working
+/// directory without imposing workspace-root containment. Absolute paths,
+/// parent-relative traversal, and ordinary symlink-following filesystem
+/// semantics are intentionally allowed for write/edit.
+pub(crate) fn resolve_mutation_path(
+    path: &str,
+    workspace: &WorkspaceRoots,
+) -> anyhow::Result<String> {
+    if path.is_empty() {
+        return Err(anyhow::anyhow!("File path must not be empty."));
+    }
+    if path.contains('\0') {
+        return Err(anyhow::anyhow!("File path contains a NUL byte."));
+    }
+    Ok(resolve_to_cwd(path, &workspace.cwd().to_string_lossy()))
+}
+
+/// Resolves a read path against the primary working directory without a
+/// workspace boundary. Absolute paths, `../` traversal, and ordinary symlink
+/// follow semantics are allowed (OMP-compatible default read). Tries pi's
+/// macOS filename fallbacks when the resolved path does not exist: narrow
+/// no-break space before AM/PM, NFD, curly quote, and combined NFD+curly.
 pub(crate) fn resolve_read_path(
     path: &str,
     workspace: &WorkspaceRoots,
 ) -> anyhow::Result<String> {
-    let resolved = resolve_scoped_path(path, workspace)?;
+    let cwd = workspace.cwd().to_string_lossy();
+    let resolved = resolve_to_cwd(path, &cwd);
     if path_exists(&resolved) {
         return Ok(resolved);
     }
     let amp = mac_ampm_variant(&resolved);
     if amp != resolved && path_exists(&amp) {
-        return resolve_scoped_path(&amp, workspace);
+        return Ok(amp);
     }
     let nfd: String = resolved.nfd().collect();
     if nfd != resolved && path_exists(&nfd) {
-        return resolve_scoped_path(&nfd, workspace);
+        return Ok(nfd);
     }
     let curly = resolved.replace('\'', "\u{2019}");
     if curly != resolved && path_exists(&curly) {
-        return resolve_scoped_path(&curly, workspace);
+        return Ok(curly);
     }
     let nfd_curly: String = nfd.replace('\'', "\u{2019}");
     if nfd_curly != resolved && path_exists(&nfd_curly) {
-        return resolve_scoped_path(&nfd_curly, workspace);
+        return Ok(nfd_curly);
     }
     Ok(resolved)
 }
@@ -222,10 +245,9 @@ fn mac_ampm_variant(p: &str) -> String {
     out
 }
 
-/// Resolves a path and tries pi's macOS filename fallbacks
+/// macOS filename fallback helper used by [`resolve_read_path`]
 /// (path-utils.ts `resolveReadPathAsync`): narrow no-break space before AM/PM,
-/// NFD, curly quote, and combined NFD+curly variants. Returns the first
-/// existing variant, else the resolved path.
+/// NFD, curly quote, and combined NFD+curly variants.
 
 #[cfg(test)]
 mod tests {
@@ -302,6 +324,82 @@ mod tests {
         assert!(resolve_scoped_path("escape/secret.txt", &workspace).is_err());
         assert!(resolve_scoped_path("escape/new.txt", &workspace).is_err());
         assert!(resolve_scoped_path("broken", &workspace).is_err());
+    }
+
+    #[test]
+    fn read_path_allows_absolute_and_parent_relative_external_files() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("project");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let external = root.path().join("outside.txt");
+        std::fs::write(&external, "external").expect("external file");
+        let workspace = WorkspaceRoots::new(&cwd, Vec::<PathBuf>::new()).expect("workspace");
+
+        let absolute = resolve_read_path(&external.to_string_lossy(), &workspace)
+            .expect("absolute external read path");
+        assert_eq!(
+            std::fs::canonicalize(&absolute).expect("canonical absolute"),
+            std::fs::canonicalize(&external).expect("canonical external")
+        );
+        assert_eq!(std::fs::read_to_string(&absolute).expect("read absolute"), "external");
+
+        let relative = resolve_read_path("../outside.txt", &workspace)
+            .expect("parent-relative external read path");
+        assert_eq!(
+            std::fs::canonicalize(&relative).expect("canonical relative"),
+            std::fs::canonicalize(&external).expect("canonical external")
+        );
+        assert_eq!(std::fs::read_to_string(&relative).expect("read relative"), "external");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_path_allows_symlink_to_external_file() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let external = tempfile::tempdir().expect("external");
+        let target = external.path().join("secret.txt");
+        std::fs::write(&target, "secret").expect("secret");
+        let link = cwd.path().join("alias.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let workspace = WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new()).expect("workspace");
+
+        let resolved =
+            resolve_read_path("alias.txt", &workspace).expect("symlink external read path");
+        assert_eq!(resolved, clean_path(&link.to_string_lossy()));
+        assert_eq!(std::fs::read_to_string(&resolved).expect("follow symlink"), "secret");
+    }
+
+    #[test]
+    fn mutation_paths_allow_absolute_and_parent_relative_external_files() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("project");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let workspace = WorkspaceRoots::new(&cwd, Vec::<PathBuf>::new()).expect("workspace");
+        let outside = root.path().join("outside.txt");
+
+        assert_eq!(
+            resolve_mutation_path(&outside.to_string_lossy(), &workspace)
+                .expect("absolute external mutation path"),
+            outside.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_mutation_path("../outside.txt", &workspace)
+                .expect("parent-relative external mutation path"),
+            outside.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_mutation_path("inside.txt", &workspace).expect("cwd-relative mutation path"),
+            cwd.join("inside.txt").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn mutation_paths_reject_invalid_inputs() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let workspace = WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new()).expect("workspace");
+
+        assert!(resolve_mutation_path("", &workspace).is_err());
+        assert!(resolve_mutation_path("bad\0path", &workspace).is_err());
     }
 
     #[test]

@@ -93,6 +93,7 @@ async fn completed_child_usage_is_preserved_in_result_and_job_snapshot() {
                 id: "UsageChild".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "report usage".to_owned(),
+                todo_task_id: None,
             }],
             abort,
         )

@@ -53,6 +53,18 @@ pub fn read_resource_text(path: &Path, kind: &str) -> anyhow::Result<String> {
         .with_context(|| format!("decoding {kind} {} as UTF-8", path.display()))
 }
 
+pub(crate) fn strip_skill_frontmatter(content: &str) -> String {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    normalized
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---"))
+        .map_or_else(
+            || normalized.clone(),
+            |(_, body)| body.trim_start_matches("\n---").trim_start().to_owned(),
+        )
+}
+
+
 /// Max name/description lengths per the Agent Skills spec (skills.ts:11,14).
 const MAX_SKILL_NAME_LENGTH: i64 = 64;
 const MAX_SKILL_DESCRIPTION_LENGTH: i64 = 1024;
@@ -370,8 +382,24 @@ pub fn load_skills_with_diagnostics(cwd: &str) -> (Vec<Skill>, Vec<SkillDiagnost
     load_skills_trusted(cwd, true)
 }
 
+pub(crate) fn load_skills_trusted_from_agent_dir(
+    cwd: &str,
+    agent_dir: &Path,
+    include_project: bool,
+) -> (Vec<Skill>, Vec<SkillDiagnostic>) {
+    load_skills_trusted_from_dirs(cwd, agent_dir, include_project)
+}
+
 pub fn load_skills_trusted(
     cwd: &str,
+    include_project: bool,
+) -> (Vec<Skill>, Vec<SkillDiagnostic>) {
+    load_skills_trusted_from_dirs(cwd, Path::new(&agent_dir()), include_project)
+}
+
+fn load_skills_trusted_from_dirs(
+    cwd: &str,
+    agent_dir: &Path,
     include_project: bool,
 ) -> (Vec<Skill>, Vec<SkillDiagnostic>) {
     let mut skills = Vec::new();
@@ -387,11 +415,8 @@ pub fn load_skills_trusted(
             skills.push(skill);
         }
     };
-    let (global, global_diagnostics) = load_skills_from_dir(
-        &ps(Path::new(&agent_dir()).join("skills")),
-        SkillSource::User,
-        true,
-    );
+    let (global, global_diagnostics) =
+        load_skills_from_dir(&ps(agent_dir.join("skills")), SkillSource::User, true);
     add(global, global_diagnostics);
     if include_project {
         let (project, project_diagnostics) = load_skills_from_dir(
@@ -764,16 +789,13 @@ fn stat_is_dir_file(full: &Path, e: &fs::DirEntry) -> (bool, bool) {
 // ---------------------------------------------------------------------------
 // Frontmatter
 // ---------------------------------------------------------------------------
-
-/// A parsed frontmatter scalar. `kind` distinguishes plain scalars (which can
-/// carry YAML booleans) from quoted strings and block scalars.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FmValue {
     value: String,
     kind: FmKind,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FmKind {
     Plain,
     Quoted,

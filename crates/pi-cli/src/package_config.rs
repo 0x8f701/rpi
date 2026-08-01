@@ -1,4 +1,4 @@
-//! `pi config [-l]` — package-resource configuration surface.
+//! `rpi config [-l]` — package-resource configuration surface.
 //!
 //! Discovers installed/configured package resources from each package's
 //! `package.json#pi` manifest, groups them by kind (extension/skill/prompt/
@@ -155,7 +155,7 @@ impl ConfigGroups {
     }
 }
 
-/// One configured package as shown by `pi config`.
+/// One configured package as shown by `rpi config`.
 #[derive(Debug, Clone)]
 pub struct ConfigPackage {
     /// Settings source string (the `packages[].source` key).
@@ -184,7 +184,7 @@ impl ConfigPackage {
     }
 }
 
-/// The full `pi config` view for one scope: pure data, no terminal. All
+/// The full `rpi config` view for one scope: pure data, no terminal. All
 /// mutation (toggle, scope switch) and persistence (apply) happens here so the
 /// surface is unit-testable without a PTY.
 #[derive(Debug)]
@@ -534,7 +534,7 @@ fn array_for_kind_mut(pkg: &mut ResourcePackage, kind: PackageResourceKind) -> &
 // Command entry point
 // ---------------------------------------------------------------------------
 
-/// `pi config [--local]` dispatch.
+/// `rpi config [--local]` dispatch.
 ///
 /// In an interactive terminal it opens the resource selector; with non-TTY
 /// stdout it prints the current scope/resource state as deterministic JSON and
@@ -782,7 +782,7 @@ async fn run_selector(mut model: PackageConfigModel) -> Result<()> {
             } else {
                 "untrusted"
             };
-            let title = format!(" pi config — {scope_label} scope ({trust_label}) ");
+            let title = format!(" rpi config — {scope_label} scope ({trust_label}) ");
 
             let items: Vec<ListItem> = if rows.is_empty() {
                 vec![ListItem::new(Line::from(Span::styled(

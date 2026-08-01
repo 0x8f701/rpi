@@ -36,10 +36,20 @@ impl PreparedExtensionRuntime {
 
 #[derive(Clone)]
 pub struct AgentSession {
-    pub session: Session,
     pub application: Application,
     pub extensions_result: Option<ExtensionLoadReport>,
     pub model_fallback_message: Option<String>,
+}
+
+impl AgentSession {
+    /// Returns a lease on the runtime generation active when this method is called.
+    ///
+    /// A retained [`Session`] remains bound to that generation even if the
+    /// [`Application`] later activates a different runtime.
+    #[must_use]
+    pub fn session(&self) -> Session {
+        self.application.session()
+    }
 }
 
 pub struct AgentSessionBuilder {
@@ -362,7 +372,6 @@ impl AgentSessionBuilder {
             None => Application::new(session.clone()).await,
         };
         Ok(AgentSession {
-            session,
             application,
             extensions_result,
             model_fallback_message,
@@ -411,7 +420,8 @@ fn parse_recorded_thinking_level(level: &str) -> ThinkingLevel {
         "low" => ThinkingLevel::Low,
         "medium" => ThinkingLevel::Medium,
         "high" => ThinkingLevel::High,
-        "xhigh" | "max" => ThinkingLevel::Xhigh,
+        "xhigh" => ThinkingLevel::Xhigh,
+        "max" => ThinkingLevel::Max,
         _ => ThinkingLevel::Off,
     }
 }
@@ -424,6 +434,7 @@ fn thinking_level_name(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",
         ThinkingLevel::Xhigh => "xhigh",
+        ThinkingLevel::Max => "max",
     }
 }
 

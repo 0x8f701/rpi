@@ -70,6 +70,9 @@ pub enum ThinkingLevel {
     Medium,
     High,
     Xhigh,
+    /// Highest effort level. Only some model families accept it; callers should
+    /// clamp via model metadata before issuing a provider request.
+    Max,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -327,6 +330,8 @@ pub enum AgentEvent {
         tool_call_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
+        /// Tool-call arguments. Serialized as `args` to match pi-agent-core.
+        #[serde(rename = "args")]
         arguments: Value,
     },
     ToolExecutionUpdate {
@@ -334,6 +339,8 @@ pub enum AgentEvent {
         tool_call_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
+        /// Tool-call arguments. Serialized as `args` to match pi-agent-core.
+        #[serde(rename = "args")]
         arguments: Value,
         #[serde(rename = "partialResult")]
         partial_result: AgentToolResult,

@@ -250,13 +250,23 @@ pub(crate) fn open_source_under_root(
     root: &Path,
     path: &Path,
 ) -> Result<OpenedSource, ImportSessionError> {
-    open_source_under_root_inner(source, root, path, true)
+    open_source_under_root_inner(source, root, path, true, false)
+}
+
+/// Securely open a native session for retained read/append ownership under a
+/// configured root. The final component is never followed.
+pub(crate) fn open_native_session_for_append_under_root(
+    root: &Path,
+    path: &Path,
+) -> Result<OpenedSource, ImportSessionError> {
+    open_source_under_root_inner(SourceSessionFormat::Pi, root, path, true, true)
 }
 
 fn open_source_under_absolute_root(
     source: SourceSessionFormat,
     root: &Path,
     path: &Path,
+    append: bool,
 ) -> Result<OpenedSource, ImportSessionError> {
     let relative = path.strip_prefix(&root).map_err(|_| {
         invalid_source_open(
@@ -287,7 +297,7 @@ fn open_source_under_absolute_root(
             format!("cannot open configured source root {}: {error}", root.display()),
         )
     })?;
-    let primary = open_capability_file(&directory, relative, source, &path)?;
+    let primary = open_capability_file(&directory, relative, source, &path, append)?;
     let metadata = primary.metadata().map_err(|source_error| ImportSessionError::Io {
         path: path.to_path_buf(),
         source: source_error,
@@ -333,6 +343,22 @@ pub(crate) fn open_source_direct(
     source: SourceSessionFormat,
     path: &Path,
 ) -> Result<OpenedSource, ImportSessionError> {
+    open_source_direct_inner(source, path, false)
+}
+
+/// Securely open an explicitly authorized native session for retained
+/// read/append ownership relative to its parent directory capability.
+pub(crate) fn open_native_session_for_append_direct(
+    path: &Path,
+) -> Result<OpenedSource, ImportSessionError> {
+    open_source_direct_inner(SourceSessionFormat::Pi, path, true)
+}
+
+fn open_source_direct_inner(
+    source: SourceSessionFormat,
+    path: &Path,
+    append: bool,
+) -> Result<OpenedSource, ImportSessionError> {
     let path = absolute_path(path)?;
     let parent = path
         .parent()
@@ -345,7 +371,7 @@ pub(crate) fn open_source_direct(
     } else {
         parent
     };
-    open_source_under_root_inner(source, root, &path, false)
+    open_source_under_root_inner(source, root, &path, false, append)
 }
 
 fn open_source_under_root_inner(
@@ -353,6 +379,7 @@ fn open_source_under_root_inner(
     root: &Path,
     path: &Path,
     require_candidate: bool,
+    append: bool,
 ) -> Result<OpenedSource, ImportSessionError> {
     if require_candidate && !is_source_candidate(source, path) {
         return Err(invalid_source_open(
@@ -363,7 +390,7 @@ fn open_source_under_root_inner(
     }
     let root = absolute_path(root)?;
     let path = absolute_path(path)?;
-    open_source_under_absolute_root(source, &root, &path)
+    open_source_under_absolute_root(source, &root, &path, append)
 }
 
 fn open_capability_file(
@@ -371,9 +398,13 @@ fn open_capability_file(
     relative: &Path,
     source: SourceSessionFormat,
     display_path: &Path,
+    append: bool,
 ) -> Result<fs::File, ImportSessionError> {
     let mut options = CapOpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
+    if append {
+        options.append(true);
+    }
     directory
         .open_with(relative, &options)
         .map(cap_std::fs::File::into_std)

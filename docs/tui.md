@@ -9,7 +9,7 @@ REPL-only limitations](#tui-vs-repl-only-limitations)). The TUI branch is select
 ## Layout
 
 ```text
- pi (rs) · provider/model · /cwd
+ rpi (rs) · provider/model · /cwd
 ┌─────────────────────────────────────┐
 │ Conversation                        │
 │ ...                                 │
@@ -369,7 +369,7 @@ not shadowed by a built-in.
 | `/ps` | List supervised processes |
 | `/process <start, describe, logs, send, resize, signal, stop, wait> ...` | Control a supervised process |
 | `/reload` | Reload extensions and project resources |
-| `/quit` | Quit pi (or use `Ctrl+D` on empty input) |
+| `/quit` | Quit rpi (or use `Ctrl+D` on empty input) |
 
 Loop intervals accept positive bare seconds (`/loop 300 check status`) or compact `s`, `m`, `h`, and `d` units (`/loop 3s echo hello`, `/loop 30m check deploy`). Scheduled turns appear as `Loop <id> · <cadence>` system cards; the internal model instruction wrapper is not shown as a user message.
 

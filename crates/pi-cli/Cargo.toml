@@ -11,7 +11,7 @@ name = "pi_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "pi"
+name = "rpi"
 path = "src/main.rs"
 
 [[bin]]
@@ -28,6 +28,7 @@ futures-util.workspace = true
 globset.workspace = true
 image.workspace = true
 ignore.workspace = true
+nix.workspace = true
 pi-ai.workspace = true
 pi-agent.workspace = true
 pi-coding.workspace = true

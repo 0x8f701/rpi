@@ -1,9 +1,9 @@
-//! Focused tests for `pi config` package-resource configuration.
+//! Focused tests for `rpi config` package-resource configuration.
 //!
 //! Covers global/project scope, trust denial, toggle/apply/cancel, package
 //! collision/source labels, invalid manifest rollback, and headless JSON
 //! output. Tests drive the library model directly (no PTY required) and use
-//! the `pi` binary only for install setup and the headless JSON smoke.
+//! the `rpi` binary only for install setup and the headless JSON smoke.
 
 use std::fs;
 use std::path::Path;
@@ -14,15 +14,15 @@ use pi_coding::PackageScope;
 use serde_json::Value;
 use tempfile::TempDir;
 
-fn pi_bin() -> String {
-    env!("CARGO_BIN_EXE_pi").to_owned()
+fn rpi_bin() -> String {
+    env!("CARGO_BIN_EXE_rpi").to_owned()
 }
 
-/// Run `pi` with a sandboxed agent dir / HOME and a cleared auth environment so
+/// Run `rpi` with a sandboxed agent dir / HOME and a cleared auth environment so
 /// no real user state or credentials are touched. stdout is piped (non-TTY),
-/// which selects the headless path for `pi config`.
+/// which selects the headless path for `rpi config`.
 fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
-    let output = Command::new(pi_bin())
+    let output = Command::new(rpi_bin())
         .args(args)
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
@@ -34,7 +34,7 @@ fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
         .current_dir(cwd)
         .stdin(Stdio::null())
         .output()
-        .expect("run pi");
+        .expect("run rpi");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -379,7 +379,7 @@ fn headless_output_is_deterministic_json() {
     let (ok, _o, e) = run(agent_dir, cwd.path(), &["install", pkg.to_str().unwrap()]);
     assert!(ok, "install: {e}");
 
-    // Library path: the same JSON `pi config` would print headlessly.
+    // Library path: the same JSON `rpi config` would print headlessly.
     let model = load_config_model(cwd.path(), agent_dir, false, PackageScope::Global).unwrap();
     let json = model.to_json();
     assert_eq!(json["scope"].as_str().unwrap(), "global");
@@ -390,7 +390,7 @@ fn headless_output_is_deterministic_json() {
 
     // Binary path: piped stdout is non-TTY → headless, never blocks for input.
     let (ok, stdout, err) = run(agent_dir, cwd.path(), &["config"]);
-    assert!(ok, "pi config headless failed: {err}");
+    assert!(ok, "rpi config headless failed: {err}");
     let parsed: Value = serde_json::from_str(stdout.trim()).expect("headless stdout is JSON");
     assert_eq!(parsed["scope"].as_str().unwrap(), "global");
     assert_eq!(
@@ -415,7 +415,7 @@ fn headless_project_scope_refused_when_untrusted() {
     );
     assert!(ok, "install: {e}");
 
-    // `pi config -l` on an untrusted project (no --approve) must fail fast and
+    // `rpi config -l` on an untrusted project (no --approve) must fail fast and
     // not block for input.
     let (ok, _stdout, err) = run(agent_dir, cwd.path(), &["config", "--local"]);
     assert!(!ok, "untrusted project config should fail");

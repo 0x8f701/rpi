@@ -1,8 +1,11 @@
+use std::ops::Range;
+
 use super::analysis::{
     AnalysisMode, ListMarker, MarkdownBlock, analyze_with_limit, streaming_tail_start,
 };
+use super::inline::{InlineStyleRange, shifted_styles, wrap_inline};
 use super::mermaid::{
-    MermaidDiagnostic, MermaidLimits, render_mermaid_unicode,
+    MermaidDiagnostic, MermaidDiagramKind, MermaidLimits, render_mermaid_unicode,
 };
 use super::table::layout_table;
 use super::text::{
@@ -32,6 +35,13 @@ pub enum LineRole {
 pub struct NeutralLine {
     pub text: String,
     pub role: LineRole,
+    pub inline_styles: Vec<InlineStyleRange>,
+    /// Normalized fenced-code language for [`LineRole::Code`] body lines.
+    ///
+    /// Terminal-neutral metadata so presentation layers can apply a language-aware
+    /// lexer instead of one language-agnostic highlighter. Fence chrome
+    /// ([`LineRole::CodeFence`]) and non-code roles leave this `None`.
+    pub language: Option<String>,
 }
 
 impl NeutralLine {
@@ -39,6 +49,17 @@ impl NeutralLine {
         Self {
             text: text.into(),
             role,
+            inline_styles: Vec::new(),
+            language: None,
+        }
+    }
+
+    fn code(text: impl Into<String>, language: Option<String>) -> Self {
+        Self {
+            text: text.into(),
+            role: LineRole::Code,
+            inline_styles: Vec::new(),
+            language,
         }
     }
 }
@@ -289,7 +310,12 @@ fn render_with_mode(
                 if let Some(layout) = layout_table(&table, width) {
                     let header_rows = table_row_height(&table.headers, &layout.column_widths);
                     let line_count = layout_line_count(&table, &layout.column_widths);
-                    for (index, line) in layout.lines.into_iter().enumerate() {
+                    for (index, (line, inline_styles)) in layout
+                        .lines
+                        .into_iter()
+                        .zip(layout.inline_styles)
+                        .enumerate()
+                    {
                         let role = if index == 0 || index == header_rows + 1 || index + 1 == line_count {
                             LineRole::TableBorder
                         } else if index <= header_rows {
@@ -297,7 +323,12 @@ fn render_with_mode(
                         } else {
                             LineRole::TableBody
                         };
-                        output.lines.push(NeutralLine::new(line, role));
+                        output.lines.push(NeutralLine {
+                            text: line,
+                            role,
+                            inline_styles,
+                            language: None,
+                        });
                     }
                 } else {
                     output
@@ -353,8 +384,12 @@ fn append_mermaid(
 ) {
     match render_mermaid_unicode(source, width.saturating_sub(2), limits) {
         Ok(art) => {
+            let kind = match art.kind {
+                MermaidDiagramKind::Flowchart => "flowchart",
+                MermaidDiagramKind::ClassDiagram => "classDiagram",
+            };
             output.lines.push(NeutralLine::new(
-                fit_text("┌─ mermaid · flowchart", width),
+                fit_text(&format!("┌─ mermaid · {kind}"), width),
                 LineRole::MermaidBorder,
             ));
             let mut in_edges = false;
@@ -408,19 +443,33 @@ fn append_mermaid(
 }
 
 fn append_code(lines: &mut Vec<NeutralLine>, info: &str, source: &str, width: usize) {
-    let title = if info.is_empty() {
-        "┌─ code".to_owned()
-    } else {
-        format!("┌─ code · {}", sanitize_inline(info))
+    let language = normalize_fence_language(info);
+    let title = match language.as_deref() {
+        Some(lang) => format!("┌─ code · {lang}"),
+        None => "┌─ code".to_owned(),
     };
     lines.push(NeutralLine::new(
         fit_text(&title, width),
         LineRole::CodeFence,
     ));
-    append_verbatim_wrapped_lines(lines, source.lines(), width, LineRole::Code);
-    if source.is_empty() {
-        lines.push(NeutralLine::new(String::new(), LineRole::Code));
+
+    // One-cell internal horizontal padding; wrap against the remaining width.
+    let body_width = width.saturating_sub(1).max(1);
+    let mut emitted_body = false;
+    for line in source.lines() {
+        for wrapped in wrap_verbatim(line, body_width) {
+            let mut text = String::with_capacity(wrapped.len().saturating_add(1));
+            text.push(' ');
+            text.push_str(&wrapped);
+            lines.push(NeutralLine::code(text, language.clone()));
+            emitted_body = true;
+        }
     }
+    if !emitted_body {
+        // Empty / blank-only fences still expose one explicit padded body row.
+        lines.push(NeutralLine::code(" ", language.clone()));
+    }
+
     lines.push(NeutralLine::new(
         fit_text("└─", width),
         LineRole::CodeFence,
@@ -434,9 +483,7 @@ fn append_source_lines<'a>(
     role: LineRole,
 ) {
     for line in lines {
-        for wrapped in wrap_text(line, width) {
-            output.push(NeutralLine::new(wrapped, role));
-        }
+        append_wrapped(output, line, width, role, "");
     }
 }
 
@@ -455,7 +502,7 @@ fn table_row_height(cells: &[String], widths: &[usize]) -> usize {
     widths
         .iter()
         .enumerate()
-        .map(|(column, width)| wrap_text(cells.get(column).map(String::as_str).unwrap_or_default(), *width).len())
+        .map(|(column, width)| wrap_inline(cells.get(column).map(String::as_str).unwrap_or_default(), *width).len())
         .max()
         .unwrap_or(1)
 }
@@ -486,25 +533,337 @@ fn append_wrapped(
         return;
     }
     let content_width = width - prefix_width;
-    let wrapped = wrap_text(text, content_width);
-    for (index, line) in wrapped.into_iter().enumerate() {
+    for (index, line) in wrap_inline(text, content_width).into_iter().enumerate() {
         let continuation = if index == 0 {
             prefix.to_owned()
         } else {
             " ".repeat(prefix_width)
         };
-        let mut rendered = String::with_capacity(continuation.len() + line.len());
+        let content_offset = continuation.len();
+        let mut rendered = String::with_capacity(content_offset + line.text.len());
         rendered.push_str(&continuation);
-        rendered.push_str(&line);
-        output.push(NeutralLine::new(rendered, role));
+        rendered.push_str(&line.text);
+        output.push(NeutralLine {
+            text: rendered,
+            role,
+            inline_styles: shifted_styles(&line.styles, content_offset),
+            language: None,
+        });
     }
 }
 
-fn is_mermaid_info(info: &str) -> bool {
+fn normalize_fence_language(info: &str) -> Option<String> {
     let language = info
         .split_whitespace()
         .next()
         .unwrap_or_default()
-        .trim_matches(['{', '}', '.']);
-    language.eq_ignore_ascii_case("mermaid") || language.eq_ignore_ascii_case("mermaid-js")
+        .trim_matches(['{', '}', '.'])
+        .trim();
+    if language.is_empty() {
+        None
+    } else {
+        Some(language.to_ascii_lowercase())
+    }
+}
+
+fn is_mermaid_info(info: &str) -> bool {
+    matches!(
+        normalize_fence_language(info).as_deref(),
+        Some("mermaid" | "mermaid-js")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    fn render(source: &str, width: usize) -> MarkdownRenderOutput {
+        render_markdown(
+            source,
+            &MarkdownRenderOptions {
+                width,
+                ..MarkdownRenderOptions::default()
+            },
+        )
+    }
+
+    fn code_body_lines(output: &MarkdownRenderOutput) -> Vec<&NeutralLine> {
+        output
+            .lines
+            .iter()
+            .filter(|line| line.role == LineRole::Code)
+            .collect()
+    }
+
+    #[test]
+    fn fenced_code_propagates_normalized_languages() {
+        for (source, expected) in [
+            ("```sh\necho hi\n```", Some("sh")),
+            ("```BASH\nls -la\n```", Some("bash")),
+            ("```Rust\nlet x = 1;\n```", Some("rust")),
+            ("```json\n{\"a\":1}\n```", Some("json")),
+            ("```JSON {highlight}\n{}\n```", Some("json")),
+            ("```.Ts\nconst n = 1\n```", Some("ts")),
+            ("```\nplain\n```", None),
+        ] {
+            let output = render(source, 40);
+            let body = code_body_lines(&output);
+            assert!(!body.is_empty(), "missing body for {source}");
+            for line in body {
+                assert_eq!(
+                    line.language.as_deref(),
+                    expected,
+                    "language mismatch for {source}: {:?}",
+                    line.text
+                );
+                assert!(
+                    line.text.starts_with(' '),
+                    "body must keep one-cell pad: {:?}",
+                    line.text
+                );
+            }
+            assert!(
+                output
+                    .lines
+                    .iter()
+                    .filter(|line| line.role == LineRole::CodeFence)
+                    .all(|line| line.language.is_none()),
+                "fence chrome must stay language-neutral"
+            );
+            if let Some(lang) = expected {
+                assert_eq!(output.lines[0].text, format!("┌─ code · {lang}"));
+            } else {
+                assert_eq!(output.lines[0].text, "┌─ code");
+            }
+            assert_eq!(output.lines.last().map(|line| line.text.as_str()), Some("└─"));
+        }
+    }
+
+    #[test]
+    fn code_fences_preserve_leading_indentation_with_padding() {
+        // Contract: fenced code is layout-verbatim after one-cell pad; tabs expand
+        // to four spaces and indentation must survive for Python/Makefile samples.
+        let output = render("```\n    indented\n\ttabbed\n  two\n```", 30);
+        assert_eq!(
+            output.plain_text(),
+            "┌─ code\n     indented\n     tabbed\n   two\n└─"
+        );
+        assert!(output.diagnostics.is_empty());
+        for line in code_body_lines(&output) {
+            assert_eq!(line.language, None);
+        }
+    }
+
+    #[test]
+    fn code_body_wraps_within_width_after_padding() {
+        let output = render("```rust\nabcdefghijklmnopqrstuvwxyz\n```", 10);
+        assert_eq!(output.lines[0].role, LineRole::CodeFence);
+        assert!(
+            output.lines[0].text.starts_with("┌─"),
+            "title chrome missing: {:?}",
+            output.lines[0].text
+        );
+        assert!(
+            UnicodeWidthStr::width(output.lines[0].text.as_str()) <= 10,
+            "title exceeded width: {:?}",
+            output.lines[0].text
+        );
+        assert_eq!(output.lines.last().map(|line| line.text.as_str()), Some("└─"));
+        let body = code_body_lines(&output);
+        assert!(body.len() >= 2, "long line must wrap: {body:?}");
+        for line in &body {
+            assert!(
+                UnicodeWidthStr::width(line.text.as_str()) <= 10,
+                "overflow {:?}: width {}",
+                line.text,
+                UnicodeWidthStr::width(line.text.as_str())
+            );
+            assert!(line.text.starts_with(' '));
+            assert_eq!(line.language.as_deref(), Some("rust"));
+        }
+        let rejoined: String = body
+            .iter()
+            .map(|line| line.text.trim_start_matches(' '))
+            .collect();
+        assert_eq!(rejoined, "abcdefghijklmnopqrstuvwxyz");
+    }
+
+    #[test]
+    fn empty_and_unclosed_fences_stay_explicit() {
+        let empty = render("```bash\n```", 20);
+        assert_eq!(empty.plain_text(), "┌─ code · bash\n \n└─");
+        assert_eq!(code_body_lines(&empty).len(), 1);
+        assert_eq!(code_body_lines(&empty)[0].text, " ");
+        assert_eq!(code_body_lines(&empty)[0].language.as_deref(), Some("bash"));
+        assert!(empty.diagnostics.is_empty());
+
+        let blank_body = render("```sh\n\n```", 20);
+        // A blank source line still yields one padded body row via wrap_verbatim.
+        assert_eq!(blank_body.plain_text(), "┌─ code · sh\n \n└─");
+        assert_eq!(code_body_lines(&blank_body)[0].language.as_deref(), Some("sh"));
+
+        let unclosed = render_markdown_streaming(
+            "```json\n{\"a\":1}",
+            &MarkdownRenderOptions {
+                width: 24,
+                ..MarkdownRenderOptions::default()
+            },
+        );
+        assert!(unclosed.plain_text().contains("┌─ code · json"));
+        assert!(unclosed.plain_text().contains(" {\"a\":1}"));
+        assert!(matches!(
+            unclosed.diagnostics.as_slice(),
+            [RenderDiagnostic::UnclosedFence { source_line: 1 }]
+        ));
+        assert!(code_body_lines(&unclosed)
+            .iter()
+            .all(|line| line.language.as_deref() == Some("json")));
+    }
+
+    #[test]
+    fn fence_title_and_borders_remain_width_bounded() {
+        let long_lang = "x".repeat(40);
+        let output = render(&format!("```{long_lang}\ncode\n```"), 12);
+        for line in output.plain_lines() {
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= 12,
+                "unbounded chrome: {line:?}"
+            );
+        }
+        assert!(output.lines[0].text.starts_with("┌─ code · "));
+        assert_eq!(output.lines[0].role, LineRole::CodeFence);
+        assert_eq!(output.lines.last().map(|line| line.role), Some(LineRole::CodeFence));
+        assert!(code_body_lines(&output)
+            .iter()
+            .all(|line| line.language.as_deref() == Some(long_lang.as_str())));
+    }
+
+    fn mermaid_card_count(text: &str) -> usize {
+        text.lines()
+            .filter(|line| line.contains("┌─ mermaid ·"))
+            .count()
+    }
+
+    fn mermaid_footer_count(output: &MarkdownRenderOutput) -> usize {
+        output
+            .lines
+            .iter()
+            .filter(|line| line.role == LineRole::MermaidBorder && line.text == "└─")
+            .count()
+    }
+
+    #[test]
+    fn successful_class_diagram_card_uses_class_title_once() {
+        // Exact user-reported classDiagram: members + Application-->Session and
+        // Agent..>AgentTool : via context. Successful render is one class card.
+        let source = "```mermaid\n\
+classDiagram\n\
+class Application {\n\
++run()\n\
+}\n\
+class Session {\n\
++id: String\n\
+}\n\
+class Agent {\n\
++tools: Vec\n\
+}\n\
+class AgentTool {\n\
++name: String\n\
+}\n\
+Application --> Session\n\
+Agent ..> AgentTool : via context\n\
+```";
+        let output = render(source, 48);
+        let text = output.plain_text();
+        assert_eq!(mermaid_card_count(&text), 1, "{text}");
+        assert!(text.contains("┌─ mermaid · classDiagram"), "{text}");
+        assert!(!text.contains("┌─ mermaid · flowchart"), "{text}");
+        assert!(!text.contains("source fallback"), "{text}");
+        assert!(!text.contains("! mermaid:"), "{text}");
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(text.contains("+run()"), "{text}");
+        assert!(text.contains("+id: String"), "{text}");
+        assert!(text.contains("Application ───▶ Session"), "{text}");
+        assert!(text.contains("Agent ··via context··▶ AgentTool"), "{text}");
+        assert_eq!(mermaid_footer_count(&output), 1, "{text}");
+        assert_eq!(
+            output
+                .lines
+                .iter()
+                .filter(|line| line.role == LineRole::Diagnostic)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn successful_labeled_subgraph_flowchart_card_is_single() {
+        // Exact user-reported flowchart LR with subgraph records["SessionRecord types"].
+        let source = "```mermaid\n\
+flowchart LR\n\
+subgraph records[\"SessionRecord types\"]\n\
+A[Session] --> B[Message]\n\
+B --> C[ToolCall]\n\
+end\n\
+X[User] --> A\n\
+```";
+        let output = render(source, 48);
+        let text = output.plain_text();
+        assert_eq!(mermaid_card_count(&text), 1, "{text}");
+        assert!(text.contains("┌─ mermaid · flowchart"), "{text}");
+        assert!(!text.contains("source fallback"), "{text}");
+        assert!(!text.contains("! mermaid:"), "{text}");
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(text.contains("subgraph records · SessionRecord types"), "{text}");
+        assert!(text.contains("end subgraph records"), "{text}");
+        assert!(text.contains("A · Session"), "{text}");
+        assert!(text.contains("X ───▶ A"), "{text}");
+        assert_eq!(mermaid_footer_count(&output), 1, "{text}");
+    }
+
+    #[test]
+    fn class_and_flowchart_cards_do_not_duplicate_fallback_chrome() {
+        let source = "```mermaid\n\
+classDiagram\n\
+class Application {\n\
++run()\n\
+}\n\
+class Session {\n\
++id: String\n\
+}\n\
+class Agent {\n\
++tools: Vec\n\
+}\n\
+class AgentTool {\n\
++name: String\n\
+}\n\
+Application --> Session\n\
+Agent ..> AgentTool : via context\n\
+```\n\n```mermaid\n\
+flowchart LR\n\
+subgraph records[\"SessionRecord types\"]\n\
+A[Session] --> B[Message]\n\
+B --> C[ToolCall]\n\
+end\n\
+X[User] --> A\n\
+```";
+        let output = render(source, 48);
+        let text = output.plain_text();
+        assert_eq!(mermaid_card_count(&text), 2, "{text}");
+        assert!(text.contains("┌─ mermaid · classDiagram"), "{text}");
+        assert!(text.contains("┌─ mermaid · flowchart"), "{text}");
+        assert!(!text.contains("source fallback"), "{text}");
+        assert!(!text.contains("! mermaid:"), "{text}");
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(mermaid_footer_count(&output), 2, "{text}");
+        assert_eq!(
+            output
+                .lines
+                .iter()
+                .filter(|line| line.role == LineRole::Diagnostic)
+                .count(),
+            0
+        );
+    }
 }

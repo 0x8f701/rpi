@@ -44,9 +44,29 @@ pub struct JobCardRows {
     pub ordinal: u64,
     pub agent_id: String,
     pub agent: String,
+    pub display_name: String,
+    pub todo_task_id: Option<String>,
     pub job_status: JobStatus,
     pub agent_status: Option<AgentStatus>,
+    pub summary: Option<String>,
     pub rows: Vec<JobCardRow>,
+}
+
+/// One Task delegation card containing every child in the active runtime group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCardRows {
+    pub group_id: String,
+    pub context: String,
+    pub children: Vec<JobCardRows>,
+    pub aggregate: JobCardRow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestedChild {
+    name: Option<String>,
+    agent: Option<String>,
+    task: String,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +83,8 @@ pub struct JobCardPresentationAdapter {
     agents: HashMap<String, AgentSnapshot>,
     next_ordinal: u64,
     group_id: Option<String>,
+    context: String,
+    requested_children: Vec<RequestedChild>,
 }
 
 impl JobCardPresentationAdapter {
@@ -80,15 +102,19 @@ impl JobCardPresentationAdapter {
     pub fn apply_orchestration_event(&mut self, event: &OrchestrationEvent) {
         let group_id = match event {
             OrchestrationEvent::JobUpdated { group_id, .. }
-            | OrchestrationEvent::AgentUpdated { group_id, .. } => group_id,
+            | OrchestrationEvent::AgentUpdated { group_id, .. }
+            | OrchestrationEvent::MessageDelivered { group_id, .. } => group_id,
         };
         if self.group_id.as_deref().is_some_and(|current| current != group_id) {
-            self.clear();
+            self.jobs.clear();
+            self.agents.clear();
+            self.next_ordinal = 0;
         }
         self.group_id = Some(group_id.clone());
         match event {
             OrchestrationEvent::JobUpdated { job, .. } => self.upsert_job(job.clone()),
             OrchestrationEvent::AgentUpdated { agent, .. } => self.upsert_agent(agent.clone()),
+            OrchestrationEvent::MessageDelivered { .. } => {}
         }
     }
 
@@ -110,11 +136,51 @@ impl JobCardPresentationAdapter {
         }
     }
 
+    pub fn set_task_request(
+        &mut self,
+        context: String,
+        children: impl IntoIterator<Item = (Option<String>, Option<String>, String)>,
+    ) {
+        self.context = context;
+        self.requested_children = children
+            .into_iter()
+            .map(|(name, agent, task)| RequestedChild { name, agent, task })
+            .collect();
+    }
+
+    #[must_use]
+    pub fn task_card(&self) -> Option<TaskCardRows> {
+        let group_id = self.group_id.clone()?;
+        let mut children = self.cards_in_source_order();
+        if children.is_empty() {
+            return None;
+        }
+        for (index, child) in children.iter_mut().enumerate() {
+            let requested = self.requested_children.iter().find(|requested| {
+                requested.name.as_deref() == Some(child.agent_id.as_str())
+            }).or_else(|| self.requested_children.get(index));
+            if let Some(requested) = requested {
+                child.summary = Some(requested.task.clone());
+                if let Some(agent) = &requested.agent {
+                    child.agent = agent.clone();
+                }
+            }
+        }
+        Some(TaskCardRows {
+            group_id,
+            context: self.context.clone(),
+            aggregate: self.aggregate_row().expect("task card has children"),
+            children,
+        })
+    }
+
     pub fn clear(&mut self) {
         self.jobs.clear();
         self.agents.clear();
         self.next_ordinal = 0;
         self.group_id = None;
+        self.context.clear();
+        self.requested_children.clear();
     }
 
     #[must_use]
@@ -173,6 +239,22 @@ impl JobCardPresentationAdapter {
             .values()
             .filter(|job| matches!(job.snapshot.status, JobStatus::Queued | JobStatus::Running))
             .count()
+    }
+
+    /// Resolve a human-facing agent label; falls back to the stable id.
+    #[must_use]
+    pub fn agent_display_name(&self, agent_id: &str) -> String {
+        self.agents
+            .get(agent_id)
+            .map(|agent| {
+                let name = agent.display_name.trim();
+                if name.is_empty() {
+                    agent.id.clone()
+                } else {
+                    agent.display_name.clone()
+                }
+            })
+            .unwrap_or_else(|| agent_id.to_owned())
     }
 
     fn upsert_job(&mut self, snapshot: JobSnapshot) {
@@ -261,8 +343,15 @@ fn card_rows(job: &ProjectedJob) -> JobCardRows {
         ordinal: job.ordinal,
         agent_id: snapshot.agent_id.clone(),
         agent: snapshot.agent.clone(),
+        display_name: job
+            .agent
+            .as_ref()
+            .map(|agent| agent.display_name.clone())
+            .unwrap_or_else(|| snapshot.agent_id.clone()),
+        todo_task_id: snapshot.todo_task_id.clone(),
         job_status: snapshot.status,
         agent_status,
+        summary: None,
         rows,
     }
 }
@@ -326,10 +415,10 @@ fn usage_text(usage: &pi_ai::Usage) -> String {
             .filter(|value| *value > 0)
             .sum()
     };
-    if total <= 0 {
-        return String::new();
+    let mut parts = Vec::new();
+    if total > 0 {
+        parts.push(format!("{total} tokens"));
     }
-    let mut parts = vec![format!("{total} tokens")];
     if usage.input > 0 {
         parts.push(format!("{} in", usage.input));
     }
@@ -338,6 +427,9 @@ fn usage_text(usage: &pi_ai::Usage) -> String {
     }
     if usage.cache_read > 0 {
         parts.push(format!("{} cache", usage.cache_read));
+    }
+    if usage.cost.total > 0.0 {
+        parts.push(format!("${:.4}", usage.cost.total));
     }
     parts.join(" · ")
 }
@@ -372,6 +464,9 @@ mod tests {
             agent: "task".to_owned(),
             parent_id: "Main".to_owned(),
             description: Some(format!("work for {agent_id}")),
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
             status,
             created_at: 1_000,
             started_at: None,
@@ -465,10 +560,10 @@ mod tests {
 
     #[test]
     fn result_is_redacted_bounded_and_terminal_update_not_duplicated() {
-        let secret = "sk-live-super-secret-value-do-not-leak";
+        let secret = "credential-redaction-fixture-value";
         let mut adapter = JobCardPresentationAdapter::new();
         let mut snapshot = job("terminal", "Child", JobStatus::Completed);
-        snapshot.result = Some(result("Child", &format!("token={secret} {}", "界".repeat(700)), None));
+        snapshot.result = Some(result("Child", &format!("token={secret} {}", "é".repeat(700)), None));
         let event = OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot };
         adapter.apply_orchestration_event(&event);
         adapter.apply_orchestration_event(&event);
@@ -515,5 +610,29 @@ mod tests {
         assert!(aggregate.text.contains("1 queued"));
         assert!(aggregate.text.contains("1 parked"));
         assert!(aggregate.text.contains("1 completed"));
+    }
+    #[test]
+    fn task_card_groups_children_and_merges_by_stable_job_id() {
+        let mut adapter = JobCardPresentationAdapter::new();
+        adapter.set_task_request(
+            "# Goal\nShip the Task card\n\n# Contract\nKeep stable ids".to_owned(),
+            [
+                (Some("Alpha".to_owned()), Some("reviewer".to_owned()), "Review adapter".to_owned()),
+                (Some("Beta".to_owned()), None, "Render card".to_owned()),
+            ],
+        );
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: job("job-a", "Alpha", JobStatus::Running) });
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: job("job-b", "Beta", JobStatus::Queued) });
+        let mut updated = job("job-a", "Alpha", JobStatus::Completed);
+        updated.result = Some(result("Alpha", "done", None));
+        adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: updated });
+        let card = adapter.task_card().expect("task card");
+        assert_eq!(card.children.len(), 2);
+        assert_eq!(card.children.iter().map(|child| child.job_id.as_str()).collect::<Vec<_>>(), ["job-a", "job-b"]);
+        assert_eq!(card.children[0].summary.as_deref(), Some("Review adapter"));
+        assert_eq!(card.children[0].agent, "reviewer");
+        assert_eq!(card.children[0].job_status, JobStatus::Completed);
+        assert_eq!(card.children[1].job_status, JobStatus::Queued);
+        assert!(card.context.contains("# Contract"));
     }
 }

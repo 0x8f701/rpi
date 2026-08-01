@@ -1,6 +1,6 @@
 # Export and share
 
-`pi` can export a session to a self-contained HTML file or to a Pi v3 JSONL
+`rpi` can export a session to a self-contained HTML file or to a Pi v3 JSONL
 branch, and it can share a session as a private GitHub gist. The export step
 needs no model, auth, or network access; only gist sharing requires the `gh`
 CLI.
@@ -9,16 +9,16 @@ CLI.
 
 ```sh
 # Export a session file to a self-contained HTML file
-pi export <agent-dir>/sessions/--cwd--/timestamp_id.jsonl
+rpi export <agent-dir>/sessions/--cwd--/timestamp_id.jsonl
 
 # Export to a specific path
-pi export session.jsonl --output report.html
+rpi export session.jsonl --output report.html
 
 # Export the current branch as JSONL (suitable for --resume)
-pi export session.jsonl --jsonl
+rpi export session.jsonl --jsonl
 
 # JSONL output with an explicit path
-pi export session.jsonl --jsonl --output backup.jsonl
+rpi export session.jsonl --jsonl --output backup.jsonl
 ```
 
 Source: `crates/pi-cli/src/args.rs:232-247`,

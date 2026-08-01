@@ -1,7 +1,7 @@
 # Security
 
 This page describes the trust boundaries and hardening that are implemented in
-the current `pi` source. Every protection below is source-grounded; unsupported
+the current `rpi` source. Every protection below is source-grounded; unsupported
 surfaces are called out explicitly rather than with vague limitations.
 
 - [Trust boundary and project-local resources](#trust-boundary-and-project-local-resources)
@@ -40,7 +40,7 @@ headless mode an unset `"ask"` decision is treated as **untrusted**, so pass
 `-a` / `--approve` when you need project-local resources:
 
 ```sh
-pi --mode json --approve "what does this project do?"
+rpi --mode json --approve "what does this project do?"
 ```
 
 Trust-gated project-local resources include skills, prompts, themes,
@@ -125,7 +125,7 @@ managed update state. Source: `crates/pi-cli/src/self_update.rs`.
 
 ## Structured stdout and protocol isolation
 
-`pi` keeps structured output channels separate from interactive terminal
+`rpi` keeps structured output channels separate from interactive terminal
 controls.
 
 - `--mode json` emits one JSON line per application event and flushes after each
@@ -179,7 +179,7 @@ When an extension process is spawned:
   `crates/pi-coding/src/extensions.rs`.
 
 Bun is resolved from `PATH` or from the absolute executable in
-`PI_BUN_EXECUTABLE`; the bridge source is bundled into `pi` and materialized
+`PI_BUN_EXECUTABLE`; the bridge source is bundled into `rpi` and materialized
 independently of the installed package location. Source:
 `crates/pi-coding/src/extensions.rs::resolve_bun_executable`.
 
@@ -242,7 +242,7 @@ terminal.
 
 ## Installer and update checksums / atomicity
 
-`install.sh`, `install.ps1`, and `pi update --self` all follow the same
+`install.sh`, `install.ps1`, and `rpi update --self` all follow the same
 pattern. The full update mechanics are documented in [`update.md`](update.md);
 the security-relevant parts are:
 
@@ -263,7 +263,7 @@ the security-relevant parts are:
   Source: `install.ps1` and `crates/pi-cli/src/self_update.rs`.
 - `update-state.json` is written atomically (temp file + rename) and is rolled
   back if activation or smoke testing fails. On Windows, activation is deferred
-  to a short-lived PowerShell process that runs after the current `pi` process
+  to a short-lived PowerShell process that runs after the current `rpi` process
   exits. Source: `crates/pi-cli/src/self_update.rs`.
 - Concurrent installs are serialized: `install.sh` uses a PID-based lockfile;
   `install.ps1` uses a named mutex; `self_update.rs` acquires an install lock.
@@ -294,5 +294,5 @@ and [`packages.md`](packages.md).
 
 ## Reporting issues
 
-If you find a security issue in `pi`, please open a private issue or contact
+If you find a security issue in `rpi`, please open a private issue or contact
 the maintainers before disclosing publicly.

@@ -7,7 +7,7 @@
 //! ```
 //!
 //! The CLI also exposes the production LF-delimited stdio protocol through
-//! `pi --mode rpc`. This example stays in-process to demonstrate subscribing to
+//! `rpi --mode rpc`. This example stays in-process to demonstrate subscribing to
 //! application events and wrapping them as JSON-RPC-style notifications.
 
 use anyhow::Result;

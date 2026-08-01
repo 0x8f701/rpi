@@ -27,14 +27,14 @@ mod tests {
         );
         assert_eq!(
             output.plain_text(),
-            "┌───────┬─────────┬────────┐\n│left   │ middle  │   right│\n├───────┼─────────┼────────┤\n│a      │    b    │       c│\n└───────┴─────────┴────────┘"
+"┌───────┬─────────┬────────┐\n│ left  │ middle  │  right │\n├───────┼─────────┼────────┤\n│ a     │    b    │      c │\n└───────┴─────────┴────────┘"
         );
     }
 
     #[test]
-    fn table_cjk_and_emoji_use_display_width() {
+    fn table_wide_unicode_and_emoji_use_display_width() {
         let output = render(
-            "| 名称 | 状态 |\n| --- | ---: |\n| 東京 | ✅ |\n| rocket | 🚀 |",
+            "| Name | Stat |\n| --- | ---: |\n| Tokyo | ✅ |\n| rocket | 🚀 |",
             19,
         );
         for line in output.plain_lines() {
@@ -42,7 +42,7 @@ mod tests {
         }
         assert_eq!(
             output.plain_text(),
-            "┌─────────┬───────┐\n│名称     │   状态│\n├─────────┼───────┤\n│東京     │     ✅│\n│rocket   │     🚀│\n└─────────┴───────┘"
+"┌─────────┬───────┐\n│ Name    │  Stat │\n├─────────┼───────┤\n│ Tokyo   │    ✅ │\n│ rocket  │    🚀 │\n└─────────┴───────┘"
         );
     }
 
@@ -54,7 +54,7 @@ mod tests {
         );
         assert_eq!(
             output.plain_text(),
-            "┌─────┬─────┐\n│item │detai│\n│     │l    │\n├─────┼─────┤\n│alpha│one  │\n│     │two  │\n│     │three│\n└─────┴─────┘"
+"┌─────┬─────┐\n│ ite │ det │\n│ m   │ ail │\n├─────┼─────┤\n│ alp │ one │\n│ ha  │ two │\n│     │ thr │\n│     │ ee  │\n└─────┴─────┘"
         );
         assert!(
             output
@@ -226,7 +226,7 @@ mod tests {
             "|Language|Paradigm|\n|",
             "|Language|Paradigm|\n||",
             "|Language|Paradigm|\n|---|",
-            "| 名称 | 状态 |",
+            "| Name | Stat |",
             "|a||b|\n| --- | --- | --- |\n|1||3|",
             "|\n| --- |\n| x |",
         ];
@@ -340,7 +340,7 @@ mod tests {
         let output = render("```\n    indented\n\ttabbed\n  two\n```", 30);
         assert_eq!(
             output.plain_text(),
-            "┌─ code\n    indented\n    tabbed\n  two\n└─"
+            "┌─ code\n     indented\n     tabbed\n   two\n└─"
         );
         assert!(output.diagnostics.is_empty());
     }
@@ -365,7 +365,12 @@ mod tests {
                 LineRole::TableHeader,
                 LineRole::TableHeader,
                 LineRole::TableHeader,
+                LineRole::TableHeader,
+                LineRole::TableHeader,
                 LineRole::TableBorder,
+                LineRole::TableBody,
+                LineRole::TableBody,
+                LineRole::TableBody,
                 LineRole::TableBody,
                 LineRole::TableBody,
                 LineRole::TableBody,
@@ -422,7 +427,7 @@ mod tests {
         );
         assert_eq!(
             output.plain_text(),
-            "┌──────────────────────┬───────────────┐\n│a                     │b              │\n├──────────────────────┼───────────────┤\n│``x|y``               │z              │\n│```p|q```             │r              │\n└──────────────────────┴───────────────┘"
+"┌────────────────────┬─────────────────┐\n│ a                  │ b               │\n├────────────────────┼─────────────────┤\n│ x|y                │ z               │\n│ p|q                │ r               │\n└────────────────────┴─────────────────┘"
         );
     }
 
@@ -574,16 +579,16 @@ mod tests {
     }
 
     #[test]
-    fn mixed_cjk_table_and_mermaid_render_deterministically() {
+    fn mixed_wide_unicode_table_and_mermaid_render_deterministically() {
         // Contract: HashMap node upsert + Unicode width must not introduce
         // order/width nondeterminism across repeated renders.
-        let source = "| 名称 | 🚀 |\n| :---: | ---: |\n| 東京 | ok |\n\n```mermaid\nflowchart RL\nA[壹] -->|go| B((二))\n```";
+        let source = "| Name | 🚀 |\n| :---: | ---: |\n| Tokyo | ok |\n\n```mermaid\nflowchart RL\nA[One] -->|go| B((Two))\n```";
         let first = render(source, 28);
         for _ in 0..16 {
             assert_eq!(render(source, 28), first);
         }
         assert!(first.diagnostics.is_empty());
-        assert!(first.plain_text().contains("東京"));
+        assert!(first.plain_text().contains("Tokyo"));
         assert!(first.plain_text().contains("flowchart RL"));
         assert!(first.plain_text().contains("A ─go─▶ B"));
         assert!(
@@ -608,7 +613,7 @@ mod tests {
         let short = render("| a | b |\n| --- | --- |\n| only |", 20);
         assert_eq!(
             short.plain_text(),
-            "┌─────────┬────────┐\n│a        │b       │\n├─────────┼────────┤\n│only     │        │\n└─────────┴────────┘"
+"┌──────────┬───────┐\n│ a        │ b     │\n├──────────┼───────┤\n│ only     │       │\n└──────────┴───────┘"
         );
     }
 
@@ -740,20 +745,158 @@ mod tests {
     }
 
     #[test]
+    fn reported_class_diagram_renders_single_class_card() {
+        // Exact user source: class members + Application --> Session and
+        // Agent ..> AgentTool : via context. One successful classDiagram card.
+        let source = "```mermaid\n\
+classDiagram\n\
+class Application {\n\
++run()\n\
+}\n\
+class Session {\n\
++id: String\n\
+}\n\
+class Agent {\n\
++tools: Vec\n\
+}\n\
+class AgentTool {\n\
++name: String\n\
+}\n\
+Application --> Session\n\
+Agent ..> AgentTool : via context\n\
+```";
+        let output = render(source, 48);
+        let text = output.plain_text();
+        assert_eq!(
+            text.lines().filter(|line| line.contains("┌─ mermaid ·")).count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("┌─ mermaid · classDiagram"), "{text}");
+        assert!(!text.contains("┌─ mermaid · flowchart"), "{text}");
+        assert!(!text.contains("source fallback"), "{text}");
+        assert!(!text.contains("! mermaid:"), "{text}");
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(text.contains("+run()"), "{text}");
+        assert!(text.contains("+id: String"), "{text}");
+        assert!(text.contains("+tools: Vec"), "{text}");
+        assert!(text.contains("+name: String"), "{text}");
+        assert!(text.contains("Application ───▶ Session"), "{text}");
+        assert!(text.contains("Agent ··via context··▶ AgentTool"), "{text}");
+        assert_eq!(
+            output
+                .lines
+                .iter()
+                .filter(|line| {
+                    line.role == LineRole::MermaidBorder && line.text.starts_with("└─")
+                })
+                .count(),
+            1,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn reported_labeled_subgraph_flowchart_renders_single_card() {
+        // Exact user source: flowchart LR + subgraph records["SessionRecord types"].
+        let source = "```mermaid\n\
+flowchart LR\n\
+subgraph records[\"SessionRecord types\"]\n\
+A[Session] --> B[Message]\n\
+B --> C[ToolCall]\n\
+end\n\
+X[User] --> A\n\
+```";
+        let output = render(source, 48);
+        let text = output.plain_text();
+        assert_eq!(
+            text.lines().filter(|line| line.contains("┌─ mermaid ·")).count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("┌─ mermaid · flowchart"), "{text}");
+        assert!(!text.contains("source fallback"), "{text}");
+        assert!(!text.contains("! mermaid:"), "{text}");
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(text.contains("subgraph records · SessionRecord types"), "{text}");
+        assert!(text.contains("end subgraph records"), "{text}");
+        assert!(text.contains("A · Session"), "{text}");
+        assert!(text.contains("B · Message"), "{text}");
+        assert!(text.contains("C · ToolCall"), "{text}");
+        assert!(text.contains("X · User"), "{text}");
+        assert!(text.contains("A ───▶ B"), "{text}");
+        assert!(text.contains("B ───▶ C"), "{text}");
+        assert!(text.contains("X ───▶ A"), "{text}");
+        assert_eq!(
+            output
+                .lines
+                .iter()
+                .filter(|line| {
+                    line.role == LineRole::MermaidBorder && line.text.starts_with("└─")
+                })
+                .count(),
+            1,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn reported_class_and_flow_cards_have_truthful_titles() {
+        let class = parse_mermaid(
+            "classDiagram\nclass Application {\n+run()\n}\nclass Session {\n+id: String\n}\nApplication --> Session\nAgent ..> AgentTool : via context\n",
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(class.nodes.len(), 4);
+        assert_eq!(class.edges.len(), 2);
+
+        let flow = parse_mermaid(
+            "flowchart LR\nsubgraph records[\"SessionRecord types\"]\nA[Session] --> B[Message]\nB --> C[ToolCall]\nend\nX[User] --> A\n",
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(flow.direction, FlowDirection::LeftRight);
+        assert_eq!(flow.nodes.len(), 4);
+        assert_eq!(flow.edges.len(), 3);
+
+        let art_class = render_mermaid_unicode(
+            "classDiagram\nclass Application {\n+run()\n}\nclass Session {\n+id: String\n}\nclass Agent {\n+tools: Vec\n}\nclass AgentTool {\n+name: String\n}\nApplication --> Session\nAgent ..> AgentTool : via context\n",
+            48,
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(art_class.kind, MermaidDiagramKind::ClassDiagram);
+
+        let art_flow = render_mermaid_unicode(
+            "flowchart LR\nsubgraph records[\"SessionRecord types\"]\nA[Session] --> B[Message]\nB --> C[ToolCall]\nend\nX[User] --> A\n",
+            48,
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(art_flow.kind, MermaidDiagramKind::Flowchart);
+    }
+
+    #[test]
     fn plain_text_join_output_is_unchanged() {
         let output = MarkdownRenderOutput {
             lines: vec![
                 NeutralLine {
                     text: "alpha".to_owned(),
                     role: LineRole::Text,
+                    inline_styles: Vec::new(),
+                    language: None,
                 },
                 NeutralLine {
                     text: String::new(),
                     role: LineRole::Text,
+                    inline_styles: Vec::new(),
+                    language: None,
                 },
                 NeutralLine {
                     text: "βeta".to_owned(),
                     role: LineRole::Text,
+                    inline_styles: Vec::new(),
+                    language: None,
                 },
             ],
             diagnostics: Vec::new(),

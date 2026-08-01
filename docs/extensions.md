@@ -1,6 +1,6 @@
 # Extensions and process protocol
 
-`pi` supports long-lived process extensions over the strict versioned LF JSONL
+`rpi` supports long-lived process extensions over the strict versioned LF JSONL
 protocol. A manifest can launch either an existing executable or an optional
 Bun-hosted TypeScript/JavaScript entry through Pi's bundled bridge. Bun remains
 an external child process; Pi does not embed a JavaScript runtime.
@@ -96,7 +96,7 @@ TUI component or theme objects fail explicitly with an actionable
 
 Bun is resolved directly as argv without shell interpolation. Set
 `PI_BUN_EXECUTABLE` to an absolute Bun executable when it is not on `PATH`.
-The bridge source is bundled into `pi` and materialized independently of the
+The bridge source is bundled into `rpi` and materialized independently of the
 installed package location.
 
 See [`examples/bun_extension.ts`](../examples/bun_extension.ts) for commands,

@@ -1,6 +1,6 @@
 # Packages
 
-`pi` supports local-directory and git-based packages. The npm backend is
+`rpi` supports local-directory and git-based packages. The npm backend is
 deliberately deferred and cannot be installed.
 
 Source: `crates/pi-coding/src/packages.rs:1-5` and
@@ -29,51 +29,51 @@ Source: `crates/pi-coding/src/packages.rs:810-903`.
 
 ```sh
 # Install globally (stored in agent settings)
-pi install git:github.com/owner/pi-my-tools
+rpi install git:github.com/owner/pi-my-tools
 
 # Install into project settings (requires project trust)
-pi install ./my-pi-tools --local
+rpi install ./my-pi-tools --local
 
 # Remove a configured package
-pi remove git:github.com/owner/pi-my-tools
+rpi remove git:github.com/owner/pi-my-tools
 
 # List configured packages and their install status
-pi list
+rpi list
 
 # Toggle enabled package resources for global or project scope
-pi config
-pi config -l            # project scope; requires project trust
+rpi config
+rpi config -l            # project scope; requires project trust
 
-# Update pi itself (default when no package flags are given)
-pi update
-pi update --self
+# Update rpi itself (default when no package flags are given)
+rpi update
+rpi update --self
 
 # Update every configured package (also accepts --all)
-pi update --extensions
-pi update --all
+rpi update --extensions
+rpi update --all
 
 # Update one configured package by source identity
-pi update git:github.com/owner/pi-my-tools
-pi update github.com/owner/pi-my-tools
+rpi update git:github.com/owner/pi-my-tools
+rpi update github.com/owner/pi-my-tools
 
-# Update packages and pi itself
-pi update --self --extensions
+# Update packages and rpi itself
+rpi update --self --extensions
 
 # Reinstall self-update even when version and checksum match
-pi update --self --force
+rpi update --self --force
 ```
 
 Source: `crates/pi-cli/src/args.rs:244-285` and
 `crates/pi-cli/src/lib.rs:62-120`.
 
-`pi list` shows the scope (`global` or `project`), source, status
+`rpi list` shows the scope (`global` or `project`), source, status
 (`installed`, `missing`, or `unsupported`), whether a git source is pinned to
 a ref, and the on-disk path for installed packages.
 
 Source: `crates/pi-cli/src/package_commands.rs:34-66` and
 `crates/pi-coding/src/packages.rs:777-800`.
 
-`pi config` discovers resources declared by each package's
+`rpi config` discovers resources declared by each package's
 `package.json#pi` manifest and lets you enable or disable individual extensions,
 skills, prompts, and themes. In a headless environment (stdout is not a TTY) it
 prints deterministic JSON and never blocks. Project scope is refused when the
@@ -82,9 +82,9 @@ project is not trusted.
 Source: `crates/pi-cli/src/package_config.rs:1-16` and
 `crates/pi-cli/src/package_config.rs:542-550`.
 
-`pi update --extensions` reconciles every configured git/local package. Pinned
+`rpi update --extensions` reconciles every configured git/local package. Pinned
 git refs are fetched and reset to the configured ref; unpinned sources follow the
-remote default branch. `npm:` entries are skipped. `pi update PACKAGE` reconciles
+remote default branch. `npm:` entries are skipped. `rpi update PACKAGE` reconciles
 one configured package by identity; matching `npm:` sources produce the deferred
 error.
 
@@ -126,7 +126,7 @@ Source: `crates/pi-coding/src/settings.rs:34-45`.
 - `autoload: true` enables all resources from the package by default.
 - `extensions`, `skills`, `prompts`, `themes` are resource-filter lists. They
   may contain exact resource names, glob patterns, `!` exclusions, and `+` / `-`
-  force-include/exclude tokens used by `pi config`.
+  force-include/exclude tokens used by `rpi config`.
 - Project entries win over global entries with the same package identity.
 
 Source: `crates/pi-coding/src/packages.rs:524-550` and

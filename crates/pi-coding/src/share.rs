@@ -1,10 +1,10 @@
 //! GitHub Gist sharing via the `gh` CLI.
 //!
-//! Creates a **private** gist through `gh gist create --private` using argv
-//! spawning (never shell interpolation). Credentials are handled entirely by
-//! the `gh` CLI — this module never reads, logs, or passes tokens. The viewer
-//! URL is derived from the `PI_SHARE_VIEWER_URL` environment variable
-//! (supporting a `{url}` placeholder) or the documented default.
+//! Creates a **secret** gist through `gh gist create` (gh's default visibility)
+//! using argv spawning (never shell interpolation). Credentials are handled
+//! entirely by the `gh` CLI — this module never reads, logs, or passes tokens.
+//! The viewer URL is derived from the `PI_SHARE_VIEWER_URL` environment
+//! variable (supporting a `{url}` placeholder) or the documented default.
 //!
 //! Fails with an actionable error when `gh` is not installed or not
 //! authenticated.
@@ -112,14 +112,30 @@ fn parse_gist_url(stdout: &str) -> Result<String> {
     )
 }
 
-/// Create a private GitHub gist from a file and return the gist URL.
+/// Build argv for `gh gist create` (excluding the program name).
 ///
-/// Spawns `gh gist create --private --desc <description> <path>` via argv —
-/// never through a shell. The path must already exist.
+/// Visibility flags are intentionally omitted so gh keeps its default
+/// (secret) gist. Pure helper for unit tests and the spawn path.
+#[must_use]
+fn gist_create_args(description: &str, path: &Path) -> Vec<String> {
+    vec![
+        "gist".into(),
+        "create".into(),
+        "--desc".into(),
+        description.into(),
+        path.as_os_str().to_string_lossy().into_owned(),
+    ]
+}
+
+/// Create a secret GitHub gist from a file and return the gist URL.
+///
+/// Spawns `gh gist create --desc <description> <path>` via argv — never
+/// through a shell. Visibility is left to gh's default (secret). The path
+/// must already exist.
 async fn create_gist(path: &Path, description: &str) -> Result<String> {
+    let args = gist_create_args(description, path);
     let output = Command::new("gh")
-        .args(["gist", "create", "--private", "--desc", description])
-        .arg(path)
+        .args(&args)
         .output()
         .await
         .context("failed to spawn `gh gist create`")?;
@@ -139,7 +155,7 @@ async fn create_gist(path: &Path, description: &str) -> Result<String> {
     parse_gist_url(&stdout)
 }
 
-/// Share a session file by exporting it to HTML and uploading to a private
+/// Share a session file by exporting it to HTML and uploading to a secret
 /// gist. Returns the gist and viewer URLs.
 ///
 /// No model, auth, or network access is needed for the export step; only the
@@ -160,7 +176,7 @@ pub async fn share_session_file(
 }
 
 /// Share a live [`crate::Session`] by exporting it and uploading to a
-/// private gist.
+/// secret gist.
 pub async fn share_session(
     session: &crate::Session,
     options: &ExportOptions,
@@ -177,7 +193,7 @@ pub async fn share_session(
 }
 
 /// Share arbitrary HTML content by writing it to a temp file and uploading
-/// to a private gist. The caller is responsible for cleaning up if needed;
+/// to a secret gist. The caller is responsible for cleaning up if needed;
 /// the temp file is in the system temp directory.
 pub async fn share_html_content(
     html: &str,
@@ -250,5 +266,21 @@ mod tests {
     fn parse_gist_url_fails_on_empty() {
         assert!(parse_gist_url("").is_err());
         assert!(parse_gist_url("no url here").is_err());
+    }
+
+    #[test]
+    fn gist_create_args_omits_visibility_flags() {
+        let args = gist_create_args("Pi session export", Path::new("/tmp/export.html"));
+        assert_eq!(
+            args,
+            vec![
+                "gist",
+                "create",
+                "--desc",
+                "Pi session export",
+                "/tmp/export.html",
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "--private" || a == "--public"));
     }
 }

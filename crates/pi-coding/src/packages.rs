@@ -335,7 +335,7 @@ impl PackageState {
     }
 }
 
-/// One settings entry shown by `pi list`.
+/// One settings entry shown by `rpi list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredPackage {
     pub source: String,
@@ -376,7 +376,7 @@ pub struct PackageUpdate {
 }
 
 /// One configured package with its freshly rediscovered manifest and resources,
-/// for `pi config` resource toggling. Resources are re-read from the on-disk
+/// for `rpi config` resource toggling. Resources are re-read from the on-disk
 /// `package.json#pi` so a corrupt or invalid manifest surfaces as an error
 /// before any settings write.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -915,7 +915,7 @@ impl PackageManager {
     }
 
     /// Re-discover configured packages and their resources for one scope, for
-    /// `pi config`. Refuses project scope when untrusted. npm entries are
+    /// `rpi config`. Refuses project scope when untrusted. npm entries are
     /// skipped. A package whose checkout is missing is omitted; a present but
     /// invalid `package.json#pi` manifest is an error so no settings write can
     /// proceed against a corrupted package.

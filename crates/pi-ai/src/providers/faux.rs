@@ -136,6 +136,16 @@ async fn faux_stream(
             .lock()
             .expect("faux queue")
             .pop_front()
+            .or_else(|| {
+                // Binary black-box tests (and other CI lanes) can supply a
+                // deterministic offline reply without registering a custom
+                // provider. Empty/missing values keep the historical error path.
+                std::env::var("PI_FAUX_RESPONSE")
+                    .ok()
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty())
+                    .map(FauxResponse::text)
+            })
             .unwrap_or_else(|| FauxResponse::error("No more faux responses queued"));
         for block in response.content.clone() {
             let index = out.content.len();

@@ -4,12 +4,12 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
-fn pi_bin() -> String {
-    env!("CARGO_BIN_EXE_pi").to_owned()
+fn rpi_bin() -> String {
+    env!("CARGO_BIN_EXE_rpi").to_owned()
 }
 
 fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
-    let output = Command::new(pi_bin())
+    let output = Command::new(rpi_bin())
         .args(args)
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
@@ -26,7 +26,7 @@ fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
         .current_dir(cwd)
         .stdin(Stdio::null())
         .output()
-        .expect("run pi package command");
+        .expect("run rpi package command");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),

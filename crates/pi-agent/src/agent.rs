@@ -450,6 +450,10 @@ impl Agent {
         self.inner.state.write().await.messages = messages;
     }
 
+    pub async fn clear_error_message(&self) {
+        self.inner.state.write().await.error_message = None;
+    }
+
     pub async fn subscribe<F, Fut>(&self, listener: F) -> Subscription
     where
         F: Fn(AgentEvent, AbortSignal) -> Fut + Send + Sync + 'static,

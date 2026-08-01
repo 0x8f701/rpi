@@ -303,6 +303,7 @@ async fn stream_assistant_response(
         ThinkingLevel::Medium => Some(pi_ai::ThinkingLevel::Medium),
         ThinkingLevel::High => Some(pi_ai::ThinkingLevel::High),
         ThinkingLevel::Xhigh => Some(pi_ai::ThinkingLevel::XHigh),
+        ThinkingLevel::Max => Some(pi_ai::ThinkingLevel::Max),
     };
     if let Some(get_api_key) = &config.get_api_key {
         if let Some(api_key) = get_api_key(&config.model.provider) {

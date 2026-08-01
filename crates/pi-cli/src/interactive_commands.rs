@@ -6,6 +6,9 @@ pub struct BuiltinCommand {
     pub name: &'static str,
     pub description: &'static str,
     pub argument_hint: Option<&'static str>,
+    /// When true, bare `/{name}` is rejected with usage before dispatch.
+    /// Must match real parsers — optional-arg commands stay false.
+    pub requires_arguments: bool,
 }
 
 /// Source that supplies an executable interactive command.
@@ -25,7 +28,9 @@ pub struct InteractiveCommand {
     pub source: CommandSource,
 }
 
-/// Build the collision-free executable catalog shared by help, completion, and dispatch.
+/// Build the full collision-free executable catalog for dispatch and source resolution.
+///
+/// Help and slash completion use [`visible_catalog`] / [`is_primary_command`] instead.
 #[must_use]
 pub fn executable_catalog(application: &pi_coding::Application) -> (Vec<InteractiveCommand>, Vec<String>) {
     let mut commands = BUILTIN_COMMANDS
@@ -54,19 +59,21 @@ pub fn executable_catalog(application: &pi_coding::Application) -> (Vec<Interact
                 source: CommandSource::Prompt,
             });
         }
-        if resources.settings.enable_skill_commands.unwrap_or(true) {
-            for skill in &resources.skills {
-                let name = format!("skill:{}", skill.name);
-                if builtin_names.contains(name.as_str()) || !dynamic_names.insert(name.clone()) {
-                    diagnostics.push(format!("Skill command '/{name}' conflicts with another command and was excluded from autocomplete"));
-                    continue;
-                }
-                commands.push(InteractiveCommand {
-                    name,
-                    description: skill.description.clone(),
-                    source: CommandSource::Skill,
-                });
+        for command in application
+            .commands_catalog()
+            .into_iter()
+            .filter(|command| command.source == "skill")
+        {
+            let name = command.name;
+            if builtin_names.contains(name.as_str()) || !dynamic_names.insert(name.clone()) {
+                diagnostics.push(format!("Skill command '/{name}' conflicts with another command and was excluded from autocomplete"));
+                continue;
             }
+            commands.push(InteractiveCommand {
+                name,
+                description: command.description.unwrap_or_else(|| "Installed skill".to_owned()),
+                source: CommandSource::Skill,
+            });
         }
     }
     if let Some(runtime) = application.extension_runtime() {
@@ -90,37 +97,50 @@ pub fn executable_catalog(application: &pi_coding::Application) -> (Vec<Interact
     (commands, diagnostics)
 }
 
+/// Built-ins shown in slash completion and `/help`. Hidden commands stay manually executable.
+pub const PRIMARY_COMMAND_NAMES: &[&str] = &[
+    "settings",
+    "model",
+    "branch",
+    "resume",
+    "fork",
+    "export",
+    "agents",
+    "compact",
+    "ps",
+    "loop",
+    "goal",
+    "workflow",
+];
+
+/// True when `name` is part of the visible primary slash surface.
+#[must_use]
+pub fn is_primary_command(name: &str) -> bool {
+    PRIMARY_COMMAND_NAMES.contains(&name)
+}
+
+/// Visible primary built-ins for slash completion and help listings.
+#[must_use]
+pub fn visible_catalog() -> Vec<InteractiveCommand> {
+    PRIMARY_COMMAND_NAMES
+        .iter()
+        .filter_map(|name| {
+            builtin(name).map(|command| InteractiveCommand {
+                name: command.name.to_owned(),
+                description: command.description.to_owned(),
+                source: CommandSource::Builtin,
+            })
+        })
+        .collect()
+}
+
 /// Expand a prompt-template or skill command into the user prompt it executes.
 pub fn expand_resource_command(
     application: &pi_coding::Application,
     name: &str,
     arguments: &str,
 ) -> anyhow::Result<Option<String>> {
-    let Some(resources) = application.resource_snapshot() else {
-        return Ok(None);
-    };
-    if let Some(template) = resources.prompts.iter().find(|template| template.name == name) {
-        return Ok(Some(pi_coding::substitute_args(
-            &template.content,
-            &pi_coding::parse_command_args(arguments),
-        )));
-    }
-    let Some(skill_name) = name.strip_prefix("skill:") else {
-        return Ok(None);
-    };
-    if !resources.settings.enable_skill_commands.unwrap_or(true) {
-        return Ok(None);
-    }
-    let Some(skill) = resources.skills.iter().find(|skill| skill.name == skill_name) else {
-        return Ok(None);
-    };
-    let content = std::fs::read_to_string(&skill.file_path)?;
-    let body = strip_frontmatter(&content).trim();
-    let block = format!(
-        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
-        skill.name, skill.file_path, skill.base_dir, body
-    );
-    Ok(Some(if arguments.is_empty() { block } else { format!("{block}\n\n{arguments}") }))
+    application.expand_resource_command(name, arguments)
 }
 
 /// Parse `/run` arguments into `(command_name, remainder)`.
@@ -196,12 +216,6 @@ pub async fn invoke_extension_chain(
     Ok(outputs)
 }
 
-fn strip_frontmatter(content: &str) -> &str {
-    let Some(rest) = content.strip_prefix("---\n") else {
-        return content;
-    };
-    rest.find("\n---\n").map_or(content, |end| &rest[end + 5..])
-}
 
 /// Commands implemented by both full-screen and line-oriented interactive modes.
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
@@ -209,206 +223,255 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         name: "help",
         description: "Show available commands",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "settings",
         description: "Inspect and edit schema-driven settings",
         argument_hint: Some("[list|search|set|reset|validate|apply|cancel] ..."),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "model",
         description: "Select or switch model",
         argument_hint: Some("[provider/model]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "scoped-models",
         description: "Enable or disable models for cycling",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "models",
         description: "List available models",
         argument_hint: Some("[filter]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "export",
         description: "Export session to HTML or JSONL",
         argument_hint: Some("[path]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "import",
         description: "Import and resume a JSONL session",
         argument_hint: Some("<path.jsonl>"),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "share",
-        description: "Share session as a private GitHub gist",
+        description: "Share session as a secret GitHub gist",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "copy",
         description: "Copy the last assistant message",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "name",
         description: "Set or show the session name",
         argument_hint: Some("[name]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "session",
         description: "Show current session information",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "sessions",
         description: "List saved sessions",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "changelog",
         description: "Show version history",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "hotkeys",
         description: "Show keyboard shortcuts",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "theme",
         description: "Show or switch the active theme",
         argument_hint: Some("[name|next|prev]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "branch",
         description: "Create a new branch from a previous message",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "fork",
         description: "Fork from a previous user message",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "clone",
         description: "Clone the current active branch",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "tree",
         description: "Navigate the current session tree",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "loop",
         description: "Run a prompt on a recurring interval",
         argument_hint: Some("[interval] <prompt>"),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "loops",
         description: "List active recurring loops",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "loop-update",
         description: "Update a recurring loop by ID",
         argument_hint: Some("<id> [interval] [prompt]"),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "loop-delete",
         description: "Delete a recurring loop by ID without aborting its active turn",
         argument_hint: Some("<id>"),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "loop-cancel",
         description: "Cancel a recurring loop by ID",
         argument_hint: Some("<id>"),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "goal",
         description: "Create, inspect, pause, resume, complete, or drop the session goal",
-        argument_hint: Some("[show|create [--tokens N] <objective>|pause|resume|complete|drop]"),
+        argument_hint: Some("[show|inspect|create [--tokens N] <objective>|pause|resume|complete|drop]"),
+        requires_arguments: false,
+    },
+    BuiltinCommand {
+        name: "workflow",
+        description: "Create and manage concurrent isolated workflows",
+        argument_hint: Some(
+            "[list|show [id|name]|create <name> <objective>|pause|resume|cancel|integrate|remove]",
+        ),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "todo",
         description: "Show or edit the task list",
         argument_hint: Some("[markdown]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "trust",
         description: "Save a project trust decision",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "login",
         description: "Configure provider authentication",
         argument_hint: Some("[provider]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "logout",
         description: "Remove provider authentication",
         argument_hint: Some("[provider]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "llama",
         description: "Manage the llama.cpp router",
         argument_hint: Some("[status|configure|refresh|load|unload]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "new",
         description: "Start a new session",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "compact",
         description: "Manually compact session context",
         argument_hint: Some("[instructions]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "resume",
         description: "Resume a native or foreign session",
         argument_hint: Some("[path|id|prefix]"),
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "ps",
         description: "List supervised processes",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "process",
         description: "Control a supervised process",
         argument_hint: Some("<start|describe|logs|send|resize|signal|stop|wait> ..."),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "agents",
         description: "Manage agent definitions and model overrides",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "reload",
         description: "Reload extensions and project resources",
         argument_hint: None,
+        requires_arguments: false,
     },
     BuiltinCommand {
         name: "run",
         description: "Run a trusted installed extension command",
         argument_hint: Some("<command> [args]"),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "chain",
         description: "Run trusted installed extension commands in sequence",
         argument_hint: Some("<command> [args] [| <command> [args] ...]"),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "run-chain",
         description: "Alias for /chain over trusted installed extension commands",
         argument_hint: Some("<command> [args] [| <command> [args] ...]"),
+        requires_arguments: true,
     },
     BuiltinCommand {
         name: "quit",
-        description: "Quit pi",
+        description: "Quit rpi",
         argument_hint: None,
+        requires_arguments: false,
     },
 ];
 
@@ -423,6 +486,12 @@ pub fn usage(command: &BuiltinCommand) -> String {
         || format!("/{}", command.name),
         |hint| format!("/{} {hint}", command.name),
     )
+}
+
+/// True when bare `/{name}` must be rejected with usage before dispatch.
+#[must_use]
+pub fn requires_arguments(command: &BuiltinCommand) -> bool {
+    command.requires_arguments
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -639,6 +708,76 @@ mod tests {
             "/resume [path|id|prefix]"
         );
         assert!(builtin("resume-codex").is_none());
+    }
+
+    #[test]
+    fn required_arguments_match_real_parsers_not_hint_heuristics() {
+        let required = BUILTIN_COMMANDS
+            .iter()
+            .filter(|command| requires_arguments(command))
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            required,
+            vec![
+                "import",
+                "loop",
+                "loop-update",
+                "loop-delete",
+                "loop-cancel",
+                "process",
+                "run",
+                "chain",
+                "run-chain",
+            ]
+        );
+        assert!(
+            !requires_arguments(builtin("goal").expect("goal command")),
+            "bare /goal must reach Show semantics"
+        );
+        assert!(requires_arguments(builtin("import").expect("import command")));
+    }
+
+    #[test]
+    fn primary_command_surface_is_explicit_and_stable() {
+        assert_eq!(
+            PRIMARY_COMMAND_NAMES,
+            &[
+                "settings",
+                "model",
+                "branch",
+                "resume",
+                "fork",
+                "export",
+                "agents",
+                "compact",
+                "ps",
+                "loop",
+                "goal",
+                "workflow",
+            ]
+        );
+        assert_eq!(PRIMARY_COMMAND_NAMES.len(), 12);
+        let visible = visible_catalog()
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert_eq!(visible, PRIMARY_COMMAND_NAMES);
+        assert!(is_primary_command("goal"));
+        assert!(is_primary_command("workflow"));
+        assert!(!is_primary_command("help"));
+        assert!(!is_primary_command("import"));
+        assert!(!is_primary_command("workfloww"));
+        assert!(!is_primary_command("skill:release"));
+        assert!(builtin("import").is_some(), "hidden commands remain executable");
+        assert_eq!(
+            usage(builtin("workflow").expect("workflow command")),
+            "/workflow [list|show [id|name]|create <name> <objective>|pause|resume|cancel|integrate|remove]"
+        );
+        assert!(
+            !requires_arguments(builtin("workflow").expect("workflow command")),
+            "bare /workflow must open the workflows page"
+        );
     }
 
     #[test]

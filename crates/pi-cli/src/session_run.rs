@@ -9,21 +9,19 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::args::Cli;
 use crate::commands::{resolve_model_spec, resolve_resume_for_startup};
-use crate::extension_ui::{ExtensionUiAdapter, NonInteractiveExtensionUiHost};
+use crate::extension_ui::ExtensionUiAdapter;
 use crate::models_config::ModelRequestAuth;
+use crate::session_run_blueprint::RunSessionBlueprint;
 use crate::output::{parse_thinking_level, thinking_level_str, warn_line};
 use pi_coding::{
-    AgentCatalog, Application, BranchContext, DEFAULT_COMPACTION_SETTINGS, ExtensionMode,
-    ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeOptions, ExtensionUiHost,
-    OrchestrationConfig, OrchestrationRuntime, OrchestrationSkill, ResourceManager,
-    ResourceManagerOptions, Session, SessionOptions, ToolSelection,
+    Application, BranchContext, DEFAULT_COMPACTION_SETTINGS, ExtensionMode, ResourceManagerOptions,
+    SessionOptions,
 };
 
 static OFFLINE: AtomicBool = AtomicBool::new(false);
@@ -48,7 +46,7 @@ pub struct RunSession {
     pub scoped_models: Option<Vec<pi_ai::Model>>,
 }
 
-fn extension_mode(cli: &Cli) -> ExtensionMode {
+pub(crate) fn extension_mode(cli: &Cli) -> ExtensionMode {
     match cli.mode {
         Some(crate::args::Mode::Json) => ExtensionMode::Json,
         Some(crate::args::Mode::Rpc) => ExtensionMode::Rpc,
@@ -186,7 +184,7 @@ pub(crate) async fn resolve_model_scope(patterns: &[String]) -> Result<Vec<pi_ai
     Ok(scoped)
 }
 
-fn resolve_prompt_input(
+pub(crate) fn resolve_prompt_input(
     input: &str,
     cwd: &Path,
     description: &str,
@@ -248,60 +246,20 @@ fn resolve_session_argument(
     }
 }
 
-fn requested_tool(name: &str, cli: &Cli) -> bool {
-    cli.tools.as_ref().is_some_and(|tools| tools.iter().any(|tool| tool == name))
-}
-
-struct MainToolGates {
-    orchestration: bool,
-    process: bool,
-    glob: bool,
-    todo: bool,
-    goal: bool,
-}
-
-fn main_tool_gates(settings: &pi_coding::Settings, cli: &Cli) -> MainToolGates {
-    let tools_allowed = !cli.no_tools;
-    MainToolGates {
-        orchestration: tools_allowed
-            && (settings.orchestration_enabled()
-                || requested_tool("task", cli)
-                || requested_tool("hub", cli)),
-        process: tools_allowed
-            && (settings.process_tool_enabled() || requested_tool("process", cli)),
-        glob: tools_allowed
-            && (settings.glob_tool_enabled() || requested_tool("glob", cli)),
-        todo: tools_allowed
-            && (settings.todo_tool_enabled() || requested_tool("todo", cli)),
-        goal: tools_allowed && requested_tool("goal", cli),
-    }
-}
-
-fn orchestration_config(
-    snapshot: &pi_coding::ResourceSnapshot,
-    settings: &pi_coding::Settings,
-    parent_model: &pi_ai::Model,
-) -> OrchestrationConfig {
-    let mut config = OrchestrationConfig::new(
-        AgentCatalog::from_agents(snapshot.agents.clone()),
-        snapshot.cwd.join(".pi").join("artifacts"),
-    );
-    config.skills = snapshot.skills.iter().map(OrchestrationSkill::from).collect();
-    if let Some(orchestration) = &settings.orchestration {
-        if let Some(value) = orchestration.max_concurrency { config.max_concurrency = value; }
-        if let Some(value) = orchestration.max_recursion_depth { config.max_recursion_depth = value; }
-        if let Some(value) = orchestration.mailbox_capacity { config.mailbox_capacity = value; }
-        if let Some(value) = orchestration.max_tools_per_agent { config.max_tools_per_agent = value; }
-    }
-    config = config.with_selector_settings(settings.selector.clone().unwrap_or_default());
-    config.agent_settings = settings.agents.clone();
-    config.parent_model = parent_model.clone();
-    config
-}
 
 
 /// Build the live [`Session`] from the parsed CLI flags, applying resume,
 /// model restoration, and recording exactly as the Go CLI does.
+fn workflow_storage_roots(cwd: &Path, agent_dir: &Path) -> (PathBuf, PathBuf) {
+    let namespace = pi_coding::workflow_worktree::WorkflowWorktreeManager::new(cwd)
+        .repository_namespace()
+        .unwrap_or_else(|_| "non-git".to_owned());
+    (
+        agent_dir.join("workflows").join(&namespace),
+        agent_dir.join("workflow-worktrees").join(namespace),
+    )
+}
+
 pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     crate::models_config::load_custom_models()?;
     if let Err(error) = crate::models_config::load_radius_catalog(!offline()).await
@@ -399,21 +357,19 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     resource_options.disable_prompt_templates = cli.no_prompt_templates;
     resource_options.disable_themes = cli.no_themes;
     resource_options.disable_context_files = cli.no_context_files;
-    if let Some(input) = cli.system.as_deref() {
-        let (prompt, path) = resolve_prompt_input(input, &cwd, "system prompt")?;
-        resource_options.system_prompt = Some(prompt);
-        resource_options.system_prompt_path = path;
-    }
-    for input in &cli.append_system_prompt {
-        let (prompt, path) = resolve_prompt_input(input, &cwd, "append system prompt")?;
-        resource_options.append_system_prompt.push(prompt);
-        resource_options.append_system_prompt_paths.push(path);
-    }
-    let resources = ResourceManager::new(resource_options)
-        .context("loading settings and resources")?;
-    let settings = resources.snapshot().settings.clone();
+    let blueprint = RunSessionBlueprint::from_cli(
+        cli,
+        resource_options,
+        matches!(extension_mode(cli), ExtensionMode::Tui | ExtensionMode::Rpc)
+            .then(ExtensionUiAdapter::new),
+    );
+    let preview_resources = pi_coding::ResourceManager::new(
+        blueprint.resource_options_for_startup(&cwd)?,
+    )
+    .context("loading settings and resources")?;
+    let settings = preview_resources.snapshot().settings.clone();
     if cli.verbose {
-        for diagnostic in resources.diagnostics() {
+        for diagnostic in preview_resources.diagnostics() {
             let path = diagnostic.path.as_ref().map_or(String::new(), |path| {
                 format!(" ({})", path.display())
             });
@@ -490,7 +446,6 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         crate::models_config::set_runtime_api_key(&model.provider, key);
     }
     let api_key = auth.api_key;
-    let auth_resolver = crate::models_config::session_auth_resolver(cli.api_key.clone());
 
     // 4. Thinking priority: --think, model suffix, resumed recorded thinking,
     //    settings default, then the existing medium default.
@@ -502,40 +457,10 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         settings.default_thinking_level.map(thinking_level_str),
     );
 
-    // 6. Extensions must be loaded before Session creation so their tools join
-    // the default coding tool set exposed to the agent.
-    let mode = extension_mode(cli);
-    let extension_ui =
-        matches!(mode, ExtensionMode::Tui | ExtensionMode::Rpc).then(ExtensionUiAdapter::new);
-    let ui_host: Option<Arc<dyn ExtensionUiHost>> = extension_ui
-        .as_ref()
-        .map(|adapter| Arc::new(adapter.clone()) as Arc<dyn ExtensionUiHost>)
-        .or_else(|| {
-            Some(Arc::new(NonInteractiveExtensionUiHost::default()) as Arc<dyn ExtensionUiHost>)
-        });
-    let runtime = ExtensionRuntime::process(
-        ui_host,
-        ExtensionRuntimeOptions {
-            mode,
-            ..ExtensionRuntimeOptions::default()
-        },
-    );
-    let permissions = ExtensionPermissionSet::allow_all();
-    let specs = resources
-        .extension_specs(&permissions)
-        .context("validating configured extensions")?;
-    let report = runtime.load(specs).await;
-    if !report.failures.is_empty() {
-        runtime.shutdown().await;
-        return Err(extension_startup_error(&report));
-    }
-
-    let snapshot = resources.snapshot();
-    let system_prompt = snapshot.system_prompt.clone().unwrap_or_default();
-    let mut opts = SessionOptions {
+    let options = SessionOptions {
         model: model.clone(),
         cwd: cwd.clone(),
-        system_prompt,
+        system_prompt: String::new(),
         thinking_level,
         api_key: api_key.clone(),
         compaction: Some(DEFAULT_COMPACTION_SETTINGS),
@@ -544,91 +469,16 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         before_tool_call: None,
         after_tool_call: None,
         stream_fn: None,
-        auth_resolver: Some(auth_resolver.clone()),
+        auth_resolver: None,
     };
-    settings.apply_session_options(&mut opts)?;
-    let gates = main_tool_gates(&settings, cli);
-    let (orchestration, uri_resolver) = if gates.orchestration {
-        let config = orchestration_config(&snapshot, &settings, &model);
-        let resolver_slot = Arc::new(parking_lot::Mutex::new(
-            None::<pi_coding::InternalUriResolverFn>,
-        ));
-        let child_resolver_slot = resolver_slot.clone();
-        let uri_resolver: pi_coding::InternalUriResolverFn = Arc::new(move |uri| {
-            child_resolver_slot
-                .lock()
-                .as_ref()
-                .ok_or_else(|| anyhow!("orchestration URI resolver is not initialized"))?(uri)
-        });
-        let factory = OrchestrationRuntime::child_factory_from_snapshot_and_uri(
-            pi_coding::ChildSessionOptionsSnapshot {
-                model: model.clone(),
-                cwd: cwd.clone(),
-                thinking_level,
-                api_key: api_key.clone(),
-                stream_options: opts.stream_options.clone(),
-                stream_fn: pi_agent::AgentOptions::default().stream_fn,
-                auth_resolver: Some(auth_resolver),
-            },
-            Some(uri_resolver.clone()),
-        );
-        let orchestration = OrchestrationRuntime::new(config, factory)?;
-        *resolver_slot.lock() = Some(orchestration.read_uri_resolver());
-        (Some(orchestration), Some(uri_resolver))
-    } else {
-        (None, None)
-    };
-    let mut additional_tools = runtime.agent_tools();
-    if let Some(orchestration) = &orchestration {
-        additional_tools.extend(orchestration.agent_tools("Main", 0));
-    }
-    let goal_tool = gates.goal.then(pi_coding::GoalToolBinding::default);
-    if let Some(binding) = &goal_tool {
-        additional_tools.push(binding.tool());
-    }
-    let selection = ToolSelection {
-        allow: cli.tools.clone(),
-        deny: cli.exclude_tools.clone(),
-        disable_all: cli.no_tools,
-        disable_builtins: cli.no_builtin_tools,
-        enable_process: gates.process,
-        enable_glob: gates.glob,
-    };
-    let session = if gates.todo {
-        Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
-            opts,
-            additional_tools,
-            selection,
-            pi_coding::ResourceDiscovery::Disabled,
-            workspace.clone(),
-            uri_resolver.clone(),
-        )
-    } else {
-        Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
-            opts,
-            additional_tools,
-            selection,
-            pi_coding::ResourceDiscovery::Disabled,
-            workspace,
-            uri_resolver,
-        )
-    };
-    let session = match session {
-        Ok(session) => session,
-        Err(error) => {
-            if let Some(orchestration) = orchestration { orchestration.shutdown().await; }
-            runtime.shutdown().await;
-            return Err(error).context("building session");
-        }
-    };
-    session.set_steering_mode(settings.steering_mode()).await;
-    session.set_follow_up_mode(settings.follow_up_mode()).await;
-    session.set_retry_settings(settings.retry_settings());
-    if let Err(error) = session.attach_resources(resources).await {
-        if let Some(orchestration) = orchestration { orchestration.shutdown().await; }
-        runtime.shutdown().await;
-        return Err(error).context("attaching settings and resources");
-    }
+    let candidate = blueprint.build(&cwd, options).await?;
+    let crate::session_run_blueprint::RunSessionCandidate {
+        session,
+        extension_runtime: runtime,
+        extension_permissions: permissions,
+        orchestration,
+        goal_tool,
+    } = candidate;
 
     let setup_result: Result<()> = async {
         if let Some(path) = &resume_path {
@@ -684,6 +534,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     }
 
     let application = Application::new_with_extensions(session, runtime, permissions).await;
+    application.attach_runtime_factory(Arc::new(blueprint.clone()))?;
     if resume_path.is_some() {
         application.prepare_resumed_goal(cli.fork.is_some())?;
     }
@@ -696,9 +547,18 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
             return Err(error);
         }
     }
+    let agent_dir = pi_coding::agent_dir_path();
+    let (workflow_store_root, workflow_worktree_root) = workflow_storage_roots(&cwd, &agent_dir);
+    if let Err(error) = application
+        .setup_workflows(cwd.clone(), workflow_store_root, workflow_worktree_root)
+        .await
+    {
+        application.cleanup().await;
+        return Err(error);
+    }
     Ok(RunSession {
         application,
-        extension_ui,
+        extension_ui: blueprint.extension_ui(),
         model,
         scoped_models,
     })
@@ -719,11 +579,36 @@ where
         let command = crate::goal_commands::parse_interactive_goal_command(
             (!argument.trim().is_empty()).then_some(argument.trim()),
         )?;
-        let output = crate::goal_commands::execute_interactive_goal_command(application, command)?;
+        let output = crate::goal_commands::execute_interactive_goal_command(application, command).await?;
         writer.write_all(output.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.flush()?;
         return Ok(output);
+    }
+    if let Some(argument) = prompt.trim().strip_prefix("/workflow") {
+        // Exact prefix: "/workflow" must not match "/workfloww".
+        if argument.is_empty() || argument.starts_with(char::is_whitespace) {
+            let rest = argument.trim_start();
+            let command = crate::workflow_commands::parse_interactive_workflow_command(
+                (!rest.is_empty()).then_some(rest),
+            )?;
+            let effect =
+                crate::workflow_commands::execute_interactive_workflow_on_application(
+                    application,
+                    command,
+                )
+                .await?;
+            let output = match effect {
+                crate::workflow_commands::WorkflowCommandEffect::OpenPage => {
+                    "Open the workflows page in the full-screen TUI (bare /workflow).".to_owned()
+                }
+                crate::workflow_commands::WorkflowCommandEffect::Message(message) => message,
+            };
+            writer.write_all(output.as_bytes())?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+            return Ok(output);
+        }
     }
     if prompt.trim().is_empty() {
         bail!("print mode requires a prompt");
@@ -740,7 +625,7 @@ pub async fn run_print(application: &Application, prompt: &str) -> Result<String
     run_print_to(application, prompt, &mut stdout, ansi).await
 }
 
-/// `pi --print` / non-interactive text entrypoint.
+/// `rpi --print` / non-interactive text entrypoint.
 pub async fn print_mode(cli: &Cli) -> Result<()> {
     let prompts = cli
         .prompt
@@ -762,7 +647,7 @@ pub async fn print_mode(cli: &Cli) -> Result<()> {
     result
 }
 
-fn extension_startup_error(report: &pi_coding::ExtensionLoadReport) -> anyhow::Error {
+pub(crate) fn extension_startup_error(report: &pi_coding::ExtensionLoadReport) -> anyhow::Error {
     anyhow!(
         "extension startup rejected {} extension(s): {}",
         report.failures.len(),
@@ -789,9 +674,66 @@ mod tests {
     use pi_agent::ThinkingLevel;
     use pi_ai::{Model, SimpleStreamOptions};
     use pi_coding::{
-        AgentDefinition, AgentDefinitionSource, ChildSessionFactory, ResourceSnapshot, Settings,
-        TaskItem, TrustDecision, TrustResolution,
+        AgentDefinition, AgentDefinitionSource, ChildSessionFactory, GoalToolBinding,
+        OrchestrationRuntime, ResourceDiscovery, ResourceSnapshot, Session, Settings, TaskItem,
+        ToolSelection, TrustDecision, TrustResolution,
     };
+
+    fn blueprint(cli: &Cli) -> RunSessionBlueprint {
+        RunSessionBlueprint::from_cli(
+            cli,
+            ResourceManagerOptions::new(std::env::current_dir().expect("cwd")),
+
+            None,
+        )
+    }
+
+    #[test]
+    fn workflow_storage_roots_are_stable_and_repository_scoped() {
+        fn init_repo(path: &Path) {
+            fs::create_dir_all(path).expect("repo directory");
+            for args in [
+                vec!["init"],
+                vec!["config", "user.name", "Pi Test"],
+                vec!["config", "user.email", "pi@example.test"],
+            ] {
+                let status = std::process::Command::new("git")
+                    .args(["-c", "init.defaultBranch=main"])
+                    .args(args)
+                    .current_dir(path)
+                    .status()
+                    .expect("git command");
+                assert!(status.success());
+            }
+            fs::write(path.join("README.md"), "base\n").expect("base file");
+            let status = std::process::Command::new("git")
+                .args(["add", "README.md"])
+                .current_dir(path)
+                .status()
+                .expect("git add");
+            assert!(status.success());
+            let status = std::process::Command::new("git")
+                .args(["-c", "commit.gpgsign=false", "commit", "-m", "initial"])
+                .current_dir(path)
+                .status()
+                .expect("git commit");
+            assert!(status.success());
+        }
+
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let agent_dir = sandbox.path().join("agent");
+        let first = sandbox.path().join("first");
+        let second = sandbox.path().join("second");
+        init_repo(&first);
+        init_repo(&second);
+
+        let first_roots = workflow_storage_roots(&first, &agent_dir);
+        assert_eq!(first_roots, workflow_storage_roots(&first, &agent_dir));
+        let second_roots = workflow_storage_roots(&second, &agent_dir);
+        assert_ne!(first_roots, second_roots);
+        assert_eq!(first_roots.0.parent(), Some(agent_dir.join("workflows").as_path()));
+        assert_eq!(first_roots.1.parent(), Some(agent_dir.join("workflow-worktrees").as_path()));
+    }
 
     #[test]
     fn settings_and_cli_selection_drive_identical_initial_tool_gates() {
@@ -803,35 +745,73 @@ mod tests {
             glob: Some(true),
             ..pi_coding::OrchestrationSettings::default()
         });
-        let cli = <Cli as clap::Parser>::try_parse_from(["pi"]).expect("default cli");
-        let gates = main_tool_gates(&settings, &cli);
-        assert!(gates.orchestration);
-        assert!(gates.process);
-        assert!(gates.todo);
-        assert!(gates.glob);
-        assert!(!gates.goal);
+        let cli = <Cli as clap::Parser>::try_parse_from(["rpi"]).expect("default cli");
+        let gates = blueprint(&cli).test_tool_gates(&settings);
+        assert_eq!(gates, (true, true, true, true, true));
 
         let selected = <Cli as clap::Parser>::try_parse_from([
-            "pi",
+            "rpi",
             "--tools",
             "task,hub,process,todo,glob,goal",
         ])
         .expect("selected tools");
-        let gates = main_tool_gates(&Settings::default(), &selected);
-        assert!(gates.orchestration);
-        assert!(gates.process);
-        assert!(gates.todo);
-        assert!(gates.glob);
-        assert!(gates.goal);
+        let gates = blueprint(&selected).test_tool_gates(&Settings::default());
+        assert_eq!(gates, (true, true, true, true, true));
 
-        let disabled = <Cli as clap::Parser>::try_parse_from(["pi", "--no-tools"])
+        let excluded = <Cli as clap::Parser>::try_parse_from([
+            "rpi",
+            "--exclude-tools",
+            "goal",
+        ])
+        .expect("excluded goal tool");
+        let gates = blueprint(&excluded).test_tool_gates(&Settings::default());
+        assert!(!gates.4);
+
+        let disabled = <Cli as clap::Parser>::try_parse_from(["rpi", "--no-tools"])
             .expect("disabled tools");
-        let gates = main_tool_gates(&settings, &disabled);
-        assert!(!gates.orchestration);
-        assert!(!gates.process);
-        assert!(!gates.todo);
-        assert!(!gates.glob);
-        assert!(!gates.goal);
+        let gates = blueprint(&disabled).test_tool_gates(&settings);
+        assert_eq!(gates, (false, false, false, false, false));
+    }
+
+    #[test]
+    fn goal_catalog_defaults_on_but_no_tools_and_explicit_exclude_win() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let options = || SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: SimpleStreamOptions::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        };
+        let with_selection = |selection: ToolSelection| {
+            Session::new_with_additional_tools_filtered_and_discovery(
+                options(),
+                vec![GoalToolBinding::default().tool()],
+                selection,
+                ResourceDiscovery::Disabled,
+            )
+            .expect("session")
+            .get_active_tool_names()
+        };
+
+        assert_eq!(with_selection(ToolSelection::default()), ["goal"]);
+        assert!(with_selection(ToolSelection {
+            deny: vec!["goal".to_owned()],
+            ..ToolSelection::default()
+        })
+        .is_empty());
+        assert!(with_selection(ToolSelection {
+            disable_all: true,
+            ..ToolSelection::default()
+        })
+        .is_empty());
     }
 
     #[test]
@@ -892,7 +872,11 @@ mod tests {
         };
         // Empty settings.agents → no per-agent model override.
         let settings = Settings::default();
-        let config = orchestration_config(&snapshot, &settings, &parent_model);
+        let config = crate::session_run_blueprint::test_orchestration_config(
+            &snapshot,
+            &settings,
+            &parent_model,
+        );
         assert_eq!(config.parent_model.provider, parent_model.provider);
         assert_eq!(config.parent_model.id, parent_model.id);
 
@@ -935,6 +919,7 @@ mod tests {
                     id: "Child".to_owned(),
                     agent: "task".to_owned(),
                     assignment: "inherit parent model".to_owned(),
+                    todo_task_id: None,
                 }],
             )
             .expect("spawn");

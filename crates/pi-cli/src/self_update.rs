@@ -30,7 +30,8 @@ const FILE_LIMIT: u64 = 1024 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const STALE_LOCK_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+const LOCK_OWNER_LIMIT: u64 = 64;
+const STALE_MALFORMED_LOCK_AGE: Duration = Duration::from_secs(5);
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize)]
@@ -205,7 +206,7 @@ pub async fn startup_notice() -> Option<String> {
     }
     notice.push_str(" — ");
     notice.push_str(&latest.release.html_url);
-    notice.push_str(" (run `pi update --self`)");
+    notice.push_str(" (run `rpi update --self`)");
     Some(notice)
 }
 
@@ -215,7 +216,7 @@ pub async fn update_self(force: bool) -> Result<()> {
         bail!("self-update is unavailable while PI_OFFLINE is enabled");
     }
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
-        .context("the running pi version is not valid semantic versioning")?;
+        .context("the running rpi version is not valid semantic versioning")?;
     let install = ManagedInstall::detect(&current)?;
     #[cfg(windows)]
     check_deferred_update_result(&install.root)?;
@@ -224,7 +225,7 @@ pub async fn update_self(force: bool) -> Result<()> {
     let latest = select_release(&client, &current).await?;
     if latest.version < current {
         println!(
-            "pi v{current} is newer than latest v{} — {}",
+            "rpi v{current} is newer than latest v{} — {}",
             latest.version, latest.release.html_url
         );
         return Ok(());
@@ -261,7 +262,7 @@ pub async fn update_self(force: bool) -> Result<()> {
         .await?;
     let expected = expected_checksum(&sums_path, &asset_name)?;
     if !force && latest.version == current && install.state.installed_sha256 == expected {
-        println!("pi v{current} is already up to date.");
+        println!("rpi v{current} is already up to date.");
         return Ok(());
     }
 
@@ -295,7 +296,7 @@ pub async fn update_self(force: bool) -> Result<()> {
     if cfg!(windows) {
         println!("The verified update will activate after this process exits.");
     } else {
-        println!("pi v{} installed successfully.", latest.version);
+        println!("rpi v{} installed successfully.", latest.version);
     }
     Ok(())
 }
@@ -414,27 +415,27 @@ impl Platform {
                 "linux",
                 "x86_64",
                 "tar.gz",
-                "pi",
+                "rpi",
             ),
             ("linux", "aarch64") => Self::new(
                 "aarch64-unknown-linux-gnu",
                 "linux",
                 "aarch64",
                 "tar.gz",
-                "pi",
+                "rpi",
             ),
             ("macos", "x86_64") => {
-                Self::new("x86_64-apple-darwin", "macos", "x86_64", "tar.gz", "pi")
+                Self::new("x86_64-apple-darwin", "macos", "x86_64", "tar.gz", "rpi")
             }
             ("macos", "aarch64") => {
-                Self::new("aarch64-apple-darwin", "macos", "aarch64", "tar.gz", "pi")
+                Self::new("aarch64-apple-darwin", "macos", "aarch64", "tar.gz", "rpi")
             }
             ("windows", "x86_64") => Self::new(
                 "x86_64-pc-windows-msvc",
                 "windows",
                 "x86_64",
                 "zip",
-                "pi.exe",
+                "rpi.exe",
             ),
             (os, arch) => bail!("no release asset is published for {os}/{arch}"),
         };
@@ -458,14 +459,14 @@ impl Platform {
     }
 
     fn asset_name(self, version: &Version) -> String {
-        format!("pi-rs-{version}-{}.{}", self.triple, self.extension)
+        format!("rpi-{version}-{}.{}", self.triple, self.extension)
     }
 
     fn installed_name(self, version: &Version, digest: &str) -> String {
         if cfg!(windows) {
-            "pi.exe".to_owned()
+            "rpi.exe".to_owned()
         } else {
-            format!("pi-rs-{version}-{}-{}-sha256-{digest}", self.os, self.arch)
+            format!("rpi-{version}-{}-{}-sha256-{digest}", self.os, self.arch)
         }
     }
 }
@@ -481,9 +482,9 @@ struct ManagedInstall {
 impl ManagedInstall {
     fn detect(current: &Version) -> Result<Self> {
         let executable = env::current_exe()
-            .context("locating the running pi executable")?
+            .context("locating the running rpi executable")?
             .canonicalize()
-            .context("resolving the running pi executable")?;
+            .context("resolving the running rpi executable")?;
         let hinted = match env::var_os("PI_HOME") {
             Some(value) => absolute(PathBuf::from(value))?,
             None if cfg!(windows) => executable
@@ -516,7 +517,7 @@ impl ManagedInstall {
         validate_digest(&state.installed_sha256)?;
         if state.installed_version != current.to_string() {
             bail!(
-                "update state records v{}, but running pi is v{current}; refusing an ambiguous install",
+                "update state records v{}, but running rpi is v{current}; refusing an ambiguous install",
                 state.installed_version
             );
         }
@@ -545,7 +546,7 @@ impl ManagedInstall {
         };
         unique(
             &directory,
-            ".pi-stage",
+            ".rpi-stage",
             if cfg!(windows) { ".exe" } else { "" },
         )
     }
@@ -562,7 +563,7 @@ fn validate_unix(
         bail!("update state contains an invalid installed_binary");
     }
     let expected = format!(
-        "pi-rs-{}-{}-{}-sha256-{}",
+        "rpi-{}-{}-{}-sha256-{}",
         state.installed_version, platform.os, platform.arch, state.installed_sha256
     );
     if state.installed_binary != expected {
@@ -573,27 +574,27 @@ fn validate_unix(
     if recorded.canonicalize()? != executable {
         bail!("running executable does not match managed update state");
     }
-    let active = root.join("bin/pi");
+    let active = root.join("bin/rpi");
     if !fs::symlink_metadata(&active)?.file_type().is_symlink() {
         bail!("{} is not a managed symlink", active.display());
     }
     if fs::read_link(&active)? != PathBuf::from("../downloads").join(&state.installed_binary)
         || active.canonicalize()? != executable
     {
-        bail!("active pi symlink does not match the managed install");
+        bail!("active rpi symlink does not match the managed install");
     }
     Ok(())
 }
 
 #[cfg(windows)]
 fn validate_windows(root: &Path, executable: &Path, state: &UpdateState) -> Result<()> {
-    if state.installed_binary != "pi.exe" {
-        bail!("managed Windows update state must record pi.exe");
+    if state.installed_binary != "rpi.exe" {
+        bail!("managed Windows update state must record rpi.exe");
     }
-    let active = root.join("bin/pi.exe");
+    let active = root.join("bin/rpi.exe");
     reject_symlink(&active, "active executable")?;
     if active.canonicalize()? != executable {
-        bail!("running executable is not the managed pi.exe");
+        bail!("running executable is not the managed rpi.exe");
     }
     Ok(())
 }
@@ -714,7 +715,7 @@ async fn smoke(path: &Path, expected: &Version) -> Result<()> {
         bail!("downloaded binary failed its --version smoke test");
     }
     let version = String::from_utf8(output.stdout)?;
-    if version.trim() != format!("pi {expected}") {
+    if version.trim() != format!("rpi {expected}") {
         bail!(
             "downloaded binary reported unexpected version {:?}",
             version.trim()
@@ -735,9 +736,9 @@ async fn activate(
     let destination = install.root.join("downloads").join(&state.installed_binary);
     reject_symlink_if_exists(&destination, "versioned binary")?;
     let existed = destination.exists();
-    let active = install.root.join("bin/pi");
+    let active = install.root.join("bin/rpi");
     let old_target = fs::read_link(&active)?;
-    let temporary = unique(&install.root.join("bin"), ".pi-activate", "")?;
+    let temporary = unique(&install.root.join("bin"), ".rpi-activate", "")?;
     let mut temporary_guard = RemovePath::new(temporary.clone());
     symlink(
         PathBuf::from("../downloads").join(&state.installed_binary),
@@ -745,7 +746,7 @@ async fn activate(
     )?;
     fs::rename(staged, &destination).context("atomically installing versioned binary")?;
     sync_parent(&destination)?;
-    if let Err(error) = fs::rename(&temporary, &active).context("atomically activating pi") {
+    if let Err(error) = fs::rename(&temporary, &active).context("atomically activating rpi") {
         if !existed {
             let _ = fs::remove_file(&destination);
         }
@@ -776,7 +777,7 @@ fn rollback_unix(
     existed: bool,
 ) -> Result<()> {
     use std::os::unix::fs::symlink;
-    let rollback = unique(&install.root.join("bin"), ".pi-rollback", "")?;
+    let rollback = unique(&install.root.join("bin"), ".rpi-rollback", "")?;
     let mut rollback_guard = RemovePath::new(rollback.clone());
     symlink(old_target, &rollback)?;
     fs::rename(&rollback, active)?;
@@ -801,9 +802,9 @@ async fn activate(
     _expected: &Version,
     lock: &mut InstallLock,
 ) -> Result<()> {
-    let backup = unique(&install.root.join("bin"), ".pi-backup", ".exe")?;
+    let backup = unique(&install.root.join("bin"), ".rpi-backup", ".exe")?;
     let state_new = unique(&install.root, ".update-state", ".json")?;
-    fs::copy(&install.executable, &backup).context("backing up active pi.exe")?;
+    fs::copy(&install.executable, &backup).context("backing up active rpi.exe")?;
     write_state_file(&state_new, state)?;
     lock.arm_windows_activation(WindowsActivationCommand {
         action: "activate",
@@ -817,13 +818,19 @@ async fn activate(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const WINDOWS_LOCKER: &str = r#"param([string]$Root,[int]$ParentId,[string]$Command,[string]$Ready,[string]$Script)
 $ErrorActionPreference='Stop'
 $mutexName='Local\pi-rs-install-' + ($Root -replace '[\\/:]','_')
 $mutex=New-Object Threading.Mutex($false,$mutexName)
+$mutexAcquired=$false
 try {
- [void]$mutex.WaitOne()
+ try {
+  $mutexAcquired=$mutex.WaitOne()
+ } catch [System.Threading.AbandonedMutexException] {
+  $mutexAcquired=$true
+ }
+ if (-not $mutexAcquired) {throw 'failed to acquire install mutex'}
  [IO.File]::WriteAllText($Ready,'ready'+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
  while (-not (Test-Path -LiteralPath $Command)) {
   if (-not (Get-Process -Id $ParentId -ErrorAction SilentlyContinue)) { return }
@@ -833,19 +840,19 @@ try {
  if ($config.action -ne 'activate') { return }
  Wait-Process -Id $ParentId -ErrorAction SilentlyContinue
  Add-Type -TypeDefinition @'
-using System; using System.Runtime.InteropServices; public static class PiMove {[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] public static extern bool MoveFileEx(string a,string b,int f);}
+using System; using System.Runtime.InteropServices; public static class RpiMove {[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] public static extern bool MoveFileEx(string a,string b,int f);}
 '@
  try {
-  if (-not [PiMove]::MoveFileEx($config.staged,$config.destination,1)) { throw 'atomic executable activation failed' }
+  if (-not [RpiMove]::MoveFileEx($config.staged,$config.destination,1)) { throw 'atomic executable activation failed' }
   & $config.destination --version *> $null
   if ($LASTEXITCODE -ne 0) {
-   if (-not [PiMove]::MoveFileEx($config.backup,$config.destination,1)) { throw 'binary failed and rollback failed' }
+   if (-not [RpiMove]::MoveFileEx($config.backup,$config.destination,1)) { throw 'binary failed and rollback failed' }
    & $config.destination --version *> $null
    if ($LASTEXITCODE -ne 0) { throw 'rollback verification failed' }
    throw 'new binary failed; previous binary restored and verified'
   }
-  if (-not [PiMove]::MoveFileEx($config.state_new,$config.state_path,1)) {
-   if (-not [PiMove]::MoveFileEx($config.backup,$config.destination,1)) { throw 'state commit and rollback failed' }
+  if (-not [RpiMove]::MoveFileEx($config.state_new,$config.state_path,1)) {
+   if (-not [RpiMove]::MoveFileEx($config.backup,$config.destination,1)) { throw 'state commit and rollback failed' }
    & $config.destination --version *> $null
    if ($LASTEXITCODE -ne 0) { throw 'rollback verification failed' }
    throw 'state commit failed; previous binary restored and verified'
@@ -857,7 +864,7 @@ using System; using System.Runtime.InteropServices; public static class PiMove {
  }
 } finally {
  Remove-Item -LiteralPath $Command,$Ready,$Script -Force -ErrorAction SilentlyContinue
- try {$mutex.ReleaseMutex()} catch {}
+ if ($mutexAcquired) {try {$mutex.ReleaseMutex()} catch {}}
  $mutex.Dispose()
 }
 "#;
@@ -1098,31 +1105,7 @@ impl InstallLock {
         }
         #[cfg(unix)]
         {
-            let path = root.join(".install.lock");
-            reject_symlink_if_exists(&path, "install lock")?;
-            let owner = std::process::id().to_string();
-            let deadline = tokio::time::Instant::now() + LOCK_TIMEOUT;
-            loop {
-                match OpenOptions::new().create_new(true).write(true).open(&path) {
-                    Ok(mut file) => {
-                        writeln!(file, "{owner}")?;
-                        file.sync_all()?;
-                        return Ok(Self { path, owner });
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        reject_symlink_if_exists(&path, "install lock")?;
-                        if stale_lock(&path)? {
-                            fs::remove_file(&path).context("removing stale install lock")?;
-                            continue;
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            bail!("timed out waiting for another pi install");
-                        }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                    Err(error) => return Err(error).context("creating install lock"),
-                }
-            }
+            acquire_unix_install_lock(root, LOCK_TIMEOUT, Duration::from_millis(250)).await
         }
     }
 
@@ -1133,6 +1116,84 @@ impl InstallLock {
             .ok_or_else(|| anyhow!("Windows install mutex handoff is unavailable"))?
             .activate(&command)
     }
+}
+
+#[cfg(unix)]
+async fn acquire_unix_install_lock(
+    root: &Path,
+    timeout: Duration,
+    retry_delay: Duration,
+) -> Result<InstallLock> {
+    let path = root.join(".install.lock");
+    reject_symlink_if_exists(&path, "install lock")?;
+    let owner = std::process::id().to_string();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{owner}")?;
+                file.sync_all()?;
+                return Ok(InstallLock { path, owner });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                reject_symlink_if_exists(&path, "install lock")?;
+                if stale_lock(&path)? {
+                    fs::remove_file(&path).context("removing stale install lock")?;
+                    continue;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("timed out waiting for another rpi install");
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error).context("creating install lock"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+#[cfg(unix)]
+fn process_liveness(pid: i32) -> ProcessLiveness {
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Ok(()) => ProcessLiveness::Alive,
+        Err(nix::errno::Errno::ESRCH) => ProcessLiveness::Dead,
+        Err(nix::errno::Errno::EPERM) => ProcessLiveness::Unknown,
+        Err(_) => ProcessLiveness::Unknown,
+    }
+}
+
+#[cfg(unix)]
+fn parse_lock_owner(bytes: &[u8]) -> Option<i32> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<i32>().ok().filter(|pid| *pid > 0)
+}
+
+#[cfg(unix)]
+fn stale_lock_with(path: &Path, probe: impl FnOnce(i32) -> ProcessLiveness) -> Result<bool> {
+    let mut bytes = Vec::with_capacity((LOCK_OWNER_LIMIT + 1) as usize);
+    File::open(path)?
+        .take(LOCK_OWNER_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 <= LOCK_OWNER_LIMIT
+        && let Some(pid) = parse_lock_owner(&bytes)
+    {
+        return Ok(probe(pid) == ProcessLiveness::Dead);
+    }
+    let modified = fs::metadata(path)?.modified()?;
+    Ok(SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age >= STALE_MALFORMED_LOCK_AGE))
 }
 
 impl Drop for InstallLock {
@@ -1148,10 +1209,7 @@ impl Drop for InstallLock {
 }
 #[cfg(unix)]
 fn stale_lock(path: &Path) -> Result<bool> {
-    let modified = fs::metadata(path)?.modified()?;
-    Ok(SystemTime::now()
-        .duration_since(modified)
-        .is_ok_and(|age| age >= STALE_LOCK_AGE))
+    stale_lock_with(path, process_liveness)
 }
 
 struct ScratchDir {
@@ -1159,7 +1217,7 @@ struct ScratchDir {
 }
 impl ScratchDir {
     fn new(root: &Path) -> Result<Self> {
-        let path = unique(root, ".pi-update", "")?;
+        let path = unique(root, ".rpi-update", "")?;
         fs::create_dir(&path)?;
         Ok(Self { path })
     }
@@ -1322,7 +1380,7 @@ fn timestamp() -> Result<u64> {
 
 fn unknown_install() -> anyhow::Error {
     anyhow!(
-        "running pi is not an installer-managed ~/.pi-rs binary; refusing to overwrite an unknown install method (use install.sh or install.ps1)"
+        "running rpi is not an installer-managed ~/.pi-rs binary; refusing to overwrite an unknown install method (use install.sh or install.ps1)"
     )
 }
 
@@ -1342,9 +1400,9 @@ mod tests {
     fn Windows_activation_payload_is_json_without_secrets_or_shell_quoting() {
         let command = WindowsActivationCommand {
             action: "activate",
-            staged: PathBuf::from(r"C:\path with spaces\pi.new.exe"),
-            destination: PathBuf::from(r"C:\path with spaces\pi.exe"),
-            backup: PathBuf::from(r"C:\path with spaces\pi.backup.exe"),
+            staged: PathBuf::from(r"C:\path with spaces\rpi.new.exe"),
+            destination: PathBuf::from(r"C:\path with spaces\rpi.exe"),
+            backup: PathBuf::from(r"C:\path with spaces\rpi.backup.exe"),
             state_new: PathBuf::from(r"C:\path with spaces\state.new.json"),
             state_path: PathBuf::from(r"C:\path with spaces\update-state.json"),
             status_path: PathBuf::from(r"C:\path with spaces\last-update-result.json"),
@@ -1353,7 +1411,137 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse command");
         assert_eq!(value["action"], "activate");
-        assert_eq!(value["destination"], r"C:\path with spaces\pi.exe");
+        assert_eq!(value["destination"], r"C:\path with spaces\rpi.exe");
+    }
+
+    #[test]
+    fn Windows_locker_recovers_abandoned_mutex_before_signalling_ready() {
+        let catch = WINDOWS_LOCKER
+            .find("catch [System.Threading.AbandonedMutexException]")
+            .expect("abandoned mutex catch");
+        let ownership = WINDOWS_LOCKER[catch..]
+            .find("$mutexAcquired=$true")
+            .map(|offset| catch + offset)
+            .expect("abandoned mutex transfers ownership");
+        let ready = WINDOWS_LOCKER
+            .find("[IO.File]::WriteAllText($Ready")
+            .expect("ready signal");
+        assert!(catch < ownership && ownership < ready);
+        assert!(WINDOWS_LOCKER.contains(
+            "if ($mutexAcquired) {try {$mutex.ReleaseMutex()} catch {}}"
+        ));
+    }
+
+    #[cfg(unix)]
+    fn absent_pid() -> i32 {
+        (i32::MAX - 1024..=i32::MAX)
+            .rev()
+            .find(|pid| process_liveness(*pid) == ProcessLiveness::Dead)
+            .expect("an absent PID near i32::MAX")
+    }
+
+    #[cfg(unix)]
+    fn age_lock(path: &Path) {
+        let old = SystemTime::now()
+            .checked_sub(STALE_MALFORMED_LOCK_AGE + Duration::from_secs(1))
+            .expect("old timestamp");
+        File::options()
+            .write(true)
+            .open(path)
+            .expect("open lock")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("age lock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn Unix_lock_liveness_controls_valid_owner_staleness() {
+        let root = tempfile::tempdir().expect("install root");
+        let path = root.path().join(".install.lock");
+        fs::write(&path, "123\n").expect("owner lock");
+        assert!(stale_lock_with(&path, |_| ProcessLiveness::Dead).expect("dead owner"));
+        age_lock(&path);
+        assert!(!stale_lock_with(&path, |_| ProcessLiveness::Alive).expect("live owner"));
+        assert!(!stale_lock_with(&path, |_| ProcessLiveness::Unknown).expect("unknown owner"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn Unix_lock_protects_fresh_malformed_owner_and_reaps_aged_malformed() {
+        let root = tempfile::tempdir().expect("install root");
+        let path = root.path().join(".install.lock");
+        for content in [Vec::new(), b"not-a-pid\n".to_vec(), vec![b'9'; 65]] {
+            fs::write(&path, &content).expect("malformed lock");
+            assert!(!stale_lock_with(&path, |_| ProcessLiveness::Dead)
+                .expect("fresh malformed owner"));
+            age_lock(&path);
+            assert!(stale_lock_with(&path, |_| ProcessLiveness::Alive)
+                .expect("aged malformed owner"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn Unix_lock_reaps_dead_owner_promptly() {
+        let root = tempfile::tempdir().expect("install root");
+        let path = root.path().join(".install.lock");
+        fs::write(&path, format!("{}\n", absent_pid())).expect("dead owner lock");
+        let started = tokio::time::Instant::now();
+        let lock = acquire_unix_install_lock(
+            root.path(),
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("replace dead owner");
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(
+            fs::read_to_string(&path).expect("active lock"),
+            format!("{}\n", std::process::id())
+        );
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn Unix_lock_live_owner_times_out_without_being_stolen() {
+        let root = tempfile::tempdir().expect("install root");
+        let path = root.path().join(".install.lock");
+        let content = format!("{}\n", std::process::id());
+        fs::write(&path, &content).expect("live owner lock");
+        age_lock(&path);
+        let started = tokio::time::Instant::now();
+        let result = acquire_unix_install_lock(
+            root.path(),
+            Duration::from_millis(80),
+            Duration::from_millis(10),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("live owner lock was stolen"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(fs::read_to_string(&path).expect("preserved lock"), content);
+    }
+
+    #[test]
+    fn release_asset_and_archive_member_use_rpi_names() {
+        let platform = Platform::new(
+            "x86_64-unknown-linux-gnu",
+            "linux",
+            "x86_64",
+            "tar.gz",
+            "rpi",
+        );
+        let version = Version::new(1, 2, 3);
+        assert_eq!(
+            platform.asset_name(&version),
+            "rpi-1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+        );
+        assert_eq!(platform.binary, "rpi");
     }
 
     #[test]

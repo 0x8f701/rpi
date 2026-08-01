@@ -140,14 +140,27 @@ async fn print_mode_expands_text_and_image_arguments() {
 }
 
 #[tokio::test]
-async fn print_mode_executes_goal_command_without_agent_turn() {
+async fn print_mode_goal_command_starts_agent_turn() {
     let cwd = tempfile::tempdir().expect("tempdir");
+    let mut model = Model::default();
+    model.id = "faux-print-goal".into();
+    model.name = "Faux Print Goal".into();
+    model.api = "faux-print-goal".into();
+    model.provider = "faux".into();
+    model.base_url = "http://localhost:0".into();
+    let registration = register_faux_provider(FauxProviderOptions {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        models: vec![model.clone()],
+        chunk_size: 4,
+    });
+    registration.set_responses(vec![FauxResponse::text("goal work")]);
     let session = Session::new(SessionOptions {
-        model: Model::default(),
+        model,
         cwd: cwd.path().to_path_buf(),
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
-        api_key: String::new(),
+        api_key: "faux".into(),
         compaction: None,
         stream_options: Default::default(),
         tools: Some(Vec::new()),
@@ -180,7 +193,9 @@ async fn print_mode_executes_goal_command_without_agent_turn() {
     )
     .await
     .expect("goal command");
-    assert!(result.contains("active · 0/20 tokens · ship cleanly"));
-    assert_eq!(session.history().len(), 0, "goal command must not run the agent");
+    assert!(result.starts_with("Goal work started · active · 0/20 tokens · ship cleanly"), "{result}");
+    application.wait_for_idle().await;
+    assert!(session.history().iter().any(|message| matches!(message, pi_ai::Message::Assistant(_))), "goal command must run the agent");
     assert_eq!(String::from_utf8(output).unwrap(), format!("{result}\n"));
+    registration.unregister();
 }

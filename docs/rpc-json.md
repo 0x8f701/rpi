@@ -1,6 +1,6 @@
 # RPC JSONL protocol
 
-`pi --mode rpc` (and the dedicated `pi-rpc` binary) expose a long-lived,
+`rpi --mode rpc` (and the dedicated `pi-rpc` binary) expose a long-lived,
 LF-delimited JSONL control protocol on stdin/stdout. The protocol is not
 JSON-RPC 2.0: every line is a single self-describing JSON object with a `type`
 discriminator, and every command can carry an optional `id` that the matching
@@ -8,7 +8,7 @@ response echoes.
 
 ## Launching the RPC mode
 
-- `pi --mode rpc [<other pi flags>]` starts the RPC server on stdin/stdout.
+- `rpi --mode rpc [<other rpi flags>]` starts the RPC server on stdin/stdout.
 - `pi-rpc` is a thin wrapper (`crates/pi-cli/src/bin/pi-rpc.rs`) that forces
   `--mode rpc` after the caller's arguments, so the binary always enters RPC
   mode even if a conflicting `--mode` is passed. On fatal initialization error

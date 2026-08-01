@@ -25,7 +25,7 @@ is trusted. Source: `crates/pi-coding/src/resource_manager.rs:49-70`.
 
 ## Project trust
 
-By default, `pi` asks before loading project-local `.pi` resources (skills,
+By default, `rpi` asks before loading project-local `.pi` resources (skills,
 prompts, themes, keybindings, extensions, agents, and package settings). Trust
 decisions are stored in `<agent-dir>/trust.json`, versioned as
 `TRUST_STORE_VERSION = 1`, and scoped to the canonical project path. The
@@ -53,8 +53,8 @@ Allowed values:
 One-run overrides:
 
 ```sh
-pi -a "hello"           # --approve: trust this project's .pi for this run
-pi --no-approve "hello" # refuse project .pi for this run
+rpi -a "hello"           # --approve: trust this project's .pi for this run
+rpi --no-approve "hello" # refuse project .pi for this run
 ```
 
 Headless modes (`--print`, `--mode json`, `--mode rpc`) never prompt. In
@@ -249,7 +249,7 @@ The final level is clamped to the resolved model's supported levels.
 
 Configuration and resources are loaded into an atomic snapshot.
 
-- `pi reload` validates the current settings/resource graph and prints a
+- `rpi reload` validates the current settings/resource graph and prints a
   structured snapshot, including `generation`, `trust`, discovered resources, and
   diagnostics. It always runs headlessly and emits JSON.
 - `SettingsManager::reload()` re-reads global settings and, when the project is
@@ -282,5 +282,5 @@ Source: `crates/pi-cli/src/commands.rs:145-180`,
 ```sh
 export PI_CODING_AGENT_DIR="<workspace>/.my-pi-config"
 mkdir -p "$PI_CODING_AGENT_DIR"
-pi --print "hello"
+rpi --print "hello"
 ```

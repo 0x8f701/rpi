@@ -737,7 +737,7 @@ async fn respond_callback(
         _ => "Bad Gateway",
     };
     let body = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>pi login</title><p>{}</p>",
+        "<!doctype html><meta charset=\"utf-8\"><title>rpi login</title><p>{}</p>",
         html_escape(message)
     );
     let response = format!(

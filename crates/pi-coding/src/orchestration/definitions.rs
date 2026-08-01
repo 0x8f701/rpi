@@ -346,7 +346,8 @@ fn split_agent_model_thinking_suffix(pattern: &str) -> (&str, Option<ThinkingLev
         "low" => ThinkingLevel::Low,
         "medium" => ThinkingLevel::Medium,
         "high" => ThinkingLevel::High,
-        "xhigh" | "max" => ThinkingLevel::Xhigh,
+        "xhigh" => ThinkingLevel::Xhigh,
+        "max" => ThinkingLevel::Max,
         _ => return (trimmed, None),
     };
     (model, Some(thinking_level))
@@ -648,7 +649,8 @@ fn parse_thinking_level(value: &str) -> Result<ThinkingLevel> {
         "low" => Ok(ThinkingLevel::Low),
         "medium" => Ok(ThinkingLevel::Medium),
         "high" => Ok(ThinkingLevel::High),
-        "xhigh" | "max" => Ok(ThinkingLevel::Xhigh),
+        "xhigh" => Ok(ThinkingLevel::Xhigh),
+        "max" => Ok(ThinkingLevel::Max),
         other => bail!("unsupported agent thinking level {other:?}"),
     }
 }
@@ -800,7 +802,7 @@ mod model_resolution_tests {
             .expect("valid model with max suffix must resolve");
         assert_eq!(resolved.model.provider, "cliproxy");
         assert_eq!(resolved.model.id, "gpt-5.6-sol");
-        assert_eq!(resolved.thinking_level, Some(ThinkingLevel::Xhigh));
+        assert_eq!(resolved.thinking_level, Some(ThinkingLevel::Max));
         assert_eq!(
             resolved.matched_pattern.as_deref(),
             Some("cliproxy/gpt-5.6-sol:max"),

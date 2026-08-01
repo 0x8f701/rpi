@@ -4,8 +4,8 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
-fn pi_bin() -> String {
-    env!("CARGO_BIN_EXE_pi").to_owned()
+fn rpi_bin() -> String {
+    env!("CARGO_BIN_EXE_rpi").to_owned()
 }
 
 fn write_config(agent_dir: &Path, settings: &str, providers: &str) {
@@ -26,7 +26,7 @@ fn provider(id: &str, model: &str, key: Option<&str>) -> String {
 }
 
 fn run(agent_dir: &Path, args: &[&str]) -> (bool, String, String) {
-    let output = Command::new(pi_bin())
+    let output = Command::new(rpi_bin())
         .args(args)
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
@@ -78,7 +78,7 @@ fn run(agent_dir: &Path, args: &[&str]) -> (bool, String, String) {
         .env_remove("GOOGLE_CLOUD_PROJECT")
         .stdin(Stdio::null())
         .output()
-        .expect("run pi");
+        .expect("run rpi");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),

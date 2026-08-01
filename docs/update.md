@@ -1,17 +1,17 @@
 # Update safety
 
-`pi` can update itself from GitHub releases and reconcile configured Pi packages.
+`rpi` can update itself from GitHub releases and reconcile configured Pi packages.
 Both paths are designed so a failed update never leaves the installation in an
 unusable state.
 
 ## Update notifications
 
-When you start an interactive session (TUI or REPL), `pi` checks GitHub
+When you start an interactive session (TUI or REPL), `rpi` checks GitHub
 releases in the background. If a newer release exists, a non-fatal status
 message is shown:
 
 ```text
-Update available: current v0.1.0, latest v0.2.0 — summary — URL (run `pi update --self`)
+Update available: current v0.1.0, latest v0.2.0 — summary — URL (run `rpi update --self`)
 ```
 
 Source: `crates/pi-cli/src/self_update.rs:187-213`.
@@ -24,17 +24,19 @@ Two environment variables control this check:
 ## Self-update
 
 ```sh
-pi update          # update pi itself (default when no package flags are given)
-pi update --self   # explicit
-pi update --self --force   # reinstall even when version and checksum match
+rpi update          # update rpi itself (default when no package flags are given)
+rpi update --self   # explicit
+rpi update --self --force   # reinstall even when version and checksum match
 ```
 
 Source: `crates/pi-cli/src/args.rs:270-288`, `crates/pi-cli/src/lib.rs:85-94`.
 
-`pi update --self` downloads the latest GitHub release for the current platform,
+`rpi update --self` downloads the latest GitHub release for the current platform,
 verifies it, smoke-tests it, and activates it atomically. It fails early if
 `PI_OFFLINE` is enabled. The updater expects a managed install layout rooted at
-`$PI_HOME` (default `<workspace>`) with an `update-state.json` file.
+`$PI_HOME` (default `~/.pi-rs` on Unix, `%USERPROFILE%\.pi-rs` on Windows; the
+self-updater otherwise derives the root from the running executable's location)
+with an `update-state.json` file.
 Source: `crates/pi-cli/src/self_update.rs:211-223`, `crates/pi-cli/src/self_update.rs:480-524`.
 
 ### What the self-update does
@@ -42,13 +44,14 @@ Source: `crates/pi-cli/src/self_update.rs:211-223`, `crates/pi-cli/src/self_upda
 1. Selects the release. Stable versions query `/releases/latest`. Prerelease
    versions pick the newest published prerelease. Drafts and unpublished
    releases are rejected.
-2. Locates the platform archive and the release's `SHA256SUMS` file.
+2. Locates the platform archive (`rpi-<version>-<triple>.tar.gz` or `.zip`) and
+   the release's `SHA256SUMS` file.
 3. Enforces size limits: archives are capped at 1 GiB and `SHA256SUMS` at 1 MiB.
 4. Downloads `SHA256SUMS`, looks up the expected digest, and skips the download
    when the installed digest already matches (unless `--force` is used).
 5. Downloads the archive, verifies its SHA-256 digest against `SHA256SUMS`, and
    extracts the binary to a staged path.
-6. Runs a smoke test: the staged binary must report `pi <version>` from
+6. Runs a smoke test: the staged binary must report `rpi <version>` from
    `--version`.
 7. Atomically installs the versioned binary and swaps the active symlink, then
    writes `update-state.json` atomically.
@@ -68,7 +71,7 @@ Sources: `crates/pi-cli/src/self_update.rs:223-304`,
 - **Smoke test** — the downloaded binary must run `--version` successfully
   before activation.
 - **Atomic activation** — the active symlink is swapped with `rename(2)` on Unix
-  and `MoveFileEx` on Windows, so the active `pi` path is never missing during
+  and `MoveFileEx` on Windows, so the active `rpi` path is never missing during
   an update.
 - **Rollback** — if smoke testing, activation, or state writing fails, the
   previous active symlink and `update-state.json` are restored.
@@ -90,7 +93,7 @@ Source: `crates/pi-cli/src/self_update.rs:250-253`,
 On Windows the running executable cannot be replaced while it is executing, so
 the self-updater writes a deferred activation script and a
 `last-update-result.json` status file. The new binary is moved into place by a
-short-lived PowerShell process after the current `pi` process exits.
+short-lived PowerShell process after the current `rpi` process exits.
 Source: `crates/pi-cli/src/self_update.rs:795-875`,
 `crates/pi-cli/src/self_update.rs:936-955`.
 
@@ -106,16 +109,16 @@ Source: `crates/pi-cli/src/self_update.rs:62-73`,
 ## Update packages
 
 ```sh
-pi update --extensions         # reconcile every configured package (--all is an alias)
-pi update OWNER/REPO           # update one configured git or local package
-pi update local:./my-tools     # update a configured local package
-pi update --self --extensions  # update packages, then update pi itself
+rpi update --extensions         # reconcile every configured package (--all is an alias)
+rpi update OWNER/REPO           # update one configured git or local package
+rpi update local:./my-tools     # update a configured local package
+rpi update --self --extensions  # update packages, then update rpi itself
 ```
 
 Source: `crates/pi-cli/src/args.rs:270-288`,
 `crates/pi-cli/src/package_commands.rs:69-94`.
 
-`pi update --extensions` re-clones or checks out every configured git package
+`rpi update --extensions` re-clones or checks out every configured git package
 and re-discovers every configured local package. Git packages are checked out
 into a content-addressed directory under the agent directory. Pinned git refs
 are honored; unpinned sources follow the remote's default branch. Local
@@ -146,7 +149,7 @@ Source: `crates/pi-coding/src/packages.rs:948-954`.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PI_HOME` | `<workspace>` | Install root for the binary and update state |
+| `PI_HOME` | `~/.pi-rs` (Unix) / `%USERPROFILE%\.pi-rs` (Windows) | Install root for the binary and update state |
 | `PI_UPDATE_BASE_URL` | `https://api.github.com/repos/0x8f701/pi-rs/releases` | Release API base (must match the installer scripts) |
 | `GITHUB_TOKEN` | (none) | Authenticate GitHub API calls for release metadata |
 | `PI_OFFLINE` | (none) | Disables all updater networking |

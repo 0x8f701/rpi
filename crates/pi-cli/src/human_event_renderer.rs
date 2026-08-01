@@ -13,6 +13,7 @@ use pi_coding::markdown::{
 };
 
 use crate::output::{DIM, RED, RESET};
+use crate::orchestration_message::orchestration_irc_view;
 
 /// Stateful renderer for the human-facing `ApplicationEvent` stream.
 ///
@@ -140,11 +141,35 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
             }
             AgentEvent::MessageEnd {
                 message: Message::Custom(message),
-            } if pi_coding::loop_message_view(message).is_some() => {
-                let loop_message = pi_coding::loop_message_view(message).expect("guarded loop message");
+            } if orchestration_irc_view(message).is_some() => {
+                let irc = orchestration_irc_view(message).expect("guarded orchestration message");
                 self.ensure_line_boundary()?;
-                self.write_styled_line(DIM, &format!("Loop {} · {}", loop_message.task_id, loop_message.schedule))?;
-                if loop_message.prompt.is_empty() { Ok(()) } else { self.write_markdown(loop_message.prompt) }
+                // Human print has no live agent roster; fall back to stable ids.
+                let label = irc.label(irc.from.as_ref(), irc.to.as_ref());
+                self.write_styled_line(DIM, &label)?;
+                if !irc.body.is_empty() {
+                    self.write_markdown(irc.body.as_ref())?;
+                }
+                if let Some(metadata) = irc.reply_metadata() {
+                    self.write_styled_line(DIM, &metadata)?;
+                }
+                Ok(())
+            }
+            AgentEvent::MessageEnd {
+                message: Message::Custom(message),
+            } if pi_coding::loop_message_view(message).is_some() => {
+                let loop_message =
+                    pi_coding::loop_message_view(message).expect("guarded loop message");
+                self.ensure_line_boundary()?;
+                self.write_styled_line(
+                    DIM,
+                    &format!("Loop {} · {}", loop_message.task_id, loop_message.schedule),
+                )?;
+                if loop_message.prompt.is_empty() {
+                    Ok(())
+                } else {
+                    self.write_markdown(loop_message.prompt)
+                }
             }
             AgentEvent::MessageEnd {
                 message: Message::Assistant(message),
@@ -734,6 +759,60 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_irc_renders_named_label_body_reply_without_raw_xml() {
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::new(&mut output, false);
+        let events = [
+            ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: Message::Custom(pi_ai::CustomMessage {
+                    custom_type: pi_coding::ORCHESTRATION_MESSAGE_TYPE.to_owned(),
+                    content: "<orchestration-message id=\"m1\" from=\"Main\">\nhello child\n</orchestration-message>".into(),
+                    display: true,
+                    details: Some(json!({
+                        "id": "m1",
+                        "from": "Main",
+                        "to": "Child",
+                        "body": "hello child",
+                    })),
+                    timestamp: 1,
+                }),
+            }),
+            ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: Message::Custom(pi_ai::CustomMessage {
+                    custom_type: pi_coding::ORCHESTRATION_MESSAGE_TYPE.to_owned(),
+                    content: "<orchestration-message id=\"m2\" from=\"Child\">\nchild ack\nReplying to message: m1\n</orchestration-message>".into(),
+                    display: true,
+                    details: Some(json!({
+                        "id": "m2",
+                        "from": "Child",
+                        "to": "Sibling",
+                        "body": "child ack",
+                        "replyTo": "m1",
+                    })),
+                    timestamp: 2,
+                }),
+            }),
+        ];
+        for event in &events {
+            renderer.render(event).expect("render irc");
+        }
+        drop(renderer);
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(output.contains("IRC · Main → Child"));
+        assert!(output.contains("hello child"));
+        assert!(output.contains("IRC · Child → Sibling"));
+        assert!(output.contains("child ack"));
+        assert!(output.contains("reply to m1"));
+        assert!(!output.contains("<orchestration-message"));
+        assert!(!output.contains("Replying to message"));
+        // Body sits on its own line beneath the label.
+        let main_idx = output.find("IRC · Main → Child").expect("main label");
+        let body_idx = output.find("hello child").expect("body");
+        assert!(body_idx > main_idx);
+    }
+
+
+    #[test]
     fn renders_thinking_tools_and_assistant_in_event_order_without_ansi() {
         let mut output = Vec::new();
         let mut renderer = HumanEventRenderer::new(&mut output, false);
@@ -847,7 +926,7 @@ mod tests {
 
     #[test]
     fn tool_argument_summary_truncates_on_character_boundaries() {
-        let arguments = json!({"command": "界".repeat(61)});
+        let arguments = json!({"command": "é".repeat(61)});
         let summary = compact_tool_arguments(&arguments);
         assert_eq!(summary.chars().count(), 60);
         assert!(summary.ends_with("..."));

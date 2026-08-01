@@ -20,7 +20,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// Stable upstream action identifiers matched by the dispatch layer. Contextual
 /// selector actions are only exposed when their product flow has an executable
 /// handler; accepting a configured action and silently dropping it is forbidden.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Action {
     EditorSubmit,
     EditorNewline,
@@ -42,6 +42,7 @@ pub enum Action {
     EditorDeleteWordForward,
     EditorDeleteToLineStart,
     EditorDeleteToLineEnd,
+    EditorClear,
     EditorYank,
     EditorYankPop,
     EditorUndo,
@@ -116,6 +117,7 @@ impl Action {
             "tui.editor.pageDown" => Self::EditorPageDown,
             "tui.editor.deleteWordBackward" => Self::EditorDeleteWordBackward,
             "tui.editor.deleteWordForward" => Self::EditorDeleteWordForward,
+            "tui.editor.clear" | "editor_clear" => Self::EditorClear,
             "tui.editor.deleteToLineStart" => Self::EditorDeleteToLineStart,
             "tui.editor.deleteToLineEnd" => Self::EditorDeleteToLineEnd,
             "tui.editor.yank" => Self::EditorYank,
@@ -171,6 +173,277 @@ impl Action {
             _ => return None,
         })
     }
+
+
+    /// Human-readable action label for `/hotkeys` and overlay help.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::EditorSubmit => "Submit message",
+            Self::EditorNewline => "Insert newline",
+            Self::EditorBackspace => "Delete backward",
+            Self::EditorDelete => "Delete forward",
+            Self::EditorLeft => "Cursor left",
+            Self::EditorRight => "Cursor right",
+            Self::EditorUp => "Cursor up / history",
+            Self::EditorDown => "Cursor down / history",
+            Self::EditorWordLeft => "Word left",
+            Self::EditorWordRight => "Word right",
+            Self::EditorHome => "Start of line",
+            Self::EditorEnd => "End of line",
+            Self::EditorJumpForward => "Jump forward",
+            Self::EditorJumpBackward => "Jump backward",
+            Self::EditorPageUp => "Page transcript up",
+            Self::EditorPageDown => "Page transcript down",
+            Self::EditorDeleteWordBackward => "Delete word backward",
+            Self::EditorDeleteWordForward => "Delete word forward",
+            Self::EditorDeleteToLineStart => "Delete to line start",
+            Self::EditorDeleteToLineEnd => "Delete to line end",
+            Self::EditorClear => "Clear composer",
+            Self::EditorYank => "Yank",
+            Self::EditorYankPop => "Yank pop",
+            Self::EditorUndo => "Undo",
+            Self::Abort => "Abort / clear input",
+            Self::ClearEditor => "Clear input / quit (twice)",
+            Self::Quit => "Quit",
+            Self::AcceptCompletion => "Accept completion",
+            Self::ThemeNext => "Next theme",
+            Self::ThemePrev => "Previous theme",
+            Self::ClipboardPaste => "Paste image (Alt+V; Ctrl+V best-effort)",
+            Self::CopyLastAssistant => "Copy last assistant",
+            Self::ExternalEditor => "External editor",
+            Self::Suspend => "Suspend",
+            Self::ThinkingCycle => "Cycle thinking level",
+            Self::ThinkingToggle => "Toggle thinking visibility",
+            Self::ModelCycleForward => "Cycle model forward",
+            Self::ModelSelect => "Open model selector",
+            Self::ModelCycleBackward => "Cycle model backward",
+            Self::ToolsExpand => "Expand/collapse tools",
+            Self::FollowUp => "Queue follow-up",
+            Self::Dequeue => "Dequeue last prompt",
+            Self::SessionNew => "New session",
+            Self::SessionResume => "Resume session",
+            Self::SessionTree => "Session tree",
+            Self::SessionFork => "Fork session",
+            Self::SessionToggleNamedFilter => "Toggle named-only filter",
+            Self::SessionTogglePath => "Toggle path display",
+            Self::SessionToggleSort => "Toggle sort",
+            Self::SessionRename => "Rename session",
+            Self::SessionDelete => "Delete session",
+            Self::SessionDeleteNoninvasive => "Delete without closing",
+            Self::ModelsSave => "Save model scope",
+            Self::ModelsEnableAll => "Enable all models",
+            Self::ModelsClearAll => "Clear all models",
+            Self::ModelsToggleProvider => "Toggle provider filter",
+            Self::ModelsReorderUp => "Reorder model up",
+            Self::ModelsReorderDown => "Reorder model down",
+            Self::TreeFoldOrUp => "Fold or move up",
+            Self::TreeUnfoldOrDown => "Unfold or move down",
+            Self::TreeEditLabel => "Edit node label",
+            Self::TreeToggleLabelTimestamp => "Toggle label timestamps",
+            Self::TreeFilterDefault => "Filter: default",
+            Self::TreeFilterNoTools => "Filter: no tools",
+            Self::TreeFilterUserOnly => "Filter: user only",
+            Self::TreeFilterLabeledOnly => "Filter: labeled only",
+            Self::TreeFilterAll => "Filter: all",
+            Self::TreeFilterCycleForward => "Cycle filter forward",
+            Self::TreeFilterCycleBackward => "Cycle filter backward",
+        }
+    }
+
+    /// Stable config ID for this action.
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::EditorSubmit => "tui.input.submit",
+            Self::EditorNewline => "tui.input.newLine",
+            Self::EditorBackspace => "tui.editor.deleteCharBackward",
+            Self::EditorDelete => "tui.editor.deleteCharForward",
+            Self::EditorLeft => "tui.editor.cursorLeft",
+            Self::EditorRight => "tui.editor.cursorRight",
+            Self::EditorUp => "tui.editor.cursorUp",
+            Self::EditorDown => "tui.editor.cursorDown",
+            Self::EditorWordLeft => "tui.editor.cursorWordLeft",
+            Self::EditorWordRight => "tui.editor.cursorWordRight",
+            Self::EditorHome => "tui.editor.cursorLineStart",
+            Self::EditorEnd => "tui.editor.cursorLineEnd",
+            Self::EditorJumpForward => "tui.editor.jumpForward",
+            Self::EditorJumpBackward => "tui.editor.jumpBackward",
+            Self::EditorPageUp => "tui.editor.pageUp",
+            Self::EditorPageDown => "tui.editor.pageDown",
+            Self::EditorDeleteWordBackward => "tui.editor.deleteWordBackward",
+            Self::EditorDeleteWordForward => "tui.editor.deleteWordForward",
+            Self::EditorDeleteToLineStart => "tui.editor.deleteToLineStart",
+            Self::EditorDeleteToLineEnd => "tui.editor.deleteToLineEnd",
+            Self::EditorClear => "tui.editor.clear",
+            Self::EditorYank => "tui.editor.yank",
+            Self::EditorYankPop => "tui.editor.yankPop",
+            Self::EditorUndo => "tui.editor.undo",
+            Self::Abort => "app.interrupt",
+            Self::ClearEditor => "app.clear",
+            Self::Quit => "app.exit",
+            Self::AcceptCompletion => "tui.input.tab",
+            Self::ThemeNext => "theme_next",
+            Self::ThemePrev => "theme_prev",
+            Self::ClipboardPaste => "app.clipboard.pasteImage",
+            Self::CopyLastAssistant => "app.message.copy",
+            Self::ExternalEditor => "app.editor.external",
+            Self::Suspend => "app.suspend",
+            Self::ThinkingCycle => "app.thinking.cycle",
+            Self::ThinkingToggle => "app.thinking.toggle",
+            Self::ModelCycleForward => "app.model.cycleForward",
+            Self::ModelSelect => "app.model.select",
+            Self::ModelCycleBackward => "app.model.cycleBackward",
+            Self::ToolsExpand => "app.tools.expand",
+            Self::FollowUp => "app.message.followUp",
+            Self::Dequeue => "app.message.dequeue",
+            Self::SessionNew => "app.session.new",
+            Self::SessionResume => "app.session.resume",
+            Self::SessionTree => "app.session.tree",
+            Self::SessionFork => "app.session.fork",
+            Self::SessionToggleNamedFilter => "app.session.toggleNamedFilter",
+            Self::SessionTogglePath => "app.session.togglePath",
+            Self::SessionToggleSort => "app.session.toggleSort",
+            Self::SessionRename => "app.session.rename",
+            Self::SessionDelete => "app.session.delete",
+            Self::SessionDeleteNoninvasive => "app.session.deleteNoninvasive",
+            Self::ModelsSave => "app.models.save",
+            Self::ModelsEnableAll => "app.models.enableAll",
+            Self::ModelsClearAll => "app.models.clearAll",
+            Self::ModelsToggleProvider => "app.models.toggleProvider",
+            Self::ModelsReorderUp => "app.models.reorderUp",
+            Self::ModelsReorderDown => "app.models.reorderDown",
+            Self::TreeFoldOrUp => "app.tree.foldOrUp",
+            Self::TreeUnfoldOrDown => "app.tree.unfoldOrDown",
+            Self::TreeEditLabel => "app.tree.editLabel",
+            Self::TreeToggleLabelTimestamp => "app.tree.toggleLabelTimestamp",
+            Self::TreeFilterDefault => "app.tree.filter.default",
+            Self::TreeFilterNoTools => "app.tree.filter.noTools",
+            Self::TreeFilterUserOnly => "app.tree.filter.userOnly",
+            Self::TreeFilterLabeledOnly => "app.tree.filter.labeledOnly",
+            Self::TreeFilterAll => "app.tree.filter.all",
+            Self::TreeFilterCycleForward => "app.tree.filter.cycleForward",
+            Self::TreeFilterCycleBackward => "app.tree.filter.cycleBackward",
+        }
+    }
+
+    const fn hotkey_category(self) -> Option<&'static str> {
+        match self {
+            Self::EditorSubmit
+            | Self::EditorNewline
+            | Self::EditorBackspace
+            | Self::EditorDelete
+            | Self::EditorLeft
+            | Self::EditorRight
+            | Self::EditorUp
+            | Self::EditorDown
+            | Self::EditorWordLeft
+            | Self::EditorWordRight
+            | Self::EditorHome
+            | Self::EditorEnd
+            | Self::EditorJumpForward
+            | Self::EditorJumpBackward
+            | Self::EditorPageUp
+            | Self::EditorPageDown
+            | Self::EditorDeleteWordBackward
+            | Self::EditorDeleteWordForward
+            | Self::EditorDeleteToLineStart
+            | Self::EditorDeleteToLineEnd
+            | Self::EditorClear
+            | Self::EditorYank
+            | Self::EditorYankPop
+            | Self::EditorUndo
+            | Self::AcceptCompletion => Some("Editor"),
+            Self::Abort
+            | Self::ClearEditor
+            | Self::Quit
+            | Self::ThemeNext
+            | Self::ThemePrev
+            | Self::ClipboardPaste
+            | Self::CopyLastAssistant
+            | Self::ExternalEditor
+            | Self::Suspend
+            | Self::ThinkingCycle
+            | Self::ThinkingToggle
+            | Self::ModelCycleForward
+            | Self::ModelCycleBackward
+            | Self::ModelSelect
+            | Self::ToolsExpand
+            | Self::FollowUp
+            | Self::Dequeue
+            | Self::SessionNew
+            | Self::SessionResume
+            | Self::SessionTree
+            | Self::SessionFork => Some("Application"),
+            Self::SessionToggleNamedFilter
+            | Self::SessionTogglePath
+            | Self::SessionToggleSort
+            | Self::SessionRename
+            | Self::SessionDelete
+            | Self::SessionDeleteNoninvasive => Some("Session selector"),
+            Self::ModelsSave
+            | Self::ModelsEnableAll
+            | Self::ModelsClearAll
+            | Self::ModelsToggleProvider
+            | Self::ModelsReorderUp
+            | Self::ModelsReorderDown => Some("Scoped models"),
+            Self::TreeFoldOrUp
+            | Self::TreeUnfoldOrDown
+            | Self::TreeEditLabel
+            | Self::TreeToggleLabelTimestamp
+            | Self::TreeFilterDefault
+            | Self::TreeFilterNoTools
+            | Self::TreeFilterUserOnly
+            | Self::TreeFilterLabeledOnly
+            | Self::TreeFilterAll
+            | Self::TreeFilterCycleForward
+            | Self::TreeFilterCycleBackward => Some("Session tree"),
+        }
+    }
+}
+
+
+/// One titled group of active keybinding rows for `/hotkeys`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HotkeySection {
+    pub title: String,
+    pub rows: Vec<String>,
+}
+
+/// Formats a canonical chord (`ctrl+shift+p`) for human display (`Ctrl+Shift+P`).
+#[must_use]
+pub fn format_chord_display(chord: &str) -> String {
+    chord
+        .split('+')
+        .map(|part| match part {
+            "ctrl" => "Ctrl".to_owned(),
+            "alt" => "Alt".to_owned(),
+            "shift" => "Shift".to_owned(),
+            "esc" => "Esc".to_owned(),
+            "enter" => "Enter".to_owned(),
+            "tab" => "Tab".to_owned(),
+            "backspace" => "Backspace".to_owned(),
+            "delete" => "Delete".to_owned(),
+            "pageup" => "PageUp".to_owned(),
+            "pagedown" => "PageDown".to_owned(),
+            "left" => "Left".to_owned(),
+            "right" => "Right".to_owned(),
+            "up" => "Up".to_owned(),
+            "down" => "Down".to_owned(),
+            "home" => "Home".to_owned(),
+            "end" => "End".to_owned(),
+            "space" => "Space".to_owned(),
+            other if other.chars().count() == 1 => other.to_ascii_uppercase(),
+            other => {
+                let mut chars = other.chars();
+                match chars.next() {
+                    Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                    None => other.to_owned(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 /// Canonical configurable action names. Every entry has observable dispatch.
@@ -193,6 +466,7 @@ pub const VALID_ACTION_NAMES: &[&str] = &[
     "tui.editor.pageDown",
     "tui.editor.deleteWordBackward",
     "tui.editor.deleteWordForward",
+    "tui.editor.clear",
     "tui.editor.deleteToLineStart",
     "tui.editor.deleteToLineEnd",
     "tui.editor.yank",
@@ -333,6 +607,77 @@ impl KeyBindingsManager {
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
     }
+
+    /// Groups active bindings into the documented keymap categories for `/hotkeys`.
+    #[must_use]
+    pub fn hotkey_sections(&self) -> Vec<HotkeySection> {
+        let mut by_action: BTreeMap<Action, Vec<String>> = BTreeMap::new();
+        for (chord, actions) in &self.active {
+            for action in actions {
+                let entry = by_action.entry(*action).or_default();
+                if !entry.iter().any(|existing| existing == chord) {
+                    entry.push(chord.clone());
+                }
+            }
+        }
+        for chords in by_action.values_mut() {
+            chords.sort();
+        }
+
+        const CATEGORIES: &[&str] = &[
+            "Editor",
+            "Application",
+            "Session selector",
+            "Scoped models",
+            "Session tree",
+        ];
+        let mut sections = Vec::new();
+        for title in CATEGORIES {
+            let mut rows = Vec::new();
+            for action in by_action.keys().copied() {
+                if action.hotkey_category() != Some(*title) {
+                    continue;
+                }
+                let Some(chords) = by_action.get(&action) else {
+                    continue;
+                };
+                if chords.is_empty() {
+                    continue;
+                }
+                let chord_text = chords
+                    .iter()
+                    .map(|chord| format_chord_display(chord))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                rows.push(format!("{chord_text}  —  {}", action.label()));
+            }
+            if !rows.is_empty() {
+                sections.push(HotkeySection {
+                    title: (*title).to_owned(),
+                    rows,
+                });
+            }
+        }
+        sections
+    }
+
+    /// Compact one-line summary of chords bound to `actions` (first chord each).
+    #[must_use]
+    pub fn chord_hint_for(&self, actions: &[Action]) -> String {
+        let mut parts = Vec::new();
+        for action in actions {
+            let mut chords = self
+                .active
+                .iter()
+                .filter_map(|(chord, bound)| bound.contains(action).then_some(chord.as_str()))
+                .collect::<Vec<_>>();
+            chords.sort();
+            if let Some(chord) = chords.first() {
+                parts.push(format!("{} {}", format_chord_display(chord), action.label()));
+            }
+        }
+        parts.join(" · ")
+    }
 }
 
 fn is_selector_action(action: Action) -> bool {
@@ -398,7 +743,7 @@ fn default_bindings() -> HashMap<String, Vec<Action>> {
         ("alt+backspace", Action::EditorDeleteWordBackward),
         ("alt+d", Action::EditorDeleteWordForward),
         ("alt+delete", Action::EditorDeleteWordForward),
-        ("ctrl+u", Action::EditorDeleteToLineStart),
+        ("ctrl+u", Action::EditorClear),
         ("ctrl+k", Action::EditorDeleteToLineEnd),
         ("ctrl+y", Action::EditorYank),
         ("alt+y", Action::EditorYankPop),
@@ -722,6 +1067,17 @@ mod tests {
         for (key, expected) in cases {
             assert_eq!(bindings.resolve(&key), Some(expected));
         }
+        assert_eq!(
+            bindings.resolve(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Some(Action::EditorClear)
+        );
+        assert_eq!(
+            bindings.resolve_in(
+                &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                &[Action::TreeFilterUserOnly]
+            ),
+            Some(Action::TreeFilterUserOnly)
+        );
     }
 
     #[test]
@@ -838,7 +1194,7 @@ mod tests {
             (KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL), Some(Action::ThinkingToggle), Action::TreeFilterNoTools),
             (KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), Some(Action::ToolsExpand), Action::TreeFilterCycleForward),
             (KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL | KeyModifiers::SHIFT), None, Action::TreeFilterCycleBackward),
-            (KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), Some(Action::EditorDeleteToLineStart), Action::TreeFilterUserOnly),
+            (KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), Some(Action::EditorClear), Action::TreeFilterUserOnly),
             (KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL), Some(Action::ModelSelect), Action::TreeFilterLabeledOnly),
             (KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), Some(Action::EditorHome), Action::TreeFilterAll),
         ];

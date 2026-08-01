@@ -1,4 +1,4 @@
-//! Library facade for the `pi` CLI.
+//! Library facade for the `rpi` CLI.
 //!
 //! Exposes the CLI's modules so integration tests can drive the same code
 //! paths as the binary (arg parsing, subcommands, session setup, print mode,
@@ -22,6 +22,7 @@ pub mod llama_commands;
 pub mod loop_commands;
 pub mod markdown;
 pub mod models_config;
+pub mod orchestration_message;
 pub mod modes;
 pub mod output;
 pub mod package_commands;
@@ -33,6 +34,7 @@ mod saved_session_selector;
 mod scoped_model_selector;
 pub mod self_update;
 pub mod session_run;
+mod session_run_blueprint;
 pub mod settings_panel;
 pub mod settings_rpc;
 pub mod terminal_images;
@@ -40,6 +42,9 @@ pub mod tool_card_adapter;
 pub mod theme;
 pub(crate) mod tree_panel;
 pub mod tui;
+pub mod workflow_commands;
+pub mod workflow_rpc;
+pub mod workflow_panel;
 
 use anyhow::Result;
 
@@ -109,7 +114,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 return package_commands::update_package(&extension, &cwd);
             }
             if let Some(package) = package {
-                if matches!(package.as_str(), "self" | "pi") {
+                if matches!(package.as_str(), "self" | "rpi") {
                     if extensions {
                         package_commands::update_packages(&cwd)?;
                     }

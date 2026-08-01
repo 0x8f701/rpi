@@ -1,22 +1,22 @@
 #!/bin/sh
 #
-# pi installer (macOS / Linux).
+# rpi installer (macOS / Linux).
 #
 # Downloads the matching platform artifact from this repo's GitHub Releases,
 # verifies its SHA-256 against the release's SHA256SUMS manifest, and installs
-# the binary as ~/.pi-rs/bin/pi (versioned binary in ~/.pi-rs/downloads/,
+# the binary as ~/.pi-rs/bin/rpi (versioned binary in ~/.pi-rs/downloads/,
 # atomic symlink in bin/).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/main/install.sh | sh
-#   sh install.sh --version v0.1.0      # pin a specific release
+#   curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | sh
+#   sh install.sh --version v0.2.0      # pin a specific release
 #
 # Environment:
 #   PI_HOME                install root (default: ~/.pi-rs)
 #   PI_UPDATE_BASE_URL     GitHub-Releases-shaped API base (default:
 #                          https://api.github.com/repos/0x8f701/pi-rs/releases)
 #
-# Fails fast on any error; never leaves a partial binary as the active pi.
+# Fails fast on any error; never leaves a partial binary as the active rpi.
 
 set -eu
 
@@ -171,7 +171,7 @@ else
     err "neither sha256sum nor shasum found"
 fi
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-install.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rpi-install.XXXXXX")"
 STAGED=""
 TMP_LINK=""
 ROLLBACK_LINK=""
@@ -259,13 +259,13 @@ if ! SUMS_URL="$(find_asset_url "SHA256SUMS")"; then
     err "release $TAG must contain exactly one SHA256SUMS asset"
 fi
 
-ASSET="pi-rs-${RESOLVED_VERSION}-${TRIPLE}.tar.gz"
+ASSET="rpi-${RESOLVED_VERSION}-${TRIPLE}.tar.gz"
 if ! ARCHIVE_URL="$(find_asset_url "$ASSET")"; then
     err "release $TAG does not contain asset $ASSET"
 fi
 
 # ── Download + verify ────────────────────────────────────────────────────────
-printf 'Downloading pi v%s (%s)...\n' "$RESOLVED_VERSION" "$TRIPLE"
+printf 'Downloading rpi v%s (%s)...\n' "$RESOLVED_VERSION" "$TRIPLE"
 fetch "$ARCHIVE_URL" "$TMP_DIR/$ASSET" || err "download failed: $ARCHIVE_URL"
 fetch "$SUMS_URL" "$TMP_DIR/SHA256SUMS" || err "download failed: $SUMS_URL"
 
@@ -308,27 +308,27 @@ BINARY_MEMBER=""
 BINARY_COUNT=0
 while IFS= read -r member; do
     normalized="${member#./}"
-    [ "$normalized" = "pi" ] || continue
+    [ "$normalized" = "rpi" ] || continue
     case "$member" in
         */)
             err "archive $ASSET contains a directory binary entry: $member"
             ;;
     esac
     if [ "$BINARY_COUNT" -ne 0 ]; then
-        err "archive $ASSET contains more than one root-level pi binary"
+        err "archive $ASSET contains more than one root-level rpi binary"
     fi
     BINARY_MEMBER="$member"
     BINARY_COUNT=1
 done < "$TMP_DIR/archive.list"
 [ "$BINARY_COUNT" -eq 1 ] \
-    || err "archive $ASSET must contain exactly one root-level pi binary"
+    || err "archive $ASSET must contain exactly one root-level rpi binary"
 
-tar -xOzf "$TMP_DIR/$ASSET" "$BINARY_MEMBER" > "$TMP_DIR/pi" \
-    || err "failed to extract pi from $ASSET"
-[ -s "$TMP_DIR/pi" ] || err "archive $ASSET contains an empty pi binary"
-BINARY_SIZE="$(wc -c < "$TMP_DIR/pi" | tr -d '[:space:]')"
-[ "$BINARY_SIZE" -le 1073741824 ] || err "extracted pi exceeds the 1 GiB safety limit"
-chmod 0755 "$TMP_DIR/pi"
+tar -xOzf "$TMP_DIR/$ASSET" "$BINARY_MEMBER" > "$TMP_DIR/rpi" \
+    || err "failed to extract rpi from $ASSET"
+[ -s "$TMP_DIR/rpi" ] || err "archive $ASSET contains an empty rpi binary"
+BINARY_SIZE="$(wc -c < "$TMP_DIR/rpi" | tr -d '[:space:]')"
+[ "$BINARY_SIZE" -le 1073741824 ] || err "extracted rpi exceeds the 1 GiB safety limit"
+chmod 0755 "$TMP_DIR/rpi"
 
 ensure_directory() {
     path="$1"
@@ -343,48 +343,63 @@ ensure_directory() {
 
 DOWNLOADS_DIR="$PI_HOME/downloads"
 BIN_DIR="$PI_HOME/bin"
-ensure_directory "$PI_HOME" "pi install root"
-ensure_directory "$DOWNLOADS_DIR" "pi downloads directory"
-ensure_directory "$BIN_DIR" "pi bin directory"
+STATE_FILE="$PI_HOME/update-state.json"
+ensure_directory "$PI_HOME" "rpi install root"
+ensure_directory "$DOWNLOADS_DIR" "rpi downloads directory"
+ensure_directory "$BIN_DIR" "rpi bin directory"
 
 # ── Serialize concurrent installs ─────────────────────────────────────────────
 # The content-addressed versioned path is shared by every install of the same
 # release, so two concurrent installs of the same release would race on DEST
 # and the active symlink. Hold an exclusive lock over PI_HOME for the whole
-# transaction. The lock is a best-effort portable mutex (POSIX noclobber
-# creation with a stale-PID reaper); it serializes honest concurrent installs.
+# transaction. The portable PID lock reaps dead/corrupt owners, but never waits
+# more than 30 seconds for a live owner, matching the self-updater deadline.
 LOCKFILE="$PI_HOME/.install.lock"
+LOCK_WAIT_SECONDS=30
 [ ! -L "$LOCKFILE" ] || err "refusing to use a symlinked install lock: $LOCKFILE"
 LOCK_HELD=0
+LOCK_OWNER="unknown"
 acquire_install_lock() {
-    attempt=0
+    waited=0
     while :; do
         if ( set -C; printf '%s\n' "$$" > "$LOCKFILE" ) 2>/dev/null; then
             LOCK_HELD=1
             return 0
         fi
-        attempt=$((attempt + 1))
         owner="$(cat "$LOCKFILE" 2>/dev/null || true)"
         case "$owner" in
             ''|*[!0-9]*)
-                # Corrupt or empty lock; best-effort remove and retry.
-                rm -f "$LOCKFILE" 2>/dev/null || sleep 1
-                continue
+                # Corrupt or empty lock; remove it only if possible.
+                if rm -f "$LOCKFILE" 2>/dev/null; then
+                    continue
+                fi
+                LOCK_OWNER="invalid owner"
+                ;;
+            *)
+                if [ "$owner" = "$$" ]; then
+                    LOCK_HELD=1
+                    return 0
+                fi
+                if ! kill -0 "$owner" 2>/dev/null; then
+                    # Stale lock from a dead process; remove it only if possible.
+                    if rm -f "$LOCKFILE" 2>/dev/null; then
+                        continue
+                    fi
+                    LOCK_OWNER="$owner (stale)"
+                else
+                    LOCK_OWNER="$owner"
+                fi
                 ;;
         esac
-        if [ "$owner" = "$$" ]; then
-            LOCK_HELD=1
-            return 0
+        if [ "$waited" -ge "$LOCK_WAIT_SECONDS" ]; then
+            return 1
         fi
-        if ! kill -0 "$owner" 2>/dev/null; then
-            # Stale lock from a dead process; remove and retry.
-            rm -f "$LOCKFILE" 2>/dev/null || sleep 1
-            continue
+        if [ "$waited" -eq 0 ]; then
+            printf 'Waiting up to %s seconds for another rpi install (lock %s, owner %s)...\n' \
+                "$LOCK_WAIT_SECONDS" "$LOCKFILE" "$LOCK_OWNER"
         fi
-        if [ "$attempt" -eq 1 ]; then
-            printf 'Waiting for another pi install to finish (holding %s, pid %s)...\n' "$LOCKFILE" "$owner"
-        fi
-        sleep 1
+        sleep 1 || return 1
+        waited=$((waited + 1))
     done
 }
 release_install_lock() {
@@ -396,39 +411,73 @@ release_install_lock() {
     fi
     LOCK_HELD=0
 }
-acquire_install_lock || err "could not acquire the install lock"
+acquire_install_lock \
+    || err "timed out after ${LOCK_WAIT_SECONDS}s waiting for another rpi install (lock $LOCKFILE, owner $LOCK_OWNER); retry after it finishes"
+
+
+# Detect a legacy installer-managed `pi` command before replacing the shared
+# update state. Removal is deferred until the verified rpi binary and its new
+# state have both committed, so rollback always preserves the old command.
+LEGACY_PI_PATH="$BIN_DIR/pi"
+LEGACY_PI_TARGET=""
+if [ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] && [ -L "$LEGACY_PI_PATH" ]; then
+    LEGACY_VERSION="$(sed -n 's/^[[:space:]]*"installed_version"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p' "$STATE_FILE")"
+    LEGACY_ASSET="$(sed -n 's/^[[:space:]]*"installed_asset"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p' "$STATE_FILE")"
+    LEGACY_DIGEST="$(sed -n 's/^[[:space:]]*"installed_sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p' "$STATE_FILE")"
+    LEGACY_BINARY="$(sed -n 's/^[[:space:]]*"installed_binary"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p' "$STATE_FILE")"
+    case "$LEGACY_DIGEST" in
+        *[!0-9A-Fa-f]*|'') LEGACY_DIGEST_VALID=0 ;;
+        *) [ "${#LEGACY_DIGEST}" -eq 64 ] && LEGACY_DIGEST_VALID=1 || LEGACY_DIGEST_VALID=0 ;;
+    esac
+    EXPECTED_LEGACY_ASSET="pi-rs-${LEGACY_VERSION}-${TRIPLE}.tar.gz"
+    EXPECTED_LEGACY_BINARY="pi-rs-${LEGACY_VERSION}-${PLATFORM_OS}-${PLATFORM_ARCH}-sha256-${LEGACY_DIGEST}"
+    CURRENT_LEGACY_TARGET="$(readlink "$LEGACY_PI_PATH" 2>/dev/null || true)"
+    if is_semver "$LEGACY_VERSION" \
+        && [ "$LEGACY_DIGEST_VALID" -eq 1 ] \
+        && [ "$LEGACY_ASSET" = "$EXPECTED_LEGACY_ASSET" ] \
+        && [ "$LEGACY_BINARY" = "$EXPECTED_LEGACY_BINARY" ] \
+        && [ "$CURRENT_LEGACY_TARGET" = "../downloads/$LEGACY_BINARY" ] \
+        && [ -f "$DOWNLOADS_DIR/$LEGACY_BINARY" ] \
+        && [ ! -L "$DOWNLOADS_DIR/$LEGACY_BINARY" ]; then
+        LEGACY_PI_TARGET="$CURRENT_LEGACY_TARGET"
+    fi
+fi
 
 # The archive digest is part of the deployment identity. A deliberately
 # republished tag therefore gets a new path and cannot overwrite the active
 # same-semver binary before its smoke test succeeds.
-VERSIONED="pi-rs-${RESOLVED_VERSION}-${PLATFORM_OS}-${PLATFORM_ARCH}-sha256-${EXPECTED}"
+VERSIONED="rpi-${RESOLVED_VERSION}-${PLATFORM_OS}-${PLATFORM_ARCH}-sha256-${EXPECTED}"
 DEST="$DOWNLOADS_DIR/$VERSIONED"
-STAGED="$(mktemp "$DOWNLOADS_DIR/.pi-stage.XXXXXX")" \
+STAGED="$(mktemp "$DOWNLOADS_DIR/.rpi-stage.XXXXXX")" \
     || err "could not create a staged binary under $DOWNLOADS_DIR"
-cp "$TMP_DIR/pi" "$STAGED" || err "could not stage downloaded pi"
+cp "$TMP_DIR/rpi" "$STAGED" || err "could not stage downloaded rpi"
 chmod 0755 "$STAGED"
 # Smoke-test the staged bytes before touching either live component.
 "$STAGED" --version >/dev/null 2>&1 \
     || err "downloaded binary failed smoke test; existing install left untouched"
 
-TMP_LINK="$BIN_DIR/pi.install.$$"
+TMP_LINK="$BIN_DIR/rpi.install.$$"
 [ ! -e "$TMP_LINK" ] && [ ! -L "$TMP_LINK" ] \
     || { rm -f "$STAGED"; err "temporary activation path already exists: $TMP_LINK"; }
 ln -s "../downloads/$VERSIONED" "$TMP_LINK" \
-    || { rm -f "$STAGED"; err "failed to stage active pi link"; }
+    || { rm -f "$STAGED"; err "failed to stage active rpi link"; }
 
-if [ ! -L "$BIN_DIR/pi" ] && [ -e "$BIN_DIR/pi" ]; then
+if [ ! -L "$BIN_DIR/rpi" ] && [ -e "$BIN_DIR/rpi" ]; then
     rm -f "$TMP_LINK" "$STAGED"
-    err "$BIN_DIR/pi is not a managed symlink; refusing to overwrite it"
+    err "$BIN_DIR/rpi is not a managed symlink; refusing to overwrite it"
+fi
+if [ -L "$BIN_DIR/rpi" ] && [ -d "$BIN_DIR/rpi" ]; then
+    rm -f "$TMP_LINK" "$STAGED"
+    err "$BIN_DIR/rpi is a symlink to a directory; refusing unsafe activation"
 fi
 
 # Capture the prior active symlink target so rollback restores exactly what
 # was live before this install, not the newly staged version.
 HAD_ACTIVE=0
 OLD_LINK_TARGET=""
-if [ -L "$BIN_DIR/pi" ]; then
-    OLD_LINK_TARGET="$(readlink "$BIN_DIR/pi")" \
-        || { rm -f "$TMP_LINK" "$STAGED"; err "failed to read prior active pi symlink"; }
+if [ -L "$BIN_DIR/rpi" ]; then
+    OLD_LINK_TARGET="$(readlink "$BIN_DIR/rpi")" \
+        || { rm -f "$TMP_LINK" "$STAGED"; err "failed to read prior active rpi symlink"; }
     HAD_ACTIVE=1
 fi
 
@@ -440,6 +489,7 @@ fi
 HAD_DEST=0
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
     [ ! -L "$DEST" ] || err "refusing to replace a symlinked versioned binary: $DEST"
+    [ -f "$DEST" ] || err "versioned binary path is not a regular file: $DEST"
     HAD_DEST=1
 fi
 
@@ -447,41 +497,41 @@ fi
 # live link contains the exact target captured before activation.
 rollback_active_link() {
     if [ "$HAD_ACTIVE" -eq 1 ]; then
-        ROLLBACK_LINK="$BIN_DIR/pi.rollback.$$"
+        ROLLBACK_LINK="$BIN_DIR/rpi.rollback.$$"
         if [ -e "$ROLLBACK_LINK" ] || [ -L "$ROLLBACK_LINK" ]; then
             printf 'install.sh: error: rollback path already exists: %s\n' "$ROLLBACK_LINK" >&2
             return 1
         fi
         if ! ln -s "$OLD_LINK_TARGET" "$ROLLBACK_LINK"; then
-            printf 'install.sh: error: rollback failed to stage the prior active pi symlink\n' >&2
+            printf 'install.sh: error: rollback failed to stage the prior active rpi symlink\n' >&2
             return 1
         fi
-        if ! mv -f "$ROLLBACK_LINK" "$BIN_DIR/pi"; then
-            printf 'install.sh: error: rollback failed to restore the prior active pi symlink\n' >&2
+        if ! mv -f "$ROLLBACK_LINK" "$BIN_DIR/rpi"; then
+            printf 'install.sh: error: rollback failed to restore the prior active rpi symlink\n' >&2
             if ! rm -f "$ROLLBACK_LINK"; then
                 printf 'install.sh: error: rollback also failed to remove temporary symlink: %s\n' "$ROLLBACK_LINK" >&2
             fi
             return 1
         fi
-        if [ ! -L "$BIN_DIR/pi" ]; then
-            printf 'install.sh: error: rollback verification found no active pi symlink\n' >&2
+        if [ ! -L "$BIN_DIR/rpi" ]; then
+            printf 'install.sh: error: rollback verification found no active rpi symlink\n' >&2
             return 1
         fi
-        if ! RESTORED_LINK_TARGET="$(readlink "$BIN_DIR/pi")"; then
-            printf 'install.sh: error: rollback could not read the restored active pi symlink\n' >&2
+        if ! RESTORED_LINK_TARGET="$(readlink "$BIN_DIR/rpi")"; then
+            printf 'install.sh: error: rollback could not read the restored active rpi symlink\n' >&2
             return 1
         fi
         if [ "$RESTORED_LINK_TARGET" != "$OLD_LINK_TARGET" ]; then
-            printf 'install.sh: error: rollback restored the wrong active pi target\n' >&2
+            printf 'install.sh: error: rollback restored the wrong active rpi target\n' >&2
             return 1
         fi
     else
-        if ! rm -f "$BIN_DIR/pi"; then
-            printf 'install.sh: error: rollback failed to remove the newly activated pi symlink\n' >&2
+        if ! rm -f "$BIN_DIR/rpi"; then
+            printf 'install.sh: error: rollback failed to remove the newly activated rpi symlink\n' >&2
             return 1
         fi
-        if [ -e "$BIN_DIR/pi" ] || [ -L "$BIN_DIR/pi" ]; then
-            printf 'install.sh: error: rollback verification found an unexpected active pi path\n' >&2
+        if [ -e "$BIN_DIR/rpi" ] || [ -L "$BIN_DIR/rpi" ]; then
+            printf 'install.sh: error: rollback verification found an unexpected active rpi path\n' >&2
             return 1
         fi
     fi
@@ -491,10 +541,10 @@ rollback_active_link() {
 rollback_install() {
     ROLLBACK_FAILED=0
     # Restore the active symlink BEFORE touching the versioned binary. After a
-    # successful symlink swap (the state-write failure path), BIN_DIR/pi points
+    # successful symlink swap (the state-write failure path), BIN_DIR/rpi points
     # at the new DEST, so removing DEST first would dangle the live link. Restoring
     # the prior symlink first makes the new DEST unreferenced, and only then is it
-    # safe to remove. (After a failed swap, BIN_DIR/pi is already the prior link,
+    # safe to remove. (After a failed swap, BIN_DIR/rpi is already the prior link,
     # so restoring it is an atomic no-op and DEST is already unreferenced.)
     if ! rollback_active_link; then
         ROLLBACK_FAILED=1
@@ -537,20 +587,30 @@ if ! mv -f "$STAGED" "$DEST"; then
     rm -f "$TMP_LINK"
     err "failed to activate versioned binary"
 fi
+if [ ! -f "$DEST" ] || [ -L "$DEST" ]; then
+    rm -f "$TMP_LINK"
+    err "activated versioned binary is not a regular file: $DEST"
+fi
 STAGED=""
 
 # Atomic activation, step 2: swap the active symlink. rename(2) of the symlink
-# is atomic; BIN_DIR/pi is either the prior target or the new one — never
+# is atomic; BIN_DIR/rpi is either the prior target or the new one — never
 # missing. A failure here leaves DEST holding the new bytes and the symlink
 # unchanged, which we roll back to the prior symlink state.
-if ! mv -f "$TMP_LINK" "$BIN_DIR/pi"; then
-    fail_after_rollback "failed to activate pi binary"
+if ! mv -f "$TMP_LINK" "$BIN_DIR/rpi"; then
+    fail_after_rollback "failed to activate rpi binary"
+fi
+EXPECTED_ACTIVE_TARGET="../downloads/$VERSIONED"
+ACTIVE_TARGET="$(readlink "$BIN_DIR/rpi" 2>/dev/null || true)"
+if [ ! -L "$BIN_DIR/rpi" ] || [ -d "$BIN_DIR/rpi" ] \
+    || [ ! -f "$BIN_DIR/rpi" ] || [ "$ACTIVE_TARGET" != "$EXPECTED_ACTIVE_TARGET" ]; then
+    fail_after_rollback "activated rpi path failed symlink verification"
 fi
 TMP_LINK=""
 
 # Record the exact release-archive identity used by any in-place updater so
 # republished tags are detected by checksum.
-STATE_FILE="$PI_HOME/update-state.json"
+# The shared state file now describes only the active rpi installation.
 if [ -d "$STATE_FILE" ]; then
     fail_after_rollback "update-state path is a directory: $STATE_FILE"
 fi
@@ -573,17 +633,34 @@ printf '{\n  "installed_version": "%s",\n  "installed_asset": "%s",\n  "installe
     fail_after_rollback "could not write update state"
 }
 if ! mv -f "$STATE_TMP" "$STATE_FILE"; then
-    fail_after_rollback "could not record pi update state"
+    fail_after_rollback "could not record rpi update state"
 fi
 STATE_TMP=""
 TRANSACTION_ACTIVE=0
 
+# Clean-cutover migration: remove only the legacy command proven above to be
+# installer-managed and still unchanged. Any unmanaged or raced path is kept.
+if [ -n "$LEGACY_PI_TARGET" ] && [ -L "$LEGACY_PI_PATH" ]; then
+    CURRENT_LEGACY_TARGET="$(readlink "$LEGACY_PI_PATH" 2>/dev/null || true)"
+    if [ "$CURRENT_LEGACY_TARGET" = "$LEGACY_PI_TARGET" ] \
+        && [ -f "$DOWNLOADS_DIR/$LEGACY_BINARY" ] \
+        && [ ! -L "$DOWNLOADS_DIR/$LEGACY_BINARY" ]; then
+        if rm -f "$LEGACY_PI_PATH" && [ ! -e "$LEGACY_PI_PATH" ] && [ ! -L "$LEGACY_PI_PATH" ]; then
+            printf 'Removed legacy installer-managed command %s.\n' "$LEGACY_PI_PATH"
+        else
+            printf 'install.sh: warning: rpi installed, but legacy managed command could not be removed: %s\n' "$LEGACY_PI_PATH" >&2
+        fi
+    else
+        printf 'install.sh: warning: legacy pi path changed during install; leaving it untouched: %s\n' "$LEGACY_PI_PATH" >&2
+    fi
+fi
 
-printf '\npi v%s installed to %s\n' "$RESOLVED_VERSION" "$BIN_DIR/pi"
+
+printf '\nrpi v%s installed to %s\n' "$RESOLVED_VERSION" "$BIN_DIR/rpi"
 
 case ":$PATH:" in
     *":$BIN_DIR:"*)
-        printf 'Run `pi` to get started.\n'
+        printf 'Run `rpi` to get started.\n'
         ;;
     *)
         # Persist BIN_DIR on PATH in the login shell's rc file.  The install
@@ -596,7 +673,7 @@ case ":$PATH:" in
                 printf '\n%s is already configured in %s.\n' "$line" "$rc"
                 return 0
             fi
-            if printf '\n# Added by the pi installer\n%s\n' "$line" >> "$rc"; then
+            if printf '\n# Added by the rpi installer\n%s\n' "$line" >> "$rc"; then
                 printf '\nAdded %s to your PATH in %s.\n' "$line" "$rc"
             else
                 printf '\ninstall.sh: warning: could not write %s.\n' "$rc" >&2
@@ -641,6 +718,6 @@ case ":$PATH:" in
                 persist_line "$HOME/.profile" "$EXPORT_LINE"
                 ;;
         esac
-        printf 'Open a new terminal, then run `pi` to get started.\n'
+        printf 'Open a new terminal, then run `rpi` to get started.\n'
         ;;
 esac

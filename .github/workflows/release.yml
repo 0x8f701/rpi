@@ -1,8 +1,8 @@
 name: Release
 
-# On tag push v*, build the `pi` binary for the five supported native targets,
-# package per-target archives named pi-rs-<version>-<target-triple>.{tar.gz|zip}
-# (each containing a root pi/pi.exe plus LICENSE), generate SHA256SUMS, and
+# On tag push v*, build the `rpi` binary for the five supported native targets,
+# package per-target archives named rpi-<version>-<target-triple>.{tar.gz|zip}
+# (each containing a root rpi/rpi.exe plus LICENSE), generate SHA256SUMS, and
 # publish as a GitHub Release. install.sh / install.ps1 resolve these exact
 # asset names.
 
@@ -17,12 +17,154 @@ env:
   CARGO_TERM_COLOR: always
   # Fail before packaging if debug metadata accidentally inflates a
   # distribution binary. The release-dist profile strips symbols and disables
-  # debuginfo; `pi` is a full agent CLI, so allow up to 64 MiB per native binary.
+  # debuginfo; `rpi` is a full agent CLI, so allow up to 64 MiB per native binary.
   MAX_RELEASE_BINARY_BYTES: "67108864"
 
 jobs:
+  validate-release:
+    name: validate release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Validate semantic version tag and workspace version
+        shell: bash
+        run: |
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must be semantic version vX.Y.Z: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          tag_version="${GITHUB_REF_NAME#v}"
+          file_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml workspace version ($file_version)" >&2
+            exit 1
+          fi
+
+  verify-release:
+    name: verify release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup_init="$RUNNER_TEMP/rustup-init"
+          rustup_sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init" \
+            --output "$rustup_init"
+          actual_sha256="$(sha256sum "$rustup_init" | cut -d ' ' -f 1)"
+          [ "$actual_sha256" = "$rustup_sha256" ] || {
+            echo "rustup-init SHA-256 mismatch" >&2
+            exit 1
+          }
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *)
+              echo "Expected rustc 1.88.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: verify-release
+
+      - name: Install Bun 1.3.14
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Check workspace
+        run: cargo +1.88.0 check --workspace --all-targets --locked
+
+      - name: Test workspace contracts
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-ai --test registry_catalog_invariant --locked
+          cargo +1.88.0 test --package pi-agent --test loop_runtime_continue --locked
+
+      - name: Test coding tool and todo lifecycles
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-coding --test coding_tools_lifecycle --locked -- --nocapture
+          cargo +1.88.0 test --package pi-coding --test todo_dag_lifecycle --locked -- --nocapture
+
+      - name: Test process and session lifecycles
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-coding --test application_process --locked
+          cargo +1.88.0 test --package pi-coding --test application_runtime --locked state_tracks_modes_pending_counts_and_new_session_reset
+
+      - name: Test structured output modes
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-cli --test print_mode --locked
+          cargo +1.88.0 test --package pi-cli --test json_mode_binary --locked
+          cargo +1.88.0 test --package pi-cli --test rpc_binary --locked
+
+      - name: Test extensions with real Bun
+        shell: bash
+        run: |
+          bun --version
+          cargo +1.88.0 test --package pi-coding --test extensions --locked
+          cargo +1.88.0 test --package pi-coding --test extension_api_conformance --locked
+          cargo +1.88.0 test --package pi-cli --test extension_run_chain_tui --locked
+          cargo +1.88.0 test --package pi-cli --test extension_ui_tui --locked
+
+      - name: Test self-update
+        run: cargo +1.88.0 test --package pi-cli --lib self_update::tests --locked
+
+      - name: Check installers
+        shell: bash
+        run: |
+          sh -n install.sh
+          sh install.sh --help >/dev/null
+          sh tests/install-sh-static.sh
+
+      - name: Check PowerShell installer
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path './install.ps1'),
+            [ref]$null,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
+      - name: Build and smoke-test release-dist rpi
+        shell: bash
+        run: |
+          cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
+          target/release-dist/rpi --version
+
+      - name: Run deterministic release E2E
+        env:
+          RPI_BIN: target/release-dist/rpi
+        run: E2E.d/ci.sh run
+
+      - name: Run multi-workflow release E2E
+        env:
+          RPI_BIN: target/release-dist/rpi
+        run: E2E.d/ci/workflow.sh run
+
+
   build-linux:
     name: build (${{ matrix.target }})
+    needs: [validate-release, verify-release]
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +179,7 @@ jobs:
     # (glibc 2.31), establishing the documented minimum Linux runtime baseline.
     runs-on: ${{ matrix.os }}
     container:
-      image: ubuntu:20.04
+      image: ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214
     steps:
       - name: Install Ubuntu 20.04 build and runtime tools
         shell: bash
@@ -74,21 +216,31 @@ jobs:
 
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - name: Check tag matches Cargo.toml workspace version
-        shell: bash
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          file_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
-          if [ "$tag_version" != "$file_version" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml workspace version ($file_version)" >&2
-            exit 1
-          fi
 
       - name: Install Rust 1.88.0
         shell: bash
         run: |
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain 1.88.0
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              rustup_host=x86_64-unknown-linux-gnu
+              rustup_sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+              ;;
+            aarch64-unknown-linux-gnu)
+              rustup_host=aarch64-unknown-linux-gnu
+              rustup_sha256=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+              ;;
+            *)
+              echo "Unsupported rustup host for ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+          rustup_init="$RUNNER_TEMP/rustup-init"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            "https://static.rust-lang.org/rustup/archive/1.28.2/${rustup_host}/rustup-init" \
+            --output "$rustup_init"
+          echo "${rustup_sha256}  ${rustup_init}" | sha256sum --check --strict
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustup" target add --toolchain 1.88.0 "${{ matrix.target }}"
 
@@ -106,14 +258,14 @@ jobs:
         with:
           key: ubuntu-20.04-${{ matrix.target }}
 
-      - name: Build pi (release-dist)
-        run: cargo +1.88.0 build --profile release-dist --locked --target ${{ matrix.target }}
+      - name: Build rpi (release-dist)
+        run: cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
 
       - name: Verify stripped release binary
         shell: bash
         run: |
-          src="target/${{ matrix.target }}/release-dist/pi"
-          [ -f "$src" ] || { echo "pi binary not found at $src" >&2; exit 1; }
+          src="target/${{ matrix.target }}/release-dist/rpi"
+          [ -f "$src" ] || { echo "rpi binary not found at $src" >&2; exit 1; }
 
           bytes="$(wc -c < "$src" | tr -d '[:space:]')"
           echo "release binary: $src ($bytes bytes; limit $MAX_RELEASE_BINARY_BYTES)"
@@ -122,7 +274,7 @@ jobs:
             exit 1
           fi
 
-          sections="$RUNNER_TEMP/pi-sections.txt"
+          sections="$RUNNER_TEMP/rpi-sections.txt"
           readelf -SW "$src" > "$sections"
           if grep -Eq '\.(z)?debug_|\.gnu_debuglink' "$sections"; then
             echo "Linux release binary still contains debug sections" >&2
@@ -131,18 +283,18 @@ jobs:
 
       - name: Smoke-test on glibc 2.31 baseline
         shell: bash
-        run: target/${{ matrix.target }}/release-dist/pi --version
+        run: target/${{ matrix.target }}/release-dist/rpi --version
 
       - name: Package archive (tar.gz)
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          archive="pi-rs-${version}-${{ matrix.target }}.tar.gz"
+          archive="rpi-${version}-${{ matrix.target }}.tar.gz"
           staging="$(mktemp -d)"
-          src="target/${{ matrix.target }}/release-dist/pi"
+          src="target/${{ matrix.target }}/release-dist/rpi"
           [ -f LICENSE ] || { echo "LICENSE is required in release archives" >&2; exit 1; }
-          cp "$src" "$staging/pi"
-          chmod 0755 "$staging/pi"
+          cp "$src" "$staging/rpi"
+          chmod 0755 "$staging/rpi"
           cp LICENSE "$staging/"
           [ ! -f NOTICE ] || cp NOTICE "$staging/"
           tar -C "$staging" -czf "$archive" .
@@ -164,33 +316,80 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-15
+            expected_arch: arm64
           - target: x86_64-apple-darwin
-            os: macos-15
+            os: macos-15-intel
+            expected_arch: x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-2022
+            expected_arch: AMD64
             rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.os }}
+    needs: [validate-release, verify-release]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - name: Check tag matches Cargo.toml workspace version
+      - name: Verify native runner architecture
         shell: bash
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          file_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
-          if [ "$tag_version" != "$file_version" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml workspace version ($file_version)" >&2
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            actual_arch="$PROCESSOR_ARCHITECTURE"
+          else
+            actual_arch="$(uname -m)"
+          fi
+          echo "Native build architecture: $actual_arch"
+          if [ "$actual_arch" != "${{ matrix.expected_arch }}" ]; then
+            echo "Expected native ${{ matrix.expected_arch }} execution" >&2
             exit 1
           fi
+
 
       - name: Install Rust 1.88.0
         shell: bash
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default 1.88.0
-          rustup target add --toolchain 1.88.0 "${{ matrix.target }}"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              rustup_host=aarch64-apple-darwin
+              rustup_filename=rustup-init
+              rustup_sha256=20ef5516c31b1ac2290084199ba77dbbcaa1406c45c1d978ca68558ef5964ef5
+              ;;
+            x86_64-apple-darwin)
+              rustup_host=x86_64-apple-darwin
+              rustup_filename=rustup-init
+              rustup_sha256=9c331076f62b4d0edeae63d9d1c9442d5fe39b37b05025ec8d41c5ed35486496
+              ;;
+            x86_64-pc-windows-msvc)
+              rustup_host=x86_64-pc-windows-msvc
+              rustup_filename=rustup-init.exe
+              rustup_sha256=88d8258dcf6ae4f7a80c7d1088e1f36fa7025a1cfd1343731b4ee6f385121fc0
+              ;;
+            *)
+              echo "Unsupported rustup host for ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+          rustup_init="$RUNNER_TEMP/$rustup_filename"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            "https://static.rust-lang.org/rustup/archive/1.28.2/${rustup_host}/${rustup_filename}" \
+            --output "$rustup_init"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual_sha256="$(sha256sum "$rustup_init" | cut -d ' ' -f 1)"
+          elif command -v shasum >/dev/null 2>&1; then
+            actual_sha256="$(shasum -a 256 "$rustup_init" | cut -d ' ' -f 1)"
+          else
+            echo "No SHA-256 tool is available" >&2
+            exit 1
+          fi
+          [ "$actual_sha256" = "$rustup_sha256" ] || {
+            echo "rustup-init SHA-256 mismatch" >&2
+            exit 1
+          }
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add --toolchain 1.88.0 "${{ matrix.target }}"
 
-          rustc_version="$(rustc +1.88.0 --version)"
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
           echo "$rustc_version"
           case "$rustc_version" in
             "rustc 1.88.0 "*) ;;
@@ -204,18 +403,18 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build pi (release-dist)
+      - name: Build rpi (release-dist)
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo +1.88.0 build --profile release-dist --locked --target ${{ matrix.target }}
+        run: cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
 
       - name: Verify stripped release binary
         shell: bash
         run: |
           suffix=""
           if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
-          src="target/${{ matrix.target }}/release-dist/pi${suffix}"
-          [ -f "$src" ] || { echo "pi binary not found at $src" >&2; exit 1; }
+          src="target/${{ matrix.target }}/release-dist/rpi${suffix}"
+          [ -f "$src" ] || { echo "rpi binary not found at $src" >&2; exit 1; }
 
           bytes="$(wc -c < "$src" | tr -d '[:space:]')"
           echo "release binary: $src ($bytes bytes; limit $MAX_RELEASE_BINARY_BYTES)"
@@ -227,28 +426,28 @@ jobs:
       - name: Smoke-test the native binary (macOS)
         if: runner.os != 'Windows'
         shell: bash
-        run: target/${{ matrix.target }}/release-dist/pi --version
+        run: target/${{ matrix.target }}/release-dist/rpi --version
 
       - name: Smoke-test the native binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $src = "target/${{ matrix.target }}/release-dist/pi.exe"
-          if (-not (Test-Path -LiteralPath $src)) { throw "pi binary not found at $src" }
+          $src = "target/${{ matrix.target }}/release-dist/rpi.exe"
+          if (-not (Test-Path -LiteralPath $src)) { throw "rpi binary not found at $src" }
           & $src --version
-          if ($LASTEXITCODE -ne 0) { throw "pi --version exited $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "rpi --version exited $LASTEXITCODE" }
 
       - name: Package archive (tar.gz)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          archive="pi-rs-${version}-${{ matrix.target }}.tar.gz"
+          archive="rpi-${version}-${{ matrix.target }}.tar.gz"
           staging="$(mktemp -d)"
-          src="target/${{ matrix.target }}/release-dist/pi"
+          src="target/${{ matrix.target }}/release-dist/rpi"
           [ -f LICENSE ] || { echo "LICENSE is required in release archives" >&2; exit 1; }
-          cp "$src" "$staging/pi"
-          chmod 0755 "$staging/pi"
+          cp "$src" "$staging/rpi"
+          chmod 0755 "$staging/rpi"
           cp LICENSE "$staging/"
           [ ! -f NOTICE ] || cp NOTICE "$staging/"
           tar -C "$staging" -czf "$archive" .
@@ -264,12 +463,12 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart("v")
-          $archive = "pi-rs-$version-${{ matrix.target }}.zip"
+          $archive = "rpi-$version-${{ matrix.target }}.zip"
           $staging = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "staging") -Force
           if (-not (Test-Path -Path LICENSE -PathType Leaf)) {
             throw "LICENSE is required in release archives"
           }
-          Copy-Item "target/${{ matrix.target }}/release-dist/pi.exe" (Join-Path $staging "pi.exe")
+          Copy-Item "target/${{ matrix.target }}/release-dist/rpi.exe" (Join-Path $staging "rpi.exe")
           Copy-Item LICENSE $staging
           if (Test-Path -Path NOTICE -PathType Leaf) { Copy-Item NOTICE $staging }
           Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $archive
@@ -312,11 +511,11 @@ jobs:
             *)   echo "IS_PRERELEASE=false" >> "$GITHUB_ENV" ;;
           esac
           expected=(
-            "pi-rs-${version}-aarch64-apple-darwin.tar.gz"
-            "pi-rs-${version}-aarch64-unknown-linux-gnu.tar.gz"
-            "pi-rs-${version}-x86_64-apple-darwin.tar.gz"
-            "pi-rs-${version}-x86_64-pc-windows-msvc.zip"
-            "pi-rs-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "rpi-${version}-aarch64-apple-darwin.tar.gz"
+            "rpi-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "rpi-${version}-x86_64-apple-darwin.tar.gz"
+            "rpi-${version}-x86_64-pc-windows-msvc.zip"
+            "rpi-${version}-x86_64-unknown-linux-gnu.tar.gz"
           )
 
           printf '%s\n' "${expected[@]}" | LC_ALL=C sort > "$RUNNER_TEMP/expected-assets.txt"
@@ -384,7 +583,7 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            ## pi `${{ github.ref_name }}`
+            ## rpi `${{ github.ref_name }}`
 
             ### Install
 
@@ -411,11 +610,11 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           expected=(
             SHA256SUMS
-            "pi-rs-${version}-aarch64-apple-darwin.tar.gz"
-            "pi-rs-${version}-aarch64-unknown-linux-gnu.tar.gz"
-            "pi-rs-${version}-x86_64-apple-darwin.tar.gz"
-            "pi-rs-${version}-x86_64-pc-windows-msvc.zip"
-            "pi-rs-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "rpi-${version}-aarch64-apple-darwin.tar.gz"
+            "rpi-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "rpi-${version}-x86_64-apple-darwin.tar.gz"
+            "rpi-${version}-x86_64-pc-windows-msvc.zip"
+            "rpi-${version}-x86_64-unknown-linux-gnu.tar.gz"
           )
           release_id="${{ steps.draft_release.outputs.id }}"
           case "$release_id" in

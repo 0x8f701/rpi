@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
@@ -14,20 +14,20 @@ use crossterm::{
         KeyEventKind, KeyModifiers,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, window_size},
+    terminal::{DisableLineWrap, EnableLineWrap, disable_raw_mode, enable_raw_mode, window_size},
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use pi_agent::{AgentEvent, ThinkingLevel};
 use pi_ai::{AssistantMessageEvent, ContentBlock, Message, Model};
 use pi_coding::{
     Application, ApplicationEvent, CONFIG_DIR_NAME, DoubleEscapeAction, ExtensionUiRequest,
-    LoopEvent, LoopTask, Session, StreamingBehavior, TodoPhase, TodoStatus, ToolCallViewStatus,
-    UiNotificationLevel, UiSelectOption, UiWidgetPlacement,
+    GoalLifecycle, GoalState, LoopEvent, LoopTask, Session, StreamingBehavior, TodoItem, TodoPhase,
+    TodoStatus, ToolCallViewStatus, UiNotificationLevel, UiSelectOption, UiWidgetPlacement,
 };
 use ratatui::{
     Terminal,
     TerminalOptions, Viewport,
-    backend::CrosstermBackend,
+    backend::{Backend, ClearType, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -44,18 +44,25 @@ use crate::clipboard::{self, ClipboardContent};
 use crate::extension_ui::{ExtensionUiAdapter, ExtensionUiEvent, ExtensionUiInteraction};
 use crate::file_search::{self, AtPrefix};
 use crate::interactive_commands::{
-    BUILTIN_COMMANDS, CommandSource, InteractiveCommand,
-    executable_catalog as interactive_commands, expand_resource_command,
+    BUILTIN_COMMANDS, CommandSource, InteractiveCommand, builtin,
+    executable_catalog as interactive_commands, expand_resource_command, requires_arguments,
+    usage, visible_catalog,
 };
 use crate::job_card_adapter::{
-    JobCardPresentationAdapter, JobCardRowRole, JobCardRows,
+    JobCardPresentationAdapter, JobCardRowRole, JobCardRows, TaskCardRows,
+};
+use crate::orchestration_message::{
+    orchestration_irc_view, orchestration_irc_view_from_mailbox, OrchestrationIrcView,
 };
 use crate::keybindings::{Action, KeyBindingsManager};
 use crate::agents_panel::{AgentsPanel, AgentsPanelAction};
 use crate::markdown::ratatui::{
     MarkdownRatatuiStyles, render_ratatui_markdown, render_ratatui_markdown_streaming,
+    syntax_spans_unpadded as markdown_syntax_spans,
 };
-use crate::process_commands::{ProcessPanel, ProcessPanelAction, render_process_panel};
+use crate::process_commands::{
+    ProcessKeyResult, ProcessPanel, ProcessPanelAction, render_process_panel,
+};
 use crate::terminal_images::{
     ImageDisplayConfig, ImageFrameIdentity, ImageLayout, ImagePlacement, TerminalCellSize,
     TerminalImageRenderer,
@@ -67,10 +74,11 @@ use crate::saved_session_selector::{
 use crate::scoped_model_selector::{ScopedModelSelection, ScopedModelSelector};
 use crate::theme::{Theme, ThemeManager};
 use crate::tool_card_adapter::{
-    ToolCardPresentationAdapter, ToolCardRowRole, ToolCardRows,
+    ToolCardPresentationAdapter, ToolCardRowRole, ToolCardRows, task_delegation_request,
 };
 use crate::tree_panel::{TreePanel, TreePanelMode};
 use crate::settings_panel::{SettingsControl, SettingsPanel};
+use crate::workflow_panel::{WorkflowIntentKind, WorkflowPanel, WorkflowPanelResult, WorkflowPanelSnapshot, compact_workflow_status, render_workflow_panel};
 
 const MAX_TRANSCRIPT_LINES: usize = 4_000;
 const MAX_COMPLETIONS: usize = 7;
@@ -87,6 +95,12 @@ enum PanelValue {
     SettingsThinking,
     SettingsTheme,
     SettingsAutoCompact,
+    GoalCreate,
+    GoalShow,
+    GoalPause,
+    GoalResume,
+    GoalComplete,
+    GoalDrop,
 }
 
 #[derive(Clone)]
@@ -240,6 +254,21 @@ impl CompletionState {
         self.selected = 0;
         self.context = None;
     }
+
+    /// Selected-centered / tail-following window into the full match list.
+    /// Navigation still walks every item; only the painted rows are capped.
+    fn visible_window(&self, max_rows: usize) -> (usize, &[CompletionItem]) {
+        if self.items.is_empty() || max_rows == 0 {
+            return (0, &[]);
+        }
+        let max_rows = max_rows.min(self.items.len());
+        let half = max_rows / 2;
+        let mut start = self.selected.saturating_sub(half);
+        if start + max_rows > self.items.len() {
+            start = self.items.len() - max_rows;
+        }
+        (start, &self.items[start..start + max_rows])
+    }
 }
 
 enum BackgroundEvent {
@@ -330,67 +359,99 @@ pub async fn interactive(
                 };
                 match terminal_event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        if let Some(first) = raw_paste_character(key) {
-                            let mut payload = first.to_string();
+                        if is_raw_multiline_paste_start(key) {
+                            // Ordinary printable keys never wait. Only an unmodified Enter
+                            // probes events already buffered by the terminal, which is enough
+                            // to recognize an unmarked multiline paste without a timer.
+                            let mut keys = vec![key];
+                            let mut payload = "\n".to_owned();
                             let mut deferred = None;
                             let mut rejected = false;
+                            let mut input_closed = false;
                             loop {
-                                match tokio::time::timeout(
-                                    std::time::Duration::from_millis(10),
-                                    input.next(),
-                                )
-                                .await
-                                {
-                                    Ok(Some(Ok(Event::Key(next))))
+                                match input.next().now_or_never() {
+                                    Some(Some(Ok(Event::Key(next))))
                                         if next.kind != KeyEventKind::Release =>
                                     {
                                         if let Some(character) = raw_paste_character(next) {
-                                            if !rejected
-                                                && payload.len() + character.len_utf8()
-                                                    <= MAX_PASTE_BYTES
+                                            if payload.len() + character.len_utf8()
+                                                <= MAX_PASTE_BYTES
                                             {
+                                                keys.push(next);
                                                 payload.push(character);
                                             } else {
+                                                // Stop at the first byte beyond the cap. The
+                                                // event that crossed it is still dispatched as
+                                                // a key, and later input remains in EventStream.
                                                 rejected = true;
-                                                payload.clear();
+                                                deferred = Some(Event::Key(next));
                                                 state.status = format!(
                                                     "Paste rejected: input exceeds the {} MiB limit",
                                                     MAX_PASTE_BYTES / (1024 * 1024)
                                                 );
+                                                break;
                                             }
                                         } else {
-                                            deferred = Some(next);
+                                            deferred = Some(Event::Key(next));
                                             break;
                                         }
                                     }
-                                    Ok(Some(Ok(Event::Paste(text)))) => {
-                                        if !rejected && payload.len() + text.len() <= MAX_PASTE_BYTES {
-                                            payload.push_str(&text);
-                                        } else {
-                                            rejected = true;
-                                            payload.clear();
-                                            state.status = format!(
-                                                "Paste rejected: input exceeds the {} MiB limit",
-                                                MAX_PASTE_BYTES / (1024 * 1024)
-                                            );
-                                        }
+                                    Some(Some(Ok(event))) => {
+                                        // Bracketed paste is always handled directly rather
+                                        // than merged into an unmarked candidate.
+                                        deferred = Some(event);
+                                        break;
                                     }
-                                    Ok(Some(Ok(_))) => break,
-                                    Ok(Some(Err(error))) => return Err(error.into()),
-                                    Ok(None) | Err(_) => break,
+                                    Some(Some(Err(error))) => return Err(error.into()),
+                                    Some(None) => {
+                                        input_closed = true;
+                                        break;
+                                    }
+                                    None => break,
                                 }
                             }
                             if !rejected {
-                                if payload.chars().count() > 1 {
-                                    handle_paste(&mut state, &payload);
-                                } else if handle_key(&application, &mut state, key, &mut terminal).await? {
-                                    state.cancel_extension_dialogs();
-                                    return Ok(());
+                                match classify_raw_input_burst(&payload) {
+                                    RawInputDisposition::Paste => {
+                                        handle_paste(&mut state, &payload);
+                                    }
+                                    RawInputDisposition::Keys => {
+                                        for replay in keys {
+                                            if handle_key(
+                                                &application,
+                                                &mut state,
+                                                replay,
+                                                &mut terminal,
+                                            )
+                                            .await?
+                                            {
+                                                state.cancel_extension_dialogs();
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            if let Some(key) = deferred
-                                && handle_key(&application, &mut state, key, &mut terminal).await?
-                            {
+                            if let Some(event) = deferred {
+                                match event {
+                                    Event::Key(next) if next.kind != KeyEventKind::Release => {
+                                        if handle_key(
+                                            &application,
+                                            &mut state,
+                                            next,
+                                            &mut terminal,
+                                        )
+                                        .await?
+                                        {
+                                            state.cancel_extension_dialogs();
+                                            return Ok(());
+                                        }
+                                    }
+                                    Event::Paste(text) => handle_paste(&mut state, &text),
+                                    _ => {}
+                                }
+                            }
+                            if input_closed {
                                 state.cancel_extension_dialogs();
                                 return Ok(());
                             }
@@ -410,9 +471,26 @@ pub async fn interactive(
             }
             application_event = events.recv() => {
                 match application_event {
+                    Ok(ApplicationEvent::RuntimeChanged { epoch }) => {
+                        state.replace_transcript_from_application(&application);
+                        state.refresh_job_projection(&application);
+                        state.todo_phases = application.todo_state().phases;
+                        state.cwd_path = application.session().cwd().to_path_buf();
+                        state.apply_runtime_settings(&application).await;
+                        state.status = format!("Switched application runtime generation {epoch}");
+                    }
+                    Ok(ApplicationEvent::Workflow(event)) => state.apply_workflow_event(&application, event),
                     Ok(event) => state.apply(event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                         state.refresh_job_projection(&application);
+                        state.workflow_snapshots = application
+                            .workflow_list()
+                            .iter()
+                            .map(|snapshot| TuiState::project_workflow_snapshot(&application, snapshot))
+                            .collect();
+                        if let Some(panel) = &mut state.workflow_panel {
+                            panel.replace(state.workflow_snapshots.clone());
+                        }
                         state.push_status(format!("UI skipped {count} stale events"), true);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => { state.cancel_extension_dialogs(); return Ok(()); }
@@ -448,7 +526,7 @@ pub async fn interactive(
                     state.push_status(notice, false);
                 }
             }
-            _ = animation.tick(), if state.is_streaming => { state.animation_frame = state.animation_frame.wrapping_add(1); }
+            _ = animation.tick(), if state.has_active_animation() => { state.animation_frame = state.animation_frame.wrapping_add(1); }
             _ = theme_watch.tick() => {
                 let changed = state.poll_theme_reload() | state.reconcile_extension_dialog();
                 if !changed {
@@ -473,11 +551,11 @@ static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 fn acquire_terminal(writer: &mut impl Write) -> io::Result<()> {
-    execute!(writer, EnableBracketedPaste, Hide)
+    execute!(writer, DisableLineWrap, EnableBracketedPaste, Hide)
 }
 
 fn release_terminal(writer: &mut impl Write) -> io::Result<()> {
-    execute!(writer, DisableBracketedPaste, Show)
+    execute!(writer, DisableBracketedPaste, EnableLineWrap, Show)
 }
 
 /// Restore cooked input and the visible cursor exactly once per active TUI
@@ -514,6 +592,10 @@ pub fn install_panic_hook() {
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     images: TerminalImageRenderer,
+    /// Previous `page_overlay_open` sample. Used to clear the live region exactly
+    /// once on overlay dismiss so transient page pixels cannot later be promoted
+    /// into native scrollback by `insert_before`.
+    page_overlay_was_open: bool,
 }
 
 impl TerminalGuard {
@@ -526,6 +608,11 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
+        // Stable full-terminal inline height. Ratatui bakes `Viewport::Inline`
+        // height at construction and reconstructing mid-session issues a CPR
+        // that fails on bare PTYs ("cursor position could not be read").
+        // Overlay durability is handled by skipping commit while open and
+        // clearing the live region on dismiss — not by shrinking the viewport.
         let height = crossterm::terminal::size()
             .map(|(_, rows)| rows.max(Self::MIN_VIEWPORT_HEIGHT))
             .unwrap_or(24);
@@ -547,13 +634,20 @@ impl TerminalGuard {
         Ok(Self {
             terminal,
             images: TerminalImageRenderer::default(),
+            page_overlay_was_open: false,
         })
     }
 
     fn commit_settled(&mut self, state: &mut TuiState) -> Result<()> {
-        self.terminal.autoresize()?;
+        // Synchronize overlay lifecycle before any insert_before call. A key
+        // dismissal is observed at the top of the next loop, before draw();
+        // clearing here prevents the prior overlay frame entering scrollback.
+        self.resize_live_viewport(state)?;
+        if page_overlay_open(state) {
+            return Ok(());
+        }
         let size = self.terminal.size()?;
-        let transcript_rows = transcript_region_height(state, size.height);
+        let transcript_rows = transcript_region_height(state, size.width.max(1), size.height);
         let entries = state.overflow_commit_batch(size.width.max(1), transcript_rows);
         if entries.is_empty() {
             return Ok(());
@@ -579,12 +673,24 @@ impl TerminalGuard {
                 .wrap(Wrap { trim: false })
                 .render(buffer.area, buffer);
         })?;
+        // `insert_before` writes directly to the backend, while ratatui keeps
+        // the prior frame buffer for its next differential draw. The following
+        // draw can therefore skip composer rows overwritten by the committed
+        // transcript. Clear row-by-row before invalidating the back buffer:
+        // this forces a complete redraw without promoting mutable live rows
+        // into scrollback.
+        self.clear_live_viewport()?;
         state.finish_commit(entries.len());
         Ok(())
     }
 
-    fn resize_live_viewport(&mut self, _state: &TuiState) -> Result<()> {
+    fn resize_live_viewport(&mut self, state: &TuiState) -> Result<()> {
         self.terminal.autoresize()?;
+        let open = page_overlay_open(state);
+        if self.page_overlay_was_open && !open {
+            self.clear_live_viewport()?;
+        }
+        self.page_overlay_was_open = open;
         Ok(())
     }
 
@@ -606,14 +712,12 @@ impl TerminalGuard {
         Ok(())
     }
 
-    /// Temporarily yield raw input and the cursor to a shell operation. The
-    /// inline viewport stays on the normal screen and committed scrollback is
-    /// never cleared.
-    /// Clear only ratatui's current inline viewport. `Terminal::clear` maps an
-    /// inline viewport to ClearType::AfterCursor from the viewport origin, so
-    /// committed normal-screen rows above it remain durable scrollback.
+    /// Clear the inline viewport without asking tmux to preserve the erased
+    /// full-screen frame in history. A home-positioned ED sequence promotes
+    /// every visible row to tmux scrollback before clearing; clearing each row
+    /// first keeps transient settings/workflow pages out of retained history.
     fn clear_live_viewport(&mut self) -> Result<()> {
-        self.terminal.clear()?;
+        clear_inline_viewport(&mut self.terminal)?;
         Ok(())
     }
     fn yield_to_shell(&mut self) -> Result<()> {
@@ -637,6 +741,7 @@ impl TerminalGuard {
         enable_raw_mode()?;
         acquire_terminal(self.terminal.backend_mut())?;
         self.images = TerminalImageRenderer::default();
+        self.page_overlay_was_open = false;
         TUI_ACTIVE.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -651,6 +756,17 @@ impl TerminalGuard {
         self.reacquire_from_shell()?;
         result
     }
+}
+
+fn clear_inline_viewport<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
+    let area = terminal.get_frame().area();
+    let backend = terminal.backend_mut();
+    for y in area.top()..area.bottom() {
+        backend.set_cursor_position((area.left(), y))?;
+        backend.clear_region(ClearType::CurrentLine)?;
+    }
+    Backend::flush(backend)?;
+    terminal.clear()
 }
 
 impl Drop for TerminalGuard {
@@ -730,6 +846,7 @@ struct YankSpan {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditorActionKind {
     Other,
+    Insert,
     Kill,
     Yank,
 }
@@ -792,6 +909,20 @@ impl EditorState {
         self.undo.push(self.snapshot());
     }
 
+    fn record_insert_undo(&mut self) {
+        if self.last_action != EditorActionKind::Insert {
+            self.record_undo();
+        }
+        self.last_action = EditorActionKind::Insert;
+        self.last_yank = None;
+    }
+
+    fn break_insert_chain(&mut self) {
+        if self.last_action == EditorActionKind::Insert {
+            self.last_action = EditorActionKind::Other;
+        }
+    }
+
     fn break_action_chain(&mut self) {
         self.last_action = EditorActionKind::Other;
         self.last_yank = None;
@@ -825,15 +956,13 @@ impl EditorState {
     }
 
     fn insert_char(&mut self, character: char) {
-        self.record_undo();
-        self.break_action_chain();
+        self.record_insert_undo();
         self.lines[self.row].insert(self.column, character);
         self.column += character.len_utf8();
     }
 
     fn insert_newline(&mut self) {
-        self.record_undo();
-        self.break_action_chain();
+        self.record_insert_undo();
         let tail = self.lines[self.row].split_off(self.column);
         self.row += 1;
         self.column = 0;
@@ -845,8 +974,7 @@ impl EditorState {
             return;
         }
         let normalized = normalize_newlines(text);
-        self.record_undo();
-        self.break_action_chain();
+        self.record_insert_undo();
         self.insert_text_internal(&normalized);
     }
 
@@ -976,6 +1104,14 @@ impl EditorState {
             self.column = floor_char_boundary(&self.lines[self.row], self.column);
         }
     }
+    fn at_first_line(&self) -> bool {
+        self.row == 0
+    }
+
+    fn at_last_line(&self) -> bool {
+        self.row + 1 >= self.lines.len()
+    }
+
     fn move_home(&mut self) {
         self.break_action_chain();
         self.column = 0;
@@ -1332,7 +1468,7 @@ struct TranscriptEntry {
     content: Vec<ContentBlock>,
     tool_name: Option<String>,
     tool_card: Option<ToolTranscript>,
-    job_card: Option<JobCardRows>,
+    job_card: Option<TaskCardRows>,
     is_error: bool,
     is_partial: bool,
 }
@@ -1363,11 +1499,19 @@ struct TuiState {
     job_cards: JobCardPresentationAdapter,
     committed_entries: usize,
     editor: EditorState,
+    /// Submitted prompt drafts newest-last. Seeded from session user messages
+    /// and extended once per accepted composer submission.
+    prompt_history: Vec<String>,
+    /// `None` while editing the live draft; `Some(i)` while browsing history.
+    prompt_history_index: Option<usize>,
+    /// Draft text captured when Up first leaves the live composer for history.
+    prompt_history_draft: Option<String>,
     streaming_text: String,
     streaming_thinking: String,
     thinking_level: ThinkingLevel,
     is_streaming: bool,
     animation_frame: usize,
+    is_compacting: bool,
     /// True after the TUI echoes a submitted user prompt immediately (before
     /// the agent emits its `MessageEnd` for the persisted `Message::User`).
     /// Consumed by the next `Message::User` `MessageEnd`, which replaces the
@@ -1379,19 +1523,25 @@ struct TuiState {
     show_thinking: bool,
     double_escape_action: DoubleEscapeAction,
     last_escape: Option<std::time::Instant>,
+    /// Timestamp of the most recent idle Ctrl-C (`Action::ClearEditor`) that
+    /// armed the OMP double-press exit ladder. Cleared on unrelated input.
+    last_ctrl_c: Option<std::time::Instant>,
     expand_tools: bool,
     transcript_scroll: usize,
     transcript_page_rows: Cell<usize>,
     show_images: bool,
     image_width_cells: u16,
     status: String,
+    /// Ephemeral input/runtime error rendered immediately above the composer.
+    /// It is never copied into the transcript or native terminal scrollback.
+    composer_error: Option<String>,
     model: String,
     cwd: String,
     completions: CompletionState,
     themes: ThemeManager,
     keybindings: KeyBindingsManager,
     cwd_path: PathBuf,
-    pending_attachments: Vec<ContentBlock>,
+    pending_attachments: Vec<PendingAttachment>,
     extension_ui: ExtensionUiAdapter,
     extension_dialog: Option<ExtensionDialog>,
     background_tx: mpsc::UnboundedSender<BackgroundEvent>,
@@ -1406,17 +1556,38 @@ struct TuiState {
     settings_value_input: Option<(String, String)>,
     tree_panel: Option<TreePanel>,
     process_panel: Option<ProcessPanel>,
+    workflow_panel: Option<WorkflowPanel>,
     agents_panel: Option<AgentsPanel>,
     scoped_models: Option<Vec<Model>>,
     session_selector: Option<SavedSessionSelector>,
     scoped_model_selector: Option<ScopedModelSelector>,
     todo_phases: Vec<TodoPhase>,
+    workflow_snapshots: Vec<WorkflowPanelSnapshot>,
     /// Extension-owned working indicator text; authoritative for host queries.
     extension_working_message: Option<String>,
     extension_working_visible: bool,
     extension_hidden_thinking_label: Option<String>,
     extension_title: Option<String>,
+    goal_state: GoalState,
     active_loops: std::collections::BTreeMap<String, LoopTask>,
+    /// Dedupes live MessageDelivered projections and session CustomMessage IRC.
+    seen_irc_message_ids: std::collections::HashSet<String>,
+}
+
+fn goal_status_summary(state: &GoalState) -> Option<String> {
+    state.current.as_ref().map(|goal| {
+        let marker = match goal.lifecycle {
+            GoalLifecycle::Active => "🎯",
+            GoalLifecycle::Paused => "⏸",
+            GoalLifecycle::Completed => "✓",
+            GoalLifecycle::Dropped => "✗",
+        };
+        let usage = goal.token_budget.map_or_else(
+            || format!("{}", goal.usage.tokens_used),
+            |budget| format!("{}/{}", goal.usage.tokens_used, budget),
+        );
+        format!("{marker} Goal {usage}")
+    })
 }
 impl TuiState {
     fn new(
@@ -1460,15 +1631,20 @@ impl TuiState {
             job_cards: JobCardPresentationAdapter::new(),
             committed_entries: 0,
             editor: EditorState::new(),
+            prompt_history: Vec::new(),
+            prompt_history_index: None,
+            prompt_history_draft: None,
             thinking_level: session.thinking_level(),
             streaming_text: String::new(),
             streaming_thinking: String::new(),
             is_streaming: false,
             animation_frame: 0,
+            is_compacting: false,
             pending_user_echo: false,
             show_thinking: runtime_settings.show_thinking,
             double_escape_action: runtime_settings.double_escape_action,
             last_escape: None,
+            last_ctrl_c: None,
             expand_tools: false,
             transcript_scroll: 0,
             transcript_page_rows: Cell::new(1),
@@ -1476,6 +1652,7 @@ impl TuiState {
             image_width_cells: runtime_settings.image_width_cells,
             status: "Enter submit · Shift+Enter/Ctrl+J newline · Esc abort · Ctrl+D quit"
                 .to_owned(),
+            composer_error: None,
             model,
             cwd: cwd.display().to_string(),
             completions: CompletionState::default(),
@@ -1497,21 +1674,26 @@ impl TuiState {
             settings_value_input: None,
             tree_panel: None,
             process_panel: None,
+            workflow_panel: None,
             agents_panel: None,
             scoped_models: initial_scoped_models,
             session_selector: None,
             scoped_model_selector: None,
             todo_phases: application.todo_state().phases,
+            workflow_snapshots: application.workflow_list().iter().map(WorkflowPanelSnapshot::from).collect(),
             extension_working_message: None,
             extension_working_visible: false,
             extension_hidden_thinking_label: None,
             extension_title: None,
             active_loops: std::collections::BTreeMap::new(),
+            seen_irc_message_ids: std::collections::HashSet::new(),
+            goal_state: application.goal_state(),
         };
         state.sync_extension_host_bindings();
         for message in session.history() {
             state.push_message(message);
         }
+        state.rebuild_prompt_history_from_messages(session.history());
         state.refresh_job_projection(application);
         let diagnostics: Vec<String> = state
             .themes
@@ -1539,6 +1721,7 @@ impl TuiState {
         self.image_width_cells = settings.tui.image_width_cells;
         self.double_escape_action = settings.tui.double_escape_action;
         self.last_escape = None;
+        self.last_ctrl_c = None;
 
         if let Some(snapshot) = application.resource_snapshot() {
             let explicit_themes = snapshot
@@ -1751,14 +1934,32 @@ impl TuiState {
     }
 
     fn apply_tool_event(&mut self, event: &AgentEvent) -> bool {
+        if let AgentEvent::ToolExecutionStart { tool_name, arguments, .. } = event
+            && tool_name.eq_ignore_ascii_case("task")
+            && let Some(request) = task_delegation_request(arguments)
+        {
+            self.job_cards.set_task_request(
+                request.context,
+                request.children.into_iter().map(|child| (child.name, child.agent, child.task)),
+            );
+            return true;
+        }
+        if matches!(event,
+            AgentEvent::ToolExecutionUpdate { tool_name, .. }
+            | AgentEvent::ToolExecutionEnd { tool_name, .. }
+            if tool_name.eq_ignore_ascii_case("task")
+        ) || matches!(event,
+            AgentEvent::MessageEnd { message: Message::ToolResult(result) }
+            if result.tool_name.eq_ignore_ascii_case("task")
+        ) {
+            return true;
+        }
         self.tool_cards.apply_agent_event(event);
         let tool_call_id = match event {
             AgentEvent::ToolExecutionStart { tool_call_id, .. }
             | AgentEvent::ToolExecutionUpdate { tool_call_id, .. }
             | AgentEvent::ToolExecutionEnd { tool_call_id, .. } => Some(tool_call_id.as_str()),
-            AgentEvent::MessageEnd {
-                message: Message::ToolResult(result),
-            } => Some(result.tool_call_id.as_str()),
+            AgentEvent::MessageEnd { message: Message::ToolResult(result) } => Some(result.tool_call_id.as_str()),
             _ => None,
         };
         if let Some(tool_call_id) = tool_call_id {
@@ -1813,7 +2014,21 @@ impl TuiState {
         self.upsert_tool_card(&tool_call_id);
     }
 
+    fn has_active_animation(&self) -> bool {
+        self.is_streaming || self.is_compacting || self.job_cards.running_count() > 0
+    }
+
     fn apply_orchestration_event(&mut self, event: pi_coding::OrchestrationEvent) {
+        if let pi_coding::OrchestrationEvent::MessageDelivered { message, .. } = &event {
+            let view = orchestration_irc_view_from_mailbox(
+                &message.id,
+                &message.from,
+                &message.to,
+                &message.body,
+                message.reply_to.as_deref(),
+            );
+            self.push_irc_view(&view);
+        }
         self.job_cards.apply_orchestration_event(&event);
         self.sync_job_cards();
     }
@@ -1832,36 +2047,15 @@ impl TuiState {
     }
 
     fn sync_job_cards(&mut self) {
-        let mut cards = self.job_cards.cards_in_source_order();
-        if let (Some(card), Some(aggregate)) = (cards.last_mut(), self.job_cards.aggregate_row()) {
-            card.rows.push(aggregate);
-        }
-        for card in cards {
-            let job_id = card.job_id.clone();
-            let is_partial = matches!(
-                card.job_status,
-                pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running
-            );
-            let is_error = card.job_status == pi_coding::JobStatus::Failed;
-            let entry = TranscriptEntry {
-                kind: TranscriptKind::Job,
-                content: Vec::new(),
-                tool_name: None,
-                tool_card: None,
-                job_card: Some(card),
-                is_error,
-                is_partial,
-            };
-            if let Some(existing) = self.transcript.iter_mut().find(|entry| {
-                entry
-                    .job_card
-                    .as_ref()
-                    .is_some_and(|card| card.job_id == job_id)
-            }) {
-                *existing = entry;
-            } else {
-                self.transcript.push(entry);
-            }
+        let Some(card) = self.job_cards.task_card() else { return };
+        let group_id = card.group_id.clone();
+        let is_partial = card.children.iter().any(|child| matches!(child.job_status, pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running));
+        let is_error = card.children.iter().any(|child| child.job_status == pi_coding::JobStatus::Failed);
+        let entry = TranscriptEntry { kind: TranscriptKind::Job, content: Vec::new(), tool_name: None, tool_card: None, job_card: Some(card), is_error, is_partial };
+        if let Some(existing) = self.transcript.iter_mut().find(|entry| entry.job_card.as_ref().is_some_and(|card| card.group_id == group_id)) {
+            *existing = entry;
+        } else {
+            self.transcript.push(entry);
         }
         self.trim_transcript();
         self.follow_transcript();
@@ -1906,9 +2100,14 @@ impl TuiState {
                     self.streaming_thinking.clear();
                 }
                 if let Message::Custom(custom) = &message
-                    && pi_coding::loop_message_view(custom).is_some()
+                    && (pi_coding::loop_message_view(custom).is_some()
+                        || orchestration_irc_view(custom).is_some())
                 {
-                    self.push_loop_message(custom);
+                    if pi_coding::loop_message_view(custom).is_some() {
+                        self.push_loop_message(custom);
+                    } else if let Some(irc) = orchestration_irc_view(custom) {
+                        self.push_irc_view(&irc);
+                    }
                 } else if self.pending_user_echo
                     && let Message::User(user) = message
                 {
@@ -1948,6 +2147,27 @@ impl TuiState {
                     final_error.unwrap_or_else(|| "Retry ended".to_owned())
                 };
             }
+            ApplicationEvent::Session(pi_coding::SessionEvent::CompactionStart { .. }) => {
+                self.is_compacting = true;
+                self.status = "Compacting context".to_owned();
+            }
+            ApplicationEvent::Session(pi_coding::SessionEvent::CompactionEnd {
+                aborted,
+                will_retry,
+                error_message,
+                ..
+            }) => {
+                self.is_compacting = false;
+                self.status = if aborted {
+                    "Compaction aborted".to_owned()
+                } else if will_retry {
+                    "Compaction will retry".to_owned()
+                } else if let Some(error) = error_message {
+                    format!("Compaction failed: {error}")
+                } else {
+                    "Compaction complete".to_owned()
+                };
+            }
             ApplicationEvent::AgentSettled => {
                 self.is_streaming = false;
                 self.streaming_text.clear();
@@ -1970,6 +2190,7 @@ impl TuiState {
             ApplicationEvent::TodoUpdated { phases, .. } => {
                 self.todo_phases = phases;
             }
+            ApplicationEvent::Workflow(_) => {}
             ApplicationEvent::TodoReminder { phases } => {
                 self.todo_phases = phases;
                 let open = todo_open_count(&self.todo_phases);
@@ -1980,8 +2201,54 @@ impl TuiState {
                     panel.apply_event(event);
                 }
             }
+            ApplicationEvent::GoalUpdated { state, .. }
+            | ApplicationEvent::GoalUsageCharged { state, .. } => {
+                self.goal_state = state;
+            }
             ApplicationEvent::Loop(event) => self.apply_loop_event(event),
             _ => {}
+        }
+    }
+
+    fn apply_workflow_event(&mut self, application: &Application, event: pi_coding::WorkflowEvent) {
+        match event {
+            pi_coding::WorkflowEvent::Created { snapshot }
+            | pi_coding::WorkflowEvent::Updated { snapshot } => {
+                let projected = Self::project_workflow_snapshot(application, &snapshot);
+                if let Some(current) = self
+                    .workflow_snapshots
+                    .iter_mut()
+                    .find(|current| current.id == projected.id)
+                {
+                    if current.generation <= projected.generation {
+                        *current = projected;
+                    }
+                } else {
+                    self.workflow_snapshots.push(projected);
+                }
+            }
+            pi_coding::WorkflowEvent::StatusChanged {
+                workflow_id,
+                generation,
+                status,
+            } => {
+                if let Some(current) = self
+                    .workflow_snapshots
+                    .iter_mut()
+                    .find(|current| current.id == workflow_id.as_str())
+                    && current.generation == generation
+                {
+                    current.status = status;
+                }
+            }
+            pi_coding::WorkflowEvent::Removed { workflow_id, generation } => {
+                self.workflow_snapshots.retain(|current| {
+                    current.id != workflow_id.as_str() || current.generation > generation
+                });
+            }
+        }
+        if let Some(panel) = &mut self.workflow_panel {
+            panel.replace(self.workflow_snapshots.clone());
         }
     }
 
@@ -2024,17 +2291,6 @@ impl TuiState {
         }
     }
 
-    /// Refresh the todo panel from canonical state. Display-only: never
-    /// mutates the canonical todo state.
-    fn refresh_todo_display(&mut self, application: &Application) {
-        self.todo_phases = application.todo_state().phases;
-    }
-
-    /// Clear the todo panel display without touching canonical state. Used on
-    /// session lifecycle transitions where the canonical list is reset.
-    fn clear_todo_display(&mut self) {
-        self.todo_phases.clear();
-    }
 
     /// Atomically replace every conversation-derived display buffer from the
     /// shared application after tree navigation, fork, resume, or reset.
@@ -2050,6 +2306,7 @@ impl TuiState {
         self.cwd_path = session.cwd().to_path_buf();
         self.cwd = self.cwd_path.display().to_string();
         self.transcript.clear();
+        self.seen_irc_message_ids.clear();
         self.committed_entries = 0;
         self.transcript_scroll = 0;
         self.transcript_page_rows.set(1);
@@ -2057,8 +2314,11 @@ impl TuiState {
         self.streaming_thinking.clear();
         self.is_streaming = false;
         self.pending_user_echo = false;
+        self.rebuild_prompt_history_from_messages(application.messages());
         self.reset_tool_projection();
         self.job_cards.clear();
+        self.todo_phases = application.todo_state().phases;
+        self.workflow_snapshots = application.workflow_list().iter().map(WorkflowPanelSnapshot::from).collect();
         for message in application.messages() {
             self.push_message(message);
         }
@@ -2069,6 +2329,37 @@ impl TuiState {
     fn push_loop_message(&mut self, message: &pi_ai::CustomMessage) {
         let Some(loop_message) = pi_coding::loop_message_view(message) else { return };
         self.push_entry(TranscriptEntry { kind: TranscriptKind::System, content: vec![ContentBlock::text(loop_message.prompt)], tool_name: Some(format!("Loop {} · {}", loop_message.task_id, loop_message.schedule)), tool_card: None, job_card: None, is_error: false, is_partial: false });
+    }
+
+    fn push_irc_view(&mut self, view: &OrchestrationIrcView<'_>) {
+        if !self.seen_irc_message_ids.insert(view.id.as_ref().to_owned()) {
+            return;
+        }
+        let from = self.job_cards.agent_display_name(view.from.as_ref());
+        let to = self.job_cards.agent_display_name(view.to.as_ref());
+        let label = view.label(&from, &to);
+        let content = view.body_blocks();
+        if content.is_empty() {
+            self.push_entry(TranscriptEntry {
+                kind: TranscriptKind::Custom,
+                content: Vec::new(),
+                tool_name: Some(label),
+                tool_card: None,
+                job_card: None,
+                is_error: false,
+                is_partial: false,
+            });
+            return;
+        }
+        self.push_entry(TranscriptEntry {
+            kind: TranscriptKind::Custom,
+            content,
+            tool_name: Some(label),
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
     }
 
     fn push_message(&mut self, message: Message) {
@@ -2089,6 +2380,8 @@ impl TuiState {
             Message::Custom(message) => {
                 if pi_coding::loop_message_view(&message).is_some() {
                     self.push_loop_message(&message);
+                } else if let Some(irc) = orchestration_irc_view(&message) {
+                    self.push_irc_view(&irc);
                 } else if message.display {
                     self.push_entry(TranscriptEntry { kind: TranscriptKind::Custom, content: message.content.into_blocks(), tool_name: Some(message.custom_type), tool_card: None, job_card: None, is_error: false, is_partial: false });
                 }
@@ -2115,13 +2408,20 @@ impl TuiState {
     }
 
     fn push_status(&mut self, text: String, is_error: bool) {
+        if is_error {
+            let clean = clean_terminal_text(&text);
+            self.status = clean.lines().next().unwrap_or_default().trim().to_owned();
+            self.composer_error = Some(text);
+            return;
+        }
+        self.status = text.clone();
         self.push_entry(TranscriptEntry {
             kind: TranscriptKind::System,
             content: vec![ContentBlock::text(text)],
             tool_name: None,
             tool_card: None,
             job_card: None,
-            is_error,
+            is_error: false,
             is_partial: false,
         });
     }
@@ -2295,6 +2595,102 @@ impl TuiState {
         self.show_thinking = !self.show_thinking;
     }
 
+    /// Rebuild prompt history from the active session's user messages and drop
+    /// any in-progress history browse/draft so session transitions cannot leak.
+    fn rebuild_prompt_history_from_messages<I>(&mut self, messages: I)
+    where
+        I: IntoIterator<Item = Message>,
+    {
+        self.prompt_history.clear();
+        self.prompt_history_index = None;
+        self.prompt_history_draft = None;
+        for message in messages {
+            if let Some(text) = message_text(message) {
+                self.push_prompt_history_entry(text);
+            }
+        }
+    }
+
+    /// Record one accepted composer draft exactly once (duplicate-suppressed).
+    fn record_accepted_prompt(&mut self, draft: &str) {
+        self.composer_error = None;
+        if draft.trim().is_empty() {
+            self.prompt_history_index = None;
+            self.prompt_history_draft = None;
+            return;
+        }
+        self.push_prompt_history_entry(draft.to_owned());
+        self.prompt_history_index = None;
+        self.prompt_history_draft = None;
+    }
+
+    fn push_prompt_history_entry(&mut self, text: String) {
+        if self.prompt_history.last().is_some_and(|last| last == &text) {
+            return;
+        }
+        self.prompt_history.push(text);
+    }
+
+    /// Ctrl-U: clear the whole composer and pending completion UI state.
+    fn clear_composer(&mut self) {
+        self.editor.clear();
+        self.pending_attachments.clear();
+        self.cancel_file_completion();
+        self.completions.clear();
+        self.completion_query = None;
+        self.prompt_history_index = None;
+        self.prompt_history_draft = None;
+    }
+
+    /// Up: move within multiline text first; at the first-line boundary enter
+    /// prompt history (newest first, then older).
+    fn history_or_move_up(&mut self) {
+        if !self.editor.at_first_line() {
+            self.editor.move_up();
+            return;
+        }
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        match self.prompt_history_index {
+            None => {
+                self.prompt_history_draft = Some(self.editor.text());
+                let index = self.prompt_history.len() - 1;
+                self.prompt_history_index = Some(index);
+                self.editor.set_text(&self.prompt_history[index]);
+            }
+            Some(0) => {}
+            Some(index) => {
+                let index = index - 1;
+                self.prompt_history_index = Some(index);
+                self.editor.set_text(&self.prompt_history[index]);
+            }
+        }
+    }
+
+    /// Down: move within multiline text first; at the last-line boundary walk
+    /// toward newer history, restoring the saved draft past newest.
+    fn history_or_move_down(&mut self) {
+        if !self.editor.at_last_line() {
+            self.editor.move_down();
+            return;
+        }
+        match self.prompt_history_index {
+            None => {}
+            Some(index) if index + 1 < self.prompt_history.len() => {
+                let index = index + 1;
+                self.prompt_history_index = Some(index);
+                self.editor.set_text(&self.prompt_history[index]);
+            }
+            Some(_) => {
+                self.prompt_history_index = None;
+                let draft = self.prompt_history_draft.take().unwrap_or_default();
+                self.editor.set_text(&draft);
+            }
+        }
+    }
+
+
     fn poll_theme_reload(&mut self) -> bool {
         let reload = self.themes.reload_if_changed();
         let changed = reload.changed || !reload.diagnostics.is_empty();
@@ -2309,9 +2705,33 @@ impl TuiState {
 
     fn refresh_completions(&mut self) {
         let row = self.editor.row;
-        let file_prefix =
-            file_search::current_at_prefix(&self.editor.lines[row], self.editor.column);
-        if let Some(prefix) = file_prefix {
+        let column = self.editor.column;
+        let (might_complete_file, slash_text) = {
+            let line = &self.editor.lines[row];
+            let before_cursor = &line[..column];
+            (
+                before_cursor.as_bytes().contains(&b'@'),
+                (row == 0 && self.editor.lines.len() == 1 && before_cursor.starts_with('/'))
+                    .then(|| before_cursor.to_owned()),
+            )
+        };
+        let might_complete_slash = slash_text.is_some();
+
+        if !might_complete_file && !might_complete_slash {
+            if self.completion_query.is_some() || self.completion_cancel.is_some() {
+                self.cancel_file_completion();
+                self.completion_query = None;
+            }
+            if !self.completions.items.is_empty() || self.completions.context.is_some() {
+                self.completions.clear();
+            }
+            return;
+        }
+
+        if might_complete_file
+            && let Some(prefix) =
+                file_search::current_at_prefix(&self.editor.lines[row], column)
+        {
             if self.completion_query.as_ref() == Some(&(row, prefix.clone())) {
                 return;
             }
@@ -2342,18 +2762,27 @@ impl TuiState {
 
         self.cancel_file_completion();
         self.completion_query = None;
-        let text = self.editor.text();
-        let Some(prefix) = text.strip_prefix('/') else {
+        if !might_complete_slash {
             self.completions.clear();
             return;
-        };
+        }
+        let text = slash_text.expect("slash completion checked");
+        let prefix = &text[1..];
         if prefix.contains(char::is_whitespace) {
             self.completions.clear();
             return;
         }
-        let mut items = self
-            .commands
-            .iter()
+        let commands = if prefix.starts_with("skill:") {
+            self.commands
+                .iter()
+                .filter(|command| command.source == CommandSource::Skill)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            visible_catalog()
+        };
+        let items = commands
+            .into_iter()
             .filter(|command| fuzzy_match(&command.name, prefix))
             .map(|command| CompletionItem {
                 value: format!("/{}", command.name),
@@ -2362,13 +2791,19 @@ impl TuiState {
                 is_directory: false,
             })
             .collect::<Vec<_>>();
-        items.truncate(MAX_COMPLETIONS);
+        // Keep every fuzzy match so `/settings` (and anything past the first
+        // MAX_COMPLETIONS alphabetical hits) remains selectable. The popup
+        // windows to MAX_COMPLETIONS rows only at render time.
         self.completions.items = items;
         self.completions.context = Some(CompletionContext::Slash);
-        self.completions.selected = self
-            .completions
-            .selected
-            .min(self.completions.items.len().saturating_sub(1));
+        // Prefer an exact full-text hit so typing `/ps` highlights `/ps`, not an
+        // earlier fuzzy neighbor like `/loops`.
+        self.completions.selected = exact_completion_index(&self.completions.items, &text)
+            .unwrap_or_else(|| {
+                self.completions
+                    .selected
+                    .min(self.completions.items.len().saturating_sub(1))
+            });
     }
 
     fn cancel_file_completion(&mut self) {
@@ -2432,16 +2867,31 @@ impl TuiState {
                     Ok(Some(ClipboardContent::Image(image))) => {
                         let mime_type = image.mime_type.clone();
                         let size = image.bytes.len();
-                        self.pending_attachments.push(image.into_content_block());
+                        self.pending_attachments
+                            .push(PendingAttachment::from_clipboard_image(image));
                         self.status = format!(
                             "Attached {mime_type} ({} KiB) · {} pending",
                             size.div_ceil(1024),
                             self.pending_attachments.len()
                         );
                     }
-                    Ok(Some(ClipboardContent::Text(text))) => self.handle_paste(&text),
+                    Ok(Some(ClipboardContent::Text(text))) => {
+                        // Never re-enter empty-paste → clipboard read from a
+                        // clipboard text result (avoids a busy loop).
+                        if text.is_empty() {
+                            self.push_status(
+                                "Clipboard is empty · use Alt+V to paste images".to_owned(),
+                                true,
+                            );
+                        } else {
+                            self.insert_pasted_text(&text);
+                        }
+                    }
                     Ok(None) => {
-                        self.push_status("Clipboard is empty".to_owned(), true);
+                        self.push_status(
+                            "Clipboard is empty · use Alt+V to paste images".to_owned(),
+                            true,
+                        );
                     }
                     Err(error) => {
                         self.push_status(format!("Clipboard paste failed: {error}"), true);
@@ -2467,6 +2917,17 @@ impl TuiState {
             );
             return;
         }
+        // Terminals often intercept Ctrl+V as bracketed paste. Image-only
+        // clipboards yield an empty text payload; fall through to the async
+        // image-capable clipboard reader instead of silently no-oping.
+        if payload.is_empty() {
+            self.start_clipboard_read();
+            return;
+        }
+        self.insert_pasted_text(payload);
+    }
+
+    fn insert_pasted_text(&mut self, payload: &str) {
         if payload.is_empty() {
             return;
         }
@@ -2481,7 +2942,9 @@ impl TuiState {
             return;
         }
         self.clipboard_read_busy = true;
-        self.status = "Reading clipboard".to_owned();
+        // Alt+V is the reliable image-paste chord; Ctrl+V is best-effort
+        // because many terminals convert it into bracketed text paste.
+        self.status = "Reading clipboard · Alt+V pastes images".to_owned();
         let tx = self.background_tx.clone();
         tokio::spawn(async move {
             let result = clipboard::read().await.map_err(|error| error.to_string());
@@ -2512,10 +2975,19 @@ impl TuiState {
 
     fn accept_unambiguous_command_prefix(&mut self) -> bool {
         let text = self.editor.text();
-        let Some(prefix) = text.strip_prefix('/') else { return false; };
-        if prefix.is_empty() || prefix.contains(char::is_whitespace) { return false; }
-        let matches = self.commands.iter().filter(|command| command.name.starts_with(prefix)).collect::<Vec<_>>();
-        if matches.len() != 1 || matches[0].name == prefix { return false; }
+        let Some(prefix) = text.strip_prefix('/') else {
+            return false;
+        };
+        if prefix.is_empty() || prefix.contains(char::is_whitespace) {
+            return false;
+        }
+        let matches = visible_catalog()
+            .into_iter()
+            .filter(|command| command.name.starts_with(prefix))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 || matches[0].name == prefix {
+            return false;
+        }
         self.editor.set_text(&format!("/{}", matches[0].name));
         self.refresh_completions();
         true
@@ -2525,6 +2997,17 @@ impl TuiState {
         let Some(item) = self.completions.selected().cloned() else {
             return;
         };
+        // Exact slash drafts already equal the selected value (`/goal`, `/ps`).
+        // Consume the accept once by dismissing the menu without rewriting the
+        // editor — a second apply would look like duplication (`/goall`) when a
+        // later key/path also inserts.
+        if matches!(self.completions.context, Some(CompletionContext::Slash))
+            && item.value == self.editor.text()
+        {
+            self.completions.clear();
+            self.completion_query = None;
+            return;
+        }
         let refresh_files = match self.completions.context.clone() {
             Some(CompletionContext::Slash) => {
                 self.editor.lines.clear();
@@ -2635,6 +3118,27 @@ impl TuiState {
         }
     }
 
+    fn project_workflow_snapshot(application: &Application, snapshot: &pi_coding::WorkflowSnapshot) -> WorkflowPanelSnapshot {
+        application.workflow_detail(&snapshot.workflow_id, snapshot.generation).map_or_else(
+            |_| WorkflowPanelSnapshot::from(snapshot),
+            |detail| WorkflowPanelSnapshot::from_runtime_detail(&detail, snapshot),
+        )
+    }
+
+    fn open_workflow_panel(&mut self, application: &Application) {
+        self.panel = None;
+        self.settings_panel = None;
+        self.tree_panel = None;
+        self.process_panel = None;
+        self.agents_panel = None;
+        self.session_selector = None;
+        self.scoped_model_selector = None;
+        self.cancel_file_completion();
+        self.editor.clear();
+        let workflows = application.workflow_list().iter().map(|snapshot| Self::project_workflow_snapshot(application, snapshot)).collect();
+        self.workflow_panel = Some(WorkflowPanel::new(workflows));
+    }
+
 
     async fn open_agents_panel(&mut self, application: &Application) {
         self.panel = None;
@@ -2706,6 +3210,82 @@ impl TuiState {
             query: String::new(),
         });
     }
+
+    fn open_goal_panel(&mut self, application: &Application) {
+        self.panel = None;
+        self.settings_panel = None;
+        self.tree_panel = None;
+        self.process_panel = None;
+        self.agents_panel = None;
+        self.session_selector = None;
+        self.cancel_file_completion();
+        self.editor.clear();
+        self.scoped_model_selector = None;
+        self.goal_state = application.goal_state();
+        let items = match self.goal_state.current.as_ref() {
+            None => vec![
+                PanelItem {
+                    label: "Create goal".to_owned(),
+                    description: "Enter an objective and optional token budget".to_owned(),
+                    value: PanelValue::GoalCreate,
+                    checked: true,
+                },
+                PanelItem {
+                    label: "Show details".to_owned(),
+                    description: "Confirm that no goal is active".to_owned(),
+                    value: PanelValue::GoalShow,
+                    checked: false,
+                },
+            ],
+            Some(goal) => {
+                let mut items = vec![PanelItem {
+                    label: "Show details".to_owned(),
+                    description: crate::goal_commands::format_goal_state(&self.goal_state),
+                    value: PanelValue::GoalShow,
+                    checked: true,
+                }];
+                match goal.lifecycle {
+                    GoalLifecycle::Active => items.push(PanelItem {
+                        label: "Pause".to_owned(),
+                        description: "Pause work without dropping the objective".to_owned(),
+                        value: PanelValue::GoalPause,
+                        checked: false,
+                    }),
+                    GoalLifecycle::Paused => items.push(PanelItem {
+                        label: "Resume".to_owned(),
+                        description: "Continue work toward this objective".to_owned(),
+                        value: PanelValue::GoalResume,
+                        checked: false,
+                    }),
+                    GoalLifecycle::Completed | GoalLifecycle::Dropped => {}
+                }
+                if !goal.lifecycle.is_terminal() {
+                    items.push(PanelItem {
+                        label: "Complete".to_owned(),
+                        description: "Mark the objective complete".to_owned(),
+                        value: PanelValue::GoalComplete,
+                        checked: false,
+                    });
+                    items.push(PanelItem {
+                        label: "Drop".to_owned(),
+                        description: "Permanently stop pursuing this goal".to_owned(),
+                        value: PanelValue::GoalDrop,
+                        checked: false,
+                    });
+                }
+                items
+            }
+        };
+        self.completions.clear();
+        self.completion_query = None;
+        self.panel = Some(SelectorPanel {
+            title: "Goal".to_owned(),
+            help: "↑/↓ move · Enter select · Esc cancel".to_owned(),
+            items,
+            selected: 0,
+            query: String::new(),
+        });
+    }
 }
 
 async fn available_models() -> Vec<Model> {
@@ -2727,7 +3307,8 @@ fn available_thinking_levels(model: &Model) -> Vec<ThinkingLevel> {
             "low" => Some(ThinkingLevel::Low),
             "medium" => Some(ThinkingLevel::Medium),
             "high" => Some(ThinkingLevel::High),
-            "xhigh" | "max" => Some(ThinkingLevel::Xhigh),
+            "xhigh" => Some(ThinkingLevel::Xhigh),
+            "max" => Some(ThinkingLevel::Max),
             _ => None,
         })
         .collect()
@@ -2757,7 +3338,7 @@ async fn handle_tree_panel_key(
                 }
             }
             KeyCode::Char(character) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => panel.insert_label_char(character),
-            _ => {}
+            _ => state.status = overlay_unknown_key_status(key),
         }
         state.tree_panel = Some(panel);
         return Ok(Some(false));
@@ -2788,7 +3369,16 @@ async fn handle_tree_panel_key(
         KeyCode::Esc => {
             if panel.mode == TreePanelMode::Navigate && panel.clear_search_or_folds() {
                 state.tree_panel = Some(panel);
+            } else {
+                state.status = "Ready".to_owned();
             }
+        }
+        KeyCode::Char('q')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            state.status = "Ready".to_owned();
         }
         KeyCode::Backspace if panel.mode == TreePanelMode::Navigate => {
             panel.backspace_search();
@@ -2858,6 +3448,8 @@ async fn handle_tree_panel_key(
         _ => {
             if let Some(action) = action {
                 panel.apply_action(action, 12);
+            } else {
+                state.status = overlay_unknown_key_status(key);
             }
             state.tree_panel = Some(panel);
         }
@@ -2903,7 +3495,17 @@ async fn handle_session_selector_key(
                 KeyCode::Esc => {
                     if !selector.cancel_mode() {
                         keep_open = false;
+                        state.status = "Ready".to_owned();
                     }
+                }
+                KeyCode::Char('q')
+                    if matches!(selector.mode(), SessionSelectorMode::List)
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    keep_open = false;
+                    state.status = "Ready".to_owned();
                 }
                 KeyCode::Up => selector.move_selection(-1),
                 KeyCode::Down => selector.move_selection(1),
@@ -2929,7 +3531,6 @@ async fn handle_session_selector_key(
                                 Ok(result) => {
                                     keep_open = false;
                                     state.replace_transcript_from_application(application);
-                                    state.refresh_todo_display(application);
                                     state.status = format!("Resumed {}", result.path.display());
                                 }
                                 Err(error) => state.push_status(
@@ -2975,7 +3576,7 @@ async fn handle_session_selector_key(
                         SessionSelectorMode::ConfirmDelete { .. } => {}
                     }
                 }
-                _ => {}
+                _ => state.status = overlay_unknown_key_status(key),
             }
         }
     }
@@ -3046,7 +3647,18 @@ fn handle_scoped_model_selector_key(
             selection_changed = true;
         }
         _ => match key.code {
-            KeyCode::Esc => keep_open = false,
+            KeyCode::Esc => {
+                keep_open = false;
+                state.status = "Ready".to_owned();
+            }
+            KeyCode::Char('q')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                keep_open = false;
+                state.status = "Ready".to_owned();
+            }
             KeyCode::Up => selector.move_selection(-1),
             KeyCode::Down => selector.move_selection(1),
             KeyCode::Backspace => selector.pop_query(),
@@ -3061,7 +3673,7 @@ fn handle_scoped_model_selector_key(
             {
                 selector.push_query(character)
             }
-            _ => {}
+            _ => state.status = overlay_unknown_key_status(key),
         },
     }
     if selection_changed {
@@ -3118,6 +3730,30 @@ async fn handle_settings_panel_key(application: &Application, state: &mut TuiSta
     state.settings_panel = Some(panel); Ok(Some(false))
 }
 
+async fn handle_workflow_panel_key(application: &Application, state: &mut TuiState, key: KeyEvent) -> Result<Option<bool>> {
+    let Some(panel) = state.workflow_panel.as_mut() else { return Ok(None); };
+    match panel.handle_key(key) {
+        WorkflowPanelResult::Close => { state.workflow_panel = None; state.status = "Ready".to_owned(); }
+        WorkflowPanelResult::Intent { workflow_id, kind } => {
+            let id = pi_coding::WorkflowId::new(workflow_id);
+            let snapshot = application.workflow_get(&id)?;
+            let result = match kind {
+                WorkflowIntentKind::Pause => application.workflow_pause(&id, snapshot.generation).await,
+                WorkflowIntentKind::Resume => application.workflow_resume(&id, snapshot.generation).await,
+                WorkflowIntentKind::Cancel => application.workflow_cancel(&id, snapshot.generation).await,
+                WorkflowIntentKind::Integrate => application.workflow_integrate(&id, snapshot.generation).await,
+            };
+            match result {
+                Ok(updated) => { application.workflow_select(Some(&id))?; panel.replace(application.workflow_list().iter().map(|snapshot| TuiState::project_workflow_snapshot(application, snapshot)).collect()); state.status = format!("Workflow {}", updated.status.as_str()); }
+                Err(error) => state.push_status(format!("Workflow action failed: {error:#}"), true),
+            }
+        }
+        WorkflowPanelResult::Unknown => state.status = overlay_unknown_key_status(key),
+        WorkflowPanelResult::Handled => if let Some(selected) = panel.selected_workflow() { application.workflow_select(Some(&pi_coding::WorkflowId::new(selected.id.clone())))?; },
+    }
+    Ok(Some(false))
+}
+
 async fn handle_panel_key(
     application: &Application,
     state: &mut TuiState,
@@ -3128,7 +3764,18 @@ async fn handle_panel_key(
     };
     let visible_count = panel.visible_indices().len();
     match key.code {
-        KeyCode::Esc => state.panel = None,
+        KeyCode::Esc => {
+            state.panel = None;
+            state.status = "Ready".to_owned();
+        }
+        KeyCode::Char('q')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            state.panel = None;
+            state.status = "Ready".to_owned();
+        }
         KeyCode::Up => panel.selected = panel.selected.saturating_sub(1),
         KeyCode::Down => panel.selected = (panel.selected + 1).min(visible_count.saturating_sub(1)),
         KeyCode::Backspace => {
@@ -3208,10 +3855,41 @@ async fn handle_panel_key(
                         ),
                     }
                 }
+                PanelValue::GoalCreate => {
+                    state.panel = None;
+                    state.editor.set_text("/goal create ");
+                    state.status = "Enter the goal objective, then press Enter".to_owned();
+                    state.refresh_completions();
+                }
+                PanelValue::GoalShow => {
+                    state.panel = None;
+                    state.goal_state = application.goal_state();
+                    state.push_lines(
+                        "Goal",
+                        crate::goal_commands::format_goal_details(&state.goal_state),
+                        state.themes.theme().accent,
+                    );
+                }
+                PanelValue::GoalPause => {
+                    state.panel = None;
+                    dispatch_goal_command(application, state, Some("pause")).await;
+                }
+                PanelValue::GoalResume => {
+                    state.panel = None;
+                    dispatch_goal_command(application, state, Some("resume")).await;
+                }
+                PanelValue::GoalComplete => {
+                    state.panel = None;
+                    dispatch_goal_command(application, state, Some("complete")).await;
+                }
+                PanelValue::GoalDrop => {
+                    state.panel = None;
+                    dispatch_goal_command(application, state, Some("drop")).await;
+                }
                 PanelValue::Session(_) | PanelValue::ScopedModel(_) => {}
             }
         }
-        _ => {}
+        _ => state.status = overlay_unknown_key_status(key),
     }
     Ok(Some(false))
 }
@@ -3275,6 +3953,7 @@ fn handle_extension_dialog_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 Some(Action::EditorDeleteWordForward) => editor.delete_word_forward(),
                 Some(Action::EditorDeleteToLineStart) => editor.delete_to_line_start(),
                 Some(Action::EditorDeleteToLineEnd) => editor.delete_to_line_end(),
+                Some(Action::EditorClear) => editor.clear(),
                 Some(Action::EditorYank) => editor.yank(),
                 Some(Action::EditorYankPop) => editor.yank_pop(),
                 Some(Action::EditorUndo) => editor.undo(),
@@ -3295,28 +3974,51 @@ async fn handle_process_panel_key(
 ) -> Result<bool> {
     let Some(mut panel) = state.process_panel.take() else { return Ok(false); };
     match panel.handle_key(key) {
-        Some(ProcessPanelAction::Close) => return Ok(true),
-        Some(ProcessPanelAction::Open(id)) => match application.process_logs(&id, 0, None, false, None).await {
-            Ok(logs) => panel.set_logs(&id, &logs),
-            Err(error) => panel.fail(format!("Cannot read process output: {error:#}")),
-        },
-        Some(ProcessPanelAction::SendText { id, text }) => {
-            if let Err(error) = application.process_write(&id, text.into_bytes(), false).await { panel.fail(format!("Cannot send input: {error:#}")); }
+        ProcessKeyResult::Action(ProcessPanelAction::Close) => {
+            state.status = "Ready".to_owned();
+            return Ok(true);
         }
-        Some(ProcessPanelAction::SendKeys { id, keys }) => {
-            if let Err(error) = application.process_send_keys(&id, &keys).await { panel.fail(format!("Cannot send key: {error:#}")); }
+        ProcessKeyResult::Action(ProcessPanelAction::Open(id)) => {
+            match application.process_logs(&id, 0, None, false, None).await {
+                Ok(logs) => panel.set_logs(&id, &logs),
+                Err(error) => panel.fail(format!("Cannot read process output: {error:#}")),
+            }
         }
-        Some(ProcessPanelAction::Resize { id, size }) => {
-            if let Err(error) = application.process_resize(&id, size) { panel.fail(format!("Cannot resize terminal: {error:#}")); }
+        ProcessKeyResult::Action(ProcessPanelAction::SendText { id, text }) => {
+            if let Err(error) = application
+                .process_write(&id, text.into_bytes(), false)
+                .await
+            {
+                panel.fail(format!("Cannot send input: {error:#}"));
+            }
         }
-        Some(ProcessPanelAction::Signal { id, signal }) => {
-            if let Err(error) = application.process_signal(&id, signal) { panel.fail(format!("Cannot signal process: {error:#}")); }
+        ProcessKeyResult::Action(ProcessPanelAction::SendKeys { id, keys }) => {
+            if let Err(error) = application.process_send_keys(&id, &keys).await {
+                panel.fail(format!("Cannot send key: {error:#}"));
+            }
         }
-        Some(ProcessPanelAction::Stop(id)) => match application.process_stop(&id, None).await {
-            Ok(process) => panel.update_process(process),
-            Err(error) => panel.fail(format!("Cannot stop process: {error:#}")),
-        },
-        None => {}
+        ProcessKeyResult::Action(ProcessPanelAction::Resize { id, size }) => {
+            if let Err(error) = application.process_resize(&id, size) {
+                panel.fail(format!("Cannot resize terminal: {error:#}"));
+            }
+        }
+        ProcessKeyResult::Action(ProcessPanelAction::Signal { id, signal }) => {
+            if let Err(error) = application.process_signal(&id, signal) {
+                panel.fail(format!("Cannot signal process: {error:#}"));
+            }
+        }
+        ProcessKeyResult::Action(ProcessPanelAction::Stop(id)) => {
+            match application.process_stop(&id, None).await {
+                Ok(process) => panel.update_process(process),
+                Err(error) => panel.fail(format!("Cannot stop process: {error:#}")),
+            }
+        }
+        ProcessKeyResult::Handled => {}
+        ProcessKeyResult::Unknown => {
+            let message = overlay_unknown_key_status(key);
+            state.status = message.clone();
+            panel.fail(message);
+        }
     }
     state.process_panel = Some(panel);
     Ok(true)
@@ -3404,6 +4106,10 @@ async fn refresh_agents_panel_from_application(application: &Application, panel:
     }
 }
 
+fn is_raw_multiline_paste_start(key: KeyEvent) -> bool {
+    key.code == KeyCode::Enter && key.modifiers.is_empty()
+}
+
 fn raw_paste_character(key: KeyEvent) -> Option<char> {
     if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
         return None;
@@ -3415,11 +4121,106 @@ fn raw_paste_character(key: KeyEvent) -> Option<char> {
     }
 }
 
+/// How a nonblocking unmarked raw input candidate should be delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawInputDisposition {
+    /// Insert as a single multiline paste.
+    Paste,
+    /// Replay each captured key through the normal key path exactly once.
+    Keys,
+}
+
+/// A nonblocking drain begins only after an unmodified Enter. Classify the
+/// candidate as paste once another complete logical line follows; otherwise
+/// replay every event through normal key dispatch.
+fn classify_raw_input_burst(payload: &str) -> RawInputDisposition {
+    if is_raw_multiline_burst(payload) {
+        RawInputDisposition::Paste
+    } else {
+        RawInputDisposition::Keys
+    }
+}
+
+/// True when `text` has two completed logical line breaks (three line segments).
+/// A single Enter batched with surrounding keystrokes is ambiguous and must stay
+/// on the key path. CRLF counts as one logical break.
+fn is_raw_multiline_burst(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut breaks = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                breaks += 1;
+                if bytes.get(index + 1) == Some(&b'\n') {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            b'\n' => {
+                breaks += 1;
+                index += 1;
+                continue;
+            }
+            _ => {
+                if breaks >= 2 {
+                    return true;
+                }
+                index += 1;
+            }
+        }
+    }
+    false
+}
+
+/// Apply a nonblocking unmarked candidate to the editor. Focused regressions
+/// use this helper to model an already-drained terminal event burst.
+fn apply_classified_burst(state: &mut TuiState, payload: &str) {
+    match classify_raw_input_burst(payload) {
+        RawInputDisposition::Paste => handle_paste(state, payload),
+        RawInputDisposition::Keys => {
+            for character in payload.chars() {
+                if character == '\n' {
+                    state.editor.insert_newline();
+                } else {
+                    state.editor.insert_char(character);
+                }
+                state.refresh_completions();
+            }
+        }
+    }
+}
+
+
+
+fn exact_completion_index(items: &[CompletionItem], text: &str) -> Option<usize> {
+    items.iter().position(|item| item.value == text)
+}
+
+/// True when the selected slash completion already equals the editor draft, so
+/// Enter should execute rather than re-accept the same value.
+fn completion_already_matches_editor(state: &TuiState) -> bool {
+    state
+        .completions
+        .selected()
+        .is_some_and(|item| item.value == state.editor.text())
+}
+
 fn handle_paste(state: &mut TuiState, payload: &str) {
     if handle_extension_dialog_paste(state, payload) {
         return;
     }
     state.handle_paste(payload);
+}
+
+fn dismiss_composer_error_on_escape(state: &mut TuiState, code: KeyCode) -> bool {
+    if code != KeyCode::Esc || state.composer_error.take().is_none() {
+        return false;
+    }
+    state.last_escape = None;
+    true
 }
 
 /// Routes an incoming key through the configured keybindings to a stable action
@@ -3447,6 +4248,9 @@ async fn handle_key(
     if let Some(exit) = handle_scoped_model_selector_key(application, state, key)? {
         return Ok(exit);
     }
+    if let Some(exit) = handle_workflow_panel_key(application, state, key).await? {
+        return Ok(exit);
+    }
     if let Some(exit) = handle_settings_panel_key(application, state, key).await? {
         return Ok(exit);
     }
@@ -3466,6 +4270,9 @@ async fn handle_key(
         state.editor.cancel_jump();
     }
 
+    if dismiss_composer_error_on_escape(state, key.code) {
+        return Ok(false);
+    }
     if key.code == KeyCode::Esc
         && !state.is_streaming
         && !application.is_bash_running()
@@ -3491,31 +4298,59 @@ async fn handle_key(
         state.last_escape = None;
     }
     let action = state.keybindings.resolve(&key);
+    // Unrelated input cancels a pending double-Ctrl-C exit arm. ClearEditor
+    // itself manages the timer inside dispatch_action.
+    if !matches!(action, Some(Action::ClearEditor)) {
+        state.last_ctrl_c = None;
+    }
+
+    if action.is_some() {
+        state.editor.break_insert_chain();
+    }
 
     // The completion menu intercepts navigation/accept/abort while open; any
     // other action falls through to normal dispatch (e.g. typing narrows it).
     if !state.completions.items.is_empty() {
         if let Some(action) = action {
             match action {
-                Action::EditorSubmit if matches!(state.completions.context, Some(CompletionContext::Slash)) => {
+                Action::EditorSubmit
+                    if matches!(state.completions.context, Some(CompletionContext::Slash))
+                        && !completion_already_matches_editor(state) =>
+                {
+                    // Partial slash draft: Tab/Enter fills the selected value.
+                    // When the editor already equals the selected value (exact
+                    // `/ps`), fall through so one Enter executes the command.
+                    state.editor.break_insert_chain();
+                    state.accept_completion();
+                    return Ok(false);
+                }
+                Action::AcceptCompletion if !completion_already_matches_editor(state) => {
+                    state.editor.break_insert_chain();
                     state.accept_completion();
                     return Ok(false);
                 }
                 Action::AcceptCompletion => {
-                    state.accept_completion();
+                    // Exact match: dismiss without rewriting so Tab cannot
+                    // re-apply `/goal` and leave a dangling insertion path.
+                    state.editor.break_insert_chain();
+                    state.completions.clear();
+                    state.completion_query = None;
                     return Ok(false);
                 }
                 Action::Abort => {
+                    state.editor.break_insert_chain();
                     state.cancel_file_completion();
                     state.completion_query = None;
                     state.completions.clear();
                     return Ok(false);
                 }
                 Action::EditorUp => {
+                    state.editor.break_insert_chain();
                     state.completions.selected = state.completions.selected.saturating_sub(1);
                     return Ok(false);
                 }
                 Action::EditorDown => {
+                    state.editor.break_insert_chain();
                     state.completions.selected = (state.completions.selected + 1)
                         .min(state.completions.items.len().saturating_sub(1));
                     return Ok(false);
@@ -3558,8 +4393,8 @@ async fn dispatch_action(
         Action::EditorDelete => state.editor.delete(),
         Action::EditorLeft => state.editor.move_left(),
         Action::EditorRight => state.editor.move_right(),
-        Action::EditorUp => state.editor.move_up(),
-        Action::EditorDown => state.editor.move_down(),
+        Action::EditorUp => state.history_or_move_up(),
+        Action::EditorDown => state.history_or_move_down(),
         Action::EditorWordLeft => state.editor.move_word_left(),
         Action::EditorWordRight => state.editor.move_word_right(),
         Action::EditorHome => state.editor.move_home(),
@@ -3572,6 +4407,7 @@ async fn dispatch_action(
         Action::EditorDeleteWordForward => state.editor.delete_word_forward(),
         Action::EditorDeleteToLineStart => state.editor.delete_to_line_start(),
         Action::EditorDeleteToLineEnd => state.editor.delete_to_line_end(),
+        Action::EditorClear => state.clear_composer(),
         Action::EditorYank => state.editor.yank(),
         Action::EditorYankPop => state.editor.yank_pop(),
         Action::EditorUndo => state.editor.undo(),
@@ -3589,7 +4425,23 @@ async fn dispatch_action(
                 state.editor.clear();
             }
         }
-        Action::ClearEditor => state.editor.clear(),
+        Action::ClearEditor => {
+            // OMP-compatible Ctrl-C ladder:
+            // 1) bash / streaming still abort on first press
+            // 2) nonempty editor or pending attachments clear on first press
+            // 3) idle second press within 500ms exits cleanly via normal return
+            if application.is_bash_running() {
+                application.abort_bash();
+                state.last_ctrl_c = None;
+                state.status = "Aborting bash command".to_owned();
+            } else if state.is_streaming {
+                application.abort().await;
+                state.last_ctrl_c = None;
+                state.status = "Aborting".to_owned();
+            } else if handle_ctrl_c_clear_or_exit(state, std::time::Instant::now()) {
+                return Ok(true);
+            }
+        }
         Action::Quit => {
             if state.editor.is_empty() && state.pending_attachments.is_empty() {
                 if state.is_streaming {
@@ -3637,17 +4489,20 @@ async fn dispatch_action(
                 }
             };
             let file_images = expanded.images;
-            let mut attachments = state.pending_attachments.clone();
-            attachments.extend(file_images.iter().cloned());
+            let attachments =
+                assemble_submit_attachments(&state.pending_attachments, file_images);
             if state.is_streaming {
                 application.follow_up(expanded.prompt, attachments).await;
                 state.status = "Queued follow-up".to_owned();
             } else if let Err(error) = application.prompt(expanded.prompt, attachments, None).await
             {
-                state.pending_attachments.extend(file_images);
+                // Clipboard attachments stay in `pending_attachments` (never drained).
+                // File @images remain in the editor text and are re-expanded on retry —
+                // do not push them into pending or retries will duplicate them.
                 state.push_status(format!("Prompt was not accepted: {error}"), true);
                 return Ok(false);
             }
+            state.record_accepted_prompt(&prompt);
             state.pending_attachments.clear();
             state.editor.clear();
         }
@@ -3720,6 +4575,33 @@ async fn dispatch_action(
         state.refresh_completions();
     }
     Ok(false)
+}
+
+/// Idle / clear branches of Ctrl-C (`Action::ClearEditor`).
+///
+/// Returns `true` when a second idle press within 500ms should exit the TUI
+/// through the normal return path (terminal restore via `TerminalGuard::drop`).
+fn handle_ctrl_c_clear_or_exit(state: &mut TuiState, now: std::time::Instant) -> bool {
+    const DOUBLE_CTRL_C_MS: u64 = 500;
+    if !state.editor.is_empty() || !state.pending_attachments.is_empty() {
+        state.editor.clear();
+        state.pending_attachments.clear();
+        state.cancel_file_completion();
+        state.completions.clear();
+        state.completion_query = None;
+        state.last_ctrl_c = Some(now);
+        state.status = "Cleared · Ctrl+C again to quit".to_owned();
+        return false;
+    }
+    let double = state.last_ctrl_c.take().is_some_and(|previous| {
+        now.duration_since(previous) <= std::time::Duration::from_millis(DOUBLE_CTRL_C_MS)
+    });
+    if double {
+        return true;
+    }
+    state.last_ctrl_c = Some(now);
+    state.status = "Ctrl+C again to quit".to_owned();
+    false
 }
 
 async fn open_external_editor(
@@ -3834,7 +4716,8 @@ fn thinking_level_from_name(name: &str) -> Option<pi_agent::ThinkingLevel> {
         "low" => pi_agent::ThinkingLevel::Low,
         "medium" => pi_agent::ThinkingLevel::Medium,
         "high" => pi_agent::ThinkingLevel::High,
-        "xhigh" | "max" => pi_agent::ThinkingLevel::Xhigh,
+        "xhigh" => pi_agent::ThinkingLevel::Xhigh,
+        "max" => pi_agent::ThinkingLevel::Max,
         _ => return None,
     })
 }
@@ -3929,7 +4812,27 @@ const fn streaming_submit_behavior(is_streaming: bool) -> Option<StreamingBehavi
     }
 }
 
-fn dispatch_goal_command(
+/// Reject bare required-arg builtins with visible usage feedback and clear the draft.
+/// Returns true when the submission was consumed as a usage rejection.
+fn reject_missing_required_arguments(state: &mut TuiState, name: &str, arg: Option<&str>) -> bool {
+    if arg.is_some() {
+        return false;
+    }
+    let Some(command) = builtin(name) else {
+        return false;
+    };
+    if !requires_arguments(command) {
+        return false;
+    }
+    state.push_status(format!("Usage: {}", usage(command)), true);
+    state.cancel_file_completion();
+    state.editor.clear();
+    state.completions.clear();
+    state.completion_query = None;
+    true
+}
+
+async fn dispatch_goal_command(
     application: &Application,
     state: &mut TuiState,
     argument: Option<&str>,
@@ -3937,17 +4840,68 @@ fn dispatch_goal_command(
     let command = match crate::goal_commands::parse_interactive_goal_command(argument) {
         Ok(command) => command,
         Err(error) => {
-            state.status = format!("{error:#}");
+            state.push_status(format!("{error:#}"), true);
             return false;
         }
     };
-    match crate::goal_commands::execute_interactive_goal_command(application, command) {
+    let render_details = matches!(
+        command,
+        crate::goal_commands::InteractiveGoalCommand::Show
+            | crate::goal_commands::InteractiveGoalCommand::Create { .. }
+    );
+    match crate::goal_commands::execute_interactive_goal_command(application, command).await {
         Ok(output) => {
+            state.composer_error = None;
+            state.goal_state = application.goal_state();
+            if render_details {
+                // Create/inspect/show surface the OMP-style details block
+                // immediately in the live transcript (not only a compact toast).
+                state.push_lines(
+                    "Goal",
+                    crate::goal_commands::format_goal_details(&state.goal_state),
+                    state.themes.theme().accent,
+                );
+            }
             state.status = output;
             true
         }
         Err(error) => {
-            state.status = format!("Goal command failed: {error:#}");
+            state.push_status(format!("Goal command failed: {error:#}"), true);
+            false
+        }
+    }
+}
+async fn dispatch_workflow_command(
+    application: &Application,
+    state: &mut TuiState,
+    argument: Option<&str>,
+) -> bool {
+    let command = match crate::workflow_commands::parse_interactive_workflow_command(argument) {
+        Ok(command) => command,
+        Err(error) => {
+            state.push_status(format!("{error:#}"), true);
+            return false;
+        }
+    };
+    match crate::workflow_commands::execute_interactive_workflow_on_application(application, command)
+        .await
+    {
+        Ok(crate::workflow_commands::WorkflowCommandEffect::OpenPage) => {
+            state.open_workflow_panel(application);
+            true
+        }
+        Ok(crate::workflow_commands::WorkflowCommandEffect::Message(message)) => {
+            state.workflow_snapshots = application
+                .workflow_list()
+                .iter()
+                .map(|snapshot| TuiState::project_workflow_snapshot(application, snapshot))
+                .collect();
+            state.composer_error = None;
+            state.status = message;
+            true
+        }
+        Err(error) => {
+            state.push_status(format!("Workflow command failed: {error:#}"), true);
             false
         }
     }
@@ -3975,6 +4929,7 @@ async fn submit(
             );
             return Ok(false);
         }
+        let bash_draft = prompt.clone();
         state.cancel_file_completion();
         state.editor.clear();
         state.completions.clear();
@@ -3985,6 +4940,8 @@ async fn submit(
             .await
         {
             state.push_status(format!("Bash command failed: {error:#}"), true);
+        } else {
+            state.record_accepted_prompt(&bash_draft);
         }
         return Ok(false);
     }
@@ -3994,11 +4951,7 @@ async fn submit(
         let mut parts = command.trim().splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("");
         let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
-        if arg.is_none()
-            && let Some(command) = BUILTIN_COMMANDS.iter().find(|command| command.name == name)
-            && command.argument_hint.is_some_and(|hint| hint.contains('<'))
-        {
-            state.status = format!("Usage: /{} {}", command.name, command.argument_hint.unwrap_or_default());
+        if reject_missing_required_arguments(state, name, arg) {
             return Ok(false);
         }
         match name {
@@ -4007,12 +4960,16 @@ async fn submit(
             "new" if !state.is_streaming => match application.new_session().await {
                 Ok(()) => {
                     state.replace_transcript_from_application(application);
-                    state.clear_todo_display();
                     state.status = "Started a new session".to_owned();
                 }
                 Err(error) => state.push_status(format!("Failed to start new session: {error:#}"), true),
             },
             "settings" => state.open_settings_panel(application),
+            "workflow" => {
+                if !dispatch_workflow_command(application, state, arg).await {
+                    return Ok(false);
+                }
+            }
             "model" if arg.is_none() => state.open_model_panel(application).await,
             "model" => {
                 let spec = arg.expect("guarded");
@@ -4062,7 +5019,6 @@ async fn submit(
                     {
                         Ok(result) => {
                             state.replace_transcript_from_application(application);
-                            state.refresh_todo_display(application);
                             state.status = format!("Resumed {}", result.path.display());
                         }
                         Err(error) => state
@@ -4151,16 +5107,15 @@ async fn submit(
                     Err(error) => state.push_status(format!("Invalid todo markdown: {error:#}"), true),
                 },
                 None => {
-                    let markdown = pi_coding::todo_phases_to_markdown(&application.todo_state().phases);
-                    state.push_lines("Todo", markdown, state.themes.theme().accent);
+                    let text = format_todo_human_lines(&application.todo_state().phases);
+                    state.push_lines("Todo", text, state.themes.theme().accent);
                 }
             },
             "changelog" => state.push_lines("Changelog", include_str!("../../../CHANGELOG.md").to_owned(), state.themes.theme().accent),
-            "hotkeys" => state.push_lines(
-                "Hotkeys",
-                "Enter submit · Shift+Enter/Ctrl+J newline · Esc abort · Ctrl+D quit · Ctrl+L model selector · Ctrl+T thinking · Ctrl+O thinking visibility · Alt+Up/Down cycle model · Ctrl+R tools · Ctrl+V paste · Ctrl+S external editor".to_owned(),
-                state.themes.theme().accent,
-            ),
+            "hotkeys" => {
+                let text = format_hotkeys_text(&state.keybindings);
+                state.push_lines("Hotkeys", text, state.themes.theme().accent);
+            }
             "reload" if !state.is_streaming => match application.reload().await {
                 Ok(result) => {
                     let (commands, diagnostics) = interactive_commands(application);
@@ -4191,7 +5146,6 @@ async fn submit(
                     Ok(imported) => match application.switch_session(&imported.path).await {
                         Ok(()) => {
                             state.replace_transcript_from_application(application);
-                            state.refresh_todo_display(application);
                             state.status = format!("Imported and resumed {}", imported.path.display());
                         }
                         Err(error) => state.push_status(format!("Imported session could not be resumed: {error:#}"), true),
@@ -4256,7 +5210,11 @@ async fn submit(
                 }
             }
             "help" => {
-                let help = state.commands.iter().map(|command| format!("/{:<18} {}", command.name, command.description)).collect::<Vec<_>>().join("\n");
+                let help = visible_catalog()
+                    .into_iter()
+                    .map(|command| format!("/{:<18} {}", command.name, command.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 state.push_lines("Commands", help, state.themes.theme().accent);
             }
             "theme" => match arg {
@@ -4310,8 +5268,9 @@ async fn submit(
                     Err(error) => state.push_status(format!("{error:#}"), true),
                 }
             }
+            "goal" if arg.is_none() => state.open_goal_panel(application),
             "goal" => {
-                if !dispatch_goal_command(application, state, arg) {
+                if !dispatch_goal_command(application, state, arg).await {
                     return Ok(false);
                 }
             }
@@ -4356,7 +5315,10 @@ async fn submit(
                 match source {
                     Some(CommandSource::Prompt | CommandSource::Skill) => match expand_resource_command(application, command, arg.unwrap_or_default()) {
                         Ok(Some(expanded)) => match application.prompt(expanded.clone(), Vec::new(), None).await {
-                            Ok(()) => state.push_lines("You", expanded, state.themes.theme().accent),
+                            Ok(()) => {
+                                state.record_accepted_prompt(&prompt);
+                                state.push_lines("You", expanded, state.themes.theme().accent);
+                            }
                             Err(error) => state.push_status(format!("Prompt was not accepted: {error}"), true),
                         },
                         Ok(None) => state.push_status(format!("Command /{command} is no longer available; try /reload"), true),
@@ -4401,15 +5363,15 @@ async fn submit(
         }
     };
     let file_images = expanded.images;
-    let mut attachments = state.pending_attachments.clone();
-    attachments.extend(file_images.iter().cloned());
+    let attachments = assemble_submit_attachments(&state.pending_attachments, file_images);
     let attachment_count = attachments.len();
     let streaming_behavior = streaming_submit_behavior(state.is_streaming);
     if let Err(error) = application
         .prompt(expanded.prompt, attachments, streaming_behavior)
         .await
     {
-        state.pending_attachments.extend(file_images);
+        // Keep pre-submit clipboard attachments. File images are still referenced
+        // by the draft text and must not be copied into pending (duplicate on retry).
         state.push_status(format!("Prompt was not accepted: {error}"), true);
         return Ok(false);
     }
@@ -4430,6 +5392,7 @@ async fn submit(
     if state.is_streaming {
         state.status = "Steering current response".to_owned();
     }
+    state.record_accepted_prompt(&prompt);
     state.pending_attachments.clear();
     state.cancel_file_completion();
     state.editor.clear();
@@ -4438,114 +5401,181 @@ async fn submit(
     Ok(false)
 }
 
-fn live_viewport_height(state: &TuiState, width: u16, terminal_height: u16) -> u16 {
-    let theme = state.themes.theme();
-    let extension = state.extension_ui.snapshot();
-    let above = extension_widget_lines(&extension, UiWidgetPlacement::AboveEditor, theme);
-    let below = extension_widget_lines(&extension, UiWidgetPlacement::BelowEditor, theme);
-    let attachment_rows = usize::from(!state.pending_attachments.is_empty());
-    let editor_rows = state.editor.lines.len().saturating_add(attachment_rows);
-    let input_height = u16::try_from(editor_rows.saturating_add(1))
-        .unwrap_or(u16::MAX)
-        .clamp(2, 9);
-    let completion_height = u16::try_from(state.completions.items.len())
-        .unwrap_or(u16::MAX)
-        .min(u16::try_from(MAX_COMPLETIONS).unwrap_or(u16::MAX));
-    let todo_height = u16::try_from(render_todo_panel_lines(&state.todo_phases, theme).len())
-        .unwrap_or(u16::MAX)
-        .min(8);
-    let mut live_lines = Vec::new();
-    for entry in &state.transcript[state.committed_entries..] {
-        render_transcript_entry(
-            &mut live_lines,
-            entry,
-            state.show_thinking,
-            state.expand_tools,
-            theme,
-            width.max(1),
-        );
-    }
-    if !state.streaming_thinking.is_empty() || !state.streaming_text.is_empty() {
-        let mut content = Vec::new();
-        if !state.streaming_thinking.is_empty() {
-            content.push(ContentBlock::thinking(state.streaming_thinking.clone()));
-        }
-        if !state.streaming_text.is_empty() {
-            content.push(ContentBlock::text(state.streaming_text.clone()));
-        }
-        render_transcript_entry(
-            &mut live_lines,
-            &TranscriptEntry {
-                kind: TranscriptKind::Assistant,
-                content,
-                tool_name: None,
-                tool_card: None,
-                job_card: None,
-                is_error: false,
-                is_partial: true,
-            },
-            state.show_thinking,
-            state.expand_tools,
-            theme,
-            width.max(1),
-        );
-    }
-    let transcript_height = u16::try_from(wrapped_line_count(&live_lines, width.max(1)))
-        .unwrap_or(u16::MAX)
-        .min(8);
-    let overlays_open = state.panel.is_some()
+/// True while a modal page owns the live inline region. These frames are
+/// transient: they expand the live viewport while open and must never be
+/// committed through `insert_before` into native/tmux scrollback.
+fn page_overlay_open(state: &TuiState) -> bool {
+    state.panel.is_some()
         || state.tree_panel.is_some()
         || state.process_panel.is_some()
+        || state.settings_panel.is_some()
+        || state.workflow_panel.is_some()
         || state.agents_panel.is_some()
         || state.session_selector.is_some()
         || state.scoped_model_selector.is_some()
-        || state.extension_dialog.is_some();
-    let overlay_height = if overlays_open { terminal_height.min(16) } else { 0 };
-    transcript_height
-        .saturating_add(todo_height)
-        .saturating_add(u16::try_from(above.len()).unwrap_or(u16::MAX).min(6))
-        .saturating_add(completion_height)
-        .saturating_add(input_height)
-        .saturating_add(u16::try_from(below.len()).unwrap_or(u16::MAX).min(6))
-        .saturating_add(1)
-        .max(overlay_height)
-        .clamp(3, terminal_height.max(3))
-        .min(if width < 40 { terminal_height } else { terminal_height.min(16) })
+        || state.extension_dialog.is_some()
 }
 
-fn transcript_region_height(state: &TuiState, terminal_height: u16) -> u16 {
+const MIN_COMPOSER_HEIGHT: u16 = 2;
+const MAX_COMPOSER_HEIGHT: u16 = 10;
+const MAX_INLINE_SUMMARY_HEIGHT: u16 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TuiLayoutHeights {
+    transcript: u16,
+    todo: u16,
+    above: u16,
+    composer: u16,
+    error: u16,
+    completions: u16,
+    below: u16,
+}
+
+fn desired_composer_height(state: &TuiState, width: u16) -> u16 {
+    let attachment_rows = pending_attachment_labels(&state.pending_attachments).len();
+    if state.editor.lines.len() <= 1 && attachment_rows == 0 {
+        return MIN_COMPOSER_HEIGHT;
+    }
+    u16::try_from(
+        state
+            .editor
+            .lines
+            .iter()
+            .map(|line| wrapped_row_count(&clean_terminal_text(line), usize::from(width.saturating_sub(5))))
+            .sum::<usize>()
+            .saturating_add(attachment_rows)
+            .saturating_add(2),
+    )
+    .unwrap_or(u16::MAX)
+    .clamp(3, MAX_COMPOSER_HEIGHT)
+}
+
+fn tui_layout_heights(
+    state: &TuiState,
+    width: u16,
+    terminal_height: u16,
+    todo_height: u16,
+    above_height: u16,
+    completion_height: u16,
+    below_height: u16,
+) -> TuiLayoutHeights {
+    let composer = desired_composer_height(state, width).min(terminal_height);
+    let mut optional_budget = terminal_height
+        .saturating_sub(composer)
+        .saturating_sub(1);
+    let error = composer_error_toast_height(state, width).min(optional_budget);
+    optional_budget = optional_budget.saturating_sub(error);
+    let todo = todo_height
+        .min(MAX_INLINE_SUMMARY_HEIGHT)
+        .min(optional_budget);
+    optional_budget = optional_budget.saturating_sub(todo);
+    let above = above_height.min(optional_budget);
+    optional_budget = optional_budget.saturating_sub(above);
+    let completions = completion_height.min(optional_budget);
+    optional_budget = optional_budget.saturating_sub(completions);
+    let below = below_height.min(optional_budget);
+    let transcript = terminal_height
+        .saturating_sub(composer)
+        .saturating_sub(todo)
+        .saturating_sub(above)
+        .saturating_sub(error)
+        .saturating_sub(completions)
+        .saturating_sub(below);
+    TuiLayoutHeights {
+        transcript,
+        todo,
+        above,
+        error,
+        composer,
+        completions,
+        below,
+    }
+}
+
+fn live_viewport_height(state: &TuiState, width: u16, terminal_height: u16) -> u16 {
     let theme = state.themes.theme();
     let extension = state.extension_ui.snapshot();
-    let above_height = u16::try_from(
-        extension_widget_lines(&extension, UiWidgetPlacement::AboveEditor, theme).len(),
-    )
-    .unwrap_or(u16::MAX)
-    .min(6);
-    let below_height = u16::try_from(
-        extension_widget_lines(&extension, UiWidgetPlacement::BelowEditor, theme).len(),
-    )
-    .unwrap_or(u16::MAX)
-    .min(6);
-    let input_height = if state.editor.lines.len() <= 1 && state.pending_attachments.is_empty() {
-        2
-    } else {
-        u16::try_from(state.editor.lines.len().saturating_add(2))
-            .unwrap_or(u16::MAX)
-            .clamp(3, 10)
-    };
+    let above_height = u16::try_from(extension_widget_lines(&extension, UiWidgetPlacement::AboveEditor, theme).len())
+        .unwrap_or(u16::MAX)
+        .min(6);
+    let below_height = u16::try_from(extension_widget_lines(&extension, UiWidgetPlacement::BelowEditor, theme).len())
+        .unwrap_or(u16::MAX)
+        .min(6);
     let completion_height = u16::try_from(state.completions.items.len())
         .unwrap_or(u16::MAX)
         .min(u16::try_from(MAX_COMPLETIONS).unwrap_or(u16::MAX));
-    let todo_height = u16::try_from(render_todo_panel_lines(&state.todo_phases, theme).len())
+    let todo_height = u16::try_from(render_todo_panel_lines(
+        &state.todo_phases,
+        &state.job_cards.cards_in_source_order(),
+        theme,
+        width.max(1),
+    ).len())
+    .unwrap_or(u16::MAX);
+    let layout = tui_layout_heights(
+        state,
+        width,
+        terminal_height,
+        todo_height,
+        above_height,
+        completion_height,
+        below_height,
+    );
+    let progress_is_capped = todo_height > layout.todo;
+    let mut live_lines = Vec::new();
+    for entry in &state.transcript[state.committed_entries..] {
+        trim_inter_entry_blank_before_user(&mut live_lines, entry);
+        render_transcript_entry(&mut live_lines, entry, state.show_thinking, state.expand_tools, theme, width.max(1));
+    }
+    let raw_transcript = u16::try_from(wrapped_line_count(&live_lines, width.max(1))).unwrap_or(u16::MAX);
+    let chrome = layout.todo
+        .saturating_add(layout.above)
+        .saturating_add(layout.error)
+        .saturating_add(layout.composer)
+        .saturating_add(layout.completions)
+        .saturating_add(layout.below)
+        .saturating_add(1);
+    let overlay_height = if page_overlay_open(state) { terminal_height.min(16) } else { 0 };
+    if progress_is_capped {
+        terminal_height
+    } else {
+        chrome
+            .saturating_add(raw_transcript.min(8).min(terminal_height.saturating_sub(chrome)))
+            .max(overlay_height)
+            .clamp(3, terminal_height.max(3))
+    }
+}
+
+
+fn transcript_region_height(state: &TuiState, width: u16, terminal_height: u16) -> u16 {
+    let theme = state.themes.theme();
+    let extension = state.extension_ui.snapshot();
+    let above_height = u16::try_from(extension_widget_lines(&extension, UiWidgetPlacement::AboveEditor, theme).len())
         .unwrap_or(u16::MAX)
-        .min(8);
-    terminal_height
-        .saturating_sub(todo_height)
-        .saturating_sub(above_height)
-        .saturating_sub(completion_height)
-        .saturating_sub(input_height)
-        .saturating_sub(below_height)
-        .max(1)
+        .min(6);
+    let below_height = u16::try_from(extension_widget_lines(&extension, UiWidgetPlacement::BelowEditor, theme).len())
+        .unwrap_or(u16::MAX)
+        .min(6);
+    let completion_height = u16::try_from(state.completions.items.len())
+        .unwrap_or(u16::MAX)
+        .min(u16::try_from(MAX_COMPLETIONS).unwrap_or(u16::MAX));
+    let todo_height = u16::try_from(render_todo_panel_lines(
+        &state.todo_phases,
+        &state.job_cards.cards_in_source_order(),
+        theme,
+        width.max(1),
+    ).len())
+    .unwrap_or(u16::MAX);
+    tui_layout_heights(
+        state,
+        width,
+        terminal_height,
+        todo_height,
+        above_height,
+        completion_height,
+        below_height,
+    )
+    .transcript
+    .max(1)
 }
 
 fn compact_cwd(cwd: &str) -> String {
@@ -4633,7 +5663,13 @@ fn visible_editor_lines(state: &TuiState, width: usize, max_rows: usize) -> (Vec
 
 fn composer_border_lines_bounded(state: &TuiState, width: u16, theme: Theme, max_rows: usize) -> Vec<Line<'static>> {
     let inner = usize::from(width.saturating_sub(2));
-    let content_rows = max_rows.saturating_sub(2).max(1);
+    let attachment_rows = pending_attachment_labels(&state.pending_attachments).len();
+    // Keep attachment placeholders visible inside the bounded card: editor
+    // rows share the interior budget after chrome (2) and attachment rows.
+    let content_rows = max_rows
+        .saturating_sub(2)
+        .saturating_sub(attachment_rows)
+        .max(1);
     let (editor_lines, _) = visible_editor_lines(state, inner.saturating_sub(3), content_rows);
     composer_border_lines_with_editor(state, width, theme, editor_lines)
 }
@@ -4641,30 +5677,213 @@ fn composer_border_lines_bounded(state: &TuiState, width: u16, theme: Theme, max
 
 fn composer_border_lines(state: &TuiState, width: u16, theme: Theme) -> Vec<Line<'static>> {
     let inner = usize::from(width.saturating_sub(2));
-    let total_rows = state.editor.lines.iter().map(|line| wrapped_row_count(&clean_terminal_text(line), inner.saturating_sub(3))).sum::<usize>();
+    let total_rows = state
+        .editor
+        .lines
+        .iter()
+        .map(|line| wrapped_row_count(&clean_terminal_text(line), inner.saturating_sub(3)))
+        .sum::<usize>();
     let (editor_lines, _) = visible_editor_lines(state, inner.saturating_sub(3), total_rows.max(1));
     composer_border_lines_with_editor(state, width, theme, editor_lines)
+}
+
+/// Compact thinking label for the OMP composer chrome (`med`, `off`, …).
+fn composer_thinking_label(state: &TuiState) -> String {
+    let effective = state.effective_thinking_state();
+    let short = match effective.level {
+        ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "min",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "med",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::Xhigh => "xhi",
+        ThinkingLevel::Max => "max",
+    };
+    if effective.show_thinking {
+        short.to_owned()
+    } else if let Some(label) = state
+        .extension_hidden_thinking_label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+    {
+        label.to_owned()
+    } else {
+        format!("{short} hid")
+    }
+}
+
+
+/// Compose the inline status segment for the OMP-style composer header.
+/// Busy states keep the activity animation; idle states surface `state.status`.
+fn composer_status_display(state: &TuiState, theme: Theme) -> (String, Color) {
+    if state.is_compacting {
+        return (
+            format!(
+                "compacting {} ▶──",
+                ACTIVE_ANIMATION_FRAMES[state.animation_frame % ACTIVE_ANIMATION_FRAMES.len()]
+            ),
+            theme.muted,
+        );
+    }
+    if state.is_streaming {
+        return (
+            format!(
+                "working {} ▶──",
+                ACTIVE_ANIMATION_FRAMES[state.animation_frame % ACTIVE_ANIMATION_FRAMES.len()]
+            ),
+            theme.muted,
+        );
+    }
+    if let Some(goal) = goal_status_summary(&state.goal_state) {
+        return (format!("{goal} ▶──"), theme.accent);
+    }
+    let text = state.status.trim();
+    if text.is_empty() {
+        ("▶──".to_owned(), theme.muted)
+    } else {
+        (format!("{text} ▶──"), theme.dim)
+    }
+}
+
+fn truncate_status_text(text: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if usize::from(display_width(text)) <= max_cols {
+        return text.to_owned();
+    }
+    if max_cols <= 1 {
+        return "…".to_owned();
+    }
+    let mut out = String::new();
+    let mut cols = 0usize;
+    let limit = max_cols.saturating_sub(1);
+    for ch in text.chars() {
+        let ch_cols = usize::from(display_width(&ch.to_string()));
+        if cols.saturating_add(ch_cols) > limit {
+            break;
+        }
+        out.push(ch);
+        cols = cols.saturating_add(ch_cols);
+    }
+    out.push('…');
+    out
+}
+
+const MAX_COMPOSER_ERROR_HEIGHT: usize = 5;
+const COMPOSER_ERROR_DISMISSAL_HINT: &str = "Dismissed when you send your next message.";
+
+fn composer_error_toast_height(state: &TuiState, width: u16) -> u16 {
+    let Some(error) = state.composer_error.as_deref() else {
+        return 0;
+    };
+    if width < 5 {
+        return 1;
+    }
+    let content_width = usize::from(width.saturating_sub(4)).max(1);
+    let message_rows = clean_terminal_text(error)
+        .lines()
+        .map(|line| wrapped_row_count(line, content_width))
+        .sum::<usize>()
+        .clamp(1, 2);
+    u16::try_from(message_rows.saturating_add(3)).unwrap_or(MAX_COMPOSER_ERROR_HEIGHT as u16)
+}
+
+/// Render a red, width- and height-bounded error toast for the live composer.
+/// These rows are ephemeral and must never enter transcript commit paths.
+fn composer_error_toast_lines(
+    state: &TuiState,
+    width: u16,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let Some(error) = state.composer_error.as_deref() else {
+        return Vec::new();
+    };
+    let width = usize::from(width);
+    let border_style = Style::default().fg(theme.error).bg(theme.tool_error_bg);
+    if width < 5 {
+        return vec![Line::from(Span::styled(
+            truncate_status_text("!", width),
+            border_style.add_modifier(Modifier::BOLD),
+        ))];
+    }
+
+    let inner = width.saturating_sub(2);
+    let content_width = width.saturating_sub(4).max(1);
+    let clean_error = clean_terminal_text(error);
+    let raw_message_rows = clean_error
+        .lines()
+        .map(|line| wrapped_row_count(line, content_width))
+        .sum::<usize>()
+        .max(1);
+    let mut message_rows = clean_error
+        .lines()
+        .flat_map(|line| wrap_display_line(line, content_width))
+        .take(2)
+        .collect::<Vec<_>>();
+    if message_rows.is_empty() {
+        message_rows.push("Unknown error".to_owned());
+    }
+    if raw_message_rows > message_rows.len()
+        && let Some(last) = message_rows.last_mut()
+    {
+        *last = truncate_status_text(&format!("{last}…"), content_width);
+    }
+
+    let error_style = Style::default().fg(theme.error).bg(theme.tool_error_bg);
+    let hint_style = Style::default().fg(theme.dim).bg(theme.tool_error_bg);
+    let title = truncate_status_text(" Error ", inner);
+    let top_fill = "─".repeat(inner.saturating_sub(usize::from(display_width(&title))));
+    let mut lines = vec![Line::from(vec![
+        Span::styled("╭", border_style),
+        Span::styled(title, border_style.add_modifier(Modifier::BOLD)),
+        Span::styled(top_fill, border_style),
+        Span::styled("╮", border_style),
+    ])];
+    for row in message_rows {
+        let row = truncate_status_text(&row, content_width);
+        let fill = " ".repeat(content_width.saturating_sub(usize::from(display_width(&row))));
+        lines.push(Line::from(vec![
+            Span::styled("│ ", border_style),
+            Span::styled(row, error_style),
+            Span::styled(fill, error_style),
+            Span::styled(" │", border_style),
+        ]));
+    }
+    let hint = truncate_status_text(COMPOSER_ERROR_DISMISSAL_HINT, content_width);
+    let hint_fill = " ".repeat(content_width.saturating_sub(usize::from(display_width(&hint))));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", border_style),
+        Span::styled(hint, hint_style),
+        Span::styled(hint_fill, hint_style),
+        Span::styled(" │", border_style),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner)),
+        border_style,
+    )));
+    lines
 }
 
 fn composer_border_lines_with_editor(state: &TuiState, width: u16, theme: Theme, editor_lines: Vec<String>) -> Vec<Line<'static>> {
     let inner = usize::from(width.saturating_sub(2));
     let model = clean_terminal_text(&state.model);
     let cwd = compact_cwd(&state.cwd);
-    let thinking = state.effective_thinking_state().label;
-    let status = if state.is_streaming {
-        const FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
-        format!("working {} ▶──", FRAMES[state.animation_frame % FRAMES.len()])
-    } else {
-        "▶──".to_owned()
-    };
-    let header_width = usize::from(display_width("── π  > ⬢ "))
+    let thinking = composer_thinking_label(state);
+    // Inline status: activity animation while busy; otherwise the durable
+    // `state.status` toast written by slash/actions/events (previously unrendered).
+    // Status is truncated inside the normal chrome budget so a long toast never
+    // forces the 90-column OMP header into the narrow fallback.
+    let (raw_status, status_color) = composer_status_display(state, theme);
+    let chrome_prefix = usize::from(display_width("── π  > ⬢ "))
         + usize::from(display_width(&model))
         + usize::from(display_width(&format!(" · ◑ {thinking} > 📁 ")))
         + usize::from(display_width(&cwd))
-        + usize::from(display_width(" > ⟲ "))
-        + usize::from(display_width(&status));
-    let mut lines = if header_width <= inner {
-        let top_fill = "─".repeat(inner - header_width);
+        + usize::from(display_width(" > ⟲ "));
+    let mut lines = if chrome_prefix < inner {
+        let status_budget = inner.saturating_sub(chrome_prefix);
+        let status_text = truncate_status_text(&raw_status, status_budget);
+        let top_fill = "─".repeat(status_budget.saturating_sub(usize::from(display_width(&status_text))));
         vec![Line::from(vec![
             Span::styled("╭── ", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
             Span::styled("π", Style::default().fg(theme.accent).bg(theme.user_message_bg).add_modifier(Modifier::BOLD)),
@@ -4673,21 +5892,33 @@ fn composer_border_lines_with_editor(state: &TuiState, width: u16, theme: Theme,
             Span::styled(format!(" · ◑ {thinking} > 📁 "), Style::default().fg(theme.accent).bg(theme.user_message_bg)),
             Span::styled(cwd, Style::default().fg(theme.syntax_variable).bg(theme.user_message_bg)),
             Span::styled(" > ⟲ ", Style::default().fg(theme.border).bg(theme.user_message_bg)),
-            Span::styled(status, Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+            Span::styled(status_text, Style::default().fg(status_color).bg(theme.user_message_bg)),
             Span::styled(top_fill, Style::default().fg(theme.muted).bg(theme.user_message_bg)),
             Span::styled("╮", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
         ])]
     } else {
+        // Narrow terminals: keep chrome + a truncated status so toasts stay visible.
+        // Inner content is `── π  > ⟲ ` + status + fill; ╭/╮ sit outside `inner`.
+        let fixed = usize::from(display_width("── π  > ⟲ "));
+        let budget = inner.saturating_sub(fixed);
+        let truncated = if budget == 0 {
+            String::new()
+        } else {
+            truncate_status_text(&raw_status, budget)
+        };
+        let fill = "─".repeat(inner.saturating_sub(fixed.saturating_add(usize::from(display_width(&truncated)))));
         vec![Line::from(vec![
             Span::styled("╭── ", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
             Span::styled("π", Style::default().fg(theme.accent).bg(theme.user_message_bg).add_modifier(Modifier::BOLD)),
-            Span::styled(" ", Style::default().bg(theme.user_message_bg)),
-            Span::styled("─".repeat(inner.saturating_sub(5)), Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+            Span::styled("  > ⟲ ", Style::default().fg(theme.border).bg(theme.user_message_bg)),
+            Span::styled(truncated, Style::default().fg(status_color).bg(theme.user_message_bg)),
+            Span::styled(fill, Style::default().fg(theme.muted).bg(theme.user_message_bg)),
             Span::styled("╮", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
         ])]
     };
     let editor_lines = editor_lines;
-    if editor_lines.len() <= 1 && state.pending_attachments.is_empty() && state.completions.items.is_empty() {
+    let attachment_labels = pending_attachment_labels(&state.pending_attachments);
+    if editor_lines.len() <= 1 && attachment_labels.is_empty() && state.completions.items.is_empty() {
         let input = editor_lines.first().cloned().unwrap_or_default();
         let input_width = usize::from(display_width(&input));
         let fill = "─".repeat(inner.saturating_sub(input_width.saturating_add(3)));
@@ -4698,7 +5929,7 @@ fn composer_border_lines_with_editor(state: &TuiState, width: u16, theme: Theme,
         ]));
         return lines;
     }
-    if !state.completions.items.is_empty() && editor_lines.len() <= 1 {
+    if !state.completions.items.is_empty() && editor_lines.len() <= 1 && attachment_labels.is_empty() {
         let input = editor_lines.first().cloned().unwrap_or_default();
         let input_width = usize::from(display_width(&input));
         let fill = " ".repeat(inner.saturating_sub(input_width.saturating_add(2)));
@@ -4721,30 +5952,25 @@ fn composer_border_lines_with_editor(state: &TuiState, width: u16, theme: Theme,
             Span::styled("│", Style::default().fg(theme.border_muted)),
         ]));
     }
+    for label in attachment_labels {
+        let line_width = usize::from(display_width(&label));
+        let fill = " ".repeat(inner.saturating_sub(line_width.saturating_add(1)));
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(theme.border_muted)),
+            Span::styled(label, Style::default().fg(theme.muted)),
+            Span::raw(fill),
+            Span::styled("│", Style::default().fg(theme.border_muted)),
+        ]));
+    }
     lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), Style::default().fg(theme.border_muted))));
     lines
 }
 
 fn render_welcome_lines(state: &TuiState, theme: Theme) -> Vec<Line<'static>> {
-    if !state.transcript.is_empty() || !state.streaming_text.is_empty() || !state.streaming_thinking.is_empty() {
-        return Vec::new();
-    }
+    if !state.transcript.is_empty() || !state.streaming_text.is_empty() || !state.streaming_thinking.is_empty() { return Vec::new(); }
     let recent = pi_coding::list_sessions(&state.cwd_path).into_iter().take(3).collect::<Vec<_>>();
-    let mut lines = vec![
-        Line::default(),
-        Line::from(Span::styled("  π  pi-rs", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled(format!("  {}", clean_terminal_text(&state.model)), Style::default().fg(theme.muted))),
-        Line::default(),
-        Line::from(Span::styled("  Start typing to begin · /help for commands · @file to attach context", Style::default().fg(theme.text))),
-    ];
-    if !recent.is_empty() {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled("  Recent sessions", Style::default().fg(theme.muted).add_modifier(Modifier::BOLD))));
-        for session in recent {
-            let label = session.name.as_deref().unwrap_or(&session.id);
-            lines.push(Line::from(Span::styled(format!("  • {}", clean_terminal_text(label)), Style::default().fg(theme.text))));
-        }
-    }
+    let mut lines = vec![Line::default(), Line::from(Span::styled("  rpi", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))), Line::from(Span::styled(format!("  {}", clean_terminal_text(&state.model)), Style::default().fg(theme.muted))), Line::default(), Line::from(Span::styled("  Start typing · Alt+V paste image · /help · @file to attach context", Style::default().fg(theme.text)))];
+    if !recent.is_empty() { lines.push(Line::default()); lines.push(Line::from(Span::styled("  Recent sessions", Style::default().fg(theme.muted).add_modifier(Modifier::BOLD)))); for session in recent { let label = session.name.as_deref().unwrap_or(&session.id); lines.push(Line::from(Span::styled(format!("  • {}", clean_terminal_text(label)), Style::default().fg(theme.text)))); } }
     lines
 }
 
@@ -4757,35 +5983,46 @@ fn render(
     let extension = state.extension_ui.snapshot();
     let above = extension_widget_lines(&extension, UiWidgetPlacement::AboveEditor, theme);
     let below = extension_widget_lines(&extension, UiWidgetPlacement::BelowEditor, theme);
+    let error_lines = composer_error_toast_lines(state, frame.area().width, theme);
     let above_height = u16::try_from(above.len()).unwrap_or(u16::MAX).min(6);
     let below_height = u16::try_from(below.len()).unwrap_or(u16::MAX).min(6);
     let completion_height = u16::try_from(state.completions.items.len())
         .unwrap_or(u16::MAX)
         .min(u16::try_from(MAX_COMPLETIONS).unwrap_or(u16::MAX));
-    let todo_lines = render_todo_panel_lines(&state.todo_phases, theme);
-    let todo_height = u16::try_from(todo_lines.len()).unwrap_or(u16::MAX).min(8);
-    let composer_height = u16::try_from(
-        state
-            .editor
-            .lines
-            .iter()
-            .map(|line| wrapped_row_count(&clean_terminal_text(line), usize::from(frame.area().width.saturating_sub(5))))
-            .sum::<usize>()
-            .saturating_add(2),
-    )
-    .unwrap_or(u16::MAX);
-    let reserved = todo_height.saturating_add(above_height).saturating_add(below_height).saturating_add(completion_height);
-    let max_composer_height = frame.area().height.saturating_sub(reserved).max(2);
-    let input_height = composer_height.min(max_composer_height);
+    let mut todo_lines = if state.workflow_snapshots.is_empty() {
+        render_todo_panel_lines(&state.todo_phases, &state.job_cards.cards_in_source_order(), theme, frame.area().width.max(1))
+    } else {
+        vec![Line::from(Span::styled(compact_workflow_status(&state.workflow_snapshots), Style::default().fg(theme.muted).add_modifier(Modifier::BOLD)))]
+    };
+    let layout = tui_layout_heights(
+        state,
+        frame.area().width,
+        frame.area().height,
+        u16::try_from(todo_lines.len()).unwrap_or(u16::MAX),
+        above_height,
+        completion_height,
+        below_height,
+    );
+    let todo_needs_trailing_gap = todo_lines.last().is_some_and(|line| line.spans.is_empty());
+    todo_lines.truncate(usize::from(layout.todo));
+    if todo_needs_trailing_gap
+        && todo_lines.len() == usize::from(layout.todo)
+        && todo_lines.last().is_some_and(|line| !line.spans.is_empty())
+    {
+        if let Some(last) = todo_lines.last_mut() {
+            *last = Line::default();
+        }
+    }
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),
-            Constraint::Length(todo_height),
-            Constraint::Length(above_height),
-            Constraint::Length(input_height),
-            Constraint::Length(completion_height),
-            Constraint::Length(below_height),
+            Constraint::Length(layout.transcript),
+            Constraint::Length(layout.todo),
+            Constraint::Length(layout.above),
+            Constraint::Length(layout.error),
+            Constraint::Length(layout.composer),
+            Constraint::Length(layout.completions),
+            Constraint::Length(layout.below),
         ])
         .split(frame.area());
 
@@ -4836,6 +6073,7 @@ fn render(
             state.expand_tools,
             theme,
             sections[0].width.max(1),
+            state.animation_frame,
             None,
         );
     }
@@ -4859,14 +6097,7 @@ fn render(
     state.themes.active_name().hash(&mut theme_hasher);
     format!("{theme:?}").hash(&mut theme_hasher);
     let theme_hash = theme_hasher.finish();
-    let overlays_open = state.panel.is_some()
-        || state.tree_panel.is_some()
-        || state.process_panel.is_some()
-        || state.settings_panel.is_some()
-        || state.agents_panel.is_some()
-        || state.session_selector.is_some()
-        || state.scoped_model_selector.is_some()
-        || state.extension_dialog.is_some();
+    let overlays_open = page_overlay_open(state);
     let placements = if overlays_open {
         Vec::new()
     } else {
@@ -4890,7 +6121,7 @@ fn render(
         paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         sections[0],
     );
-    if todo_height > 0 {
+    if layout.todo > 0 {
         frame.render_widget(
             Paragraph::new(Text::from(todo_lines))
                 .style(Style::default().fg(theme.text))
@@ -4898,47 +6129,78 @@ fn render(
             sections[1],
         );
     }
-    if above_height > 0 {
+    if layout.above > 0 {
         frame.render_widget(Paragraph::new(above), sections[2]);
     }
-    let composer_lines = composer_border_lines_bounded(state, sections[3].width, theme, usize::from(sections[3].height));
-    frame.render_widget(Paragraph::new(composer_lines), sections[3]);
+    if layout.error > 0 {
+        frame.render_widget(Paragraph::new(error_lines), sections[3]);
+    }
+    let composer_lines = composer_border_lines_bounded(state, sections[4].width, theme, usize::from(sections[4].height));
+    frame.render_widget(Paragraph::new(composer_lines), sections[4]);
     if !state.completions.items.is_empty() {
-        let lines = state.completions.items.iter().enumerate().map(|(index, item)| {
-            let selected = index == state.completions.selected;
-            Line::from(vec![
-                Span::styled(if selected { "❯ " } else { "  " }, Style::default().fg(if selected { theme.accent } else { theme.dim })),
-                Span::styled(clean_terminal_text(&item.label), Style::default().fg(if selected { theme.text } else { theme.muted }).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })),
-                Span::styled(format!("  {}", clean_terminal_text(&item.description)), Style::default().fg(theme.muted)),
-            ])
-        }).collect::<Vec<_>>();
-        let completion_area = Rect { x: sections[4].x.saturating_add(2), y: sections[4].y, width: sections[4].width.saturating_sub(3), height: sections[4].height };
+        let (window_start, visible) = state.completions.visible_window(MAX_COMPLETIONS);
+        let lines = visible
+            .iter()
+            .enumerate()
+            .map(|(offset, item)| {
+                let index = window_start + offset;
+                let selected = index == state.completions.selected;
+                Line::from(vec![
+                    Span::styled(
+                        if selected { "❯ " } else { "  " },
+                        Style::default().fg(if selected { theme.accent } else { theme.dim }),
+                    ),
+                    Span::styled(
+                        clean_terminal_text(&item.label),
+                        Style::default()
+                            .fg(if selected { theme.text } else { theme.muted })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(
+                        format!("  {}", clean_terminal_text(&item.description)),
+                        Style::default().fg(theme.muted),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let completion_area = Rect {
+            x: sections[5].x.saturating_add(2),
+            y: sections[5].y,
+            width: sections[5].width.saturating_sub(3),
+            height: sections[5].height,
+        };
         frame.render_widget(Paragraph::new(lines), completion_area);
     }
-    let editor_width = usize::from(sections[3].width.saturating_sub(5));
+    let editor_width = usize::from(sections[4].width.saturating_sub(5));
     let (_, cursor_column) = editor_wrapped_position(state, editor_width);
-    let (_, visible_cursor_row) = visible_editor_lines(state, editor_width, usize::from(sections[3].height.saturating_sub(2)).max(1));
-    let cursor_x = sections[3]
+    let (_, visible_cursor_row) = visible_editor_lines(state, editor_width, usize::from(sections[4].height.saturating_sub(2)).max(1));
+    let cursor_x = sections[4]
         .x
         .saturating_add(if state.completions.items.is_empty() && state.editor.lines.len() <= 1 { 3 } else { 2 })
         .saturating_add(cursor_column);
-    let cursor_y = sections[3].y.saturating_add(1).saturating_add(u16::try_from(visible_cursor_row).unwrap_or(u16::MAX));
+    let cursor_y = sections[4].y.saturating_add(1).saturating_add(u16::try_from(visible_cursor_row).unwrap_or(u16::MAX));
     if state.extension_dialog.is_none()
         && state.process_panel.is_none()
         && state.settings_panel.is_none()
+        && state.workflow_panel.is_none()
         && state.agents_panel.is_none()
-        && cursor_x < sections[3].right().saturating_sub(1)
-        && cursor_y < sections[3].bottom()
+        && cursor_x < sections[4].right().saturating_sub(1)
+        && cursor_y < sections[4].bottom()
     {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
-    if below_height > 0 {
-        frame.render_widget(Paragraph::new(below), sections[5]);
+    if layout.below > 0 {
+        frame.render_widget(Paragraph::new(below), sections[6]);
     }
     if let Some(panel) = &state.settings_panel { render_settings_panel(frame, panel, state.settings_value_input.as_ref(), theme); }
     if let Some(panel) = &state.panel { render_selector_panel(frame, panel, theme); }
     if let Some(panel) = &state.tree_panel { render_tree_panel(frame, panel, theme); }
     if let Some(panel) = &state.process_panel { render_process_panel(frame, panel, theme); }
+    if let Some(panel) = &state.workflow_panel { render_workflow_panel(frame, panel, theme); }
     if let Some(panel) = &state.agents_panel { render_agents_panel(frame, panel, theme); }
     if let Some(selector) = &state.session_selector { render_saved_session_selector(frame, selector, theme); }
     if let Some(selector) = &state.scoped_model_selector { render_scoped_model_selector(frame, selector, theme); }
@@ -5111,6 +6373,18 @@ fn render_extension_dialog(frame: &mut ratatui::Frame<'_>, dialog: &ExtensionDia
     }
 }
 
+fn trim_inter_entry_blank_before_user(lines: &mut Vec<Line<'static>>, entry: &TranscriptEntry) {
+    if entry.kind == TranscriptKind::User
+        && lines.last().is_some_and(|line| {
+            line.spans
+                .iter()
+                .all(|span| span.content.trim().is_empty())
+        })
+    {
+        lines.pop();
+    }
+}
+
 fn render_transcript_lines(
     state: &TuiState,
     theme: Theme,
@@ -5124,6 +6398,7 @@ fn render_transcript_lines(
     };
     let mut lines = Vec::new();
     for entry in &state.transcript[start..] {
+        trim_inter_entry_blank_before_user(&mut lines, entry);
         render_transcript_entry_inner(
             &mut lines,
             entry,
@@ -5131,36 +6406,91 @@ fn render_transcript_lines(
             state.expand_tools,
             theme,
             width,
+            state.animation_frame,
             Some(image_context),
         );
     }
     lines
 }
 
-fn render_job_card(lines: &mut Vec<Line<'static>>, card: &JobCardRows, theme: Theme) {
-    let background = match card.job_status {
-        pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running => theme.tool_pending_bg,
-        pi_coding::JobStatus::Completed => theme.tool_success_bg,
-        pi_coding::JobStatus::Failed | pi_coding::JobStatus::Cancelled => theme.tool_error_bg,
-    };
-    for row in &card.rows {
-        let (prefix, color, modifier) = match row.role {
-            JobCardRowRole::Title => ("Task ", job_status_color(card.job_status, theme), Modifier::BOLD),
-            JobCardRowRole::Description => ("  ", theme.text, Modifier::empty()),
-            JobCardRowRole::Timing => ("  ", theme.muted, Modifier::empty()),
-            JobCardRowRole::Usage => ("  ", theme.dim, Modifier::empty()),
-            JobCardRowRole::Result => ("  ↳ ", theme.tool_output, Modifier::empty()),
-            JobCardRowRole::Error => ("  ! ", theme.error, Modifier::empty()),
-            JobCardRowRole::Reference => ("  · ", theme.md_link_url, Modifier::empty()),
-            JobCardRowRole::Aggregate => ("", theme.muted, Modifier::ITALIC),
-        };
-        for (index, text) in clean_terminal_text(&row.text).lines().enumerate() {
-            let current_prefix = if index == 0 { prefix } else { "    " };
-            lines.push(Line::from(vec![
-                Span::styled(current_prefix.to_owned(), Style::default().fg(color).bg(background)),
-                Span::styled(text.to_owned(), Style::default().fg(color).bg(background).add_modifier(modifier)),
-            ]));
+fn render_job_card(lines: &mut Vec<Line<'static>>, card: &TaskCardRows, theme: Theme, animation_frame: usize, width: u16) {
+    let inner = usize::from(width.saturating_sub(2)).max(1);
+    let border = if card.children.iter().any(|child| child.job_status == pi_coding::JobStatus::Failed) { theme.error }
+        else if card.children.iter().any(|child| child.job_status == pi_coding::JobStatus::Cancelled) { theme.warning }
+        else { theme.border_accent };
+    lines.push(Line::from(Span::styled(format!("╭{}╮", "─".repeat(inner)), Style::default().fg(border))));
+    push_task_box_row(lines, &format!("Task {} agents", card.children.len()), theme.tool_title, border, inner, Modifier::BOLD);
+    if !card.context.trim().is_empty() {
+        for line in render_transcript_markdown(&card.context, theme, theme.text, u16::try_from(inner.saturating_sub(2)).unwrap_or(u16::MAX), false) {
+            push_task_box_line(lines, line, border, inner);
         }
+        push_task_separator(lines, " Agents ", border, inner);
+    }
+    for child in &card.children {
+        let marker = match child.job_status {
+            pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running => {
+                ACTIVE_ANIMATION_FRAMES[animation_frame % ACTIVE_ANIMATION_FRAMES.len()]
+            }
+            pi_coding::JobStatus::Completed => "✓",
+            pi_coding::JobStatus::Failed => "✗",
+            pi_coding::JobStatus::Cancelled => "–",
+        };
+        let status_color = job_status_color(child.job_status, theme);
+        let lifecycle = match child.job_status {
+            pi_coding::JobStatus::Queued => "queued",
+            pi_coding::JobStatus::Running => "running",
+            pi_coding::JobStatus::Completed => "completed",
+            pi_coding::JobStatus::Failed => "failed",
+            pi_coding::JobStatus::Cancelled => "cancelled",
+        };
+        let parked = if child.agent_status == Some(pi_coding::AgentStatus::Parked) {
+            " · parked"
+        } else {
+            ""
+        };
+        let title = format!("{marker} {} ({}) · {lifecycle}{parked}", child.display_name, child.agent);
+        push_task_box_row(lines, &title, status_color, border, inner, Modifier::BOLD);
+        if let Some(summary) = child.summary.as_deref().or_else(|| child.rows.iter().find(|row| row.role == JobCardRowRole::Description).map(|row| row.text.as_str())) {
+            push_task_box_row(lines, summary, theme.text, border, inner, Modifier::empty());
+        }
+        let activity = child.rows.iter().filter(|row| !matches!(row.role, JobCardRowRole::Title | JobCardRowRole::Description | JobCardRowRole::Reference)).map(|row| row.text.as_str()).collect::<Vec<_>>().join(" · ");
+        if !activity.is_empty() {
+            push_task_box_row(lines, &activity, status_color, border, inner, Modifier::empty());
+        }
+    }
+    push_task_box_row(lines, &card.aggregate.text, theme.muted, border, inner, Modifier::ITALIC);
+    lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), Style::default().fg(border))));
+}
+
+fn push_task_separator(lines: &mut Vec<Line<'static>>, label: &str, border: Color, inner: usize) {
+    let fill = "─".repeat(inner.saturating_sub(display_width(label).into()));
+    lines.push(Line::from(vec![Span::styled("├", Style::default().fg(border)), Span::styled(label.to_owned(), Style::default().fg(border)), Span::styled(fill, Style::default().fg(border)), Span::styled("┤", Style::default().fg(border))]));
+}
+
+fn push_task_box_row(lines: &mut Vec<Line<'static>>, text: &str, color: Color, border: Color, inner: usize, modifier: Modifier) {
+    for row in wrap_display_line(&clean_terminal_text(text), inner.saturating_sub(2).max(1)) {
+        push_task_box_line(lines, Line::from(Span::styled(row, Style::default().fg(color).add_modifier(modifier))), border, inner);
+    }
+}
+
+fn push_task_box_line(lines: &mut Vec<Line<'static>>, line: Line<'static>, border: Color, inner: usize) {
+    let used = line.width();
+    let fill = " ".repeat(inner.saturating_sub(used.saturating_add(2)));
+    let mut spans = vec![Span::styled("│ ", Style::default().fg(border))];
+    spans.extend(line.spans);
+    spans.push(Span::raw(fill));
+    spans.push(Span::styled(" │", Style::default().fg(border)));
+    lines.push(Line::from(spans));
+}
+
+fn job_title_prefix(status: pi_coding::JobStatus, animation_frame: usize) -> &'static str {
+    match status {
+        pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running => {
+            ACTIVE_JOB_PREFIXES[animation_frame % ACTIVE_JOB_PREFIXES.len()]
+        }
+        pi_coding::JobStatus::Completed
+        | pi_coding::JobStatus::Failed
+        | pi_coding::JobStatus::Cancelled => "Task ",
     }
 }
 
@@ -5174,6 +6504,40 @@ fn job_status_color(status: pi_coding::JobStatus, theme: Theme) -> Color {
     }
 }
 
+const TODO_HUD_TASK_LIMIT: usize = 5;
+const TODO_HUD_JOB_LIMIT: usize = 8;
+
+fn selected_todo_hud_tasks<'a>(tasks: &[&'a TodoItem]) -> (Vec<&'a TodoItem>, usize, bool) {
+    let open = tasks
+        .iter()
+        .copied()
+        .filter(|task| !matches!(task.status, TodoStatus::Completed | TodoStatus::Abandoned))
+        .collect::<Vec<_>>();
+    let active = open
+        .iter()
+        .copied()
+        .filter(|task| task.status == TodoStatus::InProgress)
+        .collect::<Vec<_>>();
+    if active.len() > TODO_HUD_TASK_LIMIT {
+        let hidden = active.len().saturating_sub(TODO_HUD_TASK_LIMIT);
+        return (
+            active.into_iter().take(TODO_HUD_TASK_LIMIT).collect(),
+            hidden,
+            true,
+        );
+    }
+
+    let mut selected = active;
+    for task in open.iter().copied().filter(|task| task.status == TodoStatus::Pending && task.ready) {
+        if selected.len() >= TODO_HUD_TASK_LIMIT {
+            break;
+        }
+        selected.push(task);
+    }
+    let hidden = open.len().saturating_sub(selected.len());
+    (selected, hidden, false)
+}
+
 /// Count tasks that are neither completed nor abandoned across all phases.
 fn todo_open_count(phases: &[TodoPhase]) -> usize {
     phases
@@ -5183,30 +6547,209 @@ fn todo_open_count(phases: &[TodoPhase]) -> usize {
         .count()
 }
 
-/// Build the compact phase/task panel lines. Each phase is a bold header; each
-/// task is a marker + content line, with a distinct color per status:
-/// pending (dim), in-progress (accent), completed (success), abandoned (muted).
-fn render_todo_panel_lines(phases: &[TodoPhase], theme: Theme) -> Vec<Line<'static>> {
+/// Build the compact OMP-style todo and active-subagent trees. This is a
+/// display-only projection: task readiness and blockers come directly from the
+/// canonical todo items, while job identity remains keyed by the adapter.
+fn render_todo_panel_lines(
+    phases: &[TodoPhase],
+    job_cards: &[JobCardRows],
+    theme: Theme,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
     let mut lines = Vec::new();
-    for phase in phases {
-        lines.push(Line::from(Span::styled(
-            clean_terminal_text(&phase.name),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for task in &phase.tasks {
-            let (marker, color) = todo_status_marker(&task.status, theme);
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {marker} "), Style::default().fg(color)),
-                Span::styled(
-                    clean_terminal_text(&task.content),
-                    Style::default().fg(theme.text),
-                ),
-            ]));
+    let tasks = phases.iter().flat_map(|phase| &phase.tasks).collect::<Vec<_>>();
+    if !tasks.is_empty() {
+        let completed = tasks.iter().filter(|task| task.status == TodoStatus::Completed).count();
+        let active = tasks.iter().filter(|task| task.status == TodoStatus::InProgress).count();
+        let next = tasks.iter().filter(|task| task.status == TodoStatus::Pending && task.ready).count();
+        lines.push(bounded_single_style_line(
+            format!(" Todos · {active} active · {next} next · {completed}/{}", tasks.len()),
+            width,
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ));
+        let (visible_tasks, hidden_tasks, hidden_tasks_are_active) = selected_todo_hud_tasks(&tasks);
+        for task in visible_tasks {
+            let (marker, _) = todo_status_marker(&task.status, theme);
+            let blocked = todo_blocked_suffix(task);
+            let suffix = if blocked.is_empty() { String::new() } else { format!(" · {blocked}") };
+            let style = if task.status == TodoStatus::InProgress {
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.muted)
+            };
+            lines.push(bounded_single_style_line(
+                format!("  {marker} {}{suffix}", clean_terminal_text(&task.content)),
+                width,
+                style,
+            ));
+        }
+        if hidden_tasks > 0 {
+            let kind = if hidden_tasks_are_active { "active" } else { "open" };
+            lines.push(bounded_single_style_line(
+                format!("  … {hidden_tasks} more {kind} todos"),
+                width,
+                Style::default().fg(theme.dim),
+            ));
         }
     }
+
+    let active_jobs = job_cards
+        .iter()
+        .filter(|card| matches!(card.job_status, pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running))
+        .collect::<Vec<_>>();
+    if !active_jobs.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(bounded_single_style_line(
+            format!(" waiting on {} jobs", active_jobs.len()),
+            width,
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ));
+        for card in active_jobs.iter().take(TODO_HUD_JOB_LIMIT) {
+            let running = card.job_status == pi_coding::JobStatus::Running;
+            let marker = if running { "►" } else { "○" };
+            let status = if running { "running" } else { "queued" };
+            let assigned_task = card.todo_task_id.as_deref().and_then(|task_id| {
+                tasks.iter().find(|task| task.id == task_id).map(|task| clean_terminal_text(&task.content))
+            });
+            let description = card
+                .rows
+                .iter()
+                .find(|row| row.role == JobCardRowRole::Description)
+                .map(|row| clean_terminal_text(&row.text));
+            let summary = assigned_task.or(description).unwrap_or_default();
+            let summary = if summary.is_empty() { String::new() } else { format!(" · {summary}") };
+            lines.push(bounded_single_style_line(
+                format!("  {marker} {} · {status}{summary}", clean_terminal_text(&card.display_name)),
+                width,
+                Style::default().fg(if running { theme.accent } else { theme.dim }),
+            ));
+        }
+        let hidden_jobs = active_jobs.len().saturating_sub(TODO_HUD_JOB_LIMIT);
+        if hidden_jobs > 0 {
+            lines.push(bounded_single_style_line(
+                format!("  … {hidden_jobs} more active jobs"),
+                width,
+                Style::default().fg(theme.dim),
+            ));
+        }
+    }
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
     lines
+}
+
+
+/// Blocked state is intentionally concise; readiness is conveyed by the lack
+/// of a blocker rather than repeating `ready` on every open task.
+fn todo_blocked_suffix(task: &TodoItem) -> String {
+    if task.ready || matches!(task.status, TodoStatus::Completed | TodoStatus::Abandoned) {
+        return String::new();
+    }
+    if task.blocked_by.is_empty() {
+        return "blocked".to_owned();
+    }
+    let blockers = task
+        .blocked_by
+        .iter()
+        .map(|reason| {
+            if reason.content.is_empty() {
+                reason.task_id.clone()
+            } else {
+                reason.content.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("blocked: {blockers}")
+}
+
+fn bounded_single_style_line(text: String, width: usize, style: Style) -> Line<'static> {
+    let text = if display_width(&text) as usize > width {
+        truncate_todo_line(&text, width)
+    } else {
+        text
+    };
+    Line::from(Span::styled(text, style))
+}
+
+
+fn truncate_todo_line(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if display_width(text) as usize <= width {
+        return text.to_owned();
+    }
+    if width <= 1 {
+        return "…".to_owned();
+    }
+    let mut output = String::new();
+    let mut used = 0usize;
+    let target = width.saturating_sub(1);
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > target {
+            break;
+        }
+        output.push(ch);
+        used += ch_width;
+    }
+    output.push('…');
+    output
+}
+
+/// Human `/todo` output keeps the full canonical dependency projection.
+fn todo_readiness_suffix(task: &TodoItem) -> String {
+    match task.status {
+        TodoStatus::Completed | TodoStatus::Abandoned => String::new(),
+        TodoStatus::Pending | TodoStatus::InProgress if task.ready => "ready".to_owned(),
+        TodoStatus::Pending | TodoStatus::InProgress => {
+            if task.blocked_by.is_empty() {
+                "blocked".to_owned()
+            } else {
+                let blockers = task
+                    .blocked_by
+                    .iter()
+                    .map(|reason| {
+                        if reason.content.is_empty() {
+                            reason.task_id.clone()
+                        } else if reason.task_id.is_empty() {
+                            reason.content.clone()
+                        } else {
+                            format!("{}({})", reason.content, reason.task_id)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("blocked by {blockers}")
+            }
+        }
+    }
+}
+
+/// Plain-text human projection for `/todo` (no markdown phase-sequence implication).
+pub(crate) fn format_todo_human_lines(phases: &[TodoPhase]) -> String {
+    if phases.is_empty() {
+        return "Todo list is empty.".to_owned();
+    }
+    let mut lines = Vec::new();
+    for phase in phases {
+        lines.push(phase.name.clone());
+        for task in &phase.tasks {
+            let (marker, _) = todo_status_marker(&task.status, crate::theme::DARK);
+            let readiness = todo_readiness_suffix(task);
+            if readiness.is_empty() {
+                lines.push(format!(" {marker} {}", task.content));
+            } else {
+                lines.push(format!(" {marker} {} · {readiness}", task.content));
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 /// Map a todo status to a display glyph and theme color.
@@ -5234,6 +6777,7 @@ fn render_transcript_entry(
         expand_tools,
         theme,
         width,
+        0,
         None,
     );
 }
@@ -5247,7 +6791,9 @@ fn render_tool_card(lines: &mut Vec<Line<'static>>, tool: &ToolTranscript, expan
     };
     let inner = usize::from(width.saturating_sub(2).max(1));
     lines.push(Line::from(Span::styled(format!("╭{}╮", "─".repeat(inner)), Style::default().fg(border))));
+    let tool_title = card.rows.iter().find(|row| row.role == ToolCardRowRole::Command).map_or(card.tool_name.as_str(), |row| row.text.as_str());
     if card.tool_name.eq_ignore_ascii_case("bash") {
+        push_tool_box_row(lines, tool_title, theme.tool_title, border, inner);
         push_tool_box_row(lines, &format!("$ {}", card.arguments_summary), theme.bash_mode, border, inner);
         if card.rows.iter().any(|row| row.role == ToolCardRowRole::Content) {
             push_tool_separator(lines, " Output ", border, inner);
@@ -5258,9 +6804,10 @@ fn render_tool_card(lines: &mut Vec<Line<'static>>, tool: &ToolTranscript, expan
             ToolCallViewStatus::Failed | ToolCallViewStatus::Cancelled => "✘",
             ToolCallViewStatus::OrphanRepaired => "↻",
         };
-        let title = if card.arguments_summary.is_empty() { format!("{marker} {}", card.tool_name) } else { format!("{marker} {} {}", card.tool_name, card.arguments_summary) };
+        let title = if card.arguments_summary.is_empty() { format!("{marker} {tool_title}") } else { format!("{marker} {tool_title} {}", card.arguments_summary) };
         push_tool_box_row(lines, &title, theme.tool_title, border, inner);
     }
+    let code_styles = markdown_ratatui_styles(theme, theme.tool_output);
     for row in &card.rows {
         if row.role == ToolCardRowRole::Command { continue; }
         let color = match row.role {
@@ -5270,7 +6817,20 @@ fn render_tool_card(lines: &mut Vec<Line<'static>>, tool: &ToolTranscript, expan
             ToolCardRowRole::Status => if card.is_error { theme.error } else { theme.muted },
             ToolCardRowRole::Error => theme.error,
         };
-        for text in clean_terminal_text(&row.text).lines() { push_tool_box_row(lines, text, color, border, inner); }
+        for text in clean_terminal_text(&row.text).lines() {
+            if row.role == ToolCardRowRole::Content
+                && let Some(language) = card.code_language.as_deref()
+            {
+                for line in wrap_styled_line(
+                    Line::from(markdown_syntax_spans(text, Some(language), code_styles)),
+                    inner.saturating_sub(2).max(1),
+                ) {
+                    push_tool_box_line(lines, line, border, inner);
+                }
+            } else {
+                push_tool_box_row(lines, text, color, border, inner);
+            }
+        }
     }
     if card.truncated { push_tool_box_row(lines, &format!("… {} more lines ⟦Ctrl+O: Expand⟧", card.omitted_content_lines), theme.dim, border, inner); }
     lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), Style::default().fg(border))));
@@ -5282,6 +6842,40 @@ fn push_tool_separator(lines: &mut Vec<Line<'static>>, label: &str, border: Colo
     lines.push(Line::from(vec![Span::styled("├──", Style::default().fg(border)), Span::styled(label.to_owned(), Style::default().fg(border)), Span::styled(fill, Style::default().fg(border)), Span::styled("┤", Style::default().fg(border))]));
 }
 
+fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows = vec![Vec::new()];
+    let mut columns = 0usize;
+    for span in line.spans {
+        let style = span.style;
+        let mut chunk = String::new();
+        for character in span.content.chars() {
+            let character_width = character.width().unwrap_or(0);
+            if columns > 0 && columns.saturating_add(character_width) > width {
+                if !chunk.is_empty() {
+                    rows.last_mut().expect("one styled row").push(Span::styled(std::mem::take(&mut chunk), style));
+                }
+                rows.push(Vec::new());
+                columns = 0;
+            }
+            chunk.push(character);
+            columns = columns.saturating_add(character_width);
+        }
+        if !chunk.is_empty() {
+            rows.last_mut().expect("one styled row").push(Span::styled(chunk, style));
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+fn push_tool_box_line(lines: &mut Vec<Line<'static>>, line: Line<'static>, border: Color, inner: usize) {
+    let used = line.width();
+    let fill = " ".repeat(inner.saturating_sub(used.saturating_add(2)));
+    let mut spans = vec![Span::styled("│ ", Style::default().fg(border))];
+    spans.extend(line.spans);
+    spans.push(Span::raw(fill));
+    spans.push(Span::styled(" │", Style::default().fg(border)));
+    lines.push(Line::from(spans));
+}
 fn push_tool_box_row(lines: &mut Vec<Line<'static>>, text: &str, color: Color, border: Color, inner: usize) {
     for row in wrap_display_line(&clean_terminal_text(text), inner.saturating_sub(2).max(1)) {
         let used = usize::from(display_width(&row));
@@ -5300,6 +6894,9 @@ fn transcript_block_has_content(block: &ContentBlock) -> bool {
     }
 }
 
+const ACTIVE_ANIMATION_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
+const ACTIVE_JOB_PREFIXES: &[&str] = &["Task ◐ ", "Task ◓ ", "Task ◑ ", "Task ◒ "];
+
 fn render_transcript_entry_inner(
     lines: &mut Vec<Line<'static>>,
     entry: &TranscriptEntry,
@@ -5307,11 +6904,12 @@ fn render_transcript_entry_inner(
     expand_tools: bool,
     theme: Theme,
     width: u16,
+    animation_frame: usize,
     mut image_context: Option<&mut TranscriptImageContext<'_>>,
 ) {
     if entry.kind == TranscriptKind::Job {
         if let Some(card) = &entry.job_card {
-            render_job_card(lines, card, theme);
+            render_job_card(lines, card, theme, animation_frame, width);
         }
         return;
     }
@@ -5359,25 +6957,39 @@ fn render_transcript_entry_inner(
     }
     let mut visible_blocks = 0_usize;
     let mut reasoning_labeled = false;
+    let mut previous_was_thinking = false;
     for block in &entry.content {
         match block {
             ContentBlock::Text { text, .. } => {
                 if text.trim().is_empty() {
                     continue;
                 }
-                let base = match entry.kind {
-                    TranscriptKind::User => theme.user_message_text,
-                    TranscriptKind::System => {
-                        if entry.is_error {
-                            theme.error
-                        } else {
-                            theme.custom_message_text
+                if previous_was_thinking {
+                    lines.push(Line::default());
+                }
+                let is_irc_reply_meta = entry.kind == TranscriptKind::Custom
+                    && entry
+                        .tool_name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("IRC · "))
+                    && text.starts_with("reply to ");
+                let base = if is_irc_reply_meta {
+                    theme.muted
+                } else {
+                    match entry.kind {
+                        TranscriptKind::User => theme.user_message_text,
+                        TranscriptKind::System => {
+                            if entry.is_error {
+                                theme.error
+                            } else {
+                                theme.custom_message_text
+                            }
                         }
-                    }
-                    TranscriptKind::Custom => theme.custom_message_text,
-                    TranscriptKind::Assistant => theme.text,
-                    TranscriptKind::Tool | TranscriptKind::Job => {
-                        unreachable!("cards return before generic text rendering")
+                        TranscriptKind::Custom => theme.custom_message_text,
+                        TranscriptKind::Assistant => theme.text,
+                        TranscriptKind::Tool | TranscriptKind::Job => {
+                            unreachable!("cards return before generic text rendering")
+                        }
                     }
                 };
                 let sanitized = clean_terminal_text(text);
@@ -5393,12 +7005,7 @@ fn render_transcript_entry_inner(
                     )
                 };
                 if entry.kind == TranscriptKind::User {
-                    for line in &mut rendered {
-                        line.spans.insert(
-                            0,
-                            Span::styled("  ", Style::default().fg(theme.accent)),
-                        );
-                    }
+                    rendered = render_user_card_lines(rendered, width);
                 }
                 if let Some(background) = background {
                     for line in &mut rendered {
@@ -5410,6 +7017,7 @@ fn render_transcript_entry_inner(
                 }
                 lines.extend(rendered);
                 visible_blocks += 1;
+                previous_was_thinking = false;
             }
             ContentBlock::Thinking {
                 thinking, redacted, ..
@@ -5441,6 +7049,7 @@ fn render_transcript_entry_inner(
                 }
                 lines.extend(rendered);
                 visible_blocks += 1;
+                previous_was_thinking = true;
             }
             ContentBlock::Image { data, mime_type } => {
                 let layout = image_context.as_deref_mut().and_then(|context| {
@@ -5492,6 +7101,66 @@ fn render_transcript_entry_inner(
     }
 }
 
+fn render_user_card_lines(rendered: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let trailing_padding = usize::from(width > 1);
+    let content_width = width.saturating_sub(trailing_padding).max(1);
+    let mut rows = Vec::new();
+
+    for line in rendered {
+        let line_style = line.style;
+        let mut row_spans = Vec::<Span<'static>>::new();
+        let mut row_width = 0_usize;
+        for span in line.spans {
+            for character in span.content.chars() {
+                let character_width = character.width().unwrap_or(0);
+                if row_width > 0 && row_width.saturating_add(character_width) > content_width {
+                    push_user_card_row(
+                        &mut rows,
+                        std::mem::take(&mut row_spans),
+                        row_width,
+                        width,
+                        line_style,
+                    );
+                    row_width = 0;
+                }
+                if let Some(last) = row_spans.last_mut().filter(|last| last.style == span.style) {
+                    last.content.to_mut().push(character);
+                } else {
+                    row_spans.push(Span::styled(character.to_string(), span.style));
+                }
+                row_width = row_width.saturating_add(character_width);
+            }
+        }
+        push_user_card_row(
+            &mut rows,
+            row_spans,
+            row_width,
+            width,
+            line_style,
+        );
+    }
+
+    rows
+}
+
+fn push_user_card_row(
+    rows: &mut Vec<Line<'static>>,
+    content: Vec<Span<'static>>,
+    content_width: usize,
+    width: usize,
+    line_style: Style,
+) {
+    let mut spans = Vec::with_capacity(content.len().saturating_add(1));
+    spans.extend(content);
+    let trailing_band = width.saturating_sub(content_width);
+    if trailing_band > 0 {
+        spans.push(Span::raw(" ".repeat(trailing_band)));
+    }
+    rows.push(Line::from(spans).style(line_style));
+}
+
+
 fn saved_session_preview_lines(
     session: &pi_coding::SessionInfo,
     marker: &str,
@@ -5532,24 +7201,13 @@ fn render_saved_session_selector(
         frame.area(),
     );
     frame.render_widget(Clear, area);
-    let sort = match selector.sort() {
-        SessionSort::Newest => "newest",
-        SessionSort::Name => "name",
-    };
-    let named = if selector.named_only() {
-        "named"
-    } else {
-        "all"
-    };
     let mut lines = vec![
         Line::from(Span::styled(
             "Resume Session",
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            format!(
-                "Ctrl+N {named} · Ctrl+P path · Ctrl+S sort:{sort} · Ctrl+R rename · Ctrl+D delete"
-            ),
+            session_selector_key_hints(selector),
             Style::default().fg(theme.dim),
         )),
     ];
@@ -5613,52 +7271,84 @@ fn render_saved_session_selector(
 }
 
 
-fn render_agents_panel(frame: &mut ratatui::Frame<'_>, panel: &AgentsPanel, theme: Theme) {
-    let lines_data = panel.view_lines();
-    let height = u16::try_from(lines_data.len().saturating_add(5))
-        .unwrap_or(u16::MAX)
-        .clamp(8, 24);
-    let area = centered_rect(
-        frame.area().width.saturating_sub(4).min(110).max(40),
-        height,
-        frame.area(),
-    );
-    frame.render_widget(Clear, area);
+const AGENTS_PANEL_PADDING: u16 = 1;
+
+fn inset_rect(area: Rect, padding: u16) -> Rect {
+    let inset = padding.saturating_mul(2);
+    Rect {
+        x: area.x.saturating_add(padding),
+        y: area.y.saturating_add(padding),
+        width: area.width.saturating_sub(inset),
+        height: area.height.saturating_sub(inset),
+    }
+}
+
+fn agents_panel_lines(panel: &AgentsPanel, theme: Theme, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
     let dirty = if panel.dirty() { " · unsaved" } else { "" };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("{}{dirty}", panel.title()),
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            panel.help().to_owned(),
-            Style::default().fg(theme.dim),
-        )),
-    ];
-    for row in lines_data {
+    let mut lines = Vec::new();
+    for text in [format!("{}{dirty}", panel.title()), panel.help().to_owned()] {
+        let style = if lines.is_empty() {
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.dim)
+        };
+        lines.extend(
+            wrap_display_line(&clean_terminal_text(&text), width)
+                .into_iter()
+                .map(|line| Line::from(Span::styled(line, style))),
+        );
+    }
+    lines.push(Line::default());
+
+    let rows = panel.view_lines();
+    for (index, row) in rows.iter().enumerate() {
         let style = if row.selected {
             Style::default().fg(theme.text).bg(theme.selected_bg)
         } else {
             Style::default().fg(theme.text)
         };
-        lines.push(Line::from(Span::styled(clean_terminal_text(&row.text), style)));
+        lines.extend(
+            wrap_display_line(&clean_terminal_text(&row.text), width)
+                .into_iter()
+                .map(|line| Line::from(Span::styled(line, style))),
+        );
+        if index + 1 < rows.len() {
+            lines.push(Line::default());
+        }
     }
     if let Some(selected) = panel.selected_row() {
-        lines.push(Line::from(Span::styled(
-            clean_terminal_text(&selected.description),
-            Style::default().fg(theme.dim),
-        )));
+        lines.push(Line::default());
+        lines.extend(
+            wrap_display_line(&clean_terminal_text(&selected.description), width)
+                .into_iter()
+                .map(|line| {
+                    Line::from(Span::styled(line, Style::default().fg(theme.dim)))
+                }),
+        );
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.border_accent)),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    lines
+}
+
+fn render_agents_panel(frame: &mut ratatui::Frame<'_>, panel: &AgentsPanel, theme: Theme) {
+    let width = frame.area().width.saturating_sub(4).min(110).max(1);
+    let content_width = width
+        .saturating_sub(2)
+        .saturating_sub(AGENTS_PANEL_PADDING.saturating_mul(2));
+    let lines = agents_panel_lines(panel, theme, content_width);
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .saturating_add(AGENTS_PANEL_PADDING.saturating_mul(2))
+        .clamp(8, 24);
+    let area = centered_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_accent));
+    let content = inset_rect(block.inner(area), AGENTS_PANEL_PADDING);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), content);
 }
 
 fn render_scoped_model_selector(
@@ -5683,9 +7373,7 @@ fn render_scoped_model_selector(
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            format!(
-                "Enter toggle · Ctrl+A all · Ctrl+X clear · Ctrl+P provider · Alt+↑/↓ reorder · Ctrl+S save{dirty}"
-            ),
+            scoped_model_key_hints().to_owned(),
             Style::default().fg(theme.dim),
         )),
         Line::from(vec![
@@ -5764,6 +7452,16 @@ fn markdown_ratatui_styles(theme: Theme, base: Color) -> MarkdownRatatuiStyles {
         quote: Style::default().fg(theme.md_quote),
         code: Style::default().fg(theme.md_code_block),
         code_fence: Style::default().fg(theme.md_code_block_border),
+        inline_code: Style::default().fg(theme.md_code),
+        syntax_comment: Style::default().fg(theme.syntax_comment),
+        syntax_keyword: Style::default().fg(theme.syntax_keyword),
+        syntax_function: Style::default().fg(theme.syntax_function),
+        syntax_variable: Style::default().fg(theme.syntax_variable),
+        syntax_string: Style::default().fg(theme.syntax_string),
+        syntax_number: Style::default().fg(theme.syntax_number),
+        syntax_type: Style::default().fg(theme.syntax_type),
+        syntax_operator: Style::default().fg(theme.syntax_operator),
+        syntax_punctuation: Style::default().fg(theme.syntax_punctuation),
         table_border: Style::default().fg(theme.md_code_block_border),
         table_header: Style::default()
             .fg(theme.md_heading)
@@ -6116,20 +7814,16 @@ fn render_tree_panel(frame: &mut ratatui::Frame<'_>, panel: &TreePanel, theme: T
             "Select a user message to copy the active path up to that point into a new session",
             Style::default().fg(theme.dim),
         )));
-        lines.push(Line::from(Span::styled(
-            "↑↓ move  Enter select  Esc close",
-            Style::default().fg(theme.dim),
-        )));
     } else {
-        lines.push(Line::from(Span::styled(
-            "↑↓ move  ← fold  → unfold  Enter select  Alt+D/T/U/L/A filters  Alt+Shift+L label  Esc close",
-            Style::default().fg(theme.dim),
-        )));
         lines.push(Line::from(vec![
             Span::styled("Type to search: ", Style::default().fg(theme.dim)),
             Span::styled(clean_terminal_text(&panel.query), Style::default().fg(theme.text)),
         ]));
     }
+    lines.push(Line::from(Span::styled(
+        tree_panel_key_hints(panel),
+        Style::default().fg(theme.dim),
+    )));
     if panel.visible().is_empty() {
         lines.push(Line::from(Span::styled(
             if panel.mode == TreePanelMode::Fork { "No user messages found" } else { "No entries found" },
@@ -6199,20 +7893,87 @@ fn render_tree_panel(frame: &mut ratatui::Frame<'_>, panel: &TreePanel, theme: T
     );
 }
 
+fn format_hotkeys_text(bindings: &KeyBindingsManager) -> String {
+    let sections = bindings.hotkey_sections();
+    if sections.is_empty() {
+        return "No keybindings loaded".to_owned();
+    }
+    let mut parts = Vec::with_capacity(sections.len());
+    for section in sections {
+        let mut block = format!("## {}", section.title);
+        for row in section.rows {
+            block.push('\n');
+            block.push_str(&row);
+        }
+        parts.push(block);
+    }
+    parts.join("\n\n")
+}
+
+fn overlay_unknown_key_status(key: KeyEvent) -> String {
+    let chord = crate::keybindings::normalize_key(&key)
+        .map(|chord| crate::keybindings::format_chord_display(&chord))
+        .unwrap_or_else(|| format!("{key:?}"));
+    format!("Unknown key {chord} · see footer hints · Esc closes · /hotkeys for full map")
+}
+
+fn tree_panel_key_hints(panel: &TreePanel) -> String {
+    if panel.label_input.is_some() {
+        return "Enter save label · Esc cancel".to_owned();
+    }
+    match panel.mode {
+        TreePanelMode::Fork => "↑/↓ move · Enter fork · Esc/q close".to_owned(),
+        TreePanelMode::Navigate => {
+            "↑/↓ move · ← fold · → unfold · Enter select · type search · Esc/q close".to_owned()
+        }
+    }
+}
+
+fn session_selector_key_hints(selector: &SavedSessionSelector) -> String {
+    match selector.mode() {
+        SessionSelectorMode::Rename { .. } => "Type name · Enter save · Esc cancel".to_owned(),
+        SessionSelectorMode::ConfirmDelete { .. } => "Enter confirm · Esc cancel".to_owned(),
+        SessionSelectorMode::List => {
+            "↑/↓ · Enter resume · Ctrl+N/P/S/R/D · type filter · Esc/q close".to_owned()
+        }
+    }
+}
+
+fn scoped_model_key_hints() -> &'static str {
+    "↑/↓ · Enter toggle · Ctrl+A/X/P/S · Alt+↑/↓ reorder · type filter · Esc/q close"
+}
+
+fn selector_panel_key_hints(panel: &SelectorPanel) -> String {
+    if panel.help.trim().is_empty() {
+        "↑/↓ move · Enter select · type filter · Esc/q close".to_owned()
+    } else if panel.help.contains("Esc") {
+        panel.help.clone()
+    } else {
+        format!("{} · Esc/q close", panel.help)
+    }
+}
+
 fn render_selector_panel(frame: &mut ratatui::Frame<'_>, panel: &SelectorPanel, theme: Theme) {
     let visible = panel.visible_indices();
+    let goal_panel = panel.title == "Goal";
     let height = u16::try_from(visible.len().saturating_add(4))
         .unwrap_or(u16::MAX)
         .clamp(5, 20);
-    let width = frame.area().width.saturating_sub(4).min(76).max(20);
+    let width = frame
+        .area()
+        .width
+        .saturating_sub(4)
+        .min(if goal_panel { 84 } else { 76 })
+        .max(20);
     let area = centered_rect(width, height, frame.area());
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Filter: ", Style::default().fg(theme.dim)),
-        Span::styled(
-            clean_terminal_text(&panel.query),
-            Style::default().fg(theme.text),
-        ),
-    ])];
+    let inner_width = usize::from(area.width.saturating_sub(4).max(1));
+    let mut lines = Vec::new();
+    if !goal_panel {
+        lines.push(Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(theme.dim)),
+            Span::styled(clean_terminal_text(&panel.query), Style::default().fg(theme.text)),
+        ]));
+    }
     for (visible_index, item_index) in visible.into_iter().enumerate() {
         let item = &panel.items[item_index];
         let marker = if item.checked { "✓" } else { " " };
@@ -6221,17 +7982,17 @@ fn render_selector_panel(frame: &mut ratatui::Frame<'_>, panel: &SelectorPanel, 
         } else {
             Style::default().fg(theme.text)
         };
-        lines.push(Line::from(Span::styled(
-            format!(
-                " {marker} {}  {}",
-                clean_terminal_text(&item.label),
-                clean_terminal_text(&item.description)
-            ),
-            style,
-        )));
+        let row = format!(
+            " {marker} {}  {}",
+            clean_terminal_text(&item.label),
+            clean_terminal_text(&item.description)
+        );
+        for wrapped in wrap_display_line(&row, inner_width) {
+            lines.push(Line::from(Span::styled(wrapped, style)));
+        }
     }
     lines.push(Line::from(Span::styled(
-        clean_terminal_text(&panel.help),
+        clean_terminal_text(&selector_panel_key_hints(panel)),
         Style::default().fg(theme.dim),
     )));
     frame.render_widget(Clear, area);
@@ -6240,6 +8001,7 @@ fn render_selector_panel(frame: &mut ratatui::Frame<'_>, panel: &SelectorPanel, 
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .padding(ratatui::widgets::Padding::horizontal(1))
                     .border_style(Style::default().fg(theme.border_accent))
                     .title(format!(" {} ", clean_terminal_text(&panel.title))),
             )
@@ -6352,6 +8114,67 @@ fn floor_char_boundary(text: &str, requested: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Clipboard image waiting in the composer. Bytes live only inside
+/// `ContentBlock::Image`; width/height are display metadata from the guarded
+/// pipeline and never appear in the model payload.
+#[derive(Clone, Debug, PartialEq)]
+struct PendingAttachment {
+    block: ContentBlock,
+    width: u32,
+    height: u32,
+}
+
+impl PendingAttachment {
+    fn from_clipboard_image(image: crate::clipboard::ClipboardImage) -> Self {
+        let width = image.width;
+        let height = image.height;
+        Self {
+            block: image.into_content_block(),
+            width,
+            height,
+        }
+    }
+
+    /// OMP-compatible composer placeholder: `[Image #N, WIDTHxHEIGHT]`.
+    fn label(&self, index: usize) -> String {
+        format!("[Image #{}, {}x{}]", index + 1, self.width, self.height)
+    }
+}
+
+/// Human-visible labels for pending image attachments. Never includes base64
+/// payload bytes or absolute paths — only ordinal and decoded dimensions.
+fn pending_attachment_labels(attachments: &[PendingAttachment]) -> Vec<String> {
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| attachment.label(index))
+        .collect()
+}
+
+/// Merge clipboard pending attachments with expanded file images for one submit.
+/// Pure helper so adapter tests can assert exact-once assembly without a desktop clipboard.
+fn assemble_submit_attachments(
+    pending: &[PendingAttachment],
+    file_images: Vec<ContentBlock>,
+) -> Vec<ContentBlock> {
+    let mut attachments = pending
+        .iter()
+        .map(|attachment| attachment.block.clone())
+        .collect::<Vec<_>>();
+    attachments.extend(file_images);
+    attachments
+}
+
+/// After a failed prompt, keep only the pre-submit pending attachments.
+/// File images must not be folded into pending while the draft still contains
+/// `@file` markers — expand will re-emit them on the next submit.
+fn restore_pending_after_failed_submit(
+    pending: &mut Vec<PendingAttachment>,
+    pre_submit_pending: Vec<PendingAttachment>,
+) {
+    *pending = pre_submit_pending;
+}
+
 fn content_text(content: &[ContentBlock]) -> String {
     content
         .iter()
@@ -6443,7 +8266,7 @@ mod tests {
     #[test]
     fn editor_handles_unicode_boundaries_and_multiline_delete() {
         let mut editor = EditorState::new();
-        editor.insert_char('界');
+        editor.insert_char('é');
         editor.insert_char('a');
         editor.move_left();
         editor.backspace();
@@ -6459,8 +8282,8 @@ mod tests {
     #[test]
     fn raw_paste_burst_maps_printable_and_enter_but_not_tab_or_control_keys() {
         assert_eq!(
-            raw_paste_character(KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE)),
-            Some('界')
+            raw_paste_character(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE)),
+            Some('é')
         );
         assert_eq!(
             raw_paste_character(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -6481,33 +8304,194 @@ mod tests {
     }
 
     #[test]
-    fn paste_event_normalizes_multiline_crlf_and_preserves_cjk() {
+    fn raw_input_burst_keeps_plain_printables_on_key_path() {
+        // Ordinary printable input is dispatched immediately and is never an
+        // unmarked-paste candidate.
+        for text in ["/work", "/settings", "ps"] {
+            assert_eq!(classify_raw_input_burst(text), RawInputDisposition::Keys);
+        }
+        // A single Enter remains ambiguous — stay on the key path.
+        assert_eq!(
+            classify_raw_input_burst("hello\n"),
+            RawInputDisposition::Keys
+        );
+        assert_eq!(
+            classify_raw_input_burst("one\ntwo"),
+            RawInputDisposition::Keys
+        );
+        // True multiline unmarked paste (≥2 breaks with trailing content).
+        assert_eq!(
+            classify_raw_input_burst("one\ntwo\nthree"),
+            RawInputDisposition::Paste
+        );
+        assert_eq!(
+            classify_raw_input_burst("one\r\ntwo\r\nthree"),
+            RawInputDisposition::Paste
+        );
+    }
+
+    #[test]
+    fn slash_work_inserts_every_printable_exactly_once() {
         let mut state = todo_test_state(Vec::new());
-        handle_paste(&mut state, "first\r\n界🙂\rthird");
-        assert_eq!(state.editor.text(), "first\n界🙂\nthird");
+        for character in "/work".chars() {
+            apply_classified_burst(&mut state, &character.to_string());
+        }
+        assert_eq!(state.editor.text(), "/work");
+    }
+
+    #[test]
+    fn slash_completion_uses_primary_catalog_only() {
+        let mut state = todo_test_state(Vec::new());
+        // Full executable catalog stays on state for dispatch/source resolution.
+        state.commands = BUILTIN_COMMANDS
+            .iter()
+            .map(|command| InteractiveCommand {
+                name: command.name.to_owned(),
+                description: command.description.to_owned(),
+                source: CommandSource::Builtin,
+            })
+            .collect();
+
+        state.editor.set_text("/");
+        state.refresh_completions();
+        let values = state
+            .completions
+            .items
+            .iter()
+            .map(|item| item.value.clone())
+            .collect::<Vec<_>>();
+        let expected = visible_catalog()
+            .into_iter()
+            .map(|command| format!("/{}", command.name))
+            .collect::<Vec<_>>();
+        assert_eq!(values, expected);
+        assert!(!values.iter().any(|value| value == "/help"));
+        assert!(!values.iter().any(|value| value == "/import"));
+        assert!(values.iter().any(|value| value == "/settings"));
+        assert!(values.iter().any(|value| value == "/goal"));
+        assert!(
+            values.len() > MAX_COMPLETIONS,
+            "primary catalog must keep entries beyond the visible window"
+        );
+
+        let settings_index = values
+            .iter()
+            .position(|value| value == "/settings")
+            .expect("settings in primary catalog");
+        state.completions.selected = settings_index;
+        let (window_start, visible) = state.completions.visible_window(MAX_COMPLETIONS);
+        assert_eq!(visible.len(), MAX_COMPLETIONS.min(values.len()));
+        assert!(
+            (window_start..window_start + visible.len()).contains(&settings_index)
+                || visible.iter().any(|item| item.value == "/settings"),
+            "selected-centered window must cover /settings"
+        );
+
+        state.accept_completion();
+        assert_eq!(state.editor.text(), "/settings");
+        assert!(state.completions.items.is_empty());
+    }
+
+
+
+    #[test]
+    fn exact_slash_command_selects_matching_completion() {
+        let mut state = todo_test_state(Vec::new());
+        state.commands = vec![
+            InteractiveCommand {
+                name: "loops".to_owned(),
+                description: "List loops".to_owned(),
+                source: CommandSource::Builtin,
+            },
+            InteractiveCommand {
+                name: "process".to_owned(),
+                description: "Process ops".to_owned(),
+                source: CommandSource::Builtin,
+            },
+            InteractiveCommand {
+                name: "ps".to_owned(),
+                description: "List processes".to_owned(),
+                source: CommandSource::Builtin,
+            },
+        ];
+        state.editor.set_text("/ps");
+        state.refresh_completions();
+        let selected = state
+            .completions
+            .selected()
+            .expect("exact /ps must select a completion");
+        assert_eq!(selected.value, "/ps");
+        assert!(completion_already_matches_editor(&state));
+    }
+
+    #[test]
+    fn exact_slash_enter_falls_through_without_reaccept() {
+        let mut state = todo_test_state(Vec::new());
+        state.commands = vec![InteractiveCommand {
+            name: "ps".to_owned(),
+            description: "List processes".to_owned(),
+            source: CommandSource::Builtin,
+        }];
+        state.editor.set_text("/ps");
+        state.refresh_completions();
+        assert!(completion_already_matches_editor(&state));
+        // One-Enter semantics: when selected already equals the draft, the
+        // completion interceptor must not consume Enter as accept_completion.
+        // Accept would be a no-op fill; execute path is the fall-through.
+        let before = state.editor.text();
+        assert_eq!(before, "/ps");
+        // Simulate what would happen if accept were wrongly forced:
+        state.accept_completion();
+        assert_eq!(
+            state.editor.text(),
+            "/ps",
+            "accepting an already-exact match must not rewrite the draft"
+        );
+        // After a real fall-through execute, completions clear via submit —
+        // here we only assert the match predicate that gates fall-through.
+        state.editor.set_text("/ps");
+        state.refresh_completions();
+        assert!(
+            completion_already_matches_editor(&state),
+            "exact draft must keep the fall-through gate open"
+        );
+        // Partial drafts still require accept (gate closed).
+        state.editor.set_text("/p");
+        state.refresh_completions();
+        assert!(!completion_already_matches_editor(&state));
+    }
+
+
+    #[test]
+    fn paste_event_normalizes_multiline_crlf_and_preserves_unicode() {
+        let mut state = todo_test_state(Vec::new());
+        handle_paste(&mut state, "first\r\né🙂\rthird");
+        assert_eq!(state.editor.text(), "first\né🙂\nthird");
         assert_eq!((state.editor.row, state.editor.column), (2, "third".len()));
         assert!(state.transcript.is_empty(), "pasting must not submit a message");
     }
 
     #[test]
-    fn paste_event_inserts_7608_plus_characters_once_and_undoes_once() {
+    fn multiline_paste_7608_then_typing_is_immediate_and_undo_is_grouped() {
         let mut state = todo_test_state(Vec::new());
-        let payload = "x".repeat(8_193);
+        let payload = format!("{}\nline two\nline three", "p".repeat(7_608));
         handle_paste(&mut state, &payload);
-        assert_eq!(state.editor.text(), payload);
+        state.editor.insert_char('x');
+        assert_eq!(state.editor.text(), format!("{payload}x"));
         assert_eq!(state.editor.undo.len(), 1);
         state.editor.undo();
         assert!(state.editor.is_empty());
     }
 
     #[test]
-    fn oversize_paste_is_rejected_without_mutating_the_draft() {
+    fn oversize_paste_rejection_does_not_consume_next_key() {
         let mut state = todo_test_state(Vec::new());
         state.editor.set_text("keep");
         let undo_entries = state.editor.undo.len();
         handle_paste(&mut state, &"x".repeat(MAX_PASTE_BYTES + 1));
-        assert_eq!(state.editor.text(), "keep");
-        assert_eq!(state.editor.undo.len(), undo_entries);
+        state.editor.insert_char('x');
+        assert_eq!(state.editor.text(), "keepx");
+        assert_eq!(state.editor.undo.len(), undo_entries + 1);
         assert!(state.status.contains("Paste rejected"));
     }
 
@@ -6525,14 +8509,14 @@ mod tests {
     #[test]
     fn editor_word_motion_and_deletion_preserve_unicode_boundaries() {
         let mut editor = EditorState::new();
-        editor.insert_text("one 界界, two\n次 line");
+        editor.insert_text("one αα, two\nβ line");
         editor.move_word_left();
-        assert_eq!((editor.row, editor.column), (1, "次 ".len()));
+        assert_eq!((editor.row, editor.column), (1, "β ".len()));
         editor.delete_word_backward();
-        assert_eq!(editor.text(), "one 界界, two\nline");
+        assert_eq!(editor.text(), "one αα, two\nline");
         editor.move_word_left();
         editor.delete_word_backward();
-        assert_eq!(editor.text(), "one 界界, \nline");
+        assert_eq!(editor.text(), "one αα, \nline");
         assert!(editor.lines[editor.row].is_char_boundary(editor.column));
     }
 
@@ -6557,25 +8541,30 @@ mod tests {
     #[test]
     fn editor_jump_searches_across_unicode_lines() {
         let mut editor = EditorState::new();
-        editor.insert_text("a界\nβ界c");
+        editor.insert_text("aé\nβéc");
         editor.move_home();
         editor.begin_jump(JumpDirection::Backward);
-        assert!(editor.jump_to_char('界'));
+        assert!(editor.jump_to_char('é'));
         assert_eq!((editor.row, editor.column), (0, 1));
         editor.begin_jump(JumpDirection::Forward);
-        assert!(editor.jump_to_char('界'));
+        assert!(editor.jump_to_char('é'));
         assert_eq!((editor.row, editor.column), (1, 'β'.len_utf8()));
         assert!(editor.lines[editor.row].is_char_boundary(editor.column));
     }
 
     #[test]
-    fn editor_histories_are_bounded() {
+    fn large_draft_contiguous_insertion_keeps_bounded_useful_undo() {
         let mut editor = EditorState::new();
-        for _ in 0..(MAX_UNDO_HISTORY + 5) {
+        for _ in 0..7_608 {
             editor.insert_char('x');
         }
-        assert_eq!(editor.undo.len(), MAX_UNDO_HISTORY);
-        editor.break_action_chain();
+        assert_eq!(editor.undo.len(), 1, "one snapshot per insertion run");
+        editor.move_left();
+        editor.insert_char('y');
+        assert_eq!(editor.undo.len(), 2, "navigation breaks the insertion run");
+        editor.undo();
+        assert_eq!(editor.text(), "x".repeat(7_608));
+
         for index in 0..(MAX_YANK_HISTORY + 5) {
             editor.push_kill(index.to_string(), false, false);
         }
@@ -6587,6 +8576,46 @@ mod tests {
     }
 
     #[test]
+    fn frequent_todo_and_job_events_preserve_editor_draft_and_undo() {
+        let mut state = todo_test_state(Vec::new());
+        for character in "large draft".chars() {
+            state.editor.insert_char(character);
+        }
+        let before = state.editor.text();
+        let undo_entries = state.editor.undo.len();
+        for index in 0..256 {
+            state.apply(ApplicationEvent::TodoUpdated {
+                phases: Vec::new(),
+                completed_tasks: Vec::new(),
+            });
+            state.apply(ApplicationEvent::Orchestration(
+                pi_coding::OrchestrationEvent::JobUpdated {
+                    group_id: "burst".to_owned(),
+                    job: pi_coding::JobSnapshot {
+                        id: format!("job-{index}"),
+                        agent_id: format!("agent-{index}"),
+                        agent: "task".to_owned(),
+                        parent_id: "Main".to_owned(),
+                        description: None,
+                        todo_task_id: None,
+                        workflow_id: None,
+                        workflow_generation: None,
+                        status: pi_coding::JobStatus::Running,
+                        created_at: index,
+                        started_at: Some(index),
+                        finished_at: None,
+                        result: None,
+                    },
+                },
+            ));
+        }
+        assert_eq!(state.editor.text(), before);
+        assert_eq!(state.editor.undo.len(), undo_entries);
+        state.editor.insert_char('x');
+        assert_eq!(state.editor.text(), "large draftx");
+    }
+
+    #[test]
     fn slash_completion_fuzzy_matches_and_accepts_selection() {
         let (background_tx, _background_rx) = mpsc::unbounded_channel();
         let mut state = TuiState {
@@ -6595,21 +8624,27 @@ mod tests {
             transcript: Vec::new(),
             committed_entries: 0,
             editor: EditorState::new(),
+            prompt_history: Vec::new(),
+            prompt_history_index: None,
+            prompt_history_draft: None,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
             thinking_level: ThinkingLevel::Off,
             is_streaming: false,
             animation_frame: 0,
+            is_compacting: false,
             pending_user_echo: false,
             show_thinking: true,
             double_escape_action: DoubleEscapeAction::Tree,
             last_escape: None,
+            last_ctrl_c: None,
             expand_tools: false,
             transcript_scroll: 0,
             transcript_page_rows: Cell::new(1),
             show_images: true,
             image_width_cells: 50,
             status: String::new(),
+            composer_error: None,
             model: String::new(),
             cwd: String::new(),
             completions: CompletionState::default(),
@@ -6635,6 +8670,7 @@ mod tests {
                 .collect(),
             panel: None,
             settings_panel: None,
+            workflow_panel: None,
             settings_value_input: None,
             tree_panel: None,
             process_panel: None,
@@ -6643,86 +8679,67 @@ mod tests {
             session_selector: None,
             scoped_model_selector: None,
             todo_phases: Vec::new(),
+            workflow_snapshots: Vec::new(),
             extension_working_message: None,
             extension_working_visible: false,
             extension_hidden_thinking_label: None,
             extension_title: None,
+            goal_state: GoalState::default(),
             active_loops: std::collections::BTreeMap::new(),
+            seen_irc_message_ids: std::collections::HashSet::new(),
         };
         state.editor.insert_char('/');
-        state.editor.insert_char('h');
-        state.editor.insert_char('p');
+        state.editor.insert_char('m');
+        state.editor.insert_char('d');
         state.refresh_completions();
-        assert_eq!(state.completions.items[0].value, "/help");
+        assert_eq!(state.completions.items[0].value, "/model");
         state.accept_completion();
-        assert_eq!(state.editor.text(), "/help");
+        assert_eq!(state.editor.text(), "/model");
         assert!(state.completions.items.is_empty());
     }
 
     #[test]
-    fn slash_completion_includes_dynamic_commands_with_descriptions() {
-        let (background_tx, _background_rx) = mpsc::unbounded_channel();
-        let mut state = TuiState {
-            tool_cards: ToolCardPresentationAdapter::new(),
-            job_cards: JobCardPresentationAdapter::new(),
-            transcript: Vec::new(),
-            committed_entries: 0,
-            editor: EditorState::new(),
-            streaming_text: String::new(),
-            streaming_thinking: String::new(),
-            thinking_level: ThinkingLevel::Off,
-            is_streaming: false,
-            animation_frame: 0,
-            pending_user_echo: false,
-            show_thinking: true,
-            double_escape_action: DoubleEscapeAction::Tree,
-            last_escape: None,
-            expand_tools: false,
-            transcript_scroll: 0,
-            transcript_page_rows: Cell::new(1),
-            show_images: true,
-            image_width_cells: 50,
-            status: String::new(),
-            model: String::new(),
-            cwd: String::new(),
-            completions: CompletionState::default(),
-            themes: ThemeManager::default(),
-            keybindings: KeyBindingsManager::default(),
-            cwd_path: PathBuf::new(),
-            pending_attachments: Vec::new(),
-            extension_ui: ExtensionUiAdapter::default(),
-            extension_dialog: None,
-            background_tx,
-            completion_generation: 0,
-            completion_query: None,
-            completion_cancel: None,
-            clipboard_read_busy: false,
-            clipboard_write_busy: false,
-            commands: vec![InteractiveCommand {
-                name: "skill:release".to_owned(),
-                description: "Prepare a release".to_owned(),
-                source: CommandSource::Skill,
-            }],
-            panel: None,
-            settings_panel: None,
-            settings_value_input: None,
-            tree_panel: None,
-            process_panel: None,
-            agents_panel: None,
-            scoped_models: None,
-            session_selector: None,
-            scoped_model_selector: None,
-            todo_phases: Vec::new(),
-            extension_working_message: None,
-            extension_working_visible: false,
-            extension_hidden_thinking_label: None,
-            extension_title: None,
-            active_loops: std::collections::BTreeMap::new(),
-        };
-        state.editor.insert_text("/srl");
+    fn coordinate_completion_is_skill_only_and_consumes_every_printable_once() {
+        assert!(
+            visible_catalog()
+                .iter()
+                .all(|command| command.name != "coordinate" && command.name != "skill:coordinate"),
+            "coordinate must not enter core command discovery"
+        );
+
+        let mut state = todo_test_state(Vec::new());
+        state.commands = vec![InteractiveCommand {
+            name: "skill:coordinate".to_owned(),
+            description: "Coordinate work across agents".to_owned(),
+            source: CommandSource::Skill,
+        }];
+        state.editor.insert_text("/coord");
         state.refresh_completions();
-        assert_eq!(state.completions.items[0].value, "/skill:release");
-        assert_eq!(state.completions.items[0].description, "Prepare a release");
+        assert!(
+            !state
+                .completions
+                .items
+                .iter()
+                .any(|item| item.value == "/skill:coordinate"),
+            "skills must not pollute core command completion"
+        );
+
+        state.editor.clear();
+        state.completions.clear();
+        apply_classified_burst(&mut state, "/");
+        apply_classified_burst(&mut state, "skill:coordinate");
+        assert_eq!(state.editor.text(), "/skill:coordinate");
+        assert!(
+            state
+                .completions
+                .selected()
+                .is_some_and(|item| item.value == "/skill:coordinate"),
+            "skill-prefixed completion must expose coordinate"
+        );
+        assert!(completion_already_matches_editor(&state));
+        state.accept_completion();
+        assert_eq!(state.editor.text(), "/skill:coordinate");
+        assert!(state.completions.items.is_empty());
     }
 
     #[test]
@@ -6791,7 +8808,7 @@ mod tests {
 
     #[test]
     fn assistant_markdown_matches_shared_neutral_output_for_rich_blocks() {
-        let source = "# Heading\n\n1. ordered\n   - [x] nested\n\n| 名称 | 状態 |\n| --- | ---: |\n| 東京 | ✅ |\n\n[docs](https://example.test)\n\n```rust\nlet place = \"東京\";\n```\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: fallback\n```";
+        let source = "# Heading\n\n1. ordered\n   - [x] nested\n\n| Name | Stat |\n| --- | ---: |\n| Tokyo | ✅ |\n\n[docs](https://example.test)\n\n```rust\nlet place = \"Tokyo\";\n```\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: fallback\n```";
         let width = 40;
         let expected = pi_coding::markdown::render_markdown(
             source,
@@ -6826,9 +8843,36 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_markdown_keeps_prose_default_and_cyan_sparse() {
+        let source = "# Release notes\n\nOrdinary prose explains the change with **bold** and *italic* detail.\n\n- first item\n- second item\n\n[project path](https://example.test/src/lib.rs) and `cargo check`.\n\n```rust\nlet count: usize = parse(42);\n```";
+        let lines = render_transcript_markdown(
+            source,
+            crate::theme::DARK,
+            crate::theme::DARK.text,
+            80,
+            false,
+        );
+        let cyan = Some(crate::theme::DARK.md_heading);
+        let plain = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(plain.contains("Ordinary prose explains the change"));
+        let prose_spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| matches!(span.content.as_ref(), "Ordinary" | "prose" | "explains" | "change"));
+        assert!(prose_spans.into_iter().all(|span| span.style.fg != cyan));
+        let visible_spans = lines.iter().flat_map(|line| &line.spans).filter(|span| !span.content.trim().is_empty()).count();
+        let cyan_spans = lines.iter().flat_map(|line| &line.spans).filter(|span| !span.content.trim().is_empty() && span.style.fg == cyan).count();
+        assert!(cyan_spans.saturating_mul(3) < visible_spans, "cyan must remain a sparse high-salience accent");
+    }
+
+    #[test]
     fn streaming_assistant_matches_shared_tail_semantics_without_prefix_duplication() {
         let width = 32;
-        let source = "# Stable\n\nmutable tail\n\n| 名称 | 状態 |\n| --- | --- |\n| 東京 | ✅ |";
+        let source = "# Stable\n\nmutable tail\n\n| Name | Stat |\n| --- | --- |\n| Tokyo | ✅ |";
         let rendered = render_transcript_markdown(
             source,
             crate::theme::DARK,
@@ -6855,7 +8899,7 @@ mod tests {
         .plain_lines();
         assert_eq!(plain, expected);
         assert_eq!(plain.iter().filter(|line| line.as_str() == "Stable").count(), 1);
-        assert!(plain.iter().any(|line| line.contains("東京")));
+        assert!(plain.iter().any(|line| line.contains("Tokyo")));
         assert!(plain.iter().all(|line| display_width(line) <= width));
 
         let finalized = render_transcript_markdown(
@@ -6917,6 +8961,46 @@ mod tests {
     }
 
     #[test]
+    fn user_card_first_glyph_has_no_phantom_prefix_at_normal_and_narrow_widths() {
+        let prompt = "Can you put it in the background?";
+        let entry = TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text(prompt)], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
+
+        for width in [80, 10] {
+            let mut lines = Vec::new();
+            render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, width);
+
+            let card = &lines[..lines.len() - 1];
+            let first_row = &card[0];
+            let first_visible = first_row
+                .spans
+                .iter()
+                .flat_map(|span| span.content.chars())
+                .find(|character| !character.is_whitespace());
+            assert_eq!(first_visible, Some('C'), "first user glyph at width {width}");
+            assert!(
+                first_row.spans.first().is_some_and(|span| span.content.starts_with('C')),
+                "user content must begin at transcript column zero at width {width}: {first_row:?}"
+            );
+            assert!(card.iter().all(|line| {
+                line.spans.iter().map(|span| display_width(span.content.as_ref())).sum::<u16>() == width
+            }));
+            assert!(card.iter().flat_map(|line| &line.spans).all(|span| {
+                span.style.bg == Some(crate::theme::DARK.user_message_bg)
+            }));
+        }
+
+        let unicode = TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text("🙂🙂🙂🙂🙂abc")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &unicode, true, true, crate::theme::DARK, 10);
+        let plain = lines[..lines.len() - 1]
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(plain[0].trim_end(), "🙂🙂🙂🙂");
+        assert_eq!(plain[1].trim_end(), "🙂abc");
+    }
+
+    #[test]
     fn compact_roles_hide_repeated_labels_and_empty_entries() {
         let assistant = TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text("answer")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
         let user = TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text("prompt")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
@@ -6933,7 +9017,7 @@ mod tests {
             .collect::<String>();
         assert!(!text.contains("You"));
         assert!(!text.contains("Assistant"));
-        assert!(lines[0].spans[0].content.starts_with("  "));
+        assert!(lines[0].spans[0].content.starts_with("prompt"));
         assert_eq!(lines[0].spans[0].style.bg, Some(crate::theme::DARK.user_message_bg));
 
         let before = lines.len();
@@ -6952,6 +9036,14 @@ mod tests {
             span.content.as_ref() != "Reasoning"
                 && !span.content.contains("Reasoning hidden")
         }));
+        let plain = reasoning_lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>();
+        let thinking_row = plain.iter().position(|line| line == "useful analysis").unwrap();
+        let answer_row = plain.iter().position(|line| line == "answer").unwrap();
+        assert_eq!(answer_row, thinking_row + 2);
+        assert_eq!(plain[thinking_row + 1], "");
     }
 
     #[test]
@@ -7008,6 +9100,13 @@ mod tests {
         assert_eq!(state.transcript.iter().filter(|entry| entry.kind == TranscriptKind::Tool).count(), 2);
         assert_eq!(state.transcript.iter().filter(|entry| entry.tool_card.as_ref().is_some_and(|tool| tool.compact.tool_call_id == "b")).count(), 1);
         assert_eq!(state.transcript[0].tool_card.as_ref().unwrap().compact.status, ToolCallViewStatus::Failed);
+        for entry in &state.transcript {
+            let mut lines = Vec::new();
+            render_transcript_entry(&mut lines, entry, true, false, crate::theme::DARK, 80);
+            let rendered = lines.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+            assert_eq!(rendered.iter().filter(|line| line.contains("Read")).count(), 1);
+            assert!(!rendered.iter().any(|line| line.contains(" read")));
+        }
 
         let mut bash = todo_test_state(Vec::new());
         let body = (1..=30).map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
@@ -7016,16 +9115,53 @@ mod tests {
         let entry = bash.transcript.last().unwrap();
         let mut compact = Vec::new();
         render_transcript_entry(&mut compact, entry, true, false, crate::theme::DARK, 80);
-        let compact_text = compact.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+        let compact_lines = compact.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+        let compact_text = compact_lines.concat();
+        assert_eq!(compact_lines.iter().filter(|line| line.contains("Bash")).count(), 1);
         assert!(compact_text.contains("$ seq 1 30"));
         assert!(compact_text.contains("… 11 more lines ⟦Ctrl+O: Expand⟧"));
-        assert!(!compact_text.contains("bash done"));
+        assert!(!compact_text.to_ascii_lowercase().contains("bash done"));
+        assert!(!compact_lines.iter().any(|line| line.contains("bash")));
         let mut expanded = Vec::new();
         render_transcript_entry(&mut expanded, entry, true, true, crate::theme::DARK, 80);
         let expanded_text = expanded.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
         assert!(expanded_text.contains("1"));
         assert!(!expanded_text.contains("Ctrl+O: Expand"));
         assert!(compact.iter().filter(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>().starts_with('╭')).count() == 1);
+
+        for (name, arguments, output, expected) in [
+            ("edit", serde_json::json!({"path": "src/lib.rs"}), "@@\n-old\n+new", "Edit"),
+            ("write", serde_json::json!({"path": "src/lib.rs", "content": "new"}), "Successfully wrote", "Write"),
+        ] {
+            let mut tool = todo_test_state(Vec::new());
+            tool.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart { tool_call_id: name.to_owned(), tool_name: name.to_owned(), arguments }));
+            tool.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd { tool_call_id: name.to_owned(), tool_name: name.to_owned(), result: AgentToolResult::text(output), is_error: false }));
+            let mut rendered = Vec::new();
+            render_transcript_entry(&mut rendered, tool.transcript.last().unwrap(), true, false, crate::theme::DARK, 80);
+            let rendered = rendered.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+            assert_eq!(rendered.iter().filter(|line| line.contains(expected)).count(), 1);
+            assert!(!rendered.iter().any(|line| line.contains(&format!(" {name}"))));
+        }
+
+        let mut read = todo_test_state(Vec::new());
+        read.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "syntax-read".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        }));
+        read.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "syntax-read".to_owned(),
+            tool_name: "read".to_owned(),
+            result: AgentToolResult::text("let count: usize = parse(42);"),
+            is_error: false,
+        }));
+        let mut styled_read = Vec::new();
+        render_transcript_entry(&mut styled_read, read.transcript.last().unwrap(), true, false, crate::theme::DARK, 80);
+        let code_line = styled_read.iter().find(|line| line.spans.iter().any(|span| span.content == "let")).expect("read code line");
+        let exact = code_line.spans.iter().skip(1).take(code_line.spans.len().saturating_sub(2)).map(|span| span.content.as_ref()).collect::<String>();
+        assert!(exact.contains("let count: usize = parse(42);"));
+        let colors = code_line.spans.iter().filter_map(|span| span.style.fg).collect::<HashSet<_>>();
+        assert!(colors.len() >= 4, "read output must retain semantic syntax differentiation");
     }
 
     fn interaction(request: ExtensionUiRequest) -> ExtensionUiInteraction {
@@ -7373,8 +9509,257 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typing_goal_character_by_character_consumes_each_key_once() {
+        let mut state = todo_test_state(Vec::new());
+        for character in "/goal".chars() {
+            apply_classified_burst(&mut state, &character.to_string());
+        }
+        assert_eq!(state.editor.text(), "/goal");
+        assert!(state.completions.selected().is_some_and(|item| item.value == "/goal"));
+
+        // Exact accept must consume once without rewriting `/goal` into `/goall`.
+        assert!(completion_already_matches_editor(&state));
+        state.accept_completion();
+        assert_eq!(state.editor.text(), "/goal");
+        assert!(state.completions.items.is_empty());
+        state.editor.insert_char('x');
+        assert_eq!(state.editor.text(), "/goalx");
+    }
+
+    #[test]
+    fn transcript_removes_only_inter_entry_blank_before_user() {
+        let assistant = TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::thinking("reason"), ContentBlock::text("answer")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
+        let user = TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text("next prompt")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &assistant, true, true, crate::theme::DARK, 80);
+        let answer = lines.iter().position(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>() == "answer").unwrap();
+        assert_eq!(lines[answer - 1].spans.len(), 0, "thinking and answer retain one separator");
+        trim_inter_entry_blank_before_user(&mut lines, &user);
+        let before_user = lines.len();
+        render_transcript_entry(&mut lines, &user, true, true, crate::theme::DARK, 80);
+        assert_ne!(lines[before_user - 1].spans.len(), 0, "no full blank row precedes the user card");
+        assert!(lines[before_user].spans[0].content.starts_with("next prompt"), "user content starts at transcript column zero");
+    }
+
     #[tokio::test]
-    async fn goal_dispatch_avoids_model_turn_and_preserves_editor_on_usage_error() {
+    async fn bare_goal_opens_intentional_choice_panel() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: cwd.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        }).expect("session");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("/goal");
+        state.open_goal_panel(&application);
+        let panel = state.panel.as_ref().expect("goal panel");
+        assert_eq!(panel.title, "Goal");
+        assert!(panel.items.iter().any(|item| item.label == "Create goal"));
+        assert!(panel.items.iter().any(|item| item.label == "Show details"));
+        assert!(state.completions.items.is_empty());
+        application.cleanup().await;
+    }
+    #[test]
+    fn goal_panel_renders_padded_bounded_overlay() {
+        use ratatui::backend::TestBackend;
+        let panel = SelectorPanel {
+            title: "Goal".to_owned(),
+            help: "↑/↓ move · Enter select · Esc cancel".to_owned(),
+            items: vec![PanelItem {
+                label: "Show details".to_owned(),
+                description: "active · 25/100 tokens · a deliberately long objective that wraps safely".to_owned(),
+                value: PanelValue::GoalShow,
+                checked: true,
+            }],
+            selected: 0,
+            query: String::new(),
+        };
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_selector_panel(frame, &panel, crate::theme::DARK))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .filter(|row| !row.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert!(rows.first().is_some_and(|row| row.contains(" Goal ")));
+        assert!(rows.iter().any(|row| row.contains(" Show details")));
+        assert!(rows.iter().all(|row| display_width(row) <= 100));
+    }
+
+
+    #[tokio::test]
+    async fn goal_dispatch_starts_work_and_preserves_editor_on_usage_error() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let stream_fn: pi_agent::StreamFn = std::sync::Arc::new(move |model, _context, _options| {
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(ContentBlock::text("done"));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        });
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+        })
+        .expect("session");
+        let application = Application::new(session.clone()).await;
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("/goal create --tokens nope keep this");
+        assert!(!dispatch_goal_command(
+            &application,
+            &mut state,
+            Some("create --tokens nope keep this"),
+        )
+        .await);
+        assert_eq!(state.editor.text(), "/goal create --tokens nope keep this");
+        assert!(
+            state
+                .composer_error
+                .as_deref()
+                .is_some_and(|error| error.contains("positive integer")),
+            "goal usage errors must remain in the composer toast"
+        );
+        assert!(
+            state.transcript.is_empty(),
+            "goal usage errors must never enter the transcript"
+        );
+        assert!(session.history().is_empty());
+
+        assert!(dispatch_goal_command(
+            &application,
+            &mut state,
+            Some("create --tokens 20 ship cleanly"),
+        )
+        .await);
+        assert!(state.composer_error.is_none(), "accepted goal work clears the toast");
+        assert!(state.status.starts_with("Goal work started · active · 0/20 tokens · ship cleanly"), "{}", state.status);
+        assert_eq!(state.goal_state, application.goal_state());
+        let details = state
+            .transcript
+            .iter()
+            .rev()
+            .find(|entry| {
+                !entry.is_error
+                    && content_text(&entry.content).contains("Objective: ship cleanly")
+            })
+            .map(|entry| content_text(&entry.content))
+            .expect("create must push OMP-style goal details");
+        assert!(details.contains("Status: active"), "{details}");
+        assert!(details.contains("Tokens: 0 / 20"), "{details}");
+        assert!(details.contains("Time spent:"), "{details}");
+
+        assert!(
+            dispatch_goal_command(&application, &mut state, Some("inspect")).await,
+            "inspect must be read-only Show, not create"
+        );
+        assert_eq!(state.goal_state, application.goal_state());
+        assert!(
+            application.goal_state().current.is_some(),
+            "inspect must not drop the active goal"
+        );
+        let inspect = state
+            .transcript
+            .last()
+            .map(|entry| content_text(&entry.content))
+            .expect("inspect details");
+        assert!(inspect.contains("Objective: ship cleanly"), "{inspect}");
+        application.wait_for_idle().await;
+        assert!(session.history().iter().any(|message| matches!(message, Message::Assistant(_))), "goal create must start the agent");
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn goal_dispatch_reports_queued_work_while_busy() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = CancellationToken::new();
+        let stream_started = started.clone();
+        let stream_release = release.clone();
+        let stream_fn: pi_agent::StreamFn = std::sync::Arc::new(move |model, _context, _options| {
+            let started = stream_started.clone();
+            let release = stream_release.clone();
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    started.notify_waiters();
+                    release.cancelled().await;
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(ContentBlock::text("done"));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        });
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+        })
+        .expect("session");
+        let application = Application::new(session).await;
+        application
+            .prompt("busy".to_owned(), Vec::new(), None)
+            .await
+            .expect("busy prompt");
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("busy turn started");
+
+        let mut state = todo_test_state(Vec::new());
+        assert!(
+            dispatch_goal_command(&application, &mut state, Some("create queued goal")).await
+        );
+        assert!(
+            state.status.starts_with("Goal work queued · active · 0 tokens used · queued goal"),
+            "{}",
+            state.status
+        );
+
+        application.goal_pause().expect("cancel queued work");
+        release.cancel();
+        application.wait_for_idle().await;
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn bare_goal_is_optional_and_opens_choice_flow() {
         let cwd = tempfile::tempdir().expect("cwd");
         let session = pi_coding::Session::new(pi_coding::SessionOptions {
             model: Model::default(),
@@ -7393,24 +9778,63 @@ mod tests {
         .expect("session");
         let application = Application::new(session.clone()).await;
         let mut state = todo_test_state(Vec::new());
-        state.editor.set_text("/goal create --tokens nope keep this");
-        assert!(!dispatch_goal_command(
-            &application,
-            &mut state,
-            Some("create --tokens nope keep this"),
-        ));
-        assert_eq!(state.editor.text(), "/goal create --tokens nope keep this");
-        assert!(state.status.contains("positive integer"));
-        assert!(session.history().is_empty());
+        state.editor.set_text("/goal");
 
-        assert!(dispatch_goal_command(
-            &application,
-            &mut state,
-            Some("create --tokens 20 ship cleanly"),
-        ));
-        assert!(state.status.contains("active · 0/20 tokens · ship cleanly"));
-        assert!(session.history().is_empty(), "goal command must not run the agent");
+        assert!(
+            !reject_missing_required_arguments(&mut state, "goal", None),
+            "bare /goal must not be treated as required-arg"
+        );
+        state.open_goal_panel(&application);
+        assert!(state.panel.as_ref().is_some_and(|panel| panel.title == "Goal"));
+        assert!(session.history().is_empty());
         application.cleanup().await;
+    }
+
+    #[test]
+    fn required_arg_guard_pushes_usage_and_clears_editor_completion() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("/import");
+        state.completions.items = vec![CompletionItem {
+            value: "/import".to_owned(),
+            label: "/import".to_owned(),
+            description: "import".to_owned(),
+            is_directory: false,
+        }];
+        state.completions.context = Some(CompletionContext::Slash);
+        state.completion_query = None;
+
+        assert!(reject_missing_required_arguments(&mut state, "import", None));
+        assert!(state.editor.is_empty(), "usage guard must clear the draft");
+        assert!(
+            state.completions.items.is_empty(),
+            "usage guard must clear the completion popup"
+        );
+        assert_eq!(state.status, "Usage: /import <path.jsonl>");
+        assert_eq!(
+            state.composer_error.as_deref(),
+            Some("Usage: /import <path.jsonl>")
+        );
+        assert!(
+            state.transcript.is_empty(),
+            "usage rejection must never enter the transcript"
+        );
+        let toast = composer_error_toast_lines(&state, 120, crate::theme::DARK)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(toast.contains("Usage: /import <path.jsonl>"), "{toast}");
+        assert!(toast.contains(COMPOSER_ERROR_DISMISSAL_HINT), "{toast}");
+
+        // Optional commands stay unguarded so bare /goal can dispatch Show.
+        state.editor.set_text("/goal");
+        assert!(!reject_missing_required_arguments(&mut state, "goal", None));
+        assert_eq!(state.editor.text(), "/goal");
     }
 
     #[tokio::test]
@@ -7535,6 +9959,164 @@ mod tests {
         application.cleanup().await;
     }
 
+    /// Contract: tree navigation, fork, keyboard-new, and resume-style session
+    /// transitions call `replace_transcript_from_application`. That path must
+    /// refresh `todo_phases` from the application so the Todo panel never shows
+    /// a stale DAG after the underlying session changes.
+    ///
+    /// Regression: replace_transcript cleared conversation buffers but left
+    /// `todo_phases` untouched, so a fork/new/tree switch kept the prior panel.
+    #[tokio::test]
+    async fn replace_transcript_refreshes_todo_phases_from_application() {
+        use pi_coding::{TodoItem, TodoPhase, TodoStatus};
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        // Canonical application has an empty todo list after a "new" session.
+        let application = Application::new(session).await;
+        assert!(
+            application.todo_state().phases.is_empty(),
+            "fresh application must start with empty todos"
+        );
+
+        // Display still shows a prior session's DAG (stale panel).
+        let stale = vec![TodoPhase {
+            name: "Stale".to_owned(),
+            tasks: vec![TodoItem {
+                id: "stale-1".to_owned(),
+                content: "should not survive session replace".to_owned(),
+                status: TodoStatus::InProgress,
+                depends_on: Vec::new(),
+                ready: true,
+                blocked_by: Vec::new(),
+            }],
+        }];
+        let mut state = todo_test_state(stale);
+        assert_eq!(state.todo_phases.len(), 1);
+        assert_eq!(state.todo_phases[0].name, "Stale");
+
+        state.job_cards.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "old-group".to_owned(),
+            job: pi_coding::JobSnapshot {
+                id: "old-job".to_owned(),
+                agent_id: "OldAgent".to_owned(),
+                agent: "task".to_owned(),
+                parent_id: "Main".to_owned(),
+                description: Some("old session subagent".to_owned()),
+                todo_task_id: Some("stale-1".to_owned()),
+                workflow_id: None,
+                workflow_generation: None,
+                status: pi_coding::JobStatus::Running,
+                created_at: 1,
+                started_at: Some(2),
+                finished_at: None,
+                result: None,
+            },
+        });
+        assert_eq!(state.job_cards.cards_in_source_order().len(), 1);
+
+        // Tree/fork/new path: replace transcript from the (empty-todo) application.
+        state.replace_transcript_from_application(&application);
+        assert!(
+            state.job_cards.cards_in_source_order().is_empty(),
+            "session replacement must clear old-session job cards"
+        );
+
+        assert!(
+            state.todo_phases.is_empty(),
+            "replace_transcript_from_application must refresh todo_phases from application \
+             (got stale panel: {:?})",
+            state.todo_phases
+        );
+        assert!(
+            render_todo_panel_lines(
+                &state.todo_phases,
+                &state.job_cards.cards_in_source_order(),
+                crate::theme::DARK,
+                80,
+            )
+            .is_empty(),
+            "empty replacement must leave no stale Todo panel rows"
+        );
+
+        // Subagents are an independent presentation domain: replacing a
+        // session clears old job cards, while later orchestration events still
+        // render even when the replacement Todo state is empty.
+        state.job_cards.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "replacement-group".to_owned(),
+            job: pi_coding::JobSnapshot {
+                id: "replacement-job".to_owned(),
+                agent_id: "ReplacementAgent".to_owned(),
+                agent: "task".to_owned(),
+                parent_id: "Main".to_owned(),
+                description: Some("independent subagent".to_owned()),
+                todo_task_id: None,
+                workflow_id: None,
+                workflow_generation: None,
+                status: pi_coding::JobStatus::Running,
+                created_at: 1,
+                started_at: Some(2),
+                finished_at: None,
+                result: None,
+            },
+        });
+        let subagent_rows = render_todo_panel_lines(
+            &state.todo_phases,
+            &state.job_cards.cards_in_source_order(),
+            crate::theme::DARK,
+            80,
+        );
+        assert!(
+            todo_line_texts(&subagent_rows)
+                .iter()
+                .any(|line| line.contains("independent subagent")),
+            "Subagents must remain driven by orchestration job cards, not Todo phases"
+        );
+        state.job_cards.clear();
+
+        // Symmetric case: application carries todos the display must pick up.
+        application
+            .set_todos(vec![TodoPhase {
+                name: "Fresh".to_owned(),
+                tasks: vec![TodoItem {
+                    id: "fresh-1".to_owned(),
+                    content: "visible after replace".to_owned(),
+                    status: TodoStatus::Pending,
+                    depends_on: Vec::new(),
+                    ready: true,
+                    blocked_by: Vec::new(),
+                }],
+            }])
+            .expect("set_todos");
+        // Simulate a display that was cleared or pointed at another session.
+        state.todo_phases.clear();
+        state.replace_transcript_from_application(&application);
+        assert_eq!(
+            state.todo_phases.len(),
+            1,
+            "replace must pull non-empty application todos into the panel"
+        );
+        assert_eq!(state.todo_phases[0].name, "Fresh");
+        assert_eq!(state.todo_phases[0].tasks[0].content, "visible after replace");
+
+        application.cleanup().await;
+    }
+
+
     #[test]
     fn extension_snapshot_renders_title_status_widgets_and_editor() {
         use crate::extension_ui::{ExtensionStatusItem, ExtensionWidgetItem};
@@ -7581,13 +10163,13 @@ mod tests {
 
     #[test]
     fn wrapped_line_count_handles_wide_unicode_and_empty_rows() {
-        let lines = vec![Line::raw("界界界"), Line::default()];
+        let lines = vec![Line::raw("🙂🙂🙂"), Line::default()];
         assert_eq!(wrapped_line_count(&lines, 4), 3);
     }
 
     #[test]
     fn compact_arguments_truncates_on_character_boundaries() {
-        let argument = "界".repeat(80);
+        let argument = "é".repeat(80);
         let compact = compact_arguments(&serde_json::json!({"path": argument}));
         assert!(compact.ends_with("..."));
         assert!(compact.is_char_boundary(compact.len()));
@@ -7601,21 +10183,27 @@ mod tests {
             transcript: Vec::new(),
             committed_entries: 0,
             editor: EditorState::new(),
+            prompt_history: Vec::new(),
+            prompt_history_index: None,
+            prompt_history_draft: None,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
             thinking_level: ThinkingLevel::Off,
             is_streaming: false,
             animation_frame: 0,
+            is_compacting: false,
             pending_user_echo: false,
             show_thinking: true,
             double_escape_action: DoubleEscapeAction::Tree,
             last_escape: None,
+            last_ctrl_c: None,
             expand_tools: false,
             transcript_scroll: 0,
             transcript_page_rows: Cell::new(1),
             show_images: true,
             image_width_cells: 50,
             status: String::new(),
+            composer_error: None,
             model: String::new(),
             cwd: String::new(),
             completions: CompletionState::default(),
@@ -7634,6 +10222,7 @@ mod tests {
             commands: Vec::new(),
             panel: None,
             settings_panel: None,
+            workflow_panel: None,
             settings_value_input: None,
             tree_panel: None,
             process_panel: None,
@@ -7642,12 +10231,75 @@ mod tests {
             session_selector: None,
             scoped_model_selector: None,
             todo_phases: phases,
+            workflow_snapshots: Vec::new(),
             extension_working_message: None,
             extension_working_visible: false,
             extension_hidden_thinking_label: None,
             extension_title: None,
+            goal_state: GoalState::default(),
             active_loops: std::collections::BTreeMap::new(),
+            seen_irc_message_ids: std::collections::HashSet::new(),
         }
+    }
+
+    fn workflow_snapshot(generation: u64, status: pi_coding::WorkflowStatus) -> pi_coding::WorkflowSnapshot {
+        pi_coding::WorkflowSnapshot {
+            workflow_id: pi_coding::WorkflowId::new("workflow-generation"),
+            name: "Generation gate".to_owned(),
+            objective: "Ignore stale lifecycle events".to_owned(),
+            status,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            generation,
+            todo: pi_coding::TodoState {
+                phases: Vec::new(),
+                storage: pi_coding::TodoStorage::Memory,
+            },
+            worktree_label: Some("workflow-generation".to_owned()),
+            branch: Some("rpi/workflow/workflow-generation".to_owned()),
+            supervisor_agent_id: None,
+            supervisor_job_id: None,
+            failure: None,
+            integration: pi_coding::WorkflowIntegration::None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_workflow_events_do_not_regress_tui_projection() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: cwd.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        }).expect("session");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        state.workflow_snapshots.push(WorkflowPanelSnapshot::from(&workflow_snapshot(
+            2,
+            pi_coding::WorkflowStatus::Running,
+        )));
+
+        state.apply_workflow_event(&application, pi_coding::WorkflowEvent::StatusChanged {
+            workflow_id: pi_coding::WorkflowId::new("workflow-generation"),
+            generation: 1,
+            status: pi_coding::WorkflowStatus::Failed,
+        });
+        assert_eq!(state.workflow_snapshots[0].status, pi_coding::WorkflowStatus::Running);
+
+        state.apply_workflow_event(&application, pi_coding::WorkflowEvent::Removed {
+            workflow_id: pi_coding::WorkflowId::new("workflow-generation"),
+            generation: 1,
+        });
+        assert_eq!(state.workflow_snapshots.len(), 1);
+
+        state.apply_workflow_event(&application, pi_coding::WorkflowEvent::StatusChanged {
+            workflow_id: pi_coding::WorkflowId::new("workflow-generation"),
+            generation: 2,
+            status: pi_coding::WorkflowStatus::Paused,
+        });
+        assert_eq!(state.workflow_snapshots[0].status, pi_coding::WorkflowStatus::Paused);
+        application.cleanup().await;
     }
 
     #[test]
@@ -7659,6 +10311,9 @@ mod tests {
             agent: "task".to_owned(),
             parent_id: "Main".to_owned(),
             description: Some("inspect the workspace".to_owned()),
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
             status: pi_coding::JobStatus::Queued,
             created_at: 1_000,
             started_at: None,
@@ -7704,12 +10359,12 @@ mod tests {
         assert_eq!(job_entries.len(), 1, "terminal updates must replace by job id");
         assert!(!job_entries[0].is_partial);
         let card = job_entries[0].job_card.as_ref().expect("job card");
-        assert_eq!(card.job_status, pi_coding::JobStatus::Completed);
-        assert_eq!(card.agent_status, Some(pi_coding::AgentStatus::Parked));
-        assert!(card.rows[0].text.contains("completed · parked"));
+        assert_eq!(card.children[0].job_status, pi_coding::JobStatus::Completed);
+        assert_eq!(card.children[0].agent_status, Some(pi_coding::AgentStatus::Parked));
+        assert!(card.children[0].rows[0].text.contains("completed · parked"));
 
         let mut rendered = Vec::new();
-        render_job_card(&mut rendered, card, crate::theme::DARK);
+        render_job_card(&mut rendered, card, crate::theme::DARK, 0, 80);
         let text = rendered
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -7718,120 +10373,439 @@ mod tests {
         assert!(text.contains("inspect the workspace"));
         assert!(text.contains("completed · parked"));
     }
+    #[test]
+    fn two_children_render_as_one_width_bounded_task_card() {
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "task-batch".to_owned(),
+            tool_name: "task".to_owned(),
+            arguments: serde_json::json!({
+                "context": "# Goal\nShip delegation\n\n# Constraints\nKeep updates stable\n\n# Contract\nOne card",
+                "tasks": [
+                    {"name": "Alpha", "agent": "reviewer", "task": "Review adapter behavior"},
+                    {"name": "Beta", "task": "Render narrow and wide layouts"}
+                ]
+            }),
+        }));
+        for (id, agent_id, status) in [
+            ("job-alpha", "Alpha", pi_coding::JobStatus::Running),
+            ("job-beta", "Beta", pi_coding::JobStatus::Queued),
+        ] {
+            state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: pi_coding::JobSnapshot { id: id.to_owned(), agent_id: agent_id.to_owned(), agent: "task".to_owned(), parent_id: "Main".to_owned(), description: Some(format!("work for {agent_id}")), todo_task_id: None, workflow_id: None, workflow_generation: None, status, created_at: 1_000, started_at: None, finished_at: None, result: None },
+            }));
+        }
+        let entries = state.transcript.iter().filter(|entry| entry.kind == TranscriptKind::Job).collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let card = entries[0].job_card.as_ref().expect("task card");
+        assert_eq!(card.children.len(), 2);
+        for width in [32, 96] {
+            let mut rendered = Vec::new();
+            render_job_card(&mut rendered, card, crate::theme::DARK, 0, width);
+            assert!(rendered.iter().all(|line| line.width() <= usize::from(width)));
+            let text = rendered.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+            assert!(text.contains("Task 2 agents"));
+            assert!(text.contains("Goal"));
+            assert!(text.contains("Alpha (reviewer)"));
+            assert!(text.contains("Beta (task)"));
+        }
+    }
 
     #[test]
-    fn todo_panel_renders_all_four_status_markers() {
-        use pi_coding::{TodoItem, TodoPhase, TodoStatus};
+    fn todo_panel_renders_compact_active_summary() {
+        use pi_coding::{TodoPhase, TodoStatus};
         let theme = crate::theme::DARK;
         let phases = vec![TodoPhase {
             name: "Plan".to_owned(),
             tasks: vec![
-                TodoItem {
-                    content: "pending".to_owned(),
-                    status: TodoStatus::Pending,
-                },
-                TodoItem {
-                    content: "active".to_owned(),
-                    status: TodoStatus::InProgress,
-                },
-                TodoItem {
-                    content: "done".to_owned(),
-                    status: TodoStatus::Completed,
-                },
-                TodoItem {
-                    content: "dropped".to_owned(),
-                    status: TodoStatus::Abandoned,
-                },
+                todo_item("p1", "pending", TodoStatus::Pending, true, &[]),
+                todo_item("p2", "active", TodoStatus::InProgress, true, &[]),
+                todo_item("p3", "done", TodoStatus::Completed, false, &[]),
+                todo_item("p4", "dropped", TodoStatus::Abandoned, false, &[]),
             ],
         }];
-        let lines = render_todo_panel_lines(&phases, theme);
-        // one bold phase header + one line per task
-        assert_eq!(lines.len(), 5);
-        let markers: Vec<&str> = lines
-            .iter()
-            .skip(1)
-            .map(|line| {
-                line.spans
-                    .first()
-                    .map(|span| span.content.as_ref())
-                    .unwrap_or("")
-            })
-            .collect();
-        assert_eq!(markers, vec![" ○ ", " ► ", " ✓ ", " ✗ "]);
-        let colors: Vec<Option<Color>> = lines
-            .iter()
-            .skip(1)
-            .map(|line| line.spans.first().and_then(|span| span.style.fg))
-            .collect();
+        let lines = render_todo_panel_lines(&phases, &[], theme, 80);
+        let texts = todo_line_texts(&lines);
         assert_eq!(
-            colors,
+            texts,
             vec![
-                Some(theme.dim),
-                Some(theme.accent),
-                Some(theme.success),
-                Some(theme.muted)
+                " Todos · 1 active · 1 next · 1/4",
+                "  ► active",
+                "  ○ pending",
+                "",
             ]
         );
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.accent));
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme.accent));
+        assert!(lines[1].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(lines[2].spans[0].style.fg, Some(theme.muted));
+    }
+
+    #[test]
+    fn todo_panel_truncates_live_rows_but_human_output_keeps_dag_detail() {
+        use pi_coding::{TodoBlockedReason, TodoItem, TodoPhase, TodoStatus};
+        let theme = crate::theme::DARK;
+        let phases = vec![
+            TodoPhase {
+                name: "Roots".to_owned(),
+                tasks: vec![
+                    todo_item("root-a", "fetch", TodoStatus::Pending, true, &[]),
+                    todo_item("root-b", "compile", TodoStatus::InProgress, true, &[]),
+                ],
+            },
+            TodoPhase {
+                name: "Join".to_owned(),
+                tasks: vec![TodoItem {
+                    id: "join".to_owned(),
+                    content: "ship a deliberately long release description".to_owned(),
+                    status: TodoStatus::Pending,
+                    depends_on: vec!["root-a".to_owned(), "root-b".to_owned()],
+                    ready: false,
+                    blocked_by: vec![
+                        TodoBlockedReason { task_id: "root-a".to_owned(), content: "fetch".to_owned(), status: TodoStatus::Pending },
+                        TodoBlockedReason { task_id: "root-b".to_owned(), content: "compile".to_owned(), status: TodoStatus::InProgress },
+                    ],
+                }],
+            },
+        ];
+        let narrow = render_todo_panel_lines(&phases, &[], theme, 24);
+        let texts = todo_line_texts(&narrow);
+        assert!(texts.iter().all(|text| display_width(text) <= 24));
+        assert!(texts[0].ends_with('…'));
+        assert!(texts.iter().any(|text| text.contains("fetch")));
+        assert!(texts.iter().any(|text| text.contains("compile")));
+        assert!(texts.iter().all(|text| !text.contains("ship a deliberately")));
+
+        let human = format_todo_human_lines(&phases);
+        assert!(human.contains("fetch · ready"), "{human}");
+        assert!(human.contains("compile · ready"), "{human}");
+        assert!(human.contains("blocked by fetch(root-a), compile(root-b)"), "{human}");
+    }
+
+
+    #[test]
+    fn todo_panel_renders_named_explicit_ownership_and_blank_sections() {
+        let theme = crate::theme::DARK;
+        let mut adapter = JobCardPresentationAdapter::new();
+        for (id, agent_id, description, status, todo_task_id) in [
+            ("job-secret-1", "StableScoutId", "map relevant files", pi_coding::JobStatus::Running, Some("owned")),
+            ("job-secret-2", "StableWriterId", "apply focused edit", pi_coding::JobStatus::Queued, Some("missing")),
+            ("job-secret-3", "StableUnownedId", "inspect without correlation", pi_coding::JobStatus::Running, None),
+        ] {
+            adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: pi_coding::JobSnapshot {
+                    id: id.to_owned(),
+                    agent_id: agent_id.to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: Some(description.to_owned()),
+                    todo_task_id: todo_task_id.map(str::to_owned),
+                    workflow_id: None, workflow_generation: None, status,
+                    created_at: 1_000,
+                    started_at: (status == pi_coding::JobStatus::Running).then_some(1_100),
+                    finished_at: None,
+                    result: None,
+                },
+            });
+        }
+        for (id, display_name, status) in [
+            ("StableScoutId", "Mira", pi_coding::AgentStatus::Running),
+            ("StableWriterId", "Rowan", pi_coding::AgentStatus::Queued),
+            ("StableUnownedId", "Sol", pi_coding::AgentStatus::Running),
+        ] {
+            adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::AgentUpdated {
+                group_id: "group".to_owned(),
+                agent: pi_coding::AgentSnapshot {
+                    id: id.to_owned(),
+                    display_name: display_name.to_owned(),
+                    parent_id: Some("Main".to_owned()),
+                    status,
+                    created_at: 1_000,
+                    last_activity: 1_100,
+                    unread: 0,
+                    artifact_ref: None,
+                    history_ref: None,
+                },
+            });
+        }
+
+        let phases = vec![pi_coding::TodoPhase {
+            name: "Work".to_owned(),
+            tasks: vec![
+                todo_item("owned", "implement correlation", TodoStatus::InProgress, true, &[]),
+                todo_item("other", "preserve DAG truth", TodoStatus::Pending, true, &[]),
+            ],
+        }];
+        let lines = render_todo_panel_lines(&phases, &adapter.cards_in_source_order(), theme, 80);
+        let texts = todo_line_texts(&lines);
+        let divider = texts.iter().position(String::is_empty).expect("section divider");
+        assert!(texts[1].contains("implement correlation"));
+        assert!(!texts[1].contains("owner:"));
+        assert!(texts[2].contains("preserve DAG truth"));
+        assert_eq!(texts[divider + 1], " waiting on 3 jobs");
+        assert!(texts[divider + 2].contains("Mira · running · implement correlation"));
+        assert!(!texts[divider + 2].contains("task:"));
+        assert!(!texts[divider + 2].contains("map relevant files"));
+        assert!(texts[divider + 3].contains("Rowan · queued · apply focused edit"));
+        assert!(texts[divider + 4].contains("Sol · running · inspect without correlation"));
+        assert_eq!(texts.last().map(String::as_str), Some(""));
+        let rendered = texts.join("\n");
+        assert!(!rendered.contains("StableScoutId"));
+        assert!(!rendered.contains("StableWriterId"));
+        assert!(!rendered.contains("job-secret"));
+        assert_eq!(lines[divider + 2].spans[0].style.fg, Some(theme.accent));
+        assert_eq!(lines[divider + 3].spans[0].style.fg, Some(theme.dim));
+        use ratatui::backend::TestBackend;
+        let mut state = todo_test_state(phases);
+        state.job_cards = adapter;
+        state.editor.set_text("compose here");
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut images = TerminalImageRenderer::default();
+        terminal.draw(|frame| { let _ = render(frame, &state, &mut images); }).unwrap();
+        let rows = terminal.backend().buffer().content.chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let jobs_row = rows.iter().position(|row| row.contains("waiting on 3 jobs")).expect("jobs row");
+        assert!(rows[jobs_row - 1].trim().is_empty());
+        let composer_row = rows.iter().position(|row| row.starts_with("╭── π")).expect("composer row");
+        assert!(rows[composer_row - 1].trim().is_empty());
+    }
+
+    #[test]
+    fn todo_hud_bounds_dense_active_work_like_omp() {
+        let tasks = (0..12)
+            .map(|index| {
+                todo_item(
+                    &format!("task-{index}"),
+                    &format!("active task {index}"),
+                    TodoStatus::InProgress,
+                    true,
+                    &[],
+                )
+            })
+            .collect::<Vec<_>>();
+        let phases = vec![TodoPhase {
+            name: "Delivery".to_owned(),
+            tasks,
+        }];
+        let lines = render_todo_panel_lines(&phases, &[], crate::theme::DARK, 80);
+        let text = todo_line_texts(&lines);
+        assert_eq!(text.iter().filter(|line| line.contains("active task")).count(), TODO_HUD_TASK_LIMIT);
+        assert!(text.iter().any(|line| line.contains("7 more active todos")));
+    }
+    #[test]
+    fn subagents_only_state_renders_above_composer_without_raw_ids() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = todo_test_state(Vec::new());
+        for event in [
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: pi_coding::JobSnapshot {
+                    id: "01999999-secret-job-uuid".to_owned(),
+                    agent_id: "opaque-agent-id".to_owned(),
+                    agent: "reviewer".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: Some("inspect the live state".to_owned()),
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: pi_coding::JobStatus::Running,
+                    created_at: 1_000,
+                    started_at: Some(1_100),
+                    finished_at: None,
+                    result: None,
+                },
+            },
+            pi_coding::OrchestrationEvent::AgentUpdated {
+                group_id: "group".to_owned(),
+                agent: pi_coding::AgentSnapshot {
+                    id: "opaque-agent-id".to_owned(),
+                    display_name: "reviewer".to_owned(),
+                    parent_id: Some("Main".to_owned()),
+                    status: pi_coding::AgentStatus::Running,
+                    created_at: 1_000,
+                    last_activity: 1_100,
+                    unread: 0,
+                    artifact_ref: None,
+                    history_ref: None,
+                },
+            },
+        ] {
+            state.apply(ApplicationEvent::Orchestration(event));
+        }
+        state.editor.set_text("compose here");
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut images = TerminalImageRenderer::default();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().all(|row| !row.contains("Todos ·")), "empty Todo must not render");
+        let jobs_row = rows
+            .iter()
+            .position(|row| row.contains("waiting on 1 jobs"))
+            .expect("jobs-only heading");
+        assert!(rows[jobs_row + 1].contains("reviewer · running"));
+        let composer_row = rows
+            .iter()
+            .position(|row| row.starts_with("╭── π"))
+            .expect("composer row");
+        assert!(jobs_row < composer_row);
+        assert!(rows[composer_row - 1].trim().is_empty(), "panel and composer need a blank row");
+        let rendered = rows.join("\n");
+        assert!(!rendered.contains("01999999-secret-job-uuid"));
+        assert!(!rendered.contains("opaque-agent-id"));
+    }
+
+    #[test]
+    fn long_tool_and_active_jobs_keep_composer_visible_at_screenshot_dimensions() {
+        use pi_agent::AgentToolResult;
+        use ratatui::backend::{Backend, TestBackend};
+
+        for (width, height) in [(196, 28), (80, 48)] {
+            let tasks = (0..14)
+                .map(|index| todo_item(&format!("task-{index}"), &format!("active task {index} with a long bounded description"), if index == 0 { TodoStatus::InProgress } else { TodoStatus::Pending }, true, &[]))
+                .collect::<Vec<_>>();
+            let phases = vec![TodoPhase { name: "Delivery".to_owned(), tasks }];
+            let mut state = todo_test_state(phases.clone());
+            state.model = "faux/faux-1".to_owned();
+            state.cwd = "/tmp/portrait-project".to_owned();
+            state.editor.set_text("draft prompt remains visible");
+            state.expand_tools = true;
+            let output = (0..160).map(|line| format!("oversized tool output row {line}"))
+                .collect::<Vec<_>>().join("\n");
+            state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+                tool_call_id: "long-tool".to_owned(),
+                tool_name: "bash".to_owned(),
+                arguments: serde_json::json!({"command": "emit long output"}),
+            }));
+            state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+                tool_call_id: "long-tool".to_owned(),
+                tool_name: "bash".to_owned(),
+                result: AgentToolResult::text(output),
+                is_error: false,
+            }));
+            for index in 0..6 {
+                state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::JobUpdated {
+                    group_id: "group".to_owned(),
+                    job: pi_coding::JobSnapshot {
+                        id: format!("job-{index}"),
+                        agent_id: format!("agent-{index}"),
+                        agent: "task".to_owned(),
+                        parent_id: "Main".to_owned(),
+                        description: Some(format!("active assignment {index} with details that must truncate")),
+                        todo_task_id: Some(format!("task-{index}")),
+                        workflow_id: None,
+                        workflow_generation: None,
+                        status: pi_coding::JobStatus::Running,
+                        created_at: 1,
+                        started_at: Some(2),
+                        finished_at: None,
+                        result: None,
+                    },
+                }));
+            }
+
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut images = TerminalImageRenderer::default();
+            for _ in 0..3 {
+                state.apply(ApplicationEvent::TodoUpdated {
+                    phases: phases.clone(),
+                    completed_tasks: Vec::new(),
+                });
+                terminal.draw(|frame| { let _ = render(frame, &state, &mut images); }).unwrap();
+                let rows = terminal.backend().buffer().content.chunks(usize::from(width))
+                    .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                    .collect::<Vec<_>>();
+                let top = rows.iter().position(|row| row.starts_with("╭── π")).expect("composer top border");
+                let bottom = rows.iter().position(|row| row.starts_with("╰─ draft prompt remains visible")).expect("composer prompt and bottom border");
+                assert!(top < bottom && bottom < usize::from(height));
+                assert!(rows[top].contains('π'));
+                assert!(rows[bottom].ends_with('╯'));
+                let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+                assert_eq!(usize::from(cursor.y), bottom);
+                assert!(cursor.x < width);
+            }
+        }
+    }
+
+    fn todo_item(
+        id: &str,
+        content: &str,
+        status: TodoStatus,
+        ready: bool,
+        blocked_by: &[(&str, &str, TodoStatus)],
+    ) -> TodoItem {
+        use pi_coding::TodoBlockedReason;
+        TodoItem {
+            id: id.to_owned(),
+            content: content.to_owned(),
+            status,
+            depends_on: blocked_by
+                .iter()
+                .map(|(dep_id, _, _)| (*dep_id).to_owned())
+                .collect(),
+            ready,
+            blocked_by: blocked_by
+                .iter()
+                .map(|(dep_id, dep_content, dep_status)| TodoBlockedReason {
+                    task_id: (*dep_id).to_owned(),
+                    content: (*dep_content).to_owned(),
+                    status: *dep_status,
+                })
+                .collect(),
+        }
+    }
+
+    fn todo_line_texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     #[test]
     fn todo_open_count_excludes_terminal_statuses() {
-        use pi_coding::{TodoItem, TodoPhase, TodoStatus};
+        use pi_coding::{TodoPhase, TodoStatus};
         let phases = vec![TodoPhase {
             name: "P".to_owned(),
             tasks: vec![
-                TodoItem {
-                    content: "a".to_owned(),
-                    status: TodoStatus::Pending,
-                },
-                TodoItem {
-                    content: "b".to_owned(),
-                    status: TodoStatus::InProgress,
-                },
-                TodoItem {
-                    content: "c".to_owned(),
-                    status: TodoStatus::Completed,
-                },
-                TodoItem {
-                    content: "d".to_owned(),
-                    status: TodoStatus::Abandoned,
-                },
+                todo_item("a", "a", TodoStatus::Pending, true, &[]),
+                todo_item("b", "b", TodoStatus::InProgress, true, &[]),
+                todo_item("c", "c", TodoStatus::Completed, false, &[]),
+                todo_item("d", "d", TodoStatus::Abandoned, false, &[]),
             ],
         }];
         assert_eq!(todo_open_count(&phases), 2);
     }
 
-    #[test]
-    fn clear_todo_display_empties_panel_without_canonical_mutation() {
-        use pi_coding::{TodoItem, TodoPhase, TodoStatus};
-        let phases = vec![TodoPhase {
-            name: "Plan".to_owned(),
-            tasks: vec![TodoItem {
-                content: "x".to_owned(),
-                status: TodoStatus::InProgress,
-            }],
-        }];
-        let mut state = todo_test_state(phases);
-        assert!(!state.todo_phases.is_empty());
-        // clear_todo_display takes no Application handle, so it cannot reach
-        // canonical state — it only resets the display buffer.
-        state.clear_todo_display();
-        assert!(state.todo_phases.is_empty());
-        assert_eq!(
-            render_todo_panel_lines(&state.todo_phases, crate::theme::DARK).len(),
-            0
-        );
-    }
 
     #[test]
     fn todo_updated_and_reminder_refresh_display_only() {
-        use pi_coding::{TodoCompletionTransition, TodoItem, TodoPhase, TodoStatus};
+        use pi_coding::{TodoCompletionTransition, TodoPhase, TodoStatus};
         let phases = vec![TodoPhase {
             name: "Plan".to_owned(),
-            tasks: vec![TodoItem {
-                content: "x".to_owned(),
-                status: TodoStatus::InProgress,
-            }],
+            tasks: vec![todo_item("x", "x", TodoStatus::InProgress, true, &[])],
         }];
         let mut state = todo_test_state(Vec::new());
         assert!(state.todo_phases.is_empty());
@@ -7932,6 +10906,144 @@ mod tests {
         assert!(state.transcript.iter().all(|entry| entry.kind == TranscriptKind::System));
     }
 
+    fn orchestration_custom(
+        id: &str,
+        from: &str,
+        to: &str,
+        body: &str,
+        reply_to: Option<&str>,
+    ) -> Message {
+        let xml = format!(
+            "<orchestration-message id=\"{id}\" from=\"{from}\">\n{body}\n</orchestration-message>"
+        );
+        Message::Custom(pi_ai::CustomMessage {
+            custom_type: pi_coding::ORCHESTRATION_MESSAGE_TYPE.to_owned(),
+            content: xml.into(),
+            display: true,
+            details: Some(serde_json::json!({
+                "id": id,
+                "from": from,
+                "to": to,
+                "body": body,
+                "replyTo": reply_to,
+            })),
+            timestamp: 1,
+        })
+    }
+
+    #[test]
+    fn orchestration_irc_renders_named_label_body_reply_and_no_raw_xml() {
+        let mut state = todo_test_state(Vec::new());
+        state.job_cards.apply_orchestration_event(&pi_coding::OrchestrationEvent::AgentUpdated {
+            group_id: "group".to_owned(),
+            agent: pi_coding::AgentSnapshot {
+                id: "Scout".to_owned(),
+                display_name: "task: scout workspace".to_owned(),
+                parent_id: Some("Main".to_owned()),
+                status: pi_coding::AgentStatus::Running,
+                created_at: 1,
+                last_activity: 1,
+                unread: 0,
+                artifact_ref: None,
+                history_ref: None,
+            },
+        });
+
+        // Main → named child
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: orchestration_custom("m1", "Main", "Scout", "please inspect src", None),
+        }));
+        // child → child with reply metadata
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: orchestration_custom(
+                "m2",
+                "Scout",
+                "Main",
+                "found three crates",
+                Some("m1"),
+            ),
+        }));
+
+        assert_eq!(state.transcript.len(), 2);
+        let first = &state.transcript[0];
+        assert_eq!(first.kind, TranscriptKind::Custom);
+        assert_eq!(
+            first.tool_name.as_deref(),
+            Some("IRC · Main → task: scout workspace")
+        );
+        assert_eq!(content_text(&first.content), "please inspect src");
+        assert!(!content_text(&first.content).contains("orchestration-message"));
+
+        let second = &state.transcript[1];
+        assert_eq!(
+            second.tool_name.as_deref(),
+            Some("IRC · task: scout workspace → Main")
+        );
+        let second_text = content_text(&second.content);
+        assert!(second_text.contains("found three crates"));
+        assert!(second_text.contains("reply to m1"));
+        assert!(!second_text.contains("<orchestration-message"));
+        assert!(!second_text.contains("Replying to message"));
+
+        // Body on its own row beneath the label.
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, second, true, true, crate::theme::DARK, 80);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(texts[0].starts_with("IRC · task: scout workspace → Main"));
+        assert!(texts.iter().any(|line| line.contains("found three crates")));
+        assert!(texts.iter().any(|line| line.contains("reply to m1")));
+        let body_idx = texts.iter().position(|line| line.contains("found three crates")).unwrap();
+        let reply_idx = texts.iter().position(|line| line.contains("reply to m1")).unwrap();
+        assert!(body_idx > 0, "body must be beneath the IRC label");
+        assert!(reply_idx > body_idx, "reply metadata follows body");
+        assert!(
+            lines[reply_idx]
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(crate::theme::DARK.muted)),
+            "reply metadata uses muted style"
+        );
+    }
+
+    #[test]
+    fn message_delivered_event_renders_once_and_dedupes_custom_message() {
+        let mut state = todo_test_state(Vec::new());
+        let message = pi_coding::MailboxMessage {
+            id: "live-1".to_owned(),
+            from: "Child".to_owned(),
+            to: "Main".to_owned(),
+            body: "status from child".to_owned(),
+            timestamp: 10,
+            reply_to: None,
+        };
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::MessageDelivered {
+                group_id: "group".to_owned(),
+                message: message.clone(),
+            },
+        ));
+        // Same id arriving again as session CustomMessage must not duplicate.
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: orchestration_custom("live-1", "Child", "Main", "status from child", None),
+        }));
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(
+            state.transcript[0].tool_name.as_deref(),
+            Some("IRC · Child → Main")
+        );
+        assert_eq!(content_text(&state.transcript[0].content), "status from child");
+        assert!(!content_text(&state.transcript[0].content).contains("orchestration-message"));
+    }
+
+
     #[test]
     fn settled_entries_commit_once_and_partial_rows_wait() {
         let mut state = todo_test_state(Vec::new());
@@ -8001,7 +11113,7 @@ mod tests {
         assert_eq!(live_viewport_height(&state, 80, 24), 3);
 
         state.editor.set_text("one\ntwo");
-        assert_eq!(live_viewport_height(&state, 80, 24), 4);
+        assert_eq!(live_viewport_height(&state, 80, 24), 5);
 
         state.panel = Some(SelectorPanel {
             title: "Models".to_owned(),
@@ -8011,6 +11123,251 @@ mod tests {
             query: String::new(),
         });
         assert_eq!(live_viewport_height(&state, 80, 24), 16);
+        assert!(page_overlay_open(&state));
+
+        state.panel = None;
+        assert!(!page_overlay_open(&state));
+        assert_eq!(live_viewport_height(&state, 80, 24), 5);
+    }
+
+    #[tokio::test]
+    async fn settings_overlay_expands_viewport_and_blocks_commit_ledger() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent = tempfile::tempdir().expect("agent");
+        std::fs::write(agent.path().join("settings.json"), "{}").expect("global settings");
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = pi_coding::ResourceManager::new(options).expect("resources");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.attach_resources(resources).await.expect("attach resources");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = cwd.path().display().to_string();
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("keep-me-in-transcript")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::text("durable assistant row")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+
+        // Open -> render contract: settings is a page overlay that expands the
+        // live inline viewport and must not feed the overflow commit ledger.
+        state.open_settings_panel(&application);
+        assert!(state.settings_panel.is_some(), "settings panel must open");
+        assert!(page_overlay_open(&state));
+        assert_eq!(
+            live_viewport_height(&state, 80, 24),
+            16,
+            "settings must expand the live viewport like other page overlays"
+        );
+        assert!(
+            state.overflow_commit_batch(80, 1).len() >= 1,
+            "settled transcript rows remain candidates while the overlay is open"
+        );
+
+        // Escape dismisses without leaving settings in the retained ledger path.
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let handled = handle_settings_panel_key(&application, &mut state, esc)
+            .await
+            .expect("settings key");
+        assert_eq!(handled, Some(false));
+        assert!(state.settings_panel.is_none(), "Escape must close settings");
+        assert!(!page_overlay_open(&state));
+        let dismissed_height = live_viewport_height(&state, 80, 24);
+        assert!(
+            dismissed_height < 16,
+            "dismissed settings must collapse below the overlay expansion height, got {dismissed_height}"
+        );
+        assert_eq!(
+            dismissed_height,
+            live_viewport_height(&state, 80, 24),
+            "dismissed height must be stable without the settings overlay"
+        );
+
+        // After dismiss, overflow commit may proceed for transcript only.
+        let overflow = state.overflow_commit_batch(80, 1);
+        assert!(
+            overflow
+                .iter()
+                .all(|entry| matches!(entry.kind, TranscriptKind::User | TranscriptKind::Assistant)),
+            "post-dismiss commit ledger must only carry transcript rows"
+        );
+        assert!(
+            overflow.iter().any(|entry| content_text(&entry.content).contains("keep-me-in-transcript")),
+            "durable transcript rows remain accessible after settings dismiss"
+        );
+        application.cleanup().await;
+    }
+
+    #[test]
+    fn settings_overlay_render_then_dismiss_leaves_no_settings_rows() {
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+
+        // Stable full-height inline viewport (matches production enter()).
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(24),
+            },
+        )
+        .expect("inline terminal");
+
+        terminal
+            .draw(|frame| render_settings_panel(frame, &panel, None, crate::theme::DARK))
+            .expect("draw open settings");
+        let open = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect::<String>();
+        assert!(
+            open.contains("Settings"),
+            "open settings frame must paint settings chrome: {open}"
+        );
+
+        // Dismiss path: clear the live inline viewport exactly as
+        // resize_live_viewport does on page_overlay open->closed edge, then
+        // draw conversation chrome without the overlay.
+        terminal.clear().expect("clear live viewport on dismiss");
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("composer ready").style(Style::default()),
+                    frame.area(),
+                );
+            })
+            .expect("draw after dismiss");
+
+        let closed = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect::<String>();
+        assert!(
+            !closed.contains("Settings"),
+            "settings chrome must be absent after dismiss clear: {closed}"
+        );
+        assert!(
+            !closed.contains("Ctrl-S apply"),
+            "settings help rows must be absent after dismiss: {closed}"
+        );
+        assert!(
+            closed.contains("composer ready"),
+            "conversation chrome remains after dismiss"
+        );
+        // Overlay frames were never insert_before'd, so the native scrollback
+        // ledger stays empty of settings content.
+        terminal.backend().assert_scrollback_empty();
+    }
+
+    #[test]
+    fn inline_insert_before_forces_complete_composer_redraw() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("composer sentinel");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(24),
+            },
+        )
+        .expect("inline terminal");
+        let mut images = TerminalImageRenderer::default();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .expect("initial draw");
+
+        terminal
+            .insert_before(18, |buffer| {
+                Paragraph::new("transcript row\n".repeat(18)).render(buffer.area, buffer);
+            })
+            .expect("insert transcript");
+        clear_inline_viewport(&mut terminal).expect("invalidate overwritten viewport");
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .expect("redraw composer");
+
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let composer_top = rows
+            .iter()
+            .position(|row| row.starts_with("╭── π"))
+            .expect("composer top border");
+        assert!(rows[composer_top + 1].contains("composer sentinel"));
+        assert!(rows[composer_top + 1].ends_with('╯'));
+    }
+
+    #[test]
+    fn live_viewport_caps_progress_and_reserves_composer() {
+        use pi_coding::{TodoPhase, TodoStatus};
+        let tasks = (0..12)
+            .map(|index| todo_item(&format!("t{index}"), &format!("task {index} keeps progress busy"), TodoStatus::Pending, true, &[]))
+            .collect::<Vec<_>>();
+        let mut state = todo_test_state(vec![TodoPhase { name: "Ship".to_owned(), tasks }]);
+        state.editor.set_text("draft remains visible");
+        let panel_rows = u16::try_from(render_todo_panel_lines(
+            &state.todo_phases,
+            &state.job_cards.cards_in_source_order(),
+            crate::theme::DARK,
+            80,
+        ).len()).unwrap_or(u16::MAX);
+        let layout = tui_layout_heights(&state, 80, 24, panel_rows, 0, 0, 0);
+        assert_eq!(layout.composer, 2);
+        assert!(layout.todo <= MAX_INLINE_SUMMARY_HEIGHT);
+        assert!(layout.transcript >= 1);
+        assert_eq!(transcript_region_height(&state, 80, 24), layout.transcript);
+        assert!(live_viewport_height(&state, 80, 24) >= 3);
+        assert!(live_viewport_height(&state, 80, 24) <= 24);
     }
 
     #[test]
@@ -8046,7 +11403,7 @@ mod tests {
     #[test]
     fn composer_wraps_unicode_input_inside_borders() {
         let mut state = todo_test_state(Vec::new());
-        state.editor.set_text("界🙂abcdefghij界🙂abcdefghij界🙂abcdefghij");
+        state.editor.set_text("🙂🙂abcdefghij🙂🙂abcdefghij🙂🙂abcdefghij");
         let lines = composer_border_lines(&state, 24, crate::theme::DARK);
         let rendered = lines.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
         assert!(rendered.len() > 3);
@@ -8067,7 +11424,7 @@ mod tests {
         ];
         state.editor.set_text("/set"); assert!(state.accept_unambiguous_command_prefix()); assert_eq!(state.editor.text(), "/settings");
         state.editor.set_text("/br"); assert!(state.accept_unambiguous_command_prefix()); assert_eq!(state.editor.text(), "/branch");
-        state.editor.set_text("/lo"); assert!(!state.accept_unambiguous_command_prefix()); assert_eq!(state.editor.text(), "/lo");
+        state.editor.set_text("/lo"); assert!(state.accept_unambiguous_command_prefix()); assert_eq!(state.editor.text(), "/loop");
     }
 
     #[test]
@@ -8101,18 +11458,80 @@ mod tests {
     }
 
     #[test]
-    fn animation_changes_only_while_streaming() {
+    fn working_and_compaction_animate_only_while_active() {
         let mut state = todo_test_state(Vec::new());
         state.is_streaming = true;
-        let first = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let working_first = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
         state.animation_frame = 1;
-        let second = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
-        assert_ne!(first, second);
+        let working_second = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert_ne!(working_first, working_second);
+
         state.is_streaming = false;
+        state.is_compacting = true;
+        let compacting_first = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        state.animation_frame = 2;
+        let compacting_second = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert_ne!(compacting_first, compacting_second);
+
+        state.is_compacting = false;
         let idle_first = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
         state.animation_frame = 3;
         let idle_second = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
         assert_eq!(idle_first, idle_second);
+        assert!(!state.has_active_animation());
+    }
+
+    #[test]
+    fn job_animation_changes_only_for_queued_and_running_cards() {
+        let mut state = todo_test_state(Vec::new());
+        let mut job = pi_coding::JobSnapshot {
+            id: "animated-job".to_owned(),
+            agent_id: "Child".to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: Some("animate me".to_owned()),
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status: pi_coding::JobStatus::Queued,
+            created_at: 1_000,
+            started_at: None,
+            finished_at: None,
+            result: None,
+        };
+        let event = |job| ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job,
+        });
+        state.apply(event(job.clone()));
+        assert!(state.has_active_animation());
+        let card = state.transcript[0].job_card.as_ref().expect("queued card");
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        render_job_card(&mut first, card, crate::theme::DARK, 0, 80);
+        render_job_card(&mut second, card, crate::theme::DARK, 1, 80);
+        assert_ne!(first, second);
+
+        job.status = pi_coding::JobStatus::Running;
+        job.started_at = Some(1_100);
+        state.apply(event(job.clone()));
+        let card = state.transcript[0].job_card.as_ref().expect("running card");
+        first.clear();
+        second.clear();
+        render_job_card(&mut first, card, crate::theme::DARK, 0, 80);
+        render_job_card(&mut second, card, crate::theme::DARK, 2, 80);
+        assert_ne!(first, second);
+
+        job.status = pi_coding::JobStatus::Completed;
+        job.finished_at = Some(2_100);
+        state.apply(event(job));
+        assert!(!state.has_active_animation());
+        let card = state.transcript[0].job_card.as_ref().expect("completed card");
+        first.clear();
+        second.clear();
+        render_job_card(&mut first, card, crate::theme::DARK, 0, 80);
+        render_job_card(&mut second, card, crate::theme::DARK, 3, 80);
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -8131,7 +11550,8 @@ mod tests {
     fn omp_single_line_composer_is_two_rows_with_input_in_lower_border() {
         let mut state = todo_test_state(Vec::new());
         state.model = "faux/faux-1".to_owned();
-        state.cwd = "/home/test/Downloads".to_owned();
+        state.cwd = "<workspace>/Downloads".to_owned();
+        state.thinking_level = ThinkingLevel::Medium;
         state.editor.set_text("visible input");
         let lines = composer_border_lines(&state, 90, crate::theme::DARK);
         assert_eq!(lines.len(), 2);
@@ -8143,6 +11563,839 @@ mod tests {
         assert!(bottom.ends_with('╯'));
         assert_eq!(display_width(&top), 90);
         assert_eq!(display_width(&bottom), 90);
+    }
+
+    #[test]
+    fn composer_header_renders_state_status_inline() {
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "<workspace>".to_owned();
+        state.status = "Usage: /import <path.jsonl>".to_owned();
+        state.editor.set_text("");
+        let top = composer_border_lines(&state, 120, crate::theme::DARK)[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            top.contains("Usage: /import <path.jsonl>"),
+            "composer header must surface state.status: {top}"
+        );
+        assert!(top.contains("▶──"), "OMP activity glyph retained: {top}");
+
+        state.push_status("Ready".to_owned(), false);
+        assert_eq!(state.status, "Ready");
+        let top = composer_border_lines(&state, 120, crate::theme::DARK)[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(top.contains("Ready"), "push_status must dual-write inline toast: {top}");
+
+        // Busy animation still wins over the toast.
+        state.is_streaming = true;
+        let top = composer_border_lines(&state, 120, crate::theme::DARK)[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(top.contains("working"), "streaming must prefer activity label: {top}");
+        assert!(!top.contains("Ready"), "activity label replaces idle toast: {top}");
+    }
+
+    #[test]
+    fn run_failure_is_ephemeral_and_never_committed() {
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::RunFailed {
+            message: "runtime exploded\nsecret detail".to_owned(),
+        });
+
+        assert_eq!(
+            state.composer_error.as_deref(),
+            Some("runtime exploded\nsecret detail")
+        );
+        assert_eq!(state.status, "runtime exploded");
+        assert!(state.transcript.is_empty());
+        assert!(state.settled_commit_batch().is_empty());
+        assert!(state.overflow_commit_batch(80, 12).is_empty());
+    }
+
+    #[test]
+    fn composer_error_clears_on_escape_and_accepted_message_only() {
+        let mut state = todo_test_state(Vec::new());
+        state.push_status("first rejection".to_owned(), true);
+
+        assert!(!dismiss_composer_error_on_escape(&mut state, KeyCode::Char('x')));
+        assert_eq!(state.composer_error.as_deref(), Some("first rejection"));
+        state.push_status("second rejection".to_owned(), true);
+        assert_eq!(state.composer_error.as_deref(), Some("second rejection"));
+
+        state.record_accepted_prompt("accepted prompt");
+        assert!(state.composer_error.is_none());
+
+        state.push_status("dismiss me".to_owned(), true);
+        state.last_escape = Some(std::time::Instant::now());
+        assert!(dismiss_composer_error_on_escape(&mut state, KeyCode::Esc));
+        assert!(state.composer_error.is_none());
+        assert!(state.last_escape.is_none());
+    }
+
+    #[test]
+    fn composer_error_toast_is_bounded_sanitized_and_truncated() {
+        let mut state = todo_test_state(Vec::new());
+        state.push_status(
+            format!("bad \u{1b}[31mpayload\u{1b}[0m {}\nsecond row\nthird row", "🙂".repeat(40)),
+            true,
+        );
+
+        let lines = composer_error_toast_lines(&state, 24, crate::theme::DARK);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), usize::from(composer_error_toast_height(&state, 24)));
+        assert!(lines.len() <= MAX_COMPOSER_ERROR_HEIGHT);
+        assert!(rendered.iter().all(|line| display_width(line) == 24));
+        assert!(rendered.iter().all(|line| !line.contains('\u{1b}')));
+        assert!(rendered.iter().any(|line| line.contains('…')));
+        assert!(rendered.first().is_some_and(|line| line.starts_with("╭ Error")));
+        assert!(rendered.last().is_some_and(|line| line.starts_with('╰')));
+        assert_eq!(lines[0].spans[0].style.fg, Some(crate::theme::DARK.error));
+
+        state.composer_error = None;
+        assert_eq!(composer_error_toast_height(&state, 24), 0);
+        assert!(composer_error_toast_lines(&state, 24, crate::theme::DARK).is_empty());
+    }
+
+    #[test]
+    fn composer_error_renders_immediately_above_composer() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "/tmp/project".to_owned();
+        state.editor.set_text("draft stays");
+        state.push_status("runtime exploded".to_owned(), true);
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut images = TerminalImageRenderer::default();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let error_row = rows
+            .iter()
+            .position(|row| row.contains("runtime exploded"))
+            .expect("error message row");
+        let composer_row = rows
+            .iter()
+            .position(|row| row.contains("π") && row.contains("faux/faux-1"))
+            .expect("composer top row");
+        assert!(error_row < composer_row, "{rows:#?}");
+        assert!(rows[composer_row - 1].starts_with('╰'), "{rows:#?}");
+        assert!(
+            rows[..composer_row]
+                .iter()
+                .any(|row| row.contains(COMPOSER_ERROR_DISMISSAL_HINT)),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_clears_editor_and_attachments_without_exiting() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("draft text");
+        state.pending_attachments.push(PendingAttachment {
+            block: ContentBlock::Image {
+                data: "aW1n".to_owned(),
+                mime_type: "image/png".to_owned(),
+            },
+            width: 1,
+            height: 1,
+        });
+        let now = std::time::Instant::now();
+        assert!(
+            !handle_ctrl_c_clear_or_exit(&mut state, now),
+            "first Ctrl-C with content must not exit"
+        );
+        assert!(state.editor.is_empty());
+        assert!(state.pending_attachments.is_empty());
+        assert_eq!(state.last_ctrl_c, Some(now));
+        assert!(
+            state.status.contains("Cleared") && state.status.contains("Ctrl+C again"),
+            "clear arm should hint double-press exit: {}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn ctrl_u_clears_multiline_draft_and_pending_completion_state() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("line one\nline two");
+        state.editor.row = 1;
+        state.editor.column = 4;
+        state.completions.items = vec![CompletionItem {
+            label: "/model".to_owned(),
+            value: "/model".to_owned(),
+            description: String::new(),
+            is_directory: false,
+        }];
+        state.completions.context = Some(CompletionContext::Slash);
+        state.completion_query = Some((
+            0,
+            file_search::AtPrefix {
+                start: 0,
+                end: 1,
+                query: String::new(),
+            },
+        ));
+        state.prompt_history_index = Some(0);
+        state.prompt_history_draft = Some("stale".to_owned());
+
+        state.clear_composer();
+
+        assert!(state.editor.is_empty(), "Ctrl-U must clear the whole composer");
+        assert_eq!(state.editor.lines.len(), 1);
+        assert_eq!((state.editor.row, state.editor.column), (0, 0));
+        assert!(state.completions.items.is_empty());
+        assert!(state.completions.context.is_none());
+        assert!(state.completion_query.is_none());
+        assert!(state.prompt_history_index.is_none());
+        assert!(state.prompt_history_draft.is_none());
+        assert_eq!(
+            state.keybindings.resolve(&KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL
+            )),
+            Some(Action::EditorClear)
+        );
+    }
+
+    #[test]
+    fn prompt_history_up_down_order_and_draft_restore() {
+        let mut state = todo_test_state(Vec::new());
+        state.record_accepted_prompt("older");
+        state.record_accepted_prompt("newer");
+        state.editor.set_text("live draft");
+
+        state.history_or_move_up();
+        assert_eq!(state.editor.text(), "newer");
+        assert_eq!(state.prompt_history_index, Some(1));
+        assert_eq!(state.prompt_history_draft.as_deref(), Some("live draft"));
+
+        state.history_or_move_up();
+        assert_eq!(state.editor.text(), "older");
+        assert_eq!(state.prompt_history_index, Some(0));
+
+        state.history_or_move_up();
+        assert_eq!(state.editor.text(), "older", "oldest is a hard stop");
+        assert_eq!(state.prompt_history_index, Some(0));
+
+        state.history_or_move_down();
+        assert_eq!(state.editor.text(), "newer");
+
+        state.history_or_move_down();
+        assert_eq!(state.editor.text(), "live draft");
+        assert!(state.prompt_history_index.is_none());
+        assert!(state.prompt_history_draft.is_none());
+    }
+
+    #[test]
+    fn prompt_history_multiline_boundary_prefers_cursor_motion() {
+        let mut state = todo_test_state(Vec::new());
+        state.record_accepted_prompt("history entry");
+        state.editor.set_text("first\nsecond\nthird");
+        state.editor.row = 2;
+        state.editor.column = 2;
+
+        state.history_or_move_up();
+        assert_eq!(state.editor.text(), "first\nsecond\nthird");
+        assert_eq!(state.editor.row, 1);
+        assert!(state.prompt_history_index.is_none());
+
+        state.history_or_move_up();
+        assert_eq!(state.editor.row, 0);
+        assert!(state.prompt_history_index.is_none());
+
+        state.history_or_move_up();
+        assert_eq!(state.editor.text(), "history entry");
+        assert_eq!(state.prompt_history_index, Some(0));
+        assert_eq!(
+            state.prompt_history_draft.as_deref(),
+            Some("first\nsecond\nthird")
+        );
+
+        // Replace with a multiline history entry and ensure Down moves inside
+        // it before restoring the draft.
+        state.prompt_history = vec!["alpha\nbeta".to_owned()];
+        state.prompt_history_index = Some(0);
+        state.editor.set_text("alpha\nbeta");
+        state.editor.row = 0;
+        state.editor.column = 0;
+        state.prompt_history_draft = Some("draft".to_owned());
+
+        state.history_or_move_down();
+        assert_eq!(state.editor.text(), "alpha\nbeta");
+        assert_eq!(state.editor.row, 1);
+        assert_eq!(state.prompt_history_index, Some(0));
+
+        state.history_or_move_down();
+        assert_eq!(state.editor.text(), "draft");
+        assert!(state.prompt_history_index.is_none());
+    }
+
+    #[test]
+    fn prompt_history_suppresses_adjacent_duplicates() {
+        let mut state = todo_test_state(Vec::new());
+        state.record_accepted_prompt("same");
+        state.record_accepted_prompt("same");
+        state.record_accepted_prompt("other");
+        state.record_accepted_prompt("other");
+        state.record_accepted_prompt("same");
+        assert_eq!(
+            state.prompt_history,
+            vec!["same".to_owned(), "other".to_owned(), "same".to_owned()]
+        );
+    }
+
+    #[test]
+    fn prompt_history_rebuild_on_session_transition_drops_prior_draft() {
+        let mut state = todo_test_state(Vec::new());
+        state.record_accepted_prompt("session-a-1");
+        state.record_accepted_prompt("session-a-2");
+        state.editor.set_text("unsaved a draft");
+        state.history_or_move_up();
+        assert_eq!(state.editor.text(), "session-a-2");
+        assert!(state.prompt_history_draft.is_some());
+
+        let next_messages = vec![
+            Message::User(pi_ai::UserMessage {
+                content: vec![ContentBlock::text("session-b-old")],
+                timestamp: 0,
+            }),
+            Message::User(pi_ai::UserMessage {
+                content: vec![ContentBlock::text("session-b-new")],
+                timestamp: 2,
+            }),
+        ];
+        state.rebuild_prompt_history_from_messages(next_messages);
+
+        assert_eq!(
+            state.prompt_history,
+            vec![
+                "session-b-old".to_owned(),
+                "session-b-new".to_owned()
+            ]
+        );
+        assert!(state.prompt_history_index.is_none());
+        assert!(
+            state.prompt_history_draft.is_none(),
+            "session transition must not leak prior draft"
+        );
+
+        state.editor.set_text("session-b draft");
+        state.history_or_move_up();
+        assert_eq!(state.editor.text(), "session-b-new");
+        assert_eq!(
+            state.prompt_history_draft.as_deref(),
+            Some("session-b draft")
+        );
+    }
+
+
+    #[test]
+    fn idle_double_ctrl_c_within_500ms_exits_while_single_does_not() {
+        let mut state = todo_test_state(Vec::new());
+        let first = std::time::Instant::now();
+        assert!(
+            !handle_ctrl_c_clear_or_exit(&mut state, first),
+            "first idle Ctrl-C arms the exit ladder only"
+        );
+        assert_eq!(state.last_ctrl_c, Some(first));
+        assert!(
+            state.status.contains("Ctrl+C again to quit"),
+            "idle arm should set quit hint: {}",
+            state.status
+        );
+
+        let second = first + std::time::Duration::from_millis(200);
+        assert!(
+            handle_ctrl_c_clear_or_exit(&mut state, second),
+            "second idle Ctrl-C within 500ms must request clean exit"
+        );
+        assert!(state.last_ctrl_c.is_none());
+
+        // A lone press after the window expires must re-arm, not exit.
+        let mut state = todo_test_state(Vec::new());
+        let armed = std::time::Instant::now();
+        assert!(!handle_ctrl_c_clear_or_exit(&mut state, armed));
+        let late = armed + std::time::Duration::from_millis(501);
+        assert!(
+            !handle_ctrl_c_clear_or_exit(&mut state, late),
+            "Ctrl-C after 500ms must not exit"
+        );
+        assert_eq!(state.last_ctrl_c, Some(late));
+    }
+
+    #[test]
+    fn unrelated_input_resets_double_ctrl_c_timer() {
+        let mut state = todo_test_state(Vec::new());
+        let armed = std::time::Instant::now();
+        assert!(!handle_ctrl_c_clear_or_exit(&mut state, armed));
+        assert!(state.last_ctrl_c.is_some());
+
+        // Same policy as handle_key: any non-ClearEditor action drops the arm.
+        let action = state
+            .keybindings
+            .resolve(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!matches!(action, Some(Action::ClearEditor)));
+        if !matches!(action, Some(Action::ClearEditor)) {
+            state.last_ctrl_c = None;
+        }
+        assert!(state.last_ctrl_c.is_none());
+
+        let again = armed + std::time::Duration::from_millis(100);
+        assert!(
+            !handle_ctrl_c_clear_or_exit(&mut state, again),
+            "after reset, next Ctrl-C is a fresh first press"
+        );
+        assert_eq!(state.last_ctrl_c, Some(again));
+    }
+
+    #[test]
+    fn default_status_documents_ctrl_c_double_quit() {
+        let status = "Enter submit · Shift+Enter/Ctrl+J newline · Esc abort · Ctrl+C twice quit · Ctrl+D quit";
+        assert!(status.contains("Ctrl+C twice quit"), "{status}");
+        assert!(status.contains("Ctrl+D quit"), "{status}");
+        assert!(
+            !status.to_lowercase().contains("cannot exit"),
+            "{status}"
+        );
+        let bindings = KeyBindingsManager::default();
+        let text = format_hotkeys_text(&bindings);
+        assert!(
+            text.contains("Clear input / quit (twice)")
+                || text.contains("Ctrl+C")
+                || text.contains("clear"),
+            "hotkeys text should document Ctrl+C clear/quit: {text}"
+        );
+    }
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        use image::ImageBuffer;
+        use image::{DynamicImage, ImageFormat};
+        use std::io::Cursor;
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(2, 2, |x, y| {
+            image::Rgb([(x * 40) as u8, (y * 80) as u8, 120])
+        }));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("encode png");
+        bytes
+    }
+
+    #[test]
+    fn clipboard_png_fixture_attaches_one_image_and_preserves_draft_text() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("describe this");
+        let image = crate::clipboard::image_from_bytes(tiny_png_bytes(), "image/png")
+            .expect("fixture png");
+        let expected_block = image.clone().into_content_block();
+        let expected_width = image.width;
+        let expected_height = image.height;
+        assert!(expected_width > 0 && expected_height > 0);
+        state.apply_background(BackgroundEvent::ClipboardRead(Ok(Some(
+            crate::clipboard::ClipboardContent::Image(image),
+        ))));
+
+        assert_eq!(state.editor.text(), "describe this");
+        assert_eq!(state.pending_attachments.len(), 1);
+        assert_eq!(state.pending_attachments[0].block, expected_block);
+        assert_eq!(state.pending_attachments[0].width, expected_width);
+        assert_eq!(state.pending_attachments[0].height, expected_height);
+        assert!(state.status.contains("Attached image/png"));
+        assert!(state.status.contains("1 pending"));
+        assert!(
+            !state.status.contains("iVBORw0KGgo"),
+            "status must not print raw/base64 image bytes"
+        );
+
+        let placeholder = format!("[Image #1, {expected_width}x{expected_height}]");
+        let labels = pending_attachment_labels(&state.pending_attachments);
+        assert_eq!(labels, vec![placeholder.clone()]);
+
+        let composer = composer_border_lines(&state, 90, crate::theme::DARK);
+        let rendered = composer
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rendered.iter().any(|line| line.contains("describe this")),
+            "draft text must remain visible: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains(&placeholder)),
+            "composer must show pending attachment label: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|line| !line.contains("iVBORw0KGgo")),
+            "composer must not print image bytes"
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains('/') || !line.contains("home")),
+            "composer must not print absolute paths"
+        );
+
+        let submitted = assemble_submit_attachments(&state.pending_attachments, Vec::new());
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0], expected_block);
+        let ContentBlock::Image { data, mime_type } = &submitted[0] else {
+            panic!("expected image content block in submit payload");
+        };
+        assert_eq!(mime_type, "image/png");
+        assert!(!data.is_empty());
+
+        // Successful send clears pending exactly once.
+        state.pending_attachments.clear();
+        assert!(state.pending_attachments.is_empty());
+        assert_eq!(state.editor.text(), "describe this");
+    }
+
+    #[test]
+    fn multiple_clipboard_images_number_stably_in_composer() {
+        let mut state = todo_test_state(Vec::new());
+        let first = crate::clipboard::image_from_bytes(tiny_png_bytes(), "image/png")
+            .expect("first png");
+        let second = crate::clipboard::image_from_bytes(tiny_png_bytes(), "image/png")
+            .expect("second png");
+        let first_w = first.width;
+        let first_h = first.height;
+        let second_w = second.width;
+        let second_h = second.height;
+        state.apply_background(BackgroundEvent::ClipboardRead(Ok(Some(
+            crate::clipboard::ClipboardContent::Image(first),
+        ))));
+        state.apply_background(BackgroundEvent::ClipboardRead(Ok(Some(
+            crate::clipboard::ClipboardContent::Image(second),
+        ))));
+
+        assert_eq!(state.pending_attachments.len(), 2);
+        let labels = pending_attachment_labels(&state.pending_attachments);
+        assert_eq!(
+            labels,
+            vec![
+                format!("[Image #1, {first_w}x{first_h}]"),
+                format!("[Image #2, {second_w}x{second_h}]"),
+            ]
+        );
+
+        let rendered = composer_border_lines(&state, 90, crate::theme::DARK)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered.iter().any(|line| line.contains(&labels[0])));
+        assert!(rendered.iter().any(|line| line.contains(&labels[1])));
+        // Stable numbering: first paste stays #1 after second paste.
+        let first_pos = rendered
+            .iter()
+            .position(|line| line.contains(&labels[0]))
+            .expect("first placeholder");
+        let second_pos = rendered
+            .iter()
+            .position(|line| line.contains(&labels[1]))
+            .expect("second placeholder");
+        assert!(first_pos < second_pos);
+    }
+
+    #[test]
+    fn failed_submit_keeps_clipboard_attachment_without_duplicating_file_images() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("keep draft @shot.png");
+        let clipboard_image = crate::clipboard::image_from_bytes(tiny_png_bytes(), "image/png")
+            .expect("clipboard png");
+        let clipboard = PendingAttachment::from_clipboard_image(clipboard_image);
+        let file_image = ContentBlock::Image {
+            data: "ZmlsZQ==".to_owned(),
+            mime_type: "image/png".to_owned(),
+        };
+        state.pending_attachments.push(clipboard.clone());
+
+        let pre_submit = state.pending_attachments.clone();
+        let assembled = assemble_submit_attachments(&pre_submit, vec![file_image.clone()]);
+        assert_eq!(assembled.len(), 2, "one clipboard + one file image");
+        assert_eq!(assembled[0], clipboard.block);
+        assert_eq!(assembled[1], file_image);
+
+        // Simulate prompt rejection: restore only pre-submit clipboard pending.
+        restore_pending_after_failed_submit(&mut state.pending_attachments, pre_submit);
+        assert_eq!(state.pending_attachments, vec![clipboard.clone()]);
+        assert_eq!(state.editor.text(), "keep draft @shot.png");
+        let labels = pending_attachment_labels(&state.pending_attachments);
+        assert_eq!(
+            labels,
+            vec![format!(
+                "[Image #1, {}x{}]",
+                clipboard.width, clipboard.height
+            )]
+        );
+
+        // Retry assembly must not accumulate file images into pending.
+        let retried =
+            assemble_submit_attachments(&state.pending_attachments, vec![file_image.clone()]);
+        assert_eq!(retried.len(), 2);
+        assert_eq!(
+            retried
+                .iter()
+                .filter(|block| matches!(block, ContentBlock::Image { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(state.pending_attachments.len(), 1);
+    }
+
+    #[test]
+    fn clipboard_errors_are_actionable_and_never_print_payload_bytes() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("draft stays");
+
+        state.apply_background(BackgroundEvent::ClipboardRead(Err(
+            "image exceeds the 20 MiB limit".to_owned(),
+        )));
+        assert_eq!(state.editor.text(), "draft stays");
+        assert!(state.pending_attachments.is_empty());
+        let oversized = state.composer_error.as_deref().expect("error toast");
+        assert!(
+            oversized.contains("Clipboard paste failed"),
+            "actionable status missing: {oversized}"
+        );
+        assert!(
+            oversized.contains("20 MiB"),
+            "size limit missing: {oversized}"
+        );
+        assert!(!oversized.contains("iVBORw0KGgo"));
+        assert!(state.transcript.is_empty());
+
+        state.apply_background(BackgroundEvent::ClipboardRead(Err(
+            "data is not a supported image".to_owned(),
+        )));
+        let malformed = state.composer_error.as_deref().expect("error toast");
+        assert!(
+            malformed.contains("Clipboard paste failed"),
+            "actionable status missing: {malformed}"
+        );
+        assert!(
+            malformed.contains("not a supported image"),
+            "mime error missing: {malformed}"
+        );
+        assert!(!malformed.contains("iVBORw0KGgo"));
+        assert!(state.transcript.is_empty());
+
+        let labels = pending_attachment_labels(&[PendingAttachment {
+            block: ContentBlock::Image {
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==".to_owned(),
+                mime_type: "image/png".to_owned(),
+            },
+            width: 1,
+            height: 1,
+        }]);
+        assert_eq!(labels, vec!["[Image #1, 1x1]".to_owned()]);
+        assert!(labels.iter().all(|label| !label.contains("iVBORw0KGgo")));
+        assert!(labels.iter().all(|label| !label.contains("image/png")));
+    }
+
+    #[test]
+    fn ctrl_v_and_alt_v_bind_to_clipboard_paste() {
+        let bindings = KeyBindingsManager::default();
+        let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        let alt_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT);
+        assert_eq!(bindings.resolve(&ctrl_v), Some(Action::ClipboardPaste));
+        assert_eq!(bindings.resolve(&alt_v), Some(Action::ClipboardPaste));
+        // Alt+V is the discoverable image-paste chord (terminals often steal Ctrl+V).
+        let label = Action::ClipboardPaste.label();
+        assert!(
+            label.contains("Alt+V"),
+            "hotkey label must advertise Alt+V: {label}"
+        );
+        let hotkeys = format_hotkeys_text(&bindings);
+        assert!(
+            hotkeys.contains("Alt+V"),
+            "/hotkeys must document Alt+V image paste: {hotkeys}"
+        );
+        assert!(
+            hotkeys.contains("Ctrl+V") || hotkeys.contains("ctrl+v") || hotkeys.contains("Ctrl+v"),
+            "/hotkeys should still list Ctrl+V best-effort: {hotkeys}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_bracketed_paste_starts_clipboard_image_read() {
+        // Terminals deliver image-only Ctrl+V as empty Event::Paste / bracketed paste.
+        // Production spawns the clipboard read on the Tokio runtime; the test must
+        // run on one or tokio::spawn panics with "no reactor running".
+        let (background_tx, mut background_rx) = mpsc::unbounded_channel();
+        let mut state = todo_test_state(Vec::new());
+        state.background_tx = background_tx;
+        state.editor.set_text("draft stays");
+        handle_paste(&mut state, "");
+        assert_eq!(state.editor.text(), "draft stays");
+        assert!(
+            state.clipboard_read_busy,
+            "empty paste must arm the async clipboard reader"
+        );
+        assert!(
+            state.status.contains("Reading clipboard"),
+            "status must show clipboard progress: {}",
+            state.status
+        );
+        assert!(
+            state.status.contains("Alt+V"),
+            "status must advertise the reliable image chord: {}",
+            state.status
+        );
+        // The generated reader must report back through the same background channel
+        // seam production drains; inject its completion via apply_background and
+        // verify the busy flag clears. No desktop clipboard is required: platform
+        // command failures still produce a terminal ClipboardRead event.
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            background_rx.recv(),
+        )
+        .await
+        .expect("spawned clipboard read must report on the background channel")
+        .expect("background channel must stay open");
+        assert!(
+            matches!(event, BackgroundEvent::ClipboardRead(_)),
+            "event must be a ClipboardRead completion"
+        );
+        state.apply_background(event);
+        assert!(
+            !state.clipboard_read_busy,
+            "injected completion must clear the busy flag"
+        );
+    }
+
+    #[test]
+    fn nonempty_text_paste_does_not_start_clipboard_read() {
+        let mut state = todo_test_state(Vec::new());
+        handle_paste(&mut state, "hello from bracketed paste");
+        assert_eq!(state.editor.text(), "hello from bracketed paste");
+        assert!(
+            !state.clipboard_read_busy,
+            "text paste must not start the image clipboard reader"
+        );
+        assert!(state.status.contains("Pasted"));
+        assert!(state.pending_attachments.is_empty());
+    }
+
+    #[test]
+    fn background_channel_clipboard_image_drains_into_composer_placeholder() {
+        // Production path: background task sends ClipboardRead on background_tx;
+        // the main select! loop drains via apply_background. Inject through the
+        // same channel seam without a desktop clipboard.
+        let (background_tx, mut background_rx) = mpsc::unbounded_channel();
+        let mut state = todo_test_state(Vec::new());
+        state.background_tx = background_tx.clone();
+        state.editor.set_text("describe this");
+
+        let image = crate::clipboard::image_from_bytes(tiny_png_bytes(), "image/png")
+            .expect("fixture png");
+        let expected_block = image.clone().into_content_block();
+        let expected_width = image.width;
+        let expected_height = image.height;
+        let placeholder = format!("[Image #1, {expected_width}x{expected_height}]");
+
+        background_tx
+            .send(BackgroundEvent::ClipboardRead(Ok(Some(
+                crate::clipboard::ClipboardContent::Image(image),
+            ))))
+            .expect("background channel open");
+
+        let event = background_rx
+            .try_recv()
+            .expect("production drain must observe the clipboard completion");
+        state.apply_background(event);
+
+        assert!(!state.clipboard_read_busy);
+        assert_eq!(state.editor.text(), "describe this");
+        assert_eq!(state.pending_attachments.len(), 1);
+        assert_eq!(state.pending_attachments[0].block, expected_block);
+        let labels = pending_attachment_labels(&state.pending_attachments);
+        assert_eq!(labels, vec![placeholder.clone()]);
+
+        let rendered = composer_border_lines(&state, 90, crate::theme::DARK)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rendered.iter().any(|line| line.contains(&placeholder)),
+            "composer must show exact placeholder after channel drain: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("describe this")),
+            "draft text must remain: {rendered:?}"
+        );
+
+        let submitted = assemble_submit_attachments(&state.pending_attachments, Vec::new());
+        assert_eq!(submitted, vec![expected_block]);
+        state.pending_attachments.clear();
+        assert!(state.pending_attachments.is_empty());
+    }
+
+    #[test]
+    fn welcome_line_documents_alt_v_image_paste() {
+        let state = todo_test_state(Vec::new());
+        let lines = render_welcome_lines(&state, crate::theme::DARK);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("Alt+V"),
+            "welcome must advertise Alt+V image paste: {rendered}"
+        );
+        assert!(rendered.contains("  rpi"), "welcome must use concise rpi branding: {rendered}");
+        assert!(!rendered.contains("pi-rs"), "welcome must not expose repository branding: {rendered}");
+        assert!(
+            rendered.contains("paste image") || rendered.contains("Paste image"),
+            "welcome must mention image paste: {rendered}"
+        );
     }
 
     #[test]
@@ -8182,9 +12435,9 @@ mod tests {
     }
 
     #[test]
-    fn bounded_composer_materializes_only_visible_rows_for_large_and_cjk_pastes() {
+    fn bounded_composer_materializes_only_visible_rows_for_large_and_wide_unicode_pastes() {
         let mut state = todo_test_state(Vec::new());
-        state.editor.set_text(&format!("{}{}", "x".repeat(7_608), "界".repeat(200)));
+        state.editor.set_text(&format!("{}{}", "x".repeat(7_608), "🙂".repeat(200)));
         let lines = composer_border_lines_bounded(&state, 80, crate::theme::DARK, 9);
         assert!(lines.len() <= 9);
         let (_, cursor_column) = editor_wrapped_position(&state, 75);
@@ -8204,4 +12457,306 @@ mod tests {
         assert!(output.contains("\u{1b}[?25l"));
         assert!(output.contains("\u{1b}[?25h"));
     }
+
+    #[test]
+    fn hotkeys_sections_cover_keymap_categories_from_catalog() {
+        let bindings = KeyBindingsManager::default();
+        let text = format_hotkeys_text(&bindings);
+        for section in [
+            "## Editor",
+            "## Application",
+            "## Session selector",
+            "## Scoped models",
+            "## Session tree",
+        ] {
+            assert!(text.contains(section), "missing section {section} in:\n{text}");
+        }
+        assert!(text.contains("Enter  —  Submit message") || text.contains("Enter"), "{text}");
+        assert!(text.contains("Ctrl+D") || text.contains("Quit"), "{text}");
+        assert!(text.contains("Session tree") || text.contains("Filter:"), "{text}");
+        let sections = bindings.hotkey_sections();
+        assert_eq!(sections.len(), 5, "{sections:?}");
+        assert_eq!(sections[0].title, "Editor");
+        assert_eq!(sections[1].title, "Application");
+        assert_eq!(sections[2].title, "Session selector");
+        assert_eq!(sections[3].title, "Scoped models");
+        assert_eq!(sections[4].title, "Session tree");
+        assert!(!sections[0].rows.is_empty());
+    }
+
+    #[test]
+    fn overlay_key_hints_document_esc_q_and_navigation() {
+        let tree = TreePanel::new(
+            pi_coding::SessionTreeResult {
+                tree: Vec::new(),
+                leaf_id: None,
+                active_leaf_id: None,
+            },
+            TreePanelMode::Navigate,
+        );
+        let tree_hints = tree_panel_key_hints(&tree);
+        assert!(tree_hints.contains("Esc/q"), "{tree_hints}");
+        assert!(tree_hints.contains("↑/↓") || tree_hints.contains("move"), "{tree_hints}");
+
+        let fork = TreePanel::new(
+            pi_coding::SessionTreeResult {
+                tree: Vec::new(),
+                leaf_id: None,
+                active_leaf_id: None,
+            },
+            TreePanelMode::Fork,
+        );
+        let fork_hints = tree_panel_key_hints(&fork);
+        assert!(fork_hints.contains("Esc/q"), "{fork_hints}");
+        assert!(fork_hints.contains("Enter"), "{fork_hints}");
+
+        let selector = SavedSessionSelector::new(Vec::new(), None);
+        let session_hints = session_selector_key_hints(&selector);
+        assert!(session_hints.contains("Esc/q"), "{session_hints}");
+        assert!(session_hints.contains("Enter"), "{session_hints}");
+
+        let model_hints = scoped_model_key_hints();
+        assert!(model_hints.contains("Esc/q"), "{model_hints}");
+        assert!(model_hints.contains("Enter"), "{model_hints}");
+
+        let panel = SelectorPanel {
+            title: "Models".to_owned(),
+            help: "Type to filter · Enter select · Esc cancel".to_owned(),
+            items: Vec::new(),
+            selected: 0,
+            query: String::new(),
+        };
+        let panel_hints = selector_panel_key_hints(&panel);
+        assert!(panel_hints.contains("Esc"), "{panel_hints}");
+    }
+
+    #[test]
+    fn unknown_overlay_key_keeps_status_help_text() {
+        let key = KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE);
+        let status = overlay_unknown_key_status(key);
+        assert!(status.contains("Unknown key"), "{status}");
+        assert!(status.contains("/hotkeys") || status.contains("footer"), "{status}");
+        assert!(status.contains("Esc"), "{status}");
+    }
+
+    #[test]
+    fn process_panel_list_footer_shows_key_hints() {
+        use ratatui::backend::TestBackend;
+        let panel = ProcessPanel::new(Vec::new());
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_process_panel(frame, &panel, crate::theme::DARK);
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Esc"), "{rendered}");
+        assert!(rendered.contains("Enter") || rendered.contains("select"), "{rendered}");
+    }
+
+    #[test]
+    fn tree_and_session_overlay_render_footer_key_hints() {
+        use ratatui::backend::TestBackend;
+        let mut state = todo_test_state(Vec::new());
+        state.tree_panel = Some(TreePanel::new(
+            pi_coding::SessionTreeResult {
+                tree: Vec::new(),
+                leaf_id: None,
+                active_leaf_id: None,
+            },
+            TreePanelMode::Navigate,
+        ));
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut images = TerminalImageRenderer::default();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Esc/q") || rendered.contains("Esc"),
+            "tree overlay missing key hints: {rendered}"
+        );
+
+        state.tree_panel = None;
+        state.session_selector = Some(SavedSessionSelector::new(Vec::new(), None));
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Esc/q") || rendered.contains("Esc"),
+            "session selector missing key hints: {rendered}"
+        );
+        assert!(rendered.contains("Enter") || rendered.contains("resume"), "{rendered}");
+    }
+
+    fn agents_panel_fixture() -> AgentsPanel {
+        use pi_coding::{AgentDefinition, AgentDefinitionSource, AgentRuntimeSettings};
+
+        let definition = |name: &str, tools: Vec<&str>, skills: Vec<&str>| AgentDefinition {
+            name: name.to_owned(),
+            description: format!("{name} handles detailed orchestration diagnostics"),
+            system_prompt: "prompt".to_owned(),
+            tools: Some(tools.into_iter().map(str::to_owned).collect()),
+            autoload_skills: skills.into_iter().map(str::to_owned).collect(),
+            model: None,
+            thinking_level: Some(ThinkingLevel::Medium),
+            source: AgentDefinitionSource::User,
+            path: None,
+            trusted: true,
+        };
+        let mut settings = std::collections::BTreeMap::new();
+        settings.insert(
+            "reviewer".to_owned(),
+            AgentRuntimeSettings {
+                enabled: Some(true),
+                model: Some("missing/model".to_owned()),
+                tools: None,
+            },
+        );
+        AgentsPanel::new(
+            vec![
+                definition(
+                    "reviewer",
+                    vec!["read", "grep", "bash", "browser", "debug"],
+                    vec!["rust", "research", "performance", "accessibility"],
+                ),
+                definition("worker", vec!["read", "bash"], vec!["rust"]),
+            ],
+            &settings,
+            Model {
+                provider: "openai".to_owned(),
+                id: "gpt-4.1".to_owned(),
+                name: "gpt-4.1".to_owned(),
+                ..Model::default()
+            },
+            vec![Model {
+                provider: "openai".to_owned(),
+                id: "gpt-4.1".to_owned(),
+                name: "gpt-4.1".to_owned(),
+                ..Model::default()
+            }],
+        )
+    }
+
+    #[test]
+    fn agents_panel_lines_reserve_width_and_separate_wrapped_records() {
+        let panel = agents_panel_fixture();
+        for width in [24, 106] {
+            let lines = agents_panel_lines(&panel, crate::theme::DARK, width);
+            assert!(lines.iter().all(|line| {
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                display_width(&text) <= width
+            }));
+            let selected = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.spans
+                        .iter()
+                        .any(|span| span.style.bg == Some(crate::theme::DARK.selected_bg))
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert!(!selected.is_empty());
+            assert!(selected.windows(2).all(|pair| pair[1] == pair[0] + 1));
+            assert!(
+                lines[selected[selected.len() - 1] + 1].spans.is_empty(),
+                "wrapped selected record must be separated from the next record"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_panel_render_keeps_content_and_highlight_inside_padding() {
+        use ratatui::backend::TestBackend;
+
+        for (terminal_width, terminal_height) in [(156, 40), (44, 24)] {
+            let panel = agents_panel_fixture();
+            let backend = TestBackend::new(terminal_width, terminal_height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_agents_panel(frame, &panel, crate::theme::DARK))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let top = buffer
+                .content
+                .chunks(usize::from(terminal_width))
+                .position(|row| row.iter().any(|cell| cell.symbol() == "┌"))
+                .expect("agents panel top border") as u16;
+            let top_row = &buffer.content[usize::from(top * terminal_width)
+                ..usize::from((top + 1) * terminal_width)];
+            let left = top_row
+                .iter()
+                .position(|cell| cell.symbol() == "┌")
+                .expect("agents panel left border") as u16;
+            let right = top_row
+                .iter()
+                .rposition(|cell| cell.symbol() == "┐")
+                .expect("agents panel right border") as u16;
+
+            let rows = buffer.content.chunks(usize::from(terminal_width));
+            let content_rows = rows
+                .skip(usize::from(top + 1))
+                .take_while(|row| row[usize::from(left)].symbol() != "└")
+                .collect::<Vec<_>>();
+            assert!(content_rows[0][usize::from(left + 1)..usize::from(right)]
+                .iter()
+                .all(|cell| cell.symbol() == " "));
+            assert!(content_rows
+                .last()
+                .expect("agents panel bottom padding row")
+                [usize::from(left + 1)..usize::from(right)]
+                .iter()
+                .all(|cell| cell.symbol() == " "));
+            assert!(content_rows
+                .iter()
+                .all(|row| row[usize::from(left + 1)].symbol() == " "));
+            assert!(content_rows
+                .iter()
+                .all(|row| row[usize::from(right - 1)].symbol() == " "));
+
+            let highlighted = content_rows
+                .iter()
+                .filter(|row| {
+                    row.iter().any(|cell| cell.bg == crate::theme::DARK.selected_bg)
+                })
+                .collect::<Vec<_>>();
+            assert!(!highlighted.is_empty());
+            assert!(highlighted.iter().all(|row| {
+                row[usize::from(left + 1)].bg != crate::theme::DARK.selected_bg
+                    && row[usize::from(left + 2)].bg == crate::theme::DARK.selected_bg
+                    && row[usize::from(right - 1)].bg != crate::theme::DARK.selected_bg
+            }));
+        }
+    }
+
 }

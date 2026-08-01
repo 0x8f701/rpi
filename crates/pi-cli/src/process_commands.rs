@@ -197,6 +197,13 @@ pub(crate) enum ProcessPanelAction {
     Stop(ProcessId),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessKeyResult {
+    Action(ProcessPanelAction),
+    Handled,
+    Unknown,
+}
+
 pub(crate) struct ProcessPanel {
     processes: Vec<ProcessInfo>,
     selected: usize,
@@ -242,55 +249,161 @@ impl ProcessPanel {
     pub(crate) fn update_process(&mut self, process: ProcessInfo) { self.upsert(process); }
     pub(crate) fn fail(&mut self, message: impl Into<String>) { self.notice = Some(message.into()); }
 
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<ProcessPanelAction> {
-        if self.input.is_some() { return self.handle_input_key(key); }
-        match self.view { ProcessPanelView::List => self.handle_list_key(key), ProcessPanelView::Detail | ProcessPanelView::Logs => self.handle_process_key(key) }
-    }
-
-    fn handle_list_key(&mut self, key: KeyEvent) -> Option<ProcessPanelAction> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => Some(ProcessPanelAction::Close),
-            KeyCode::Up | KeyCode::Char('k') => { self.move_selection(-1); None }
-            KeyCode::Down | KeyCode::Char('j') => { self.move_selection(1); None }
-            KeyCode::Home => { self.selected = 0; None }
-            KeyCode::End => { self.selected = self.processes.len().saturating_sub(1); None }
-            KeyCode::Enter => {
-                let id = self.processes.get(self.selected)?.id.clone();
-                self.active_id = Some(id.clone()); self.view = ProcessPanelView::Detail; self.log.clear(); self.log_scroll = 0; self.follow = true; self.notice = None;
-                Some(ProcessPanelAction::Open(id))
-            }
-            _ => None,
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> ProcessKeyResult {
+        if self.input.is_some() {
+            return match self.handle_input_key(key) {
+                Some(action) => ProcessKeyResult::Action(action),
+                None => ProcessKeyResult::Handled,
+            };
+        }
+        match self.view {
+            ProcessPanelView::List => self.handle_list_key(key),
+            ProcessPanelView::Detail | ProcessPanelView::Logs => self.handle_process_key(key),
         }
     }
 
-    fn handle_process_key(&mut self, key: KeyEvent) -> Option<ProcessPanelAction> {
-        let id = self.active_id.clone()?;
+    fn handle_list_key(&mut self, key: KeyEvent) -> ProcessKeyResult {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => ProcessKeyResult::Action(ProcessPanelAction::Close),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_selection(-1);
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_selection(1);
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Home => {
+                self.selected = 0;
+                ProcessKeyResult::Handled
+            }
+            KeyCode::End => {
+                self.selected = self.processes.len().saturating_sub(1);
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Enter => {
+                let Some(id) = self.processes.get(self.selected).map(|process| process.id.clone()) else {
+                    return ProcessKeyResult::Handled;
+                };
+                self.active_id = Some(id.clone());
+                self.view = ProcessPanelView::Detail;
+                self.log.clear();
+                self.log_scroll = 0;
+                self.follow = true;
+                self.notice = None;
+                ProcessKeyResult::Action(ProcessPanelAction::Open(id))
+            }
+            _ => ProcessKeyResult::Unknown,
+        }
+    }
+
+    fn handle_process_key(&mut self, key: KeyEvent) -> ProcessKeyResult {
+        let Some(id) = self.active_id.clone() else {
+            return ProcessKeyResult::Unknown;
+        };
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
-                KeyCode::Char('c') if self.active_process().is_some_and(|process| process.tty) => Some(ProcessPanelAction::SendKeys { id, keys: vec![ProcessKey::CtrlC] }),
-                KeyCode::Char('c') => Some(ProcessPanelAction::Signal { id, signal: ProcessSignal::Sigint }),
-                KeyCode::Char('d') => Some(ProcessPanelAction::SendKeys { id, keys: vec![ProcessKey::CtrlD] }),
-                _ => None,
+                KeyCode::Char('c') if self.active_process().is_some_and(|process| process.tty) => {
+                    ProcessKeyResult::Action(ProcessPanelAction::SendKeys {
+                        id,
+                        keys: vec![ProcessKey::CtrlC],
+                    })
+                }
+                KeyCode::Char('c') => ProcessKeyResult::Action(ProcessPanelAction::Signal {
+                    id,
+                    signal: ProcessSignal::Sigint,
+                }),
+                KeyCode::Char('d') => ProcessKeyResult::Action(ProcessPanelAction::SendKeys {
+                    id,
+                    keys: vec![ProcessKey::CtrlD],
+                }),
+                _ => ProcessKeyResult::Unknown,
             };
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Left => { self.view = ProcessPanelView::List; self.input = None; None }
-            KeyCode::Char('q') => Some(ProcessPanelAction::Close),
-            KeyCode::Tab => { self.view = if self.view == ProcessPanelView::Detail { ProcessPanelView::Logs } else { ProcessPanelView::Detail }; None }
-            KeyCode::Char('d') => { self.view = ProcessPanelView::Detail; None }
-            KeyCode::Char('l') => { self.view = ProcessPanelView::Logs; None }
-            KeyCode::Char('f') => { self.follow = !self.follow; if self.follow { self.log_scroll = 0; } None }
-            KeyCode::Char('t') | KeyCode::End => { self.follow = true; self.log_scroll = 0; None }
-            KeyCode::Up if self.view == ProcessPanelView::Logs => { self.follow = false; self.log_scroll = self.log_scroll.saturating_add(1); None }
-            KeyCode::Down if self.view == ProcessPanelView::Logs => { self.log_scroll = self.log_scroll.saturating_sub(1); if self.log_scroll == 0 { self.follow = true; } None }
-            KeyCode::PageUp if self.view == ProcessPanelView::Logs => { self.follow = false; self.log_scroll = self.log_scroll.saturating_add(10); None }
-            KeyCode::PageDown if self.view == ProcessPanelView::Logs => { self.log_scroll = self.log_scroll.saturating_sub(10); if self.log_scroll == 0 { self.follow = true; } None }
-            KeyCode::Char('i') => { self.input = Some(ProcessPanelInput::Text(String::new())); None }
-            KeyCode::Char('k') => { self.input = Some(ProcessPanelInput::Key { selected: 0 }); None }
-            KeyCode::Char('r') => { self.input = Some(ProcessPanelInput::Resize("24x80".to_owned())); None }
-            KeyCode::Char('g') => { self.input = Some(ProcessPanelInput::Signal { selected: 0 }); None }
-            KeyCode::Char('x') if self.active_process().is_some_and(|process| !process.state.is_terminal()) => { self.input = Some(ProcessPanelInput::ConfirmStop); None }
-            _ => None,
+            KeyCode::Esc | KeyCode::Left => {
+                self.view = ProcessPanelView::List;
+                self.input = None;
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('q') => ProcessKeyResult::Action(ProcessPanelAction::Close),
+            KeyCode::Tab => {
+                self.view = if self.view == ProcessPanelView::Detail {
+                    ProcessPanelView::Logs
+                } else {
+                    ProcessPanelView::Detail
+                };
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('d') => {
+                self.view = ProcessPanelView::Detail;
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('l') => {
+                self.view = ProcessPanelView::Logs;
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('f') => {
+                self.follow = !self.follow;
+                if self.follow {
+                    self.log_scroll = 0;
+                }
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('t') | KeyCode::End => {
+                self.follow = true;
+                self.log_scroll = 0;
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Up if self.view == ProcessPanelView::Logs => {
+                self.follow = false;
+                self.log_scroll = self.log_scroll.saturating_add(1);
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Down if self.view == ProcessPanelView::Logs => {
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+                if self.log_scroll == 0 {
+                    self.follow = true;
+                }
+                ProcessKeyResult::Handled
+            }
+            KeyCode::PageUp if self.view == ProcessPanelView::Logs => {
+                self.follow = false;
+                self.log_scroll = self.log_scroll.saturating_add(10);
+                ProcessKeyResult::Handled
+            }
+            KeyCode::PageDown if self.view == ProcessPanelView::Logs => {
+                self.log_scroll = self.log_scroll.saturating_sub(10);
+                if self.log_scroll == 0 {
+                    self.follow = true;
+                }
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('i') => {
+                self.input = Some(ProcessPanelInput::Text(String::new()));
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('k') => {
+                self.input = Some(ProcessPanelInput::Key { selected: 0 });
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('r') => {
+                self.input = Some(ProcessPanelInput::Resize("24x80".to_owned()));
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('g') => {
+                self.input = Some(ProcessPanelInput::Signal { selected: 0 });
+                ProcessKeyResult::Handled
+            }
+            KeyCode::Char('x')
+                if self
+                    .active_process()
+                    .is_some_and(|process| !process.state.is_terminal()) =>
+            {
+                self.input = Some(ProcessPanelInput::ConfirmStop);
+                ProcessKeyResult::Handled
+            }
+            _ => ProcessKeyResult::Unknown,
         }
     }
 
@@ -512,14 +625,17 @@ mod tests {
             process("00000000-0000-0000-0000-000000000002", ProcessState::Running, 2),
         ]);
         let newest = match panel.handle_key(key(KeyCode::Enter)) {
-            Some(ProcessPanelAction::Open(id)) => id,
+            ProcessKeyResult::Action(ProcessPanelAction::Open(id)) => id,
             action => panic!("expected open action, got {action:?}"),
         };
         assert_eq!(newest.as_str(), "00000000-0000-0000-0000-000000000002");
         assert_eq!(panel.view(), ProcessPanelView::Detail);
-        assert_eq!(panel.handle_key(key(KeyCode::Esc)), None);
+        assert_eq!(panel.handle_key(key(KeyCode::Esc)), ProcessKeyResult::Handled);
         assert_eq!(panel.view(), ProcessPanelView::List);
-        assert_eq!(panel.handle_key(key(KeyCode::Esc)), Some(ProcessPanelAction::Close));
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Esc)),
+            ProcessKeyResult::Action(ProcessPanelAction::Close)
+        );
     }
 
     #[test]
@@ -527,7 +643,10 @@ mod tests {
         let info = process("00000000-0000-0000-0000-000000000003", ProcessState::Running, 1);
         let id = info.id.clone();
         let mut panel = ProcessPanel::new(vec![info]);
-        assert!(matches!(panel.handle_key(key(KeyCode::Enter)), Some(ProcessPanelAction::Open(_))));
+        assert!(matches!(
+            panel.handle_key(key(KeyCode::Enter)),
+            ProcessKeyResult::Action(ProcessPanelAction::Open(_))
+        ));
         panel.apply_event(ProcessEvent::ProcessOutput {
             id: id.clone(),
             owner_id: pi_coding::ProcessOwnerId::new("test-owner"),
@@ -562,23 +681,50 @@ mod tests {
         panel.handle_key(key(KeyCode::Char('i')));
         panel.handle_key(key(KeyCode::Char('o')));
         panel.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(panel.handle_key(key(KeyCode::Enter)), Some(ProcessPanelAction::SendText { id: id.clone(), text: "ok".to_owned() }));
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter)),
+            ProcessKeyResult::Action(ProcessPanelAction::SendText {
+                id: id.clone(),
+                text: "ok".to_owned()
+            })
+        );
 
         panel.handle_key(key(KeyCode::Char('k')));
         panel.handle_key(key(KeyCode::Down));
-        assert_eq!(panel.handle_key(key(KeyCode::Enter)), Some(ProcessPanelAction::SendKeys { id: id.clone(), keys: vec![ProcessKey::Tab] }));
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter)),
+            ProcessKeyResult::Action(ProcessPanelAction::SendKeys {
+                id: id.clone(),
+                keys: vec![ProcessKey::Tab]
+            })
+        );
 
         panel.handle_key(key(KeyCode::Char('r')));
         for _ in 0..5 { panel.handle_key(key(KeyCode::Backspace)); }
         for character in "40x120".chars() { panel.handle_key(key(KeyCode::Char(character))); }
-        assert_eq!(panel.handle_key(key(KeyCode::Enter)), Some(ProcessPanelAction::Resize { id: id.clone(), size: ProcessTerminalSize { rows: 40, cols: 120 } }));
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter)),
+            ProcessKeyResult::Action(ProcessPanelAction::Resize {
+                id: id.clone(),
+                size: ProcessTerminalSize { rows: 40, cols: 120 }
+            })
+        );
 
         panel.handle_key(key(KeyCode::Char('g')));
         panel.handle_key(key(KeyCode::Down));
-        assert_eq!(panel.handle_key(key(KeyCode::Enter)), Some(ProcessPanelAction::Signal { id: id.clone(), signal: ProcessSignal::Sigterm }));
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Enter)),
+            ProcessKeyResult::Action(ProcessPanelAction::Signal {
+                id: id.clone(),
+                signal: ProcessSignal::Sigterm
+            })
+        );
 
         panel.handle_key(key(KeyCode::Char('x')));
-        assert_eq!(panel.handle_key(key(KeyCode::Char('y'))), Some(ProcessPanelAction::Stop(id)));
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char('y'))),
+            ProcessKeyResult::Action(ProcessPanelAction::Stop(id))
+        );
 
         panel.handle_key(key(KeyCode::Char('l')));
         panel.handle_key(key(KeyCode::Up));
@@ -596,13 +742,25 @@ mod tests {
         let id = pipe.id.clone();
         let mut panel = ProcessPanel::new(vec![pipe]);
         panel.handle_key(key(KeyCode::Enter));
-        assert_eq!(panel.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), Some(ProcessPanelAction::Signal { id, signal: ProcessSignal::Sigint }));
+        assert_eq!(
+            panel.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ProcessKeyResult::Action(ProcessPanelAction::Signal {
+                id,
+                signal: ProcessSignal::Sigint
+            })
+        );
 
         let pty = process("00000000-0000-0000-0000-000000000007", ProcessState::Running, 1);
         let id = pty.id.clone();
         let mut panel = ProcessPanel::new(vec![pty]);
         panel.handle_key(key(KeyCode::Enter));
-        assert_eq!(panel.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), Some(ProcessPanelAction::SendKeys { id, keys: vec![ProcessKey::CtrlC] }));
+        assert_eq!(
+            panel.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ProcessKeyResult::Action(ProcessPanelAction::SendKeys {
+                id,
+                keys: vec![ProcessKey::CtrlC]
+            })
+        );
     }
 
     #[test]
@@ -631,7 +789,7 @@ mod tests {
 
     #[test]
     fn wrapped_rows_use_terminal_display_width() {
-        assert_eq!(wrap_log_rows("ab界c", 4), vec!["ab界", "c"]);
+        assert_eq!(wrap_log_rows("ab🙂c", 4), vec!["ab🙂", "c"]);
     }
     #[test]
     fn invalid_resize_stays_open_and_reports_error() {
@@ -643,7 +801,7 @@ mod tests {
         panel.handle_key(key(KeyCode::Char('0')));
         panel.handle_key(key(KeyCode::Char('x')));
         panel.handle_key(key(KeyCode::Char('0')));
-        assert_eq!(panel.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(panel.handle_key(key(KeyCode::Enter)), ProcessKeyResult::Handled);
         assert!(matches!(panel.input, Some(ProcessPanelInput::Resize(_))));
         assert!(panel.notice.as_deref().unwrap().contains("non-zero"));
     }

@@ -31,6 +31,7 @@ use crate::import::{
     SourceSessionFormat,
 };
 use crate::default_session_dir;
+use crate::PreparedSessionResume;
 
 use self::discovery::{
     contains_component, is_grok_summary_depth, is_native_tree_session, matches_source_pattern,
@@ -680,6 +681,33 @@ impl SessionCatalog {
                     .map(|path| (kind, path))
                     .collect(),
             }),
+        }
+    }
+
+    /// Resolve and securely prepare a native session for resume while retaining
+    /// the same opened inode for parse and append.
+    pub fn prepare_native_resume(
+        &self,
+        input: impl AsRef<Path>,
+    ) -> Result<PreparedSessionResume, CatalogError> {
+        let path = self.resolve_for(SessionSourceKind::NativePi, input)?;
+        let root = self.root_for(SessionSourceKind::NativePi).path;
+        if path_lexically_under_root(&path, &root) {
+            PreparedSessionResume::prepare_under_root(&root, &path).map_err(|error| {
+                CatalogError::Import(ImportSessionError::InvalidInput {
+                    format: SourceSessionFormat::Pi,
+                    path,
+                    reason: format!("{error:#}"),
+                })
+            })
+        } else {
+            PreparedSessionResume::prepare_path(&path).map_err(|error| {
+                CatalogError::Import(ImportSessionError::InvalidInput {
+                    format: SourceSessionFormat::Pi,
+                    path,
+                    reason: format!("{error:#}"),
+                })
+            })
         }
     }
 

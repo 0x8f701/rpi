@@ -93,6 +93,10 @@ pub struct RetryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_delay_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_fallback: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_chains: Option<crate::RetryFallbackChains>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderRetryConfig>,
 }
 
@@ -261,6 +265,8 @@ pub struct RuntimeSettingsState {
     pub auto_retry: bool,
     pub max_retries: usize,
     pub base_delay_ms: u64,
+    pub model_fallback: bool,
+    pub fallback_chains: crate::RetryFallbackChains,
     pub compaction_enabled: bool,
     pub compaction_reserve_tokens: i64,
     pub compaction_keep_recent_tokens: i64,
@@ -305,6 +311,8 @@ impl RuntimeSettingsSnapshot {
             auto_retry: self.retry.enabled,
             max_retries: self.retry.max_retries,
             base_delay_ms: self.retry.base_delay_ms,
+            model_fallback: self.retry.model_fallback,
+            fallback_chains: self.retry.fallback_chains.clone(),
             compaction_enabled: self.compaction.enabled,
             compaction_reserve_tokens: self.compaction.reserve_tokens,
             compaction_keep_recent_tokens: self.compaction.keep_recent_tokens,
@@ -624,6 +632,10 @@ impl Settings {
                 .and_then(|value| value.base_delay_ms)
                 .or(self.base_delay_ms)
                 .unwrap_or(2_000),
+            model_fallback: retry.and_then(|value| value.model_fallback).unwrap_or(true),
+            fallback_chains: retry
+                .and_then(|value| value.fallback_chains.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -1104,33 +1116,52 @@ fn parse_legacy_agent_override(name: &str, value: &Value) -> Result<AgentRuntime
     })
 }
 
-/// Paths that have already emitted the legacy `agentOverrides` deprecation
-/// warning in this process. Keyed by the settings path string so global and
-/// project files each warn once and repeated loads of the same path stay quiet.
-static LEGACY_AGENT_MIGRATION_WARNED_PATHS: LazyLock<Mutex<HashSet<String>>> =
+/// Process-wide dedupe keys for settings diagnostics (legacy migration path
+/// strings, or `path\0subagents.<key>` for ignored agent-config fields).
+static SETTINGS_DIAGNOSTIC_WARNED_KEYS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[cfg(test)]
 thread_local! {
-    /// When set, warnings from this thread are collected instead of printed.
-    /// Thread-local so parallel settings tests cannot pollute each other's
-    /// capture buffers or suppress foreign-thread diagnostics.
-    static LEGACY_AGENT_MIGRATION_WARN_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
+    /// When set, settings diagnostics from this thread are collected instead of
+    /// printed. Thread-local so parallel settings tests cannot pollute each
+    /// other's capture buffers or suppress foreign-thread diagnostics.
+    static SETTINGS_DIAGNOSTIC_WARN_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Emit a settings diagnostic once per process-wide dedupe key.
+fn emit_settings_diagnostic(dedupe_key: String, message: String) {
+    {
+        let mut warned = SETTINGS_DIAGNOSTIC_WARNED_KEYS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !warned.insert(dedupe_key) {
+            return;
+        }
+    }
+    #[cfg(test)]
+    {
+        let captured = SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            if let Some(log) = capture.as_mut() {
+                log.push(message.clone());
+                true
+            } else {
+                false
+            }
+        });
+        if captured {
+            return;
+        }
+    }
+    // Diagnostics go to stderr so structured stdout (JSON/RPC) stays clean.
+    eprintln!("{message}");
 }
 
 fn warn_legacy_agent_migration(path: &Path, migration: &LegacyAgentMigration) {
     if !migration.needs_rewrite {
         return;
-    }
-    let key = path.to_string_lossy().into_owned();
-    {
-        let mut warned = LEGACY_AGENT_MIGRATION_WARNED_PATHS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !warned.insert(key) {
-            return;
-        }
     }
     let detail = match (migration.merged, migration.conflicts) {
         (true, 0) => "legacy-only entries were merged into top-level agents".to_owned(),
@@ -1148,33 +1179,78 @@ fn warn_legacy_agent_migration(path: &Path, migration: &LegacyAgentMigration) {
          The file will be rewritten in canonical form on the next settings save.",
         path.display()
     );
-    #[cfg(test)]
-    {
-        let captured = LEGACY_AGENT_MIGRATION_WARN_CAPTURE.with(|capture| {
-            let mut capture = capture.borrow_mut();
-            if let Some(log) = capture.as_mut() {
-                log.push(message.clone());
-                true
-            } else {
-                false
-            }
-        });
-        if captured {
-            return;
-        }
+    // One deprecation notice per settings file path.
+    emit_settings_diagnostic(path.to_string_lossy().into_owned(), message);
+}
+
+/// Known nested keys under `subagents` that look like agent configuration but
+/// are not migrated (only `agentOverrides` is). Arbitrary metadata is retained
+/// silently; these names always warn so mis-nested config is not silent.
+const UNSUPPORTED_SUBAGENTS_AGENT_KEYS: &[&str] =
+    &["agents", "models", "agentModels", "tools", "defaults"];
+
+fn value_looks_like_agent_runtime_config(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.contains_key("enabled") || object.contains_key("model") || object.contains_key("tools")
+}
+
+/// True when a remaining `subagents.<key>` value looks like agent configuration:
+/// a single agent runtime object, or a map of agent-name → runtime objects.
+fn value_looks_like_agent_config_tree(value: &Value) -> bool {
+    if value_looks_like_agent_runtime_config(value) {
+        return true;
     }
-    eprintln!("{message}");
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    !object.is_empty() && object.values().any(value_looks_like_agent_runtime_config)
+}
+
+fn is_unsupported_agentish_subagents_field(key: &str, value: &Value) -> bool {
+    if UNSUPPORTED_SUBAGENTS_AGENT_KEYS.contains(&key) {
+        return true;
+    }
+    // `agentOverrides` is handled by migration + its own deprecation warning.
+    if key == "agentOverrides" {
+        return false;
+    }
+    value_looks_like_agent_config_tree(value)
+}
+
+/// Warn once per settings path + field for remaining agent-config-looking keys
+/// under `subagents`. Unknown non-agent metadata is preserved without warning.
+fn warn_unsupported_subagents_fields(path: &Path, settings: &Settings) {
+    let Some(subagents_value) = settings.extra.get("subagents") else {
+        return;
+    };
+    let Some(subagents) = subagents_value.as_object() else {
+        return;
+    };
+    let path_display = path.display().to_string();
+    for (key, value) in subagents {
+        if !is_unsupported_agentish_subagents_field(key, value) {
+            continue;
+        }
+        let message = format!(
+            "{path_display} contains unsupported subagents.{key}; this setting is ignored. \
+             Move agent configuration to top-level agents.<name>.{{enabled,model,tools}}."
+        );
+        let dedupe_key = format!("{path_display}\0subagents.{key}");
+        emit_settings_diagnostic(dedupe_key, message);
+    }
 }
 
 #[cfg(test)]
-fn capture_legacy_agent_migration_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+fn capture_settings_diagnostics<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     // Unique temp paths make process-wide path state safe without clearing:
     // each capture body only asserts on warnings for the paths it loads.
-    LEGACY_AGENT_MIGRATION_WARN_CAPTURE.with(|capture| {
+    SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
         *capture.borrow_mut() = Some(Vec::new());
     });
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    let messages = LEGACY_AGENT_MIGRATION_WARN_CAPTURE.with(|capture| {
+    let messages = SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
         capture.borrow_mut().take().unwrap_or_default()
     });
     match result {
@@ -1182,6 +1258,13 @@ fn capture_legacy_agent_migration_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
+
+#[cfg(test)]
+fn capture_legacy_agent_migration_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    capture_settings_diagnostics(f)
+}
+
+
 
 
 fn load_settings_file(path: &Path, scope: SettingsScope) -> Result<Settings> {
@@ -1231,6 +1314,7 @@ fn load_settings_file(path: &Path, scope: SettingsScope) -> Result<Settings> {
     })?;
     validate_settings(&settings, scope, path)?;
     warn_legacy_agent_migration(path, &migration);
+    warn_unsupported_subagents_fields(path, &settings);
     Ok(settings)
 }
 
@@ -1323,6 +1407,28 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
     }
     if settings.retry.as_ref().and_then(|value| value.base_delay_ms).or(settings.base_delay_ms).is_some_and(|value| value == 0) {
         bail!("retry.baseDelayMs must be greater than zero");
+    }
+    if let Some(chains) = settings.retry.as_ref().and_then(|value| value.fallback_chains.as_ref()) {
+        for (key, chain) in chains {
+            if key.trim().is_empty() {
+                bail!("retry.fallbackChains contains an empty key");
+            }
+            if !chain.iter().any(|selector| !selector.trim().is_empty()) {
+                bail!("retry.fallbackChains entry '{key}' must contain at least one selector");
+            }
+            for selector in chain {
+                let trimmed = selector.trim();
+                if trimmed.is_empty() {
+                    bail!("retry.fallbackChains entry '{key}' contains an empty selector");
+                }
+                if crate::is_retry_fallback_wildcard_key(trimmed) {
+                    continue;
+                }
+                if crate::parse_retry_fallback_selector(trimmed, None::<&crate::CatalogModelLookup>).is_none() {
+                    bail!("retry.fallbackChains entry '{key}' has invalid selector '{trimmed}'");
+                }
+            }
+        }
     }
     if settings.temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
         bail!("temperature must be finite and between 0 and 2");
@@ -1827,6 +1933,181 @@ mod tests {
             "project path warned: {warnings:?}"
         );
     }
+
+    #[test]
+    fn unsupported_subagents_agent_keys_warn_once_per_path_key() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+              "subagents": {
+                "agents": {
+                  "reviewer": {"enabled": false, "model": "openai/gpt-4.1"}
+                },
+                "models": {"reviewer": "anthropic/claude-sonnet-4-5"},
+                "keepMe": {"x": 1}
+              }
+            }"#,
+        )
+        .expect("write unsupported nested agents");
+
+        let (loaded, warnings) = capture_settings_diagnostics(|| {
+            let first = load_settings_file(&path, SettingsScope::Global).expect("load 1");
+            let second = load_settings_file(&path, SettingsScope::Global).expect("load 2");
+            (first, second)
+        });
+        let (first, second) = loaded;
+
+        assert_eq!(
+            warnings.len(),
+            2,
+            "each unsupported key warns once: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.contains(&path.display().to_string())
+                    && warning.contains("unsupported subagents.agents")
+                    && warning.contains("top-level agents.<name>.{enabled,model,tools}")
+            }),
+            "agents key warned: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.contains(&path.display().to_string())
+                    && warning.contains("unsupported subagents.models")
+            }),
+            "models key warned: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("subagents.keepMe")),
+            "arbitrary metadata must stay silent: {warnings:?}"
+        );
+        assert!(first.agents.is_empty(), "ignored nested agents must not migrate");
+        assert_eq!(
+            first.extra.get("subagents").and_then(|value| value.get("agents")),
+            second.extra.get("subagents").and_then(|value| value.get("agents")),
+            "unsupported fields remain in extra"
+        );
+        assert_eq!(
+            first
+                .extra
+                .get("subagents")
+                .and_then(|value| value.get("keepMe"))
+                .and_then(|value| value.get("x")),
+            Some(&Value::Number(1.into()))
+        );
+    }
+
+    #[test]
+    fn unsupported_subagents_agentish_maps_warn_and_preserve_unknowns_on_save() {
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let path = agent.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+              "subagents": {
+                "agentModels": {"reviewer": "openai/gpt-4.1"},
+                "tools": ["read"],
+                "defaults": {"enabled": true},
+                "reviewer": {"enabled": false, "tools": ["grep"]},
+                "otherLegacy": {"keep": true}
+              }
+            }"#,
+        )
+        .expect("seed unsupported nested config");
+
+        let (manager, warnings) = capture_settings_diagnostics(|| {
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("load")
+        });
+
+        let warned_keys = ["agentModels", "tools", "defaults", "reviewer"];
+        for key in warned_keys {
+            assert!(
+                warnings.iter().any(|warning| {
+                    warning.contains(&format!("unsupported subagents.{key}"))
+                        && warning.contains("this setting is ignored")
+                        && warning.contains("top-level agents")
+                }),
+                "expected warning for subagents.{key}: {warnings:?}"
+            );
+        }
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains("subagents.otherLegacy")),
+            "non-agent metadata must not warn: {warnings:?}"
+        );
+        assert_eq!(
+            warnings.len(),
+            warned_keys.len(),
+            "exactly one warning per unsupported key: {warnings:?}"
+        );
+        assert!(manager.settings().agents.is_empty());
+
+        manager
+            .update_global(|settings| {
+                settings.quiet_startup = Some(true);
+            })
+            .expect("save");
+
+        let raw = fs::read_to_string(&path).expect("read rewritten");
+        for key in ["agentModels", "tools", "defaults", "reviewer", "otherLegacy"] {
+            assert!(
+                raw.contains(&format!("\"{key}\"")),
+                "canonical save must preserve unknown subagents field {key}: {raw}"
+            );
+        }
+        assert!(
+            !raw.contains("agentOverrides"),
+            "no accidental agentOverrides injection: {raw}"
+        );
+
+        let (_, reload_warnings) = capture_settings_diagnostics(|| {
+            SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload")
+        });
+        assert!(
+            reload_warnings.is_empty(),
+            "same path+key must not warn again after reload: {reload_warnings:?}"
+        );
+    }
+
+    #[test]
+    fn plain_subagents_metadata_does_not_warn() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+              "subagents": {
+                "keepMe": 1,
+                "otherLegacy": {"keep": true},
+                "note": "freeform"
+              }
+            }"#,
+        )
+        .expect("write metadata-only subagents");
+
+        let (loaded, warnings) = capture_settings_diagnostics(|| {
+            load_settings_file(&path, SettingsScope::Global).expect("load")
+        });
+        assert!(
+            warnings.is_empty(),
+            "non-agent metadata must stay silent: {warnings:?}"
+        );
+        let subagents = loaded.extra.get("subagents").expect("subagents retained");
+        assert_eq!(subagents.get("keepMe"), Some(&Value::Number(1.into())));
+        assert_eq!(
+            subagents
+                .get("otherLegacy")
+                .and_then(|value| value.get("keep")),
+            Some(&Value::Bool(true))
+        );
+    }
+
 
 
     #[test]

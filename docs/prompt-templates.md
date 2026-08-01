@@ -84,8 +84,8 @@ If a project has no `.pi` directory at all, it is trusted by default because the
 CLI flags:
 
 ```sh
-pi --prompt-template ./prompts/review.md          # load an explicit template for interactive use
-pi --no-prompt-templates --print "hello"          # disables discovered/configured templates, explicit paths still load
+rpi --prompt-template ./prompts/review.md          # load an explicit template for interactive use
+rpi --no-prompt-templates --print "hello"          # disables discovered/configured templates, explicit paths still load
 ```
 
 ### Safe path containment
@@ -134,7 +134,7 @@ $ARGUMENTS
 EOF
 ```
 
-In an interactive `pi` session:
+In an interactive `rpi` session:
 
 ```
 /review src/main.rs src/lib.rs

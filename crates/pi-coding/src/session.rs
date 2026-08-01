@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     io::Write,
     path::{Path, PathBuf},
@@ -28,17 +28,24 @@ use uuid::Uuid;
 
 use crate::system_prompt::BuildSystemPromptOptions;
 use crate::{
-    BashProcessContext, CompactionDetails, CompactionResult, CompactionSettings, GoalRuntime,
-    ProcessManager, ProcessOwnerId, RequestAuth, ResourceManager, SessionRecorder,
+    BashProcessContext, CompactionDetails, CompactionResult, CompactionSettings, GoalLifecycle,
+    GoalRuntime, GoalState, ProcessManager, ProcessOwnerId, RequestAuth, ResourceManager,
+    SessionRecorder,
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
     UPDATE_SUMMARIZATION_PROMPT, TodoApplyResult, TodoOp, TodoPhase, TodoRuntime, TodoState,
     TodoStorage, apply_checkpoint, build_system_prompt, compute_file_lists, create_todo_tool,
     estimate_context_tokens_usage_aware, find_cut_point, format_file_operations,
-    is_context_overflow, is_retryable_assistant_error, load_context_files,
-    load_project_context_files, load_skills, load_skills_trusted, messages_as_llm, process_tool,
-    serialize_conversation, should_compact, tool_snippet,
+    ActiveRetryFallbackState, CatalogModelLookup, RetryFallbackModelLookup,
+    RetryFallbackResolutionContext, aggregate_retry_diagnostics, find_retry_fallback_candidates,
+    format_retry_fallback_selector, is_context_overflow, is_hard_error_fallback_eligible,
+    is_retryable_assistant_error,
+    load_context_files, load_project_context_files, load_skills, load_skills_trusted,
+    messages_as_llm, process_tool, resolve_retry_fallback_chain_key, serialize_conversation,
+    should_compact, tool_snippet,
 };
 pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
+/// Ephemeral custom message type projected only into parent model requests.
+pub const ACTIVE_GOAL_CUSTOM_TYPE: &str = "pi.goal.active";
 
 /// Result of applying a thinking-level change after model capability clamping.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -143,6 +150,8 @@ struct SessionRuntime {
     retry_settings: RwLock<RetrySettings>,
     retry_controller: Mutex<Option<AbortController>>,
     retry_attempt: AtomicUsize,
+    active_retry_fallback: Mutex<Option<ActiveRetryFallbackState>>,
+    fallback_attempt_errors: Mutex<Vec<String>>,
     events: broadcast::Sender<SessionEvent>,
     pending_next_turn: Mutex<Vec<Message>>,
     stream_options: RwLock<SimpleStreamOptions>,
@@ -348,17 +357,31 @@ pub struct RunResult {
     pub error_message: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrySettings {
     pub enabled: bool,
     pub max_retries: usize,
     pub base_delay_ms: u64,
+    #[serde(default = "default_model_fallback")]
+    pub model_fallback: bool,
+    #[serde(default, skip_serializing_if = "crate::RetryFallbackChains::is_empty")]
+    pub fallback_chains: crate::RetryFallbackChains,
+}
+
+fn default_model_fallback() -> bool {
+    true
 }
 
 impl Default for RetrySettings {
     fn default() -> Self {
-        Self { enabled: true, max_retries: 3, base_delay_ms: 2_000 }
+        Self {
+            enabled: true,
+            max_retries: 3,
+            base_delay_ms: 2_000,
+            model_fallback: true,
+            fallback_chains: crate::RetryFallbackChains::default(),
+        }
     }
 }
 
@@ -375,6 +398,8 @@ pub enum SummarizationSource { Compaction, BranchSummary }
 pub enum SessionEvent {
     AutoRetryStart { attempt: usize, max_attempts: usize, delay_ms: u64, error_message: String },
     AutoRetryEnd { success: bool, attempt: usize, #[serde(skip_serializing_if = "Option::is_none")] final_error: Option<String> },
+    RetryFallbackApplied { from: String, to: String, role: String },
+    RetryFallbackSucceeded { model: String, role: String },
     BashExecutionUpdate { #[serde(skip_serializing_if = "Option::is_none")] id: Option<String>, delta: String },
     BashExecutionEnd { message: BashExecutionMessage },
     CompactionStart { reason: CompactionReason },
@@ -452,6 +477,57 @@ pub struct NavigateTreeResult {
 }
 
 
+fn goal_context_message(state: &GoalState) -> Option<Message> {
+    let goal = state
+        .current
+        .as_ref()
+        .filter(|goal| goal.lifecycle != GoalLifecycle::Dropped)?;
+    let lifecycle = match goal.lifecycle {
+        GoalLifecycle::Active => "active",
+        GoalLifecycle::Paused => "paused",
+        GoalLifecycle::Completed => "completed",
+        GoalLifecycle::Dropped => unreachable!("dropped goals are filtered above"),
+    };
+    let objective = escape_goal_objective(&goal.objective);
+    let budget = goal
+        .token_budget
+        .map_or_else(|| "unlimited".to_owned(), |budget| budget.to_string());
+    let content = format!(
+        "<system-reminder>\nActive session goal (revision {}, lifecycle {lifecycle}).\nObjective: {objective}\nToken budget: {}/{budget}.\nKeep this goal in scope. Use the goal tool to inspect, pause, or complete it when appropriate.\n</system-reminder>",
+        state.revision, goal.usage.tokens_used
+    );
+    Some(Message::Custom(CustomMessage {
+        custom_type: ACTIVE_GOAL_CUSTOM_TYPE.to_owned(),
+        content: content.into(),
+        display: false,
+        details: serde_json::to_value(state).ok(),
+        timestamp: pi_ai::now_millis(),
+    }))
+}
+
+fn escape_goal_objective(objective: &str) -> String {
+    let mut escaped = String::with_capacity(objective.len());
+    let mut chars = objective.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                escaped.push('\n');
+            }
+            character if character.is_control() && character != '\n' && character != '\t' => {
+                escaped.push(' ');
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ToolSelection {
     pub allow: Option<Vec<String>>,
@@ -479,6 +555,7 @@ pub struct ChildSessionOptionsSnapshot {
 pub struct Session {
     inner: Arc<SessionInner>,
 }
+
 
 impl Session {
     pub fn new(options: SessionOptions) -> Result<Self> {
@@ -712,6 +789,8 @@ impl Session {
             retry_settings: RwLock::new(RetrySettings::default()),
             retry_controller: Mutex::new(None),
             retry_attempt: AtomicUsize::new(0),
+            active_retry_fallback: Mutex::new(None),
+            fallback_attempt_errors: Mutex::new(Vec::new()),
             events,
             stream_options: RwLock::new(stream_options.clone()),
             recorded_count: AtomicUsize::new(0),
@@ -884,6 +963,7 @@ impl Session {
         } else {
             effective_stream_fn.clone()
         };
+        let goal_runtime = shared.clone();
         let agent = Agent::new(AgentOptions {
             initial_state: AgentState {
                 system_prompt: system_prompt.clone(),
@@ -897,7 +977,12 @@ impl Session {
             get_api_key: Some(Arc::new(move |_| {
                 Some(key_runtime.state.read().api_key.clone())
             })),
-            convert_to_llm: Some(Arc::new(|messages| Ok(pi_ai::messages_to_llm(&messages)))),
+            convert_to_llm: Some(Arc::new(move |mut messages| {
+                if let Some(message) = goal_context_message(&goal_runtime.goal.read().get()) {
+                    messages.push(message);
+                }
+                Ok(pi_ai::messages_to_llm(&messages))
+            })),
             transform_context: None,
             before_tool_call,
             after_tool_call: Some(compose_bash_spill_after_tool_call(
@@ -993,6 +1078,8 @@ impl Session {
         }
     }
 
+
+
     #[must_use]
     pub fn stream_options(&self) -> SimpleStreamOptions {
         self.inner.shared.stream_options.read().clone()
@@ -1049,6 +1136,17 @@ impl Session {
     #[must_use]
     pub fn todo_state(&self) -> TodoState {
         self.inner.todo.state()
+    }
+    pub(crate) fn set_todo_mutation_transaction(&self, transaction: crate::todo::TodoMutationTransaction) {
+        self.inner.todo.set_mutation_transaction(transaction);
+    }
+
+    pub(crate) fn apply_todo_raw(&self, op: TodoOp) -> Result<TodoApplyResult> {
+        self.inner.todo.apply_raw(op).inspect_err(|_| self.schedule_todo_reminder())
+    }
+
+    pub(crate) fn set_todos_raw(&self, phases: Vec<TodoPhase>) -> Result<TodoApplyResult> {
+        self.inner.todo.set_phases_raw(phases)
     }
 
     pub fn apply_todo(&self, op: TodoOp) -> Result<TodoApplyResult> {
@@ -1522,6 +1620,11 @@ impl Session {
 
 
     pub fn set_model(&self, model: Model, api_key: String) -> ThinkingLevelChange {
+        self.clear_active_retry_fallback();
+        self.set_model_internal(model, api_key)
+    }
+
+    fn set_model_internal(&self, model: Model, api_key: String) -> ThinkingLevelChange {
         let change = {
             let mut state = self.inner.shared.state.write();
             let requested = state.thinking_level;
@@ -1538,6 +1641,22 @@ impl Session {
             }
         }
         change
+    }
+
+    #[must_use]
+    pub fn retry_fallback_model(&self) -> Option<String> {
+        self.inner.shared.active_retry_fallback.lock().as_ref()?;
+        self.model().map(|model| {
+            format_retry_fallback_selector(
+                &model,
+                Some(thinking_level_name(self.thinking_level())),
+            )
+        })
+    }
+
+    pub fn clear_active_retry_fallback(&self) {
+        *self.inner.shared.active_retry_fallback.lock() = None;
+        self.inner.shared.fallback_attempt_errors.lock().clear();
     }
 
     pub async fn set_model_with_resolved_auth(&self, model: Model) -> Result<ThinkingLevelChange> {
@@ -1813,7 +1932,7 @@ impl Session {
             .ok()
             .flatten()
             .map_or_else(Vec::new, |state| state.phases);
-        let _ = self.inner.todo.restore_open(phases);
+        self.inner.todo.restore_state(phases)?;
         *self.inner.shared.session_name.write() = recorder.session_name();
         *self.inner.shared.recorder.lock() = Some(Arc::new(recorder));
         *self.inner.shared.goal.write() = goal;
@@ -1844,17 +1963,26 @@ impl Session {
     }
 
     pub async fn switch_session(&self, path: &Path) -> Result<()> {
-        let tree = crate::load_session_tree(path)?;
-        if !tree.header.cwd.as_os_str().is_empty() && tree.header.cwd != self.inner.cwd {
+        self.switch_prepared_session(crate::PreparedSessionResume::prepare_path(path)?)
+            .await
+    }
+
+    pub async fn switch_prepared_session(
+        &self,
+        prepared: crate::PreparedSessionResume,
+    ) -> Result<()> {
+        if !prepared.target_cwd().as_os_str().is_empty()
+            && prepared.target_cwd() != self.inner.cwd
+        {
             return Err(anyhow!(
                 "session working directory {} does not match {}",
-                tree.header.cwd.display(),
+                prepared.target_cwd().display(),
                 self.inner.cwd.display()
             ));
         }
-        // Drop spills from the outgoing conversation before loading the new one.
+        let context = prepared.build_context();
+        let recorder = prepared.into_recorder()?;
         self.cleanup_bash_spills();
-        let context = tree.build_context(None);
         self.load_history(context.messages).await?;
         if let Some(provider) = context.provider.as_deref()
             && let Some(model_id) = context.model_id.as_deref()
@@ -1864,7 +1992,7 @@ impl Session {
             self.set_model(model, api_key);
         }
         self.set_thinking_level(parse_recorded_thinking_level(&context.thinking_level));
-        self.record(crate::resume_session(path)?)?;
+        self.record(recorder)?;
         Ok(())
     }
 
@@ -1924,9 +2052,12 @@ impl Session {
             None
         };
         let active_leaf_id = recorder.active_leaf_id();
-        let context = recorder.tree()?.build_context(None);
+        let tree = recorder.tree()?;
+        let context = tree.build_context(None);
+        let todo_phases = tree.latest_todo_state().map_or_else(Vec::new, |state| state.phases);
         self.inner.agent.set_messages(context.messages.clone()).await;
         self.inner.shared.state.write().messages = context.messages;
+        self.inner.todo.restore_state(todo_phases)?;
         *self.inner.shared.compaction_runtime.lock() = CompactionRuntime::default();
         self.inner.shared.compaction_active.store(false, Ordering::Release);
         *self.inner.shared.goal.write() = GoalRuntime::from_session_recorder((*recorder).clone())
@@ -2093,12 +2224,13 @@ impl Session {
 
     #[must_use]
     pub fn retry_settings(&self) -> RetrySettings {
-        *self.inner.shared.retry_settings.read()
+        self.inner.shared.retry_settings.read().clone()
     }
 
     pub fn set_retry_settings(&self, settings: RetrySettings) {
+        let enabled = settings.enabled;
         *self.inner.shared.retry_settings.write() = settings;
-        if !settings.enabled {
+        if !enabled {
             self.abort_retry();
         }
     }
@@ -2480,6 +2612,15 @@ impl Session {
         self.finish_run(claim, operation).await
     }
 
+    fn is_expanded_skill_command(request: &str, name: &str, body: &str) -> bool {
+        let uri = format!("skill://{name}");
+        let wrapper = format!(
+            "<skill name=\"{name}\" location=\"{uri}\">\nReferences are relative to {uri}/.\n\n{}\n</skill>",
+            body.trim()
+        );
+        request == wrapper || request.strip_prefix(&wrapper).is_some_and(|rest| rest.starts_with("\n\n"))
+    }
+
     async fn inject_selection_messages(&self, mut messages: Vec<Message>) -> Vec<Message> {
         let request = messages.iter().rev().find_map(|message| match message {
             Message::User(user) => Some(content_text(&user.content)),
@@ -2498,7 +2639,10 @@ impl Session {
         let autoload = crate::load_autoload_skill_bodies(
             &plan,
             &self.inner.shared.selector_skills.read(),
-        );
+        )
+        .into_iter()
+        .filter(|(name, body)| !Self::is_expanded_skill_command(&request, name, body))
+        .collect::<Vec<_>>();
         if prompt.is_empty() && autoload.is_empty() {
             return messages;
         }
@@ -2532,7 +2676,7 @@ impl Session {
                 Message::Custom(CustomMessage {
                     custom_type: "todo-error-reminder".to_owned(),
                     content: format!(
-                        "A previous todo operation failed. Reconcile the canonical todo state before continuing:\n{}",
+                        "A previous todo operation failed. Reconcile the canonical todo DAG before continuing. Prefer any ready task; phase order is presentation only, and blockedBy explains what remains unsatisfied:\n{}",
                         serde_json::to_string(&state).unwrap_or_default()
                     )
                     .into(),
@@ -2548,60 +2692,162 @@ impl Session {
 
     async fn execute_with_retries(&self, initial: Option<Vec<Message>>) -> Result<()> {
         self.inner.shared.overflow_recovery_attempted.store(false, Ordering::Release);
+        self.inner.shared.fallback_attempt_errors.lock().clear();
         let mut operation = match initial {
-            Some(messages) => self.settle_operation(self.inner.agent.prompt_messages(self.prepare_initial_messages(messages))).await,
+            Some(messages) => {
+                self.settle_operation(
+                    self.inner
+                        .agent
+                        .prompt_messages(self.prepare_initial_messages(messages)),
+                )
+                .await
+            }
             None => self.settle_operation(self.inner.agent.continue_run()).await,
         };
         let mut attempt = 0usize;
         loop {
             let state = self.inner.agent.state().await;
             let Some(Message::Assistant(failure)) = state.messages.last().cloned() else {
-                self.inner.shared.retry_attempt.store(0, Ordering::Release);
+                self.finish_retry_success(attempt);
                 return operation;
             };
+            // Successful assistant turns end the retry/fallback saga. Only Error
+            // (and overflow) stops continue into recovery; otherwise primary or
+            // fallback success must emit lifecycle completion and return.
+            if failure.stop_reason != StopReason::Error {
+                self.finish_retry_success(attempt);
+                return operation;
+            }
             if is_context_overflow(&failure, state.model.context_window) {
-                if self.inner.shared.overflow_recovery_attempted.swap(true, Ordering::AcqRel) {
+                if self
+                    .inner
+                    .shared
+                    .overflow_recovery_attempted
+                    .swap(true, Ordering::AcqRel)
+                {
                     self.inner.shared.retry_attempt.store(0, Ordering::Release);
-                    return Err(anyhow!("Context overflow persisted after automatic compaction. Reduce the prompt or start a new session."));
+                    return Err(anyhow!(
+                        "Context overflow persisted after automatic compaction. Reduce the prompt or start a new session."
+                    ));
                 }
                 let mut live_messages = state.messages;
                 live_messages.pop();
                 self.inner.agent.set_messages(live_messages).await;
-                self.perform_compaction(CompactionReason::Overflow, true, None).await
+                self.perform_compaction(CompactionReason::Overflow, true, None)
+                    .await
                     .map_err(|error| anyhow!("Context overflow recovery failed: {error}"))?;
                 operation = self.settle_operation(self.inner.agent.continue_run()).await;
                 continue;
             }
-            if !is_retryable_assistant_error(&failure) {
+
+            let settings = self.retry_settings();
+            let retryable = is_retryable_assistant_error(&failure);
+            let has_tool_call = failure
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)));
+            let lower_error = failure
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_abort = failure.stop_reason == StopReason::Aborted
+                || lower_error.contains("aborted")
+                || lower_error.contains("cancelled");
+            let error_message = failure
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "transient provider error".to_owned());
+            self.inner
+                .shared
+                .fallback_attempt_errors
+                .lock()
+                .push(error_message.clone());
+
+            let current_selector = format_retry_fallback_selector(
+                &state.model,
+                Some(thinking_level_name(state.thinking_level)),
+            );
+            let may_fallback = settings.enabled
+                && settings.model_fallback
+                && !has_tool_call
+                && !is_abort
+                && (retryable
+                    || is_hard_error_fallback_eligible(
+                        failure.stop_reason == StopReason::Error,
+                        retryable,
+                        has_tool_call,
+                        false,
+                        is_abort,
+                        settings.model_fallback,
+                        true,
+                    ));
+            let switched_model = if may_fallback {
+                self.try_apply_retry_model_fallback(&current_selector, &state.model)
+                    .await
+            } else {
+                false
+            };
+
+            if switched_model {
+                attempt = 0;
                 self.inner.shared.retry_attempt.store(0, Ordering::Release);
+                let mut live_messages = state.messages;
+                let _failed = live_messages.pop();
+                let (next_model, next_thinking) = {
+                    let shared = self.inner.shared.state.read();
+                    (shared.model.clone(), shared.thinking_level)
+                };
+                self.inner.agent.set_model(next_model).await;
+                self.inner.agent.set_thinking_level(next_thinking).await;
+                self.inner.agent.set_messages(live_messages).await;
+                self.inner.agent.clear_error_message().await;
+                operation = self.settle_operation(self.inner.agent.continue_run()).await;
+                continue;
+            }
+
+            if !retryable {
+                self.finish_retry_failure(attempt, &error_message);
                 return operation;
             }
-            let settings = self.retry_settings();
             if !settings.enabled || attempt >= settings.max_retries {
-                if attempt > 0 { self.publish_session_event(SessionEvent::AutoRetryEnd { success: false, attempt, final_error: failure.error_message.clone() }); }
-                self.inner.shared.retry_attempt.store(0, Ordering::Release);
+                self.finish_retry_failure(attempt, &error_message);
                 return operation;
             }
             attempt += 1;
             self.inner.shared.retry_attempt.store(attempt, Ordering::Release);
-            let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX).min(63);
+            let shift = u32::try_from(attempt.saturating_sub(1))
+                .unwrap_or(u32::MAX)
+                .min(63);
             let delay_ms = settings.base_delay_ms.saturating_mul(1u64 << shift);
-            let error_message = failure.error_message.clone().unwrap_or_else(|| "transient provider error".to_owned());
             let (controller, abort) = AbortController::new();
             *self.inner.shared.retry_controller.lock() = Some(controller);
-            self.publish_session_event(SessionEvent::AutoRetryStart { attempt, max_attempts: settings.max_retries, delay_ms, error_message });
+            self.publish_session_event(SessionEvent::AutoRetryStart {
+                attempt,
+                max_attempts: settings.max_retries,
+                delay_ms,
+                error_message: crate::redact_retry_diagnostic(&error_message),
+            });
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
                 () = abort.cancelled() => {
                     self.inner.shared.retry_controller.lock().take();
-                    self.publish_session_event(SessionEvent::AutoRetryEnd { success: false, attempt, final_error: Some("Retry cancelled".to_owned()) });
+                    self.publish_session_event(SessionEvent::AutoRetryEnd {
+                        success: false,
+                        attempt,
+                        final_error: Some("Retry cancelled".to_owned()),
+                    });
                     self.inner.shared.retry_attempt.store(0, Ordering::Release);
                     return Err(anyhow!("Retry cancelled"));
                 }
             }
             if !self.retry_settings().enabled || abort.is_aborted() {
                 self.inner.shared.retry_controller.lock().take();
-                self.publish_session_event(SessionEvent::AutoRetryEnd { success: false, attempt, final_error: Some("Retry cancelled".to_owned()) });
+                self.publish_session_event(SessionEvent::AutoRetryEnd {
+                    success: false,
+                    attempt,
+                    final_error: Some("Retry cancelled".to_owned()),
+                });
                 self.inner.shared.retry_attempt.store(0, Ordering::Release);
                 return Err(anyhow!("Retry cancelled"));
             }
@@ -2614,21 +2860,153 @@ impl Session {
                 () = abort.cancelled() => {
                     self.inner.agent.abort().await;
                     self.inner.shared.retry_controller.lock().take();
-                    self.publish_session_event(SessionEvent::AutoRetryEnd { success: false, attempt, final_error: Some("Retry cancelled".to_owned()) });
+                    self.publish_session_event(SessionEvent::AutoRetryEnd {
+                        success: false,
+                        attempt,
+                        final_error: Some("Retry cancelled".to_owned()),
+                    });
                     self.inner.shared.retry_attempt.store(0, Ordering::Release);
                     return Err(anyhow!("Retry cancelled"));
                 }
             };
             self.inner.shared.retry_controller.lock().take();
             let retry_state = self.inner.agent.state().await;
-            let retry_failed = retry_state.messages.last().and_then(|message| match message { Message::Assistant(assistant) => Some(assistant), _ => None });
+            let retry_failed = retry_state.messages.last().and_then(|message| match message {
+                Message::Assistant(assistant) => Some(assistant),
+                _ => None,
+            });
             if retry_failed.is_none_or(|assistant| assistant.stop_reason != StopReason::Error) {
-                self.publish_session_event(SessionEvent::AutoRetryEnd { success: true, attempt, final_error: None });
-                self.inner.shared.retry_attempt.store(0, Ordering::Release);
+                self.finish_retry_success(attempt);
                 return operation;
             }
         }
     }
+
+    fn finish_retry_success(&self, attempt: usize) {
+        if attempt > 0 {
+            self.publish_session_event(SessionEvent::AutoRetryEnd {
+                success: true,
+                attempt,
+                final_error: None,
+            });
+        }
+        if let Some(active) = self.inner.shared.active_retry_fallback.lock().clone() {
+            if let Some(model) = self.model() {
+                self.publish_session_event(SessionEvent::RetryFallbackSucceeded {
+                    model: format_retry_fallback_selector(
+                        &model,
+                        Some(thinking_level_name(self.thinking_level())),
+                    ),
+                    role: active.role,
+                });
+            }
+        }
+        self.inner.shared.retry_attempt.store(0, Ordering::Release);
+        self.inner.shared.fallback_attempt_errors.lock().clear();
+    }
+
+    fn finish_retry_failure(&self, attempt: usize, latest_error: &str) {
+        let errors = self.inner.shared.fallback_attempt_errors.lock().clone();
+        let final_error = if errors.is_empty() {
+            crate::redact_retry_diagnostic(latest_error)
+        } else {
+            aggregate_retry_diagnostics(&errors)
+        };
+        if attempt > 0 || errors.len() > 1 {
+            self.publish_session_event(SessionEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: Some(final_error),
+            });
+        }
+        self.inner.shared.retry_attempt.store(0, Ordering::Release);
+    }
+
+    async fn try_apply_retry_model_fallback(
+        &self,
+        current_selector: &str,
+        current_model: &Model,
+    ) -> bool {
+        let settings = self.retry_settings();
+        if !settings.model_fallback || settings.fallback_chains.is_empty() {
+            return false;
+        }
+        let roles = BTreeMap::new();
+        let lookup = CatalogModelLookup;
+        let context = RetryFallbackResolutionContext {
+            chains: &settings.fallback_chains,
+            model_roles: &roles,
+            model_lookup: &lookup,
+        };
+        let active_role = self
+            .inner
+            .shared
+            .active_retry_fallback
+            .lock()
+            .as_ref()
+            .map(|state| state.role.clone());
+        let role = active_role.or_else(|| {
+            resolve_retry_fallback_chain_key(&context, current_selector, Some(current_model), None)
+        });
+        let Some(role) = role else {
+            return false;
+        };
+        let candidates = find_retry_fallback_candidates(
+            &context,
+            &role,
+            current_selector,
+            Some(current_model),
+            true,
+        );
+        for candidate in candidates {
+            let Some(model) = lookup.find(&candidate.provider, &candidate.id) else {
+                continue;
+            };
+            let api_key = if let Some(resolver) = &self.inner.shared.auth_resolver {
+                match resolver(model.clone()).await {
+                    Ok(auth) => auth.api_key,
+                    Err(_) => continue,
+                }
+            } else {
+                let current = self.inner.shared.state.read();
+                if current.model.provider != model.provider {
+                    continue;
+                }
+                current.api_key.clone()
+            };
+            if api_key.trim().is_empty() {
+                continue;
+            }
+            {
+                let mut active = self.inner.shared.active_retry_fallback.lock();
+                if active.is_none() {
+                    *active = Some(ActiveRetryFallbackState { role: role.clone() });
+                }
+            }
+            self.set_model_internal(model, api_key);
+            if let Some(level) = candidate
+                .thinking_level
+                .as_deref()
+                .and_then(parse_thinking_level_name)
+            {
+                let _ = self.set_thinking_level(level);
+            }
+            let applied_model = self.model().map_or(candidate.raw, |model| {
+                format_retry_fallback_selector(
+                    &model,
+                    Some(thinking_level_name(self.thinking_level())),
+                )
+            });
+            self.publish_session_event(SessionEvent::RetryFallbackApplied {
+                from: current_selector.to_owned(),
+                to: applied_model,
+                role,
+            });
+            return true;
+        }
+        false
+    }
+
 
     async fn settle_operation<F>(&self, operation: F) -> Result<()>
     where
@@ -3111,7 +3489,7 @@ async fn complete_summary(
     abort: AbortSignal,
     reason: Option<CompactionReason>,
 ) -> Result<String> {
-    let settings = *inner.retry_settings.read();
+    let settings = inner.retry_settings.read().clone();
     let mut attempt = 0usize;
     loop {
         if attempt > 0 {
@@ -3132,6 +3510,7 @@ async fn complete_summary(
                 ThinkingLevel::Medium => Some(pi_ai::ThinkingLevel::Medium),
                 ThinkingLevel::High => Some(pi_ai::ThinkingLevel::High),
                 ThinkingLevel::Xhigh => Some(pi_ai::ThinkingLevel::XHigh),
+                ThinkingLevel::Max => Some(pi_ai::ThinkingLevel::Max),
             }
         } else { None };
         let requested_max = (reserve_tokens as f64 * fraction).floor() as i64;
@@ -3256,7 +3635,8 @@ fn parse_recorded_thinking_level(level: &str) -> ThinkingLevel {
         "low" => ThinkingLevel::Low,
         "medium" => ThinkingLevel::Medium,
         "high" => ThinkingLevel::High,
-        "xhigh" | "max" => ThinkingLevel::Xhigh,
+        "xhigh" => ThinkingLevel::Xhigh,
+        "max" => ThinkingLevel::Max,
         _ => ThinkingLevel::Off,
     }
 }
@@ -3267,8 +3647,22 @@ fn clamp_thinking_level(model: &Model, requested: ThinkingLevel) -> ThinkingLeve
         "low" => ThinkingLevel::Low,
         "medium" => ThinkingLevel::Medium,
         "high" => ThinkingLevel::High,
-        "xhigh" | "max" => ThinkingLevel::Xhigh,
+        "xhigh" => ThinkingLevel::Xhigh,
+        "max" => ThinkingLevel::Max,
         _ => ThinkingLevel::Off,
+    }
+}
+
+fn parse_thinking_level_name(name: &str) -> Option<ThinkingLevel> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(ThinkingLevel::Off),
+        "minimal" => Some(ThinkingLevel::Minimal),
+        "low" => Some(ThinkingLevel::Low),
+        "medium" => Some(ThinkingLevel::Medium),
+        "high" => Some(ThinkingLevel::High),
+        "xhigh" => Some(ThinkingLevel::Xhigh),
+        "max" => Some(ThinkingLevel::Max),
+        _ => None,
     }
 }
 
@@ -3280,6 +3674,7 @@ fn thinking_level_name(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",
         ThinkingLevel::Xhigh => "xhigh",
+        ThinkingLevel::Max => "max",
     }
 }
 
@@ -3387,6 +3782,67 @@ mod thinking_level_change_tests {
         assert_eq!(change.effective, ThinkingLevel::Off);
         assert_eq!(session.thinking_level(), ThinkingLevel::Off);
         assert!(change.message.contains("unsupported"), "{}", change.message);
+    }
+}
+
+#[cfg(test)]
+mod todo_persistence_tests {
+    use super::*;
+
+    fn test_session(cwd: &Path) -> Session {
+        Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session")
+    }
+
+    #[test]
+    fn attaching_resumed_session_restores_complete_todo_dag() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let recorder = crate::start_session_in(cwd.path(), None, Some("off"), Some(cwd.path()), Some("todo-dag-resume"), None).expect("start recorder");
+        let state = TodoState {
+            phases: vec![TodoPhase {
+                name: "Build".to_owned(),
+                tasks: vec![
+                    crate::TodoItem {
+                        id: "task-root".to_owned(),
+                        content: "root".to_owned(),
+                        status: crate::TodoStatus::Completed,
+                        depends_on: Vec::new(),
+                        ready: false,
+                        blocked_by: Vec::new(),
+                    },
+                    crate::TodoItem {
+                        id: "task-child".to_owned(),
+                        content: "child".to_owned(),
+                        status: crate::TodoStatus::InProgress,
+                        depends_on: vec!["task-root".to_owned()],
+                        ready: true,
+                        blocked_by: Vec::new(),
+                    },
+                ],
+            }],
+            storage: TodoStorage::Session,
+        };
+        recorder.record_todo_snapshot(&state).expect("record todo snapshot");
+        recorder.persist_now().expect("persist session");
+        let path = recorder.path();
+        recorder.close().expect("close recorder");
+
+        let session = test_session(cwd.path());
+        session.record(crate::resume_session(&path).expect("resume recorder")).expect("attach recorder");
+        assert_eq!(session.todo_state(), state);
     }
 }
 

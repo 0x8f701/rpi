@@ -195,6 +195,8 @@ pub enum RpcCommand {
     SetTodos {
         #[serde(default)]
         id: Option<String>,
+        #[serde(default, rename = "workflowId")]
+        workflow_id: Option<String>,
         phases: Vec<TodoPhase>,
     },
     LoopCreate {
@@ -387,6 +389,54 @@ pub enum RpcCommand {
         #[serde(rename = "draftId")]
         draft_id: String,
     },
+    WorkflowCreate {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+        objective: String,
+    },
+    WorkflowList {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    WorkflowGet {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default, rename = "workflowId")]
+        workflow_id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    WorkflowPause {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "workflowId")]
+        workflow_id: String,
+    },
+    WorkflowResume {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "workflowId")]
+        workflow_id: String,
+    },
+    WorkflowCancel {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "workflowId")]
+        workflow_id: String,
+    },
+    WorkflowIntegrate {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "workflowId")]
+        workflow_id: String,
+    },
+    WorkflowRemove {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "workflowId")]
+        workflow_id: String,
+    },
 }
 impl RpcCommand {
     fn id(&self) -> Option<String> {
@@ -454,7 +504,15 @@ impl RpcCommand {
             | Self::SettingsValidate { id, .. }
             | Self::SettingsApply { id, .. }
             | Self::SettingsCancel { id, .. }
-            | Self::ProcessWait { id, .. } => id.clone(),
+            | Self::ProcessWait { id, .. }
+            | Self::WorkflowCreate { id, .. }
+            | Self::WorkflowList { id }
+            | Self::WorkflowGet { id, .. }
+            | Self::WorkflowPause { id, .. }
+            | Self::WorkflowResume { id, .. }
+            | Self::WorkflowCancel { id, .. }
+            | Self::WorkflowIntegrate { id, .. }
+            | Self::WorkflowRemove { id, .. } => id.clone(),
         }
     }
     const fn command_name(&self) -> &'static str {
@@ -523,6 +581,14 @@ impl RpcCommand {
             Self::SettingsValidate { .. } => "settings_validate",
             Self::SettingsApply { .. } => "settings_apply",
             Self::SettingsCancel { .. } => "settings_cancel",
+            Self::WorkflowCreate { .. } => "workflow_create",
+            Self::WorkflowList { .. } => "workflow_list",
+            Self::WorkflowGet { .. } => "workflow_get",
+            Self::WorkflowPause { .. } => "workflow_pause",
+            Self::WorkflowResume { .. } => "workflow_resume",
+            Self::WorkflowCancel { .. } => "workflow_cancel",
+            Self::WorkflowIntegrate { .. } => "workflow_integrate",
+            Self::WorkflowRemove { .. } => "workflow_remove",
         }
     }
 }
@@ -542,6 +608,14 @@ impl RpcCommand {
                 | Self::SettingsValidate { .. }
                 | Self::SettingsApply { .. }
                 | Self::SettingsCancel { .. }
+                | Self::WorkflowCreate { .. }
+                | Self::WorkflowList { .. }
+                | Self::WorkflowGet { .. }
+                | Self::WorkflowPause { .. }
+                | Self::WorkflowResume { .. }
+                | Self::WorkflowCancel { .. }
+                | Self::WorkflowIntegrate { .. }
+                | Self::WorkflowRemove { .. }
         )
     }
 }
@@ -696,6 +770,8 @@ where
     let reader = tokio::spawn(read_jsonl(input, lines_tx));
     let output = Arc::new(StdMutex::new(output));
     let settings = crate::settings_rpc::SettingsRpcState::default();
+    // Application-owned manager bind (no independent manager open / set_host).
+    let workflows = crate::workflow_rpc::WorkflowRpcState::for_application(&application);
     let mut commands = tokio::task::JoinSet::new();
     let mut input_open = true;
     loop {
@@ -707,7 +783,8 @@ where
                 match line {
                     Some(JsonlFrame::Line(line)) => match parse_input(&line) {
                         Ok(RpcInput::Command(command)) if command.runs_inline() => {
-                            let response = handle_command(&application, &settings, command).await;
+                            let response =
+                                handle_command(&application, &settings, &workflows, command).await;
                             write_shared_json(&output, &response)?;
                         }
                         Ok(RpcInput::Command(command)) if commands.len() >= MAX_CONCURRENT_COMMANDS => {
@@ -721,9 +798,12 @@ where
                         Ok(RpcInput::Command(command)) => {
                             let application = application.clone();
                             let settings = settings.clone();
+                            let workflows = workflows.clone();
                             let output = output.clone();
                             commands.spawn(async move {
-                                let response = handle_command(&application, &settings, command).await;
+                                let response =
+                                    handle_command(&application, &settings, &workflows, command)
+                                        .await;
                                 write_shared_json(&output, &response)
                             });
                         }
@@ -765,6 +845,10 @@ where
                 }
                 Ok(ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message })) => {
                     write_shared_json(&output, &ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message: public_message(message) }))?
+                }
+                Ok(ApplicationEvent::Workflow(event)) => {
+                    let public = crate::workflow_rpc::project_workflow_event(&event);
+                    write_shared_json(&output, &public)?
                 }
                 Ok(event) => write_shared_json(&output, &event)?,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => write_shared_json(
@@ -842,6 +926,46 @@ fn trim_cr(line: &mut Vec<u8>) {
         line.pop();
     }
 }
+fn rpc_command_from_workflow(command: crate::workflow_rpc::WorkflowRpcCommand) -> RpcCommand {
+    match command {
+        crate::workflow_rpc::WorkflowRpcCommand::WorkflowCreate {
+            id,
+            name,
+            objective,
+        } => RpcCommand::WorkflowCreate {
+            id,
+            name,
+            objective,
+        },
+        crate::workflow_rpc::WorkflowRpcCommand::WorkflowList { id } => {
+            RpcCommand::WorkflowList { id }
+        }
+        crate::workflow_rpc::WorkflowRpcCommand::WorkflowGet {
+            id,
+            workflow_id,
+            name,
+        } => RpcCommand::WorkflowGet {
+            id,
+            workflow_id,
+            name,
+        },
+        crate::workflow_rpc::WorkflowRpcCommand::WorkflowPause { id, workflow_id } => {
+            RpcCommand::WorkflowPause { id, workflow_id }
+        }
+        crate::workflow_rpc::WorkflowRpcCommand::WorkflowResume { id, workflow_id } => {
+            RpcCommand::WorkflowResume { id, workflow_id }
+        }
+        crate::workflow_rpc::WorkflowRpcCommand::WorkflowCancel { id, workflow_id } => {
+            RpcCommand::WorkflowCancel { id, workflow_id }
+        }
+        crate::workflow_rpc::WorkflowRpcCommand::WorkflowIntegrate { id, workflow_id } => {
+            RpcCommand::WorkflowIntegrate { id, workflow_id }
+        }
+        crate::workflow_rpc::WorkflowRpcCommand::WorkflowRemove { id, workflow_id } => {
+            RpcCommand::WorkflowRemove { id, workflow_id }
+        }
+    }
+}
 fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcResponse> {
     let value: Value = serde_json::from_slice(line).map_err(|e| {
         RpcResponse::failure(None, "parse", format!("Failed to parse command: {e}"))
@@ -860,6 +984,17 @@ fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcResponse> {
             .map_err(|e| {
                 RpcResponse::failure(id, command, format!("Invalid extension UI response: {e}"))
             });
+    }
+    // Workflow commands use a deny_unknown_fields wire schema.
+    if crate::workflow_rpc::WorkflowRpcCommand::is_workflow_type(&command) {
+        return match crate::workflow_rpc::parse_workflow_command(value) {
+            Ok(workflow) => Ok(RpcInput::Command(rpc_command_from_workflow(workflow))),
+            Err(error) => Err(RpcResponse::failure(
+                id,
+                command,
+                format!("Invalid command: {error}"),
+            )),
+        };
     }
     serde_json::from_value(value)
         .map(RpcInput::Command)
@@ -1092,11 +1227,12 @@ fn ui_request(id: String, request: pi_coding::ExtensionUiRequest) -> Result<RpcE
 async fn handle_command(
     app: &Application,
     settings: &crate::settings_rpc::SettingsRpcState,
+    workflows: &crate::workflow_rpc::WorkflowRpcState,
     c: RpcCommand,
 ) -> RpcResponse {
     let id = c.id();
     let name = c.command_name();
-    match handle_command_inner(app, settings, c).await {
+    match handle_command_inner(app, settings, workflows, c).await {
         Ok(data) => RpcResponse::success(id, name, data),
         Err(e) => RpcResponse::failure(id, name, e.to_string()),
     }
@@ -1104,6 +1240,7 @@ async fn handle_command(
 async fn handle_command_inner(
     app: &Application,
     settings: &crate::settings_rpc::SettingsRpcState,
+    workflows: &crate::workflow_rpc::WorkflowRpcState,
     c: RpcCommand,
 ) -> Result<Option<Value>> {
     match c {
@@ -1330,9 +1467,24 @@ async fn handle_command_inner(
             let messages: Vec<Message> = app.messages().into_iter().map(public_message).collect();
             Ok(Some(json!({"messages":messages})))
         }
-        RpcCommand::GetCommands { .. } => Ok(Some(json!({"commands":app.commands_catalog()}))),
-        RpcCommand::SetTodos { phases, .. } => {
-            let result = app.set_todos(phases)?;
+        RpcCommand::GetCommands { .. } => {
+            let commands = crate::interactive_commands::visible_catalog()
+                .into_iter()
+                .map(|command| {
+                    json!({
+                        "name": command.name,
+                        "description": command.description,
+                        "source": "builtin",
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(Some(json!({"commands":commands})))
+        }
+        RpcCommand::SetTodos { workflow_id, phases, .. } => {
+            let result = match workflow_id {
+                Some(workflow_id) => app.set_workflow_todos(&pi_coding::WorkflowId::new(workflow_id), phases)?,
+                None => app.set_todos(phases)?,
+            };
             Ok(Some(
                 json!({"phases":result.phases,"completedTasks":result.completed_tasks,"summary":result.summary}),
             ))
@@ -1412,6 +1564,46 @@ async fn handle_command_inner(
             )
             .await?,
         )?)),
+        RpcCommand::WorkflowCreate {
+            id,
+            name,
+            objective,
+        } => Ok(Some(workflows.dispatch(
+            crate::workflow_rpc::WorkflowRpcCommand::WorkflowCreate {
+                id,
+                name,
+                objective,
+            },
+        ).await?)),
+        RpcCommand::WorkflowList { id } => Ok(Some(workflows.dispatch(
+            crate::workflow_rpc::WorkflowRpcCommand::WorkflowList { id },
+        ).await?)),
+        RpcCommand::WorkflowGet {
+            id,
+            workflow_id,
+            name,
+        } => Ok(Some(workflows.dispatch(
+            crate::workflow_rpc::WorkflowRpcCommand::WorkflowGet {
+                id,
+                workflow_id,
+                name,
+            },
+        ).await?)),
+        RpcCommand::WorkflowPause { id, workflow_id } => Ok(Some(workflows.dispatch(
+            crate::workflow_rpc::WorkflowRpcCommand::WorkflowPause { id, workflow_id },
+        ).await?)),
+        RpcCommand::WorkflowResume { id, workflow_id } => Ok(Some(workflows.dispatch(
+            crate::workflow_rpc::WorkflowRpcCommand::WorkflowResume { id, workflow_id },
+        ).await?)),
+        RpcCommand::WorkflowCancel { id, workflow_id } => Ok(Some(workflows.dispatch(
+            crate::workflow_rpc::WorkflowRpcCommand::WorkflowCancel { id, workflow_id },
+        ).await?)),
+        RpcCommand::WorkflowIntegrate { id, workflow_id } => Ok(Some(workflows.dispatch(
+            crate::workflow_rpc::WorkflowRpcCommand::WorkflowIntegrate { id, workflow_id },
+        ).await?)),
+        RpcCommand::WorkflowRemove { id, workflow_id } => Ok(Some(workflows.dispatch(
+            crate::workflow_rpc::WorkflowRpcCommand::WorkflowRemove { id, workflow_id },
+        ).await?)),
     }
 }
 fn public_message(message: Message) -> Message {
@@ -1490,7 +1682,8 @@ fn available_thinking_levels(model: &Model) -> Vec<ThinkingLevel> {
             "low" => Some(ThinkingLevel::Low),
             "medium" => Some(ThinkingLevel::Medium),
             "high" => Some(ThinkingLevel::High),
-            "xhigh" | "max" => Some(ThinkingLevel::Xhigh),
+            "xhigh" => Some(ThinkingLevel::Xhigh),
+            "max" => Some(ThinkingLevel::Max),
             _ => None,
         })
         .collect()
@@ -1501,6 +1694,35 @@ mod tests {
     use super::*;
     fn settings_state() -> crate::settings_rpc::SettingsRpcState {
         crate::settings_rpc::SettingsRpcState::default()
+    }
+
+    fn workflows_state() -> crate::workflow_rpc::WorkflowRpcState {
+        let state = crate::workflow_rpc::WorkflowRpcState::new();
+        state.set_memory_host();
+        state
+    }
+
+    #[test]
+    fn workflow_application_events_use_public_rpc_projection() {
+        let workflow_id = pi_coding::WorkflowId::new("workflow-wire");
+        let event = pi_coding::WorkflowEvent::StatusChanged {
+            workflow_id: workflow_id.clone(),
+            generation: 7,
+            status: pi_coding::WorkflowStatus::Running,
+        };
+        let projected = crate::workflow_rpc::project_workflow_event(&event);
+        assert!(matches!(
+            &projected,
+            crate::workflow_rpc::WorkflowWireEvent::WorkflowStatusChanged {
+                workflow_id: projected_id,
+                generation: 7,
+                status: pi_coding::WorkflowStatus::Running,
+                name: None,
+            } if projected_id == &workflow_id
+        ));
+        let wire = serde_json::to_value(projected).expect("serialize projected event");
+        assert_eq!(wire["type"], "workflow_status_changed");
+        assert!(wire.get("snapshot").is_none());
     }
 
     #[test]
@@ -1538,7 +1760,7 @@ mod tests {
             json!({"type":"set_session_name","name":"n"}),
             json!({"type":"get_messages"}),
             json!({"type":"get_commands"}),
-            json!({"type":"set_todos","phases":[]}),
+            json!({"type":"set_todos","workflowId":"wf-1","phases":[]}),
             json!({"type":"loop_create","interval":"5m","prompt":"check","fireImmediately":true,"durable":false}),
             json!({"type":"loop_update","taskId":"loop-1","interval":"10m","prompt":"check again"}),
             json!({"type":"loop_list"}),
@@ -1570,6 +1792,15 @@ mod tests {
             json!({"type":"settings_validate","draftId":"draft"}),
             json!({"type":"settings_apply","draftId":"draft"}),
             json!({"type":"settings_cancel","draftId":"draft"}),
+            json!({"type":"workflow_create","name":"ship","objective":"land multi-workflow"}),
+            json!({"type":"workflow_list"}),
+            json!({"type":"workflow_get","workflowId":"wf-1"}),
+            json!({"type":"workflow_get","name":"ship"}),
+            json!({"type":"workflow_pause","workflowId":"wf-1"}),
+            json!({"type":"workflow_resume","workflowId":"wf-1"}),
+            json!({"type":"workflow_cancel","workflowId":"wf-1"}),
+            json!({"type":"workflow_integrate","workflowId":"wf-1"}),
+            json!({"type":"workflow_remove","workflowId":"wf-1"}),
         ];
         for f in fixtures {
             assert!(
@@ -1892,8 +2123,12 @@ mod tests {
         let phases = vec![TodoPhase {
             name: "Plan".into(),
             tasks: vec![TodoItem {
+                id: "task-x".into(),
                 content: "x".into(),
                 status: TodoStatus::InProgress,
+                depends_on: Vec::new(),
+                ready: true,
+                blocked_by: Vec::new(),
             }],
         }];
         let updated = pi_coding::ApplicationEvent::TodoUpdated {
@@ -1907,6 +2142,10 @@ mod tests {
         assert_eq!(v["type"], "todo_updated");
         assert_eq!(v["phases"][0]["name"], "Plan");
         assert_eq!(v["phases"][0]["tasks"][0]["status"], "in_progress");
+        assert_eq!(v["phases"][0]["tasks"][0]["id"], "task-x");
+        assert_eq!(v["phases"][0]["tasks"][0]["dependsOn"], json!([]));
+        assert_eq!(v["phases"][0]["tasks"][0]["ready"], true);
+        assert_eq!(v["phases"][0]["tasks"][0]["blockedBy"], json!([]));
         assert_eq!(v["completed_tasks"][0]["phase"], "Plan");
         let reminder = pi_coding::ApplicationEvent::TodoReminder { phases };
         let v: Value = serde_json::from_str(&serde_json::to_string(&reminder).unwrap()).unwrap();
@@ -2033,6 +2272,7 @@ mod tests {
         let response = handle_command(
             &app,
             &settings_state(),
+            &workflows_state(),
             RpcCommand::Compact {
                 id: Some("compact-1".into()),
                 custom_instructions: Some("preserve decisions".into()),
@@ -2062,6 +2302,7 @@ mod tests {
         let response = handle_command(
             &app,
             &settings_state(),
+            &workflows_state(),
             RpcCommand::Compact {
                 id: Some("compact-error".into()),
                 custom_instructions: None,
@@ -2103,6 +2344,7 @@ mod tests {
         let response = handle_command(
             &app,
             &settings_state(),
+            &workflows_state(),
             RpcCommand::Clone {
                 id: Some("clone-1".into()),
             },
@@ -2129,8 +2371,9 @@ mod tests {
         assert_eq!(malformed.command, "goal_create");
 
         let created = handle_command(
-            &app,
-            &settings,
+                &app,
+                &settings,
+                &workflows_state(),
             RpcCommand::GoalCreate {
                 id: Some("create".into()),
                 objective: "ship safely".into(),
@@ -2142,8 +2385,9 @@ mod tests {
         assert_eq!(created.data.expect("goal")["objective"], "ship safely");
 
         let charged = handle_command(
-            &app,
-            &settings,
+                &app,
+                &settings,
+                &workflows_state(),
             RpcCommand::GoalUpdateUsage {
                 id: Some("usage".into()),
                 tokens: 10,
@@ -2153,8 +2397,9 @@ mod tests {
         .await;
         assert!(charged.success, "{charged:?}");
         let state = handle_command(
-            &app,
-            &settings,
+                &app,
+                &settings,
+                &workflows_state(),
             RpcCommand::GoalGet {
                 id: Some("get".into()),
             },
@@ -2165,8 +2410,9 @@ mod tests {
         assert_eq!(data["current"]["pauseReason"], "budget_exhausted");
 
         let after_malformed = handle_command(
-            &app,
-            &settings,
+                &app,
+                &settings,
+                &workflows_state(),
             RpcCommand::GetState {
                 id: Some("state".into()),
             },
@@ -2213,8 +2459,9 @@ mod tests {
         let (agent, app) = build_settings_app().await;
         let settings = settings_state();
         let opened = handle_command(
-            &app,
-            &settings,
+                &app,
+                &settings,
+                &workflows_state(),
             RpcCommand::SettingsOpenDraft {
                 id: Some("open".into()),
                 scope: pi_coding::SettingsScope::Global,
@@ -2227,8 +2474,9 @@ mod tests {
             .expect("draft id")
             .to_owned();
         let invalid = handle_command(
-            &app,
-            &settings,
+                &app,
+                &settings,
+                &workflows_state(),
             RpcCommand::SettingsSet {
                 id: Some("invalid".into()),
                 draft_id: draft_id.clone(),
@@ -2239,8 +2487,9 @@ mod tests {
         .await;
         assert!(!invalid.success);
         let valid = handle_command(
-            &app,
-            &settings,
+                &app,
+                &settings,
+                &workflows_state(),
             RpcCommand::SettingsSet {
                 id: Some("set".into()),
                 draft_id: draft_id.clone(),
@@ -2254,6 +2503,7 @@ mod tests {
             handle_command(
                 &app,
                 &settings,
+                &workflows_state(),
                 RpcCommand::SettingsValidate {
                     id: Some("validate".into()),
                     draft_id: draft_id.clone(),
@@ -2263,8 +2513,9 @@ mod tests {
             .success
         );
         let applied = handle_command(
-            &app,
-            &settings,
+                &app,
+                &settings,
+                &workflows_state(),
             RpcCommand::SettingsApply {
                 id: Some("apply".into()),
                 draft_id,
@@ -2298,16 +2549,18 @@ mod tests {
         let app = build_todo_app("faux-rpc-todo-set", "faux-rpc-todo-set-api").await;
         let phases = vec![TodoPhase {
             name: "Plan".into(),
-            tasks: vec![TodoItem {
-                content: "do".into(),
-                status: TodoStatus::InProgress,
-            }],
+            tasks: vec![
+                TodoItem { id: "task-root".into(), content: "root".into(), status: TodoStatus::InProgress, depends_on: Vec::new(), ready: true, blocked_by: Vec::new() },
+                TodoItem { id: "task-do".into(), content: "do".into(), status: TodoStatus::Pending, depends_on: vec!["task-root".into()], ready: false, blocked_by: Vec::new() },
+            ],
         }];
         let r = handle_command(
             &app,
             &settings_state(),
+            &workflows_state(),
             RpcCommand::SetTodos {
                 id: Some("t1".into()),
+                workflow_id: None,
                 phases,
             },
         )
@@ -2317,8 +2570,32 @@ mod tests {
         assert_eq!(r.command, "set_todos");
         let d = r.data.expect("set_todos returns data");
         assert_eq!(d["phases"][0]["name"], "Plan");
-        assert_eq!(d["phases"][0]["tasks"][0]["content"], "do");
-        assert_eq!(d["phases"][0]["tasks"][0]["status"], "in_progress");
+        assert_eq!(d["phases"][0]["tasks"][1]["content"], "do");
+        assert_eq!(d["phases"][0]["tasks"][1]["status"], "pending");
+        assert_eq!(d["phases"][0]["tasks"][1]["id"], "task-do");
+        assert_eq!(d["phases"][0]["tasks"][1]["dependsOn"], json!(["task-root"]));
+        assert_eq!(d["phases"][0]["tasks"][1]["ready"], false);
+        assert_eq!(d["phases"][0]["tasks"][1]["blockedBy"][0]["taskId"], "task-root");
+    }
+    #[tokio::test]
+    async fn set_todos_with_workflow_id_fails_without_mutating_parent_when_missing() {
+        let app = build_todo_app("faux-rpc-workflow-todo-missing", "faux-rpc-workflow-todo-missing-api").await;
+        let phases = vec![pi_coding::TodoPhase {
+            name: "Workflow".into(),
+            tasks: vec![pi_coding::TodoItem {
+                id: "scoped".into(), content: "scoped".into(), status: pi_coding::TodoStatus::Pending,
+                depends_on: Vec::new(), ready: true, blocked_by: Vec::new(),
+            }],
+        }];
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::SetTodos { id: Some("scoped".into()), workflow_id: Some("missing".into()), phases },
+        ).await;
+        assert!(!response.success);
+        assert_eq!(response.error.as_deref(), Some("application workflow manager is not configured"));
+        assert!(app.todo_state().phases.is_empty(), "missing workflow must not fall back to parent");
     }
     #[tokio::test]
     async fn get_state_exposes_todo_phases() {
@@ -2327,14 +2604,19 @@ mod tests {
         app.set_todos(vec![TodoPhase {
             name: "Plan".into(),
             tasks: vec![TodoItem {
+                id: "task-x".into(),
                 content: "x".into(),
                 status: TodoStatus::InProgress,
+                depends_on: Vec::new(),
+                ready: true,
+                blocked_by: Vec::new(),
             }],
         }])
         .expect("set_todos");
         let r = handle_command(
             &app,
             &settings_state(),
+            &workflows_state(),
             RpcCommand::GetState {
                 id: Some("s1".into()),
             },
@@ -2342,7 +2624,145 @@ mod tests {
         .await;
         assert!(r.success);
         let d = r.data.expect("state data");
+        assert_eq!(d["todoPhases"][0]["tasks"][0]["id"], "task-x");
+        assert_eq!(d["todoPhases"][0]["tasks"][0]["dependsOn"], json!([]));
+        assert_eq!(d["todoPhases"][0]["tasks"][0]["ready"], true);
         assert_eq!(d["todoPhases"][0]["name"], "Plan");
         assert_eq!(d["todoPhases"][0]["tasks"][0]["status"], "in_progress");
+    }
+
+    #[test]
+    fn workflow_unknown_fields_fail_closed_via_parse_input() {
+        let err = parse_input(
+            br#"{"type":"workflow_create","name":"ship","objective":"x","extraField":true}"#,
+        )
+        .expect_err("unknown fields must fail");
+        assert!(!err.success);
+        assert_eq!(err.command, "workflow_create");
+        assert!(
+            err.error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown field") || e.contains("extraField")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_rpc_create_list_get_and_event_redaction() {
+        let app = build_todo_app("faux-rpc-workflow", "faux-rpc-workflow-api").await;
+        let settings = settings_state();
+        let workflows = workflows_state();
+
+        let created = handle_command(
+            &app,
+            &settings,
+            &workflows,
+            RpcCommand::WorkflowCreate {
+                id: Some("wc1".into()),
+                name: "ship".into(),
+                objective: "land multi-workflow foundation".into(),
+            },
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        assert_eq!(created.command, "workflow_create");
+        let data = created.data.as_ref().expect("create data").clone();
+        assert_eq!(data["name"], "ship");
+        assert_eq!(data["status"], "queued");
+        assert_eq!(data["generation"], 1);
+        let workflow_id = data["workflowId"].as_str().expect("workflowId").to_owned();
+        let worktree = data["worktree"].as_str().expect("worktree label");
+        assert!(
+            !worktree.starts_with('/'),
+            "worktree must not be absolute: {worktree}"
+        );
+        let encoded = serde_json::to_string(&data).unwrap();
+        assert!(!crate::workflow_rpc::wire_json_leaks_absolute_path(&encoded));
+
+        let listed = handle_command(
+            &app,
+            &settings,
+            &workflows,
+            RpcCommand::WorkflowList {
+                id: Some("wl1".into()),
+            },
+        )
+        .await;
+        assert!(listed.success, "{listed:?}");
+        assert_eq!(listed.data.as_ref().unwrap()["workflows"][0]["workflowId"], workflow_id);
+
+        let got = handle_command(
+            &app,
+            &settings,
+            &workflows,
+            RpcCommand::WorkflowGet {
+                id: Some("wg1".into()),
+                workflow_id: Some(workflow_id.clone()),
+                name: None,
+            },
+        )
+        .await;
+        assert!(got.success, "{got:?}");
+        assert_eq!(got.data.as_ref().unwrap()["objective"], "land multi-workflow foundation");
+
+        // Host-side absolute path redacted on event wire projection.
+        let host = workflows
+            .with_host(|host| host.get(Some(&workflow_id), None))
+            .expect("host get");
+        assert!(
+            host.worktree_label
+                .as_deref()
+                .is_some_and(|p| std::path::Path::new(p).is_absolute()),
+            "host keeps absolute path internally for redaction"
+        );
+        let event = crate::workflow_rpc::project_workflow_event(
+            &pi_coding::WorkflowEvent::Updated {
+                snapshot: host.clone(),
+            },
+        );
+        let event_json = serde_json::to_value(&event).unwrap();
+        assert_eq!(event_json["type"], "workflow_updated");
+        assert_eq!(event_json["workflowId"], workflow_id);
+        assert_eq!(event_json["generation"], host.generation);
+        let event_encoded = serde_json::to_string(&event).unwrap();
+        assert!(!crate::workflow_rpc::wire_json_leaks_absolute_path(&event_encoded));
+
+        // LF framing: response + event are one JSON object each.
+        let mut buffer = Vec::new();
+        crate::modes::json::write_json_line(&mut buffer, &created).unwrap();
+        crate::modes::json::write_json_line(&mut buffer, &event).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        assert!(!text.contains('\u{1b}'));
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let _: Value = serde_json::from_str(line).expect("JSON object per LF");
+        }
+
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn get_commands_includes_workflow() {
+        let app = build_todo_app("faux-rpc-workflow-cmds", "faux-rpc-workflow-cmds-api").await;
+        let r = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::GetCommands {
+                id: Some("cmds".into()),
+            },
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        let commands = r.data.expect("commands")["commands"]
+            .as_array()
+            .cloned()
+            .expect("commands array");
+        assert!(
+            commands.iter().any(|c| c["name"] == "workflow"),
+            "expected workflow in {commands:?}"
+        );
+        app.cleanup().await;
     }
 }

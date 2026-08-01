@@ -12,7 +12,10 @@ use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::prompt_templates::{LoadPromptTemplatesOptions, PromptTemplate, load_prompt_templates};
-use crate::resources::{CONFIG_DIR_NAME, Skill, agent_dir_path, load_context_files, load_skills_trusted};
+use crate::resources::{
+    CONFIG_DIR_NAME, Skill, agent_dir_path, load_context_files,
+    load_skills_trusted_from_agent_dir,
+};
 use crate::settings::{DefaultProjectTrust, Settings, SettingsManager};
 use crate::system_prompt::ContextFile;
 use crate::trust::{TrustResolution, TrustStore, resolve_project_trust};
@@ -335,7 +338,7 @@ fn build_candidate(
     let (mut skills, skill_diagnostics) = if options.disable_skills {
         (Vec::new(), Vec::new())
     } else {
-        load_skills_trusted(&cwd_text, project_trusted)
+        load_skills_trusted_from_agent_dir(&cwd_text, &options.agent_dir, project_trusted)
     };
     let mut diagnostics = skill_diagnostics
         .into_iter()

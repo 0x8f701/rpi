@@ -16,6 +16,12 @@ pub enum FlowDirection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MermaidDiagramKind {
+    Flowchart,
+    ClassDiagram,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MermaidNodeShape {
     Rectangle,
     Rounded,
@@ -85,66 +91,28 @@ pub struct MermaidDiagnostic {
 pub struct MermaidArt {
     pub lines: Vec<String>,
     pub diagram: MermaidFlowchart,
+    pub kind: MermaidDiagramKind,
 }
 
 pub fn parse_mermaid(
     source: &str,
     limits: MermaidLimits,
 ) -> Result<MermaidFlowchart, MermaidDiagnostic> {
-    if source.len() > limits.max_source_bytes {
-        return Err(diagnostic(
-            MermaidDiagnosticKind::OversizeSource,
-            format!(
-                "Mermaid source is {} bytes; limit is {} bytes",
-                source.len(),
-                limits.max_source_bytes
-            ),
-            None,
-        ));
-    }
-
-    let statements = statements(source);
-    let Some((header_line, header)) = statements.first() else {
+    check_source_limit(source, limits)?;
+    let source_statements = statements(source);
+    let header_line = source_statements.first().map(|(line, _)| *line);
+    let Some(header_line) = header_line else {
         return Err(diagnostic(
             MermaidDiagnosticKind::InvalidSyntax,
             "Mermaid diagram is empty",
             None,
         ));
     };
-    let header_line = *header_line;
-    let direction = parse_header(header).ok_or_else(|| {
-        diagnostic(
-            MermaidDiagnosticKind::UnsupportedDiagram,
-            "Only flowchart/graph diagrams are supported",
-            Some(header_line),
-        )
-    })?;
-
-    let mut nodes = Vec::new();
-    let mut node_indices = HashMap::new();
-    let mut edges = Vec::new();
-    for (line, statement) in statements.into_iter().skip(1) {
-        parse_statement(
-            &statement,
-            line,
-            &mut nodes,
-            &mut node_indices,
-            &mut edges,
-            limits,
-        )?;
+    let header = source_statements.first().map(|(_, header)| header.as_str()).unwrap_or_default();
+    if header.eq_ignore_ascii_case("classDiagram") {
+        return parse_class_diagram(source, limits).map(|parsed| parsed.diagram);
     }
-    if nodes.is_empty() {
-        return Err(diagnostic(
-            MermaidDiagnosticKind::InvalidSyntax,
-            "Flowchart contains no nodes",
-            Some(header_line),
-        ));
-    }
-    Ok(MermaidFlowchart {
-        direction,
-        nodes,
-        edges,
-    })
+    parse_flowchart(source_statements, header_line, limits).map(|parsed| parsed.diagram)
 }
 
 pub fn render_mermaid_unicode(
@@ -152,8 +120,25 @@ pub fn render_mermaid_unicode(
     width: usize,
     limits: MermaidLimits,
 ) -> Result<MermaidArt, MermaidDiagnostic> {
-    let diagram = parse_mermaid(source, limits)?;
+    check_source_limit(source, limits)?;
+    let source_statements = statements(source);
+    let header_line = source_statements.first().map(|(line, _)| *line);
+    let Some(header_line) = header_line else {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::InvalidSyntax,
+            "Mermaid diagram is empty",
+            None,
+        ));
+    };
+    let header = source_statements.first().map(|(_, header)| header.as_str()).unwrap_or_default();
     let width = width.clamp(4, limits.max_output_cells.max(4));
+
+    if header.eq_ignore_ascii_case("classDiagram") {
+        return render_class_diagram(source, width, limits);
+    }
+
+    let parsed = parse_flowchart(source_statements, header_line, limits)?;
+    let diagram = parsed.diagram;
     let estimated_cells = 12usize
         .saturating_add(
             diagram
@@ -161,7 +146,7 @@ pub fn render_mermaid_unicode(
                 .iter()
                 .map(|node| {
                     display_width(&node.id)
-                        .saturating_add(display_width(&sanitize_inline(&node.label)))
+                        .saturating_add(display_width(&sanitize_mermaid_label(&node.label)))
                         .saturating_add(6)
                 })
                 .sum::<usize>(),
@@ -181,6 +166,13 @@ pub fn render_mermaid_unicode(
                         .saturating_add(7)
                 })
                 .sum::<usize>(),
+        )
+        .saturating_add(
+            parsed
+                .subgraphs
+                .iter()
+                .map(|group| display_width(&group.id).saturating_add(display_width(&group.title)).saturating_add(18))
+                .sum::<usize>(),
         );
     if estimated_cells > limits.max_output_cells.saturating_mul(8) {
         return Err(diagnostic(
@@ -191,6 +183,7 @@ pub fn render_mermaid_unicode(
     }
     let minimum_lines = 1usize
         .saturating_add(diagram.nodes.len())
+        .saturating_add(parsed.subgraphs.len().saturating_mul(2))
         .saturating_add(usize::from(!diagram.edges.is_empty()))
         .saturating_add(diagram.edges.len());
     if minimum_lines > limits.max_output_cells {
@@ -209,15 +202,24 @@ pub fn render_mermaid_unicode(
     };
     lines.push(fit_text(&format!("flowchart {direction}"), width));
 
-    for node in &diagram.nodes {
+    for (index, node) in diagram.nodes.iter().enumerate() {
+        for group in parsed.subgraphs.iter().filter(|group| group.start_node == index) {
+            lines.push(fit_text(
+                &format!("subgraph {} · {}", group.id, sanitize_mermaid_label(&group.title)),
+                width,
+            ));
+        }
         append_node(&mut lines, node, width);
+        for group in parsed.subgraphs.iter().filter(|group| group.end_node == index + 1) {
+            lines.push(fit_text(&format!("end subgraph {}", group.id), width));
+        }
     }
     if !diagram.edges.is_empty() {
         lines.push(fit_text("edges", width));
         for edge in &diagram.edges {
             let connector = match (&edge.label, edge.arrow) {
-                (Some(label), true) => format!(" ─{}─▶ ", sanitize_inline(label)),
-                (Some(label), false) => format!(" ─{}── ", sanitize_inline(label)),
+                (Some(label), true) => format!(" ─{}─▶ ", sanitize_mermaid_label(label)),
+                (Some(label), false) => format!(" ─{}── ", sanitize_mermaid_label(label)),
                 (None, true) => " ───▶ ".to_owned(),
                 (None, false) => " ──── ".to_owned(),
             };
@@ -228,6 +230,372 @@ pub fn render_mermaid_unicode(
         }
     }
 
+    check_output_cells(&lines, limits)?;
+    Ok(MermaidArt {
+        lines,
+        diagram,
+        kind: MermaidDiagramKind::Flowchart,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ParsedFlowchart {
+    diagram: MermaidFlowchart,
+    subgraphs: Vec<MermaidSubgraph>,
+}
+
+#[derive(Clone, Debug)]
+struct MermaidSubgraph {
+    id: String,
+    title: String,
+    start_node: usize,
+    end_node: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedClassDiagram {
+    diagram: MermaidFlowchart,
+    classes: Vec<MermaidClass>,
+    relations: Vec<ClassRelation>,
+}
+
+#[derive(Clone, Debug)]
+struct MermaidClass {
+    name: String,
+    members: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ClassRelation {
+    from: String,
+    to: String,
+    label: Option<String>,
+    dotted: bool,
+}
+
+fn check_source_limit(source: &str, limits: MermaidLimits) -> Result<(), MermaidDiagnostic> {
+    if source.len() > limits.max_source_bytes {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::OversizeSource,
+            format!(
+                "Mermaid source is {} bytes; limit is {} bytes",
+                source.len(),
+                limits.max_source_bytes
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn parse_flowchart(
+    source_statements: Vec<(usize, String)>,
+    header_line: usize,
+    limits: MermaidLimits,
+) -> Result<ParsedFlowchart, MermaidDiagnostic> {
+    let header = &source_statements[0].1;
+    let direction = parse_header(header).ok_or_else(|| {
+        diagnostic(
+            MermaidDiagnosticKind::UnsupportedDiagram,
+            "Only flowchart/graph and classDiagram diagrams are supported",
+            Some(header_line),
+        )
+    })?;
+    let mut nodes = Vec::new();
+    let mut node_indices = HashMap::new();
+    let mut edges = Vec::new();
+    let mut subgraphs = Vec::new();
+    let mut open_subgraph: Option<(String, String, usize, usize)> = None;
+    for (line, statement) in source_statements.into_iter().skip(1) {
+        if let Some(declaration) = statement.strip_prefix("subgraph").map(str::trim) {
+            if declaration.is_empty() || open_subgraph.is_some() {
+                return Err(invalid_line(line, &statement));
+            }
+            let mut cursor = Cursor::new(declaration);
+            let group = cursor.node().ok_or_else(|| invalid_line(line, &statement))?;
+            if !cursor.done() {
+                return Err(invalid_line(line, &statement));
+            }
+            open_subgraph = Some((group.id, group.label, nodes.len(), line));
+            continue;
+        }
+        if statement.eq_ignore_ascii_case("end") {
+            let Some((id, title, start_node, _)) = open_subgraph.take() else {
+                return Err(invalid_line(line, &statement));
+            };
+            subgraphs.push(MermaidSubgraph {
+                id,
+                title,
+                start_node,
+                end_node: nodes.len(),
+            });
+            continue;
+        }
+        parse_statement(
+            &statement,
+            line,
+            &mut nodes,
+            &mut node_indices,
+            &mut edges,
+            limits,
+        )?;
+    }
+    if let Some((_, _, _, line)) = open_subgraph {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::InvalidSyntax,
+            "Flowchart subgraph is missing end",
+            Some(line),
+        ));
+    }
+    if nodes.is_empty() {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::InvalidSyntax,
+            "Flowchart contains no nodes",
+            Some(header_line),
+        ));
+    }
+    Ok(ParsedFlowchart {
+        diagram: MermaidFlowchart {
+            direction,
+            nodes,
+            edges,
+        },
+        subgraphs,
+    })
+}
+
+fn parse_class_diagram(
+    source: &str,
+    limits: MermaidLimits,
+) -> Result<ParsedClassDiagram, MermaidDiagnostic> {
+    let mut nodes = Vec::new();
+    let mut node_indices = HashMap::new();
+    let mut edges = Vec::new();
+    let mut classes = Vec::new();
+    let mut relations = Vec::new();
+    let mut current_class: Option<(String, Vec<String>, usize)> = None;
+    let mut saw_header = false;
+
+    for (index, raw_line) in source.lines().enumerate() {
+        let line = index + 1;
+        let statement = raw_line
+            .split_once("%%")
+            .map_or(raw_line, |(before, _)| before)
+            .trim();
+        if statement.is_empty() {
+            continue;
+        }
+        if !saw_header {
+            if !statement.eq_ignore_ascii_case("classDiagram") {
+                return Err(diagnostic(
+                    MermaidDiagnosticKind::UnsupportedDiagram,
+                    "Only flowchart/graph and classDiagram diagrams are supported",
+                    Some(line),
+                ));
+            }
+            saw_header = true;
+            continue;
+        }
+        if current_class.is_some() {
+            if statement == "}" {
+                let (name, members, _) = current_class.take().expect("class is open");
+                classes.push(MermaidClass { name, members });
+            } else if matches!(statement.chars().next(), Some('+' | '-' | '#' | '~')) {
+                current_class
+                    .as_mut()
+                    .expect("class is open")
+                    .1
+                    .push(sanitize_mermaid_label(statement));
+            } else {
+                return Err(invalid_class_line(line, statement));
+            }
+            continue;
+        }
+        if let Some(declaration) = statement.strip_prefix("class ") {
+            let Some(name) = declaration.strip_suffix('{').map(str::trim) else {
+                return Err(invalid_class_line(line, statement));
+            };
+            if !valid_identifier(name) {
+                return Err(invalid_class_line(line, statement));
+            }
+            let node = MermaidNode {
+                id: name.to_owned(),
+                label: name.to_owned(),
+                shape: MermaidNodeShape::Rectangle,
+            };
+            upsert_node(node, &mut nodes, &mut node_indices, limits, line)?;
+            current_class = Some((name.to_owned(), Vec::new(), line));
+            continue;
+        }
+        let relation = parse_class_relation(statement, line)?;
+        for name in [&relation.from, &relation.to] {
+            upsert_node(
+                MermaidNode {
+                    id: (*name).clone(),
+                    label: (*name).clone(),
+                    shape: MermaidNodeShape::Rectangle,
+                },
+                &mut nodes,
+                &mut node_indices,
+                limits,
+                line,
+            )?;
+        }
+        if edges.len() >= limits.max_edges {
+            return Err(diagnostic(
+                MermaidDiagnosticKind::OversizeGraph,
+                format!("Mermaid edge limit of {} exceeded", limits.max_edges),
+                Some(line),
+            ));
+        }
+        edges.push(MermaidEdge {
+            from: relation.from.clone(),
+            to: relation.to.clone(),
+            label: relation.label.clone(),
+            arrow: true,
+        });
+        relations.push(relation);
+    }
+    if let Some((_, _, line)) = current_class {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::InvalidSyntax,
+            "Class block is missing }",
+            Some(line),
+        ));
+    }
+    if nodes.is_empty() {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::InvalidSyntax,
+            "Class diagram contains no classes",
+            Some(1),
+        ));
+    }
+    Ok(ParsedClassDiagram {
+        diagram: MermaidFlowchart {
+            direction: FlowDirection::LeftRight,
+            nodes,
+            edges,
+        },
+        classes,
+        relations,
+    })
+}
+
+fn parse_class_relation(statement: &str, line: usize) -> Result<ClassRelation, MermaidDiagnostic> {
+    let (left, remainder, dotted) = if let Some((left, right)) = statement.split_once("..>") {
+        (left, right, true)
+    } else if let Some((left, right)) = statement.split_once("-->") {
+        (left, right, false)
+    } else {
+        return Err(invalid_class_line(line, statement));
+    };
+    let (right, label) = remainder.split_once(':').map_or((remainder, None), |(right, label)| {
+        (right, Some(sanitize_mermaid_label(label.trim())))
+    });
+    let from = left.trim();
+    let to = right.trim();
+    if !valid_identifier(from) || !valid_identifier(to) || label.as_deref() == Some("") {
+        return Err(invalid_class_line(line, statement));
+    }
+    Ok(ClassRelation {
+        from: from.to_owned(),
+        to: to.to_owned(),
+        label,
+        dotted,
+    })
+}
+
+fn render_class_diagram(
+    source: &str,
+    width: usize,
+    limits: MermaidLimits,
+) -> Result<MermaidArt, MermaidDiagnostic> {
+    let parsed = parse_class_diagram(source, limits)?;
+    let minimum_lines = 1usize
+        .saturating_add(parsed.diagram.nodes.len().saturating_mul(3))
+        .saturating_add(parsed.classes.iter().map(|class| class.members.len()).sum::<usize>())
+        .saturating_add(usize::from(!parsed.relations.is_empty()))
+        .saturating_add(parsed.relations.len());
+    if minimum_lines > limits.max_output_cells {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::OutputLimit,
+            "Mermaid output cell limit is too small for this class diagram",
+            None,
+        ));
+    }
+    let mut lines = vec![fit_text("classDiagram", width)];
+    for node in &parsed.diagram.nodes {
+        let members = parsed
+            .classes
+            .iter()
+            .find(|class| class.name == node.id)
+            .map_or(&[][..], |class| class.members.as_slice());
+        append_class(&mut lines, &node.id, members, width);
+    }
+    if !parsed.relations.is_empty() {
+        lines.push(fit_text("edges", width));
+        for relation in &parsed.relations {
+            let connector = match (relation.dotted, &relation.label) {
+                (true, Some(label)) => format!(" ··{}··▶ ", sanitize_mermaid_label(label)),
+                (true, None) => " ····▶ ".to_owned(),
+                (false, Some(label)) => format!(" ─{}─▶ ", sanitize_mermaid_label(label)),
+                (false, None) => " ───▶ ".to_owned(),
+            };
+            lines.push(fit_text(
+                &format!("{}{}{}", relation.from, connector, relation.to),
+                width,
+            ));
+        }
+    }
+    check_output_cells(&lines, limits)?;
+    Ok(MermaidArt {
+        lines,
+        diagram: parsed.diagram,
+        kind: MermaidDiagramKind::ClassDiagram,
+    })
+}
+
+fn append_class(output: &mut Vec<String>, name: &str, members: &[String], width: usize) {
+    if width < 5 {
+        output.push(fit_text(name, width));
+        return;
+    }
+    let inner_width = std::iter::once(name)
+        .chain(members.iter().map(String::as_str))
+        .map(display_width)
+        .max()
+        .unwrap_or(1)
+        .min(width - 2)
+        .max(1);
+    output.push(format!("┌{}┐", "─".repeat(inner_width)));
+    output.push(format!("│{}│", pad_to_width(&fit_text(name, inner_width), inner_width)));
+    if !members.is_empty() {
+        output.push(format!("├{}┤", "─".repeat(inner_width)));
+        for member in members {
+            output.push(format!(
+                "│{}│",
+                pad_to_width(&fit_text(member, inner_width), inner_width)
+            ));
+        }
+    }
+    output.push(format!("└{}┘", "─".repeat(inner_width)));
+}
+
+fn sanitize_mermaid_label(text: &str) -> String {
+    sanitize_inline(text)
+        .replace("<br/>", " · ")
+        .replace("<br />", " · ")
+        .replace("<br>", " · ")
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
+}
+
+fn check_output_cells(lines: &[String], limits: MermaidLimits) -> Result<(), MermaidDiagnostic> {
     let cells = lines.iter().map(|line| display_width(line)).sum::<usize>();
     if cells > limits.max_output_cells {
         return Err(diagnostic(
@@ -239,7 +607,15 @@ pub fn render_mermaid_unicode(
             None,
         ));
     }
-    Ok(MermaidArt { lines, diagram })
+    Ok(())
+}
+
+fn invalid_class_line(line: usize, statement: &str) -> MermaidDiagnostic {
+    diagnostic(
+        MermaidDiagnosticKind::InvalidSyntax,
+        format!("Unsupported classDiagram syntax: {}", fit_text(statement, 80)),
+        Some(line),
+    )
 }
 
 fn append_node(output: &mut Vec<String>, node: &MermaidNode, width: usize) {
@@ -477,4 +853,131 @@ fn invalid_line(line: usize, statement: &str) -> MermaidDiagnostic {
         format!("Unsupported flowchart syntax: {}", fit_text(statement, 80)),
         Some(line),
     )
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exact user-reported classDiagram: members + solid/dotted relations.
+    const CLASS_SOURCE: &str = "\
+classDiagram
+class Application {
++run()
+}
+class Session {
++id: String
+}
+class Agent {
++tools: Vec
+}
+class AgentTool {
++name: String
+}
+Application --> Session
+Agent ..> AgentTool : via context
+";
+
+    /// Exact user-reported flowchart LR with labeled subgraph.
+    const FLOW_SOURCE: &str = "\
+flowchart LR
+subgraph records[\"SessionRecord types\"]
+A[Session] --> B[Message]
+B --> C[ToolCall]
+end
+X[User] --> A
+";
+
+    #[test]
+    fn class_diagram_parses_members_and_relations() {
+        let parsed = parse_class_diagram(CLASS_SOURCE, MermaidLimits::default()).unwrap();
+        assert_eq!(
+            parsed.classes.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["Application", "Session", "Agent", "AgentTool"]
+        );
+        assert_eq!(parsed.classes[0].members, vec!["+run()".to_owned()]);
+        assert_eq!(parsed.classes[1].members, vec!["+id: String".to_owned()]);
+        assert_eq!(parsed.classes[2].members, vec!["+tools: Vec".to_owned()]);
+        assert_eq!(parsed.classes[3].members, vec!["+name: String".to_owned()]);
+        assert_eq!(parsed.relations.len(), 2);
+        assert_eq!(parsed.relations[0].from, "Application");
+        assert_eq!(parsed.relations[0].to, "Session");
+        assert!(!parsed.relations[0].dotted);
+        assert_eq!(parsed.relations[0].label, None);
+        assert_eq!(parsed.relations[1].from, "Agent");
+        assert_eq!(parsed.relations[1].to, "AgentTool");
+        assert!(parsed.relations[1].dotted);
+        assert_eq!(parsed.relations[1].label.as_deref(), Some("via context"));
+        let chart = parse_mermaid(CLASS_SOURCE, MermaidLimits::default()).unwrap();
+        assert_eq!(chart.nodes.len(), 4);
+        assert_eq!(chart.edges.len(), 2);
+    }
+
+    #[test]
+    fn class_diagram_render_includes_members_and_relation_edges() {
+        let art = render_mermaid_unicode(CLASS_SOURCE, 48, MermaidLimits::default()).unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::ClassDiagram);
+        let text = art.lines.join("\n");
+        assert!(text.starts_with("classDiagram"), "{text}");
+        assert!(text.contains("+run()"), "{text}");
+        assert!(text.contains("+id: String"), "{text}");
+        assert!(text.contains("+tools: Vec"), "{text}");
+        assert!(text.contains("+name: String"), "{text}");
+        assert!(text.contains("Application ───▶ Session"), "{text}");
+        assert!(text.contains("Agent ··via context··▶ AgentTool"), "{text}");
+        assert!(!text.contains("source fallback"), "{text}");
+    }
+
+    #[test]
+    fn labeled_subgraph_parses_id_title_and_nested_edges() {
+        let statements = statements(FLOW_SOURCE);
+        let header_line = statements[0].0;
+        let parsed = parse_flowchart(statements, header_line, MermaidLimits::default()).unwrap();
+        assert_eq!(parsed.diagram.direction, FlowDirection::LeftRight);
+        assert_eq!(parsed.subgraphs.len(), 1);
+        assert_eq!(parsed.subgraphs[0].id, "records");
+        assert_eq!(parsed.subgraphs[0].title, "SessionRecord types");
+        assert_eq!(parsed.subgraphs[0].start_node, 0);
+        assert_eq!(parsed.subgraphs[0].end_node, 3);
+        assert_eq!(
+            parsed
+                .diagram
+                .nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("A", "Session"),
+                ("B", "Message"),
+                ("C", "ToolCall"),
+                ("X", "User"),
+            ]
+        );
+        assert_eq!(parsed.diagram.edges.len(), 3);
+        assert_eq!(parsed.diagram.edges[0].from, "A");
+        assert_eq!(parsed.diagram.edges[0].to, "B");
+        assert_eq!(parsed.diagram.edges[2].from, "X");
+        assert_eq!(parsed.diagram.edges[2].to, "A");
+    }
+
+    #[test]
+    fn labeled_subgraph_render_keeps_title_and_end_markers() {
+        let art = render_mermaid_unicode(FLOW_SOURCE, 48, MermaidLimits::default()).unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::Flowchart);
+        let text = art.lines.join("\n");
+        assert!(text.starts_with("flowchart LR"), "{text}");
+        assert!(
+            text.contains("subgraph records · SessionRecord types"),
+            "{text}"
+        );
+        assert!(text.contains("end subgraph records"), "{text}");
+        assert!(text.contains("A · Session"), "{text}");
+        assert!(text.contains("B · Message"), "{text}");
+        assert!(text.contains("C · ToolCall"), "{text}");
+        assert!(text.contains("X · User"), "{text}");
+        assert!(text.contains("A ───▶ B"), "{text}");
+        assert!(text.contains("B ───▶ C"), "{text}");
+        assert!(text.contains("X ───▶ A"), "{text}");
+    }
 }

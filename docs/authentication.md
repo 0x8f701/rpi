@@ -1,20 +1,20 @@
 # Authentication
 
-`pi` resolves credentials in a strict, documented order and never logs them.
-Credentials can be managed interactively with `pi login` / `pi logout` or
+`rpi` resolves credentials in a strict, documented order and never logs them.
+Credentials can be managed interactively with `rpi login` / `rpi logout` or
 configured manually in `auth.json` or `models.json`.
 
 ## Quick credential management
 
 ```sh
 # Interactive login (choose provider and method)
-pi login
+rpi login
 
 # Login to a specific provider
-pi login anthropic
+rpi login anthropic
 
 # Remove stored credentials
-pi logout openai
+rpi logout openai
 ```
 
 `login` and `logout` operate on the agent's `auth.json`. Outside an
@@ -24,7 +24,7 @@ permissions on Unix.
 
 ## Credential precedence (per provider)
 
-When a request is built, `pi` looks for a usable credential in this order
+When a request is built, `rpi` looks for a usable credential in this order
 (source: `crates/pi-cli/src/models_config.rs::resolve_model_request_auth` and
 `resolve_model_request_auth_async`):
 
@@ -34,7 +34,7 @@ When a request is built, `pi` looks for a usable credential in this order
    key for the resolved provider for the duration of the run).
 3. A stored `auth.json` credential for the provider:
    - `api_key` entries are expanded and used as the key.
-   - OAuth entries require async resolution; `pi` refreshes expired OAuth
+   - OAuth entries require async resolution; `rpi` refreshes expired OAuth
      tokens automatically before use.
 4. The `apiKey` field from `models.json` for that provider.
 5. A recognized provider environment variable (see table below).
@@ -53,7 +53,7 @@ support `$VAR` / `${VAR}` template expansion (see
 
 ## Supported OAuth providers
 
-`pi login` can store OAuth credentials for:
+`rpi login` can store OAuth credentials for:
 
 - `anthropic`
 - `openai-codex`
@@ -138,7 +138,7 @@ Example:
 
 Rules:
 
-- `type` is `"api_key"` for manually edited entries. `pi login` may write
+- `type` is `"api_key"` for manually edited entries. `rpi login` may write
   `"oauth"` entries; those should not be hand-edited.
 - `key` is the credential value or a `$VAR` / `${VAR}` template.
 - `env` is an optional map of variables available only while resolving this
@@ -201,7 +201,7 @@ Both `auth.json` and `models.json` values use the same expander
 For `auth.json`, variables are resolved from the request environment, then the
 credential's own `env` map, then the process environment. Empty values are
 treated as unset. Invalid braced names such as `${1bad}` are left unchanged.
-If a referenced variable is not set, `pi` exits with an error that names the
+If a referenced variable is not set, `rpi` exits with an error that names the
 variable and source file but never exposes the original template text.
 
 ## Redaction and sensitive headers
@@ -221,7 +221,7 @@ messages name the missing variable or provider, never the key value.
 
 ## Fail-closed behavior
 
-`pi` fails loudly rather than silently when authentication cannot be resolved:
+`rpi` fails loudly rather than silently when authentication cannot be resolved:
 
 - No API key, no OAuth credential, no recognized auth header, and no
   `authHeader` fallback → request fails with:

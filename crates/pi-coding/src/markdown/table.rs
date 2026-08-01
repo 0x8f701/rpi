@@ -1,5 +1,6 @@
 use super::AnalysisMode;
-use super::text::{display_width, pad_to_width, sanitize_inline, wrap_text};
+use super::inline::{InlineStyleRange, StyledText, append_styled, parse_inline, shifted_styles, wrap_inline};
+use super::text::display_width;
 
 const MAX_TABLE_COLUMNS: usize = 32;
 const MAX_LAYOUT_WIDTH: usize = 1_000;
@@ -25,6 +26,7 @@ pub struct TableBlock {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableLayout {
     pub lines: Vec<String>,
+    pub inline_styles: Vec<Vec<InlineStyleRange>>,
     pub column_widths: Vec<usize>,
     pub width: usize,
 }
@@ -35,21 +37,26 @@ pub fn layout_table(table: &TableBlock, available_width: usize) -> Option<TableL
         return None;
     }
     let available_width = available_width.min(MAX_LAYOUT_WIDTH);
-    if available_width < columns * 2 + 1 {
+    if available_width < columns * 3 + 1 {
         return None;
     }
     let widths = allocate_widths(table, available_width)?;
     let mut lines = Vec::new();
+    let mut inline_styles = Vec::new();
     lines.push(border('┌', '┬', '┐', &widths));
-    append_row(&mut lines, &table.headers, &widths, &table.alignments);
+    inline_styles.push(Vec::new());
+    append_row(&mut lines, &mut inline_styles, &table.headers, &widths, &table.alignments);
     lines.push(border('├', '┼', '┤', &widths));
+    inline_styles.push(Vec::new());
     for row in &table.rows {
-        append_row(&mut lines, row, &widths, &table.alignments);
+        append_row(&mut lines, &mut inline_styles, row, &widths, &table.alignments);
     }
     lines.push(border('└', '┴', '┘', &widths));
+    inline_styles.push(Vec::new());
     let width = display_width(lines.first()?);
     Some(TableLayout {
         lines,
+        inline_styles,
         column_widths: widths,
         width,
     })
@@ -105,20 +112,20 @@ pub(crate) fn parse_table_at(
 
 fn allocate_widths(table: &TableBlock, available_width: usize) -> Option<Vec<usize>> {
     let columns = table.headers.len();
-    let borders = columns + 1;
-    let content_budget = available_width.checked_sub(borders)?;
-    let minimum_width = if content_budget >= columns * 3 { 3 } else { 1 };
-    if content_budget < columns * minimum_width {
+    let borders_and_padding = columns * 3 + 1;
+    let content_budget = available_width.checked_sub(borders_and_padding)?;
+    let minimum_width = 1;
+    if content_budget < columns {
         return None;
     }
 
     let mut preferred = vec![1; columns];
     for (column, header) in table.headers.iter().enumerate() {
-        preferred[column] = preferred[column].max(display_width(&sanitize_inline(header)));
+        preferred[column] = preferred[column].max(display_width(&parse_inline(header).text));
     }
     for row in &table.rows {
         for (column, cell) in row.iter().enumerate().take(columns) {
-            preferred[column] = preferred[column].max(display_width(&sanitize_inline(cell)));
+            preferred[column] = preferred[column].max(display_width(&parse_inline(cell).text));
         }
     }
     let mut widths = vec![minimum_width; columns];
@@ -154,52 +161,61 @@ fn allocate_widths(table: &TableBlock, available_width: usize) -> Option<Vec<usi
 
 fn append_row(
     output: &mut Vec<String>,
+    output_styles: &mut Vec<Vec<InlineStyleRange>>,
     cells: &[String],
     widths: &[usize],
     alignments: &[TableAlignment],
 ) {
-    let wrapped = widths
+    let parsed = widths
         .iter()
         .enumerate()
         .map(|(column, width)| {
-            wrap_text(cells.get(column).map(String::as_str).unwrap_or_default(), *width)
+            wrap_inline(
+                cells.get(column).map(String::as_str).unwrap_or_default(),
+                *width,
+            )
         })
         .collect::<Vec<_>>();
-    let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+    let height = parsed.iter().map(Vec::len).max().unwrap_or(1);
     for line in 0..height {
         let mut rendered = String::from("│");
+        let mut styles = Vec::new();
         for (column, width) in widths.iter().enumerate() {
-            let text = wrapped[column].get(line).map(String::as_str).unwrap_or_default();
-            rendered.push_str(&align_text(
-                text,
-                *width,
-                alignments.get(column).copied().unwrap_or_default(),
-            ));
+            let text = parsed[column].get(line).cloned().unwrap_or_default();
+            let aligned = align_styled(text, *width, alignments.get(column).copied().unwrap_or_default());
+            rendered.push(' ');
+            styles.extend(shifted_styles(&aligned.styles, rendered.len()));
+            rendered.push_str(&aligned.text);
+            rendered.push(' ');
             rendered.push('│');
         }
         output.push(rendered);
+        output_styles.push(styles);
     }
 }
 
-fn align_text(text: &str, width: usize, alignment: TableAlignment) -> String {
-    let actual = display_width(text).min(width);
+fn align_styled(text: StyledText, width: usize, alignment: TableAlignment) -> StyledText {
+    let actual = display_width(&text.text).min(width);
     let remaining = width.saturating_sub(actual);
-    match alignment {
-        TableAlignment::Left => pad_to_width(text, width),
-        TableAlignment::Right => format!("{}{text}", " ".repeat(remaining)),
-        TableAlignment::Center => {
-            let left = remaining / 2;
-            let right = remaining - left;
-            format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
-        }
-    }
+    let (left, right) = match alignment {
+        TableAlignment::Left => (0, remaining),
+        TableAlignment::Right => (remaining, 0),
+        TableAlignment::Center => (remaining / 2, remaining - remaining / 2),
+    };
+    let mut aligned = StyledText {
+        text: " ".repeat(left),
+        styles: Vec::new(),
+    };
+    append_styled(&mut aligned, &text, 0..text.text.len());
+    aligned.text.push_str(&" ".repeat(right));
+    aligned
 }
 
 fn border(left: char, joint: char, right: char, widths: &[usize]) -> String {
     let mut rendered = String::new();
     rendered.push(left);
     for (index, width) in widths.iter().enumerate() {
-        rendered.extend(std::iter::repeat_n('─', *width));
+        rendered.extend(std::iter::repeat_n('─', width + 2));
         rendered.push(if index + 1 == widths.len() { right } else { joint });
     }
     rendered
@@ -339,7 +355,7 @@ mod tests {
             "|Language|Paradigm|",
             "|Language|Paradigm",
             "Language|Paradigm|",
-            "|日本語|Paradigm|",
+            "|Ελληνικά|Paradigm|",
             "|a\\|b|",
             "\\|a|",
             "| `a|b` | c |",
@@ -363,8 +379,8 @@ mod tests {
             Some(vec!["Language".to_owned(), "Paradigm".to_owned()])
         );
         assert_eq!(
-            parse_pipe_row("|日本語|Paradigm|"),
-            Some(vec!["日本語".to_owned(), "Paradigm".to_owned()])
+            parse_pipe_row("|Ελληνικά|Paradigm|"),
+            Some(vec!["Ελληνικά".to_owned(), "Paradigm".to_owned()])
         );
         assert_eq!(
             parse_pipe_row("|a||b|"),

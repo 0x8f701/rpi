@@ -184,6 +184,7 @@ fn orchestration_excludes_incompatible_agent_without_blocking_valid_agents() {
                 id: "ArchitectChild".to_owned(),
                 agent: "architect".to_owned(),
                 assignment: "design the system".to_owned(),
+                todo_task_id: None,
             }],
         )
         .expect_err("explicit incompatible agent must fail")
@@ -573,12 +574,14 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
                     id: "Second".to_owned(),
                     agent: "task".to_owned(),
                     assignment: "second assignment".to_owned(),
+                    todo_task_id: None,
                 },
                 TaskItem {
                     index: 0,
                     id: "First".to_owned(),
                     agent: "task".to_owned(),
                     assignment: "first assignment".to_owned(),
+                    todo_task_id: None,
                 },
             ],
             abort,
@@ -733,6 +736,7 @@ async fn batch_never_exceeds_configured_concurrency() {
                         id: format!("Concurrent{index}"),
                         agent: "task".to_owned(),
                         assignment: format!("work {index}"),
+                        todo_task_id: None,
                     })
                     .collect(),
                 abort,
@@ -778,6 +782,7 @@ async fn mailbox_cap_wait_and_peer_roster_are_enforced() {
                 id: "Worker".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "finish".to_owned(),
+                todo_task_id: None,
             }],
             abort,
         )
@@ -924,6 +929,7 @@ async fn cancellation_aborts_a_running_child() {
                     id: "CancelMe".to_owned(),
                     agent: "task".to_owned(),
                     assignment: "wait".to_owned(),
+                    todo_task_id: None,
                 }],
                 abort,
             )
@@ -1015,6 +1021,7 @@ async fn dropping_runtime_owner_cancels_children() {
                     id: "DropMe".to_owned(),
                     agent: "task".to_owned(),
                     assignment: "wait".to_owned(),
+                    todo_task_id: None,
                 }],
                 abort,
             )
@@ -1154,11 +1161,190 @@ async fn run_one_child(runtime: &OrchestrationRuntime, child_id: &str) {
                 id: child_id.to_owned(),
                 agent: "task".to_owned(),
                 assignment: "finish".to_owned(),
+                todo_task_id: None,
             }],
             abort,
         )
         .await
         .expect("child batch");
+}
+
+fn context_user_texts(context: &pi_ai::Context) -> Vec<String> {
+    context
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(
+                user.content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            Message::Custom(custom) => Some(
+                custom
+                    .content
+                    .to_blocks()
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn running_child_observes_mid_run_steering_exactly_once() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release_first = tokio_util::sync::CancellationToken::new();
+    let contexts = Arc::new(Mutex::new(Vec::<pi_ai::Context>::new()));
+    let stream_started = started.clone();
+    let stream_release = release_first.clone();
+    let stream_contexts = contexts.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream_calls = calls.clone();
+    let stream_fn: pi_agent::StreamFn = Arc::new(move |model, context, options| {
+        let started = stream_started.clone();
+        let release = stream_release.clone();
+        let contexts = stream_contexts.clone();
+        let calls = stream_calls.clone();
+        Box::pin(async move {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            contexts.lock().push(context);
+            let stream = pi_ai::new_assistant_message_event_stream();
+            let producer = stream.clone();
+            tokio::spawn(async move {
+                if call == 0 {
+                    started.notify_waiters();
+                    let abort = options.stream.abort_signal;
+                    tokio::select! {
+                        () = release.cancelled() => {}
+                        () = async {
+                            match abort {
+                                Some(signal) => signal.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => {}
+                    }
+                }
+                let mut message = pi_ai::AssistantMessage::pending(&model);
+                message.content.push(ContentBlock::text(if call == 0 {
+                    "initial response"
+                } else {
+                    "urgent instruction followed"
+                }));
+                message.stop_reason = StopReason::Stop;
+                producer.end(Some(message)).await;
+            });
+            stream
+        })
+    });
+    let factory: ChildSessionFactory = Arc::new(move |request| {
+        let stream_fn = stream_fn.clone();
+        Box::pin(async move {
+            Session::new(SessionOptions {
+                model: Model::default(),
+                cwd: std::env::current_dir().expect("cwd"),
+                system_prompt: request.system_prompt,
+                thinking_level: ThinkingLevel::Off,
+                api_key: String::new(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(request.orchestration_tools),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: Some(stream_fn),
+                auth_resolver: None,
+            })
+        })
+    });
+    let runtime = OrchestrationRuntime::new(config_with_ttl(artifacts.path(), None), factory)
+        .expect("runtime");
+    let runner = runtime.clone();
+    let run = tokio::spawn(async move {
+        let (_, abort) = AbortController::new();
+        runner
+            .run_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "Steered".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "start with the original plan".to_owned(),
+                    todo_task_id: None,
+                }],
+                abort,
+            )
+            .await
+    });
+    started.notified().await;
+    let receipt = runtime.send(
+        "Main",
+        "Steered",
+        "URGENT: replace the original plan with the new instruction",
+        None,
+    );
+    assert_eq!(receipt[0].outcome, pi_coding::DeliveryOutcome::Woken);
+    assert!(runtime.inbox("Steered", true).is_empty());
+    release_first.cancel();
+    let results = run.await.expect("run join").expect("run result");
+    assert_eq!(results[0].output, "urgent instruction followed");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let captured = contexts.lock();
+    let second = captured.get(1).expect("steered provider request");
+    let steering = context_user_texts(second)
+        .into_iter()
+        .filter(|text| text.contains("URGENT: replace the original plan"))
+        .collect::<Vec<_>>();
+    assert_eq!(steering.len(), 1, "steering must reach provider exactly once");
+    assert!(runtime.inbox("Steered", true).is_empty());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancellation_race_does_not_report_or_deliver_fake_wake() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let (factory, started, _release) = hanging_factory();
+    let runtime = OrchestrationRuntime::new(config_with_ttl(artifacts.path(), None), factory)
+        .expect("runtime");
+    let runner = runtime.clone();
+    let run = tokio::spawn(async move {
+        let (_, abort) = AbortController::new();
+        runner
+            .run_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "Race".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "remain active".to_owned(),
+                    todo_task_id: None,
+                }],
+                abort,
+            )
+            .await
+    });
+    started.notified().await;
+    assert_eq!(runtime.cancel(&["Race".to_owned()]), vec!["Race"]);
+    let receipt = runtime.send("Main", "Race", "too late", None)[0].clone();
+    let results = run.await.expect("race join").expect("race result");
+    assert_eq!(results[0].status, AgentStatus::Aborted);
+    assert_ne!(receipt.outcome, pi_coding::DeliveryOutcome::Woken);
+    if receipt.outcome == pi_coding::DeliveryOutcome::Queued {
+        assert_eq!(runtime.inbox("Race", false).len(), 1);
+    } else {
+        assert_eq!(receipt.outcome, pi_coding::DeliveryOutcome::Failed);
+    }
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -1179,6 +1365,7 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
                     id: "Runner".to_owned(),
                     agent: "task".to_owned(),
                     assignment: "hang".to_owned(),
+                    todo_task_id: None,
                 }],
                 abort,
             )
@@ -1186,10 +1373,10 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
     });
     started.notified().await;
 
-    // Queued: target is Running (mid-execution).
+    // Woken: target is Running and the active child delivery bridge accepts it.
     assert_eq!(
         runtime.send("Main", "Runner", "while running", None)[0].outcome,
-        pi_coding::DeliveryOutcome::Queued,
+        pi_coding::DeliveryOutcome::Woken,
     );
     // Failed: unknown target.
     assert_eq!(
@@ -1243,6 +1430,7 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
                     id: "CancelMe".to_owned(),
                     agent: "task".to_owned(),
                     assignment: "hang".to_owned(),
+                    todo_task_id: None,
                 }],
                 abort2,
             )
@@ -1308,6 +1496,7 @@ async fn parked_agent_delivery_retains_registry_refs_without_claiming_revival() 
                 id: "Survivor".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "produce".to_owned(),
+                todo_task_id: None,
             }],
             {
                 let (_, abort) = AbortController::new();
@@ -1471,6 +1660,7 @@ async fn group_bound_resolver_keeps_same_agent_artifacts_unique_and_stale_safe()
                 id: "Shared".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "runtime a".to_owned(),
+                todo_task_id: None,
             }],
             abort_a,
         )
@@ -1492,6 +1682,7 @@ async fn group_bound_resolver_keeps_same_agent_artifacts_unique_and_stale_safe()
                 id: "Shared".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "runtime b".to_owned(),
+                todo_task_id: None,
             }],
             abort_b,
         )
@@ -1579,6 +1770,7 @@ async fn disabled_agent_prevents_spawn_with_actionable_error() {
                 id: "Child".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "should fail".to_owned(),
+                todo_task_id: None,
             }],
             abort,
         )
@@ -1652,6 +1844,7 @@ async fn agent_model_override_changes_child_session_model() {
                 id: "Child".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "use override model".to_owned(),
+                todo_task_id: None,
             }],
         )
         .expect("spawn");
@@ -1725,6 +1918,7 @@ async fn live_parent_model_provider_changes_fallback_between_spawns() {
                 id: "FirstLiveParent".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "first parent".to_owned(),
+                todo_task_id: None,
             }],
         )
         .expect("first spawn");
@@ -1748,6 +1942,7 @@ async fn live_parent_model_provider_changes_fallback_between_spawns() {
                 id: "SecondLiveParent".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "second parent".to_owned(),
+                todo_task_id: None,
             }],
         )
         .expect("second spawn");
@@ -1790,6 +1985,7 @@ async fn public_events_report_queued_running_terminal_and_parked_truthfully() {
                 id: "EventChild".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "summarize\nsecret sk-live-super-secret".to_owned(),
+                todo_task_id: None,
             }],
         )
         .expect("spawn")

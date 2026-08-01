@@ -35,7 +35,7 @@ impl OrchestrationRuntime {
         AgentTool::new(
             "task",
             format!(
-                "Start one or more independent child coding-session jobs. Returns immediately with stable job and agent ids; use hub jobs/wait/cancel to supervise completion. Available agents:\n{agents}"
+                "Start one or more independent child coding-session jobs. Returns immediately with stable job and agent ids; use hub jobs/wait/cancel to supervise completion. When a child owns a canonical todo DAG item, pass that item's stable id as todoTaskId; omit it for unrelated work. Available agents:\n{agents}"
             ),
             task_schema(),
             move |context| {
@@ -57,6 +57,7 @@ impl OrchestrationRuntime {
             },
         )
         .with_execution_mode(ToolExecutionMode::Sequential)
+        .with_prepare_arguments(fill_task_nulls)
     }
 
     fn hub_tool(&self, caller_id: &str) -> AgentTool {
@@ -89,6 +90,8 @@ struct TaskParameters {
     agent: Option<String>,
     #[serde(default)]
     task: Option<String>,
+    #[serde(default, rename = "todoTaskId")]
+    todo_task_id: Option<String>,
     #[serde(default)]
     context: Option<String>,
     #[serde(default)]
@@ -102,6 +105,8 @@ struct TaskParametersItem {
     name: Option<String>,
     #[serde(default)]
     agent: Option<String>,
+    #[serde(default, rename = "todoTaskId")]
+    todo_task_id: Option<String>,
     task: String,
 }
 
@@ -112,8 +117,7 @@ impl TaskParameters {
                 if task.trim().is_empty() {
                     bail!("task must not be empty");
                 }
-                let agent = runtime.select_agent(&task, self.agent.as_deref());
-                runtime.ensure_agent_enabled(&agent)?;
+                let agent = runtime.resolve_task_agent(&task, self.agent.as_deref())?;
                 Ok(vec![TaskItem {
                     index: 0,
                     id: self
@@ -122,6 +126,7 @@ impl TaskParameters {
                         .unwrap_or_else(|| runtime.generated_agent_id(0)),
                     agent,
                     assignment: task,
+                    todo_task_id: self.todo_task_id,
                 }])
             }
             (None, Some(tasks)) => {
@@ -147,8 +152,8 @@ impl TaskParameters {
                         } else {
                             format!("{shared}\n\n{}", item.task)
                         };
-                        let agent = runtime.select_agent(&assignment, item.agent.as_deref());
-                        runtime.ensure_agent_enabled(&agent)?;
+                        let agent =
+                            runtime.resolve_task_agent(&assignment, item.agent.as_deref())?;
                         Ok(TaskItem {
                             index,
                             id: item
@@ -157,6 +162,7 @@ impl TaskParameters {
                                 .unwrap_or_else(|| runtime.generated_agent_id(index)),
                             agent,
                             assignment,
+                            todo_task_id: item.todo_task_id,
                         })
                     })
                     .collect()
@@ -215,23 +221,36 @@ async fn execute_hub(
                         DeliveryOutcome::Revived => "revived",
                         DeliveryOutcome::Failed => "failed",
                     };
+                    let target = match receipt.requested.as_deref() {
+                        Some(requested) if requested != receipt.to => {
+                            format!("{} (requested {requested})", receipt.to)
+                        }
+                        _ => receipt.to.clone(),
+                    };
                     match (&receipt.error, receipt.outcome) {
                         (Some(error), DeliveryOutcome::Failed) => {
-                            format!("- {}: failed — {error}", receipt.to)
+                            format!("- {target}: failed — {error}")
                         }
-                        (Some(error), _) => format!("- {}: {} — {error}", receipt.to, label),
-                        (None, _) => format!("- {}: {}", receipt.to, label),
+                        (Some(error), _) => format!("- {target}: {label} — {error}"),
+                        (None, _) => format!("- {target}: {label}"),
                     }
                 })
                 .collect::<Vec<_>>();
             if parameters.await_reply
                 && receipts.iter().any(|receipt| receipt.error.is_none())
             {
+                // Prefer the canonical agent id from a successful receipt so
+                // await-from tracks job-UUID sends after resolution.
+                let await_from = receipts
+                    .iter()
+                    .find(|receipt| receipt.error.is_none())
+                    .map(|receipt| receipt.to.as_str())
+                    .unwrap_or(to.as_str());
                 lines.push(String::new());
                 let reply = runtime
                     .wait_message(
                         &caller_id,
-                        Some(&to),
+                        Some(await_from),
                         Some(Duration::from_millis(
                             parameters.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS),
                         )),
@@ -241,7 +260,7 @@ async fn execute_hub(
                 if let Some(reply) = reply {
                     lines.push(format!("Reply from {}: {}", reply.from, reply.body));
                 } else {
-                    lines.push(format!("No reply from {to} before timeout."));
+                    lines.push(format!("No reply from {await_from} before timeout."));
                 }
             }
             Ok(result(
@@ -395,38 +414,42 @@ fn required_text(value: Option<String>, name: &str) -> Result<String> {
 
 fn task_schema() -> Schema {
     let item = strict_object(vec![
-        ("name", string_schema("Stable child id", None), false),
-        ("agent", string_schema("Agent definition name", None), false),
+        ("name", nullable(string_schema("Stable child id", None)), true),
+        ("agent", nullable(string_schema("Agent definition name", None)), true),
+        ("todoTaskId", nullable(string_schema("Stable canonical todo task id owned by this child; null for unrelated work", None)), true),
         ("task", string_schema("Assignment for this child", Some(1)), true),
     ]);
-    let single = strict_object(vec![
-        ("name", string_schema("Stable child id", None), false),
-        ("agent", string_schema("Agent definition name", None), false),
-        ("task", string_schema("Assignment for this child", Some(1)), true),
-    ]);
-    let batch = strict_object(vec![
-        (
-            "context",
-            string_schema("Shared context prepended to every child assignment", None),
-            false,
-        ),
+    strict_object(vec![
+        ("name", nullable(string_schema("Stable child id", None)), true),
+        ("agent", nullable(string_schema("Agent definition name", None)), true),
+        ("task", nullable(string_schema("Single child assignment", Some(1))), true),
+        ("todoTaskId", nullable(string_schema("Stable canonical todo task id owned by the single child; null for unrelated work", None)), true),
+        ("context", nullable(string_schema("Shared context prepended to every batch child assignment", None)), true),
         (
             "tasks",
-            Schema {
+            nullable(Schema {
                 schema_type: Some(Value::String("array".to_owned())),
                 description: Some("Independent child assignments".to_owned()),
-                items: Some(Box::new(item)),
-                min_items: Some(1),
-                max_items: Some(MAX_TASK_BATCH),
+                items: Some(Box::new(item)), min_items: Some(1), max_items: Some(MAX_TASK_BATCH),
                 ..Schema::default()
-            },
+            }),
             true,
         ),
-    ]);
-    Schema {
-        one_of: vec![single, batch],
-        ..Schema::default()
+    ])
+}
+
+fn nullable(mut schema: Schema) -> Schema { schema.nullable = true; schema }
+
+fn fill_task_nulls(mut arguments: Value) -> Result<Value> {
+    let object = arguments.as_object_mut().ok_or_else(|| anyhow!("task arguments must be an object"))?;
+    for key in ["name", "agent", "task", "todoTaskId", "context", "tasks"] { object.entry(key).or_insert(Value::Null); }
+    if let Some(tasks) = object.get_mut("tasks").and_then(Value::as_array_mut) {
+        for item in tasks {
+            let item = item.as_object_mut().ok_or_else(|| anyhow!("each task entry must be an object"))?;
+            for key in ["name", "agent", "todoTaskId"] { item.entry(key).or_insert(Value::Null); }
+        }
     }
+    Ok(arguments)
 }
 
 fn hub_schema() -> Schema {
@@ -574,5 +597,18 @@ mod advertisement_tests {
         assert!(task.description.contains("task —"));
         assert!(!task.description.contains("reviewer —"), "{}", task.description);
         assert_eq!(runtime.select_agent("anything", None), "task");
+
+    }
+    #[test]
+    fn task_schema_is_valid_for_openai_strict_tools() {
+        let schema = serde_json::to_value(task_schema()).expect("task schema");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        let properties = schema["properties"].as_object().expect("task properties");
+        let required = schema["required"].as_array().expect("task required");
+        assert_eq!(required.len(), properties.len());
+        for name in properties.keys() { assert!(required.iter().any(|item| item == name)); }
+        let prepared = fill_task_nulls(json!({"task":"inspect source"})).expect("prepare task");
+        assert!(task_schema().validate(&prepared).is_ok());
     }
 }

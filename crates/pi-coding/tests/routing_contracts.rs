@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::FutureExt;
@@ -7,9 +8,9 @@ use parking_lot::Mutex;
 use pi_agent::{AbortController, ThinkingLevel, ToolCallContext};
 use pi_ai::{AssistantMessage, AssistantMessageEvent, Context, Model, StopReason};
 use pi_coding::{
-    AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentRuntimeSettings, ChildSessionFactory,
-    OrchestrationConfig, OrchestrationRuntime, OrchestrationSkill, SelectorSettings, Session,
-    SessionOptions, SkillSource, TaskSpawn,
+    AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentRuntimeSettings, AgentStatus,
+    ChildSessionFactory, JobStatus, OrchestrationConfig, OrchestrationEvent, OrchestrationRuntime,
+    OrchestrationSkill, SelectorSettings, Session, SessionOptions, SkillSource, TaskSpawn,
 };
 use serde_json::{Value, json};
 
@@ -127,6 +128,18 @@ fn runtime(
     OrchestrationRuntime::new(config, recording_factory(contexts)).expect("runtime")
 }
 
+fn runtime_with_agents(
+    artifacts: &std::path::Path,
+    agents: Vec<AgentDefinition>,
+) -> OrchestrationRuntime {
+    let mut config = OrchestrationConfig::new(AgentCatalog::from_agents(agents), artifacts)
+        .with_selector_settings(selector_settings());
+    config.default_agent = config.catalog.agents()[0].name.clone();
+    config.parent_model = model();
+    OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))
+        .expect("runtime")
+}
+
 fn tool<'a>(tools: &'a [pi_agent::AgentTool], name: &str) -> &'a pi_agent::AgentTool {
     tools.iter().find(|candidate| candidate.name == name).unwrap_or_else(|| panic!("missing tool {name}"))
 }
@@ -213,6 +226,210 @@ async fn disabled_agents_are_not_advertised_or_auto_selected_and_explicit_enable
     assert!(captured[0].system_prompt.starts_with("WRITER_PROMPT"));
     drop(captured);
     runtime.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_agent_mentions_route_before_overlapping_skills_and_ambiguous_mentions_fail() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let research = skill(
+        root.path(),
+        "research",
+        "Research topics for a researcher study",
+        "RESEARCH_BODY",
+    );
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![
+            agent(
+                "researcher",
+                "Research and study assigned topics",
+                "RESEARCHER_PROMPT",
+                &[],
+            ),
+            agent("writer", "Write assigned content", "WRITER_PROMPT", &[]),
+        ]),
+        root.path(),
+    )
+    .with_selector_settings(selector_settings());
+    config.default_agent = "writer".to_owned();
+    config.skills = vec![research];
+    config.parent_model = model();
+    let runtime = OrchestrationRuntime::new(config, recording_factory(contexts.clone()))?;
+    assert_eq!(runtime.select_agent("Have researcher study this", None), "researcher");
+    assert_eq!(
+        runtime.select_agent("Use research for this", None),
+        "writer",
+        "generic skill text must not force the overlapping agent"
+    );
+
+    let mut events = runtime.subscribe();
+    let task = tool(&runtime.agent_tools("Main", 0), "task").clone();
+    let result = (task.execute)(context(json!({
+        "name": "ResearchChild",
+        "task": "Have researcher study this"
+    })))
+    .await?;
+    let spawns: Vec<TaskSpawn> = serde_json::from_value(result.details)?;
+    assert_eq!(spawns.len(), 1);
+    assert_eq!(spawns[0].agent, "researcher");
+    assert_eq!(spawns[0].agent_id, "ResearchChild");
+
+    let mut saw_agent = false;
+    let mut saw_job = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !(saw_agent && saw_job) && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Ok(OrchestrationEvent::AgentUpdated { agent, .. }))
+                if agent.id == "ResearchChild" =>
+            {
+                assert_eq!(agent.display_name, "researcher");
+                assert!(matches!(
+                    agent.status,
+                    AgentStatus::Queued | AgentStatus::Running | AgentStatus::Idle | AgentStatus::Parked
+                ));
+                saw_agent = true;
+            }
+            Ok(Ok(OrchestrationEvent::JobUpdated { job, .. }))
+                if job.id == spawns[0].job_id =>
+            {
+                assert_eq!(job.agent, "researcher");
+                assert_eq!(job.agent_id, "ResearchChild");
+                assert!(matches!(
+                    job.status,
+                    JobStatus::Queued | JobStatus::Running | JobStatus::Completed
+                ));
+                saw_job = true;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(saw_agent, "exact mention spawn must publish AgentUpdated");
+    assert!(saw_job, "exact mention spawn must publish JobUpdated");
+
+    wait_for_spawn(&runtime, &spawns[0]).await?;
+    let captured = contexts.lock();
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0].system_prompt.starts_with("RESEARCHER_PROMPT"));
+    assert!(
+        !captured[0].system_prompt.contains("RESEARCH_BODY"),
+        "exact agent mention must not autoload the overlapping skill body"
+    );
+    drop(captured);
+    runtime.shutdown().await;
+
+    // Natural-language spawn API: verb + exact name spawns; skill-only does not.
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![
+            agent(
+                "researcher",
+                "Research and study assigned topics",
+                "RESEARCHER_PROMPT",
+                &[],
+            ),
+            agent("writer", "Write assigned content", "WRITER_PROMPT", &[]),
+        ]),
+        root.path(),
+    )
+    .with_selector_settings(selector_settings());
+    config.default_agent = "writer".to_owned();
+    config.skills = vec![skill(
+        root.path(),
+        "research",
+        "Research topics for a researcher study",
+        "RESEARCH_BODY",
+    )];
+    config.parent_model = model();
+    let nl_runtime = OrchestrationRuntime::new(config, recording_factory(contexts.clone()))?;
+    let nl_spawns = nl_runtime
+        .spawn_from_natural_language("Main", 0, "Have researcher study this")?
+        .expect("verb + exact agent must spawn");
+    assert_eq!(nl_spawns[0].agent, "researcher");
+    assert_eq!(nl_spawns[0].agent_id, "researcher");
+    wait_for_spawn(&nl_runtime, &nl_spawns[0]).await?;
+    assert!(
+        nl_runtime
+            .spawn_from_natural_language("Main", 0, "Use research for this")?
+            .is_none(),
+        "skill-oriented text must remain a recommendation"
+    );
+    nl_runtime.shutdown().await;
+
+    let ambiguous_runtime = runtime_with_agents(
+        root.path(),
+        vec![
+            agent("Research-Agent", "First researcher", "FIRST_PROMPT", &[]),
+            agent("research-agent", "Second researcher", "SECOND_PROMPT", &[]),
+        ],
+    );
+    let ambiguous_task = tool(&ambiguous_runtime.agent_tools("Main", 0), "task").clone();
+    let error = (ambiguous_task.execute)(context(json!({
+        "task": "Have Research Agent study this"
+    })))
+    .await
+    .expect_err("ambiguous exact agent mention must fail");
+    let message = error.to_string();
+    assert!(message.contains("ambiguous"), "{message}");
+    assert!(message.contains("Research-Agent"), "{message}");
+    assert!(message.contains("research-agent"), "{message}");
+    assert!(message.contains("task.agent"), "{message}");
+    let nl_ambiguous = ambiguous_runtime
+        .spawn_from_natural_language("Main", 0, "Have Research Agent study this")
+        .expect_err("ambiguous NL spawn must fail");
+    assert!(nl_ambiguous.to_string().contains("ambiguous"), "{nl_ambiguous}");
+    ambiguous_runtime.shutdown().await;
+
+    // Disabled exact agent mention fails clearly (task tool and NL spawn).
+    let mut disabled_settings = BTreeMap::new();
+    disabled_settings.insert(
+        "researcher".to_owned(),
+        AgentRuntimeSettings {
+            enabled: Some(false),
+            model: None,
+            tools: None,
+        },
+    );
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let mut disabled_config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![
+            agent(
+                "researcher",
+                "Research and study assigned topics",
+                "RESEARCHER_PROMPT",
+                &[],
+            ),
+            agent("writer", "Write assigned content", "WRITER_PROMPT", &[]),
+        ]),
+        root.path(),
+    )
+    .with_selector_settings(selector_settings())
+    .with_agent_settings(disabled_settings);
+    disabled_config.default_agent = "writer".to_owned();
+    disabled_config.parent_model = model();
+    let disabled_runtime =
+        OrchestrationRuntime::new(disabled_config, recording_factory(contexts))?;
+    let disabled_task = tool(&disabled_runtime.agent_tools("Main", 0), "task").clone();
+    let disabled_error = (disabled_task.execute)(context(json!({
+        "task": "Have researcher study this"
+    })))
+    .await
+    .expect_err("disabled exact agent mention must fail");
+    let disabled_message = disabled_error.to_string();
+    assert!(
+        disabled_message.contains("researcher") && disabled_message.contains("disabled"),
+        "{disabled_message}"
+    );
+    let disabled_nl = disabled_runtime
+        .spawn_from_natural_language("Main", 0, "Have researcher study this")
+        .expect_err("disabled NL exact mention must fail");
+    assert!(
+        disabled_nl.to_string().contains("disabled"),
+        "{disabled_nl}"
+    );
+    disabled_runtime.shutdown().await;
     Ok(())
 }
 

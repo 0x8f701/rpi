@@ -1,6 +1,6 @@
 # Environment variables
 
-This page lists every environment variable that `pi` reads from source. Values
+This page lists every environment variable that `rpi` reads from source. Values
 are never documented here; set them in your shell or agent configuration. The
 lists are grouped by function rather than priority.
 
@@ -55,7 +55,7 @@ applied, so stale values never leak into a child.
 
 ## Provider API keys
 
-These variables are read by `pi` to authenticate provider requests. Empty values
+These variables are read by `rpi` to authenticate provider requests. Empty values
 are treated as unset.
 
 | Variable(s) | Provider |

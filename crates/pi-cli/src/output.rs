@@ -20,7 +20,7 @@ pub fn warn_line(msg: &str) {
 
 /// Print an error to stderr (no ANSI in case the stream is not a TTY).
 pub fn error_line(msg: &str) {
-    eprintln!("pi: {msg}");
+    eprintln!("rpi: {msg}");
 }
 
 /// Parse a reasoning level string into a [`ThinkingLevel`].
@@ -37,6 +37,7 @@ pub fn parse_thinking_level(level: &str) -> ThinkingLevel {
         "low" => ThinkingLevel::Low,
         "high" => ThinkingLevel::High,
         "xhigh" => ThinkingLevel::Xhigh,
+        "max" => ThinkingLevel::Max,
         other => {
             warn_line(&format!(
                 "ignoring unknown thinking level {other:?}; defaulting to medium"
@@ -57,5 +58,6 @@ pub fn thinking_level_str(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",
         ThinkingLevel::Xhigh => "xhigh",
+        ThinkingLevel::Max => "max",
     }
 }

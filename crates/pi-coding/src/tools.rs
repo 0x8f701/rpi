@@ -1,5 +1,5 @@
 //! Built-in coding tools (port of pi's `coding/tools.go`): read, write, edit,
-//! bash, ls, find, grep — all rooted at `cwd`.
+//! bash, ls, find, and grep. Relative filesystem paths resolve from `cwd`.
 //!
 //! Tool definitions, parameter schemas, prompt guidelines, path resolution,
 //! edit unique/non-overlapping replacement semantics, bounded output,
@@ -53,7 +53,7 @@ use glob::{match_fd_glob, match_rg_glob, IgnoreStack};
 use imageresize::process_image;
 use mime::detect_supported_image_mime_type_from_file;
 use mutation_queue::with_file_mutation_queue;
-use paths::{resolve_read_path, resolve_scoped_path};
+use paths::{resolve_mutation_path, resolve_read_path, resolve_scoped_path};
 
 /// pi `MAX_TIMEOUT_MS` (INT32_MAX): the bash tool rejects any timeout that
 /// would exceed this many milliseconds (`resolveTimeoutMs`).
@@ -110,13 +110,14 @@ pub const TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find
 pub fn tool_snippet(name: &str) -> Option<&'static str> {
     Some(match name {
         "read" => "Read file contents",
-        "bash" => "Execute bash commands (ls, grep, find, etc.)",
+        "bash" => "Execute finite foreground shell commands, or supervised long-running commands with background=true",
         "edit" => "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
         "write" => "Create or overwrite files",
         "grep" => "Search file contents for patterns (respects .gitignore)",
         "find" => "Find files by glob pattern (respects .gitignore)",
         "glob" => "Match files by glob pattern under workspace roots (sandboxed, bounded)",
         "ls" => "List directory contents",
+        "process" => "Start and control supervised long-running processes listed by /ps",
         "todo" => "Track phased session work and completion state",
         _ => return None,
     })
@@ -154,6 +155,21 @@ fn s_array(item: Schema, desc: &str) -> Schema {
         description: Some(desc.to_string()),
         ..Default::default()
     }
+}
+fn nullable(mut schema: Schema) -> Schema {
+    schema.nullable = true;
+    schema
+}
+
+fn fill_missing_with_null(mut arguments: Value) -> Result<Value> {
+    let object = arguments.as_object_mut().ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+    for key in ["list", "task", "phase", "items", "dependsOn"] {
+        object.entry(key).or_insert(Value::Null);
+    }
+    if object.get("cascade").is_none_or(Value::is_null) {
+        object.insert("cascade".to_owned(), Value::Bool(false));
+    }
+    Ok(arguments)
 }
 /// Builds an object schema from ordered `(name, schema)` pairs. Names in
 /// `required` are required (the rest are optional, like pi's `Opt`).
@@ -477,7 +493,7 @@ fn todo_tool(runtime: TodoRuntime) -> AgentTool {
                 "op".to_owned(),
                 Schema {
                     schema_type: Some(json!("string")),
-                    enum_values: ["init", "start", "done", "drop", "rm", "append", "view"]
+                    enum_values: ["init", "start", "done", "drop", "rm", "append", "add_dependency", "remove_dependency", "update_dependencies", "view"]
                         .into_iter()
                         .map(|value| json!(value))
                         .collect(),
@@ -485,13 +501,15 @@ fn todo_tool(runtime: TodoRuntime) -> AgentTool {
                     ..Schema::default()
                 },
             ),
-            ("list".to_owned(), s_array(init_phase, "phased task list (init)")),
-            ("task".to_owned(), s_string("task content")),
-            ("phase".to_owned(), s_string("phase name")),
+            ("list".to_owned(), nullable(s_array(init_phase, "phased task list (init)"))),
+            ("task".to_owned(), nullable(s_string("stable task ID (preferred), or exact task content for start/done/drop/rm compatibility"))),
+            ("phase".to_owned(), nullable(s_string("phase name"))),
             (
                 "items".to_owned(),
-                s_array(s_string("task content"), "tasks to append or initialize"),
+                nullable(s_array(s_string("task content"), "tasks to append or initialize")),
             ),
+            ("dependsOn".to_owned(), nullable(s_array(s_string("stable dependency task ID"), "dependency task IDs for add/remove/update operations"))),
+            ("cascade".to_owned(), nullable(s_boolean("For rm, explicitly remove dependency edges from surviving tasks before removing dependency targets"))),
         ]),
         property_order: vec![
             "op".to_owned(),
@@ -499,14 +517,16 @@ fn todo_tool(runtime: TodoRuntime) -> AgentTool {
             "task".to_owned(),
             "phase".to_owned(),
             "items".to_owned(),
+            "dependsOn".to_owned(),
+            "cascade".to_owned(),
         ],
-        required: vec!["op".to_owned()],
+        required: vec!["op", "list", "task", "phase", "items", "dependsOn", "cascade"].into_iter().map(str::to_owned).collect(),
         additional_properties: Some(Value::Bool(false)),
         ..Schema::default()
     };
     let mut tool = AgentTool::new(
         "todo",
-        "Apply one operation to the phased session todo list. Tasks and phases are referenced by exact content, not generated IDs. Use init, start, done, drop, rm, append, or read-only view.",
+        "Maintain the durable session todo DAG while preserving phased presentation. Every returned task has a stable id, dependsOn, ready, and blockedBy. Phase order is not a dependency: any ready task may proceed. Completed and dropped dependencies both satisfy dependents. Use init/append, start/done/drop/rm, add_dependency/remove_dependency/update_dependencies, or read-only view. Dependency operations require stable task IDs. rm rejects dependency targets unless cascade=true explicitly removes the surviving dependency edges. This tool changes canonical readiness/status; an attached parent application may orchestrate ready items.",
         parameters,
         move |context| {
             let runtime = runtime.clone();
@@ -559,10 +579,9 @@ fn todo_tool(runtime: TodoRuntime) -> AgentTool {
         },
     )
     .with_label("Todo")
-    .with_execution_mode(ToolExecutionMode::Sequential);
-    tool.constrained_sampling = Some(ConstrainedSampling::json_schema(
-        ConstrainedSamplingStrictness::Prefer,
-    ));
+    .with_execution_mode(ToolExecutionMode::Sequential)
+    .with_prepare_arguments(fill_missing_with_null);
+    tool.constrained_sampling = Some(ConstrainedSampling::json_schema(ConstrainedSamplingStrictness::Prefer));
     tool
 }
 
@@ -811,7 +830,7 @@ fn write_tool(cwd: &str) -> AgentTool {
 fn write_tool_for_workspace(workspace: crate::WorkspaceRoots) -> AgentTool {
     let params = s_object(
         vec![
-            ("path", s_string("Path to the file to write (relative or absolute)")),
+            ("path", s_string("Path to the file to write. Relative paths resolve from the current working directory; absolute and parent-relative paths may target ordinary filesystem locations outside workspace roots. Existing symlinks to regular files are followed.")),
             ("content", s_string("Content to write to the file")),
         ],
         vec!["path", "content"],
@@ -835,9 +854,10 @@ async fn run_write(
 ) -> Result<AgentToolResult> {
     let path = arg_str(&args, "path");
     let content = arg_str(&args, "content");
-    let abs = resolve_scoped_path(&path, workspace)?;
+    let abs = resolve_mutation_path(&path, workspace)?;
     with_file_mutation_queue(&abs, || async {
         check_aborted(&abort)?;
+        ensure_regular_mutation_target(&abs, &path, "write", true)?;
         if let Some(parent) = Path::new(&abs).parent() {
             std::fs::create_dir_all(parent).map_err(|e| anyhow!("{}", e))?;
         }
@@ -873,7 +893,7 @@ fn edit_tool_for_workspace(workspace: crate::WorkspaceRoots) -> AgentTool {
     );
     let params = s_object(
         vec![
-            ("path", s_string("Path to the file to edit (relative or absolute)")),
+            ("path", s_string("Path to the file to edit. Relative paths resolve from the current working directory; absolute and parent-relative paths may target ordinary filesystem locations outside workspace roots. Existing symlinks to regular files are followed.")),
             ("edits", s_array(edit_obj, "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.")),
         ],
         vec!["path", "edits"],
@@ -913,10 +933,11 @@ async fn run_edit(workspace: &crate::WorkspaceRoots, args: Value, abort: AbortSi
         let new = re.get("newText").and_then(|v| v.as_str()).unwrap_or("").to_string();
         edits.push(EditEntry { old_text: old, new_text: new });
     }
-    let abs = resolve_scoped_path(&path, workspace)?;
+    let abs = resolve_mutation_path(&path, workspace)?;
     // Serialize edits/writes to the same file (different files run in parallel).
     with_file_mutation_queue(&abs, || async {
         check_aborted(&abort)?;
+        ensure_regular_mutation_target(&abs, &path, "edit", false)?;
         let data = std::fs::read(&abs)
             .map_err(|e| anyhow!("Could not edit file: {}. {}.", path, fs_error_code(&e)))?;
         check_aborted(&abort)?;
@@ -940,6 +961,25 @@ async fn run_edit(workspace: &crate::WorkspaceRoots, args: Value, abort: AbortSi
         Ok(result)
     })
     .await
+}
+
+fn ensure_regular_mutation_target(
+    absolute_path: &str,
+    display_path: &str,
+    operation: &str,
+    allow_missing: bool,
+) -> Result<()> {
+    match std::fs::metadata(absolute_path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(anyhow!(
+            "Could not {operation} file: {display_path}. Target is not a regular file."
+        )),
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow!(
+            "Could not {operation} file: {display_path}. {}.",
+            fs_error_code(&error)
+        )),
+    }
 }
 
 fn check_aborted(abort: &AbortSignal) -> Result<()> {
@@ -1000,14 +1040,14 @@ fn bash_tool(cwd: &str, session_env: Option<SessionEnvFn>, process: Option<BashP
     let cwd = cwd.to_string();
     let params = s_object(
         vec![
-            ("command", s_string("Bash command to execute")),
+            ("command", s_string("Bash command to execute. Do not use nohup, setsid, disown, or shell background '&' syntax.")),
             ("timeout", s_number("Timeout in seconds (optional, no default timeout)")),
-            ("background", s_boolean("Start under the supervised process manager and return immediately")),
+            ("background", s_boolean("Start the command under the supervised process manager, return immediately, and list it in /ps")),
         ],
         vec!["command"],
     );
     let description = format!(
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last {} lines or {}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds. Set background=true only for a long-running command; it returns an opaque supervised process id.",
+        "Execute a bash command in the current working directory. Finite commands run in the foreground and return stdout and stderr exactly as before. Output is truncated to last {} lines or {}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds. For servers, watchers, and other long-running commands, set background=true to return a stable supervised process id visible in /ps. Unsupervised nohup, setsid, disown, and shell '&' detachment are rejected.",
         DEFAULT_MAX_LINES,
         DEFAULT_MAX_BYTES / 1024
     );
@@ -1019,7 +1059,57 @@ fn bash_tool(cwd: &str, session_env: Option<SessionEnvFn>, process: Option<BashP
     })
     .with_prompt_guidelines(vec![
         "Inspect PI_* environment variables for current model and session details.".to_string(),
+        "Use foreground bash only for finite commands. For servers, watchers, or commands intended to outlive the tool call, set background=true; never use nohup, setsid, disown, or shell '&'. Supervised commands are visible in /ps with logs, signal, stop, and wait controls.".to_string(),
     ])
+}
+
+const NON_INTERACTIVE_COMMAND_ENV: &[(&str, &str)] = &[
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("SYSTEMD_PAGER", "cat"),
+    ("BAT_PAGER", "cat"),
+    ("DELTA_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("GLAB_PAGER", "cat"),
+    ("PSQL_PAGER", "cat"),
+    ("MYSQL_PAGER", "cat"),
+    ("AWS_PAGER", ""),
+    ("HOMEBREW_PAGER", "cat"),
+    ("LESS", "FRX"),
+    ("TERM", "dumb"),
+    ("NO_COLOR", "1"),
+    ("PYTHONUNBUFFERED", "1"),
+    ("GIT_EDITOR", "true"),
+    ("VISUAL", "true"),
+    ("EDITOR", "true"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("SSH_ASKPASS", "/usr/bin/false"),
+    ("CI", "1"),
+    ("npm_config_yes", "true"),
+    ("npm_config_update_notifier", "false"),
+    ("npm_config_fund", "false"),
+    ("npm_config_audit", "false"),
+    ("npm_config_progress", "false"),
+    ("PNPM_DISABLE_SELF_UPDATE_CHECK", "true"),
+    ("PNPM_UPDATE_NOTIFIER", "false"),
+    ("YARN_ENABLE_TELEMETRY", "0"),
+    ("YARN_ENABLE_PROGRESS_BARS", "0"),
+    ("CARGO_TERM_PROGRESS_WHEN", "never"),
+    ("DEBIAN_FRONTEND", "noninteractive"),
+    ("PIP_NO_INPUT", "1"),
+    ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+    ("TF_INPUT", "0"),
+    ("TF_IN_AUTOMATION", "1"),
+    ("GH_PROMPT_DISABLED", "1"),
+    ("COMPOSER_NO_INTERACTION", "1"),
+    ("CLOUDSDK_CORE_DISABLE_PROMPTS", "1"),
+];
+
+fn apply_non_interactive_command_env(command: &mut Command) {
+    for (key, value) in NON_INTERACTIVE_COMMAND_ENV {
+        command.env(key, value);
+    }
 }
 
 /// Builds the child environment: the inherited environment minus the PI_*
@@ -1203,6 +1293,10 @@ async fn run_bash_core(
     {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
+    // Foreground tool commands are non-interactive. Never let a child race the
+    // TUI for terminal input; interactive services belong in ProcessManager,
+    // where stdin is explicitly piped and controlled through process_send.
+    cmd.stdin(Stdio::null());
     cmd.kill_on_drop(true);
     // Run in its own process group; on cancel/timeout kill the whole tree.
     #[cfg(unix)]
@@ -1214,6 +1308,10 @@ async fn run_bash_core(
     for (k, v) in bash_command_env(session_env) {
         cmd.env(k, v);
     }
+    // Foreground bash follows OMP's unattended command contract. Apply these
+    // after inherited/session values so pagers, editors, and credential
+    // prompts cannot reclaim the parent TUI.
+    apply_non_interactive_command_env(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| anyhow!("{}", e))?;
     let state = Arc::new(Mutex::new(BashState::new(on_update, on_chunk)));
@@ -1336,6 +1434,479 @@ async fn run_bash_core(
     })
 }
 
+fn contains_detaching_shell_substitution(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = (index + 2).min(bytes.len()),
+            b'\'' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'\'' {
+                    index += 1;
+                }
+                index = (index + 1).min(bytes.len());
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                let opening = index + 1;
+                let end = skip_dollar_substitution(command, opening);
+                let content_end = end.saturating_sub(1).max(opening + 1);
+                if command[opening + 1..content_end].contains(['&', ';']) {
+                    return true;
+                }
+                index = end;
+            }
+            b'`' => {
+                let end = skip_backtick_substitution(command, index);
+                let content_end = end.saturating_sub(1).max(index + 1);
+                if command[index + 1..content_end].contains(['&', ';']) {
+                    return true;
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellOperator {
+    Background,
+    Control,
+    Redirection,
+    GroupOpen,
+    GroupClose,
+}
+
+#[derive(Debug)]
+enum ShellTokenKind {
+    Word(String),
+    Operator(ShellOperator),
+}
+
+#[derive(Debug)]
+struct ShellToken {
+    kind: ShellTokenKind,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Default)]
+struct ShellDetachAnalysis {
+    backgrounds: Vec<std::ops::Range<usize>>,
+    nohups: Vec<std::ops::Range<usize>>,
+    setsids: Vec<std::ops::Range<usize>>,
+    disowns: Vec<std::ops::Range<usize>>,
+    leading_nohup: Option<std::ops::Range<usize>>,
+    leading_nohup_separator: Option<std::ops::Range<usize>>,
+    terminal_background: Option<std::ops::Range<usize>>,
+}
+
+impl ShellDetachAnalysis {
+    fn has_detach_intent(&self) -> bool {
+        !self.backgrounds.is_empty()
+            || !self.nohups.is_empty()
+            || !self.setsids.is_empty()
+            || !self.disowns.is_empty()
+    }
+
+    fn detected_constructs(&self) -> String {
+        let mut constructs = Vec::new();
+        if !self.nohups.is_empty() {
+            constructs.push("nohup");
+        }
+        if !self.setsids.is_empty() {
+            constructs.push("setsid");
+        }
+        if !self.disowns.is_empty() {
+            constructs.push("disown");
+        }
+        if !self.backgrounds.is_empty() {
+            constructs.push("shell background '&'");
+        }
+        constructs.join(", ")
+    }
+}
+
+fn shell_detach_analysis(command: &str) -> ShellDetachAnalysis {
+    let tokens = shell_tokens(command);
+    let first_non_whitespace = command
+        .char_indices()
+        .find_map(|(index, character)| (!character.is_whitespace()).then_some(index));
+    let mut analysis = ShellDetachAnalysis::default();
+    let mut command_position = true;
+    let mut prefix_options = false;
+    let mut redirection_target = false;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            ShellTokenKind::Operator(operator) => match operator {
+                ShellOperator::Background => {
+                    analysis.backgrounds.push(token.start..token.end);
+                    command_position = true;
+                    prefix_options = false;
+                    redirection_target = false;
+                }
+                ShellOperator::Control | ShellOperator::GroupOpen => {
+                    command_position = true;
+                    prefix_options = false;
+                    redirection_target = false;
+                }
+                ShellOperator::Redirection => redirection_target = true,
+                ShellOperator::GroupClose => {
+                    command_position = false;
+                    prefix_options = false;
+                    redirection_target = false;
+                }
+            },
+            ShellTokenKind::Word(word) => {
+                if redirection_target {
+                    redirection_target = false;
+                    continue;
+                }
+                if !command_position {
+                    continue;
+                }
+                if shell_assignment_word(word) {
+                    continue;
+                }
+                if prefix_options && word.starts_with('-') {
+                    continue;
+                }
+                if shell_command_prefix(word) {
+                    prefix_options = matches!(word.as_str(), "builtin" | "command" | "env" | "exec");
+                    continue;
+                }
+
+                let range = token.start..token.end;
+                match word.as_str() {
+                    "nohup" => {
+                        analysis.nohups.push(range.clone());
+                        if first_non_whitespace == Some(token.start) {
+                            analysis.leading_nohup = Some(range);
+                            if let Some(ShellToken {
+                                kind: ShellTokenKind::Word(separator),
+                                start,
+                                end,
+                            }) = tokens.get(index + 1)
+                                && separator == "--"
+                            {
+                                analysis.leading_nohup_separator = Some(*start..*end);
+                            }
+                        }
+                    }
+                    "setsid" => analysis.setsids.push(range),
+                    "disown" => analysis.disowns.push(range),
+                    _ => {}
+                }
+                command_position = false;
+                prefix_options = false;
+            }
+        }
+    }
+
+    if let Some(ShellToken {
+        kind: ShellTokenKind::Operator(ShellOperator::Background),
+        start,
+        end,
+    }) = tokens.last()
+    {
+        analysis.terminal_background = Some(*start..*end);
+    }
+    analysis
+}
+
+fn normalize_supervised_bash(command: &str, analysis: &ShellDetachAnalysis) -> Result<String> {
+    if !analysis.setsids.is_empty() || !analysis.disowns.is_empty() {
+        return Err(anyhow!(
+            "Cannot safely supervise shell detachment using {}. Remove the detach command and run the long-lived command with background=true so it remains visible in /ps.",
+            analysis.detected_constructs()
+        ));
+    }
+    if !analysis.nohups.is_empty()
+        && (analysis.nohups.len() != 1 || analysis.leading_nohup.is_none())
+    {
+        return Err(anyhow!(
+            "Cannot safely supervise nested or compound nohup execution. Remove nohup and run the long-lived command with background=true so it remains visible in /ps."
+        ));
+    }
+    if !analysis.backgrounds.is_empty()
+        && (analysis.backgrounds.len() != 1
+            || analysis.terminal_background.as_ref() != analysis.backgrounds.first())
+    {
+        return Err(anyhow!(
+            "Cannot safely supervise a compound shell background job. Remove shell '&' syntax and run the long-lived command with background=true so it remains visible in /ps."
+        ));
+    }
+
+    let mut removals = Vec::new();
+    if let Some(range) = &analysis.leading_nohup {
+        removals.push(range.clone());
+    }
+    if let Some(range) = &analysis.leading_nohup_separator {
+        removals.push(range.clone());
+    }
+    if let Some(range) = &analysis.terminal_background {
+        removals.push(range.clone());
+    }
+    removals.sort_by(|left, right| right.start.cmp(&left.start));
+    let mut normalized = command.to_owned();
+    for range in removals {
+        normalized.replace_range(range, "");
+    }
+    if normalized.trim().is_empty() {
+        return Err(anyhow!("background bash requires a command to supervise"));
+    }
+    Ok(normalized)
+}
+
+fn reject_unsupervised_shell_detach(analysis: &ShellDetachAnalysis) -> Result<()> {
+    if analysis.has_detach_intent() {
+        return Err(anyhow!(
+            "Unsupervised background or detached bash execution is not allowed (detected {}). Re-run the long-lived command with background=true so ProcessManager owns it and /ps reports its stable process id, logs, status, stop, and wait controls.",
+            analysis.detected_constructs()
+        ));
+    }
+    Ok(())
+}
+
+fn shell_assignment_word(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn shell_command_prefix(word: &str) -> bool {
+    matches!(
+        word,
+        "!" | "builtin" | "command" | "coproc" | "do" | "elif" | "else" | "env"
+            | "exec" | "if" | "then" | "time" | "until" | "while"
+    )
+}
+
+fn shell_tokens(command: &str) -> Vec<ShellToken> {
+    let bytes = command.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            if bytes[index] == b'\n' {
+                tokens.push(ShellToken {
+                    kind: ShellTokenKind::Operator(ShellOperator::Control),
+                    start: index,
+                    end: index + 1,
+                });
+            }
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'#' {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'`' {
+            let end = skip_backtick_substitution(command, index);
+            tokens.push(ShellToken {
+                kind: ShellTokenKind::Word(command[index..end].to_owned()),
+                start: index,
+                end,
+            });
+            index = end;
+            continue;
+        }
+        if let Some((operator, end)) = shell_operator(command, index) {
+            tokens.push(ShellToken {
+                kind: ShellTokenKind::Operator(operator),
+                start: index,
+                end,
+            });
+            index = end;
+            continue;
+        }
+        if bytes[index].is_ascii_digit() {
+            let mut end = index;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end < bytes.len()
+                && matches!(bytes[end], b'<' | b'>')
+                && let Some((ShellOperator::Redirection, redirection_end)) = shell_operator(command, end)
+            {
+                tokens.push(ShellToken {
+                    kind: ShellTokenKind::Operator(ShellOperator::Redirection),
+                    start: index,
+                    end: redirection_end,
+                });
+                index = redirection_end;
+                continue;
+            }
+        }
+
+        let start = index;
+        let mut word = Vec::new();
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && !matches!(bytes[index], b'&' | b'|' | b';' | b'(' | b')' | b'<' | b'>' | b'`')
+        {
+            if bytes[index] == b'\'' {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'\'' {
+                    let width = command[index..].chars().next().map_or(1, char::len_utf8);
+                    word.extend_from_slice(&bytes[index..index + width]);
+                    index += width;
+                }
+                if index < bytes.len() {
+                    index += 1;
+                }
+                continue;
+            }
+            if bytes[index] == b'"' {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    if bytes[index] == b'\\'
+                        && index + 1 < bytes.len()
+                        && matches!(bytes[index + 1], b'$' | b'`' | b'"' | b'\\' | b'\n')
+                    {
+                        index += 1;
+                    }
+                    let width = command[index..].chars().next().map_or(1, char::len_utf8);
+                    word.extend_from_slice(&bytes[index..index + width]);
+                    index += width;
+                }
+                if index < bytes.len() {
+                    index += 1;
+                }
+                continue;
+            }
+            match bytes[index] {
+                b'\\' if index + 1 < bytes.len() => {
+                    index += 1;
+                    let width = command[index..].chars().next().map_or(1, char::len_utf8);
+                    word.extend_from_slice(&bytes[index..index + width]);
+                    index += width;
+                }
+                b'\\' => {
+                    word.push(b'\\');
+                    index += 1;
+                }
+                b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                    word.push(b'$');
+                    let opening = index + 1;
+                    let end = skip_dollar_substitution(command, opening);
+                    word.extend_from_slice(&bytes[opening..end]);
+                    index = end;
+                }
+                b'`' => {
+                    let end = skip_backtick_substitution(command, index);
+                    word.extend_from_slice(&bytes[index..end]);
+                    index = end;
+                }
+                _ => {
+                    let width = command[index..].chars().next().map_or(1, char::len_utf8);
+                    word.extend_from_slice(&bytes[index..index + width]);
+                    index += width;
+                }
+            }
+        }
+        tokens.push(ShellToken {
+            kind: ShellTokenKind::Word(String::from_utf8(word).expect("shell token preserves UTF-8")),
+            start,
+            end: index,
+        });
+    }
+    tokens
+}
+
+fn shell_operator(command: &str, index: usize) -> Option<(ShellOperator, usize)> {
+    let bytes = command.as_bytes();
+    let current = *bytes.get(index)?;
+    let next = bytes.get(index + 1).copied();
+    match current {
+        b'&' if next == Some(b'&') => Some((ShellOperator::Control, index + 2)),
+        b'&' if next == Some(b'>') => {
+            let end = if bytes.get(index + 2) == Some(&b'>') { index + 3 } else { index + 2 };
+            Some((ShellOperator::Redirection, end))
+        }
+        b'&' => Some((ShellOperator::Background, index + 1)),
+        b'|' => {
+            let end = if matches!(next, Some(b'|' | b'&')) { index + 2 } else { index + 1 };
+            Some((ShellOperator::Control, end))
+        }
+        b';' if next == Some(b'&') => Some((ShellOperator::Background, index + 2)),
+        b';' if next == Some(b';') && bytes.get(index + 2) == Some(&b'&') => {
+            Some((ShellOperator::Background, index + 3))
+        }
+        b';' => {
+            let end = if next == Some(b';') { index + 2 } else { index + 1 };
+            Some((ShellOperator::Control, end))
+        }
+        b'(' if index > 0 && bytes[index - 1] == b'$' => None,
+        b'(' => Some((ShellOperator::GroupOpen, index + 1)),
+        b')' => Some((ShellOperator::GroupClose, index + 1)),
+        b'`' => None,
+        b'<' | b'>' => {
+            let mut end = index + 1;
+            if bytes.get(end) == Some(&current) {
+                end += 1;
+                if current == b'<' && bytes.get(end) == Some(&b'-') {
+                    end += 1;
+                }
+            }
+            if matches!(bytes.get(end), Some(b'&' | b'|')) {
+                end += 1;
+            }
+            Some((ShellOperator::Redirection, end))
+        }
+        _ => None,
+    }
+}
+
+fn skip_dollar_substitution(command: &str, opening: usize) -> usize {
+    let bytes = command.as_bytes();
+    let mut depth = 1_usize;
+    let mut index = opening + 1;
+    let mut quote = None;
+    while index < bytes.len() {
+        match (quote, bytes[index]) {
+            (Some(b'\''), b'\'') | (Some(b'"'), b'"') => quote = None,
+            (None, b'\'' | b'"') => quote = Some(bytes[index]),
+            (Some(b'"'), b'\\') | (None, b'\\') => index += 1,
+            (None, b'(') => depth += 1,
+            (None, b')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return index + 1;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+fn skip_backtick_substitution(command: &str, opening: usize) -> usize {
+    let bytes = command.as_bytes();
+    let mut index = opening + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 1,
+            b'`' => return index + 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
 /// Bash tool wrapper: validates the tool timeout, checks the working directory,
 /// emits the initial empty update, runs the command, and maps the low-level
 /// outcome to the agent's result contract (abort/timeout/nonzero-exit become
@@ -1359,11 +1930,22 @@ async fn run_bash(
         }
     }
     check_aborted(&abort)?;
-    if arg_bool(&args, "background") {
+    let background = arg_bool(&args, "background");
+    let detach = shell_detach_analysis(&command);
+    if contains_detaching_shell_substitution(&command) {
+        return Err(anyhow!(
+            "Cannot safely determine supervision for shell substitution containing background or control syntax. Move the long-lived command out of the substitution and run it with background=true so it remains visible in /ps."
+        ));
+    }
+    if !background {
+        reject_unsupervised_shell_detach(&detach)?;
+    }
+    if background {
         let process = process.ok_or_else(|| anyhow!("background bash is unavailable in this context"))?;
         if !path_exists(cwd) {
             return Err(anyhow!("Working directory does not exist: {cwd}\nCannot execute bash commands."));
         }
+        let command = normalize_supervised_bash(&command, &detach)?;
         let (shell, shell_args) = get_shell_config();
         let mut argv = Vec::with_capacity(shell_args.len() + 2);
         argv.push(shell);
@@ -1392,7 +1974,7 @@ async fn run_bash(
             output_bytes: None,
         }).await?;
         return Ok(AgentToolResult {
-            content: vec![ContentBlock::text(format!("Process started: {}", info.id))],
+            content: vec![ContentBlock::text(format!("Process started: {} (visible in /ps)", info.id))],
             details: serde_json::to_value(info)?,
             ..Default::default()
         });
@@ -2551,6 +3133,10 @@ mod tests {
         assert_eq!(success.details["op"], "init");
         assert_eq!(success.details["storage"], "memory");
         assert_eq!(success.details["phases"][0]["tasks"][0]["content"], "compile");
+        assert!(success.details["phases"][0]["tasks"][0]["id"].as_str().is_some_and(|id| id.starts_with("task-")));
+        assert_eq!(success.details["phases"][0]["tasks"][0]["dependsOn"], json!([]));
+        assert_eq!(success.details["phases"][0]["tasks"][0]["ready"], true);
+        assert_eq!(success.details["phases"][0]["tasks"][0]["blockedBy"], json!([]));
         assert!(success.details.get(TODO_ERROR_MARKER).is_none());
 
         let failure = (tool.execute)(make_ctx(json!({
@@ -2566,6 +3152,22 @@ mod tests {
         assert_eq!(failure.details[TODO_ERROR_MARKER], true);
         assert!(!failure.terminate);
         assert!(runtime.reminder_pending());
+
+    }
+    #[test]
+    fn todo_schema_is_valid_for_openai_strict_tools() {
+        let tool = create_todo_tool(TodoRuntime::memory());
+        let schema = serde_json::to_value(&tool.parameters).expect("todo schema");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        let properties = schema["properties"].as_object().expect("todo properties");
+        let required = schema["required"].as_array().expect("todo required");
+        assert_eq!(required.len(), properties.len());
+        for name in properties.keys() {
+            assert!(required.iter().any(|item| item == name));
+        }
+        let prepared = tool.prepare_arguments.as_ref().expect("todo preparation")(json!({"op":"view"})).expect("prepare todo");
+        assert!(tool.parameters.validate(&prepared).is_ok());
     }
 
 
@@ -2621,46 +3223,164 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn traversal_rejection_remains_unchanged() {
-        let d = tmpdir();
-        let tool = read_tool(&d.to_string_lossy());
-        let error = (tool.execute)(make_ctx(json!({ "path": "../outside.txt" })))
+    async fn read_allows_absolute_and_parent_relative_external_files() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let external = root.path().join("outside.txt");
+        fs::write(&external, "external-bytes").expect("external file");
+        let tool = read_tool(&cwd.to_string_lossy());
+
+        let absolute = (tool.execute)(make_ctx(json!({ "path": external })))
             .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "Path escapes working directory: ../outside.txt");
+            .expect("absolute external read");
+        assert_eq!(text_of(&absolute), "external-bytes");
+
+        let relative = (tool.execute)(make_ctx(json!({ "path": "../outside.txt" })))
+            .await
+            .expect("parent-relative external read");
+        assert_eq!(text_of(&relative), "external-bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_allows_symlink_to_external_file() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let external = tempfile::tempdir().expect("external");
+        let target = external.path().join("secret.txt");
+        fs::write(&target, "linked-secret").expect("secret");
+        std::os::unix::fs::symlink(&target, cwd.path().join("alias.txt")).expect("symlink");
+        let tool = read_tool(&cwd.path().to_string_lossy());
+
+        let result = (tool.execute)(make_ctx(json!({ "path": "alias.txt" })))
+            .await
+            .expect("symlink external read");
+        assert_eq!(text_of(&result), "linked-secret");
     }
 
     #[tokio::test]
-    async fn workspace_tools_accept_added_root_and_reject_other_absolute_paths() {
-        let cwd = tempfile::tempdir().expect("cwd");
-        let added = tempfile::tempdir().expect("added");
-        let external = tempfile::tempdir().expect("external");
-        let accepted = added.path().join("accepted.txt");
-        let rejected = external.path().join("rejected.txt");
-        fs::write(&accepted, "accepted").expect("accepted file");
-        fs::write(&rejected, "rejected").expect("rejected file");
-        let workspace = crate::WorkspaceRoots::new(cwd.path(), [added.path()]).expect("workspace");
-        let read = create_coding_tools_for_workspace_with_context_and_resolver(
-            workspace,
-            None,
-            None,
-            None,
-            None,
-        )
-        .into_iter()
-        .find(|tool| tool.name == "read")
-        .expect("read tool");
+    async fn write_and_edit_allow_external_absolute_and_parent_relative_paths() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("project");
+        let added = root.path().join("added");
+        let external = root.path().join("external");
+        fs::create_dir_all(&cwd).expect("cwd");
+        fs::create_dir_all(&added).expect("added root");
+        fs::create_dir_all(&external).expect("external directory");
+        let workspace = crate::WorkspaceRoots::new(&cwd, [&added]).expect("workspace");
+        let tools = create_coding_tools_for_workspace_with_context_and_resolver(
+            workspace, None, None, None, None,
+        );
+        let write = tools
+            .iter()
+            .find(|tool| tool.name == "write")
+            .expect("write tool");
+        let edit = tools
+            .iter()
+            .find(|tool| tool.name == "edit")
+            .expect("edit tool");
 
-        let result = (read.execute)(make_ctx(json!({ "path": accepted })))
+        let absolute = external.join("absolute.txt");
+        (write.execute)(make_ctx(json!({
+            "path": absolute,
+            "content": "absolute-before"
+        })))
+        .await
+        .expect("write absolute external file");
+        (edit.execute)(make_ctx(json!({
+            "path": absolute,
+            "edits": [{ "oldText": "absolute-before", "newText": "absolute-after" }]
+        })))
+        .await
+        .expect("edit absolute external file");
+        assert_eq!(fs::read_to_string(&absolute).expect("read absolute file"), "absolute-after");
+
+        (write.execute)(make_ctx(json!({
+            "path": "../parent-relative.txt",
+            "content": "relative-before"
+        })))
+        .await
+        .expect("write parent-relative external file");
+        (edit.execute)(make_ctx(json!({
+            "path": "../parent-relative.txt",
+            "edits": [{ "oldText": "relative-before", "newText": "relative-after" }]
+        })))
+        .await
+        .expect("edit parent-relative external file");
+        assert_eq!(
+            fs::read_to_string(root.path().join("parent-relative.txt"))
+                .expect("read parent-relative file"),
+            "relative-after"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_and_edit_follow_symlinks_to_external_regular_files() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let external = tempfile::tempdir().expect("external");
+        let target = external.path().join("target.txt");
+        let alias = cwd.path().join("alias.txt");
+        fs::write(&target, "before").expect("target");
+        std::os::unix::fs::symlink(&target, &alias).expect("symlink");
+        let write = write_tool(&cwd.path().to_string_lossy());
+        let edit = edit_tool(&cwd.path().to_string_lossy());
+
+        (write.execute)(make_ctx(json!({ "path": "alias.txt", "content": "written" })))
             .await
-            .expect("read added root");
-        assert_eq!(text_of(&result), "accepted");
-        let error = (read.execute)(make_ctx(json!({ "path": rejected })))
+            .expect("write through symlink");
+        assert_eq!(fs::read_to_string(&target).expect("read written target"), "written");
+
+        (edit.execute)(make_ctx(json!({
+            "path": "alias.txt",
+            "edits": [{ "oldText": "written", "newText": "edited" }]
+        })))
+        .await
+        .expect("edit through symlink");
+        assert_eq!(fs::read_to_string(&target).expect("read edited target"), "edited");
+        assert!(alias.is_symlink());
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_reject_non_regular_and_invalid_paths() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let directory = cwd.path().join("directory");
+        fs::create_dir(&directory).expect("directory");
+        let write = write_tool(&cwd.path().to_string_lossy());
+        let edit = edit_tool(&cwd.path().to_string_lossy());
+
+        let write_directory_error = (write.execute)(make_ctx(json!({
+            "path": "directory",
+            "content": "nope"
+        })))
+        .await
+        .expect_err("write must reject directory")
+        .to_string();
+        assert!(write_directory_error.contains("not a regular file"), "{write_directory_error}");
+
+        let edit_directory_error = (edit.execute)(make_ctx(json!({
+            "path": "directory",
+            "edits": [{ "oldText": "x", "newText": "y" }]
+        })))
+        .await
+        .expect_err("edit must reject directory")
+        .to_string();
+        assert!(edit_directory_error.contains("not a regular file"), "{edit_directory_error}");
+
+        let empty_error = (write.execute)(make_ctx(json!({ "path": "", "content": "nope" })))
             .await
-            .expect_err("reject untrusted root")
+            .expect_err("write must reject empty path")
             .to_string();
-        assert!(error.contains("Path escapes workspace roots"), "{error}");
+        assert!(empty_error.contains("must not be empty"), "{empty_error}");
+
+        let nul_error = (edit.execute)(make_ctx(json!({
+            "path": "bad\0path",
+            "edits": [{ "oldText": "x", "newText": "y" }]
+        })))
+        .await
+        .expect_err("edit must reject NUL path")
+        .to_string();
+        assert!(nul_error.contains("NUL byte"), "{nul_error}");
     }
 
     #[tokio::test]
@@ -2755,6 +3475,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_closes_stdin_and_applies_non_interactive_environment() {
+        let d = tmpdir();
+        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let result = (tool.execute)(make_ctx(json!({
+            "command": "if read line; then printf 'unexpected:%s' \"$line\"; else printf 'stdin-closed:%s:%s:%s' \"$GIT_TERMINAL_PROMPT\" \"$GH_PROMPT_DISABLED\" \"$PAGER\"; fi",
+            "timeout": 2
+        })))
+        .await
+        .expect("non-interactive bash");
+        assert_eq!(text_of(&result), "stdin-closed:0:1:cat");
+    }
+    #[tokio::test]
     async fn bash_nonzero_exit() {
         let d = tmpdir();
         let tool = bash_tool(&d.to_string_lossy(), None, None);
@@ -2793,7 +3525,6 @@ mod tests {
         });
         let tool = bash_tool(&d.to_string_lossy(), None, None);
         let (_ctrl, abort) = pi_agent::AbortController::new();
-        std::mem::forget(_ctrl);
         let ctx = ToolCallContext {
             tool_call_id: "t".to_string(),
             arguments: json!({ "command": "echo streaming-output" }),
@@ -2826,13 +3557,69 @@ mod tests {
         let on_chunk: Arc<dyn Fn(String) + Send + Sync> =
             Arc::new(move |s| c.lock().push_str(&s));
         let (_ctrl, abort) = pi_agent::AbortController::new();
-        std::mem::forget(_ctrl);
 
         let res = execute_bash(&d, "echo hello", None, on_chunk, abort).await.unwrap();
         assert!(!res.cancelled);
         assert_eq!(res.exit_code, Some(0));
         assert!(res.output.contains("hello"));
         assert!(chunks.lock().contains("hello"), "on_chunk stream missed output");
+    }
+
+    #[tokio::test]
+    async fn bash_rejects_unsupervised_detach_without_rejecting_literal_ampersands() {
+        let d = tmpdir();
+        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        for command in [
+            "nohup python3 -m http.server 8765 &",
+            "python3 -m http.server 8765 &",
+            "setsid python3 -m http.server 8765",
+            "sleep 30; disown",
+        ] {
+            let error = (tool.execute)(make_ctx(json!({ "command": command })))
+                .await
+                .expect_err("detach intent must be rejected")
+                .to_string();
+            assert!(error.contains("background=true"), "{command}: {error}");
+            assert!(error.contains("/ps"), "{command}: {error}");
+        }
+
+        for substitution in ["printf '%s' \"$(sleep 1 &)\"", "printf '%s' \"`sleep 1 &`\""] {
+            let error = (tool.execute)(make_ctx(json!({ "command": substitution })))
+                .await
+                .expect_err("detach syntax inside shell substitution must fail closed")
+                .to_string();
+            assert!(error.contains("background=true"), "{substitution}: {error}");
+            assert!(error.contains("/ps"), "{substitution}: {error}");
+        }
+
+        let result = (tool.execute)(make_ctx(json!({
+            "command": "printf '%s\\n' 'quoted & text' escaped\\&value nohup setsid disown '$(sleep 1 &)' '$(nohup true)' '`sleep 1 &`'"
+        })))
+        .await
+        .expect("literal ampersands and argument words remain foreground");
+        assert_eq!(
+            text_of(&result),
+            "quoted & text\nescaped&value\nnohup\nsetsid\ndisown\n$(sleep 1 &)\n$(nohup true)\n`sleep 1 &`\n"
+        );
+    }
+
+    #[test]
+    fn supervised_detach_normalization_is_limited_to_simple_wrappers() {
+        let simple = "nohup python3 -m http.server 8765 >/tmp/http.log 2>&1 &";
+        let normalized = normalize_supervised_bash(simple, &shell_detach_analysis(simple))
+            .expect("simple legacy detach syntax can become supervised");
+        assert_eq!(normalized, " python3 -m http.server 8765 >/tmp/http.log 2>&1 ");
+
+        for complex in [
+            "python3 -m http.server 8765 & echo hidden",
+            "setsid python3 -m http.server 8765",
+            "sleep 30; disown",
+        ] {
+            assert!(
+                normalize_supervised_bash(complex, &shell_detach_analysis(complex)).is_err(),
+                "complex detach must fail closed: {complex}"
+            );
+        }
     }
 
     #[tokio::test]

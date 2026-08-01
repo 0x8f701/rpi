@@ -1,12 +1,12 @@
-# pi installer (Windows x86_64).
+# rpi installer (Windows x86_64).
 #
 # Downloads the x86_64-pc-windows-msvc artifact from this repo's GitHub Releases,
 # verifies its SHA-256 against the release's SHA256SUMS manifest, and installs
-# the binary as %USERPROFILE%\.pi-rs\bin\pi.exe.
+# the binary as %USERPROFILE%\.pi-rs\bin\rpi.exe.
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/0x8f701/pi-rs/main/install.ps1 | iex
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.1.0
+#   irm https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.ps1 | iex
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.0
 #
 # Environment:
 #   PI_HOME                install root (default: %USERPROFILE%\.pi-rs)
@@ -114,8 +114,8 @@ function Fail-WithRollbackErrors(
 # Atomic same-volume file replacement via the Win32 MoveFileEx API. PowerShell's
 # Move-Item cannot overwrite an existing file, so the reference installer renamed
 # the active executable aside before moving the new one in — leaving a window in
-# which pi.exe is absent. MoveFileEx with MOVEFILE_REPLACE_EXISTING renames the
-# staged file over the destination in a single syscall, so pi.exe is never
+# which rpi.exe is absent. MoveFileEx with MOVEFILE_REPLACE_EXISTING renames the
+# staged file over the destination in a single syscall, so rpi.exe is never
 # missing (when it is not locked by a running process).
 if (-not ('PiInstall.Native' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -130,7 +130,7 @@ namespace PiInstall {
 '@
 }
 $MOVEFILE_REPLACE_EXISTING = 1
-# ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED: a running pi.exe holds Dest.
+# ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED: a running rpi.exe holds Dest.
 $ERR_SHARING_VIOLATION = 32
 $ERR_ACCESS_DENIED = 5
 
@@ -141,7 +141,7 @@ $Triple = "x86_64-pc-windows-msvc"
 
 # ── Platform gate ────────────────────────────────────────────────────────────
 if (-not [System.Environment]::Is64BitOperatingSystem) {
-    Fail "pi requires 64-bit Windows (x86_64)"
+    Fail "rpi requires 64-bit Windows (x86_64)"
 }
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -ne "AMD64") {
@@ -160,7 +160,7 @@ if ($Version -and $Version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Z
 # TLS 1.2 for older PowerShell 5.1 defaults.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$Headers = @{ "User-Agent" = "pi-install"; "Accept" = "application/vnd.github+json" }
+$Headers = @{ "User-Agent" = "rpi-install"; "Accept" = "application/vnd.github+json" }
 
 # ── Resolve the release ──────────────────────────────────────────────────────
 $ReleaseUrl = if ($Version) { "$ApiBase/tags/v$Version" } else { "$ApiBase/latest" }
@@ -181,7 +181,7 @@ if ($Version -and $ResolvedVersion -ne $Version) {
     Fail "requested version $Version but release tag is $Tag"
 }
 
-$Asset = "pi-rs-$ResolvedVersion-$Triple.zip"
+$Asset = "rpi-$ResolvedVersion-$Triple.zip"
 if ($null -eq $Release.assets) { Fail "release $Tag has no assets" }
 $ArchiveMatches = @($Release.assets | Where-Object { $_.name -eq $Asset })
 $SumsMatches = @($Release.assets | Where-Object { $_.name -eq "SHA256SUMS" })
@@ -191,15 +191,16 @@ $ArchiveAsset = $ArchiveMatches[0]
 $SumsAsset = $SumsMatches[0]
 
 # ── Download + verify ────────────────────────────────────────────────────────
-$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pi-install-" + [System.IO.Path]::GetRandomFileName())
+$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("rpi-install-" + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 $StateTmp = $null
 $InstallMutex = $null
+$InstallMutexAcquired = $false
 try {
     $ArchivePath = Join-Path $TmpDir $Asset
     $SumsPath = Join-Path $TmpDir "SHA256SUMS"
 
-    Write-Host "Downloading pi v$ResolvedVersion ($Triple)..."
+    Write-Host "Downloading rpi v$ResolvedVersion ($Triple)..."
     Invoke-WebRequest -Uri $ArchiveAsset.browser_download_url -Headers $Headers -OutFile $ArchivePath -UseBasicParsing
     Invoke-WebRequest -Uri $SumsAsset.browser_download_url -Headers $Headers -OutFile $SumsPath -UseBasicParsing
 
@@ -233,25 +234,25 @@ try {
 
     # Materialize the root executable only; no bundled runtime is shipped.
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $BinaryPath = Join-Path $TmpDir "pi.exe"
+    $BinaryPath = Join-Path $TmpDir "rpi.exe"
     $Zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
         if (@($Zip.Entries).Count -gt 4096) {
             Fail "archive $Asset contains too many entries"
         }
         $BinaryEntries = @($Zip.Entries | Where-Object {
-            $_.FullName -eq "pi.exe" -or $_.FullName -eq "./pi.exe"
+            $_.FullName -eq "rpi.exe" -or $_.FullName -eq "./rpi.exe"
         })
         if ($BinaryEntries.Count -ne 1) {
-            Fail "archive $Asset must contain exactly one root-level pi.exe"
+            Fail "archive $Asset must contain exactly one root-level rpi.exe"
         }
         $BinaryEntry = $BinaryEntries[0]
         if ($BinaryEntry.Length -le 0 -or $BinaryEntry.Length -gt 1GB) {
-            Fail "archive $Asset contains an invalid-size pi.exe"
+            Fail "archive $Asset contains an invalid-size rpi.exe"
         }
         $UnixFileType = (($BinaryEntry.ExternalAttributes -shr 16) -band 0xF000)
         if ($UnixFileType -ne 0 -and $UnixFileType -ne 0x8000) {
-            Fail "archive $Asset contains a non-regular pi.exe entry"
+            Fail "archive $Asset contains a non-regular rpi.exe entry"
         }
         [System.IO.Compression.ZipFileExtensions]::ExtractToFile(
             $BinaryEntry, $BinaryPath, $true
@@ -261,18 +262,18 @@ try {
     }
     $Binary = Get-Item -LiteralPath $BinaryPath
 
-    Ensure-SafeDirectory $PiHome "pi install root"
+    Ensure-SafeDirectory $PiHome "rpi install root"
     $BinDir = Join-Path $PiHome "bin"
-    Ensure-SafeDirectory $BinDir "pi bin directory"
-    $Dest = Join-Path $BinDir "pi.exe"
+    Ensure-SafeDirectory $BinDir "rpi bin directory"
+    $Dest = Join-Path $BinDir "rpi.exe"
     $StatePath = Join-Path $PiHome "update-state.json"
     if (Test-Path -LiteralPath $Dest) {
         $DestItem = Get-Item -LiteralPath $Dest -Force
         if (($DestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Fail "refusing to replace reparse-point pi executable: $Dest"
+            Fail "refusing to replace reparse-point rpi executable: $Dest"
         }
         if ($DestItem.PSIsContainer) {
-            Fail "refusing to replace directory at pi executable path: $Dest"
+            Fail "refusing to replace directory at rpi executable path: $Dest"
         }
     }
     if (Test-Path -LiteralPath $StatePath) {
@@ -309,30 +310,69 @@ try {
         installed_version = $ResolvedVersion
         installed_asset = $Asset
         installed_sha256 = $Expected
-        installed_binary = "pi.exe"
+        installed_binary = "rpi.exe"
         checked_at_unix = $CheckedAtUnix
     }
     $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     $StateJson = ($State | ConvertTo-Json) + [Environment]::NewLine
     [IO.File]::WriteAllText($StateTmp, $StateJson, $Utf8NoBom)
 
-    # Serialize concurrent installs over PI_HOME. A named mutex is the portable
-    # Windows exclusion primitive; downloads run concurrently, but the
-    # activation (staging through state commit) is serialized so two installs of
-    # the same release cannot interleave the atomic replace and rollback.
+    # Serialize concurrent installs over PI_HOME. Downloads run concurrently,
+    # but activation is guarded by a named mutex with the same 30-second bound
+    # as the self-updater. An abandoned mutex transfers ownership safely.
     $MutexName = "Local\pi-rs-install-" + ($PiHome -replace '[\\/:]', '_')
     $InstallMutex = New-Object System.Threading.Mutex($false, $MutexName)
-    [void]$InstallMutex.WaitOne()
+    try {
+        $InstallMutexAcquired = $InstallMutex.WaitOne([TimeSpan]::FromSeconds(30))
+    } catch [System.Threading.AbandonedMutexException] {
+        $InstallMutexAcquired = $true
+    }
+    if (-not $InstallMutexAcquired) {
+        Fail "timed out after 30s waiting for another rpi install ($MutexName); retry after it finishes"
+    }
+
+    # Detect a legacy installer-managed pi.exe while the install mutex is held.
+    # The shared state must prove the old product/version/platform, the command
+    # must report that exact version, and its bytes are fingerprinted so a raced
+    # or user-replaced file is never removed. Cleanup happens only after rpi and
+    # its replacement state have committed successfully.
+    $LegacyPiPath = Join-Path $BinDir "pi.exe"
+    $LegacyPiSha256 = $null
+    if ((Test-Path -LiteralPath $StatePath -PathType Leaf) -and
+        (Test-Path -LiteralPath $LegacyPiPath -PathType Leaf)) {
+        try {
+            $LegacyState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+            $LegacyVersion = [string]$LegacyState.installed_version
+            $LegacyAsset = [string]$LegacyState.installed_asset
+            $LegacyDigest = [string]$LegacyState.installed_sha256
+            $LegacyBinary = [string]$LegacyState.installed_binary
+            $LegacyItem = Get-Item -LiteralPath $LegacyPiPath -Force
+            $LegacyVersionOutput = (& $LegacyPiPath --version 2>$null | Out-String).Trim()
+            $LegacyVersionExit = $LASTEXITCODE
+            if ($LegacyVersion -match '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' -and
+                $LegacyAsset -eq "pi-rs-$LegacyVersion-$Triple.zip" -and
+                $LegacyDigest -match '^[0-9A-Fa-f]{64}$' -and
+                $LegacyBinary -eq "pi.exe" -and
+                ($LegacyItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and
+                -not $LegacyItem.PSIsContainer -and
+                $LegacyVersionExit -eq 0 -and
+                $LegacyVersionOutput -eq "pi $LegacyVersion") {
+                $LegacyPiSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $LegacyPiPath).Hash.ToLowerInvariant()
+            }
+        } catch {
+            $LegacyPiSha256 = $null
+        }
+    }
 
     # Stage the new binary next to Dest (same volume) so the final swap is an
     # atomic same-volume rename (MoveFileEx), not a cross-volume move. If a
-    # running pi.exe locks Dest, the atomic replace fails and we refuse outright
+    # running rpi.exe locks Dest, the atomic replace fails and we refuse outright
     # rather than fall back to a window-opening rename-aside.
-    $Staged = Join-Path $BinDir ("pi.new.$PID.$([Guid]::NewGuid().ToString('N')).exe")
+    $Staged = Join-Path $BinDir ("rpi.new.$PID.$([Guid]::NewGuid().ToString('N')).exe")
     try {
         Copy-Item -LiteralPath $Binary.FullName -Destination $Staged -Force -ErrorAction Stop
     } catch {
-        Fail "could not stage downloaded pi for activation: $($_.Exception.Message)"
+        Fail "could not stage downloaded rpi for activation: $($_.Exception.Message)"
     }
     # Re-smoke the staged copy in its final directory before activation.
     $StagedSmokeExit = $null
@@ -357,23 +397,23 @@ try {
             Copy-Item -LiteralPath $Dest -Destination $Backup -Force -ErrorAction Stop
         } catch {
             Remove-Item -LiteralPath $Staged -Force -ErrorAction SilentlyContinue
-            Fail "could not back up the existing pi executable: $($_.Exception.Message)"
+            Fail "could not back up the existing rpi executable: $($_.Exception.Message)"
         }
     }
 
     # Atomic activation. MoveFileEx with MOVEFILE_REPLACE_EXISTING renames the
     # staged file over Dest in one syscall — Dest is never absent, so concurrent
-    # `pi` launches never see a missing executable. A running pi.exe holds Dest
+    # `rpi` launches never see a missing executable. A running rpi.exe holds Dest
     # and makes the replace fail with a sharing/access error; rather than perform
     # a rename-aside that would open a missing-path window, we refuse outright so
-    # the user closes pi and retries. This keeps activation strictly window-free.
+    # the user closes rpi and retries. This keeps activation strictly window-free.
     $MoveFileOk = [PiInstall.Native]::MoveFileEx($Staged, $Dest, $MOVEFILE_REPLACE_EXISTING)
     if (-not $MoveFileOk) {
         $Win32Err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
         Remove-Item -LiteralPath $Staged -Force -ErrorAction SilentlyContinue
         if ($HadPrior) { Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue }
         if ($Win32Err -eq $ERR_SHARING_VIOLATION -or $Win32Err -eq $ERR_ACCESS_DENIED) {
-            Fail "cannot replace $Dest (close all running pi sessions and retry)"
+            Fail "cannot replace $Dest (close all running rpi sessions and retry)"
         } else {
             Fail "cannot install to ${Dest} (MoveFileEx error $Win32Err)"
         }
@@ -395,15 +435,15 @@ try {
             # Atomic-replace path: restore the pre-emptive backup atomically.
             $RestoreOk = [PiInstall.Native]::MoveFileEx($Backup, $Dest, $MOVEFILE_REPLACE_EXISTING)
             if (-not $RestoreOk) {
-                Add-RollbackError $RollbackErrors "could not restore prior pi executable (MoveFileEx error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+                Add-RollbackError $RollbackErrors "could not restore prior rpi executable (MoveFileEx error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
             } else {
                 $Backup = $null
             }
         } else {
             # Fresh install with no prior binary: remove the new (failed)
             # executable so the system returns to its pre-install state.
-            Remove-RollbackPath $Dest "new pi executable" $RollbackErrors
-            Confirm-RollbackPath $Dest "new pi executable" $false $RollbackErrors
+            Remove-RollbackPath $Dest "new rpi executable" $RollbackErrors
+            Confirm-RollbackPath $Dest "new rpi executable" $false $RollbackErrors
         }
         if ($Backup) { Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue }
         Fail-WithRollbackErrors "installed binary failed to run ($ActiveSmokeDetail)" $RollbackErrors
@@ -444,15 +484,15 @@ try {
         if ($HadPrior -and $Backup) {
             $RestoreOk = [PiInstall.Native]::MoveFileEx($Backup, $Dest, $MOVEFILE_REPLACE_EXISTING)
             if (-not $RestoreOk) {
-                Add-RollbackError $RollbackErrors "could not restore prior pi executable (MoveFileEx error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+                Add-RollbackError $RollbackErrors "could not restore prior rpi executable (MoveFileEx error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
             } else {
                 $Backup = $null
             }
         } else {
-            Remove-RollbackPath $Dest "new pi executable" $RollbackErrors
-            Confirm-RollbackPath $Dest "new pi executable" $false $RollbackErrors
+            Remove-RollbackPath $Dest "new rpi executable" $RollbackErrors
+            Confirm-RollbackPath $Dest "new rpi executable" $false $RollbackErrors
         }
-        Fail-WithRollbackErrors "cannot record pi update state: $StateCommitError" $RollbackErrors
+        Fail-WithRollbackErrors "cannot record rpi update state: $StateCommitError" $RollbackErrors
     }
     if ($HadState -and (Test-Path -LiteralPath $StateAside)) {
         Remove-Item -LiteralPath $StateAside -Force -ErrorAction SilentlyContinue
@@ -462,8 +502,30 @@ try {
         Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
     }
 
+    # Clean-cutover migration: remove only the unchanged legacy executable that
+    # the prior state proved was installer-managed. Unmanaged paths are kept.
+    if ($LegacyPiSha256 -and (Test-Path -LiteralPath $LegacyPiPath -PathType Leaf)) {
+        try {
+            $LegacyItem = Get-Item -LiteralPath $LegacyPiPath -Force
+            $CurrentLegacySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $LegacyPiPath).Hash.ToLowerInvariant()
+            if (($LegacyItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and
+                -not $LegacyItem.PSIsContainer -and
+                $CurrentLegacySha256 -eq $LegacyPiSha256) {
+                Remove-Item -LiteralPath $LegacyPiPath -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $LegacyPiPath) {
+                    throw "path still exists after removal"
+                }
+                Write-Host "Removed legacy installer-managed command $LegacyPiPath"
+            } else {
+                Write-Warning "Legacy pi path changed during install; leaving it untouched: $LegacyPiPath"
+            }
+        } catch {
+            Write-Warning "rpi installed, but legacy managed command could not be removed: ${LegacyPiPath}: $($_.Exception.Message)"
+        }
+    }
+
     Write-Host ""
-    Write-Host "pi v$ResolvedVersion installed to $Dest"
+    Write-Host "rpi v$ResolvedVersion installed to $Dest"
 
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $OnPath = (($UserPath -split ";") -contains $BinDir) -or
@@ -474,13 +536,13 @@ try {
             [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
             Write-Host ""
             Write-Host "Added $BinDir to your user PATH."
-            Write-Host "Open a new terminal, then run 'pi' to get started."
+            Write-Host "Open a new terminal, then run 'rpi' to get started."
         } catch {
             Write-Warning "Could not add $BinDir to your user PATH: $($_.Exception.Message)"
             Write-Host "Add it manually: [Environment]::SetEnvironmentVariable('Path', '$BinDir;' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')"
         }
     } else {
-        Write-Host "Run 'pi' to get started."
+        Write-Host "Run 'rpi' to get started."
     }
 } finally {
     if ($StateTmp -and (Test-Path -LiteralPath $StateTmp)) {
@@ -488,7 +550,9 @@ try {
     }
     Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($InstallMutex) {
-        try { $InstallMutex.ReleaseMutex() } catch { }
+        if ($InstallMutexAcquired) {
+            try { $InstallMutex.ReleaseMutex() } catch { }
+        }
         try { $InstallMutex.Dispose() } catch { }
     }
 }

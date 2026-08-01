@@ -247,6 +247,8 @@ pub const SETTINGS_CATALOG: &[SettingDef] = &[
     setting!("retry.provider.timeoutMs", RetryTransport, NON_NEGATIVE_U64, "null", "Provider request timeout override in milliseconds.", NONE, ALL, LIVE, false, false),
     setting!("retry.provider.maxRetries", RetryTransport, NON_NEGATIVE_U64, "0", "Provider transport retry count.", NONE, ALL, LIVE, false, false),
     setting!("retry.provider.maxRetryDelayMs", RetryTransport, NON_NEGATIVE_U64, "null", "Provider transport retry-delay cap in milliseconds.", NONE, ALL, LIVE, false, false),
+    setting!("retry.modelFallback", RetryTransport, BOOL, "true", "Allow retry recovery to switch to configured fallback models.", NONE, ALL, LIVE, false, false),
+    setting!("retry.fallbackChains", RetryTransport, OBJECT, "{}", "Ordered model/provider fallback chains keyed by role, model selector, or provider wildcard.", NONE, ALL, LIVE, false, false),
     setting!("autoRetry", RetryTransport, BOOL, "true", "Legacy alias for retry.enabled.", NONE, ALL, LIVE, false, false),
     setting!("maxRetries", RetryTransport, NON_NEGATIVE_U64, "3", "Legacy alias for retry.maxRetries.", NONE, ALL, LIVE, false, false),
     setting!("baseDelayMs", RetryTransport, POSITIVE_U64, "2000", "Legacy alias for retry.baseDelayMs.", NONE, ALL, LIVE, false, false),
@@ -470,6 +472,7 @@ impl SettingsDraft {
             pi_agent::ThinkingLevel::Medium => "medium",
             pi_agent::ThinkingLevel::High => "high",
             pi_agent::ThinkingLevel::Xhigh => "xhigh",
+            pi_agent::ThinkingLevel::Max => "max",
         };
         self.runtime
             .insert("defaultThinkingLevel", Value::String(name.to_owned()));
@@ -744,6 +747,7 @@ mod tests {
             "terminal.showImages", "terminal.imageWidthCells", "terminal.clearOnShrink", "terminal.showTerminalProgress",
             "images.autoResize", "images.blockImages", "retry.enabled", "retry.maxRetries", "retry.baseDelayMs",
             "retry.provider.timeoutMs", "retry.provider.maxRetries", "retry.provider.maxRetryDelayMs",
+            "retry.modelFallback", "retry.fallbackChains",
             "branchSummary.reserveTokens", "branchSummary.skipPrompt", "steeringMode", "followUpMode", "autoRetry",
             "maxRetries", "baseDelayMs", "transport", "timeoutMs", "maxRetryDelayMs", "temperature", "maxTokens",
             "cacheRetention", "thinkingBudgets.minimal", "thinkingBudgets.low", "thinkingBudgets.medium",

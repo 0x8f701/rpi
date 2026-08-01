@@ -77,9 +77,9 @@ Project-local `.pi/skills/` are loaded only when the resolved project trust deci
 If a project has no `.pi` directory, it is trusted by default.
 
 ```sh
-pi --skill ./my-skills/rust-review.md --print "review src/main.rs"
-pi --no-skills --print "hello"     # disables discovered/configured skills, explicit paths still load
-pi --no-context-files --print "hello" # also skip AGENTS.md / CLAUDE.md
+rpi --skill ./my-skills/rust-review.md --print "review src/main.rs"
+rpi --no-skills --print "hello"     # disables discovered/configured skills, explicit paths still load
+rpi --no-context-files --print "hello" # also skip AGENTS.md / CLAUDE.md
 ```
 
 ## Safe path containment
@@ -211,7 +211,7 @@ EOF
 Run with project trust:
 
 ```sh
-pi --approve --print "Review src/lib.rs using the rust-review skill"
+rpi --approve --print "Review src/lib.rs using the rust-review skill"
 ```
 
 Or in an interactive session type:

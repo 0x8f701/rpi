@@ -78,11 +78,11 @@ fn print_header(session: &Session) {
         .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
     if std::io::stdout().is_terminal() {
         println!(
-            "\x1b[1mpi (rs)\x1b[0m · {provider}/{id} · cwd {}",
+            "\x1b[1mrpi\x1b[0m · {provider}/{id} · cwd {}",
             session.cwd().display()
         );
     } else {
-        println!("pi (rs) · {provider}/{id} · cwd {}", session.cwd().display());
+        println!("rpi · {provider}/{id} · cwd {}", session.cwd().display());
     }
 }
 
@@ -109,8 +109,7 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
         "quit" | "exit" => return Ok(true),
         "help" => {
             let ansi = std::io::stdout().is_terminal();
-            let (commands, diagnostics) = crate::interactive_commands::executable_catalog(application);
-            for command in commands {
+            for command in crate::interactive_commands::visible_catalog() {
                 let usage = crate::interactive_commands::builtin(&command.name)
                     .map(crate::interactive_commands::usage)
                     .unwrap_or_else(|| format!("/{}", command.name));
@@ -119,9 +118,6 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
                 } else {
                     println!("  {usage:<24} {}", command.description);
                 }
-            }
-            for diagnostic in diagnostics {
-                error_line(&diagnostic);
             }
         }
         "settings" => match crate::interactive_commands::parse_interactive_settings_command(
@@ -321,16 +317,41 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
             }
         }
         "goal" => match crate::goal_commands::parse_interactive_goal_command((!arg.is_empty()).then_some(arg)) {
-            Ok(command) => match crate::goal_commands::execute_interactive_goal_command(application, command) {
+            Ok(command) => match crate::goal_commands::execute_interactive_goal_command(application, command).await {
                 Ok(output) => println!("{output}"),
                 Err(error) => error_line(&format!("{error:#}")),
             },
             Err(error) => error_line(&format!("{error:#}")),
         },
+        "workflow" => {
+            match crate::workflow_commands::parse_interactive_workflow_command(
+                (!arg.is_empty()).then_some(arg),
+            ) {
+                Ok(command) => {
+                    match crate::workflow_commands::execute_interactive_workflow_on_application(
+                        application,
+                        command,
+                    )
+                    .await
+                    {
+                        Ok(crate::workflow_commands::WorkflowCommandEffect::OpenPage) => {
+                            println!(
+                                "Open the workflows page in the full-screen TUI (bare /workflow)."
+                            );
+                        }
+                        Ok(crate::workflow_commands::WorkflowCommandEffect::Message(output)) => {
+                            println!("{output}");
+                        }
+                        Err(error) => error_line(&format!("{error:#}")),
+                    }
+                }
+                Err(error) => error_line(&format!("{error:#}")),
+            }
+        }
         "todo" => {
             if arg.is_empty() {
-                let markdown = pi_coding::todo_phases_to_markdown(&application.todo_state().phases);
-                println!("{markdown}");
+                let text = crate::tui::format_todo_human_lines(&application.todo_state().phases);
+                println!("{text}");
             } else {
                 match pi_coding::parse_todo_markdown(arg) {
                     Ok(phases) => match application.set_todos(phases) {

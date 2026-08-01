@@ -3,7 +3,7 @@ members = ["crates/pi-ai", "crates/pi-agent", "crates/pi-coding", "crates/pi-cli
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -28,7 +28,7 @@ pi-coding = { path = "crates/pi-coding" }
 nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
 regex = "1.11"
 portable-pty = "0.9"
-ratatui = "0.29"
+ratatui = { version = "0.29", default-features = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 semver = "1.0"
 sha2 = "0.10"

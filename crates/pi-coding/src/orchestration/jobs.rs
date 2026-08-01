@@ -63,6 +63,12 @@ pub struct JobSnapshot {
     pub parent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_generation: Option<u64>,
     pub status: JobStatus,
     pub created_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,6 +132,33 @@ impl JobManager {
             record.snapshot.id == id || record.snapshot.agent_id == id
         })
     }
+
+    /// Resolve a job id or agent id accepted by job APIs to the canonical agent id.
+    ///
+    /// Job UUIDs and agent ids both match. Multiple distinct agent ids for one
+    /// identifier are rejected as ambiguous; unknown identifiers error.
+    pub(crate) fn resolve_agent_id(&self, identifier: &str) -> Result<String> {
+        let records = self.records.lock();
+        let mut agent_ids = records
+            .values()
+            .filter(|record| {
+                record.snapshot.id == identifier || record.snapshot.agent_id == identifier
+            })
+            .map(|record| record.snapshot.agent_id.clone())
+            .collect::<Vec<_>>();
+        agent_ids.sort();
+        agent_ids.dedup();
+        match agent_ids.as_slice() {
+            [agent_id] => Ok(agent_id.clone()),
+            [] => Err(anyhow!(
+                "unknown orchestration job or agent id {identifier:?}"
+            )),
+            matches => Err(anyhow!(
+                "ambiguous orchestration job or agent id {identifier:?} matches agents {matches:?}; use a unique job id or agent id"
+            )),
+        }
+    }
+
 
     pub(crate) fn insert(&self, snapshot: JobSnapshot, cancel: CancellationToken) -> Result<JobSnapshot> {
         let mut records = self.records.lock();
@@ -370,5 +403,72 @@ impl JobManager {
             return Err(anyhow!("unknown orchestration job or agent id {id:?}"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(id: &str, agent_id: &str) -> JobSnapshot {
+        JobSnapshot {
+            id: id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: None,
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status: JobStatus::Queued,
+            created_at: 1,
+            started_at: None,
+            finished_at: None,
+            result: None,
+        }
+    }
+
+    #[test]
+    fn resolve_agent_id_maps_job_and_agent_identifiers() {
+        let jobs = JobManager::new();
+        jobs.insert(snapshot("job-a", "Worker"), CancellationToken::new())
+            .expect("insert");
+
+        assert_eq!(jobs.resolve_agent_id("job-a").expect("job uuid"), "Worker");
+        assert_eq!(
+            jobs.resolve_agent_id("Worker").expect("agent id"),
+            "Worker"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_id_unknown_is_actionable() {
+        let jobs = JobManager::new();
+        let error = jobs
+            .resolve_agent_id("missing-job")
+            .expect_err("unknown id");
+        let message = error.to_string();
+        assert!(message.contains("unknown"), "{message}");
+        assert!(message.contains("missing-job"), "{message}");
+    }
+
+    #[test]
+    fn resolve_agent_id_rejects_ambiguous_agent_matches() {
+        let jobs = JobManager::new();
+        // Two jobs that both claim the same synthetic identifier via agent_id
+        // collision with another job's id is prevented at spawn, but agent_id
+        // equality across records is still possible if identifiers overlap.
+        jobs.insert(snapshot("shared", "Alpha"), CancellationToken::new())
+            .expect("insert alpha");
+        jobs.insert(snapshot("other", "shared"), CancellationToken::new())
+            .expect("insert shared agent");
+
+        let error = jobs
+            .resolve_agent_id("shared")
+            .expect_err("shared matches job id and agent id of different agents");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(message.contains("Alpha"), "{message}");
+        assert!(message.contains("shared"), "{message}");
     }
 }

@@ -19,9 +19,52 @@ pub struct ToolCardRow { pub tool_call_id: String, pub role: ToolCardRowRole, pu
 #[serde(rename_all = "camelCase")]
 pub struct ToolCardRows {
     pub tool_call_id: String, pub tool_name: String, pub ordinal: u64,
-    pub arguments_summary: String, pub status: ToolCallViewStatus,
+    pub arguments_summary: String, pub code_language: Option<String>, pub status: ToolCallViewStatus,
     pub is_partial: bool, pub is_error: bool, pub cancelled: bool,
     pub truncated: bool, pub omitted_content_lines: usize, pub rows: Vec<ToolCardRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskDelegationChild {
+    pub name: Option<String>,
+    pub agent: Option<String>,
+    pub task: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskDelegationRequest {
+    pub context: String,
+    pub children: Vec<TaskDelegationChild>,
+}
+
+#[must_use]
+pub fn task_delegation_request(arguments: &serde_json::Value) -> Option<TaskDelegationRequest> {
+    if let Some(tasks) = arguments.get("tasks").and_then(serde_json::Value::as_array) {
+        let children = tasks
+            .iter()
+            .filter_map(|item| {
+                let task = item.get("task")?.as_str()?.trim();
+                (!task.is_empty()).then(|| TaskDelegationChild {
+                    name: item.get("name").and_then(serde_json::Value::as_str).map(str::to_owned),
+                    agent: item.get("agent").and_then(serde_json::Value::as_str).map(str::to_owned),
+                    task: task.to_owned(),
+                })
+            })
+            .collect::<Vec<_>>();
+        return (!children.is_empty()).then(|| TaskDelegationRequest {
+            context: arguments.get("context").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+            children,
+        });
+    }
+    let task = arguments.get("task")?.as_str()?.trim();
+    (!task.is_empty()).then(|| TaskDelegationRequest {
+        context: String::new(),
+        children: vec![TaskDelegationChild {
+            name: arguments.get("name").and_then(serde_json::Value::as_str).map(str::to_owned),
+            agent: arguments.get("agent").and_then(serde_json::Value::as_str).map(str::to_owned),
+            task: task.to_owned(),
+        }],
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,7 +108,7 @@ impl ToolCardPresentationAdapter {
 
 fn card_rows(card: &ToolCard, expanded: bool) -> ToolCardRows {
     let view = card.expanded_view();
-    let mut rows = vec![row(card, ToolCardRowRole::Command, card.compact_title())];
+    let mut rows = vec![row(card, ToolCardRowRole::Command, tool_title(&card.tool_name))];
     let content = tool_content_text(card, &view.content_text);
     let content_lines = content.lines().collect::<Vec<_>>();
     let limit = if card.tool_name.eq_ignore_ascii_case("bash") { 19 } else { 6 };
@@ -76,9 +119,48 @@ fn card_rows(card: &ToolCard, expanded: bool) -> ToolCardRows {
         let details = serde_json::to_string_pretty(&redact_value(&view.details)).unwrap_or_else(|_| view.details.to_string());
         if !matches!(details.as_str(), "{}" | "[]" | "null" | "") { rows.extend(details.lines().map(|line| row(card, ToolCardRowRole::Details, line.to_owned()))); }
     }
+    let code_language = tool_code_language(&card.tool_name, &card.arguments);
     ToolCardRows { tool_call_id: card.tool_call_id.clone(), tool_name: card.tool_name.clone(), ordinal: card.ordinal,
-        arguments_summary: compact_tool_arguments(&card.arguments), status: card.status, is_partial: card.is_partial(),
+        arguments_summary: compact_tool_arguments(&card.arguments), code_language, status: card.status, is_partial: card.is_partial(),
         is_error: card.is_error, cancelled: card.cancelled, truncated: omitted_content_lines > 0, omitted_content_lines, rows }
+}
+
+fn tool_code_language(tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
+    if !matches!(tool_name.to_ascii_lowercase().as_str(), "read" | "write" | "edit") {
+        return None;
+    }
+    let path = ["path", "file"]
+        .into_iter()
+        .find_map(|key| arguments.get(key).and_then(serde_json::Value::as_str))?;
+    let extension = std::path::Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+    let language = match extension.as_str() {
+        "rs" => "rust",
+        "sh" | "bash" | "zsh" | "fish" | "ksh" => "sh",
+        "json" | "jsonc" | "json5" => "json",
+        "ts" => "typescript",
+        "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "cpp" | "cs" | "swift"
+        | "rb" | "php" | "scala" | "toml" | "yaml" | "yml" | "sql" | "lua" | "zig"
+        | "dart" | "r" | "hs" | "ex" | "clj" => extension.as_str(),
+        "cc" => "cpp",
+        "kt" => "kotlin",
+        "pl" => "perl",
+        "exs" => "elixir",
+        _ => return None,
+    };
+    Some(language.to_owned())
+}
+fn tool_title(tool_name: &str) -> String {
+    tool_name
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn tool_content_text(card: &ToolCard, fallback: &str) -> String {
@@ -102,6 +184,7 @@ mod tests {
     fn end(id: &str, name: &str, text: &str, details: serde_json::Value, is_error: bool) -> ApplicationEvent { let mut result = AgentToolResult::text(text); result.details = details; app(AgentEvent::ToolExecutionEnd { tool_call_id: id.into(), tool_name: name.into(), result, is_error }) }
     fn result(id: &str, name: &str, text: &str, details: Option<serde_json::Value>, is_error: bool) -> ApplicationEvent { app(AgentEvent::MessageEnd { message: Message::ToolResult(ToolResultMessage { tool_call_id: id.into(), tool_name: name.into(), content: vec![ContentBlock::text(text)], usage: None, details, added_tool_names: Vec::new(), is_error, timestamp: now_millis() }) }) }
     fn content(rows: &ToolCardRows) -> Vec<String> { rows.rows.iter().filter(|row| row.role == ToolCardRowRole::Content).map(|row| row.text.clone()).collect() }
+    fn title(rows: &ToolCardRows) -> &str { rows.rows.iter().find(|row| row.role == ToolCardRowRole::Command).map_or("", |row| row.text.as_str()) }
 
     #[test]
     fn concurrent_same_name_preserves_ids_order_and_results() {
@@ -113,7 +196,7 @@ mod tests {
 
     #[test]
     fn terminal_orphan_reconciliation_and_redaction() {
-        let secret = "sk-live-super-secret-value";
+        let secret = "credential-redaction-fixture-value";
         let mut a = ToolCardPresentationAdapter::new();
         for e in [start("c","bash",json!({"command":"sleep"})), end("c","bash","Operation aborted",json!({"cancelled":true}),true), result("c","bash","Operation aborted",Some(json!({"cancelled":true,"signal":"SIGINT"})),true), result("o","read","recovered",None,false), start("s","http",json!({"api_key":secret,"password":"hunter2"})), end("s","http",&format!("token={secret}"),json!({"authorization":secret}),true)] { a.apply_application_event(&e); }
         assert_eq!(a.projection().len(), 3);
@@ -127,17 +210,46 @@ mod tests {
     fn short_empty_long_and_expanded_bash_match_capture() {
         let mut a = ToolCardPresentationAdapter::new();
         a.apply_application_event(&start("s","bash",json!({"command":"printf short-output"}))); a.apply_application_event(&end("s","bash","short-output",serde_json::Value::Null,false));
-        let short = a.rows("s",false).unwrap(); assert_eq!(short.arguments_summary,"printf short-output"); assert_eq!(content(&short),vec!["short-output"]); assert!(!short.truncated);
-        a.apply_application_event(&start("e","bash",json!({"command":"true"}))); a.apply_application_event(&end("e","bash","",serde_json::Value::Null,false)); assert!(content(&a.rows("e",false).unwrap()).is_empty());
+        let short = a.rows("s",false).unwrap(); assert_eq!(title(&short), "Bash"); assert_eq!(short.arguments_summary,"printf short-output"); assert_eq!(content(&short),vec!["short-output"]); assert!(!short.truncated);
+        a.apply_application_event(&start("e","bash",json!({"command":"true"}))); a.apply_application_event(&end("e","bash","",serde_json::Value::Null,false)); let empty = a.rows("e",false).unwrap(); assert_eq!(title(&empty), "Bash"); assert!(content(&empty).is_empty());
         let body=(1..=30).map(|n|n.to_string()).collect::<Vec<_>>().join("\n"); a.apply_application_event(&start("l","bash",json!({"command":"seq 1 30"}))); a.apply_application_event(&end("l","bash",&body,serde_json::Value::Null,false));
-        let compact=a.rows("l",false).unwrap(); assert_eq!(compact.omitted_content_lines,11); assert_eq!(content(&compact),(12..=30).map(|n|n.to_string()).collect::<Vec<_>>()); assert_eq!(content(&a.rows("l",true).unwrap()).len(),30);
+        let compact=a.rows("l",false).unwrap(); assert_eq!(title(&compact), "Bash"); assert_eq!(compact.omitted_content_lines,11); assert_eq!(content(&compact),(12..=30).map(|n|n.to_string()).collect::<Vec<_>>()); assert_eq!(content(&a.rows("l",true).unwrap()).len(),30);
+        a.apply_application_event(&start("t","task",json!({"prompt":"inspect"}))); let task = a.rows("t",false).unwrap(); assert_eq!(title(&task), "Task");
     }
 
     #[test]
+    fn task_request_preserves_shared_context_and_children() {
+        let request = task_delegation_request(&json!({
+            "context": "# Goal\nShip it\n\n# Constraints\nBe precise",
+            "tasks": [
+                {"name": "Alpha", "agent": "reviewer", "task": "Review the adapter"},
+                {"name": "Beta", "task": "Render the card"}
+            ]
+        })).expect("task batch");
+        assert_eq!(request.children.len(), 2);
+        assert_eq!(request.children[0].name.as_deref(), Some("Alpha"));
+        assert_eq!(request.children[0].agent.as_deref(), Some("reviewer"));
+        assert!(request.context.contains("# Constraints"));
+    }
+    #[test]
     fn edit_read_write_and_foreground_status_are_specific() {
-        let mut a=ToolCardPresentationAdapter::new(); a.apply_application_event(&start("x","edit",json!({"path":"f"}))); a.apply_application_event(&end("x","edit","success",json!({"diff":"@@\n-old\n+new"}),false)); assert!(content(&a.rows("x",false).unwrap()).contains(&"@@".into()));
-        let body=(1..=8).map(|n|format!("line-{n}")).collect::<Vec<_>>().join("\n"); a.apply_application_event(&start("r","read",json!({"path":"f"}))); a.apply_application_event(&end("r","read",&body,serde_json::Value::Null,false)); assert_eq!(a.rows("r",false).unwrap().omitted_content_lines,2);
-        a.apply_application_event(&start("w","write",json!({"path":"f","content":body}))); a.apply_application_event(&end("w","write","Successfully wrote",serde_json::Value::Null,false)); assert_eq!(a.rows("w",false).unwrap().omitted_content_lines,2);
-        let failed=BashExecutionMessage{command:"false".into(),output:String::new(),exit_code:Some(7),cancelled:false,truncated:false,full_output_path:None,timestamp:42,exclude_from_context:None}; let rows=ToolCardPresentationAdapter::bash_execution_rows(&failed,false); assert!(rows.rows.iter().any(|r|r.role==ToolCardRowRole::Status&&r.text=="Exit: 7"));
+        let mut a=ToolCardPresentationAdapter::new(); a.apply_application_event(&start("x","edit",json!({"path":"f"}))); a.apply_application_event(&end("x","edit","success",json!({"diff":"@@\n-old\n+new"}),false)); let edit=a.rows("x",false).unwrap(); assert_eq!(title(&edit), "Edit"); assert!(content(&edit).contains(&"@@".into()));
+        let body=(1..=8).map(|n|format!("line-{n}")).collect::<Vec<_>>().join("\n"); a.apply_application_event(&start("r","read",json!({"path":"f"}))); a.apply_application_event(&end("r","read",&body,serde_json::Value::Null,false)); let read=a.rows("r",false).unwrap(); assert_eq!(title(&read), "Read"); assert_eq!(read.omitted_content_lines,2);
+        a.apply_application_event(&start("w","write",json!({"path":"f","content":body}))); a.apply_application_event(&end("w","write","Successfully wrote",serde_json::Value::Null,false)); let write=a.rows("w",false).unwrap(); assert_eq!(title(&write), "Write"); assert_eq!(write.omitted_content_lines,2);
+        let failed=BashExecutionMessage{command:"false".into(),output:String::new(),exit_code:Some(7),cancelled:false,truncated:false,full_output_path:None,timestamp:42,exclude_from_context:None}; let rows=ToolCardPresentationAdapter::bash_execution_rows(&failed,false); assert_eq!(title(&rows), "Bash"); assert!(rows.rows.iter().any(|r|r.role==ToolCardRowRole::Status&&r.text=="Exit: 7"));
+    }
+    #[test]
+    fn read_code_language_uses_only_trusted_path_extensions() {
+        let mut adapter = ToolCardPresentationAdapter::new();
+        adapter.apply_application_event(&start("rust", "read", json!({"path":"src/lib.rs"})));
+        adapter.apply_application_event(&end("rust", "read", "fn main() {}", serde_json::Value::Null, false));
+        assert_eq!(adapter.rows("rust", false).unwrap().code_language.as_deref(), Some("rust"));
+
+        adapter.apply_application_event(&start("plain", "read", json!({"path":"notes.unknown"})));
+        adapter.apply_application_event(&end("plain", "read", "fn main() {}", serde_json::Value::Null, false));
+        assert_eq!(adapter.rows("plain", false).unwrap().code_language, None);
+
+        adapter.apply_application_event(&start("http", "http", json!({"path":"src/lib.rs"})));
+        assert_eq!(adapter.rows("http", false).unwrap().code_language, None);
     }
 }

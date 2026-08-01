@@ -21,7 +21,7 @@ pub fn process_tool(
     let cwd = cwd.to_path_buf();
     AgentTool::new(
         "process",
-        "Start and supervise long-running argv-based processes. Supports PTY input, bounded cursor logs, signals, wait, describe, and ps. Commands are never shell-interpolated.",
+        "Start and supervise long-running argv-based processes owned by the current Application. Every start returns a stable id listed by /ps and supports PTY input, bounded cursor logs, signals, stop, wait, and describe. Commands are never shell-interpolated.",
         process_schema(),
         move |context| {
             let manager = manager.clone();
@@ -31,7 +31,8 @@ pub fn process_tool(
         },
     )
     .with_prompt_guidelines(vec![
-        "Use process for long-running or interactive commands; use bash for finite foreground commands.".to_owned(),
+        "Use process start for servers, watchers, long-running, or interactive commands; use bash only for finite foreground commands.".to_owned(),
+        "Never launch long-lived work with nohup, setsid, disown, or shell '&'. A supervised process must have a stable id visible in /ps with logs, signal, stop, and wait controls.".to_owned(),
         "Pass an argv array to process start; shell syntax is not interpreted.".to_owned(),
     ])
 }

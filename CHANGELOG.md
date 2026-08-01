@@ -2,6 +2,47 @@
 
 All notable changes to the `pi-rs` project are documented in this file.
 
+## [0.2.0] - 2026-08-01
+
+### Changed
+
+- Product binary cutover from `pi` to `rpi`. The published CLI executable,
+  managed install path, and self-update activation target are now `rpi`
+  (`~/.pi-rs/bin/rpi` on Unix, `%USERPROFILE%\.pi-rs\bin\rpi.exe` on Windows).
+- Release assets are named `rpi-<version>-<target-triple>.tar.gz` (`.zip` on
+  Windows) and contain a root-level `rpi` / `rpi.exe` binary plus `LICENSE`.
+- One-line installers (`install.sh`, `install.ps1`) and `rpi update --self`
+  download, checksum, smoke-test (`rpi <version>`), and atomically activate
+  those `rpi-*` assets under `PI_HOME` (default `~/.pi-rs`).
+- Workspace package version is `0.2.0`. Manual install from source is
+  `cargo install --path crates/pi-cli --locked --bin rpi`.
+- The headless RPC companion binary remains `pi-rpc`. Runtime configuration
+  paths and environment variables are unchanged: `~/.pi/agent`, project
+  `.pi/`, and `PI_*`.
+
+- Added durable multi-workflow orchestration with isolated git worktrees,
+  workflow-owned Todo DAGs and subagents, typed RPC lifecycle commands,
+  list-to-detail TUI navigation, IRC projections, and explicit conflict state.
+- Reworked the inline TUI composer for immediate printable input, bounded large
+  paste handling, grouped undo, Ctrl-U clear, prompt history, clipboard image
+  attachments, compact live task cards, and non-durable error toasts.
+- Goal create/resume now activates model work immediately. Trusted skills remain
+  namespaced under `/skill:`, including `coordinate` discovery and execution.
+
+### Migration
+
+- Fresh installs create only the `rpi` command. On Unix, `install.sh` removes a
+  legacy installer-managed `~/.pi-rs/bin/pi` symlink only when it still points
+  at a previous installer-owned download path; unmanaged `pi` commands are left
+  alone.
+- Prefer `rpi` in scripts and docs. Existing agent config under `~/.pi/agent`
+  continues to work without relocation.
+
+### Known limitations
+
+- `npm:` package sources are not implemented; attempting to install one fails
+  with a clear error.
+
 ## [0.1.0] - 2026-08-01
 
 ### Added
@@ -57,4 +98,5 @@ All notable changes to the `pi-rs` project are documented in this file.
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
 
+[0.2.0]: https://github.com/0x8f701/pi-rs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/0x8f701/pi-rs/releases/tag/v0.1.0

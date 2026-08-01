@@ -11,10 +11,12 @@ use pi_ai::providers::{
 };
 use pi_ai::{ContentBlock, Model, StopReason};
 use pi_coding::{
-    AgentRuntimeSettings, Application, ApplicationEvent, ExtensionCapability, ExtensionMode,
+    AgentRuntimeSettings, Application, ApplicationEvent, ApplicationRuntimeCandidate,
+    ApplicationRuntimeFactory, ApplicationRuntimeFuture, ExtensionCapability, ExtensionMode,
     ExtensionOrigin, ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeOptions,
     ExtensionSpec, ExtensionSpecRuntime, JobStatus, OrchestrationSettings, ResourceManager,
-    ResourceManagerOptions, Session, SessionOptions, StreamingBehavior, TaskItem,
+    ResourceManagerOptions, Session, SessionOptions, StreamingBehavior, TaskItem, ToolSelection,
+    WorkspaceRoots,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -98,6 +100,307 @@ fn session_with_recorded_contexts(
     })
     .expect("build context-recording session");
     (session, registration)
+}
+
+#[derive(Clone, Default)]
+struct TestRuntimeFactory {
+    bun: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct FailingRuntimeFactory;
+
+impl ApplicationRuntimeFactory for FailingRuntimeFactory {
+    fn build_runtime_candidate(
+        &self,
+        _cwd: PathBuf,
+        _options: SessionOptions,
+        _resume: Option<pi_coding::PreparedSessionResume>,
+    ) -> ApplicationRuntimeFuture {
+        Box::pin(async { anyhow::bail!("candidate build failed") })
+    }
+}
+
+impl ApplicationRuntimeFactory for TestRuntimeFactory {
+    fn build_runtime_candidate(
+        &self,
+        cwd: PathBuf,
+        mut options: SessionOptions,
+        resume: Option<pi_coding::PreparedSessionResume>,
+    ) -> ApplicationRuntimeFuture {
+        let bun = self.bun.clone();
+        Box::pin(async move {
+            options.cwd.clone_from(&cwd);
+            let workspace = WorkspaceRoots::new(&cwd, Vec::<PathBuf>::new())?;
+            let mut resource_options = ResourceManagerOptions::new(&cwd);
+            resource_options.project_trust_override = Some(true);
+            let resources = ResourceManager::new(resource_options)?;
+            options.system_prompt = resources.snapshot().system_prompt.clone().unwrap_or_default();
+            let session = Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
+                options,
+                Vec::new(),
+                ToolSelection { enable_glob: true, ..ToolSelection::default() },
+                pi_coding::ResourceDiscovery::Disabled,
+                workspace,
+                None,
+            )?;
+            session.attach_resources(resources).await?;
+            if let Some(resume) = resume {
+                let context = resume.build_context();
+                let recorder = resume.into_recorder()?;
+                session.load_history(context.messages).await?;
+                session.record(recorder)?;
+            }
+            let mut candidate = ApplicationRuntimeCandidate::new(session);
+            if let Some(bun) = bun {
+                let entry = cwd.join(".pi/extensions/target-probe.ts");
+                let permissions = ExtensionPermissionSet {
+                    capabilities: BTreeSet::from([ExtensionCapability::Commands]),
+                    ui_capabilities: BTreeSet::new(),
+                };
+                let mut spec = ExtensionSpec::new_runtime(
+                    "target-probe",
+                    ExtensionSpecRuntime::Bun { entry: entry.clone() },
+                    entry.parent().expect("extension parent"),
+                    ExtensionOrigin::Project,
+                    true,
+                    permissions.clone(),
+                );
+                spec.environment.insert(
+                    "PI_BUN_EXECUTABLE".to_owned(),
+                    bun.to_string_lossy().into_owned(),
+                );
+                let runtime = ExtensionRuntime::process(
+                    None,
+                    ExtensionRuntimeOptions {
+                        mode: ExtensionMode::Tui,
+                        invocation_timeout: Duration::from_secs(5),
+                        ..ExtensionRuntimeOptions::default()
+                    },
+                );
+                let report = runtime.load(vec![spec]).await;
+                anyhow::ensure!(report.failures.is_empty(), "{:?}", report.failures);
+                candidate = candidate.with_extensions(runtime, permissions);
+            }
+            Ok(candidate)
+        })
+    }
+}
+
+fn write_session(path: &Path, cwd: &Path, id: &str, message: &str) {
+    let body = [
+        serde_json::json!({
+            "type": "session",
+            "version": 3,
+            "id": id,
+            "timestamp": "2026-08-02T00:00:00.000Z",
+            "cwd": cwd,
+        }),
+        serde_json::json!({
+            "type": "message",
+            "id": format!("{id}-message"),
+            "parentId": null,
+            "timestamp": "2026-08-02T00:00:01.000Z",
+            "message": pi_ai::Message::user_text(message, 1),
+        }),
+    ];
+    std::fs::write(
+        path,
+        body.into_iter()
+            .map(|record| serde_json::to_string(&record).expect("serialize"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write session");
+}
+
+#[tokio::test]
+async fn cross_cwd_switch_replaces_generation_and_preserves_old_session_lease() {
+    let source = tempfile::tempdir().expect("source cwd");
+    let target = tempfile::tempdir().expect("target cwd");
+    let source_file = source.path().join("source.jsonl");
+    let target_file = target.path().join("target.jsonl");
+    write_session(&source_file, source.path(), "source", "source message");
+    write_session(&target_file, target.path(), "target", "target message");
+    std::fs::write(source.path().join("source-only.txt"), "source").expect("source marker");
+    std::fs::write(target.path().join("target-only.txt"), "target").expect("target marker");
+    let target_skill = target.path().join(".pi/skills/target-skill");
+    std::fs::create_dir_all(&target_skill).expect("target skill directory");
+    std::fs::write(
+        target_skill.join("SKILL.md"),
+        "---\nname: target-skill\ndescription: target-only runtime resource\n---\ntarget body\n",
+    )
+    .expect("target skill");
+    let bun = bun_executable();
+    if bun.is_some() {
+        let extension_dir = target.path().join(".pi/extensions");
+        std::fs::create_dir_all(&extension_dir).expect("target extension directory");
+        std::fs::write(
+            extension_dir.join("target-probe.ts"),
+            r#"export default function (pi: any) {
+  pi.registerCommand("target-probe", { handler: () => "target-extension" });
+}"#,
+        )
+        .expect("target extension");
+    }
+    let has_target_extension = bun.is_some();
+
+    let session = Session::new(SessionOptions {
+        model: Model::default(),
+        cwd: source.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: pi_agent::ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+    })
+    .expect("source session");
+    session
+        .switch_session(&source_file)
+        .await
+        .expect("attach source recording");
+    let application = Application::new(session).await;
+    application
+        .attach_runtime_factory(Arc::new(TestRuntimeFactory { bun }))
+        .expect("factory");
+    let clone = application.clone();
+    let retained = application.session();
+    let mut events = application.subscribe();
+    let source_epoch = application.runtime_epoch();
+
+    tokio::time::timeout(Duration::from_secs(5), application.switch_session(&target_file))
+        .await
+        .expect("cross cwd switch timeout")
+        .expect("cross cwd switch");
+
+    assert!(application.runtime_epoch() > source_epoch);
+    assert_eq!(clone.session().cwd(), target.path());
+    assert_eq!(retained.cwd(), source.path());
+    assert_eq!(application.messages(), vec![pi_ai::Message::user_text("target message", 1)]);
+    let resources = application
+        .session()
+        .resource_manager()
+        .expect("target resources")
+        .snapshot();
+    assert_eq!(resources.cwd, target.path());
+    assert!(resources.skills.iter().any(|skill| skill.name == "target-skill"));
+    if has_target_extension {
+        let runtime = application.extension_runtime().expect("target extension runtime");
+        assert_eq!(
+            runtime
+                .invoke_command("target-probe", String::new(), None, None)
+                .await
+                .expect("target extension command"),
+            serde_json::Value::String("target-extension".to_owned())
+        );
+    }
+    let bash = tokio::time::timeout(
+        Duration::from_secs(5),
+        application.execute_bash("pwd; cat target-only.txt".to_owned(), false),
+    )
+    .await
+    .expect("target bash timeout")
+    .expect("target bash");
+    assert!(bash.output.contains(&target.path().to_string_lossy().into_owned()));
+    assert!(bash.output.contains("target"));
+    let glob = application
+        .session()
+        .get_tool_definition("glob")
+        .expect("target glob tool");
+    let (_, source_abort) = AbortController::new();
+    let source_glob_error = tokio::time::timeout(
+        Duration::from_secs(5),
+        (glob.execute)(pi_agent::ToolCallContext {
+            tool_call_id: "source-glob".to_owned(),
+            arguments: serde_json::json!({"pattern": "*", "path": source.path()}),
+            on_update: Arc::new(|_| {}),
+            abort: source_abort,
+            model: None,
+        }),
+    )
+    .await
+    .expect("source glob timeout")
+    .expect_err("source-scoped glob must be rejected")
+    .to_string();
+    assert!(
+        source_glob_error.contains("working directory")
+            || source_glob_error.contains("workspace"),
+        "{source_glob_error}"
+    );
+    let read = application
+        .session()
+        .get_tool_definition("read")
+        .expect("target read tool");
+    let (_, target_abort) = AbortController::new();
+    let target_read = tokio::time::timeout(
+        Duration::from_secs(5),
+        (read.execute)(pi_agent::ToolCallContext {
+            tool_call_id: "target-read".to_owned(),
+            arguments: serde_json::json!({"path": "target-only.txt"}),
+            on_update: Arc::new(|_| {}),
+            abort: target_abort,
+            model: None,
+        }),
+    )
+    .await
+    .expect("target read timeout")
+    .expect("target read response");
+    assert!(!target_read.content.is_empty());
+    let barrier = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("runtime barrier timeout")
+        .expect("runtime barrier");
+    assert!(matches!(
+        barrier,
+        ApplicationEvent::RuntimeChanged { epoch } if epoch == application.runtime_epoch()
+    ));
+    std::mem::forget(retained);
+    std::mem::forget(clone);
+    std::mem::forget(application);
+}
+
+#[tokio::test]
+async fn cross_cwd_candidate_failure_preserves_old_runtime() {
+    let source = tempfile::tempdir().expect("source cwd");
+    let target = tempfile::tempdir().expect("target cwd");
+    let source_file = source.path().join("source.jsonl");
+    let target_file = target.path().join("target.jsonl");
+    write_session(&source_file, source.path(), "source", "source message");
+    write_session(&target_file, target.path(), "target", "target message");
+    let session = Session::new(SessionOptions {
+        model: Model::default(),
+        cwd: source.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: pi_agent::ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+    })
+    .expect("source session");
+    session.switch_session(&source_file).await.expect("source resume");
+    let application = Application::new(session).await;
+    application
+        .attach_runtime_factory(Arc::new(FailingRuntimeFactory))
+        .expect("factory");
+    let epoch = application.runtime_epoch();
+    let error = application
+        .switch_session(&target_file)
+        .await
+        .expect_err("candidate must fail");
+    assert!(error.to_string().contains("candidate build failed"));
+    assert_eq!(application.runtime_epoch(), epoch);
+    assert_eq!(application.session().cwd(), source.path());
+    assert_eq!(application.messages(), [pi_ai::Message::user_text("source message", 1)]);
 }
 
 fn bun_executable() -> Option<PathBuf> {
@@ -766,6 +1069,7 @@ async fn equivalent_reload_retains_running_and_retained_jobs() {
                 id: "ReloadSurvivor".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "remain active across reload".to_owned(),
+                todo_task_id: None,
             }],
         )
         .expect("spawn")
@@ -828,6 +1132,7 @@ async fn non_equivalent_reload_cleans_running_and_retained_job_state() {
                 id: "ReloadCleanup".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "cancel on non-equivalent reload".to_owned(),
+                todo_task_id: None,
             }],
         )
         .expect("spawn")
@@ -877,8 +1182,11 @@ async fn extension_session_reducers_cancel_without_mutation_and_transform_tree()
     let before = application.state().await;
     let history = application.messages();
 
+    let resume_directory = tempfile::tempdir()?;
+    let resume_file = resume_directory.path().join("resume.jsonl");
+    write_session(&resume_file, resume_directory.path(), "resume", "resume message");
     assert!(application.new_session().await.expect_err("cancel new").to_string().contains("cancelled"));
-    assert!(application.switch_session(Path::new("missing.jsonl")).await.expect_err("cancel resume").to_string().contains("cancelled"));
+    assert!(application.switch_session(&resume_file).await.expect_err("cancel resume").to_string().contains("cancelled"));
     assert!(application.fork_session(&user_id).await.expect_err("cancel fork").to_string().contains("cancelled"));
     let unchanged = application.state().await;
     assert_eq!(unchanged.session_id, before.session_id);
@@ -1025,8 +1333,13 @@ async fn loop_turns_project_events_use_session_path_and_suspend_on_switch() {
         None,
     )
     .expect("first recorder");
+    first_recorder.persist_now().expect("persist first session");
     let first_path = first_recorder.path();
-    session.record(first_recorder).expect("attach first recorder");
+    first_recorder.close().expect("close first recorder");
+    session
+        .switch_session(&first_path)
+        .await
+        .expect("attach first recorder");
     let second_recorder = pi_coding::start_session_in(
         std::env::current_dir().expect("current directory"),
         session.model().as_ref(),
@@ -1183,6 +1496,7 @@ async fn enabling_orchestration_on_reload_forwards_job_events() {
                 id: "ForwardedChild".to_owned(),
                 agent: "task".to_owned(),
                 assignment: "prove reload event forwarding".to_owned(),
+                todo_task_id: None,
             }],
         )
         .expect("spawn child")

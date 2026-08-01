@@ -1,4 +1,4 @@
-//! Command-line argument parsing for the `pi` binary.
+//! Command-line argument parsing for the `rpi` binary.
 //!
 //! Mirrors the Go upstream flag surface: top-level flags drive the agent run
 //! path (print mode or interactive REPL), while `models`, `sessions`, and
@@ -10,12 +10,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-/// `pi` — Rust port of the pi coding agent.
+/// `rpi` — Rust port of the pi coding agent.
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "pi",
+    name = "rpi",
     version,
-    about = "pi - Rust port of the pi coding agent",
+    about = "rpi - Rust port of the pi coding agent",
     long_about = None,
     args_override_self = true,
 )]
@@ -90,7 +90,7 @@ pub struct Cli {
     #[arg(short = 'C', long, value_name = "DIR", global = true)]
     pub cwd: Option<PathBuf>,
 
-    /// Add a trusted workspace directory for file tools and @file expansion; repeatable.
+    /// Add a directory to scoped ls/find/grep/glob tools and @file expansion; repeatable.
     #[arg(long = "add-dir", value_name = "DIR", action = clap::ArgAction::Append)]
     pub add_dirs: Vec<PathBuf>,
 
@@ -265,15 +265,15 @@ pub enum Command {
         #[arg(short = 'l', long)]
         local: bool,
     },
-    /// Update pi itself, configured extensions, or model catalogs.
+    /// Update rpi itself, configured extensions, or model catalogs.
     Update {
-        /// Explicitly update the managed pi installation (also the default with no target).
+        /// Explicitly update the managed rpi installation (also the default with no target).
         #[arg(long = "self", conflicts_with_all = ["package", "extension", "models", "all"])]
         self_update: bool,
         /// Update every configured extension; combine with --self to update both.
         #[arg(long, conflicts_with_all = ["extension", "models", "all"])]
         extensions: bool,
-        /// Update pi and every configured extension.
+        /// Update rpi and every configured extension.
         #[arg(long, conflicts_with_all = ["self_update", "extensions", "package", "extension", "models"])]
         all: bool,
         /// Refresh dynamic model catalogs.
@@ -285,7 +285,7 @@ pub enum Command {
         /// Reinstall the selected self-update even when version and checksum match.
         #[arg(long, conflicts_with_all = ["models", "extension"])]
         force: bool,
-        /// Update one configured extension by source identity; `self` and `pi` select pi itself.
+        /// Update one configured extension by source identity; `self` and `rpi` select rpi itself.
         #[arg(value_name = "PACKAGE", conflicts_with_all = ["all", "models", "extension"])]
         package: Option<String>,
     },
@@ -408,7 +408,7 @@ impl Cli {
         {
             let positional_self = package
                 .as_deref()
-                .is_some_and(|source| matches!(source, "self" | "pi"));
+                .is_some_and(|source| matches!(source, "self" | "rpi"));
             if package.is_some()
                 && !positional_self
                 && (*self_update || *extensions || *force)
@@ -421,7 +421,7 @@ impl Cli {
             let default_self = !*all && !*self_update && !*extensions && package.is_none();
             let includes_self = *all || *self_update || positional_self || default_self;
             if *force && !includes_self {
-                return Err("--force only applies to pi self-update targets".to_owned());
+                return Err("--force only applies to rpi self-update targets".to_owned());
             }
         }
         for (flag, names) in [
@@ -481,10 +481,10 @@ mod tests {
 
     #[test]
     fn positional_prompts_remain_interactive_without_print() {
-        let empty = Cli::try_parse_from(["pi", ""]).expect("parse empty positional");
+        let empty = Cli::try_parse_from(["rpi", ""]).expect("parse empty positional");
         assert!(empty.prompt_text().is_empty());
         assert!(!empty.is_print_mode());
-        let cli = Cli::try_parse_from(["pi", "hello", "world"]).expect("parse prompts");
+        let cli = Cli::try_parse_from(["rpi", "hello", "world"]).expect("parse prompts");
         assert_eq!(cli.prompt, ["hello", "world"]);
         assert_eq!(cli.prompt_text(), "hello world");
         assert!(!cli.is_print_mode());
@@ -492,16 +492,16 @@ mod tests {
 
     #[test]
     fn explicit_print_flag_forces_print_mode() {
-        let cli = Cli::try_parse_from(["pi", "-p"]).expect("parse -p");
+        let cli = Cli::try_parse_from(["rpi", "-p"]).expect("parse -p");
         assert!(cli.is_print_mode());
-        let cli = Cli::try_parse_from(["pi", "--print", ""]).expect("parse --print empty");
+        let cli = Cli::try_parse_from(["rpi", "--print", ""]).expect("parse --print empty");
         assert!(cli.is_print_mode());
     }
 
     #[test]
     fn parses_core_parity_flags_and_repeats() {
         let cli = Cli::try_parse_from([
-            "pi", "--provider", "openai", "--model", "gpt-5", "--models",
+            "rpi", "--provider", "openai", "--model", "gpt-5", "--models",
             "openai/*,*sonnet*:high", "--system-prompt", "system.txt",
             "--append-system-prompt", "one", "--append-system-prompt", "two",
             "--name", "named", "--session-id", "session_1", "--session-dir",
@@ -535,66 +535,66 @@ mod tests {
     #[test]
     fn parses_disable_aliases_session_paths_and_optional_model_search() {
         let cli = Cli::try_parse_from([
-            "pi", "-ne", "-ns", "-np", "--no-themes", "-nc", "-nbt",
+            "rpi", "-ne", "-ns", "-np", "--no-themes", "-nc", "-nbt",
             "--session", "sessions/a.jsonl",
         ]).expect("disable aliases");
         assert!(cli.no_extensions && cli.no_skills && cli.no_prompt_templates);
         assert!(cli.no_themes && cli.no_context_files && cli.no_builtin_tools);
         assert_eq!(cli.session.as_deref(), Some("sessions/a.jsonl"));
-        let all = Cli::try_parse_from(["pi", "--list-models"]).expect("list all");
+        let all = Cli::try_parse_from(["rpi", "--list-models"]).expect("list all");
         assert_eq!(all.list_models.as_deref(), Some(""));
-        let searched = Cli::try_parse_from(["pi", "--list-models", "sonnet"])
+        let searched = Cli::try_parse_from(["rpi", "--list-models", "sonnet"])
             .expect("list search");
         assert_eq!(searched.list_models.as_deref(), Some("sonnet"));
     }
 
     #[test]
     fn parses_unified_resume_and_rejects_removed_codex_flag() {
-        let unified = Cli::try_parse_from(["pi", "--resume", "grok-prefix"])
+        let unified = Cli::try_parse_from(["rpi", "--resume", "grok-prefix"])
             .expect("unified resume");
         assert_eq!(unified.resume.as_deref(), Some("grok-prefix"));
-        assert!(Cli::try_parse_from(["pi", "--resume-codex", "codex-id"]).is_err());
+        assert!(Cli::try_parse_from(["rpi", "--resume-codex", "codex-id"]).is_err());
     }
 
     #[test]
     fn rejects_conflicts_empty_values_and_unknown_flags() {
         for args in [
-            ["pi", "--session", "id", "--fork", "other"].as_slice(),
-            ["pi", "--no-session", "--continue"].as_slice(),
-            ["pi", "--no-tools", "--no-builtin-tools"].as_slice(),
-            ["pi", "--approve", "--no-approve"].as_slice(),
+            ["rpi", "--session", "id", "--fork", "other"].as_slice(),
+            ["rpi", "--no-session", "--continue"].as_slice(),
+            ["rpi", "--no-tools", "--no-builtin-tools"].as_slice(),
+            ["rpi", "--approve", "--no-approve"].as_slice(),
         ] {
             assert!(Cli::try_parse_from(args).is_err(), "accepted conflict: {args:?}");
         }
         for args in [
-            ["pi", "--name", ""].as_slice(),
-            ["pi", "--session-id", ""].as_slice(),
-            ["pi", "--models", "a,,b"].as_slice(),
-            ["pi", "--tools", "read,,bash"].as_slice(),
+            ["rpi", "--name", ""].as_slice(),
+            ["rpi", "--session-id", ""].as_slice(),
+            ["rpi", "--models", "a,,b"].as_slice(),
+            ["rpi", "--tools", "read,,bash"].as_slice(),
         ] {
             let cli = Cli::try_parse_from(args).expect("parse for validation");
             assert!(cli.validate().is_err(), "accepted empty value: {args:?}");
         }
-        assert!(Cli::try_parse_from(["pi", "--provider", "openai"]).is_err());
-        assert!(Cli::try_parse_from(["pi", "--unknown-extension-flag"]).is_err());
+        assert!(Cli::try_parse_from(["rpi", "--provider", "openai"]).is_err());
+        assert!(Cli::try_parse_from(["rpi", "--unknown-extension-flag"]).is_err());
     }
     #[test]
     fn parses_package_aliases_update_targets_and_global_trust_flags() {
-        let uninstall = Cli::try_parse_from(["pi", "uninstall", "package", "--approve"])
+        let uninstall = Cli::try_parse_from(["rpi", "uninstall", "package", "--approve"])
             .expect("uninstall alias and trailing trust flag");
         assert!(uninstall.approve);
         assert!(matches!(uninstall.command, Some(Command::Remove { ref source, .. }) if source == "package"));
 
-        let no_approve = Cli::try_parse_from(["pi", "config", "-na"])
+        let no_approve = Cli::try_parse_from(["rpi", "config", "-na"])
             .expect("no-approve alias after command");
         assert!(no_approve.no_approve);
 
         for args in [
-            ["pi", "update", "--all"].as_slice(),
-            ["pi", "update", "--models"].as_slice(),
-            ["pi", "update", "--extension", "package"].as_slice(),
-            ["pi", "update", "self"].as_slice(),
-            ["pi", "update", "pi", "--extensions"].as_slice(),
+            ["rpi", "update", "--all"].as_slice(),
+            ["rpi", "update", "--models"].as_slice(),
+            ["rpi", "update", "--extension", "package"].as_slice(),
+            ["rpi", "update", "self"].as_slice(),
+            ["rpi", "update", "rpi", "--extensions"].as_slice(),
         ] {
             let cli = Cli::try_parse_from(args).expect("parse update target");
             cli.validate().expect("validate update target");
@@ -604,12 +604,12 @@ mod tests {
 
     #[test]
     fn validates_update_target_combinations() {
-        let all = Cli::try_parse_from(["pi", "update", "--all", "--force"])
+        let all = Cli::try_parse_from(["rpi", "update", "--all", "--force"])
             .expect("parse all force");
         all.validate().expect("all includes self");
 
         let alias = Cli::try_parse_from([
-            "pi",
+            "rpi",
             "update",
             "self",
             "--extensions",
@@ -618,25 +618,25 @@ mod tests {
         .expect("parse self alias");
         alias.validate().expect("self alias includes self");
 
-        let extensions = Cli::try_parse_from(["pi", "update", "--extensions", "--force"])
+        let extensions = Cli::try_parse_from(["rpi", "update", "--extensions", "--force"])
             .expect("parse extensions force");
         assert!(extensions.validate().is_err());
 
-        let package = Cli::try_parse_from(["pi", "update", "git:example/repo", "--extensions"])
+        let package = Cli::try_parse_from(["rpi", "update", "git:example/repo", "--extensions"])
             .expect("parse package extensions");
         assert!(package.validate().is_err());
     }
     #[test]
     fn cwd_is_global_for_sessions_subcommand() {
         let before =
-            Cli::try_parse_from(["pi", "--cwd", "workspace-a", "sessions"]).expect("before");
+            Cli::try_parse_from(["rpi", "--cwd", "workspace-a", "sessions"]).expect("before");
         assert_eq!(
             before.cwd.as_deref(),
             Some(PathBuf::from("workspace-a").as_path())
         );
         assert!(matches!(before.command, Some(Command::Sessions)));
 
-        let after = Cli::try_parse_from(["pi", "sessions", "-C", "workspace-b"]).expect("after");
+        let after = Cli::try_parse_from(["rpi", "sessions", "-C", "workspace-b"]).expect("after");
         assert_eq!(
             after.cwd.as_deref(),
             Some(PathBuf::from("workspace-b").as_path())

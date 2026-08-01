@@ -10,13 +10,33 @@ use nix::pty::{openpty, Winsize};
 use nix::sys::termios::Termios;
 use tempfile::TempDir;
 
-fn pi_bin() -> String {
-    env!("CARGO_BIN_EXE_pi").to_owned()
+fn rpi_bin() -> String {
+    env!("CARGO_BIN_EXE_rpi").to_owned()
+}
+
+fn bun_available() -> bool {
+    Command::new("bun").arg("--version").output().is_ok()
+}
+
+fn require_bun_for_designated_test() {
+    if bun_available() {
+        return;
+    }
+    let required = matches!(
+        std::env::var("BUN_REQUIRED").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
+    );
+    if required {
+        panic!(
+            "BUN_REQUIRED is set but Bun was not found; install Bun on PATH or set PI_BUN_EXECUTABLE before running designated Bun extension tests"
+        );
+    }
 }
 
 #[test]
 fn pty_bun_extension_run_and_chain_commands() {
-    if Command::new("bun").arg("--version").output().is_err() {
+    require_bun_for_designated_test();
+    if !bun_available() {
         return;
     }
     let home = TempDir::new().unwrap();
@@ -59,7 +79,7 @@ export default function (pi: any) {
     .unwrap();
     let slave_in = pty.slave.try_clone().unwrap();
     let slave_out = pty.slave.try_clone().unwrap();
-    let mut child = Command::new(pi_bin())
+    let mut child = Command::new(rpi_bin())
         .env_clear()
         .env("HOME", home.path())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -133,6 +153,7 @@ export default function (pi: any) {
         output.lock().unwrap()
     );
 
+    let before_chain = output.lock().unwrap().clone();
     writer.write_all(b"/chain alpha one | beta two\r").unwrap();
     writer.flush().unwrap();
     assert!(
@@ -144,6 +165,20 @@ export default function (pi: any) {
         wait_for("beta:two", Duration::from_secs(10)),
         "chain beta missing: {}",
         output.lock().unwrap()
+    );
+    let after_chain = output.lock().unwrap().clone();
+    let chain_delta = after_chain
+        .strip_prefix(&before_chain)
+        .unwrap_or(&after_chain);
+    let alpha_at = chain_delta
+        .find("alpha:one")
+        .expect("alpha:one must appear in chain output");
+    let beta_at = chain_delta
+        .find("beta:two")
+        .expect("beta:two must appear in chain output");
+    assert!(
+        alpha_at < beta_at,
+        "/chain must execute steps in order; delta={chain_delta}"
     );
 
     let before_unknown = output.lock().unwrap().clone();

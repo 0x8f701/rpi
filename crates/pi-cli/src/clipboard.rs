@@ -23,6 +23,10 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct ClipboardImage {
     pub bytes: Vec<u8>,
     pub mime_type: String,
+    /// Decoded width after the guarded image pipeline (may be resized).
+    pub width: u32,
+    /// Decoded height after the guarded image pipeline (may be resized).
+    pub height: u32,
 }
 
 impl ClipboardImage {
@@ -31,6 +35,41 @@ impl ClipboardImage {
         pi_ai::ContentBlock::Image {
             data: base64::engine::general_purpose::STANDARD.encode(self.bytes),
             mime_type: self.mime_type,
+        }
+    }
+}
+
+/// Validate, bound, and process raw image bytes into a clipboard image.
+/// Used by platform readers and deterministic adapter fixtures.
+pub fn image_from_bytes(bytes: Vec<u8>, advertised_mime: &str) -> Result<ClipboardImage> {
+    let image = crate::image_pipeline::process_image(bytes, Some(advertised_mime))?;
+    Ok(ClipboardImage {
+        bytes: image.bytes,
+        mime_type: image.mime_type,
+        width: image.width,
+        height: image.height,
+    })
+}
+
+/// Prefer a successfully read image over text. Platform command failures are
+/// surfaced only when neither payload is available.
+pub fn prefer_image_then_text(
+    image: Result<Option<ClipboardImage>>,
+    text: Result<Option<String>>,
+) -> Result<Option<ClipboardContent>> {
+    let mut failures = Vec::new();
+    match image {
+        Ok(Some(image)) => return Ok(Some(ClipboardContent::Image(image))),
+        Ok(None) => {}
+        Err(error) => failures.push(error.to_string()),
+    }
+    match text {
+        Ok(Some(text)) => Ok(Some(ClipboardContent::Text(text))),
+        Ok(None) if failures.is_empty() => Ok(None),
+        Ok(None) => Err(anyhow!(failures.join("; "))),
+        Err(error) => {
+            failures.push(error.to_string());
+            Err(anyhow!(failures.join("; ")))
         }
     }
 }
@@ -50,21 +89,7 @@ struct CommandOutput {
 /// Read an image first and fall back to UTF-8 text. Platform command failures
 /// are returned to the UI instead of being allowed to unwind terminal state.
 pub async fn read() -> Result<Option<ClipboardContent>> {
-    let mut failures = Vec::new();
-    match read_image_platform().await {
-        Ok(Some(image)) => return Ok(Some(ClipboardContent::Image(image))),
-        Ok(None) => {}
-        Err(error) => failures.push(error.to_string()),
-    }
-    match read_text_platform().await {
-        Ok(Some(text)) => Ok(Some(ClipboardContent::Text(text))),
-        Ok(None) if failures.is_empty() => Ok(None),
-        Ok(None) => Err(anyhow!(failures.join("; "))),
-        Err(error) => {
-            failures.push(error.to_string());
-            Err(anyhow!(failures.join("; ")))
-        }
-    }
+    prefer_image_then_text(read_image_platform().await, read_text_platform().await)
 }
 
 pub async fn write_text(text: &str) -> Result<()> {
@@ -119,6 +144,8 @@ pub async fn write_image(image: &ClipboardImage) -> Result<()> {
     let processed_image = ClipboardImage {
         bytes: processed.bytes,
         mime_type: processed.mime_type,
+        width: processed.width,
+        height: processed.height,
     };
     let image = &processed_image;
     #[cfg(target_os = "windows")]
@@ -337,11 +364,7 @@ fn image_from_command(
     if output.status != Some(0) || output.stdout.is_empty() {
         return Ok(None);
     }
-    let image = crate::image_pipeline::process_image(output.stdout, Some(advertised_mime))?;
-    Ok(Some(ClipboardImage {
-        bytes: image.bytes,
-        mime_type: image.mime_type,
-    }))
+    Ok(Some(image_from_bytes(output.stdout, advertised_mime)?))
 }
 
 fn text_from_command(output: CommandOutput) -> Result<Option<String>> {
@@ -555,4 +578,96 @@ async fn run_command(
     tokio::time::timeout(COMMAND_TIMEOUT, future)
         .await
         .with_context(|| format!("`{program}` timed out"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::ImageBuffer;
+    use image::{DynamicImage, ImageFormat};
+    use std::io::Cursor;
+
+    fn tiny_png() -> Vec<u8> {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(2, 2, |x, y| {
+            image::Rgb([(x * 40) as u8, (y * 80) as u8, 120])
+        }));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("encode png");
+        bytes
+    }
+
+    #[test]
+    fn image_is_preferred_before_text() {
+        let image = image_from_bytes(tiny_png(), "image/png").expect("png");
+        let selected = prefer_image_then_text(
+            Ok(Some(image.clone())),
+            Ok(Some("should not win".to_owned())),
+        )
+        .expect("prefer image");
+        assert_eq!(selected, Some(ClipboardContent::Image(image)));
+    }
+
+    #[test]
+    fn text_is_used_when_no_image_is_available() {
+        let selected = prefer_image_then_text(Ok(None), Ok(Some("hello".to_owned())))
+            .expect("prefer text");
+        assert_eq!(selected, Some(ClipboardContent::Text("hello".to_owned())));
+    }
+
+    #[test]
+    fn image_read_failure_still_allows_text_fallback() {
+        let selected = prefer_image_then_text(
+            Err(anyhow!("pngpaste missing")),
+            Ok(Some("fallback text".to_owned())),
+        )
+        .expect("text fallback");
+        assert_eq!(
+            selected,
+            Some(ClipboardContent::Text("fallback text".to_owned()))
+        );
+    }
+
+    #[test]
+    fn malformed_image_bytes_are_actionable() {
+        let error = image_from_bytes(b"not-an-image".to_vec(), "image/png")
+            .expect_err("reject malformed");
+        let message = error.to_string();
+        assert!(
+            message.contains("not a supported image") || message.contains("could not"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn oversized_image_bytes_are_actionable() {
+        let mut bytes = tiny_png();
+        bytes.resize(MAX_IMAGE_BYTES + 1, 0);
+        let error = image_from_bytes(bytes, "image/png").expect_err("reject oversized");
+        assert!(
+            error.to_string().contains("exceeds the"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn processed_png_becomes_image_content_block_without_raw_bytes() {
+        let image = image_from_bytes(tiny_png(), "image/png").expect("png");
+        assert_eq!((image.width, image.height), (2, 2));
+        let raw_len = image.bytes.len();
+        let block = image.into_content_block();
+        let pi_ai::ContentBlock::Image { data, mime_type } = block else {
+            panic!("expected image content block");
+        };
+        assert_eq!(mime_type, "image/png");
+        assert!(!data.is_empty());
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&data)
+                .expect("base64")
+                .len(),
+            raw_len
+        );
+    }
 }

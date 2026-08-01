@@ -82,16 +82,16 @@ async fn builder_defaults_to_no_resource_discovery_and_injects_settings_tools_an
     )
     .await?;
 
-    assert_eq!(built.session.get_active_tool_names(), ["injected"]);
-    assert_eq!(built.session.recorder_info().map(|value| value.0), Some(recorder_id));
+    assert_eq!(built.session().get_active_tool_names(), ["injected"]);
+    assert_eq!(built.session().recorder_info().map(|value| value.0), Some(recorder_id));
     assert_eq!(built.application.session().cwd(), cwd.path());
     let state = built.application.state().await;
     assert_eq!(state.thinking_level, ThinkingLevel::Off);
-    assert_eq!(built.session.stream_options().stream.temperature, Some(0.25));
-    let prompt = built.session.system_prompt().await;
+    assert_eq!(built.session().stream_options().stream.temperature, Some(0.25));
+    let prompt = built.session().system_prompt().await;
     assert!(!prompt.contains("project-only-marker"));
     assert!(!prompt.contains("project-only-skill-marker"));
-    let selection = built.session.select_for_request("project-only-skill-marker").await;
+    let selection = built.session().select_for_request("project-only-skill-marker").await;
     assert!(selection.skills.is_empty());
     assert!(selection.autoload_skills.is_empty());
     Ok(())
@@ -109,7 +109,7 @@ async fn explicit_trusted_project_discovery_loads_project_context() -> Result<()
         .await?;
 
     assert!(built
-        .session
+        .session()
         .system_prompt()
         .await
         .contains("trusted-project-marker"));
@@ -166,7 +166,7 @@ async fn prepared_extension_runtime_is_attached_and_reports_its_load_outcome() -
         Some(runtime.generation())
     );
     assert_eq!(built.extensions_result, Some(report));
-    assert_eq!(built.application.session().cwd(), built.session.cwd());
+    assert_eq!(built.application.session().cwd(), built.session().cwd());
     Ok(())
 }
 
@@ -186,19 +186,19 @@ async fn resume_recorder_restores_active_branch_history_and_lineage() -> Result<
         .build()
         .await?;
 
-    assert_eq!(built.session.history(), [Message::user_text("first branch", 1)]);
-    assert_eq!(built.session.thinking_level(), ThinkingLevel::Low);
+    assert_eq!(built.session().history(), [Message::user_text("first branch", 1)]);
+    assert_eq!(built.session().thinking_level(), ThinkingLevel::Low);
     assert_eq!(
-        built.session.stream_options().stream.session_id.as_deref(),
-        built.session.recorder_info().as_ref().map(|(id, _)| id.as_str())
+        built.session().stream_options().stream.session_id.as_deref(),
+        built.session().recorder_info().as_ref().map(|(id, _)| id.as_str())
     );
-    assert_eq!(built.session.recorder_info(), Some((resumed_id, resumed_path)));
+    assert_eq!(built.session().recorder_info(), Some((resumed_id, resumed_path)));
     assert_eq!(
-        built.session.session_tree()?.active_leaf_id.as_deref(),
+        built.session().session_tree()?.active_leaf_id.as_deref(),
         Some(first_id.as_str())
     );
-    let continued_id = built.session.append_custom_entry("resume-check", None)?;
-    let continued_tree = built.session.session_tree()?;
+    let continued_id = built.session().append_custom_entry("resume-check", None)?;
+    let continued_tree = built.session().session_tree()?;
     assert_eq!(
         find_entry(&continued_tree.tree, &|entry| entry.id == continued_id)
             .and_then(|entry| entry.parent_id.as_deref()),
@@ -227,9 +227,9 @@ async fn resume_reports_saved_model_fallback_without_discovery() -> Result<()> {
         built.model_fallback_message.as_deref(),
         Some("Could not restore model missing-provider/missing-model. Using sdk-provider/sdk-model")
     );
-    assert_eq!(built.session.model(), Some(model()));
-    assert_eq!(built.session.history(), [Message::user_text("resume history", 1)]);
-    assert!(!built.session.system_prompt().await.contains("resume-project-marker"));
+    assert_eq!(built.session().model(), Some(model()));
+    assert_eq!(built.session().history(), [Message::user_text("resume history", 1)]);
+    assert!(!built.session().system_prompt().await.contains("resume-project-marker"));
     Ok(())
 }
 
@@ -256,10 +256,10 @@ async fn resume_restores_catalog_model_when_auth_resolves() -> Result<()> {
         .build()
         .await?;
 
-    assert_eq!(built.session.model(), Some(saved_model));
-    assert_eq!(built.session.current_api_key(), "restored-key");
+    assert_eq!(built.session().model(), Some(saved_model));
+    assert_eq!(built.session().current_api_key(), "restored-key");
     assert_eq!(built.model_fallback_message, None);
-    assert_eq!(built.session.thinking_level(), ThinkingLevel::Medium);
+    assert_eq!(built.session().thinking_level(), ThinkingLevel::Medium);
     Ok(())
 }
 
@@ -280,7 +280,7 @@ async fn model_override_suppresses_saved_model_restore_notification() -> Result<
         .build()
         .await?;
 
-    assert_eq!(built.session.model(), Some(explicit_model));
+    assert_eq!(built.session().model(), Some(explicit_model));
     assert_eq!(built.model_fallback_message, None);
     Ok(())
 }
@@ -309,8 +309,8 @@ async fn settings_supply_thinking_level_when_resume_has_no_recorded_level() -> R
         .build()
         .await?;
 
-    assert_eq!(built.session.thinking_level(), ThinkingLevel::High);
-    let tree = built.session.session_tree()?;
+    assert_eq!(built.session().thinking_level(), ThinkingLevel::High);
+    let tree = built.session().session_tree()?;
     let context = find_entry(&tree.tree, &|entry| {
         entry.entry_type == "thinking_level_change"
     });

@@ -603,25 +603,25 @@ mod tests {
 
     #[test]
     fn estimates_text_with_javascript_utf16_lengths() {
-        assert_eq!(estimate_message_tokens(&Message::user_text("你好", 1)), 1);
+        assert_eq!(estimate_message_tokens(&Message::user_text("αβ", 1)), 1);
         assert_eq!(estimate_message_tokens(&Message::user_text("😀😀😀", 1)), 2);
 
         let model = pi_ai::Model::default();
         let mut assistant = pi_ai::AssistantMessage::pending(&model);
         assistant.content = vec![
             ContentBlock::text("😀"),
-            ContentBlock::thinking("你好"),
+            ContentBlock::thinking("αβ"),
             ContentBlock::ToolCall(ToolCall {
                 id: "t".to_owned(),
-                name: "工具😀".to_owned(),
-                arguments: serde_json::json!({"值": "😀"}),
+                name: "αβ😀".to_owned(),
+                arguments: serde_json::json!({"é": "😀"}),
                 thought_signature: None,
             }),
         ];
         let expected_chars = utf16_len("😀")
-            + utf16_len("你好")
-            + utf16_len("工具😀")
-            + utf16_len(&serde_json::to_string(&serde_json::json!({"值": "😀"})).unwrap());
+            + utf16_len("αβ")
+            + utf16_len("αβ😀")
+            + utf16_len(&serde_json::to_string(&serde_json::json!({"é": "😀"})).unwrap());
         assert_eq!(estimate_message_tokens(&Message::Assistant(assistant)), (expected_chars + 3) / 4);
     }
 

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,6 +16,10 @@ use uuid::Uuid;
 
 use crate::resources::agent_dir;
 use crate::TodoState;
+use crate::import::{
+    OpenedSource, open_native_session_for_append_direct,
+    open_native_session_for_append_under_root,
+};
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;
 
@@ -447,6 +451,108 @@ struct RecorderState {
     session_name: Option<String>,
 }
 
+/// A fully parsed native session whose read/append descriptor is retained from
+/// secure open through recorder construction.
+#[derive(Debug)]
+pub struct PreparedSessionResume {
+    path: PathBuf,
+    tree: SessionTree,
+    file: File,
+    requires_separator: bool,
+}
+
+impl PreparedSessionResume {
+    /// Prepare an explicitly authorized native session path. The parent
+    /// directory is opened as a capability and the final component is not
+    /// followed.
+    pub fn prepare_path(path: impl AsRef<Path>) -> Result<Self> {
+        let opened = open_native_session_for_append_direct(path.as_ref())?;
+        Self::from_opened(opened)
+    }
+
+    /// Prepare a native session confined beneath a configured catalog root.
+    pub(crate) fn prepare_under_root(root: &Path, path: &Path) -> Result<Self> {
+        let opened = open_native_session_for_append_under_root(root, path)?;
+        Self::from_opened(opened)
+    }
+
+    fn from_opened(opened: OpenedSource) -> Result<Self> {
+        let path = opened.path().to_path_buf();
+        let mut file = opened.into_primary();
+        let tree = load_session_tree_from_file(
+            file.try_clone()
+                .with_context(|| format!("cloning retained session handle {}", path.display()))?,
+            &path,
+        )?;
+        let requires_separator = session_requires_separator(&mut file, &path)?;
+        Ok(Self {
+            path,
+            tree,
+            file,
+            requires_separator,
+        })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn tree(&self) -> &SessionTree {
+        &self.tree
+    }
+
+    #[must_use]
+    pub fn target_cwd(&self) -> &Path {
+        &self.tree.header.cwd
+    }
+
+    #[must_use]
+    pub fn build_context(&self) -> BranchContext {
+        self.tree.build_context(None)
+    }
+
+    /// Consume the prepared session and transfer its retained append handle to
+    /// a recorder. No pathname is reopened.
+    pub fn into_recorder(mut self) -> Result<SessionRecorder> {
+        if self.requires_separator {
+            self.file.write_all(b"\n").with_context(|| {
+                format!("separating final session record in {}", self.path.display())
+            })?;
+            self.file.flush().with_context(|| {
+                format!("flushing session separator in {}", self.path.display())
+            })?;
+        }
+        let session_name = self.tree.session_name();
+        let used_ids = self
+            .tree
+            .entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        let active_leaf_id = self.tree.leaf_id.clone();
+        Ok(SessionRecorder {
+            inner: Arc::new(Mutex::new(RecorderState {
+                path: self.path,
+                id: self.tree.header.id,
+                timestamp: self.tree.header.timestamp,
+                cwd: self.tree.header.cwd,
+                parent_session: self.tree.header.parent_session,
+                last_id: self.tree.leaf_id,
+                active_leaf_id,
+                revision: 0,
+                used_ids,
+                pending: Vec::new(),
+                file: Some(self.file),
+                flushed: true,
+                has_assistant: true,
+                session_name,
+            })),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRecorder {
     inner: Arc<Mutex<RecorderState>>,
@@ -731,6 +837,7 @@ impl SessionRecorder {
 
     pub fn close(&self) -> Result<()> {
         let mut state = self.inner.lock();
+        persist_durable(&mut state)?;
         if let Some(file) = state.file.as_mut() {
             file.flush().context("flushing session file")?;
             file.sync_all().context("syncing session file")?;
@@ -745,6 +852,13 @@ pub fn default_session_dir(cwd: impl AsRef<Path>) -> PathBuf {
     PathBuf::from(agent_dir())
         .join("sessions")
         .join(format!("--{}--", encode_cwd_safe_path(&cwd)))
+}
+
+fn new_session_path(directory: &Path, timestamp: &str, id: &str, has_explicit_id: bool) -> PathBuf {
+    if has_explicit_id {
+        return directory.join(format!("{id}.jsonl"));
+    }
+    directory.join(format!("{}_{}.jsonl", timestamp.replace([':', '.'], "-"), id))
 }
 
 pub fn start_session(
@@ -776,6 +890,7 @@ pub fn start_session_in(
     let directory = session_dir.map_or_else(|| default_session_dir(&cwd), absolute_path);
     fs::create_dir_all(&directory)
         .with_context(|| format!("creating session directory {}", directory.display()))?;
+    let has_explicit_id = session_id.is_some();
     let id = match session_id {
         Some(id) => { validate_session_id(id)?; id.to_owned() }
         None => Uuid::now_v7().to_string(),
@@ -784,18 +899,21 @@ pub fn start_session_in(
         bail!("Session already exists with id '{id}'");
     }
     let timestamp = iso_now();
-    let filename = format!("{}_{}.jsonl", timestamp.replace([':', '.'], "-"), id);
+    let path = new_session_path(&directory, &timestamp, &id, has_explicit_id);
     let parent_session = parent_session.map(|path| path.to_string_lossy().into_owned());
     let header = json!({
         "type": "session", "version": CURRENT_SESSION_VERSION, "id": id,
         "timestamp": timestamp, "cwd": cwd, "parentSession": parent_session,
     });
     let recorder = SessionRecorder { inner: Arc::new(Mutex::new(RecorderState {
-        path: directory.join(filename), id, timestamp, cwd, parent_session,
+        path, id, timestamp, cwd, parent_session,
         last_id: None, active_leaf_id: None, revision: 0, used_ids: HashSet::new(),
         pending: vec![header], file: None, flushed: false,
         has_assistant: false, session_name: None,
     })) };
+    if has_explicit_id {
+        recorder.persist_now().context("reserving explicit session id")?;
+    }
     if let Some(model) = model { recorder.record_model_change(&model.provider, &model.id)?; }
     if let Some(level) = thinking_level.filter(|level| !level.is_empty()) {
         recorder.record_thinking_level(level)?;
@@ -883,6 +1001,7 @@ pub fn fork_session_in(
     let directory = session_dir.map_or_else(|| default_session_dir(&target_cwd), absolute_path);
     fs::create_dir_all(&directory)
         .with_context(|| format!("creating session directory {}", directory.display()))?;
+    let has_explicit_id = session_id.is_some();
     let id = match session_id {
         Some(id) => { validate_session_id(id)?; id.to_owned() }
         None => Uuid::now_v7().to_string(),
@@ -892,7 +1011,7 @@ pub fn fork_session_in(
     }
     let branch = tree.branch(tree.leaf_id.as_deref());
     let timestamp = iso_now();
-    let path = directory.join(format!("{}_{}.jsonl", timestamp.replace([':', '.'], "-"), id));
+    let path = new_session_path(&directory, &timestamp, &id, has_explicit_id);
     let parent_session = Some(source_path.to_string_lossy().into_owned());
     let mut pending = vec![json!({
         "type": "session", "version": CURRENT_SESSION_VERSION, "id": id,
@@ -910,64 +1029,27 @@ pub fn fork_session_in(
         last_id: leaf_id.clone(), active_leaf_id: leaf_id, revision: 0, used_ids, pending,
         file: None, flushed: false, has_assistant, session_name,
     })) };
-    if has_assistant { persist(&mut recorder.inner.lock())?; }
+    if has_explicit_id {
+        recorder.persist_now().context("reserving explicit fork session id")?;
+    } else if has_assistant {
+        persist(&mut recorder.inner.lock())?;
+    }
     Ok(recorder)
 }
 
 pub fn resume_session(path: impl AsRef<Path>) -> Result<SessionRecorder> {
-    let path = path.as_ref().to_path_buf();
-    let tree = load_session_tree(&path)?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("opening session {} for append", path.display()))?;
-    let requires_separator = file
-        .metadata()
-        .with_context(|| format!("reading session metadata {}", path.display()))?
-        .len()
-        > 0
-        && {
-            use std::io::{Read, Seek, SeekFrom};
-            file.seek(SeekFrom::End(-1))
-                .with_context(|| format!("seeking final session byte {}", path.display()))?;
-            let mut last_byte = [0_u8; 1];
-            file.read_exact(&mut last_byte)
-                .with_context(|| format!("reading final session byte {}", path.display()))?;
-            last_byte[0] != b'\n'
-        };
-    if requires_separator {
-        file.write_all(b"\n")
-            .with_context(|| format!("separating final session record in {}", path.display()))?;
-        file.flush()
-            .with_context(|| format!("flushing session separator in {}", path.display()))?;
-    }
-    let session_name = tree.session_name();
-    let used_ids = tree.entries.iter().map(|entry| entry.id.clone()).collect();
-    let active_leaf_id = tree.leaf_id.clone();
-    Ok(SessionRecorder {
-        inner: Arc::new(Mutex::new(RecorderState {
-            path,
-            id: tree.header.id,
-            timestamp: tree.header.timestamp,
-            cwd: tree.header.cwd,
-            parent_session: tree.header.parent_session,
-            last_id: tree.leaf_id,
-            active_leaf_id,
-            revision: 0,
-            used_ids,
-            pending: Vec::new(),
-            file: Some(file),
-            flushed: true,
-            has_assistant: true,
-            session_name,
-        })),
-    })
+    PreparedSessionResume::prepare_path(path)?.into_recorder()
 }
 
 pub fn load_session_tree(path: impl AsRef<Path>) -> Result<SessionTree> {
     let path = path.as_ref();
     let file = File::open(path).with_context(|| format!("opening session {}", path.display()))?;
+    load_session_tree_from_file(file, path)
+}
+
+fn load_session_tree_from_file(mut file: File, path: &Path) -> Result<SessionTree> {
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seeking session {} for parse", path.display()))?;
     let file_size = file
         .metadata()
         .with_context(|| format!("reading session metadata {}", path.display()))?
@@ -1024,6 +1106,23 @@ pub fn load_session_tree(path: impl AsRef<Path>) -> Result<SessionTree> {
     session_tree_from_values(path, &values)
 }
 
+fn session_requires_separator(file: &mut File, path: &Path) -> Result<bool> {
+    if file
+        .metadata()
+        .with_context(|| format!("reading session metadata {}", path.display()))?
+        .len()
+        == 0
+    {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))
+        .with_context(|| format!("seeking final session byte {}", path.display()))?;
+    let mut last_byte = [0_u8; 1];
+    file.read_exact(&mut last_byte)
+        .with_context(|| format!("reading final session byte {}", path.display()))?;
+    Ok(last_byte[0] != b'\n')
+}
+
 fn read_bounded_session_line<R: BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,
@@ -1071,6 +1170,13 @@ fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
 }
 
 fn session_tree_from_values(path: &Path, values: &[Value]) -> Result<SessionTree> {
+    if values.len() > MAX_SESSION_RECORDS {
+        bail!(
+            "session {} exceeds the 100000 record safety limit at record {}",
+            path.display(),
+            MAX_SESSION_RECORDS + 1
+        );
+    }
     let header_value = values
         .first()
         .and_then(Value::as_object)
@@ -1119,12 +1225,12 @@ fn session_tree_from_values(path: &Path, values: &[Value]) -> Result<SessionTree
                     .collect()
             })
             .unwrap_or_default();
-        let decoded_messages = usize::from(message.is_some())
-            .saturating_add(retained_tail.len())
-            .saturating_add(usize::from(matches!(
-                entry_type.as_str(),
-                "custom_message" | "branch_summary" | "compaction"
-            )));
+        let decoded_messages = reconstructed_message_count(
+            &entry_type,
+            message.as_ref(),
+            object,
+            &retained_tail,
+        );
         reconstructed_messages = reconstructed_messages
             .checked_add(decoded_messages)
             .ok_or_else(|| anyhow!("session {} reconstructed message count overflow", path.display()))?;
@@ -1186,6 +1292,29 @@ fn session_tree_from_values(path: &Path, values: &[Value]) -> Result<SessionTree
         labels,
     })
 }
+fn reconstructed_message_count(
+    entry_type: &str,
+    message: Option<&Message>,
+    object: &Map<String, Value>,
+    retained_tail: &[Message],
+) -> usize {
+    match entry_type {
+        "message" => usize::from(message.is_some()),
+        "custom_message" => usize::from(
+            nonempty_string(object, "customType").is_some()
+                && object
+                    .get("content")
+                    .cloned()
+                    .and_then(|content| serde_json::from_value::<CustomMessageContent>(content).ok())
+                    .is_some(),
+        ),
+        "branch_summary" => usize::from(nonempty_string(object, "summary").is_some()),
+        "compaction" => usize::from(nonempty_string(object, "summary").is_some())
+            .saturating_add(retained_tail.len()),
+        _ => 0,
+    }
+}
+
 
 fn build_tree_indexes(
     entries: &[SessionEntry],
@@ -1349,7 +1478,14 @@ fn append_token_from_state(state: &RecorderState) -> SessionAppendToken {
 
 fn session_tree_from_state(state: &RecorderState) -> Result<SessionTree> {
     let mut tree = if state.flushed {
-        let persisted = load_session_tree(&state.path)?;
+        let persisted = if let Some(file) = state.file.as_ref() {
+            load_session_tree_from_file(
+                file.try_clone().context("cloning attached session handle for tree load")?,
+                &state.path,
+            )?
+        } else {
+            load_session_tree(&state.path)?
+        };
         if state.pending.is_empty() {
             persisted
         } else {
@@ -1485,6 +1621,7 @@ fn persist(state: &mut RecorderState) -> Result<()> {
     if !state.flushed {
         let mut file = OpenOptions::new()
             .write(true)
+            .read(true)
             .append(true)
             .create_new(true)
             .open(&state.path)
@@ -1760,6 +1897,121 @@ mod tests {
             "cwd": cwd,
         }))
         .expect("serialize session header")
+    }
+
+    fn native_session_body(cwd: &Path, id: &str, message: &str) -> String {
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&json!({
+                "type": "session",
+                "version": CURRENT_SESSION_VERSION,
+                "id": id,
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "cwd": cwd,
+            }))
+            .expect("serialize header"),
+            serde_json::to_string(&json!({
+                "type": "message",
+                "id": "first",
+                "parentId": null,
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "message": Message::user_text(message, 0),
+            }))
+            .expect("serialize message")
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prepared_resume_rejects_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("directory");
+        let target = directory.path().join("target.jsonl");
+        let link = directory.path().join("link.jsonl");
+        fs::write(&target, native_session_body(directory.path(), "target", "target"))
+            .expect("write target");
+        symlink(&target, &link).expect("create symlink");
+
+        let error = PreparedSessionResume::prepare_path(&link)
+            .expect_err("final symlink must be rejected");
+        assert!(format!("{error:#}").contains("no-follow"));
+    }
+
+    #[test]
+    fn prepared_resume_rejects_malformed_and_oversized_inputs_without_mutation() {
+        let directory = tempfile::tempdir().expect("directory");
+        let malformed = directory.path().join("malformed.jsonl");
+        let malformed_body = format!("{}\n{{not-json}}\n", session_header_line(directory.path()));
+        fs::write(&malformed, &malformed_body).expect("write malformed");
+        let error = PreparedSessionResume::prepare_path(&malformed)
+            .expect_err("malformed session must fail");
+        assert!(format!("{error:#}").contains("line 2"));
+        assert_eq!(fs::read_to_string(&malformed).expect("read malformed"), malformed_body);
+
+        let oversized = directory.path().join("oversized.jsonl");
+        let file = File::create(&oversized).expect("create oversized");
+        file.set_len(MAX_SESSION_FILE_BYTES + 1).expect("extend oversized");
+        let error = PreparedSessionResume::prepare_path(&oversized)
+            .expect_err("oversized session must fail");
+        assert!(format!("{error:#}").contains("64 MiB file safety limit"));
+        assert_eq!(fs::metadata(&oversized).expect("oversized metadata").len(), MAX_SESSION_FILE_BYTES + 1);
+    }
+
+    #[test]
+    fn prepared_resume_retains_inode_across_path_replacement_for_tree_append_and_close() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("session.jsonl");
+        let held = directory.path().join("held.jsonl");
+        let replacement_body = native_session_body(directory.path(), "replacement", "replacement");
+        fs::write(&path, native_session_body(directory.path(), "held", "held"))
+            .expect("write held session");
+
+        let prepared = PreparedSessionResume::prepare_path(&path).expect("prepare held session");
+        assert_eq!(prepared.target_cwd(), directory.path());
+        assert_eq!(message_texts(&prepared.build_context()), vec!["held"]);
+        fs::rename(&path, &held).expect("retain opened inode under another name");
+        fs::write(&path, &replacement_body).expect("write replacement path");
+
+        let recorder = prepared.into_recorder().expect("build retained recorder");
+        assert_eq!(recorder.tree().expect("tree from retained handle").header.id, "held");
+        let (tree, _) = recorder
+            .tree_with_append_token()
+            .expect("tree and token from retained handle");
+        assert_eq!(tree.header.id, "held");
+        recorder
+            .record_message(&Message::user_text("appended", 0))
+            .expect("append retained inode");
+        recorder.close().expect("close retained inode");
+
+        assert_eq!(
+            message_texts(&load_session_tree(&held).expect("load held inode").build_context(None)),
+            vec!["held", "appended"]
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read replacement"), replacement_body);
+    }
+
+    #[test]
+    fn persisted_recorder_retains_readable_handle_for_runtime_hydration() {
+        let directory = tempfile::tempdir().expect("directory");
+        let recorder = start_session_in(
+            directory.path(),
+            None,
+            None,
+            Some(directory.path()),
+            None,
+            None,
+        )
+        .expect("start session");
+        recorder
+            .record_message(&Message::user_text("hydrate", 0))
+            .expect("record message");
+        recorder.persist_now().expect("persist session");
+
+        let (tree, _) = recorder
+            .tree_with_append_token()
+            .expect("read persisted recorder through retained handle");
+        assert_eq!(message_texts(&tree.build_context(None)), vec!["hydrate"]);
     }
 
     #[test]
@@ -2547,8 +2799,23 @@ mod tests {
             phases: vec![crate::TodoPhase {
                 name: "Build".to_owned(),
                 tasks: vec![crate::TodoItem {
+                    id: "task-compile".to_owned(),
                     content: "compile".to_owned(),
                     status: crate::TodoStatus::InProgress,
+                    depends_on: Vec::new(),
+                    ready: true,
+                    blocked_by: Vec::new(),
+                }, crate::TodoItem {
+                    id: "task-test".to_owned(),
+                    content: "test".to_owned(),
+                    status: crate::TodoStatus::Pending,
+                    depends_on: vec!["task-compile".to_owned()],
+                    ready: false,
+                    blocked_by: vec![crate::TodoBlockedReason {
+                        task_id: "task-compile".to_owned(),
+                        content: "compile".to_owned(),
+                        status: crate::TodoStatus::InProgress,
+                    }],
                 }],
             }],
             storage: crate::TodoStorage::Session,
@@ -2580,6 +2847,25 @@ mod tests {
             load_session_tree(&path).expect("reload").latest_todo_state(),
             Some(crate::TodoState { phases: Vec::new(), storage: crate::TodoStorage::Session })
         );
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn legacy_todo_snapshot_migrates_stable_ids_on_reload() {
+        let directory = std::env::temp_dir().join(format!("pi-session-todo-legacy-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let path = directory.join("session.jsonl");
+        let lines = [
+            json!({"type":"session", "version":CURRENT_SESSION_VERSION, "id":"legacy-todo", "timestamp":"2026-01-01T00:00:00.000Z", "cwd":directory}),
+            json!({"type":"message", "id":"a", "parentId":null, "timestamp":"2026-01-01T00:00:01.000Z", "message":Message::user_text("root", 0)}),
+            json!({"type":"todo_snapshot", "id":"todo-a", "parentId":"a", "timestamp":"2026-01-01T00:00:02.000Z", "state":{"phases":[{"name":"Build","tasks":[{"content":"compile","status":"in_progress"},{"content":"test","status":"pending"}]}],"storage":"session"}}),
+        ];
+        fs::write(&path, lines.iter().map(|line| serde_json::to_string(line).expect("serialize record")).collect::<Vec<_>>().join("\n")).expect("write legacy session");
+        let first = load_session_tree(&path).expect("first load").latest_todo_state().expect("todo state");
+        let second = load_session_tree(&path).expect("second load").latest_todo_state().expect("todo state");
+        assert_eq!(first.phases[0].tasks[0].id, second.phases[0].tasks[0].id);
+        assert_eq!(first.phases[0].tasks[1].id, second.phases[0].tasks[1].id);
+        assert!(first.phases[0].tasks.iter().all(|task| task.id.starts_with("task-") && task.ready));
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
