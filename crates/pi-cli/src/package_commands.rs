@@ -75,8 +75,8 @@ pub fn list_packages(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reconcile every configured package. npm entries produce the backend's clear
-/// deferred error and are never written to package state.
+/// Reconcile every configured package. Any configured `npm:` entry fails the
+/// whole update with the backend's deferred error and never mutates state.
 pub fn update_packages(cwd: &Path) -> Result<()> {
     let operations = package_manager(cwd)?.update_all()?;
     if operations.is_empty() {

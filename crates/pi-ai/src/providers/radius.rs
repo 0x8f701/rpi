@@ -160,6 +160,17 @@ impl RadiusCatalog {
         };
         self.restore_snapshot(snapshot).map(Some)
     }
+    pub fn restore_stored_snapshot_quarantining_invalid(
+        &self,
+    ) -> Result<Option<RadiusCatalogSnapshot>> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let Some(snapshot) = store.read_quarantining_invalid(&self.provider_id)? else {
+            return Ok(None);
+        };
+        self.restore_snapshot(snapshot).map(Some)
+    }
     pub fn snapshot(&self) -> RadiusCatalogSnapshot {
         self.state
             .lock()

@@ -12,7 +12,10 @@ use tokio::io::AsyncBufReadExt;
 
 use pi_coding::{Application, ApplicationEvent, Session, TrustDecision};
 
-use crate::commands::{import_codex_for_resume, list_models, list_sessions, resolve_model_spec};
+use crate::commands::{list_models, list_sessions, resolve_model_spec};
+use crate::resume_catalog::{
+    ResumeCatalogRequest, ResumeSelectionRequest, load_resume_catalog, switch_resume_selection,
+};
 use crate::output::{error_line, parse_thinking_level, thinking_level_str};
 
 /// Run the interactive REPL over an already-built [`Application`].
@@ -83,6 +86,19 @@ fn print_header(session: &Session) {
     }
 }
 
+async fn resume_application(application: &Application, input: &str) -> Result<PathBuf> {
+    let catalog = pi_coding::SessionCatalog::from_env().map_err(anyhow::Error::new)?;
+    let cwd = application.session().cwd().to_path_buf();
+    let result = switch_resume_selection(
+        application,
+        &catalog,
+        &ResumeSelectionRequest::Input(input.to_owned()),
+        Some(&cwd),
+    )
+    .await?;
+    Ok(result.path)
+}
+
 /// Dispatch a slash command (without the leading `/`). Returns `true` to quit.
 async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
     let session = application.session();
@@ -108,12 +124,22 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
                 error_line(&diagnostic);
             }
         }
-        "settings" => {
-            let state = application.state().await;
-            println!("model: {}", state.model.as_ref().map(|model| format!("{}/{}", model.provider, model.id)).unwrap_or_else(|| "none".to_owned()));
-            println!("thinking: {}", thinking_level_str(state.thinking_level));
-            println!("automatic compaction: {}", if state.auto_compaction_enabled { "enabled" } else { "disabled" });
-        }
+        "settings" => match crate::interactive_commands::parse_interactive_settings_command(
+            cmd,
+            (!arg.is_empty()).then_some(arg),
+        ) {
+            Ok(Some(command)) => match crate::interactive_commands::execute_interactive_settings_command(
+                application,
+                command,
+            )
+            .await
+            {
+                Ok(output) => println!("{output}"),
+                Err(error) => error_line(&format!("settings command failed: {error:#}")),
+            },
+            Ok(None) => unreachable!("settings command name was matched"),
+            Err(error) => error_line(&format!("{error:#}")),
+        },
         "scoped-models" => error_line("/scoped-models requires the full-screen TUI; use --models for line-oriented sessions"),
         "changelog" => println!("{}", include_str!("../../../CHANGELOG.md")),
         "hotkeys" => println!("Enter submit · Ctrl-D quit · Ctrl-C abort · !command record bash · !!command exclude bash from context"),
@@ -149,7 +175,14 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
             Ok((model, _)) => {
                 let reference = format!("{}/{}", model.provider, model.id);
                 match application.set_model_with_resolved_auth(model).await {
-                    Ok(()) => println!("switched to {reference}"),
+                    Ok(change) => {
+                        if change.clamped {
+                            println!("switched to {reference}");
+                            println!("{}", change.message);
+                        } else {
+                            println!("switched to {reference}");
+                        }
+                    }
                     Err(error) => error_line(&format!("{error:#}")),
                 }
             }
@@ -157,8 +190,8 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
         },
         "think" | "thinking" => {
             let level = parse_thinking_level(arg);
-            application.set_thinking_level(level);
-            println!("thinking level: {}", thinking_level_str(level));
+            let change = application.set_thinking_level(level);
+            println!("{}", change.message);
         },
         "new" => {
             application.new_session().await?;
@@ -186,18 +219,44 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
             );
         }
         "sessions" => list_sessions(session.cwd())?,
-        "resume" if arg.is_empty() => list_sessions(session.cwd())?,
+        "resume" if arg.is_empty() => match pi_coding::SessionCatalog::from_env() {
+            Ok(catalog) => match load_resume_catalog(
+                &catalog,
+                &ResumeCatalogRequest {
+                    cwd_scope: Some(session.cwd().to_path_buf()),
+                    ..ResumeCatalogRequest::default()
+                },
+            ) {
+                Ok(result) if result.rows.is_empty() => println!("No sessions for this directory."),
+                Ok(result) => {
+                    for row in result.rows {
+                        let imported = if matches!(
+                            row.status,
+                            pi_coding::CatalogRowStatus::AlreadyImported { .. }
+                        ) {
+                            " imported"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "[{:<10}] {}  {}  {}{}  {}",
+                            row.source_badge,
+                            row.display_time,
+                            row.session_id,
+                            row.summary,
+                            imported,
+                            row.cwd.display()
+                        );
+                    }
+                }
+                Err(error) => error_line(&format!("failed to list resumable sessions: {error}")),
+            },
+            Err(error) => error_line(&format!("failed to open session catalog: {error}")),
+        },
         "resume" => {
-            application.switch_session(Path::new(arg)).await?;
-            println!("resumed {arg}");
-        }
-        "resume-codex" => {
-            if arg.is_empty() {
-                error_line("usage: /resume-codex <path|id>");
-            } else {
-                let path = import_codex_for_resume(arg)?;
-                application.switch_session(&path).await?;
-                println!("resumed {}", path.display());
+            match resume_application(application, arg).await {
+                Ok(path) => println!("resumed {}", path.display()),
+                Err(error) => error_line(&format!("{error:#}")),
             }
         }
         "import" => {
@@ -241,50 +300,33 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
             "{}",
             serde_json::to_string_pretty(&application.session_tree()?)?
         ),
-        "loop" => {
-            let parsed = pi_coding::parse_loop_args(arg);
-            let Some(interval) = parsed.interval else {
-                error_line(pi_coding::loop_usage_message());
-                return Ok(false);
-            };
-            let task = application
-                .loop_create(pi_coding::LoopCreateRequest::immediate(
-                    interval,
-                    parsed.prompt,
-                ))
-                .await?;
-            println!(
-                "scheduled {} · {} · expires {}",
-                task.id,
-                task.human_schedule(),
-                task.expires_at.to_rfc3339()
-            );
-        }
-        "loops" => {
-            let tasks = application.loop_list().await?;
-            if tasks.is_empty() {
-                println!("no active loops");
-            } else {
-                for task in tasks {
-                    println!(
-                        "{}  {}  next {}  {}",
-                        task.id,
-                        task.human_schedule(),
-                        task.next_fire_at().to_rfc3339(),
-                        task.prompt
-                    );
+        "loop" | "loops" | "loop-update" | "loop-delete" | "loop-cancel" => {
+            match crate::loop_commands::parse_interactive_loop_command(
+                cmd,
+                (!arg.is_empty()).then_some(arg),
+            ) {
+                Ok(Some(command)) => {
+                    match crate::loop_commands::execute_interactive_loop_command(
+                        application,
+                        command,
+                    )
+                    .await
+                    {
+                        Ok(output) => println!("{output}"),
+                        Err(error) => error_line(&format!("{error:#}")),
+                    }
                 }
+                Ok(None) => unreachable!("loop command name was matched"),
+                Err(error) => error_line(&format!("{error:#}")),
             }
         }
-        "loop-cancel" => {
-            if arg.is_empty() {
-                error_line("usage: /loop-cancel <id>");
-            } else if application.loop_cancel(arg).await? {
-                println!("cancelled loop {arg}");
-            } else {
-                error_line(&format!("no active loop with id {arg}"));
-            }
-        }
+        "goal" => match crate::goal_commands::parse_interactive_goal_command((!arg.is_empty()).then_some(arg)) {
+            Ok(command) => match crate::goal_commands::execute_interactive_goal_command(application, command) {
+                Ok(output) => println!("{output}"),
+                Err(error) => error_line(&format!("{error:#}")),
+            },
+            Err(error) => error_line(&format!("{error:#}")),
+        },
         "todo" => {
             if arg.is_empty() {
                 let markdown = pi_coding::todo_phases_to_markdown(&application.todo_state().phases);
@@ -351,6 +393,40 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
         "copy" => println!("{}", application.last_assistant_text().unwrap_or_default()),
         "llama" => match crate::llama_commands::run_slash(arg).await {
             Ok(message) => println!("{message}"),
+            Err(error) => error_line(&format!("{error:#}")),
+        },
+        "run" => match crate::interactive_commands::parse_run_invocation(arg) {
+            Ok((command, arguments)) => {
+                match crate::interactive_commands::invoke_extension_command(
+                    application,
+                    command,
+                    arguments.to_owned(),
+                )
+                .await
+                {
+                    Ok(value) if !value.is_null() => println!("{value}"),
+                    Ok(_) => println!("ran /{command}"),
+                    Err(error) => error_line(&format!("/run {command} failed: {error:#}")),
+                }
+            }
+            Err(error) => error_line(&format!("{error:#}")),
+        },
+        "chain" | "run-chain" => match crate::interactive_commands::parse_chain_invocation(arg) {
+            Ok(steps) => {
+                match crate::interactive_commands::invoke_extension_chain(application, &steps).await
+                {
+                    Ok(outputs) => {
+                        for (name, value) in outputs {
+                            if value.is_null() {
+                                println!("/{name}: ok");
+                            } else {
+                                println!("/{name}: {value}");
+                            }
+                        }
+                    }
+                    Err(error) => error_line(&format!("/{cmd} failed: {error:#}")),
+                }
+            }
             Err(error) => error_line(&format!("{error:#}")),
         },
         "ps" | "process" => match crate::process_commands::parse_interactive_process_command(cmd, (!arg.is_empty()).then_some(arg)) {

@@ -186,6 +186,17 @@ impl ResourceManager {
     #[must_use] pub fn settings_manager(&self) -> SettingsManager { self.inner.settings.read().clone() }
     #[must_use] pub fn trust_store(&self) -> TrustStore { self.inner.trust_store.clone() }
 
+    #[must_use]
+    pub fn options(&self) -> ResourceManagerOptions {
+        self.inner.options.clone()
+    }
+
+    pub fn rebuild_for_cwd(&self, cwd: impl Into<PathBuf>) -> Result<Self> {
+        let mut options = self.options();
+        options.cwd = cwd.into();
+        Self::new(options)
+    }
+
     /// Converts the active snapshot's explicit process extension manifests into
     /// launch specifications. Untrusted project resources, malformed manifests,
     /// and capabilities outside the host policy fail closed before process launch.
@@ -326,7 +337,7 @@ fn build_candidate(
     } else {
         load_skills_trusted(&cwd_text, project_trusted)
     };
-    let diagnostics = skill_diagnostics
+    let mut diagnostics = skill_diagnostics
         .into_iter()
         .map(|diagnostic| ResourceDiagnostic {
             level: if diagnostic.kind == "error" {
@@ -338,6 +349,21 @@ fn build_candidate(
             path: Some(PathBuf::from(diagnostic.path)),
         })
         .collect::<Vec<_>>();
+    let available_models = crate::available_models();
+    let parent_model = pi_ai::Model::default();
+    diagnostics.extend(agents.iter().filter_map(|agent| {
+        crate::agent_compatibility_error(
+            agent,
+            settings.agents.get(&agent.name),
+            &parent_model,
+            &available_models,
+        )
+        .map(|error| ResourceDiagnostic {
+            level: ResourceDiagnosticLevel::Warning,
+            message: error.to_string(),
+            path: agent.path.clone(),
+        })
+    }));
 
     let configured_skill_paths = settings
         .skills

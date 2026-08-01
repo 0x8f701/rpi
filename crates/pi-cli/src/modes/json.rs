@@ -20,8 +20,11 @@ pub async fn run(cli: &Cli) -> Result<()> {
         if prompt.is_empty() {
             continue;
         }
-        let cwd = application.session().cwd().to_path_buf();
-        let expanded = crate::file_args::expand_prompt(prompt, &cwd)?;
+        let session = application.session();
+        let expanded = crate::file_args::expand_prompt_in_workspace(
+            prompt,
+            session.workspace_roots(),
+        )?;
         application
             .prompt(expanded.prompt, expanded.images, None)
             .await?;

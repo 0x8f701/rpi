@@ -67,6 +67,39 @@ async fn dropping_application_kills_owned_process() {
 }
 
 #[tokio::test]
+async fn cleanup_is_idempotent_and_kills_owned_process() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let pid_file = cwd.path().join("cleanup.pid");
+    let (session, registration) = session(cwd.path());
+    let application = Application::new(session).await;
+    application
+        .process_spawn(spec(
+            cwd.path(),
+            &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+        ))
+        .await
+        .expect("spawn");
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            break text.trim().parse::<i32>().expect("pid");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    application.cleanup().await;
+    application.cleanup().await;
+
+    for _ in 0..100 {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            registration.unregister();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("application-owned process survived repeated cleanup");
+}
+
+#[tokio::test]
 async fn new_session_stops_owned_process() {
     let cwd = tempfile::tempdir().expect("tempdir");
     let pid_file = cwd.path().join("session-change.pid");

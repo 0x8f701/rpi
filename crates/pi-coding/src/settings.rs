@@ -1,10 +1,10 @@
 //! Two-phase global/project settings loading with atomic scoped persistence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::RwLock;
@@ -153,6 +153,8 @@ pub struct OrchestrationSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glob: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_recursion_depth: Option<usize>,
@@ -160,6 +162,55 @@ pub struct OrchestrationSettings {
     pub mailbox_capacity: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tools_per_agent: Option<usize>,
+}
+
+/// Per-agent enablement and model override persisted under `settings.agents`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRuntimeSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Model spec override (`provider/id` or bare id). Empty clears the override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Optional tool allow-list override for the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+}
+
+impl AgentRuntimeSettings {
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    #[must_use]
+    pub fn model_override(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    #[must_use]
+    pub fn tools_override(&self) -> Option<&[String]> {
+        self.tools.as_deref()
+    }
+
+    /// Explicit model clear tombstone (`Some("")`) is not default — it must persist
+    /// so a global clear can shadow a project-level model override.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.enabled.is_none() && self.model.is_none() && self.tools.is_none()
+    }
+
+    /// Whether this entry clears any model override (including project-effective).
+    #[must_use]
+    pub fn clears_model(&self) -> bool {
+        self.model
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +244,7 @@ pub struct RuntimeSettingsSnapshot {
     pub tui: TuiRuntimeSettings,
     pub expose_session_environment: bool,
     pub process_tool_enabled: bool,
+    pub glob_tool_enabled: bool,
     pub orchestration_enabled: bool,
     pub todo_tool_enabled: bool,
     pub orchestration_max_concurrency: usize,
@@ -235,6 +287,7 @@ pub struct RuntimeSettingsState {
     pub scoped_models: Option<Vec<String>>,
     pub expose_session_environment: bool,
     pub process_tool_enabled: bool,
+    pub glob_tool_enabled: bool,
     pub orchestration_enabled: bool,
     pub todo_tool_enabled: bool,
     pub orchestration_max_concurrency: usize,
@@ -283,6 +336,7 @@ impl RuntimeSettingsSnapshot {
             scoped_models: self.tui.scoped_models.clone(),
             expose_session_environment: self.expose_session_environment,
             process_tool_enabled: self.process_tool_enabled,
+            glob_tool_enabled: self.glob_tool_enabled,
             orchestration_enabled: self.orchestration_enabled,
             todo_tool_enabled: self.todo_tool_enabled,
             orchestration_max_concurrency: self.orchestration_max_concurrency,
@@ -405,6 +459,8 @@ pub struct Settings {
     pub orchestration: Option<OrchestrationSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<crate::SelectorSettings>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentRuntimeSettings>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packages: Vec<PackageSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -427,8 +483,14 @@ impl Settings {
     #[must_use]
     pub fn merged(&self, overrides: &Self) -> Self {
         let base = serde_json::to_value(self).unwrap_or_else(|_| Value::Object(Map::new()));
-        let overlay = serde_json::to_value(overrides).unwrap_or_else(|_| Value::Object(Map::new()));
-        serde_json::from_value(deep_merge(base, overlay)).unwrap_or_else(|_| self.clone())
+        let overlay =
+            serde_json::to_value(overrides).unwrap_or_else(|_| Value::Object(Map::new()));
+        let mut merged = serde_json::from_value::<Settings>(deep_merge(base, overlay))
+            .unwrap_or_else(|_| self.clone());
+        // Agent entries need field-aware merge so a global model clear tombstone
+        // (`Some("")`) is not overwritten by a project-level model promotion.
+        merged.agents = merge_agent_settings_maps(&self.agents, &overrides.agents);
+        merged
     }
 
     pub fn apply_session_options(&self, options: &mut crate::SessionOptions) -> Result<()> {
@@ -518,6 +580,7 @@ impl Settings {
             tui: self.tui_runtime(),
             expose_session_environment: self.expose_session_environment(),
             process_tool_enabled: self.process_tool_enabled(),
+            glob_tool_enabled: self.glob_tool_enabled(),
             orchestration_enabled: self.orchestration_enabled(),
             todo_tool_enabled: self.todo_tool_enabled(),
             orchestration_max_concurrency: orchestration
@@ -585,6 +648,36 @@ impl Settings {
         self.scoped_models.as_deref().or(self.enabled_models.as_deref())
     }
 
+    /// Lookup per-agent runtime settings, if any override exists.
+    #[must_use]
+    pub fn agent_settings(&self, name: &str) -> Option<&AgentRuntimeSettings> {
+        self.agents.get(name)
+    }
+
+    /// Whether the named agent may be spawned. Missing entries default to enabled.
+    #[must_use]
+    pub fn is_agent_enabled(&self, name: &str) -> bool {
+        self.agents
+            .get(name)
+            .map_or(true, AgentRuntimeSettings::is_enabled)
+    }
+
+    /// Model override string for the named agent, if configured.
+    #[must_use]
+    pub fn agent_model_override(&self, name: &str) -> Option<&str> {
+        self.agents.get(name).and_then(AgentRuntimeSettings::model_override)
+    }
+
+    /// Insert or update one agent entry, removing it when it collapses to defaults.
+    pub fn set_agent_settings(&mut self, name: impl Into<String>, settings: AgentRuntimeSettings) {
+        let name = name.into();
+        if settings.is_default() {
+            self.agents.remove(&name);
+        } else {
+            self.agents.insert(name, settings);
+        }
+    }
+
     #[must_use]
     pub fn tui_runtime(&self) -> TuiRuntimeSettings {
         TuiRuntimeSettings {
@@ -626,6 +719,18 @@ impl Settings {
         self.orchestration
             .as_ref()
             .and_then(|value| value.process)
+            .unwrap_or(false)
+    }
+
+    /// When true, the main session catalog includes the native sandboxed `glob`
+    /// tool. Default false — does not broaden the strict [read,bash,edit,write]
+    /// baseline unless explicitly enabled via `settings.orchestration.glob` or
+    /// an allow-list that names `glob`.
+    #[must_use]
+    pub fn glob_tool_enabled(&self) -> bool {
+        self.orchestration
+            .as_ref()
+            .and_then(|value| value.glob)
             .unwrap_or(false)
     }
 
@@ -755,6 +860,11 @@ impl SettingsManager {
     pub fn project_settings(&self) -> Settings {
         self.inner.read().project.clone()
     }
+    #[must_use]
+    pub fn session_overrides(&self) -> Settings {
+        self.inner.read().overrides.clone()
+    }
+
 
     #[must_use]
     pub fn paths(&self) -> SettingsPaths {
@@ -819,6 +929,50 @@ fn recompute(state: &mut SettingsState) {
     state.effective = state.global.merged(&state.project).merged(&state.overrides);
 }
 
+/// Merge per-agent maps with tombstone-aware field semantics.
+///
+/// Overlay fields win when present. An empty-string model in either layer is a
+/// clear tombstone that must survive merge so a global clear continues to shadow
+/// a project model promotion.
+fn merge_agent_settings_maps(
+    base: &BTreeMap<String, AgentRuntimeSettings>,
+    overlay: &BTreeMap<String, AgentRuntimeSettings>,
+) -> BTreeMap<String, AgentRuntimeSettings> {
+    let mut names = base.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    names.extend(overlay.keys().cloned());
+    let mut out = BTreeMap::new();
+    for name in names {
+        let left = base.get(&name);
+        let right = overlay.get(&name);
+        let enabled = right
+            .and_then(|entry| entry.enabled)
+            .or_else(|| left.and_then(|entry| entry.enabled));
+        // A clear tombstone in either layer shadows a concrete model in the other
+        // so global clear remains effective against project promotions (and vice versa).
+        let model = if left.is_some_and(AgentRuntimeSettings::clears_model)
+            || right.is_some_and(AgentRuntimeSettings::clears_model)
+        {
+            Some(String::new())
+        } else if let Some(value) = right.and_then(|entry| entry.model.as_ref()) {
+            Some(value.clone())
+        } else {
+            left.and_then(|entry| entry.model.clone())
+        };
+        let tools = right
+            .and_then(|entry| entry.tools.clone())
+            .or_else(|| left.and_then(|entry| entry.tools.clone()));
+        let entry = AgentRuntimeSettings {
+            enabled,
+            model,
+            tools,
+        };
+        if !entry.is_default() {
+            out.insert(name.clone(), entry);
+        }
+    }
+    out
+}
+
 fn deep_merge(base: Value, overlay: Value) -> Value {
     match (base, overlay) {
         (Value::Object(mut base), Value::Object(overlay)) => {
@@ -838,6 +992,197 @@ fn deep_merge(base: Value, overlay: Value) -> Value {
 }
 
 const MAX_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Result of migrating legacy `subagents.agentOverrides` into canonical `agents`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LegacyAgentMigration {
+    /// True when any legacy-only entry was merged into `agents`.
+    merged: bool,
+    /// True when at least one name existed in both layers (canonical kept).
+    conflicts: usize,
+    /// True when the on-disk shape still carries legacy overrides that should be rewritten.
+    needs_rewrite: bool,
+}
+
+fn migrate_legacy_agent_overrides(settings: &mut Settings) -> Result<LegacyAgentMigration> {
+    let Some(subagents_value) = settings.extra.get("subagents").cloned() else {
+        return Ok(LegacyAgentMigration::default());
+    };
+    let Some(subagents) = subagents_value.as_object() else {
+        // Preserve unknown non-object subagents payloads untouched.
+        return Ok(LegacyAgentMigration::default());
+    };
+    let Some(overrides_value) = subagents.get("agentOverrides") else {
+        return Ok(LegacyAgentMigration::default());
+    };
+    let Some(overrides) = overrides_value.as_object() else {
+        bail!(
+            "subagents.agentOverrides must be an object of per-agent overrides; \
+             migrate entries to top-level agents or fix the settings file"
+        );
+    };
+
+    let mut migration = LegacyAgentMigration {
+        needs_rewrite: true,
+        ..LegacyAgentMigration::default()
+    };
+
+    for (name, value) in overrides {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("subagents.agentOverrides contains an empty agent name");
+        }
+        let legacy = parse_legacy_agent_override(name, value)?;
+        if legacy.is_default() {
+            continue;
+        }
+        if settings.agents.contains_key(name) {
+            // Canonical top-level agents always win on conflict.
+            migration.conflicts += 1;
+            continue;
+        }
+        settings.agents.insert(name.to_owned(), legacy);
+        migration.merged = true;
+    }
+
+    // Drop only agentOverrides; preserve any other unknown subagents fields.
+    let mut remaining = subagents.clone();
+    remaining.remove("agentOverrides");
+    if remaining.is_empty() {
+        settings.extra.remove("subagents");
+    } else {
+        settings
+            .extra
+            .insert("subagents".to_owned(), Value::Object(remaining));
+    }
+    Ok(migration)
+}
+
+fn parse_legacy_agent_override(name: &str, value: &Value) -> Result<AgentRuntimeSettings> {
+    let object = value.as_object().ok_or_else(|| {
+        anyhow!("subagents.agentOverrides.{name} must be an object with enabled/model/tools fields")
+    })?;
+    let enabled = match object.get("enabled") {
+        None => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(other) => bail!(
+            "subagents.agentOverrides.{name}.enabled must be a boolean, got {other}"
+        ),
+    };
+    let model = match object.get("model") {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(Value::Null) => Some(String::new()),
+        Some(other) => bail!(
+            "subagents.agentOverrides.{name}.model must be a string, got {other}"
+        ),
+    };
+    let tools = match object.get("tools") {
+        None => None,
+        Some(Value::Array(items)) => {
+            let mut tools = Vec::with_capacity(items.len());
+            for item in items {
+                let tool = item.as_str().ok_or_else(|| {
+                    anyhow!("subagents.agentOverrides.{name}.tools entries must be strings")
+                })?;
+                if tool.trim().is_empty() {
+                    bail!("subagents.agentOverrides.{name}.tools contains an empty tool name");
+                }
+                tools.push(tool.to_owned());
+            }
+            Some(tools)
+        }
+        Some(other) => bail!(
+            "subagents.agentOverrides.{name}.tools must be an array of strings, got {other}"
+        ),
+    };
+    // Unknown per-agent keys are intentionally ignored (not promoted into extra).
+    Ok(AgentRuntimeSettings {
+        enabled,
+        model,
+        tools,
+    })
+}
+
+/// Paths that have already emitted the legacy `agentOverrides` deprecation
+/// warning in this process. Keyed by the settings path string so global and
+/// project files each warn once and repeated loads of the same path stay quiet.
+static LEGACY_AGENT_MIGRATION_WARNED_PATHS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+thread_local! {
+    /// When set, warnings from this thread are collected instead of printed.
+    /// Thread-local so parallel settings tests cannot pollute each other's
+    /// capture buffers or suppress foreign-thread diagnostics.
+    static LEGACY_AGENT_MIGRATION_WARN_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn warn_legacy_agent_migration(path: &Path, migration: &LegacyAgentMigration) {
+    if !migration.needs_rewrite {
+        return;
+    }
+    let key = path.to_string_lossy().into_owned();
+    {
+        let mut warned = LEGACY_AGENT_MIGRATION_WARNED_PATHS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !warned.insert(key) {
+            return;
+        }
+    }
+    let detail = match (migration.merged, migration.conflicts) {
+        (true, 0) => "legacy-only entries were merged into top-level agents".to_owned(),
+        (true, n) => format!(
+            "legacy-only entries were merged into top-level agents; {n} conflicting name(s) kept the canonical agents value"
+        ),
+        (false, n) if n > 0 => format!(
+            "{n} conflicting name(s) kept the canonical agents value; redundant legacy overrides were dropped"
+        ),
+        _ => "legacy overrides were removed with no additional agent entries".to_owned(),
+    };
+    let message = format!(
+        "warning: {} uses deprecated subagents.agentOverrides; {detail}. \
+         Prefer settings.agents.<name>.{{enabled,model,tools}}. \
+         The file will be rewritten in canonical form on the next settings save.",
+        path.display()
+    );
+    #[cfg(test)]
+    {
+        let captured = LEGACY_AGENT_MIGRATION_WARN_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            if let Some(log) = capture.as_mut() {
+                log.push(message.clone());
+                true
+            } else {
+                false
+            }
+        });
+        if captured {
+            return;
+        }
+    }
+    eprintln!("{message}");
+}
+
+#[cfg(test)]
+fn capture_legacy_agent_migration_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    // Unique temp paths make process-wide path state safe without clearing:
+    // each capture body only asserts on warnings for the paths it loads.
+    LEGACY_AGENT_MIGRATION_WARN_CAPTURE.with(|capture| {
+        *capture.borrow_mut() = Some(Vec::new());
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    let messages = LEGACY_AGENT_MIGRATION_WARN_CAPTURE.with(|capture| {
+        capture.borrow_mut().take().unwrap_or_default()
+    });
+    match result {
+        Ok(value) => (value, messages),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 
 fn load_settings_file(path: &Path, scope: SettingsScope) -> Result<Settings> {
     let file = match File::open(path) {
@@ -874,14 +1219,22 @@ fn load_settings_file(path: &Path, scope: SettingsScope) -> Result<Settings> {
             MAX_SETTINGS_FILE_BYTES,
         );
     }
-    let settings: Settings = serde_json::from_str(&content).with_context(|| {
+    let mut settings: Settings = serde_json::from_str(&content).with_context(|| {
         format!("Failed to parse settings.json\nFile: {}", path.display())
     })?;
+    let migration = migrate_legacy_agent_overrides(&mut settings).with_context(|| {
+        format!(
+            "invalid {} settings {} while migrating subagents.agentOverrides",
+            scope_name(scope),
+            path.display()
+        )
+    })?;
     validate_settings(&settings, scope, path)?;
+    warn_legacy_agent_migration(path, &migration);
     Ok(settings)
 }
 
-fn validate_settings(settings: &Settings, scope: SettingsScope, path: &Path) -> Result<()> {
+pub(crate) fn validate_settings(settings: &Settings, scope: SettingsScope, path: &Path) -> Result<()> {
     for (field, entries) in [
         ("extensions", &settings.extensions),
         ("skills", &settings.skills),
@@ -1001,6 +1354,9 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
         }
     })) {
         bail!("keybindings contains an empty action or chord");
+    }
+    if settings.agents.iter().any(|(name, _)| name.trim().is_empty()) {
+        bail!("agents contains an empty name");
     }
     if let Some(orchestration) = &settings.orchestration {
         if orchestration.max_concurrency.is_some_and(|value| value == 0 || value > 64) {
@@ -1123,6 +1479,356 @@ mod tests {
             .to_string()
             .contains("selector.maxResults"));
     }
+
+    #[test]
+    fn agent_runtime_settings_persist_atomically() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
+        manager
+            .update_global(|settings| {
+                settings.set_agent_settings(
+                    "reviewer",
+                    AgentRuntimeSettings {
+                        enabled: Some(false),
+                        model: Some("anthropic/claude-sonnet-4-5".to_owned()),
+                tools: None,
+            },
+                );
+            })
+            .expect("persist agent settings");
+
+        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload");
+        let entry = reloaded
+            .settings()
+            .agent_settings("reviewer")
+            .cloned()
+            .expect("reviewer settings");
+        assert_eq!(entry.enabled, Some(false));
+        assert_eq!(entry.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        assert!(!reloaded.settings().is_agent_enabled("reviewer"));
+        assert!(reloaded.settings().is_agent_enabled("task"));
+        assert_eq!(
+            reloaded.settings().agent_model_override("reviewer"),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+    }
+
+    #[test]
+    fn empty_agent_model_override_is_clear_tombstone() {
+        let mut settings = Settings::default();
+        settings.agents.insert(
+            "task".to_owned(),
+            AgentRuntimeSettings {
+                enabled: Some(true),
+                model: Some("   ".to_owned()),
+                tools: None,
+            },
+        );
+        validate_operational_settings(&settings).expect("empty model is a clear tombstone");
+        assert!(settings.agents["task"].clears_model());
+        assert!(settings.agents["task"].model_override().is_none());
+        assert!(!settings.agents["task"].is_default());
+    }
+
+    #[test]
+    fn global_model_clear_tombstone_shadows_project_model() {
+        let mut global = Settings::default();
+        global.agents.insert(
+            "task".to_owned(),
+            AgentRuntimeSettings {
+                enabled: Some(true),
+                model: Some(String::new()),
+                tools: None,
+            },
+        );
+        let mut project = Settings::default();
+        project.agents.insert(
+            "task".to_owned(),
+            AgentRuntimeSettings {
+                enabled: None,
+                model: Some("anthropic/claude-sonnet-4-5".to_owned()),
+                tools: None,
+            },
+        );
+        let effective = global.merged(&project);
+        let entry = effective.agent_settings("task").expect("task settings");
+        assert!(
+            entry.clears_model(),
+            "global clear must remain effective after project model merge: {entry:?}"
+        );
+        assert!(entry.model_override().is_none());
+        assert_eq!(entry.enabled, Some(true));
+    }
+
+    #[test]
+    fn project_enabled_override_still_merges_with_global_model() {
+        let mut global = Settings::default();
+        global.agents.insert(
+            "task".to_owned(),
+            AgentRuntimeSettings {
+                enabled: Some(true),
+                model: Some("openai/gpt-4.1".to_owned()),
+                tools: None,
+            },
+        );
+        let mut project = Settings::default();
+        project.agents.insert(
+            "task".to_owned(),
+            AgentRuntimeSettings {
+                enabled: Some(false),
+                model: None,
+                tools: None,
+            },
+        );
+        let effective = global.merged(&project);
+        let entry = effective.agent_settings("task").expect("task settings");
+        assert_eq!(entry.enabled, Some(false));
+        assert_eq!(entry.model.as_deref(), Some("openai/gpt-4.1"));
+    }
+
+    #[test]
+    fn untrusted_project_agent_write_is_refused() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings manager");
+        let error = manager
+            .update_project(|settings| {
+                settings.set_agent_settings(
+                    "task",
+                    AgentRuntimeSettings {
+                        enabled: Some(false),
+                        model: None,
+                tools: None,
+            },
+                );
+            })
+            .expect_err("untrusted project write must fail")
+            .to_string();
+        assert!(error.contains("not trusted"), "{error}");
+    }
+
+    #[test]
+    fn legacy_agent_overrides_merge_enabled_model_and_tools() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+              "theme": "keep-me",
+              "subagents": {
+                "agentOverrides": {
+                  "reviewer": {
+                    "enabled": false,
+                    "model": "anthropic/claude-sonnet-4-5",
+                    "tools": ["read", "grep"],
+                    "futureFlag": true
+                  }
+                },
+                "otherLegacy": {"keep": true}
+              }
+            }"#,
+        )
+        .expect("write legacy settings");
+
+        let loaded = load_settings_file(&path, SettingsScope::Global).expect("load");
+        let entry = loaded.agent_settings("reviewer").expect("migrated reviewer");
+        assert_eq!(entry.enabled, Some(false));
+        assert_eq!(entry.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        assert_eq!(
+            entry.tools.as_deref(),
+            Some(["read".to_owned(), "grep".to_owned()].as_slice())
+        );
+        let subagents = loaded.extra.get("subagents").expect("subagents retained");
+        assert!(subagents.get("agentOverrides").is_none());
+        assert_eq!(
+            subagents.get("otherLegacy").and_then(|value| value.get("keep")),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(loaded.theme.as_deref(), Some("keep-me"));
+    }
+
+    #[test]
+    fn canonical_agents_win_conflicts_over_legacy_overrides() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+              "agents": {
+                "reviewer": {"enabled": true, "model": "openai/gpt-4.1"}
+              },
+              "subagents": {
+                "agentOverrides": {
+                  "reviewer": {
+                    "enabled": false,
+                    "model": "anthropic/claude-sonnet-4-5",
+                    "tools": ["bash"]
+                  },
+                  "task": {"enabled": false, "tools": ["read"]}
+                }
+              }
+            }"#,
+        )
+        .expect("write conflict settings");
+
+        let loaded = load_settings_file(&path, SettingsScope::Global).expect("load");
+        let reviewer = loaded.agent_settings("reviewer").expect("reviewer");
+        assert_eq!(reviewer.enabled, Some(true), "canonical enabled must win");
+        assert_eq!(reviewer.model.as_deref(), Some("openai/gpt-4.1"));
+        assert!(
+            reviewer.tools.is_none(),
+            "legacy tools must not override canonical absence"
+        );
+
+        let task = loaded.agent_settings("task").expect("legacy-only task merged");
+        assert_eq!(task.enabled, Some(false));
+        assert_eq!(
+            task.tools.as_deref(),
+            Some(["read".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn legacy_agent_overrides_rewrite_on_save_is_canonical() {
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let path = agent.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+              "subagents": {
+                "agentOverrides": {
+                  "reviewer": {
+                    "enabled": false,
+                    "model": "anthropic/claude-sonnet-4-5"
+                  }
+                },
+                "keepMe": 1
+              }
+            }"#,
+        )
+        .expect("seed legacy");
+
+        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("load");
+        assert!(!manager.settings().is_agent_enabled("reviewer"));
+        assert_eq!(
+            manager.settings().agent_model_override("reviewer"),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+
+        manager
+            .update_global(|settings| {
+                settings.quiet_startup = Some(true);
+            })
+            .expect("save");
+
+        let raw = fs::read_to_string(&path).expect("read rewritten");
+        assert!(
+            !raw.contains("agentOverrides"),
+            "legacy key must be gone after save: {raw}"
+        );
+        assert!(raw.contains("\"agents\""), "canonical agents present: {raw}");
+        assert!(raw.contains("\"reviewer\""), "migrated agent persisted: {raw}");
+        assert!(
+            raw.contains("\"keepMe\""),
+            "unknown subagents fields preserved: {raw}"
+        );
+
+        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload");
+        assert!(!reloaded.settings().is_agent_enabled("reviewer"));
+        assert_eq!(
+            reloaded.settings().agent_model_override("reviewer"),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+    }
+
+    #[test]
+    fn legacy_agent_overrides_warning_is_deduped_per_path() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{
+              "subagents": {
+                "agentOverrides": {
+                  "reviewer": {
+                    "enabled": false,
+                    "model": "anthropic/claude-sonnet-4-5"
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("write legacy settings");
+
+        let (loaded, warnings) = capture_legacy_agent_migration_warnings(|| {
+            let first = load_settings_file(&path, SettingsScope::Global).expect("load 1");
+            let second = load_settings_file(&path, SettingsScope::Global).expect("load 2");
+            let third = load_settings_file(&path, SettingsScope::Global).expect("load 3");
+            (first, second, third)
+        });
+        let (first, second, third) = loaded;
+
+        assert_eq!(warnings.len(), 1, "same path warns once: {warnings:?}");
+        assert!(
+            warnings[0].contains("deprecated subagents.agentOverrides"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(&path.display().to_string()),
+            "warning identifies settings path: {warnings:?}"
+        );
+        assert_eq!(first.agent_settings("reviewer"), second.agent_settings("reviewer"));
+        assert_eq!(second.agent_settings("reviewer"), third.agent_settings("reviewer"));
+        assert_eq!(
+            first.agent_settings("reviewer").and_then(|entry| entry.model.clone()),
+            Some("anthropic/claude-sonnet-4-5".to_owned())
+        );
+    }
+
+    #[test]
+    fn legacy_agent_overrides_warning_is_separate_per_settings_path() {
+        let dir = tempfile::tempdir().expect("dir");
+        let global = dir.path().join("global-settings.json");
+        let project = dir.path().join("project-settings.json");
+        let body = r#"{
+          "subagents": {
+            "agentOverrides": {
+              "reviewer": {"enabled": false}
+            }
+          }
+        }"#;
+        fs::write(&global, body).expect("write global");
+        fs::write(&project, body).expect("write project");
+
+        let (_, warnings) = capture_legacy_agent_migration_warnings(|| {
+            load_settings_file(&global, SettingsScope::Global).expect("global");
+            load_settings_file(&project, SettingsScope::Project).expect("project");
+            load_settings_file(&global, SettingsScope::Global).expect("global reload");
+            load_settings_file(&project, SettingsScope::Project).expect("project reload");
+        });
+
+        assert_eq!(
+            warnings.len(),
+            2,
+            "each distinct settings path warns once: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains(&global.display().to_string())),
+            "global path warned: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains(&project.display().to_string())),
+            "project path warned: {warnings:?}"
+        );
+    }
+
+
     #[test]
     fn settings_file_size_boundary_is_accepted() {
         let dir = tempfile::tempdir().expect("settings dir");

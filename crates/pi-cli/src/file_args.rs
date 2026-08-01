@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use pi_ai::ContentBlock;
@@ -15,10 +15,14 @@ pub struct ExpandedPrompt {
 }
 
 pub fn expand_prompt(prompt: &str, cwd: &Path) -> Result<ExpandedPrompt> {
-    expand_prompt_inner(prompt, cwd)
+    let workspace = pi_coding::WorkspaceRoots::new(cwd, Vec::<PathBuf>::new())?;
+    expand_prompt_in_workspace(prompt, &workspace)
 }
 
-fn expand_prompt_inner(prompt: &str, cwd: &Path) -> Result<ExpandedPrompt> {
+pub fn expand_prompt_in_workspace(
+    prompt: &str,
+    workspace: &pi_coding::WorkspaceRoots,
+) -> Result<ExpandedPrompt> {
     let arguments = parse_file_arguments(prompt)?;
     if arguments.is_empty() {
         return Ok(ExpandedPrompt {
@@ -28,9 +32,6 @@ fn expand_prompt_inner(prompt: &str, cwd: &Path) -> Result<ExpandedPrompt> {
         });
     }
 
-    let root = cwd
-        .canonicalize()
-        .with_context(|| format!("cannot resolve working directory {}", cwd.display()))?;
     let file_count = arguments.len();
     let mut expanded = String::with_capacity(prompt.len());
     let mut images = Vec::new();
@@ -38,7 +39,7 @@ fn expand_prompt_inner(prompt: &str, cwd: &Path) -> Result<ExpandedPrompt> {
 
     for argument in arguments {
         expanded.push_str(&prompt[cursor..argument.start]);
-        let resolved = resolve_contained_file(&root, &argument.path)?;
+        let resolved = resolve_contained_file(workspace, &argument.path)?;
         let metadata = std::fs::metadata(&resolved)
             .with_context(|| format!("could not inspect @{}", argument.path))?;
         if !metadata.is_file() {
@@ -207,28 +208,28 @@ fn parse_unquoted_path(prompt: &str, start: usize) -> (String, usize) {
     (path, index)
 }
 
-fn resolve_contained_file(root: &Path, input: &str) -> Result<PathBuf> {
+fn resolve_contained_file(
+    workspace: &pi_coding::WorkspaceRoots,
+    input: &str,
+) -> Result<PathBuf> {
     if input.contains('\0') {
         bail!("@file path contains a NUL byte");
     }
     let path = Path::new(input);
-    if path.is_absolute() {
-        bail!("unsafe @file path {input:?}: absolute paths are not allowed");
-    }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        bail!("unsafe @file path {input:?}: paths must stay within the working directory");
-    }
-    let joined = root.join(path);
-    let canonical = joined
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.cwd().join(path)
+    };
+    let canonical = candidate
         .canonicalize()
         .map_err(|error| anyhow!("@file not found: {} ({error})", input))?;
-    if !canonical.starts_with(root) {
-        bail!("unsafe @file path {input:?}: symlink escapes the working directory");
+    if !workspace
+        .roots()
+        .iter()
+        .any(|root| canonical.starts_with(root))
+    {
+        bail!("unsafe @file path {input:?}: path escapes the configured workspace roots");
     }
     Ok(canonical)
 }
@@ -313,6 +314,39 @@ mod tests {
             .expect("symlink");
             assert!(expand_prompt("@link.txt", cwd.path()).is_err());
         }
+    }
+
+    #[test]
+    fn absolute_file_under_additional_root_is_allowed() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let additional = tempfile::tempdir().expect("additional");
+        let file = additional.path().join("shared.txt");
+        std::fs::write(&file, "shared").expect("write shared");
+        let workspace = pi_coding::WorkspaceRoots::new(cwd.path(), [additional.path()])
+            .expect("workspace");
+        let expanded = expand_prompt_in_workspace(
+            &format!("inspect @{}", file.display()),
+            &workspace,
+        )
+        .expect("expand additional file");
+        assert!(expanded.prompt.contains("shared"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn additional_root_symlink_escape_is_rejected() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let additional = tempfile::tempdir().expect("additional");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "secret").expect("secret");
+        let link = additional.path().join("escape.txt");
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).expect("symlink");
+        let workspace = pi_coding::WorkspaceRoots::new(cwd.path(), [additional.path()])
+            .expect("workspace");
+        assert!(
+            expand_prompt_in_workspace(&format!("inspect @{}", link.display()), &workspace)
+                .is_err()
+        );
     }
 
     #[test]

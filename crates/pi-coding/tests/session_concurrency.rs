@@ -453,7 +453,7 @@ async fn recorder_persists_messages_to_resumed_temp_session() {
         session_path,
         "recorder targets the temp path"
     );
-    session.record(recorder);
+    session.record(recorder).expect("attach recorder");
 
     provider.queue(vec![ScriptedResponse::immediate("recorded answer")]);
     let mut out = Vec::new();

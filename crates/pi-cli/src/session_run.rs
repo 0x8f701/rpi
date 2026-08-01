@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::args::Cli;
-use crate::commands::{import_codex_for_resume, resolve_model_spec};
+use crate::commands::{resolve_model_spec, resolve_resume_for_startup};
 use crate::extension_ui::{ExtensionUiAdapter, NonInteractiveExtensionUiHost};
 use crate::models_config::ModelRequestAuth;
 use crate::output::{parse_thinking_level, thinking_level_str, warn_line};
@@ -252,9 +252,35 @@ fn requested_tool(name: &str, cli: &Cli) -> bool {
     cli.tools.as_ref().is_some_and(|tools| tools.iter().any(|tool| tool == name))
 }
 
+struct MainToolGates {
+    orchestration: bool,
+    process: bool,
+    glob: bool,
+    todo: bool,
+    goal: bool,
+}
+
+fn main_tool_gates(settings: &pi_coding::Settings, cli: &Cli) -> MainToolGates {
+    let tools_allowed = !cli.no_tools;
+    MainToolGates {
+        orchestration: tools_allowed
+            && (settings.orchestration_enabled()
+                || requested_tool("task", cli)
+                || requested_tool("hub", cli)),
+        process: tools_allowed
+            && (settings.process_tool_enabled() || requested_tool("process", cli)),
+        glob: tools_allowed
+            && (settings.glob_tool_enabled() || requested_tool("glob", cli)),
+        todo: tools_allowed
+            && (settings.todo_tool_enabled() || requested_tool("todo", cli)),
+        goal: tools_allowed && requested_tool("goal", cli),
+    }
+}
+
 fn orchestration_config(
     snapshot: &pi_coding::ResourceSnapshot,
     settings: &pi_coding::Settings,
+    parent_model: &pi_ai::Model,
 ) -> OrchestrationConfig {
     let mut config = OrchestrationConfig::new(
         AgentCatalog::from_agents(snapshot.agents.clone()),
@@ -267,9 +293,9 @@ fn orchestration_config(
         if let Some(value) = orchestration.mailbox_capacity { config.mailbox_capacity = value; }
         if let Some(value) = orchestration.max_tools_per_agent { config.max_tools_per_agent = value; }
     }
-    if let Some(selector) = settings.selector.clone() {
-        config = config.with_selector_settings(selector);
-    }
+    config = config.with_selector_settings(settings.selector.clone().unwrap_or_default());
+    config.agent_settings = settings.agents.clone();
+    config.parent_model = parent_model.clone();
     config
 }
 
@@ -305,28 +331,24 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     cwd = cwd
         .canonicalize()
         .with_context(|| format!("resolving working directory {}", cwd.display()))?;
+    let mut workspace = pi_coding::WorkspaceRoots::new(&cwd, &cli.add_dirs)?;
     let session_dir = cli.session_dir.as_deref();
     if let Some(id) = cli.session_id.as_deref() {
         pi_coding::validate_session_id(id)?;
     }
-    let resume_codex_path = match &cli.resume_codex {
-        Some(input) => Some(import_codex_for_resume(input)?),
-        None => None,
-    };
-    let resume_path: Option<PathBuf> = if let Some(path) = resume_codex_path {
-        Some(path)
-    } else if let Some(path) = &cli.resume {
-        let root = session_dir
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| pi_coding::default_session_dir(&cwd));
-        let path = if path.is_absolute() { path.clone() } else { cwd.join(path) };
-        Some(pi_coding::validated_saved_session_path(&root, &path)?)
+    let resume_path: Option<PathBuf> = if let Some(input) = cli.resume.as_deref() {
+        Some(resolve_resume_for_startup(input, Some(&cwd))?.path)
     } else if let Some(argument) = cli.session.as_deref() {
         Some(resolve_session_argument(argument, &cwd, session_dir)?)
     } else if let Some(argument) = cli.fork.as_deref() {
         Some(resolve_session_argument(argument, &cwd, session_dir)?)
     } else if cli.continue_latest {
-        pi_coding::list_sessions_in(&cwd, session_dir).into_iter().next().map(|session| session.path)
+        // Deliberately native-only: `--continue` must never surprise-import a
+        // foreign session merely because it is newer.
+        pi_coding::list_sessions_in(&cwd, session_dir)
+            .into_iter()
+            .next()
+            .map(|session| session.path)
     } else if let Some(id) = cli.session_id.as_deref() {
         pi_coding::list_sessions_in(&cwd, session_dir)
             .into_iter()
@@ -341,11 +363,15 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     if let Some(path) = &resume_path {
         let tree = pi_coding::load_session_tree(path)
             .with_context(|| format!("loading session {}", path.display()))?;
-        if cli.cwd.is_none() && !tree.header.cwd.as_os_str().is_empty() {
+        if cli.cwd.is_none() && !tree.header.cwd.as_os_str().is_empty() && tree.header.cwd.exists() {
+            // Restore the session's recorded cwd only when it still exists;
+            // an imported/foreign session may record a cwd that is absent on
+            // this machine — fall back to the current cwd rather than fail.
             cwd = tree.header.cwd.canonicalize().with_context(|| {
                 format!("resolving resumed working directory {}", tree.header.cwd.display())
             })?;
         }
+        workspace = pi_coding::WorkspaceRoots::new(&cwd, &cli.add_dirs)?;
         resume_has_thinking_entry = tree.has_thinking_entry();
         resume_ctx = Some(tree.build_context(None));
     }
@@ -521,15 +547,19 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         auth_resolver: Some(auth_resolver.clone()),
     };
     settings.apply_session_options(&mut opts)?;
-    let orchestration_enabled = !cli.no_tools
-        && (settings.orchestration_enabled()
-            || requested_tool("task", cli)
-            || requested_tool("hub", cli));
-    let (orchestration, uri_resolver) = if orchestration_enabled {
-        let config = orchestration_config(&snapshot, &settings);
-        let uri_resolver = OrchestrationRuntime::read_uri_resolver_for_artifact_dir(
-            &config.artifact_dir,
-        )?;
+    let gates = main_tool_gates(&settings, cli);
+    let (orchestration, uri_resolver) = if gates.orchestration {
+        let config = orchestration_config(&snapshot, &settings, &model);
+        let resolver_slot = Arc::new(parking_lot::Mutex::new(
+            None::<pi_coding::InternalUriResolverFn>,
+        ));
+        let child_resolver_slot = resolver_slot.clone();
+        let uri_resolver: pi_coding::InternalUriResolverFn = Arc::new(move |uri| {
+            child_resolver_slot
+                .lock()
+                .as_ref()
+                .ok_or_else(|| anyhow!("orchestration URI resolver is not initialized"))?(uri)
+        });
         let factory = OrchestrationRuntime::child_factory_from_snapshot_and_uri(
             pi_coding::ChildSessionOptionsSnapshot {
                 model: model.clone(),
@@ -542,10 +572,9 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
             },
             Some(uri_resolver.clone()),
         );
-        (
-            Some(OrchestrationRuntime::new(config, factory)?),
-            Some(uri_resolver),
-        )
+        let orchestration = OrchestrationRuntime::new(config, factory)?;
+        *resolver_slot.lock() = Some(orchestration.read_uri_resolver());
+        (Some(orchestration), Some(uri_resolver))
     } else {
         (None, None)
     };
@@ -553,28 +582,34 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     if let Some(orchestration) = &orchestration {
         additional_tools.extend(orchestration.agent_tools("Main", 0));
     }
+    let goal_tool = gates.goal.then(pi_coding::GoalToolBinding::default);
+    if let Some(binding) = &goal_tool {
+        additional_tools.push(binding.tool());
+    }
     let selection = ToolSelection {
         allow: cli.tools.clone(),
         deny: cli.exclude_tools.clone(),
         disable_all: cli.no_tools,
         disable_builtins: cli.no_builtin_tools,
-        enable_process: requested_tool("process", cli),
+        enable_process: gates.process,
+        enable_glob: gates.glob,
     };
-    let todo_enabled = requested_tool("todo", cli);
-    let session = if todo_enabled {
-        Session::new_with_todo_additional_tools_filtered_discovery_and_uri(
+    let session = if gates.todo {
+        Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
             opts,
             additional_tools,
             selection,
             pi_coding::ResourceDiscovery::Disabled,
+            workspace.clone(),
             uri_resolver.clone(),
         )
     } else {
-        Session::new_with_additional_tools_filtered_discovery_and_uri(
+        Session::new_with_additional_tools_filtered_discovery_workspace_and_uri(
             opts,
             additional_tools,
             selection,
             pi_coding::ResourceDiscovery::Disabled,
+            workspace,
             uri_resolver,
         )
     };
@@ -619,7 +654,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
                 if !resume_has_thinking_entry {
                     recorder.record_thinking_level(thinking_level_str(thinking_level))?;
                 }
-                session.record(recorder);
+                session.record(recorder)?;
             }
         } else if !cli.no_session {
             let recorder = pi_coding::start_session_in(
@@ -630,7 +665,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
                 cli.session_id.as_deref(),
                 None,
             )?;
-            session.record(recorder);
+            session.record(recorder)?;
         }
         if let Some(name) = cli.name.as_deref() {
             session.set_session_name(name)?;
@@ -649,6 +684,12 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     }
 
     let application = Application::new_with_extensions(session, runtime, permissions).await;
+    if resume_path.is_some() {
+        application.prepare_resumed_goal(cli.fork.is_some())?;
+    }
+    if let Some(binding) = goal_tool {
+        application.attach_goal_tool(binding)?;
+    }
     if let Some(orchestration) = orchestration {
         if let Err(error) = application.attach_orchestration(orchestration) {
             application.cleanup().await;
@@ -674,6 +715,16 @@ pub async fn run_print_to<W>(
 where
     W: std::io::Write,
 {
+    if let Some(argument) = prompt.trim().strip_prefix("/goal") {
+        let command = crate::goal_commands::parse_interactive_goal_command(
+            (!argument.trim().is_empty()).then_some(argument.trim()),
+        )?;
+        let output = crate::goal_commands::execute_interactive_goal_command(application, command)?;
+        writer.write_all(output.as_bytes())?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        return Ok(output);
+    }
     if prompt.trim().is_empty() {
         bail!("print mode requires a prompt");
     }
@@ -732,6 +783,56 @@ fn extension_startup_error(report: &pi_coding::ExtensionLoadReport) -> anyhow::E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use pi_agent::ThinkingLevel;
+    use pi_ai::{Model, SimpleStreamOptions};
+    use pi_coding::{
+        AgentDefinition, AgentDefinitionSource, ChildSessionFactory, ResourceSnapshot, Settings,
+        TaskItem, TrustDecision, TrustResolution,
+    };
+
+    #[test]
+    fn settings_and_cli_selection_drive_identical_initial_tool_gates() {
+        let mut settings = Settings::default();
+        settings.orchestration = Some(pi_coding::OrchestrationSettings {
+            tasks: Some(true),
+            process: Some(true),
+            todo: Some(true),
+            glob: Some(true),
+            ..pi_coding::OrchestrationSettings::default()
+        });
+        let cli = <Cli as clap::Parser>::try_parse_from(["pi"]).expect("default cli");
+        let gates = main_tool_gates(&settings, &cli);
+        assert!(gates.orchestration);
+        assert!(gates.process);
+        assert!(gates.todo);
+        assert!(gates.glob);
+        assert!(!gates.goal);
+
+        let selected = <Cli as clap::Parser>::try_parse_from([
+            "pi",
+            "--tools",
+            "task,hub,process,todo,glob,goal",
+        ])
+        .expect("selected tools");
+        let gates = main_tool_gates(&Settings::default(), &selected);
+        assert!(gates.orchestration);
+        assert!(gates.process);
+        assert!(gates.todo);
+        assert!(gates.glob);
+        assert!(gates.goal);
+
+        let disabled = <Cli as clap::Parser>::try_parse_from(["pi", "--no-tools"])
+            .expect("disabled tools");
+        let gates = main_tool_gates(&settings, &disabled);
+        assert!(!gates.orchestration);
+        assert!(!gates.process);
+        assert!(!gates.todo);
+        assert!(!gates.glob);
+        assert!(!gates.goal);
+    }
 
     #[test]
     fn settings_thinking_level_is_used_after_cli_model_and_resume_priorities() {
@@ -743,5 +844,112 @@ mod tests {
             resolve_initial_thinking_level(Some("low"), "", None, false, Some("high")),
             pi_agent::ThinkingLevel::Low
         );
+    }
+
+    #[tokio::test]
+    async fn initial_cli_orchestration_inherits_selected_parent_model() {
+        let artifacts = tempfile::tempdir().expect("artifacts root");
+        let parent_model = Model {
+            id: "selected-parent".to_owned(),
+            name: "Selected Parent".to_owned(),
+            api: "test-api".to_owned(),
+            provider: "test-provider".to_owned(),
+            ..Model::default()
+        };
+        let bundled = AgentDefinition {
+            name: "task".to_owned(),
+            description: "bundled task agent".to_owned(),
+            system_prompt: "do the task".to_owned(),
+            tools: Some(Vec::new()),
+            autoload_skills: Vec::new(),
+            // No definition model list — must fall through to parent.
+            model: None,
+            thinking_level: Some(ThinkingLevel::Off),
+            source: AgentDefinitionSource::Bundled,
+            path: None,
+            trusted: true,
+        };
+        let snapshot = ResourceSnapshot {
+            generation: 1,
+            cwd: artifacts.path().to_path_buf(),
+            trust: TrustResolution {
+                decision: TrustDecision::Trusted,
+                matched_path: None,
+                project_path: artifacts.path().to_path_buf(),
+            },
+            settings: Settings::default(),
+            context_files: Vec::new(),
+            skills: Vec::new(),
+            agents: vec![bundled],
+            prompts: Vec::new(),
+            themes: Vec::new(),
+            package_extensions: Vec::new(),
+            theme_dirs: Vec::new(),
+            keybinding_files: Vec::new(),
+            system_prompt: None,
+            append_system_prompt: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        // Empty settings.agents → no per-agent model override.
+        let settings = Settings::default();
+        let config = orchestration_config(&snapshot, &settings, &parent_model);
+        assert_eq!(config.parent_model.provider, parent_model.provider);
+        assert_eq!(config.parent_model.id, parent_model.id);
+
+        let seen = Arc::new(Mutex::new(None::<Model>));
+        let seen_factory = seen.clone();
+        let factory: ChildSessionFactory = Arc::new(move |request| {
+            let seen_factory = seen_factory.clone();
+            Box::pin(async move {
+                *seen_factory.lock() = Some(request.model.clone());
+                // Debug must never surface secret material from the request.
+                let debug = format!("{request:?}");
+                assert!(
+                    !debug.contains("sk-") && !debug.to_ascii_lowercase().contains("api_key"),
+                    "ChildSessionRequest debug leaked secrets: {debug}"
+                );
+                Session::new(SessionOptions {
+                    model: request.model,
+                    cwd: std::env::current_dir().expect("cwd"),
+                    system_prompt: request.system_prompt,
+                    thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
+                    api_key: String::new(),
+                    compaction: None,
+                    stream_options: SimpleStreamOptions::default(),
+                    tools: Some(Vec::new()),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: None,
+                    auth_resolver: None,
+                })
+            })
+        });
+
+        let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
+        let _ = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "Child".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "inherit parent model".to_owned(),
+                }],
+            )
+            .expect("spawn");
+        for _ in 0..50 {
+            if seen.lock().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let captured = seen
+            .lock()
+            .clone()
+            .expect("factory observed ChildSessionRequest.model");
+        assert_eq!(captured.provider, parent_model.provider);
+        assert_eq!(captured.id, parent_model.id);
+        runtime.shutdown().await;
     }
 }

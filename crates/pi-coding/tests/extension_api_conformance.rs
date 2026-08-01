@@ -8,10 +8,11 @@ use std::{
 use anyhow::Result;
 use pi_coding::{
     ExtensionActionHost, ExtensionCancellation, ExtensionCapability, ExtensionContextSnapshot,
-    ExtensionContextUsage, ExtensionEvent, ExtensionFuture, ExtensionMode, ExtensionOrigin,
-    ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeAction, ExtensionRuntimeOptions,
-    ExtensionSpec, ExtensionSpecRuntime, ExtensionUiCapability, ExtensionUiContext,
-    ExtensionUiHost, ExtensionUiRequest, ExtensionUiResponse,
+    ExtensionContextUsage, ExtensionEvent, ExtensionFlagType, ExtensionFuture, ExtensionMode,
+    ExtensionOrigin, ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeAction,
+    ExtensionRuntimeOptions, ExtensionSpec, ExtensionSpecRuntime, ExtensionThemeDescriptor,
+    ExtensionUiCapability, ExtensionUiContext, ExtensionUiHost, ExtensionUiRequest,
+    ExtensionUiResponse, WorkingIndicatorOptions,
 };
 use serde_json::{Value, json};
 
@@ -117,6 +118,7 @@ impl ExtensionActionHost for RecordingActions {
                     name: "snapshot".to_owned(),
                     description: Some("Snapshot".to_owned()),
                 }],
+                flag_values: std::collections::BTreeMap::new(),
                 system_prompt: "fixture system".to_owned(),
                 model: None,
                 thinking_level: pi_agent::ThinkingLevel::Low,
@@ -640,6 +642,245 @@ async fn process_inexpressible_ui_factories_are_actionably_rejected() -> Result<
             command.name,
         );
     }
+    runtime.shutdown().await;
+    Ok(())
+}
+
+#[derive(Default)]
+struct ValueRecordingUi {
+    requests: Mutex<Vec<ExtensionUiRequest>>,
+}
+
+impl ValueRecordingUi {
+    fn requests(&self) -> Vec<ExtensionUiRequest> {
+        self.requests.lock().expect("UI request mutex").clone()
+    }
+}
+
+impl ExtensionUiHost for ValueRecordingUi {
+    fn request(
+        &self,
+        _context: ExtensionUiContext,
+        request: ExtensionUiRequest,
+        _cancellation: ExtensionCancellation,
+    ) -> pi_coding::ExtensionFuture<'_, Result<ExtensionUiResponse>> {
+        self.requests
+            .lock()
+            .expect("UI request mutex")
+            .push(request.clone());
+        Box::pin(async move {
+            Ok(match request {
+                ExtensionUiRequest::GetEditorText => ExtensionUiResponse::EditorText {
+                    value: "editor-text".to_owned(),
+                },
+                ExtensionUiRequest::GetAllThemes => ExtensionUiResponse::Themes {
+                    themes: vec![
+                        ExtensionThemeDescriptor {
+                            name: "dark".to_owned(),
+                            path: None,
+                        },
+                        ExtensionThemeDescriptor {
+                            name: "light".to_owned(),
+                            path: Some("/themes/light.json".to_owned()),
+                        },
+                    ],
+                },
+                ExtensionUiRequest::GetTheme { name } => ExtensionUiResponse::Theme {
+                    theme: (name == "dark").then(|| ExtensionThemeDescriptor {
+                        name,
+                        path: None,
+                    }),
+                },
+                ExtensionUiRequest::SetTheme { name } => ExtensionUiResponse::ThemeSet {
+                    success: name == "dark",
+                    error: (name != "dark").then(|| "unknown theme".to_owned()),
+                },
+                ExtensionUiRequest::GetToolsExpanded => ExtensionUiResponse::ToolsExpanded {
+                    expanded: true,
+                },
+                _ => ExtensionUiResponse::Acknowledged,
+            })
+        })
+    }
+
+    fn clear_extension(
+        &self,
+        _instance: pi_coding::ExtensionInstanceId,
+    ) -> pi_coding::ExtensionFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn real_bun_extension_apis_perform_observable_host_actions() -> Result<()> {
+    let Some(bun) = bun_executable() else {
+        return Ok(());
+    };
+    let ui = Arc::new(ValueRecordingUi::default());
+    let runtime = ExtensionRuntime::process(Some(ui.clone()), options());
+    let report = runtime
+        .load(vec![bun_spec(
+            "extension-apis",
+            "extension-apis.ts",
+            &bun,
+            [
+                ExtensionCapability::Commands,
+                ExtensionCapability::Ui,
+                ExtensionCapability::SessionActions,
+            ],
+            [
+                ExtensionUiCapability::EditorText,
+                ExtensionUiCapability::Working,
+                ExtensionUiCapability::HiddenThinking,
+                ExtensionUiCapability::Theme,
+                ExtensionUiCapability::ToolsExpanded,
+            ],
+        )])
+        .await;
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+
+    assert!(
+        runtime.shortcuts().iter().any(|shortcut| {
+            shortcut.key == "ctrl+k"
+                && shortcut.description.as_deref() == Some("Unsupported process shortcut")
+        }),
+        "shortcut registration must preserve its truthful descriptor: {:?}",
+        runtime.shortcuts(),
+    );
+    let flags = runtime.flags();
+    assert!(
+        flags.iter().any(|flag| {
+            flag.name == "verbose"
+                && flag.r#type == ExtensionFlagType::Boolean
+                && flag.default == Some(json!(true))
+        }),
+        "flag registration must preserve its declared type and default: {:?}",
+        flags,
+    );
+
+    let shortcut_error = runtime
+        .invoke_shortcut("ctrl+k", None, None)
+        .await
+        .expect_err("shortcuts must not be advertised as invokable without a real dispatcher");
+    assert!(shortcut_error.to_string().contains("unsupported"));
+
+    let result = runtime
+        .invoke_command("exercise-apis", String::new(), None, None)
+        .await?;
+    let obj = result
+        .as_object()
+        .expect("exercise-apis must return an object");
+    assert_eq!(obj["editorText"], json!("editor-text"));
+    assert_eq!(obj["themes"][0]["name"], json!("dark"));
+    assert_eq!(obj["themes"][1]["path"], json!("/themes/light.json"));
+    assert_eq!(obj["theme"]["name"], json!("dark"));
+    assert_eq!(obj["setThemeResult"], json!({ "success": true }));
+    assert_eq!(obj["missingTheme"], Value::Null);
+    assert_eq!(obj["toolsExpanded"], json!(true));
+    let verbose_error = obj["verboseError"].as_str().expect("registered flag must surface unsupported error text");
+    assert!(
+        verbose_error.contains("unsupported") && verbose_error.contains("verbose"),
+        "registered flag must fail with an actionable unsupported error, got: {verbose_error}"
+    );
+    assert_eq!(obj["missing"], Value::Null, "unknown flags follow upstream undefined semantics");
+
+    let requests = ui.requests();
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::SetWorkingMessage { message } if message.as_deref() == Some("working")
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::SetWorkingVisible { visible } if *visible
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::SetWorkingIndicator { options: Some(WorkingIndicatorOptions { frames: Some(frames), interval_ms: Some(120) }) }
+            if frames == &["·".to_owned(), "●".to_owned()]
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::SetHiddenThinkingLabel { label } if label.as_deref() == Some("thinking…")
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::SetToolsExpanded { expanded } if *expanded
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::SetTheme { name } if name == "dark"
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::PasteToEditor { text } if text == "pasted"
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::GetEditorText
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::GetAllThemes
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::GetTheme { name } if name == "dark"
+    )));
+    assert!(requests.iter().any(|request| matches!(request,
+        ExtensionUiRequest::GetToolsExpanded
+    )));
+
+    runtime.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_bun_extension_apis_reject_ungranted_ui_capabilities() -> Result<()> {
+    let Some(bun) = bun_executable() else {
+        return Ok(());
+    };
+    let ui = Arc::new(ValueRecordingUi::default());
+    let runtime = ExtensionRuntime::process(Some(ui.clone()), options());
+    let report = runtime
+        .load(vec![bun_spec(
+            "extension-apis",
+            "extension-apis.ts",
+            &bun,
+            [ExtensionCapability::Commands, ExtensionCapability::Ui],
+            [],
+        )])
+        .await;
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let error = runtime
+        .invoke_command("get-editor-text", String::new(), None, None)
+        .await
+        .expect_err("getEditorText must reject without the EditorText capability");
+    let message = error.to_string();
+    assert!(
+        message.contains("EditorText") && message.contains("not granted"),
+        "expected a permission-denied rejection for the ungranted UI capability, got: {message}",
+    );
+    runtime.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_bun_extension_apis_reject_when_no_ui_host_is_bound() -> Result<()> {
+    let Some(bun) = bun_executable() else {
+        return Ok(());
+    };
+    let mut no_ui_options = options();
+    no_ui_options.mode = ExtensionMode::Print;
+    let runtime = ExtensionRuntime::process(None, no_ui_options);
+    let report = runtime
+        .load(vec![bun_spec(
+            "extension-apis",
+            "extension-apis.ts",
+            &bun,
+            [ExtensionCapability::Commands, ExtensionCapability::Ui],
+            [ExtensionUiCapability::EditorText],
+        )])
+        .await;
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let error = runtime
+        .invoke_command("get-editor-text", String::new(), None, None)
+        .await
+        .expect_err("getEditorText must reject when no UI host is bound");
+    let message = error.to_string();
+    assert!(
+        message.contains("no extension UI adapter") || message.contains("ui_unavailable"),
+        "expected a no-UI-adapter rejection, got: {message}",
+    );
     runtime.shutdown().await;
     Ok(())
 }

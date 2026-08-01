@@ -19,6 +19,10 @@ pub const LS_DEFAULT_LIMIT: usize = 500;
 pub const FIND_DEFAULT_LIMIT: usize = 1000;
 /// Default match limit for the `grep` tool.
 pub const GREP_DEFAULT_LIMIT: usize = 100;
+/// Default / hard-max result limit for the `glob` tool (OMP child-agent parity).
+pub const GLOB_DEFAULT_LIMIT: usize = 200;
+/// Hard maximum for the `glob` tool `limit` parameter (clamped, never exceeded).
+pub const GLOB_MAX_LIMIT: usize = 200;
 
 /// Describes the outcome of a truncation operation. The JSON field names match
 /// pi's `TruncationResult` shape (truncate.ts) so it can be embedded in tool

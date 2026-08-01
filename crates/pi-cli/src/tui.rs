@@ -9,25 +9,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, window_size},
+    terminal::{disable_raw_mode, enable_raw_mode, window_size},
 };
 use futures_util::StreamExt;
 use pi_agent::{AgentEvent, ThinkingLevel};
 use pi_ai::{AssistantMessageEvent, ContentBlock, Message, Model};
 use pi_coding::{
     Application, ApplicationEvent, CONFIG_DIR_NAME, DoubleEscapeAction, ExtensionUiRequest,
-    LoopEvent, LoopTask, Session, TodoPhase, TodoStatus, UiNotificationLevel, UiSelectOption,
-    UiWidgetPlacement,
+    LoopEvent, LoopTask, Session, StreamingBehavior, TodoPhase, TodoStatus, ToolCallViewStatus,
+    UiNotificationLevel, UiSelectOption, UiWidgetPlacement,
 };
 use ratatui::{
     Terminal,
+    TerminalOptions, Viewport,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::Widget,
 };
 #[cfg(unix)]
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -42,7 +47,15 @@ use crate::interactive_commands::{
     BUILTIN_COMMANDS, CommandSource, InteractiveCommand,
     executable_catalog as interactive_commands, expand_resource_command,
 };
+use crate::job_card_adapter::{
+    JobCardPresentationAdapter, JobCardRowRole, JobCardRows,
+};
 use crate::keybindings::{Action, KeyBindingsManager};
+use crate::agents_panel::{AgentsPanel, AgentsPanelAction};
+use crate::markdown::ratatui::{
+    MarkdownRatatuiStyles, render_ratatui_markdown, render_ratatui_markdown_streaming,
+};
+use crate::process_commands::{ProcessPanel, ProcessPanelAction, render_process_panel};
 use crate::terminal_images::{
     ImageDisplayConfig, ImageFrameIdentity, ImageLayout, ImagePlacement, TerminalCellSize,
     TerminalImageRenderer,
@@ -53,10 +66,15 @@ use crate::saved_session_selector::{
 };
 use crate::scoped_model_selector::{ScopedModelSelection, ScopedModelSelector};
 use crate::theme::{Theme, ThemeManager};
+use crate::tool_card_adapter::{
+    ToolCardPresentationAdapter, ToolCardRowRole, ToolCardRows,
+};
 use crate::tree_panel::{TreePanel, TreePanelMode};
+use crate::settings_panel::{SettingsControl, SettingsPanel};
 
 const MAX_TRANSCRIPT_LINES: usize = 4_000;
 const MAX_COMPLETIONS: usize = 7;
+const MAX_PASTE_BYTES: usize = 1024 * 1024;
 
 
 #[derive(Clone)]
@@ -281,20 +299,29 @@ pub async fn interactive(
         background_tx,
         initial_scoped_models,
     );
+    let session = application.session();
     if let Some(prompt) = initial_prompts.first() {
-        let expanded = crate::file_args::expand_prompt(prompt, &state.cwd_path)?;
+        let expanded = crate::file_args::expand_prompt_in_workspace(
+            prompt,
+            session.workspace_roots(),
+        )?;
         state.push_lines("You", prompt.clone(), state.themes.theme().accent);
         application.prompt(expanded.prompt, expanded.images, None).await?;
         for prompt in initial_prompts.into_iter().skip(1) {
-            let expanded = crate::file_args::expand_prompt(&prompt, &state.cwd_path)?;
+            let expanded = crate::file_args::expand_prompt_in_workspace(
+                &prompt,
+                session.workspace_roots(),
+            )?;
             application.follow_up(expanded.prompt, expanded.images).await;
         }
     }
     let mut update_notice = Some(Box::pin(crate::self_update::startup_notice()));
     let mut theme_watch = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut animation = tokio::time::interval(std::time::Duration::from_millis(120));
 
     loop {
-        terminal.draw(|frame, images| render(frame, &state, images))?;
+        terminal.commit_settled(&mut state)?;
+        terminal.draw(&state, |frame, images| render(frame, &state, images))?;
         tokio::select! {
             terminal_event = input.next() => {
                 let Some(terminal_event) = terminal_event else {
@@ -303,10 +330,79 @@ pub async fn interactive(
                 };
                 match terminal_event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        if handle_key(&application, &mut state, key, &mut terminal).await? {
+                        if let Some(first) = raw_paste_character(key) {
+                            let mut payload = first.to_string();
+                            let mut deferred = None;
+                            let mut rejected = false;
+                            loop {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_millis(10),
+                                    input.next(),
+                                )
+                                .await
+                                {
+                                    Ok(Some(Ok(Event::Key(next))))
+                                        if next.kind != KeyEventKind::Release =>
+                                    {
+                                        if let Some(character) = raw_paste_character(next) {
+                                            if !rejected
+                                                && payload.len() + character.len_utf8()
+                                                    <= MAX_PASTE_BYTES
+                                            {
+                                                payload.push(character);
+                                            } else {
+                                                rejected = true;
+                                                payload.clear();
+                                                state.status = format!(
+                                                    "Paste rejected: input exceeds the {} MiB limit",
+                                                    MAX_PASTE_BYTES / (1024 * 1024)
+                                                );
+                                            }
+                                        } else {
+                                            deferred = Some(next);
+                                            break;
+                                        }
+                                    }
+                                    Ok(Some(Ok(Event::Paste(text)))) => {
+                                        if !rejected && payload.len() + text.len() <= MAX_PASTE_BYTES {
+                                            payload.push_str(&text);
+                                        } else {
+                                            rejected = true;
+                                            payload.clear();
+                                            state.status = format!(
+                                                "Paste rejected: input exceeds the {} MiB limit",
+                                                MAX_PASTE_BYTES / (1024 * 1024)
+                                            );
+                                        }
+                                    }
+                                    Ok(Some(Ok(_))) => break,
+                                    Ok(Some(Err(error))) => return Err(error.into()),
+                                    Ok(None) | Err(_) => break,
+                                }
+                            }
+                            if !rejected {
+                                if payload.chars().count() > 1 {
+                                    handle_paste(&mut state, &payload);
+                                } else if handle_key(&application, &mut state, key, &mut terminal).await? {
+                                    state.cancel_extension_dialogs();
+                                    return Ok(());
+                                }
+                            }
+                            if let Some(key) = deferred
+                                && handle_key(&application, &mut state, key, &mut terminal).await?
+                            {
+                                state.cancel_extension_dialogs();
+                                return Ok(());
+                            }
+                        } else if handle_key(&application, &mut state, key, &mut terminal).await? {
                             state.cancel_extension_dialogs();
                             return Ok(());
                         }
+                        state.sync_extension_host_bindings();
+                    }
+                    Event::Paste(payload) => {
+                        handle_paste(&mut state, &payload);
+                        state.sync_extension_host_bindings();
                     }
                     Event::Resize(_, _) => {}
                     _ => {}
@@ -315,7 +411,10 @@ pub async fn interactive(
             application_event = events.recv() => {
                 match application_event {
                     Ok(event) => state.apply(event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => state.push_status(format!("UI skipped {count} stale events"), true),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        state.refresh_job_projection(&application);
+                        state.push_status(format!("UI skipped {count} stale events"), true);
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => { state.cancel_extension_dialogs(); return Ok(()); }
                 }
             }
@@ -335,6 +434,7 @@ pub async fn interactive(
                     return Ok(());
                 };
                 state.apply_background(background_event);
+                state.sync_extension_host_bindings();
             }
             notice = async {
                 update_notice
@@ -348,55 +448,57 @@ pub async fn interactive(
                     state.push_status(notice, false);
                 }
             }
-            _ = theme_watch.tick() => { state.poll_theme_reload(); state.reconcile_extension_dialog(); }
+            _ = animation.tick(), if state.is_streaming => { state.animation_frame = state.animation_frame.wrapping_add(1); }
+            _ = theme_watch.tick() => {
+                let changed = state.poll_theme_reload() | state.reconcile_extension_dialog();
+                if !changed {
+                    continue;
+                }
+            }
             _ = shutdown.recv() => {
-                // SIGTERM/SIGHUP (Unix): restore the terminal and exit
-                // cleanly. The signal handler itself only signals tokio's
-                // self-pipe (async-signal-safe); all terminal IO happens
-                // here in normal async context, never in the handler.
+                // Return through TerminalGuard::drop so the live inline
+                // viewport is cleared before cooked mode and the cursor are
+                // restored. Committed rows above it remain untouched.
                 state.cancel_extension_dialogs();
-                restore_terminal();
                 return Ok(());
             }
         }
     }
 }
 
-/// Whether the TUI currently owns the terminal (raw mode + alternate screen
-/// + hidden cursor). Set on enter/re-enter, cleared on restore. RPC/JSON and
-/// print modes never set this, so terminal restoration is a no-op for them —
-/// structured-output modes never acquire a TUI guard.
+/// Whether the inline TUI currently owns raw mode and the hidden cursor.
+/// Structured-output modes never acquire a guard, so restoration is a no-op
+/// for them. The normal screen is deliberately retained for scrollback.
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-/// Restore the terminal to cooked mode + the main screen exactly once per
-/// active TUI epoch. The atomic swap is the idempotency latch: the first
-/// caller (Drop, the panic hook, or the async signal-exit branch) wins and
-/// performs the restoration; every later caller observes `false` and does
-/// nothing. Safe to call concurrently from the panic hook and Drop.
+fn acquire_terminal(writer: &mut impl Write) -> io::Result<()> {
+    execute!(writer, EnableBracketedPaste, Hide)
+}
+
+fn release_terminal(writer: &mut impl Write) -> io::Result<()> {
+    execute!(writer, DisableBracketedPaste, Show)
+}
+
+/// Restore cooked input and the visible cursor exactly once per active TUI
+/// epoch. This never clears the normal screen, so committed transcript output
+/// remains in terminal and tmux scrollback after exit, panic, or a signal.
 fn restore_terminal() {
     if TUI_ACTIVE.swap(false, Ordering::SeqCst) {
         let mut stdout = io::stdout();
-        // Clear inlined Kitty graphics before leaving the alt screen so a
-        // panic/signal-driven cleanup doesn't strand image state. Detection
-        // is env-only (non-blocking — safe in the panic path); non-Kitty
-        // terminals ignore the APC escape. Runs exactly once via the
-        // TUI_ACTIVE latch, before disable_raw_mode / Show / LeaveAlternateScreen.
         if crate::terminal_images::detect_protocol(
             &crate::terminal_images::TerminalEnvironment::current(),
         ) == Some(crate::terminal_images::TerminalImageProtocol::Kitty) {
             let _ = stdout.write_all(crate::terminal_images::KITTY_DELETE_ALL);
         }
         let _ = disable_raw_mode();
-        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+        let _ = release_terminal(&mut stdout);
         let _ = stdout.flush();
     }
 }
 
-/// Install a process-wide panic hook that restores the terminal before the
-/// panic message is printed, so a panicking TUI never strands the user in raw
-/// mode / alternate screen. Idempotent. No-op for non-TUI paths: `TUI_ACTIVE`
-/// is false there, so the hook forwards to the previous hook unchanged.
+/// Install a process-wide panic hook that restores cooked mode and the cursor
+/// before the panic is printed. The normal-screen transcript is left intact.
 pub fn install_panic_hook() {
     if INSTALLED.swap(true, Ordering::SeqCst) {
         return;
@@ -408,55 +510,115 @@ pub fn install_panic_hook() {
     }));
 }
 
+
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     images: TerminalImageRenderer,
 }
 
 impl TerminalGuard {
+    const MIN_VIEWPORT_HEIGHT: u16 = 3;
+
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+        if let Err(error) = acquire_terminal(&mut stdout) {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
-        let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+        let height = crossterm::terminal::size()
+            .map(|(_, rows)| rows.max(Self::MIN_VIEWPORT_HEIGHT))
+            .unwrap_or(24);
+        let terminal = match Terminal::with_options(
+            CrosstermBackend::new(stdout),
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        ) {
             Ok(terminal) => terminal,
             Err(error) => {
                 let mut stdout = io::stdout();
-                let _ = execute!(stdout, Show, LeaveAlternateScreen);
+                let _ = release_terminal(&mut stdout);
                 let _ = disable_raw_mode();
                 return Err(error.into());
             }
         };
         TUI_ACTIVE.store(true, Ordering::SeqCst);
-        Ok(Self { terminal, images: TerminalImageRenderer::default() })
+        Ok(Self {
+            terminal,
+            images: TerminalImageRenderer::default(),
+        })
+    }
+
+    fn commit_settled(&mut self, state: &mut TuiState) -> Result<()> {
+        self.terminal.autoresize()?;
+        let size = self.terminal.size()?;
+        let transcript_rows = transcript_region_height(state, size.height);
+        let entries = state.overflow_commit_batch(size.width.max(1), transcript_rows);
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let theme = state.themes.theme();
+        let mut lines = Vec::new();
+        for entry in &entries {
+            render_transcript_entry(
+                &mut lines,
+                entry,
+                state.show_thinking,
+                state.expand_tools,
+                theme,
+                size.width.max(1),
+            );
+        }
+        let height = u16::try_from(wrapped_line_count(&lines, size.width.max(1)))
+            .unwrap_or(u16::MAX)
+            .max(1);
+        self.terminal.insert_before(height, |buffer| {
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().fg(theme.text))
+                .wrap(Wrap { trim: false })
+                .render(buffer.area, buffer);
+        })?;
+        state.finish_commit(entries.len());
+        Ok(())
+    }
+
+    fn resize_live_viewport(&mut self, _state: &TuiState) -> Result<()> {
+        self.terminal.autoresize()?;
+        Ok(())
     }
 
     fn draw(
         &mut self,
+        state: &TuiState,
         render: impl FnOnce(&mut ratatui::Frame<'_>, &mut TerminalImageRenderer) -> ImageDrawPlan,
     ) -> Result<()> {
+        self.resize_live_viewport(state)?;
         let mut plan = None;
-        self.terminal.draw(|frame| plan = Some(render(frame, &mut self.images)))?;
+        self.terminal
+            .draw(|frame| plan = Some(render(frame, &mut self.images)))?;
         let plan = plan.expect("render closure always produces an image plan");
-        self.images.present(self.terminal.backend_mut(), plan.identity, &plan.placements)?;
+        self.images.present(
+            self.terminal.backend_mut(),
+            plan.identity,
+            &plan.placements,
+        )?;
         Ok(())
     }
 
-    /// Temporarily yield the terminal (cooked mode + main screen + visible
-    /// cursor) for a sub-operation such as `/login`, `/logout`, or an external
-    /// editor. Pairs with [`reacquire_from_shell`]. Marks the TUI inactive so a
-    /// concurrent restore (panic/signal) is a no-op while the terminal is
-    /// already yielded — the cursor is shown and the alternate screen left
-    /// exactly once across normal/panic/suspend paths.
+    /// Temporarily yield raw input and the cursor to a shell operation. The
+    /// inline viewport stays on the normal screen and committed scrollback is
+    /// never cleared.
+    /// Clear only ratatui's current inline viewport. `Terminal::clear` maps an
+    /// inline viewport to ClearType::AfterCursor from the viewport origin, so
+    /// committed normal-screen rows above it remain durable scrollback.
+    fn clear_live_viewport(&mut self) -> Result<()> {
+        self.terminal.clear()?;
+        Ok(())
+    }
     fn yield_to_shell(&mut self) -> Result<()> {
+        self.clear_live_viewport()?;
         self.images.cleanup(self.terminal.backend_mut())?;
-        // Clear inlined Kitty graphics before yielding to the cooked shell so
-        // a sub-operation (external editor/viewer) and the shell don't see
-        // stale image state. Same env-only Kitty gate as restore_terminal;
-        // flushed by the subsequent execute!(...). Runs once per yield.
         if crate::terminal_images::detect_protocol(
             &crate::terminal_images::TerminalEnvironment::current(),
         ) == Some(crate::terminal_images::TerminalImageProtocol::Kitty) {
@@ -466,16 +628,14 @@ impl TerminalGuard {
                 .write_all(crate::terminal_images::KITTY_DELETE_ALL);
         }
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), Show, LeaveAlternateScreen)?;
+        release_terminal(self.terminal.backend_mut())?;
         TUI_ACTIVE.store(false, Ordering::SeqCst);
         Ok(())
     }
 
-    /// Re-enter raw mode + alternate screen after [`yield_to_shell`].
     fn reacquire_from_shell(&mut self) -> Result<()> {
         enable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), EnterAlternateScreen, Hide)?;
-        self.terminal.clear()?;
+        acquire_terminal(self.terminal.backend_mut())?;
         self.images = TerminalImageRenderer::default();
         TUI_ACTIVE.store(true, Ordering::SeqCst);
         Ok(())
@@ -495,6 +655,9 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Best effort: erase only mutable composer/status/overlay rows. Never
+        // clear the normal screen or terminal scrollback.
+        let _ = self.terminal.clear();
         restore_terminal();
     }
 }
@@ -681,37 +844,32 @@ impl EditorState {
         if text.is_empty() {
             return;
         }
-        let normalized = if text.contains('\r') {
-            Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
-        } else {
-            Cow::Borrowed(text)
-        };
+        let normalized = normalize_newlines(text);
         self.record_undo();
         self.break_action_chain();
         self.insert_text_internal(&normalized);
     }
 
     fn insert_text_internal(&mut self, text: &str) -> EditorPosition {
-        let tail = self.lines[self.row].split_off(self.column);
-        let mut pieces = text.split('\n').peekable();
+        let original_row = self.row;
+        let tail = self.lines[original_row].split_off(self.column);
+        let mut pieces = text.split('\n');
         let first = pieces.next().unwrap_or_default();
-        self.lines[self.row].push_str(first);
-        self.column += first.len();
-        if pieces.peek().is_none() {
-            self.lines[self.row].push_str(&tail);
-            return EditorPosition {
-                row: self.row,
-                column: self.column,
-            };
-        }
-        while let Some(piece) = pieces.next() {
-            self.row += 1;
-            if pieces.peek().is_none() {
-                self.column = piece.len();
-                self.lines.insert(self.row, format!("{piece}{tail}"));
-            } else {
-                self.lines.insert(self.row, piece.to_owned());
-            }
+        self.lines[original_row].push_str(first);
+
+        let mut inserted = pieces.map(str::to_owned).collect::<Vec<_>>();
+        if inserted.is_empty() {
+            self.column += first.len();
+            self.lines[original_row].push_str(&tail);
+        } else {
+            self.row = original_row + inserted.len();
+            self.column = inserted.last().map_or(0, String::len);
+            inserted
+                .last_mut()
+                .expect("multiline insertion has a last line")
+                .push_str(&tail);
+            self.lines
+                .splice(original_row + 1..original_row + 1, inserted);
         }
         EditorPosition {
             row: self.row,
@@ -1159,6 +1317,13 @@ enum TranscriptKind {
     System,
     Custom,
     Tool,
+    Job,
+}
+
+#[derive(Clone)]
+struct ToolTranscript {
+    compact: ToolCardRows,
+    expanded: ToolCardRows,
 }
 
 #[derive(Clone)]
@@ -1166,16 +1331,51 @@ struct TranscriptEntry {
     kind: TranscriptKind,
     content: Vec<ContentBlock>,
     tool_name: Option<String>,
+    tool_card: Option<ToolTranscript>,
+    job_card: Option<JobCardRows>,
     is_error: bool,
     is_partial: bool,
 }
 
+fn tool_transcript_entry(compact: ToolCardRows, expanded: ToolCardRows) -> TranscriptEntry {
+    let is_error = compact.is_error;
+    let is_partial = compact.is_partial;
+    TranscriptEntry {
+        kind: TranscriptKind::Tool,
+        content: Vec::new(),
+        tool_name: Some(compact.tool_name.clone()),
+        tool_card: Some(ToolTranscript { compact, expanded }),
+        job_card: None,
+        is_error,
+        is_partial,
+    }
+}
+
+struct EffectiveThinkingState<'a> {
+    level: ThinkingLevel,
+    show_thinking: bool,
+    label: Cow<'a, str>,
+}
+
 struct TuiState {
     transcript: Vec<TranscriptEntry>,
+    tool_cards: ToolCardPresentationAdapter,
+    job_cards: JobCardPresentationAdapter,
+    committed_entries: usize,
     editor: EditorState,
     streaming_text: String,
     streaming_thinking: String,
+    thinking_level: ThinkingLevel,
     is_streaming: bool,
+    animation_frame: usize,
+    /// True after the TUI echoes a submitted user prompt immediately (before
+    /// the agent emits its `MessageEnd` for the persisted `Message::User`).
+    /// Consumed by the next `Message::User` `MessageEnd`, which replaces the
+    /// immediate-display entry with the canonical persisted content instead
+    /// of appending a second "You" row. Loops and follow-ups have no immediate
+    /// display, so their `MessageEnd` falls through to `push_message` and
+    /// renders exactly once.
+    pending_user_echo: bool,
     show_thinking: bool,
     double_escape_action: DoubleEscapeAction,
     last_escape: Option<std::time::Instant>,
@@ -1202,11 +1402,20 @@ struct TuiState {
     clipboard_write_busy: bool,
     commands: Vec<InteractiveCommand>,
     panel: Option<SelectorPanel>,
+    settings_panel: Option<SettingsPanel>,
+    settings_value_input: Option<(String, String)>,
     tree_panel: Option<TreePanel>,
+    process_panel: Option<ProcessPanel>,
+    agents_panel: Option<AgentsPanel>,
     scoped_models: Option<Vec<Model>>,
     session_selector: Option<SavedSessionSelector>,
     scoped_model_selector: Option<ScopedModelSelector>,
     todo_phases: Vec<TodoPhase>,
+    /// Extension-owned working indicator text; authoritative for host queries.
+    extension_working_message: Option<String>,
+    extension_working_visible: bool,
+    extension_hidden_thinking_label: Option<String>,
+    extension_title: Option<String>,
     active_loops: std::collections::BTreeMap<String, LoopTask>,
 }
 impl TuiState {
@@ -1247,10 +1456,16 @@ impl TuiState {
         let (commands, command_diagnostics) = interactive_commands(application);
         let mut state = Self {
             transcript: Vec::new(),
+            tool_cards: ToolCardPresentationAdapter::new(),
+            job_cards: JobCardPresentationAdapter::new(),
+            committed_entries: 0,
             editor: EditorState::new(),
+            thinking_level: session.thinking_level(),
             streaming_text: String::new(),
             streaming_thinking: String::new(),
             is_streaming: false,
+            animation_frame: 0,
+            pending_user_echo: false,
             show_thinking: runtime_settings.show_thinking,
             double_escape_action: runtime_settings.double_escape_action,
             last_escape: None,
@@ -1278,16 +1493,26 @@ impl TuiState {
             clipboard_write_busy: false,
             commands,
             panel: None,
+            settings_panel: None,
+            settings_value_input: None,
             tree_panel: None,
+            process_panel: None,
+            agents_panel: None,
             scoped_models: initial_scoped_models,
             session_selector: None,
             scoped_model_selector: None,
             todo_phases: application.todo_state().phases,
+            extension_working_message: None,
+            extension_working_visible: false,
+            extension_hidden_thinking_label: None,
+            extension_title: None,
             active_loops: std::collections::BTreeMap::new(),
         };
+        state.sync_extension_host_bindings();
         for message in session.history() {
             state.push_message(message);
         }
+        state.refresh_job_projection(application);
         let diagnostics: Vec<String> = state
             .themes
             .diagnostics()
@@ -1346,6 +1571,7 @@ impl TuiState {
             },
             None => None,
         };
+        self.sync_extension_host_bindings();
     }
 
     fn apply_extension_ui(&mut self, event: ExtensionUiEvent) {
@@ -1372,6 +1598,46 @@ impl TuiState {
                     self.refresh_completions();
                 }
             }
+            ExtensionUiEvent::WorkingMessageChanged { message, .. } => {
+                self.extension_working_message = message.clone();
+                if self.extension_working_visible {
+                    if let Some(message) = message.filter(|text| !text.is_empty()) {
+                        self.status = message;
+                    }
+                }
+            }
+            ExtensionUiEvent::WorkingVisibilityChanged { visible, .. } => {
+                self.extension_working_visible = visible;
+                if visible {
+                    if let Some(message) = self
+                        .extension_working_message
+                        .as_ref()
+                        .filter(|text| !text.is_empty())
+                    {
+                        self.status = message.clone();
+                    }
+                }
+            }
+            ExtensionUiEvent::WorkingIndicatorChanged { .. } => {
+                // Frames/interval are retained in the adapter snapshot; the
+                // compact TUI has no separate spinner surface beyond status.
+            }
+            ExtensionUiEvent::HiddenThinkingLabelChanged { label, .. } => {
+                self.extension_hidden_thinking_label = label;
+            }
+            ExtensionUiEvent::ThemeChanged { name, .. } => {
+                if let Err(error) = self.themes.switch_by_name(&name) {
+                    self.push_status(error, true);
+                } else {
+                    self.status = format!("Theme: {name}");
+                }
+            }
+            ExtensionUiEvent::ToolsExpandedChanged { expanded, .. } => {
+                self.expand_tools = expanded;
+            }
+            ExtensionUiEvent::TitleChanged { title, .. } => {
+                self.extension_title = Some(title);
+            }
             ExtensionUiEvent::ExtensionCleared { instance } => {
                 if self
                     .extension_dialog
@@ -1380,28 +1646,66 @@ impl TuiState {
                 {
                     self.extension_dialog = None;
                 }
+                // Re-read owner-scoped adapter snapshot after cleanup so local
+                // caches cannot outlive the cleared extension.
+                let snapshot = self.extension_ui.snapshot();
+                self.extension_working_message = snapshot.working_message;
+                self.extension_working_visible = snapshot.working_visible;
+                self.extension_hidden_thinking_label = snapshot.hidden_thinking_label;
+                self.extension_title = snapshot.title;
+                self.expand_tools = snapshot.tools_expanded;
+                if let Some(name) = snapshot.active_theme {
+                    let _ = self.themes.switch_by_name(&name);
+                }
             }
-            ExtensionUiEvent::Notification { .. }
-            | ExtensionUiEvent::StatusChanged { .. }
-            | ExtensionUiEvent::StatusCleared { .. }
+            ExtensionUiEvent::Notification { notification } => {
+                self.push_status(notification.message, matches!(notification.level, UiNotificationLevel::Error | UiNotificationLevel::Warning));
+            }
+            ExtensionUiEvent::StatusChanged { item } => {
+                self.status = item.text;
+            }
+            ExtensionUiEvent::StatusCleared { .. }
             | ExtensionUiEvent::WidgetChanged { .. }
-            | ExtensionUiEvent::WidgetCleared { .. }
-            | ExtensionUiEvent::TitleChanged { .. } => {}
+            | ExtensionUiEvent::WidgetCleared { .. } => {}
         }
+        self.sync_extension_host_bindings();
     }
 
-    fn reconcile_extension_dialog(&mut self) {
+    /// Publishes live editor/theme/tools state into the extension adapter so
+    /// canonical queries answer from the real TUI reducer, not shadow defaults.
+    fn sync_extension_host_bindings(&self) {
+        let themes = self
+            .themes
+            .names()
+            .into_iter()
+            .map(|name| pi_coding::ExtensionThemeDescriptor {
+                name,
+                path: None,
+            })
+            .collect();
+        self.extension_ui.set_themes(themes);
+        self.extension_ui
+            .set_active_theme(Some(self.themes.active_name().to_owned()));
+        self.extension_ui
+            .set_host_editor_text(self.editor.text());
+        self.extension_ui
+            .set_host_tools_expanded(self.expand_tools);
+    }
+
+    fn reconcile_extension_dialog(&mut self) -> bool {
         let Some(dialog) = &self.extension_dialog else {
-            return;
+            return false;
         };
-        if !self
+        if self
             .extension_ui
             .pending_interactions()
             .iter()
             .any(|pending| pending.id == dialog.interaction.id)
         {
-            self.extension_dialog = None;
+            return false;
         }
+        self.extension_dialog = None;
+        true
     }
 
     fn cancel_extension_dialogs(&mut self) {
@@ -1442,7 +1746,133 @@ impl TuiState {
         }
     }
 
+    fn reset_tool_projection(&mut self) {
+        self.tool_cards.clear();
+    }
+
+    fn apply_tool_event(&mut self, event: &AgentEvent) -> bool {
+        self.tool_cards.apply_agent_event(event);
+        let tool_call_id = match event {
+            AgentEvent::ToolExecutionStart { tool_call_id, .. }
+            | AgentEvent::ToolExecutionUpdate { tool_call_id, .. }
+            | AgentEvent::ToolExecutionEnd { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            AgentEvent::MessageEnd {
+                message: Message::ToolResult(result),
+            } => Some(result.tool_call_id.as_str()),
+            _ => None,
+        };
+        if let Some(tool_call_id) = tool_call_id {
+            self.upsert_tool_card(tool_call_id);
+            return matches!(event, AgentEvent::MessageEnd { message: Message::ToolResult(_) });
+        }
+        false
+    }
+
+    fn upsert_tool_card(&mut self, tool_call_id: &str) {
+        let (Some(compact), Some(expanded)) = (
+            self.tool_cards.rows(tool_call_id, false),
+            self.tool_cards.rows(tool_call_id, true),
+        ) else {
+            return;
+        };
+        let entry = tool_transcript_entry(compact, expanded);
+        if let Some(existing) = self.transcript.iter_mut().find(|entry| {
+            entry.tool_card.as_ref().is_some_and(|tool| {
+                tool.compact.tool_call_id == tool_call_id
+            })
+        }) {
+            *existing = entry;
+            self.trim_transcript();
+            self.follow_transcript();
+        } else {
+            self.push_entry(entry);
+        }
+    }
+
+    fn push_bash_execution(&mut self, message: pi_ai::BashExecutionMessage) {
+        let compact = ToolCardPresentationAdapter::bash_execution_rows(&message, false);
+        let expanded = ToolCardPresentationAdapter::bash_execution_rows(&message, true);
+        let tool_call_id = compact.tool_call_id.clone();
+        let entry = tool_transcript_entry(compact, expanded);
+        if let Some(existing) = self.transcript.iter_mut().find(|entry| {
+            entry.tool_card.as_ref().is_some_and(|tool| {
+                tool.compact.tool_call_id == tool_call_id
+            })
+        }) {
+            *existing = entry;
+            self.trim_transcript();
+            self.follow_transcript();
+        } else {
+            self.push_entry(entry);
+        }
+    }
+
+    fn push_tool_result(&mut self, message: pi_ai::ToolResultMessage) {
+        let tool_call_id = message.tool_call_id.clone();
+        self.tool_cards.apply_tool_result(&message);
+        self.upsert_tool_card(&tool_call_id);
+    }
+
+    fn apply_orchestration_event(&mut self, event: pi_coding::OrchestrationEvent) {
+        self.job_cards.apply_orchestration_event(&event);
+        self.sync_job_cards();
+    }
+
+    fn refresh_job_projection(&mut self, application: &Application) {
+        self.job_cards.clear();
+        let Some(runtime) = application.orchestration_runtime() else {
+            return;
+        };
+        self.job_cards.replace_snapshots(
+            runtime.group_id().to_owned(),
+            runtime.jobs(None),
+            runtime.list(runtime.main_agent_id()),
+        );
+        self.sync_job_cards();
+    }
+
+    fn sync_job_cards(&mut self) {
+        let mut cards = self.job_cards.cards_in_source_order();
+        if let (Some(card), Some(aggregate)) = (cards.last_mut(), self.job_cards.aggregate_row()) {
+            card.rows.push(aggregate);
+        }
+        for card in cards {
+            let job_id = card.job_id.clone();
+            let is_partial = matches!(
+                card.job_status,
+                pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running
+            );
+            let is_error = card.job_status == pi_coding::JobStatus::Failed;
+            let entry = TranscriptEntry {
+                kind: TranscriptKind::Job,
+                content: Vec::new(),
+                tool_name: None,
+                tool_card: None,
+                job_card: Some(card),
+                is_error,
+                is_partial,
+            };
+            if let Some(existing) = self.transcript.iter_mut().find(|entry| {
+                entry
+                    .job_card
+                    .as_ref()
+                    .is_some_and(|card| card.job_id == job_id)
+            }) {
+                *existing = entry;
+            } else {
+                self.transcript.push(entry);
+            }
+        }
+        self.trim_transcript();
+        self.follow_transcript();
+    }
+
     fn apply(&mut self, event: ApplicationEvent) {
+        if let ApplicationEvent::Agent(agent_event) = &event
+            && self.apply_tool_event(agent_event)
+        {
+            return;
+        }
         match event {
             ApplicationEvent::Agent(AgentEvent::AgentStart) => {
                 self.is_streaming = true;
@@ -1465,41 +1895,40 @@ impl TuiState {
                 self.streaming_thinking.push_str(&delta);
                 self.follow_transcript();
             }
-            ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
-                tool_name,
-                arguments,
-                ..
-            }) => self.push_tool(tool_name, arguments, Vec::new(), false, true),
-            ApplicationEvent::Agent(AgentEvent::ToolExecutionUpdate {
-                tool_name,
-                arguments,
-                partial_result,
-                ..
-            }) => self.push_tool(tool_name, arguments, partial_result.content, false, true),
-            ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
-                tool_name,
-                result,
-                is_error,
-                ..
-            }) => self.push_tool(
-                tool_name,
-                serde_json::Value::Null,
-                result.content,
-                is_error,
-                false,
-            ),
+            ApplicationEvent::Agent(
+                AgentEvent::ToolExecutionStart { .. }
+                | AgentEvent::ToolExecutionUpdate { .. }
+                | AgentEvent::ToolExecutionEnd { .. },
+            ) => {}
             ApplicationEvent::Agent(AgentEvent::MessageEnd { message }) => {
                 if matches!(message, Message::Assistant(_)) {
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
                 }
-                self.push_message(message);
+                if let Message::Custom(custom) = &message
+                    && pi_coding::loop_message_view(custom).is_some()
+                {
+                    self.push_loop_message(custom);
+                } else if self.pending_user_echo
+                    && let Message::User(user) = message
+                {
+                    // The TUI already echoed this prompt on submission. The
+                    // canonical `MessageEnd` only confirms Session persistence
+                    // (handled by the session's history subscription, outside
+                    // the TUI), so reconcile it into the immediate-display
+                    // slot — upgrading to the persisted content blocks (which
+                    // carry image attachments) — instead of appending a second
+                    // "You" row.
+                    self.pending_user_echo = false;
+                    self.replace_last_user_entry(TranscriptEntry { kind: TranscriptKind::User, content: user.content, tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false });
+                } else {
+                    self.push_message(message);
+                }
             }
+            ApplicationEvent::Orchestration(event) => self.apply_orchestration_event(event),
             ApplicationEvent::Session(pi_coding::SessionEvent::BashExecutionEnd { message }) => {
-                self.push_message(Message::BashExecution(message));
-                self.status = "Ready".to_owned();
+                self.push_bash_execution(message);
             }
-            ApplicationEvent::Session(pi_coding::SessionEvent::BashExecutionUpdate { .. }) => {}
             ApplicationEvent::Session(pi_coding::SessionEvent::AutoRetryStart {
                 attempt,
                 max_attempts,
@@ -1545,6 +1974,11 @@ impl TuiState {
                 self.todo_phases = phases;
                 let open = todo_open_count(&self.todo_phases);
                 self.status = format!("Todo reminder: {open} open task(s)");
+            }
+            ApplicationEvent::Process(event) => {
+                if let Some(panel) = &mut self.process_panel {
+                    panel.apply_event(event);
+                }
             }
             ApplicationEvent::Loop(event) => self.apply_loop_event(event),
             _ => {}
@@ -1602,76 +2036,82 @@ impl TuiState {
         self.todo_phases.clear();
     }
 
+    /// Atomically replace every conversation-derived display buffer from the
+    /// shared application after tree navigation, fork, resume, or reset.
+    /// Reset ledger indices before replay so committed history from the old
+    /// conversation can never index into the shorter replacement transcript.
+    fn replace_transcript_from_application(&mut self, application: &Application) {
+        let session = application.session();
+        self.model = session.model().map_or_else(
+            || "no model".to_owned(),
+            |model| format!("{}/{}", model.provider, model.id),
+        );
+        self.thinking_level = session.thinking_level();
+        self.cwd_path = session.cwd().to_path_buf();
+        self.cwd = self.cwd_path.display().to_string();
+        self.transcript.clear();
+        self.committed_entries = 0;
+        self.transcript_scroll = 0;
+        self.transcript_page_rows.set(1);
+        self.streaming_text.clear();
+        self.streaming_thinking.clear();
+        self.is_streaming = false;
+        self.pending_user_echo = false;
+        self.reset_tool_projection();
+        self.job_cards.clear();
+        for message in application.messages() {
+            self.push_message(message);
+        }
+        self.refresh_job_projection(application);
+        self.committed_entries = self.committed_entries.min(self.transcript.len());
+    }
+
+    fn push_loop_message(&mut self, message: &pi_ai::CustomMessage) {
+        let Some(loop_message) = pi_coding::loop_message_view(message) else { return };
+        self.push_entry(TranscriptEntry { kind: TranscriptKind::System, content: vec![ContentBlock::text(loop_message.prompt)], tool_name: Some(format!("Loop {} · {}", loop_message.task_id, loop_message.schedule)), tool_card: None, job_card: None, is_error: false, is_partial: false });
+    }
+
     fn push_message(&mut self, message: Message) {
         match message {
-            Message::User(message) => self.push_entry(TranscriptEntry {
-                kind: TranscriptKind::User,
-                content: message.content,
-                tool_name: None,
-                is_error: false,
-                is_partial: false,
-            }),
-            Message::Assistant(message) => self.push_entry(TranscriptEntry {
-                kind: TranscriptKind::Assistant,
-                content: message.content,
-                tool_name: None,
-                is_error: false,
-                is_partial: false,
-            }),
-            Message::ToolResult(message) => self.push_entry(TranscriptEntry {
-                kind: TranscriptKind::Tool,
-                content: message.content,
-                tool_name: Some(message.tool_name),
-                is_error: message.is_error,
-                is_partial: false,
-            }),
-            Message::BashExecution(message) => self.push_entry(TranscriptEntry {
-                kind: TranscriptKind::Tool,
-                content: vec![ContentBlock::text(pi_ai::bash_execution_to_text(&message))],
-                tool_name: Some("Bash".to_owned()),
-                is_error: message.cancelled || message.exit_code.is_some_and(|code| code != 0),
-                is_partial: false,
-            }),
-            Message::Custom(message) => {
-                if message.display {
-                    self.push_entry(TranscriptEntry {
-                        kind: TranscriptKind::Custom,
-                        content: message.content.into_blocks(),
-                        tool_name: Some(message.custom_type),
-                        is_error: false,
-                        is_partial: false,
-                    });
+            Message::User(message) => self.push_entry(TranscriptEntry { kind: TranscriptKind::User, content: message.content, tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false }),
+            Message::Assistant(message) => {
+                let content = message
+                    .content
+                    .into_iter()
+                    .filter(|block| !matches!(block, ContentBlock::ToolCall(_)))
+                    .collect::<Vec<_>>();
+                if !content.is_empty() {
+                    self.push_entry(TranscriptEntry { kind: TranscriptKind::Assistant, content, tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false });
                 }
             }
-            Message::BranchSummary(message) => self.push_entry(TranscriptEntry {
-                kind: TranscriptKind::System,
-                content: vec![ContentBlock::text(message.summary)],
-                tool_name: Some("Branch summary".to_owned()),
-                is_error: false,
-                is_partial: false,
-            }),
-            Message::CompactionSummary(message) => self.push_entry(TranscriptEntry {
-                kind: TranscriptKind::System,
-                content: vec![ContentBlock::text(message.summary)],
-                tool_name: Some("Compaction summary".to_owned()),
-                is_error: false,
-                is_partial: false,
-            }),
+            Message::ToolResult(message) => self.push_tool_result(message),
+            Message::BashExecution(message) => self.push_bash_execution(message),
+            Message::Custom(message) => {
+                if pi_coding::loop_message_view(&message).is_some() {
+                    self.push_loop_message(&message);
+                } else if message.display {
+                    self.push_entry(TranscriptEntry { kind: TranscriptKind::Custom, content: message.content.into_blocks(), tool_name: Some(message.custom_type), tool_card: None, job_card: None, is_error: false, is_partial: false });
+                }
+            }
+            Message::BranchSummary(message) => self.push_entry(TranscriptEntry { kind: TranscriptKind::System, content: vec![ContentBlock::text(message.summary)], tool_name: Some("Branch summary".to_owned()), tool_card: None, job_card: None, is_error: false, is_partial: false }),
+            Message::CompactionSummary(message) => self.push_entry(TranscriptEntry { kind: TranscriptKind::System, content: vec![ContentBlock::text(message.summary)], tool_name: Some("Compaction summary".to_owned()), tool_card: None, job_card: None, is_error: false, is_partial: false }),
         }
     }
 
     fn push_lines(&mut self, label: &str, text: String, _color: Color) {
-        self.push_entry(TranscriptEntry {
-            kind: if label == "You" {
-                TranscriptKind::User
-            } else {
-                TranscriptKind::System
-            },
-            content: vec![ContentBlock::text(text)],
-            tool_name: None,
-            is_error: false,
-            is_partial: false,
-        });
+        let is_user_echo = label == "You";
+        // The immediate "You" echo is the only transcript source for a
+        // user-submitted prompt until the agent's `MessageEnd` arrives; arm
+        // `pending_user_echo` so that event reconciles into this slot instead
+        // of appending a duplicate "You" row.
+        if is_user_echo {
+            self.pending_user_echo = true;
+        }
+        self.push_entry(TranscriptEntry { kind: if is_user_echo {
+            TranscriptKind::User
+        } else {
+            TranscriptKind::System
+        }, content: vec![ContentBlock::text(text)], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false });
     }
 
     fn push_status(&mut self, text: String, is_error: bool) {
@@ -1679,36 +2119,13 @@ impl TuiState {
             kind: TranscriptKind::System,
             content: vec![ContentBlock::text(text)],
             tool_name: None,
+            tool_card: None,
+            job_card: None,
             is_error,
             is_partial: false,
         });
     }
 
-    fn push_tool(
-        &mut self,
-        tool_name: String,
-        arguments: serde_json::Value,
-        mut content: Vec<ContentBlock>,
-        is_error: bool,
-        is_partial: bool,
-    ) {
-        self.transcript.retain(|entry| {
-            !(entry.kind == TranscriptKind::Tool
-                && entry.is_partial
-                && entry.tool_name.as_deref() == Some(&tool_name))
-        });
-        let summary = compact_arguments(&arguments);
-        if !summary.is_empty() {
-            content.insert(0, ContentBlock::text(summary));
-        }
-        self.push_entry(TranscriptEntry {
-            kind: TranscriptKind::Tool,
-            content,
-            tool_name: Some(tool_name),
-            is_error,
-            is_partial,
-        });
-    }
 
     fn push_entry(&mut self, entry: TranscriptEntry) {
         self.transcript.push(entry);
@@ -1716,10 +2133,121 @@ impl TuiState {
         self.follow_transcript();
     }
 
+    fn settled_end(&self) -> usize {
+        let mut end = self.committed_entries;
+        while let Some(entry) = self.transcript.get(end) {
+            let pending_user = self.pending_user_echo
+                && end + 1 == self.transcript.len()
+                && entry.kind == TranscriptKind::User;
+            if entry.is_partial || pending_user {
+                break;
+            }
+            end += 1;
+        }
+        end
+    }
+
+    fn settled_commit_batch(&self) -> Vec<TranscriptEntry> {
+        self.transcript[self.committed_entries..self.settled_end()].to_vec()
+    }
+
+    fn overflow_commit_batch(&self, width: u16, viewport_rows: u16) -> Vec<TranscriptEntry> {
+        let theme = self.themes.theme();
+        let mut rendered = Vec::new();
+        for entry in &self.transcript[self.committed_entries..] {
+            render_transcript_entry(
+                &mut rendered,
+                entry,
+                self.show_thinking,
+                self.expand_tools,
+                theme,
+                width,
+            );
+        }
+        if !self.streaming_thinking.is_empty() || !self.streaming_text.is_empty() {
+            let mut content = Vec::new();
+            if !self.streaming_thinking.is_empty() {
+                content.push(ContentBlock::thinking(self.streaming_thinking.clone()));
+            }
+            if !self.streaming_text.is_empty() {
+                content.push(ContentBlock::text(self.streaming_text.clone()));
+            }
+            render_transcript_entry(
+                &mut rendered,
+                &TranscriptEntry {
+                    kind: TranscriptKind::Assistant,
+                    content,
+                    tool_name: None,
+                    tool_card: None,
+                    job_card: None,
+                    is_error: false,
+                    is_partial: true,
+                },
+                self.show_thinking,
+                self.expand_tools,
+                theme,
+                width,
+            );
+        }
+        let width = width.max(1);
+        let mut rows = wrapped_line_count(&rendered, width);
+        let settled_end = self.settled_end();
+        let live_entries = self.transcript.len().saturating_sub(self.committed_entries);
+        let mut end = self.committed_entries;
+        while rows > usize::from(viewport_rows.max(1))
+            && end < settled_end
+            && live_entries.saturating_sub(end - self.committed_entries) > 1
+        {
+            let mut entry_lines = Vec::new();
+            render_transcript_entry(
+                &mut entry_lines,
+                &self.transcript[end],
+                self.show_thinking,
+                self.expand_tools,
+                theme,
+                width,
+            );
+            rows = rows.saturating_sub(wrapped_line_count(&entry_lines, width));
+            end += 1;
+        }
+        self.transcript[self.committed_entries..end].to_vec()
+    }
+
+    fn finish_commit(&mut self, count: usize) {
+        self.committed_entries = self
+            .committed_entries
+            .saturating_add(count)
+            .min(self.transcript.len());
+    }
+
+    /// Reconcile a canonical `Message::User` `MessageEnd` into the
+    /// immediate-display "You" slot left by [`push_lines`] instead of pushing
+    /// a second entry. The immediate echo is always the last transcript entry
+    /// when the matching `MessageEnd` arrives (only `AgentStart`, which emits
+    /// no transcript row, is processed in between), so this collapses the two
+    /// rows into one carrying the persisted content blocks. If the slot was
+    /// somehow displaced, fall back to a normal append so the user message is
+    /// never lost.
+    fn replace_last_user_entry(&mut self, entry: TranscriptEntry) {
+        if matches!(
+            self.transcript.last(),
+            Some(existing) if existing.kind == TranscriptKind::User
+        ) {
+            if let Some(last) = self.transcript.last_mut() {
+                *last = entry;
+            }
+            self.trim_transcript();
+            self.follow_transcript();
+        } else {
+            self.push_entry(entry);
+        }
+    }
+
     fn trim_transcript(&mut self) {
         if self.transcript.len() > MAX_TRANSCRIPT_LINES {
             let excess = self.transcript.len() - MAX_TRANSCRIPT_LINES;
             self.transcript.drain(..excess);
+            self.committed_entries = self.committed_entries.saturating_sub(excess);
         }
     }
 
@@ -1738,17 +2266,45 @@ impl TuiState {
 
     fn toggle_tool_details(&mut self) {
         self.expand_tools = !self.expand_tools;
+        self.sync_extension_host_bindings();
+    }
+
+    fn effective_thinking_state(&self) -> EffectiveThinkingState<'_> {
+        let label = if self.show_thinking {
+            Cow::Borrowed(crate::output::thinking_level_str(self.thinking_level))
+        } else if let Some(label) = self
+            .extension_hidden_thinking_label
+            .as_deref()
+            .filter(|label| !label.trim().is_empty())
+        {
+            Cow::Borrowed(label)
+        } else {
+            Cow::Owned(format!(
+                "{} hidden",
+                crate::output::thinking_level_str(self.thinking_level)
+            ))
+        };
+        EffectiveThinkingState {
+            level: self.thinking_level,
+            show_thinking: self.show_thinking,
+            label,
+        }
     }
 
     fn toggle_thinking(&mut self) {
         self.show_thinking = !self.show_thinking;
     }
 
-    fn poll_theme_reload(&mut self) {
+    fn poll_theme_reload(&mut self) -> bool {
         let reload = self.themes.reload_if_changed();
+        let changed = reload.changed || !reload.diagnostics.is_empty();
         for diagnostic in reload.diagnostics {
             self.push_status(format!("Theme reload ignored: {diagnostic}"), true);
         }
+        if reload.changed {
+            self.sync_extension_host_bindings();
+        }
+        changed
     }
 
     fn refresh_completions(&mut self) {
@@ -1883,11 +2439,7 @@ impl TuiState {
                             self.pending_attachments.len()
                         );
                     }
-                    Ok(Some(ClipboardContent::Text(text))) => {
-                        self.editor.insert_text(&text);
-                        self.status = "Pasted clipboard text".to_owned();
-                        self.refresh_completions();
-                    }
+                    Ok(Some(ClipboardContent::Text(text))) => self.handle_paste(&text),
                     Ok(None) => {
                         self.push_status("Clipboard is empty".to_owned(), true);
                     }
@@ -1904,6 +2456,23 @@ impl TuiState {
                 }
             }
         }
+    }
+
+    fn handle_paste(&mut self, payload: &str) {
+        if payload.len() > MAX_PASTE_BYTES {
+            self.status = format!(
+                "Paste rejected: {} bytes exceeds the {} MiB limit",
+                payload.len(),
+                MAX_PASTE_BYTES / (1024 * 1024)
+            );
+            return;
+        }
+        if payload.is_empty() {
+            return;
+        }
+        self.editor.insert_text(payload);
+        self.status = format!("Pasted {} bytes", payload.len());
+        self.refresh_completions();
     }
 
     fn start_clipboard_read(&mut self) {
@@ -1939,6 +2508,17 @@ impl TuiState {
                 .map_err(|error| error.to_string());
             let _ = tx.send(BackgroundEvent::ClipboardWrite(result));
         });
+    }
+
+    fn accept_unambiguous_command_prefix(&mut self) -> bool {
+        let text = self.editor.text();
+        let Some(prefix) = text.strip_prefix('/') else { return false; };
+        if prefix.is_empty() || prefix.contains(char::is_whitespace) { return false; }
+        let matches = self.commands.iter().filter(|command| command.name.starts_with(prefix)).collect::<Vec<_>>();
+        if matches.len() != 1 || matches[0].name == prefix { return false; }
+        self.editor.set_text(&format!("/{}", matches[0].name));
+        self.refresh_completions();
+        true
     }
 
     fn accept_completion(&mut self) {
@@ -2022,6 +2602,7 @@ impl TuiState {
     async fn open_session_panel(&mut self, application: &Application) {
         let current = application.state().await.session_file.map(PathBuf::from);
         self.panel = None;
+        self.agents_panel = None;
         self.tree_panel = None;
         self.scoped_model_selector = None;
         self.session_selector = Some(SavedSessionSelector::new(
@@ -2032,6 +2613,7 @@ impl TuiState {
 
     async fn open_scoped_models_panel(&mut self) {
         self.panel = None;
+        self.agents_panel = None;
         self.tree_panel = None;
         self.session_selector = None;
         self.scoped_model_selector = Some(ScopedModelSelector::new(
@@ -2040,39 +2622,32 @@ impl TuiState {
         ));
     }
 
-    async fn open_settings_panel(&mut self, application: &Application) {
-        let state = application.state().await;
-        self.panel = Some(SelectorPanel {
-            title: "Settings".to_owned(),
-            help: "Enter change · Esc close".to_owned(),
-            items: vec![
-                PanelItem {
-                    label: "Thinking level".to_owned(),
-                    description: crate::output::thinking_level_str(state.thinking_level).to_owned(),
-                    value: PanelValue::SettingsThinking,
-                    checked: false,
-                },
-                PanelItem {
-                    label: "Theme".to_owned(),
-                    description: self.themes.active_name().to_owned(),
-                    value: PanelValue::SettingsTheme,
-                    checked: false,
-                },
-                PanelItem {
-                    label: "Automatic compaction".to_owned(),
-                    description: if state.auto_compaction_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                    .to_owned(),
-                    value: PanelValue::SettingsAutoCompact,
-                    checked: state.auto_compaction_enabled,
-                },
-            ],
-            selected: 0,
-            query: String::new(),
-        });
+    fn open_settings_panel(&mut self, application: &Application) {
+        self.panel = None;
+        self.tree_panel = None;
+        self.process_panel = None;
+        self.agents_panel = None;
+        self.session_selector = None;
+        self.scoped_model_selector = None;
+        match SettingsPanel::from_application(application, pi_coding::SettingsScope::Global) {
+            Ok(panel) => self.settings_panel = Some(panel),
+            Err(error) => self.push_status(format!("Cannot open settings: {error:#}"), true),
+        }
+    }
+
+
+    async fn open_agents_panel(&mut self, application: &Application) {
+        self.panel = None;
+        self.tree_panel = None;
+        self.process_panel = None;
+        self.session_selector = None;
+        self.scoped_model_selector = None;
+        match AgentsPanel::from_application(application, available_models().await) {
+            Ok(panel) => {
+                self.agents_panel = Some(panel);
+            }
+            Err(error) => self.push_status(format!("Cannot open agents panel: {error:#}"), true),
+        }
     }
 
     fn open_tree_panel(&mut self, application: &Application) {
@@ -2087,6 +2662,8 @@ impl TuiState {
         match application.session_tree() {
             Ok(tree) => {
                 self.panel = None;
+                self.agents_panel = None;
+                self.process_panel = None;
                 self.tree_panel = Some(TreePanel::new(tree, mode));
             }
             Err(error) => self.push_status(format!("Cannot load session tree: {error:#}"), true),
@@ -2228,10 +2805,7 @@ async fn handle_tree_panel_key(
                     .await
                 {
                     Ok(result) => {
-                        state.transcript.clear();
-                        for message in application.messages() {
-                            state.push_message(message);
-                        }
+                        state.replace_transcript_from_application(application);
                         if let Some(text) = result.editor_text {
                             state.editor.set_text(&text);
                         }
@@ -2260,10 +2834,7 @@ async fn handle_tree_panel_key(
                     }
                     match application.fork_session(&selected.id).await {
                         Ok(prompt) => {
-                            state.transcript.clear();
-                            for message in application.messages() {
-                                state.push_message(message);
-                            }
+                            state.replace_transcript_from_application(application);
                             state.editor.set_text(&prompt);
                             state.status =
                                 "Forked session; edit and submit the selected prompt".to_owned();
@@ -2344,18 +2915,32 @@ async fn handle_session_selector_key(
                 KeyCode::Enter => match selector.confirm() {
                     SessionSelectorRequest::None => {}
                     SessionSelectorRequest::Resume(path) => {
-                        match application.switch_session(&path).await {
-                            Ok(()) => {
-                                keep_open = false;
-                                state.transcript.clear();
-                                for message in application.messages() {
-                                    state.push_message(message);
+                        match pi_coding::SessionCatalog::from_env() {
+                            Ok(catalog) => match crate::resume_catalog::switch_resume_selection(
+                                application,
+                                &catalog,
+                                &crate::resume_catalog::ResumeSelectionRequest::Input(
+                                    path.to_string_lossy().into_owned(),
+                                ),
+                                Some(&state.cwd_path),
+                            )
+                            .await
+                            {
+                                Ok(result) => {
+                                    keep_open = false;
+                                    state.replace_transcript_from_application(application);
+                                    state.refresh_todo_display(application);
+                                    state.status = format!("Resumed {}", result.path.display());
                                 }
-                                state.refresh_todo_display(application);
-                                state.status = format!("Resumed {}", path.display());
-                            }
-                            Err(error) => state
-                                .push_status(format!("Failed to resume session: {error:#}"), true),
+                                Err(error) => state.push_status(
+                                    format!("Failed to resume session: {error:#}"),
+                                    true,
+                                ),
+                            },
+                            Err(error) => state.push_status(
+                                format!("Failed to resume session: {error:#}"),
+                                true,
+                            ),
                         }
                     }
                     SessionSelectorRequest::Rename { path, name } => {
@@ -2494,6 +3079,45 @@ fn handle_scoped_model_selector_key(
     Ok(Some(false))
 }
 
+async fn handle_settings_panel_key(application: &Application, state: &mut TuiState, key: KeyEvent) -> Result<Option<bool>> {
+    let Some(mut panel) = state.settings_panel.take() else { return Ok(None); };
+    if let Some((setting_key, mut value)) = state.settings_value_input.take() {
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Backspace => { value.pop(); state.settings_value_input = Some((setting_key, value)); }
+            KeyCode::Enter => { let parsed = serde_json::from_str::<serde_json::Value>(&value).unwrap_or_else(|_| serde_json::Value::String(value.clone())); if let Err(error) = panel.set_value(&setting_key, parsed) { state.status = format!("Invalid setting value: {error:#}"); state.settings_value_input = Some((setting_key, value)); } }
+            KeyCode::Char(character) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => { value.push(character); state.settings_value_input = Some((setting_key, value)); }
+            _ => state.settings_value_input = Some((setting_key, value)),
+        }
+        state.settings_panel = Some(panel); return Ok(Some(false));
+    }
+    match key.code {
+        KeyCode::Esc => { panel.cancel()?; return Ok(Some(false)); }
+        KeyCode::Up => panel.move_previous()?, KeyCode::Down => panel.move_next()?,
+        KeyCode::Left => panel.previous_category(), KeyCode::Right | KeyCode::Tab => panel.next_category(), KeyCode::BackTab => panel.previous_category(),
+        KeyCode::Backspace => { let mut search = panel.search().to_owned(); search.pop(); panel.set_search(search); }
+        KeyCode::Delete => if let Some(row) = panel.selected()? { if let Err(error) = panel.reset(&row.key) { state.status = format!("Cannot reset setting: {error:#}"); } },
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => if let Err(error) = panel.set_scope(pi_coding::SettingsScope::Global) { state.status = format!("Cannot change settings scope: {error:#}"); },
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => if let Err(error) = panel.set_scope(pi_coding::SettingsScope::Project) { state.status = format!("Cannot change settings scope: {error:#}"); },
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => match panel.validate() {
+            Err(error) => state.status = format!("Settings validation failed: {error:#}"),
+            Ok(()) => match panel.apply(application).await {
+                Ok(outcome) => { if outcome.applied_live || outcome.reloaded { state.apply_runtime_settings(application).await; } state.status = if outcome.restart_required { "Settings saved; restart required".to_owned() } else { "Settings applied".to_owned() }; }
+                Err(error) => state.status = format!("Settings apply failed: {error:#}"),
+            },
+        },
+        KeyCode::Enter => if let Some(row) = panel.selected()? { if row.writable && row.blocked_reason.is_none() { match row.control {
+            SettingsControl::Boolean { value } => panel.set_boolean(&row.key, !value.unwrap_or(false))?,
+            SettingsControl::Enum { value, options } => if !options.is_empty() { let next = value.as_ref().and_then(|current| options.iter().position(|option| option == current)).map_or(0, |index| (index + 1) % options.len()); panel.set_enum(&row.key, options[next].clone())?; },
+            SettingsControl::Secret { .. } => state.status = "Secret settings are managed through auth storage".to_owned(),
+            _ => { let initial = row.scope_value.as_ref().unwrap_or(&row.effective_value); state.settings_value_input = Some((row.key, match initial { serde_json::Value::String(value) => value.clone(), other => other.to_string() })); }
+        } } },
+        KeyCode::Char(character) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => { let mut search = panel.search().to_owned(); search.push(character); panel.set_search(search); }
+        _ => {}
+    }
+    state.settings_panel = Some(panel); Ok(Some(false))
+}
+
 async fn handle_panel_key(
     application: &Application,
     state: &mut TuiState,
@@ -2527,10 +3151,15 @@ async fn handle_panel_key(
                 PanelValue::Model(model) => {
                     let reference = format!("{}/{}", model.provider, model.id);
                     match application.set_model_with_resolved_auth(model).await {
-                        Ok(()) => {
+                        Ok(change) => {
                             state.model = reference;
+                            state.thinking_level = change.effective;
                             state.panel = None;
-                            state.status = format!("Model: {}", state.model);
+                            state.status = if change.clamped {
+                                change.message
+                            } else {
+                                format!("Model: {}", state.model)
+                            };
                         }
                         Err(error) => {
                             state.push_status(format!("Cannot switch model: {error:#}"), true)
@@ -2538,16 +3167,16 @@ async fn handle_panel_key(
                     }
                 }
                 PanelValue::Thinking(level) => {
-                    application.set_thinking_level(level);
+                    let change = application.set_thinking_level(level);
+                    state.thinking_level = change.effective;
                     state.panel = None;
-                    state.status =
-                        format!("Thinking: {}", crate::output::thinking_level_str(level));
+                    state.status = change.message;
                 }
                 PanelValue::SettingsThinking => state.open_thinking_panel(application).await,
                 PanelValue::SettingsTheme => {
                     state.themes.cycle(1);
                     state.status = format!("Theme: {}", state.themes.active_name());
-                    state.open_settings_panel(application).await;
+                    state.open_settings_panel(application);
                 }
                 PanelValue::SettingsAutoCompact => {
                     let enabled = !application.state().await.auto_compaction_enabled;
@@ -2556,7 +3185,7 @@ async fn handle_panel_key(
                         "Automatic compaction {}",
                         if enabled { "enabled" } else { "disabled" }
                     );
-                    state.open_settings_panel(application).await;
+                    state.open_settings_panel(application);
                 }
                 PanelValue::Trust(decision) => {
                     match application.set_project_trust(decision).await {
@@ -2585,6 +3214,27 @@ async fn handle_panel_key(
         _ => {}
     }
     Ok(Some(false))
+}
+
+fn handle_extension_dialog_paste(state: &mut TuiState, payload: &str) -> bool {
+    let Some(dialog) = state.extension_dialog.as_mut() else {
+        return false;
+    };
+    if payload.len() > MAX_PASTE_BYTES {
+        state.status = format!(
+            "Paste rejected: {} bytes exceeds the {} MiB limit",
+            payload.len(),
+            MAX_PASTE_BYTES / (1024 * 1024)
+        );
+        return true;
+    }
+    match &mut dialog.kind {
+        ExtensionDialogKind::Input { editor, .. } | ExtensionDialogKind::Editor { editor } => {
+            editor.insert_text(payload);
+        }
+        ExtensionDialogKind::Select { .. } | ExtensionDialogKind::Confirm { .. } => {}
+    }
+    true
 }
 
 fn handle_extension_dialog_key(state: &mut TuiState, key: KeyEvent) -> bool {
@@ -2638,6 +3288,140 @@ fn handle_extension_dialog_key(state: &mut TuiState, key: KeyEvent) -> bool {
     true
 }
 
+async fn handle_process_panel_key(
+    application: &Application,
+    state: &mut TuiState,
+    key: KeyEvent,
+) -> Result<bool> {
+    let Some(mut panel) = state.process_panel.take() else { return Ok(false); };
+    match panel.handle_key(key) {
+        Some(ProcessPanelAction::Close) => return Ok(true),
+        Some(ProcessPanelAction::Open(id)) => match application.process_logs(&id, 0, None, false, None).await {
+            Ok(logs) => panel.set_logs(&id, &logs),
+            Err(error) => panel.fail(format!("Cannot read process output: {error:#}")),
+        },
+        Some(ProcessPanelAction::SendText { id, text }) => {
+            if let Err(error) = application.process_write(&id, text.into_bytes(), false).await { panel.fail(format!("Cannot send input: {error:#}")); }
+        }
+        Some(ProcessPanelAction::SendKeys { id, keys }) => {
+            if let Err(error) = application.process_send_keys(&id, &keys).await { panel.fail(format!("Cannot send key: {error:#}")); }
+        }
+        Some(ProcessPanelAction::Resize { id, size }) => {
+            if let Err(error) = application.process_resize(&id, size) { panel.fail(format!("Cannot resize terminal: {error:#}")); }
+        }
+        Some(ProcessPanelAction::Signal { id, signal }) => {
+            if let Err(error) = application.process_signal(&id, signal) { panel.fail(format!("Cannot signal process: {error:#}")); }
+        }
+        Some(ProcessPanelAction::Stop(id)) => match application.process_stop(&id, None).await {
+            Ok(process) => panel.update_process(process),
+            Err(error) => panel.fail(format!("Cannot stop process: {error:#}")),
+        },
+        None => {}
+    }
+    state.process_panel = Some(panel);
+    Ok(true)
+}
+
+
+async fn handle_agents_panel_key(
+    application: &Application,
+    state: &mut TuiState,
+    key: KeyEvent,
+) -> Result<Option<bool>> {
+    let Some(mut panel) = state.agents_panel.take() else {
+        return Ok(None);
+    };
+    let settings = application
+        .session()
+        .resource_manager()
+        .map(|resources| resources.settings_manager());
+    let settings_ref = settings.as_ref();
+    match panel.handle_key(key, settings_ref) {
+        AgentsPanelAction::Continue(status) => {
+            if let Some(status) = status {
+                state.status = status;
+            }
+            state.agents_panel = Some(panel);
+        }
+        AgentsPanelAction::Saved => {
+            // Disk write already succeeded; only report Saved when live runtime reflects it.
+            match application.reload().await {
+                Ok(result) => {
+                    refresh_agents_panel_from_application(application, &mut panel).await;
+                    state.status = format!(
+                        "Saved global agent settings · live orchestration generation {}",
+                        result.generation
+                    );
+                    state.agents_panel = Some(panel);
+                    let (commands, diagnostics) = interactive_commands(application);
+                    state.commands = commands;
+                    state.apply_runtime_settings(application).await;
+                    for diagnostic in diagnostics {
+                        state.push_status(diagnostic, true);
+                    }
+                }
+                Err(error) => {
+                    // Settings are on disk but runtime is stale — never claim Saved.
+                    state.push_status(
+                        format!(
+                            "Agent settings written, but live reload failed: {error:#}. Run /reload."
+                        ),
+                        true,
+                    );
+                    state.agents_panel = Some(panel);
+                }
+            }
+        }
+        AgentsPanelAction::Close(status) => {
+            state.status = status.unwrap_or_else(|| "Ready".to_owned());
+        }
+        AgentsPanelAction::Error(error) => {
+            state.push_status(error, true);
+            state.agents_panel = Some(panel);
+        }
+    }
+    Ok(Some(false))
+}
+
+async fn refresh_agents_panel_from_application(application: &Application, panel: &mut AgentsPanel) {
+    let models = available_models().await;
+    if let Some(snapshot) = application.resource_snapshot() {
+        let parent = application.session().model().unwrap_or_default();
+        let global_agents = application
+            .session()
+            .resource_manager()
+            .map(|resources| resources.settings_manager().global_settings().agents)
+            .unwrap_or_default();
+        panel.reload_definitions(
+            snapshot.agents.clone(),
+            parent,
+            &global_agents,
+            &snapshot.settings.agents,
+            Some(models),
+        );
+    } else {
+        panel.set_model_choices(models);
+    }
+}
+
+fn raw_paste_character(key: KeyEvent) -> Option<char> {
+    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(character) => Some(character),
+        KeyCode::Enter => Some('\n'),
+        _ => None,
+    }
+}
+
+fn handle_paste(state: &mut TuiState, payload: &str) {
+    if handle_extension_dialog_paste(state, payload) {
+        return;
+    }
+    state.handle_paste(payload);
+}
+
 /// Routes an incoming key through the configured keybindings to a stable action
 async fn handle_key(
     application: &Application,
@@ -2648,6 +3432,12 @@ async fn handle_key(
     if handle_extension_dialog_key(state, key) {
         return Ok(false);
     }
+    if handle_process_panel_key(application, state, key).await? {
+        return Ok(false);
+    }
+    if let Some(exit) = handle_agents_panel_key(application, state, key).await? {
+        return Ok(exit);
+    }
     if let Some(exit) = handle_tree_panel_key(application, state, key).await? {
         return Ok(exit);
     }
@@ -2655,6 +3445,9 @@ async fn handle_key(
         return Ok(exit);
     }
     if let Some(exit) = handle_scoped_model_selector_key(application, state, key)? {
+        return Ok(exit);
+    }
+    if let Some(exit) = handle_settings_panel_key(application, state, key).await? {
         return Ok(exit);
     }
     if let Some(exit) = handle_panel_key(application, state, key).await? {
@@ -2704,6 +3497,10 @@ async fn handle_key(
     if !state.completions.items.is_empty() {
         if let Some(action) = action {
             match action {
+                Action::EditorSubmit if matches!(state.completions.context, Some(CompletionContext::Slash)) => {
+                    state.accept_completion();
+                    return Ok(false);
+                }
                 Action::AcceptCompletion => {
                     state.accept_completion();
                     return Ok(false);
@@ -2829,7 +3626,10 @@ async fn dispatch_action(
             if prompt.trim().is_empty() && state.pending_attachments.is_empty() {
                 return Ok(false);
             }
-            let expanded = match crate::file_args::expand_prompt(&prompt, &state.cwd_path) {
+            let expanded = match crate::file_args::expand_prompt_in_workspace(
+                &prompt,
+                application.session().workspace_roots(),
+            ) {
                 Ok(expanded) => expanded,
                 Err(error) => {
                     state.push_status(format!("Prompt was not accepted: {error:#}"), true);
@@ -2880,7 +3680,7 @@ async fn dispatch_action(
             if !state.is_streaming {
                 match application.new_session().await {
                     Ok(()) => {
-                        state.transcript.clear();
+                        state.replace_transcript_from_application(application);
                         state.status = "Started a new session".to_owned();
                     }
                     Err(error) => {
@@ -3058,11 +3858,9 @@ async fn cycle_thinking(application: &Application, state: &mut TuiState) {
         .position(|level| *level == application_state.thinking_level)
         .unwrap_or(0);
     let next = levels[(current + 1) % levels.len()];
-    application.set_thinking_level(next);
-    state.status = format!(
-        "Thinking level: {}",
-        crate::output::thinking_level_str(next)
-    );
+    let change = application.set_thinking_level(next);
+    state.thinking_level = change.effective;
+    state.status = change.message;
 }
 
 async fn cycle_model(application: &Application, state: &mut TuiState, direction: i32) {
@@ -3111,18 +3909,58 @@ async fn cycle_model(application: &Application, state: &mut TuiState, direction:
     let model = models.remove(next);
     let reference = format!("{}/{}", model.provider, model.id);
     match application.set_model_with_resolved_auth(model).await {
-        Ok(()) => {
+        Ok(change) => {
             state.model = reference;
-            state.status = format!("Switched to {}", state.model);
+            state.thinking_level = change.effective;
+            state.status = if change.clamped {
+                change.message
+            } else {
+                format!("Switched to {}", state.model)
+            };
         }
         Err(error) => state.push_status(format!("Cannot switch model: {error:#}"), true),
     }
 }
+const fn streaming_submit_behavior(is_streaming: bool) -> Option<StreamingBehavior> {
+    if is_streaming {
+        Some(StreamingBehavior::Steer)
+    } else {
+        None
+    }
+}
+
+fn dispatch_goal_command(
+    application: &Application,
+    state: &mut TuiState,
+    argument: Option<&str>,
+) -> bool {
+    let command = match crate::goal_commands::parse_interactive_goal_command(argument) {
+        Ok(command) => command,
+        Err(error) => {
+            state.status = format!("{error:#}");
+            return false;
+        }
+    };
+    match crate::goal_commands::execute_interactive_goal_command(application, command) {
+        Ok(output) => {
+            state.status = output;
+            true
+        }
+        Err(error) => {
+            state.status = format!("Goal command failed: {error:#}");
+            false
+        }
+    }
+}
+
 async fn submit(
     application: &Application,
     state: &mut TuiState,
     terminal: &mut TerminalGuard,
 ) -> Result<bool> {
+    if state.pending_attachments.is_empty() && state.accept_unambiguous_command_prefix() {
+        return Ok(false);
+    }
     let prompt = state.editor.text();
     if prompt.trim().is_empty() && state.pending_attachments.is_empty() {
         return Ok(false);
@@ -3156,18 +3994,25 @@ async fn submit(
         let mut parts = command.trim().splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("");
         let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
+        if arg.is_none()
+            && let Some(command) = BUILTIN_COMMANDS.iter().find(|command| command.name == name)
+            && command.argument_hint.is_some_and(|hint| hint.contains('<'))
+        {
+            state.status = format!("Usage: /{} {}", command.name, command.argument_hint.unwrap_or_default());
+            return Ok(false);
+        }
         match name {
             "quit" | "exit" => return Ok(true),
             "copy" => state.start_copy(application),
             "new" if !state.is_streaming => match application.new_session().await {
                 Ok(()) => {
-                    state.transcript.clear();
+                    state.replace_transcript_from_application(application);
                     state.clear_todo_display();
                     state.status = "Started a new session".to_owned();
                 }
                 Err(error) => state.push_status(format!("Failed to start new session: {error:#}"), true),
             },
-            "settings" => state.open_settings_panel(application).await,
+            "settings" => state.open_settings_panel(application),
             "model" if arg.is_none() => state.open_model_panel(application).await,
             "model" => {
                 let spec = arg.expect("guarded");
@@ -3175,9 +4020,14 @@ async fn submit(
                     Ok((model, _)) => {
                         let reference = format!("{}/{}", model.provider, model.id);
                         match application.set_model_with_resolved_auth(model).await {
-                            Ok(()) => {
+                            Ok(change) => {
                                 state.model = reference;
-                                state.status = format!("Model: {}", state.model);
+                                state.thinking_level = change.effective;
+                                state.status = if change.clamped {
+                                    change.message
+                                } else {
+                                    format!("Model: {}", state.model)
+                                };
                             }
                             Err(error) => state.push_status(format!("Cannot switch model: {error:#}"), true),
                         }
@@ -3194,86 +4044,70 @@ async fn submit(
                 state.push_lines("Models", if listing.is_empty() { "No available models".to_owned() } else { listing }, state.themes.theme().accent);
             }
             "sessions" => state.open_session_panel(application).await,
-            "resume-codex" => match arg {
-                Some(input) => match crate::commands::import_codex_for_resume(input) {
-                    Ok(path) => match application.switch_session(&path).await {
-                        Ok(()) => {
-                            state.transcript.clear();
-                            for message in application.messages() { state.push_message(message); }
-                            state.refresh_todo_display(application);
-                            state.status = format!("Imported and resumed {}", path.display());
-                        }
-                        Err(error) => state.push_status(format!("Imported Codex session could not be resumed: {error:#}"), true),
-                    },
-                    Err(error) => state.push_status(format!("Codex import failed: {error:#}"), true),
-                },
-                None => state.push_status("Usage: /resume-codex <path|id>".to_owned(), true),
-            },
             "scoped-models" => state.open_scoped_models_panel().await,
             "resume" if arg.is_none() => state.open_session_panel(application).await,
-            "fork" => state.open_fork_panel(application),
+            "branch" | "fork" => state.open_fork_panel(application),
             "tree" => state.open_tree_panel(application),
             "trust" => state.open_trust_panel(application),
             "resume" => {
-                let path = Path::new(arg.expect("guarded"));
-                match application.switch_session(path).await {
-                    Ok(()) => {
-                        state.transcript.clear();
-                        for message in application.messages() { state.push_message(message); }
-                        state.refresh_todo_display(application);
-                        state.status = format!("Resumed {}", path.display());
-                    }
-                    Err(error) => state.push_status(format!("Failed to resume session: {error:#}"), true),
+                let input = arg.expect("guarded");
+                match pi_coding::SessionCatalog::from_env() {
+                    Ok(catalog) => match crate::resume_catalog::switch_resume_selection(
+                        application,
+                        &catalog,
+                        &crate::resume_catalog::ResumeSelectionRequest::Input(input.to_owned()),
+                        Some(&state.cwd_path),
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            state.replace_transcript_from_application(application);
+                            state.refresh_todo_display(application);
+                            state.status = format!("Resumed {}", result.path.display());
+                        }
+                        Err(error) => state
+                            .push_status(format!("Failed to resume session: {error:#}"), true),
+                    },
+                    Err(error) => state
+                        .push_status(format!("Failed to resume session: {error:#}"), true),
                 }
             }
             "clone" if !state.is_streaming => match application.clone_session().await {
                 Ok(()) => state.status = "Cloned current session branch".to_owned(),
                 Err(error) => state.push_status(format!("Failed to clone session: {error:#}"), true),
             }
-            "loop" => {
-                let parsed = pi_coding::parse_loop_args(arg.unwrap_or_default());
-                let Some(interval) = parsed.interval else {
-                    state.push_status(pi_coding::loop_usage_message().to_owned(), true);
-                    return Ok(false);
-                };
-                match application
-                    .loop_create(pi_coding::LoopCreateRequest::immediate(interval, parsed.prompt))
-                    .await
-                {
-                    Ok(task) => state.status = format!(
-                        "Loop {} scheduled {} · expires {}",
-                        task.id,
-                        task.human_schedule(),
-                        task.expires_at.to_rfc3339()
-                    ),
-                    Err(error) => state.push_status(format!("Failed to schedule loop: {error}"), true),
-                }
+            "loop" | "loop-update" if state.is_streaming => {
+                state.push_status(
+                    format!("/{name} is unavailable while another turn is running"),
+                    true,
+                );
+                return Ok(false);
             }
-            "loops" => match application.loop_list().await {
-                Ok(tasks) if tasks.is_empty() => state.push_status("No active loops".to_owned(), false),
-                Ok(tasks) => {
-                    let listing = tasks
-                        .iter()
-                        .map(|task| format!(
-                            "{}  {}  next {}  {}",
-                            task.id,
-                            task.human_schedule(),
-                            task.next_fire_at().to_rfc3339(),
-                            task.prompt
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    state.push_lines("Loops", listing, state.themes.theme().accent);
+            "loop" | "loops" | "loop-update" | "loop-delete" | "loop-cancel" => {
+                match crate::loop_commands::parse_interactive_loop_command(name, arg) {
+                    Ok(Some(command)) => {
+                        match crate::loop_commands::execute_interactive_loop_command(
+                            application,
+                            command,
+                        )
+                        .await
+                        {
+                            Ok(output) if name == "loops" => {
+                                state.push_lines("Loops", output, state.themes.theme().accent);
+                            }
+                            Ok(output) => state.status = output,
+                            Err(error) => {
+                                state.push_status(format!("Loop command failed: {error:#}"), true);
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Ok(None) => unreachable!("loop command name was matched"),
+                    Err(error) => {
+                        state.push_status(format!("{error:#}"), true);
+                        return Ok(false);
+                    }
                 }
-                Err(error) => state.push_status(format!("Failed to list loops: {error}"), true),
-            },
-            "loop-cancel" => match arg {
-                Some(task_id) => match application.loop_cancel(task_id).await {
-                    Ok(true) => state.status = format!("Cancelled loop {task_id}"),
-                    Ok(false) => state.push_status(format!("No active loop with id {task_id}"), true),
-                    Err(error) => state.push_status(format!("Failed to cancel loop: {error}"), true),
-                },
-                None => state.push_status("Usage: /loop-cancel <id>".to_owned(), true),
             }
             "compact" if !state.is_streaming => match application.compact(arg).await {
                 Ok(result) => state.status = format!(
@@ -3332,6 +4166,9 @@ async fn submit(
                     let (commands, diagnostics) = interactive_commands(application);
                     state.commands = commands;
                     state.apply_runtime_settings(application).await;
+                    if let Some(panel) = state.agents_panel.as_mut() {
+                        refresh_agents_panel_from_application(application, panel).await;
+                    }
                     state.status = format!("Reloaded resource generation {}", result.generation);
                     for diagnostic in diagnostics { state.push_status(diagnostic, true); }
                 }
@@ -3353,8 +4190,7 @@ async fn submit(
                 Some(input) => match pi_coding::import_session(pi_coding::SourceSessionFormat::Pi, Path::new(input)) {
                     Ok(imported) => match application.switch_session(&imported.path).await {
                         Ok(()) => {
-                            state.transcript.clear();
-                            for message in application.messages() { state.push_message(message); }
+                            state.replace_transcript_from_application(application);
                             state.refresh_todo_display(application);
                             state.status = format!("Imported and resumed {}", imported.path.display());
                         }
@@ -3374,6 +4210,15 @@ async fn submit(
                     Ok(message) => state.push_status(message, false),
                     Err(error) => state.push_status(format!("{error:#}"), true),
                 }
+            }
+            "agents" => state.open_agents_panel(application).await,
+            "ps" if arg.is_none() => {
+                state.panel = None;
+                state.tree_panel = None;
+                state.session_selector = None;
+                state.scoped_model_selector = None;
+                state.agents_panel = None;
+                state.process_panel = Some(ProcessPanel::new(application.process_list()));
             }
             "ps" | "process" => match crate::process_commands::parse_interactive_process_command(name, arg) {
                 Ok(Some(command)) => match crate::process_commands::execute_interactive_process_command(application, command).await {
@@ -3444,6 +4289,67 @@ async fn submit(
                     Err(error) => state.push_status(error, true),
                 },
             },
+            "run" => {
+                match crate::interactive_commands::parse_run_invocation(arg.unwrap_or_default()) {
+                    Ok((command, arguments)) => {
+                        match crate::interactive_commands::invoke_extension_command(
+                            application,
+                            command,
+                            arguments.to_owned(),
+                        )
+                        .await
+                        {
+                            Ok(value) if !value.is_null() => {
+                                state.push_status(value.to_string(), false)
+                            }
+                            Ok(_) => state.status = format!("Ran /{command}"),
+                            Err(error) => state
+                                .push_status(format!("/run {command} failed: {error:#}"), true),
+                        }
+                    }
+                    Err(error) => state.push_status(format!("{error:#}"), true),
+                }
+            }
+            "goal" => {
+                if !dispatch_goal_command(application, state, arg) {
+                    return Ok(false);
+                }
+            }
+            "chain" | "run-chain" => {
+                match crate::interactive_commands::parse_chain_invocation(arg.unwrap_or_default()) {
+                    Ok(steps) => {
+                        match crate::interactive_commands::invoke_extension_chain(
+                            application,
+                            &steps,
+                        )
+                        .await
+                        {
+                            Ok(outputs) => {
+                                let summary = outputs
+                                    .into_iter()
+                                    .map(|(name, value)| {
+                                        if value.is_null() {
+                                            format!("/{name}: ok")
+                                        } else {
+                                            format!("/{name}: {value}")
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                state.push_lines(
+                                    "Chain",
+                                    summary,
+                                    state.themes.theme().accent,
+                                );
+                            }
+                            Err(error) => {
+                                state.push_status(format!("/{name} failed: {error:#}"), true)
+                            }
+                        }
+                    }
+                    Err(error) => state.push_status(format!("{error:#}"), true),
+                }
+            }
             "" => {}
             command => {
                 let source = state.commands.iter().find(|candidate| candidate.name == command).map(|candidate| candidate.source);
@@ -3484,7 +4390,10 @@ async fn submit(
         state.completion_query = None;
         return Ok(false);
     }
-    let expanded = match crate::file_args::expand_prompt(&prompt, &state.cwd_path) {
+    let expanded = match crate::file_args::expand_prompt_in_workspace(
+        &prompt,
+        application.session().workspace_roots(),
+    ) {
         Ok(expanded) => expanded,
         Err(error) => {
             state.push_status(format!("Prompt was not accepted: {error:#}"), true);
@@ -3495,7 +4404,11 @@ async fn submit(
     let mut attachments = state.pending_attachments.clone();
     attachments.extend(file_images.iter().cloned());
     let attachment_count = attachments.len();
-    if let Err(error) = application.prompt(expanded.prompt, attachments, None).await {
+    let streaming_behavior = streaming_submit_behavior(state.is_streaming);
+    if let Err(error) = application
+        .prompt(expanded.prompt, attachments, streaming_behavior)
+        .await
+    {
         state.pending_attachments.extend(file_images);
         state.push_status(format!("Prompt was not accepted: {error}"), true);
         return Ok(false);
@@ -3514,12 +4427,325 @@ async fn submit(
         )
     };
     state.push_lines("You", display_prompt, state.themes.theme().accent);
+    if state.is_streaming {
+        state.status = "Steering current response".to_owned();
+    }
     state.pending_attachments.clear();
     state.cancel_file_completion();
     state.editor.clear();
     state.completions.clear();
     state.completion_query = None;
     Ok(false)
+}
+
+fn live_viewport_height(state: &TuiState, width: u16, terminal_height: u16) -> u16 {
+    let theme = state.themes.theme();
+    let extension = state.extension_ui.snapshot();
+    let above = extension_widget_lines(&extension, UiWidgetPlacement::AboveEditor, theme);
+    let below = extension_widget_lines(&extension, UiWidgetPlacement::BelowEditor, theme);
+    let attachment_rows = usize::from(!state.pending_attachments.is_empty());
+    let editor_rows = state.editor.lines.len().saturating_add(attachment_rows);
+    let input_height = u16::try_from(editor_rows.saturating_add(1))
+        .unwrap_or(u16::MAX)
+        .clamp(2, 9);
+    let completion_height = u16::try_from(state.completions.items.len())
+        .unwrap_or(u16::MAX)
+        .min(u16::try_from(MAX_COMPLETIONS).unwrap_or(u16::MAX));
+    let todo_height = u16::try_from(render_todo_panel_lines(&state.todo_phases, theme).len())
+        .unwrap_or(u16::MAX)
+        .min(8);
+    let mut live_lines = Vec::new();
+    for entry in &state.transcript[state.committed_entries..] {
+        render_transcript_entry(
+            &mut live_lines,
+            entry,
+            state.show_thinking,
+            state.expand_tools,
+            theme,
+            width.max(1),
+        );
+    }
+    if !state.streaming_thinking.is_empty() || !state.streaming_text.is_empty() {
+        let mut content = Vec::new();
+        if !state.streaming_thinking.is_empty() {
+            content.push(ContentBlock::thinking(state.streaming_thinking.clone()));
+        }
+        if !state.streaming_text.is_empty() {
+            content.push(ContentBlock::text(state.streaming_text.clone()));
+        }
+        render_transcript_entry(
+            &mut live_lines,
+            &TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                content,
+                tool_name: None,
+                tool_card: None,
+                job_card: None,
+                is_error: false,
+                is_partial: true,
+            },
+            state.show_thinking,
+            state.expand_tools,
+            theme,
+            width.max(1),
+        );
+    }
+    let transcript_height = u16::try_from(wrapped_line_count(&live_lines, width.max(1)))
+        .unwrap_or(u16::MAX)
+        .min(8);
+    let overlays_open = state.panel.is_some()
+        || state.tree_panel.is_some()
+        || state.process_panel.is_some()
+        || state.agents_panel.is_some()
+        || state.session_selector.is_some()
+        || state.scoped_model_selector.is_some()
+        || state.extension_dialog.is_some();
+    let overlay_height = if overlays_open { terminal_height.min(16) } else { 0 };
+    transcript_height
+        .saturating_add(todo_height)
+        .saturating_add(u16::try_from(above.len()).unwrap_or(u16::MAX).min(6))
+        .saturating_add(completion_height)
+        .saturating_add(input_height)
+        .saturating_add(u16::try_from(below.len()).unwrap_or(u16::MAX).min(6))
+        .saturating_add(1)
+        .max(overlay_height)
+        .clamp(3, terminal_height.max(3))
+        .min(if width < 40 { terminal_height } else { terminal_height.min(16) })
+}
+
+fn transcript_region_height(state: &TuiState, terminal_height: u16) -> u16 {
+    let theme = state.themes.theme();
+    let extension = state.extension_ui.snapshot();
+    let above_height = u16::try_from(
+        extension_widget_lines(&extension, UiWidgetPlacement::AboveEditor, theme).len(),
+    )
+    .unwrap_or(u16::MAX)
+    .min(6);
+    let below_height = u16::try_from(
+        extension_widget_lines(&extension, UiWidgetPlacement::BelowEditor, theme).len(),
+    )
+    .unwrap_or(u16::MAX)
+    .min(6);
+    let input_height = if state.editor.lines.len() <= 1 && state.pending_attachments.is_empty() {
+        2
+    } else {
+        u16::try_from(state.editor.lines.len().saturating_add(2))
+            .unwrap_or(u16::MAX)
+            .clamp(3, 10)
+    };
+    let completion_height = u16::try_from(state.completions.items.len())
+        .unwrap_or(u16::MAX)
+        .min(u16::try_from(MAX_COMPLETIONS).unwrap_or(u16::MAX));
+    let todo_height = u16::try_from(render_todo_panel_lines(&state.todo_phases, theme).len())
+        .unwrap_or(u16::MAX)
+        .min(8);
+    terminal_height
+        .saturating_sub(todo_height)
+        .saturating_sub(above_height)
+        .saturating_sub(completion_height)
+        .saturating_sub(input_height)
+        .saturating_sub(below_height)
+        .max(1)
+}
+
+fn compact_cwd(cwd: &str) -> String {
+    let home = std::env::var("HOME").ok();
+    home.as_deref().and_then(|home| cwd.strip_prefix(home)).map_or_else(
+        || clean_terminal_text(cwd),
+        |suffix| if suffix.is_empty() { "~".to_owned() } else { format!("~{suffix}") },
+    )
+}
+
+fn wrap_display_line(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut columns = 0usize;
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if columns > 0 && columns.saturating_add(character_width) > width {
+            rows.push(String::new());
+            columns = 0;
+        }
+        rows.last_mut().expect("one wrap row").push(character);
+        columns = columns.saturating_add(character_width);
+    }
+    rows
+}
+fn wrapped_row_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut columns = 0usize;
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if columns > 0 && columns.saturating_add(character_width) > width {
+            rows += 1;
+            columns = 0;
+        }
+        columns = columns.saturating_add(character_width);
+    }
+    rows
+}
+
+fn editor_wrapped_position(state: &TuiState, width: usize) -> (usize, u16) {
+    let width = width.max(1);
+    let prior_rows = state.editor.lines[..state.editor.row]
+        .iter()
+        .map(|line| wrapped_row_count(&clean_terminal_text(line), width))
+        .sum::<usize>();
+    let prefix = clean_terminal_text(&state.editor.lines[state.editor.row][..state.editor.column]);
+    let mut row = 0usize;
+    let mut columns = 0usize;
+    for character in prefix.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if columns > 0 && columns.saturating_add(character_width) > width {
+            row += 1;
+            columns = 0;
+        }
+        columns = columns.saturating_add(character_width);
+    }
+    (prior_rows.saturating_add(row), u16::try_from(columns).unwrap_or(u16::MAX))
+}
+
+fn visible_editor_lines(state: &TuiState, width: usize, max_rows: usize) -> (Vec<String>, usize) {
+    let width = width.max(1);
+    let max_rows = max_rows.max(1);
+    let (cursor_row, _) = editor_wrapped_position(state, width);
+    let start = cursor_row.saturating_sub(max_rows.saturating_sub(1));
+    let end = start.saturating_add(max_rows);
+    let mut visible = Vec::with_capacity(max_rows);
+    let mut absolute_row = 0usize;
+    for line in &state.editor.lines {
+        for wrapped in wrap_display_line(&clean_terminal_text(line), width) {
+            if absolute_row >= start && absolute_row < end {
+                visible.push(wrapped);
+            }
+            absolute_row += 1;
+            if absolute_row >= end {
+                break;
+            }
+        }
+        if absolute_row >= end {
+            break;
+        }
+    }
+    (visible, cursor_row.saturating_sub(start))
+}
+
+fn composer_border_lines_bounded(state: &TuiState, width: u16, theme: Theme, max_rows: usize) -> Vec<Line<'static>> {
+    let inner = usize::from(width.saturating_sub(2));
+    let content_rows = max_rows.saturating_sub(2).max(1);
+    let (editor_lines, _) = visible_editor_lines(state, inner.saturating_sub(3), content_rows);
+    composer_border_lines_with_editor(state, width, theme, editor_lines)
+}
+
+
+fn composer_border_lines(state: &TuiState, width: u16, theme: Theme) -> Vec<Line<'static>> {
+    let inner = usize::from(width.saturating_sub(2));
+    let total_rows = state.editor.lines.iter().map(|line| wrapped_row_count(&clean_terminal_text(line), inner.saturating_sub(3))).sum::<usize>();
+    let (editor_lines, _) = visible_editor_lines(state, inner.saturating_sub(3), total_rows.max(1));
+    composer_border_lines_with_editor(state, width, theme, editor_lines)
+}
+
+fn composer_border_lines_with_editor(state: &TuiState, width: u16, theme: Theme, editor_lines: Vec<String>) -> Vec<Line<'static>> {
+    let inner = usize::from(width.saturating_sub(2));
+    let model = clean_terminal_text(&state.model);
+    let cwd = compact_cwd(&state.cwd);
+    let thinking = state.effective_thinking_state().label;
+    let status = if state.is_streaming {
+        const FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
+        format!("working {} ▶──", FRAMES[state.animation_frame % FRAMES.len()])
+    } else {
+        "▶──".to_owned()
+    };
+    let header_width = usize::from(display_width("── π  > ⬢ "))
+        + usize::from(display_width(&model))
+        + usize::from(display_width(&format!(" · ◑ {thinking} > 📁 ")))
+        + usize::from(display_width(&cwd))
+        + usize::from(display_width(" > ⟲ "))
+        + usize::from(display_width(&status));
+    let mut lines = if header_width <= inner {
+        let top_fill = "─".repeat(inner - header_width);
+        vec![Line::from(vec![
+            Span::styled("╭── ", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+            Span::styled("π", Style::default().fg(theme.accent).bg(theme.user_message_bg).add_modifier(Modifier::BOLD)),
+            Span::styled("  > ⬢ ", Style::default().fg(theme.border).bg(theme.user_message_bg)),
+            Span::styled(model, Style::default().fg(theme.accent).bg(theme.user_message_bg)),
+            Span::styled(format!(" · ◑ {thinking} > 📁 "), Style::default().fg(theme.accent).bg(theme.user_message_bg)),
+            Span::styled(cwd, Style::default().fg(theme.syntax_variable).bg(theme.user_message_bg)),
+            Span::styled(" > ⟲ ", Style::default().fg(theme.border).bg(theme.user_message_bg)),
+            Span::styled(status, Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+            Span::styled(top_fill, Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+            Span::styled("╮", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+        ])]
+    } else {
+        vec![Line::from(vec![
+            Span::styled("╭── ", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+            Span::styled("π", Style::default().fg(theme.accent).bg(theme.user_message_bg).add_modifier(Modifier::BOLD)),
+            Span::styled(" ", Style::default().bg(theme.user_message_bg)),
+            Span::styled("─".repeat(inner.saturating_sub(5)), Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+            Span::styled("╮", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+        ])]
+    };
+    let editor_lines = editor_lines;
+    if editor_lines.len() <= 1 && state.pending_attachments.is_empty() && state.completions.items.is_empty() {
+        let input = editor_lines.first().cloned().unwrap_or_default();
+        let input_width = usize::from(display_width(&input));
+        let fill = "─".repeat(inner.saturating_sub(input_width.saturating_add(3)));
+        lines.push(Line::from(vec![
+            Span::styled("╰─ ", Style::default().fg(theme.border_muted)),
+            Span::styled(input, Style::default().fg(theme.text)),
+            Span::styled(format!(" {fill}╯"), Style::default().fg(theme.border_muted)),
+        ]));
+        return lines;
+    }
+    if !state.completions.items.is_empty() && editor_lines.len() <= 1 {
+        let input = editor_lines.first().cloned().unwrap_or_default();
+        let input_width = usize::from(display_width(&input));
+        let fill = " ".repeat(inner.saturating_sub(input_width.saturating_add(2)));
+        lines.push(Line::from(vec![
+            Span::styled("│  ", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+            Span::styled(input, Style::default().fg(theme.text).bg(theme.user_message_bg)),
+            Span::styled(fill, Style::default().bg(theme.user_message_bg)),
+            Span::styled("│", Style::default().fg(theme.muted).bg(theme.user_message_bg)),
+        ]));
+        lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), Style::default().fg(theme.muted).bg(theme.user_message_bg))));
+        return lines;
+    }
+    for line in editor_lines {
+        let line_width = usize::from(display_width(&line));
+        let fill = " ".repeat(inner.saturating_sub(line_width.saturating_add(1)));
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(theme.border_muted)),
+            Span::styled(line, Style::default().fg(theme.text)),
+            Span::raw(fill),
+            Span::styled("│", Style::default().fg(theme.border_muted)),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), Style::default().fg(theme.border_muted))));
+    lines
+}
+
+fn render_welcome_lines(state: &TuiState, theme: Theme) -> Vec<Line<'static>> {
+    if !state.transcript.is_empty() || !state.streaming_text.is_empty() || !state.streaming_thinking.is_empty() {
+        return Vec::new();
+    }
+    let recent = pi_coding::list_sessions(&state.cwd_path).into_iter().take(3).collect::<Vec<_>>();
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled("  π  pi-rs", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!("  {}", clean_terminal_text(&state.model)), Style::default().fg(theme.muted))),
+        Line::default(),
+        Line::from(Span::styled("  Start typing to begin · /help for commands · @file to attach context", Style::default().fg(theme.text))),
+    ];
+    if !recent.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("  Recent sessions", Style::default().fg(theme.muted).add_modifier(Modifier::BOLD))));
+        for session in recent {
+            let label = session.name.as_deref().unwrap_or(&session.id);
+            lines.push(Line::from(Span::styled(format!("  • {}", clean_terminal_text(label)), Style::default().fg(theme.text))));
+        }
+    }
+    lines
 }
 
 fn render(
@@ -3533,60 +4759,46 @@ fn render(
     let below = extension_widget_lines(&extension, UiWidgetPlacement::BelowEditor, theme);
     let above_height = u16::try_from(above.len()).unwrap_or(u16::MAX).min(6);
     let below_height = u16::try_from(below.len()).unwrap_or(u16::MAX).min(6);
-    let attachment_rows = usize::from(!state.pending_attachments.is_empty());
-    let editor_rows = state.editor.lines.len().saturating_add(attachment_rows);
-    let input_height = u16::try_from(editor_rows.saturating_add(2))
-        .unwrap_or(u16::MAX)
-        .clamp(3, 10);
     let completion_height = u16::try_from(state.completions.items.len())
         .unwrap_or(u16::MAX)
         .min(u16::try_from(MAX_COMPLETIONS).unwrap_or(u16::MAX));
     let todo_lines = render_todo_panel_lines(&state.todo_phases, theme);
     let todo_height = u16::try_from(todo_lines.len()).unwrap_or(u16::MAX).min(8);
+    let composer_height = u16::try_from(
+        state
+            .editor
+            .lines
+            .iter()
+            .map(|line| wrapped_row_count(&clean_terminal_text(line), usize::from(frame.area().width.saturating_sub(5))))
+            .sum::<usize>()
+            .saturating_add(2),
+    )
+    .unwrap_or(u16::MAX);
+    let reserved = todo_height.saturating_add(above_height).saturating_add(below_height).saturating_add(completion_height);
+    let max_composer_height = frame.area().height.saturating_sub(reserved).max(2);
+    let input_height = composer_height.min(max_composer_height);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(todo_height),
             Constraint::Length(above_height),
-            Constraint::Length(completion_height),
             Constraint::Length(input_height),
+            Constraint::Length(completion_height),
             Constraint::Length(below_height),
-            Constraint::Length(1),
         ])
         .split(frame.area());
 
-    let title = extension.title.as_deref().unwrap_or("pi (rs)");
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {} ", clean_terminal_text(title)),
-                Style::default()
-                    .fg(theme.text)
-                    .bg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    " {} · {}",
-                    clean_terminal_text(&state.model),
-                    clean_terminal_text(&state.cwd)
-                ),
-                Style::default().fg(theme.text),
-            ),
-        ])),
-        sections[0],
-    );
-
-    let cell_size = window_size().ok().and_then(|size| {
-        (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0).then_some(
-            TerminalCellSize {
-                width_pixels: size.width / size.columns,
-                height_pixels: size.height / size.rows,
-            },
-        )
-    }).unwrap_or_default();
+    let cell_size = window_size()
+        .ok()
+        .and_then(|size| {
+            (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0)
+                .then_some(TerminalCellSize {
+                    width_pixels: size.width / size.columns,
+                    height_pixels: size.height / size.rows,
+                })
+        })
+        .unwrap_or_default();
     let mut image_candidates = Vec::new();
     let mut image_context = TranscriptImageContext {
         renderer: images,
@@ -3595,11 +4807,12 @@ fn render(
             show_images: state.show_images,
             width_cells: state.image_width_cells,
         },
-        viewport_columns: sections[1].width.saturating_sub(2),
-        viewport_rows: sections[1].height.saturating_sub(2),
+        viewport_columns: sections[0].width,
+        viewport_rows: sections[0].height,
         cell_size,
     };
-    let mut transcript = render_transcript_lines(state, theme, &mut image_context);
+    let mut transcript =
+        render_transcript_lines(state, theme, sections[0].width.max(1), &mut image_context);
     if !state.streaming_thinking.is_empty() || !state.streaming_text.is_empty() {
         let mut content = Vec::new();
         if !state.streaming_thinking.is_empty() {
@@ -3614,37 +4827,30 @@ fn render(
                 kind: TranscriptKind::Assistant,
                 content,
                 tool_name: None,
+                tool_card: None,
+                job_card: None,
                 is_error: false,
                 is_partial: true,
             },
             state.show_thinking,
             state.expand_tools,
             theme,
+            sections[0].width.max(1),
             None,
         );
     }
-    let transcript_height = usize::from(sections[1].height.saturating_sub(2));
+    if transcript.is_empty() {
+        transcript = render_welcome_lines(state, theme);
+    }
+    let transcript_height = usize::from(sections[0].height);
     state.transcript_page_rows.set(transcript_height.max(1));
-    let transcript_width = sections[1].width.saturating_sub(2).max(1);
+    let transcript_width = sections[0].width.max(1);
     let total_rows = wrapped_line_count(&transcript, transcript_width);
-    let paragraph = Paragraph::new(Text::from(transcript.clone()))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.border))
-                .title(if state.transcript_scroll == 0 {
-                    " Conversation ".to_owned()
-                } else {
-                    format!(
-                        " Conversation · {} rows above latest ",
-                        state.transcript_scroll
-                    )
-                }),
-        )
-        .style(Style::default().fg(theme.text))
-        .wrap(Wrap { trim: false });
     let bottom = total_rows.saturating_sub(transcript_height);
     let scroll = bottom.saturating_sub(state.transcript_scroll.min(bottom));
+    let paragraph = Paragraph::new(Text::from(transcript.clone()))
+        .style(Style::default().fg(theme.text))
+        .wrap(Wrap { trim: false });
     let mut message_hasher = DefaultHasher::new();
     transcript.hash(&mut message_hasher);
     state.transcript_scroll.hash(&mut message_hasher);
@@ -3655,6 +4861,9 @@ fn render(
     let theme_hash = theme_hasher.finish();
     let overlays_open = state.panel.is_some()
         || state.tree_panel.is_some()
+        || state.process_panel.is_some()
+        || state.settings_panel.is_some()
+        || state.agents_panel.is_some()
         || state.session_selector.is_some()
         || state.scoped_model_selector.is_some()
         || state.extension_dialog.is_some();
@@ -3671,165 +4880,107 @@ fn render(
                         candidate.layout,
                         candidate.data,
                         candidate.mime_type,
-                        sections[1].x.saturating_add(1),
-                        sections[1].y.saturating_add(1).saturating_add(
-                            u16::try_from(visible_row).unwrap_or(u16::MAX),
-                        ),
+                        sections[0].x,
+                        sections[0].y.saturating_add(u16::try_from(visible_row).unwrap_or(u16::MAX)),
                     ))
             })
             .collect()
     };
     frame.render_widget(
         paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
-        sections[1],
+        sections[0],
     );
-
     if todo_height > 0 {
-        let open = todo_open_count(&state.todo_phases);
-        let title = format!(" Tasks · {open} open ");
         frame.render_widget(
             Paragraph::new(Text::from(todo_lines))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme.border))
-                        .title(title),
-                )
                 .style(Style::default().fg(theme.text))
                 .wrap(Wrap { trim: false }),
-            sections[2],
+            sections[1],
         );
     }
     if above_height > 0 {
-        frame.render_widget(Paragraph::new(above), sections[3]);
+        frame.render_widget(Paragraph::new(above), sections[2]);
     }
+    let composer_lines = composer_border_lines_bounded(state, sections[3].width, theme, usize::from(sections[3].height));
+    frame.render_widget(Paragraph::new(composer_lines), sections[3]);
     if !state.completions.items.is_empty() {
-        let lines = state
-            .completions
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let style = if index == state.completions.selected {
-                    Style::default().fg(theme.text).bg(theme.selected_bg)
-                } else {
-                    Style::default().fg(theme.muted)
-                };
-                Line::from(Span::styled(
-                    format!(
-                        " {}  {}",
-                        clean_terminal_text(&item.label),
-                        clean_terminal_text(&item.description)
-                    ),
-                    style,
-                ))
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(lines), sections[4]);
+        let lines = state.completions.items.iter().enumerate().map(|(index, item)| {
+            let selected = index == state.completions.selected;
+            Line::from(vec![
+                Span::styled(if selected { "❯ " } else { "  " }, Style::default().fg(if selected { theme.accent } else { theme.dim })),
+                Span::styled(clean_terminal_text(&item.label), Style::default().fg(if selected { theme.text } else { theme.muted }).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })),
+                Span::styled(format!("  {}", clean_terminal_text(&item.description)), Style::default().fg(theme.muted)),
+            ])
+        }).collect::<Vec<_>>();
+        let completion_area = Rect { x: sections[4].x.saturating_add(2), y: sections[4].y, width: sections[4].width.saturating_sub(3), height: sections[4].height };
+        frame.render_widget(Paragraph::new(lines), completion_area);
     }
-
-    let editor_text = if state.pending_attachments.is_empty() {
-        clean_terminal_text(&state.editor.lines.join("\n"))
-    } else {
-        clean_terminal_text(&format!(
-            "[{} image attachment{}]\n{}",
-            state.pending_attachments.len(),
-            if state.pending_attachments.len() == 1 {
-                ""
-            } else {
-                "s"
-            },
-            state.editor.lines.join("\n")
-        ))
-    };
-    frame.render_widget(
-        Paragraph::new(editor_text)
-            .style(Style::default().fg(theme.text))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if state.is_streaming {
-                        theme.border_accent
-                    } else {
-                        theme.border
-                    }))
-                    .title(if state.is_streaming {
-                        " Queue "
-                    } else {
-                        " Message "
-                    }),
-            )
-            .wrap(Wrap { trim: false }),
-        sections[5],
-    );
-    let cursor_x = sections[5]
+    let editor_width = usize::from(sections[3].width.saturating_sub(5));
+    let (_, cursor_column) = editor_wrapped_position(state, editor_width);
+    let (_, visible_cursor_row) = visible_editor_lines(state, editor_width, usize::from(sections[3].height.saturating_sub(2)).max(1));
+    let cursor_x = sections[3]
         .x
-        .saturating_add(1)
-        .saturating_add(display_width(
-            &state.editor.lines[state.editor.row][..state.editor.column],
-        ));
-    let cursor_y = sections[5]
-        .y
-        .saturating_add(1)
-        .saturating_add(u16::from(!state.pending_attachments.is_empty()))
-        .saturating_add(u16::try_from(state.editor.row).unwrap_or(u16::MAX));
+        .saturating_add(if state.completions.items.is_empty() && state.editor.lines.len() <= 1 { 3 } else { 2 })
+        .saturating_add(cursor_column);
+    let cursor_y = sections[3].y.saturating_add(1).saturating_add(u16::try_from(visible_cursor_row).unwrap_or(u16::MAX));
     if state.extension_dialog.is_none()
-        && cursor_x < sections[5].right().saturating_sub(1)
-        && cursor_y < sections[5].bottom().saturating_sub(1)
+        && state.process_panel.is_none()
+        && state.settings_panel.is_none()
+        && state.agents_panel.is_none()
+        && cursor_x < sections[3].right().saturating_sub(1)
+        && cursor_y < sections[3].bottom()
     {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
     if below_height > 0 {
-        frame.render_widget(Paragraph::new(below), sections[6]);
+        frame.render_widget(Paragraph::new(below), sections[5]);
     }
-    let mut status = extension
-        .statuses
-        .iter()
-        .map(|item| clean_terminal_text(&item.text))
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>();
-    if let Some(notification) = extension.notifications.last() {
-        status.push(clean_terminal_text(&notification.message));
-    }
-    if status.is_empty() {
-        status.push(clean_terminal_text(&state.status));
-    }
-    if !state.active_loops.is_empty() {
-        let count = state.active_loops.len();
-        status.push(format!(
-            "{count} loop{} active",
-            if count == 1 { "" } else { "s" }
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(status.join(" · ")).style(Style::default().fg(theme.dim)),
-        sections[7],
-    );
-    if let Some(panel) = &state.panel {
-        render_selector_panel(frame, panel, theme);
-    }
-    if let Some(panel) = &state.tree_panel {
-        render_tree_panel(frame, panel, theme);
-    }
-    if let Some(selector) = &state.session_selector {
-        render_saved_session_selector(frame, selector, theme);
-    }
-    if let Some(selector) = &state.scoped_model_selector {
-        render_scoped_model_selector(frame, selector, theme);
-    }
-    if let Some(dialog) = &state.extension_dialog {
-        render_extension_dialog(frame, dialog, theme);
-    }
+    if let Some(panel) = &state.settings_panel { render_settings_panel(frame, panel, state.settings_value_input.as_ref(), theme); }
+    if let Some(panel) = &state.panel { render_selector_panel(frame, panel, theme); }
+    if let Some(panel) = &state.tree_panel { render_tree_panel(frame, panel, theme); }
+    if let Some(panel) = &state.process_panel { render_process_panel(frame, panel, theme); }
+    if let Some(panel) = &state.agents_panel { render_agents_panel(frame, panel, theme); }
+    if let Some(selector) = &state.session_selector { render_saved_session_selector(frame, selector, theme); }
+    if let Some(selector) = &state.scoped_model_selector { render_scoped_model_selector(frame, selector, theme); }
+    if let Some(dialog) = &state.extension_dialog { render_extension_dialog(frame, dialog, theme); }
     ImageDrawPlan {
         identity: ImageFrameIdentity {
-            viewport_width: sections[1].width,
-            viewport_height: sections[1].height,
+            viewport_width: sections[0].width,
+            viewport_height: sections[0].height,
             theme_hash,
             message_hash,
         },
         placements,
     }
 }
+fn render_settings_panel(frame: &mut ratatui::Frame<'_>, panel: &SettingsPanel, input: Option<&(String, String)>, theme: Theme) {
+    let Ok(snapshot) = panel.snapshot() else { return; };
+    let area = centered_rect(frame.area().width.saturating_sub(4).min(140).max(40), frame.area().height.saturating_sub(4).max(12), frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default().title(format!(" Settings · {:?} scope{} ", snapshot.scope, if snapshot.dirty { " · modified" } else { "" })).borders(Borders::ALL).border_style(Style::default().fg(theme.border_accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let category = snapshot.category.map_or_else(|| "All".to_owned(), |value| format!("{value:?}"));
+    let mut lines = vec![Line::from(vec![Span::styled("Category ", Style::default().fg(theme.dim)), Span::styled(category, Style::default().fg(theme.accent)), Span::styled("  ←/→ · Scope Ctrl-G/Ctrl-P · ", Style::default().fg(theme.dim)), Span::styled(if snapshot.project_trusted { "trusted" } else { "untrusted" }, Style::default().fg(if snapshot.project_trusted { theme.success } else { theme.warning }))]), Line::from(vec![Span::styled("Search ", Style::default().fg(theme.dim)), Span::styled(if snapshot.search.is_empty() { "type to filter" } else { &snapshot.search }, Style::default().fg(theme.text))]), Line::from(Span::styled("↑/↓ select · Enter edit/toggle · Del reset · Ctrl-S apply · Esc cancel", Style::default().fg(theme.muted))), Line::from("")];
+    let visible_rows = usize::from(inner.height).saturating_sub(4);
+    let start = snapshot.cursor.saturating_sub(visible_rows.saturating_sub(1));
+    for (index, row) in snapshot.rows.iter().enumerate().skip(start).take(visible_rows) {
+        let selected = index == snapshot.cursor;
+        let value = if row.redacted { "[redacted]".to_owned() } else { row.effective_value.to_string() };
+        let metadata = format!("{:?} · {:?}{}", row.source, row.behavior, if row.inherited { " · inherited" } else { "" });
+        let blocked = row.blocked_reason.as_deref().map_or(String::new(), |reason| format!(" · {reason}"));
+        lines.push(Line::from(vec![Span::styled(if selected { "› " } else { "  " }, Style::default().fg(theme.accent)), Span::styled(clean_terminal_text(&row.key), Style::default().fg(if selected { theme.accent } else { theme.text }).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })), Span::styled(format!(" = {value}  [{metadata}]{blocked}"), Style::default().fg(if row.blocked_reason.is_some() { theme.warning } else { theme.muted }))]));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    if let Some((key, value)) = input {
+        let y = inner.bottom().saturating_sub(1);
+        let prefix = format!("Edit {key}: ");
+        frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(prefix.clone(), Style::default().fg(theme.accent)), Span::styled(value.clone(), Style::default().fg(theme.text))])), Rect { x: inner.x, y, width: inner.width, height: 1 });
+        let x = inner.x.saturating_add(display_width(&format!("{prefix}{value}")));
+        if x < inner.right() { frame.set_cursor_position((x, y)); }
+    }
+}
+
 
 fn render_extension_dialog(frame: &mut ratatui::Frame<'_>, dialog: &ExtensionDialog, theme: Theme) {
     let mut lines = Vec::new();
@@ -3963,20 +5114,64 @@ fn render_extension_dialog(frame: &mut ratatui::Frame<'_>, dialog: &ExtensionDia
 fn render_transcript_lines(
     state: &TuiState,
     theme: Theme,
+    width: u16,
     image_context: &mut TranscriptImageContext<'_>,
 ) -> Vec<Line<'static>> {
+    let start = if state.transcript_scroll > 0 {
+        0
+    } else {
+        state.committed_entries.min(state.transcript.len())
+    };
     let mut lines = Vec::new();
-    for entry in &state.transcript {
+    for entry in &state.transcript[start..] {
         render_transcript_entry_inner(
             &mut lines,
             entry,
             state.show_thinking,
             state.expand_tools,
             theme,
+            width,
             Some(image_context),
         );
     }
     lines
+}
+
+fn render_job_card(lines: &mut Vec<Line<'static>>, card: &JobCardRows, theme: Theme) {
+    let background = match card.job_status {
+        pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running => theme.tool_pending_bg,
+        pi_coding::JobStatus::Completed => theme.tool_success_bg,
+        pi_coding::JobStatus::Failed | pi_coding::JobStatus::Cancelled => theme.tool_error_bg,
+    };
+    for row in &card.rows {
+        let (prefix, color, modifier) = match row.role {
+            JobCardRowRole::Title => ("Task ", job_status_color(card.job_status, theme), Modifier::BOLD),
+            JobCardRowRole::Description => ("  ", theme.text, Modifier::empty()),
+            JobCardRowRole::Timing => ("  ", theme.muted, Modifier::empty()),
+            JobCardRowRole::Usage => ("  ", theme.dim, Modifier::empty()),
+            JobCardRowRole::Result => ("  ↳ ", theme.tool_output, Modifier::empty()),
+            JobCardRowRole::Error => ("  ! ", theme.error, Modifier::empty()),
+            JobCardRowRole::Reference => ("  · ", theme.md_link_url, Modifier::empty()),
+            JobCardRowRole::Aggregate => ("", theme.muted, Modifier::ITALIC),
+        };
+        for (index, text) in clean_terminal_text(&row.text).lines().enumerate() {
+            let current_prefix = if index == 0 { prefix } else { "    " };
+            lines.push(Line::from(vec![
+                Span::styled(current_prefix.to_owned(), Style::default().fg(color).bg(background)),
+                Span::styled(text.to_owned(), Style::default().fg(color).bg(background).add_modifier(modifier)),
+            ]));
+        }
+    }
+}
+
+fn job_status_color(status: pi_coding::JobStatus, theme: Theme) -> Color {
+    match status {
+        pi_coding::JobStatus::Queued => theme.dim,
+        pi_coding::JobStatus::Running => theme.accent,
+        pi_coding::JobStatus::Completed => theme.success,
+        pi_coding::JobStatus::Failed => theme.error,
+        pi_coding::JobStatus::Cancelled => theme.warning,
+    }
 }
 
 /// Count tasks that are neither completed nor abandoned across all phases.
@@ -4030,8 +5225,79 @@ fn render_transcript_entry(
     show_thinking: bool,
     expand_tools: bool,
     theme: Theme,
+    width: u16,
 ) {
-    render_transcript_entry_inner(lines, entry, show_thinking, expand_tools, theme, None);
+    render_transcript_entry_inner(
+        lines,
+        entry,
+        show_thinking,
+        expand_tools,
+        theme,
+        width,
+        None,
+    );
+}
+
+fn render_tool_card(lines: &mut Vec<Line<'static>>, tool: &ToolTranscript, expanded: bool, theme: Theme, width: u16) {
+    let card = if expanded { &tool.expanded } else { &tool.compact };
+    let border = match card.status {
+        ToolCallViewStatus::Failed | ToolCallViewStatus::Cancelled => theme.error,
+        ToolCallViewStatus::Running | ToolCallViewStatus::Streaming => theme.border_accent,
+        ToolCallViewStatus::Succeeded | ToolCallViewStatus::OrphanRepaired => theme.border_muted,
+    };
+    let inner = usize::from(width.saturating_sub(2).max(1));
+    lines.push(Line::from(Span::styled(format!("╭{}╮", "─".repeat(inner)), Style::default().fg(border))));
+    if card.tool_name.eq_ignore_ascii_case("bash") {
+        push_tool_box_row(lines, &format!("$ {}", card.arguments_summary), theme.bash_mode, border, inner);
+        if card.rows.iter().any(|row| row.role == ToolCardRowRole::Content) {
+            push_tool_separator(lines, " Output ", border, inner);
+        }
+    } else {
+        let marker = match card.status {
+            ToolCallViewStatus::Running | ToolCallViewStatus::Streaming | ToolCallViewStatus::Succeeded => if matches!(card.tool_name.as_str(), "edit" | "write") { "✎" } else { "•" },
+            ToolCallViewStatus::Failed | ToolCallViewStatus::Cancelled => "✘",
+            ToolCallViewStatus::OrphanRepaired => "↻",
+        };
+        let title = if card.arguments_summary.is_empty() { format!("{marker} {}", card.tool_name) } else { format!("{marker} {} {}", card.tool_name, card.arguments_summary) };
+        push_tool_box_row(lines, &title, theme.tool_title, border, inner);
+    }
+    for row in &card.rows {
+        if row.role == ToolCardRowRole::Command { continue; }
+        let color = match row.role {
+            ToolCardRowRole::Command => theme.tool_title,
+            ToolCardRowRole::Content => theme.tool_output,
+            ToolCardRowRole::Details => theme.dim,
+            ToolCardRowRole::Status => if card.is_error { theme.error } else { theme.muted },
+            ToolCardRowRole::Error => theme.error,
+        };
+        for text in clean_terminal_text(&row.text).lines() { push_tool_box_row(lines, text, color, border, inner); }
+    }
+    if card.truncated { push_tool_box_row(lines, &format!("… {} more lines ⟦Ctrl+O: Expand⟧", card.omitted_content_lines), theme.dim, border, inner); }
+    lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), Style::default().fg(border))));
+    lines.push(Line::default());
+}
+
+fn push_tool_separator(lines: &mut Vec<Line<'static>>, label: &str, border: Color, inner: usize) {
+    let fill = "─".repeat(inner.saturating_sub(label.chars().count().saturating_add(2)));
+    lines.push(Line::from(vec![Span::styled("├──", Style::default().fg(border)), Span::styled(label.to_owned(), Style::default().fg(border)), Span::styled(fill, Style::default().fg(border)), Span::styled("┤", Style::default().fg(border))]));
+}
+
+fn push_tool_box_row(lines: &mut Vec<Line<'static>>, text: &str, color: Color, border: Color, inner: usize) {
+    for row in wrap_display_line(&clean_terminal_text(text), inner.saturating_sub(2).max(1)) {
+        let used = usize::from(display_width(&row));
+        let fill = " ".repeat(inner.saturating_sub(used.saturating_add(2)));
+        lines.push(Line::from(vec![Span::styled("│ ", Style::default().fg(border)), Span::styled(row, Style::default().fg(color)), Span::raw(fill), Span::styled(" │", Style::default().fg(border))]));
+    }
+}
+
+fn transcript_block_has_content(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::Text { text, .. } => !text.trim().is_empty(),
+        ContentBlock::Thinking {
+            thinking, redacted, ..
+        } => !redacted && !thinking.trim().is_empty(),
+        ContentBlock::Image { .. } | ContentBlock::ToolCall(_) => true,
+    }
 }
 
 fn render_transcript_entry_inner(
@@ -4040,71 +5306,67 @@ fn render_transcript_entry_inner(
     show_thinking: bool,
     expand_tools: bool,
     theme: Theme,
+    width: u16,
     mut image_context: Option<&mut TranscriptImageContext<'_>>,
 ) {
+    if entry.kind == TranscriptKind::Job {
+        if let Some(card) = &entry.job_card {
+            render_job_card(lines, card, theme);
+        }
+        return;
+    }
+    if entry.kind == TranscriptKind::Tool {
+        if let Some(tool) = &entry.tool_card { render_tool_card(lines, tool, expand_tools, theme, width); }
+        return;
+    }
+    if !entry.content.iter().any(|block| match block {
+        ContentBlock::Thinking { .. } => show_thinking && transcript_block_has_content(block),
+        _ => transcript_block_has_content(block),
+    }) {
+        return;
+    }
     let (label, label_color, background) = match entry.kind {
-        TranscriptKind::User => ("You", theme.accent, Some(theme.user_message_bg)),
-        TranscriptKind::Assistant => ("Assistant", theme.success, None),
+        TranscriptKind::User => (None, theme.accent, Some(theme.user_message_bg)),
+        TranscriptKind::Assistant => (None, theme.success, None),
         TranscriptKind::System => (
-            entry
-                .tool_name
-                .as_deref()
-                .unwrap_or(if entry.is_error { "Error" } else { "System" }),
+            Some(
+                entry
+                    .tool_name
+                    .as_deref()
+                    .unwrap_or(if entry.is_error { "Error" } else { "System" }),
+            ),
             if entry.is_error {
                 theme.error
             } else {
                 theme.custom_message_label
             },
-            Some(theme.custom_message_bg),
+            None,
         ),
         TranscriptKind::Custom => (
-            entry.tool_name.as_deref().unwrap_or("Custom"),
+            Some(entry.tool_name.as_deref().unwrap_or("Custom")),
             theme.custom_message_label,
-            Some(theme.custom_message_bg),
+            None,
         ),
-        TranscriptKind::Tool => (
-            entry.tool_name.as_deref().unwrap_or("Tool"),
-            if entry.is_error {
-                theme.error
-            } else {
-                theme.tool_title
-            },
-            Some(if entry.is_partial {
-                theme.tool_pending_bg
-            } else if entry.is_error {
-                theme.tool_error_bg
-            } else {
-                theme.tool_success_bg
-            }),
-        ),
-    };
-    let status = if entry.kind == TranscriptKind::Tool {
-        if entry.is_partial {
-            " …"
-        } else if entry.is_error {
-            " error"
-        } else {
-            " done"
+        TranscriptKind::Tool | TranscriptKind::Job => {
+            unreachable!("cards return before generic rendering")
         }
-    } else {
-        ""
     };
-    lines.push(Line::from(Span::styled(
-        format!("{}{status}", clean_terminal_text(label)),
-        Style::default()
-            .fg(label_color)
-            .add_modifier(Modifier::BOLD),
-    )));
+    if let Some(label) = label {
+        lines.push(Line::from(Span::styled(
+            format!("{} ·", clean_terminal_text(label)),
+            Style::default().fg(label_color),
+        )));
+    }
     let mut visible_blocks = 0_usize;
+    let mut reasoning_labeled = false;
     for block in &entry.content {
         match block {
             ContentBlock::Text { text, .. } => {
-                if entry.kind == TranscriptKind::Tool && !expand_tools && visible_blocks > 0 {
+                if text.trim().is_empty() {
                     continue;
                 }
                 let base = match entry.kind {
                     TranscriptKind::User => theme.user_message_text,
-                    TranscriptKind::Tool => theme.tool_output,
                     TranscriptKind::System => {
                         if entry.is_error {
                             theme.error
@@ -4114,24 +5376,31 @@ fn render_transcript_entry_inner(
                     }
                     TranscriptKind::Custom => theme.custom_message_text,
                     TranscriptKind::Assistant => theme.text,
-                };
-                let mut rendered = if entry.kind == TranscriptKind::Tool {
-                    render_tool_text(&clean_terminal_text(text), theme)
-                } else {
-                    render_markdown(&clean_terminal_text(text), theme, base)
-                };
-                if entry.kind == TranscriptKind::Tool {
-                    apply_tool_line_styles(&mut rendered, theme, background);
-                    if !expand_tools && rendered.len() > 1 {
-                        rendered.truncate(1);
-                        rendered.push(Line::from(Span::styled(
-                            "  Ctrl+O to expand",
-                            Style::default()
-                                .fg(theme.dim)
-                                .bg(background.unwrap_or(Color::Reset)),
-                        )));
+                    TranscriptKind::Tool | TranscriptKind::Job => {
+                        unreachable!("cards return before generic text rendering")
                     }
-                } else if let Some(background) = background {
+                };
+                let sanitized = clean_terminal_text(text);
+                let mut rendered = if entry.kind == TranscriptKind::User {
+                    render_markdown(&sanitized, theme, base)
+                } else {
+                    render_transcript_markdown(
+                        &sanitized,
+                        theme,
+                        base,
+                        width,
+                        entry.is_partial,
+                    )
+                };
+                if entry.kind == TranscriptKind::User {
+                    for line in &mut rendered {
+                        line.spans.insert(
+                            0,
+                            Span::styled("  ", Style::default().fg(theme.accent)),
+                        );
+                    }
+                }
+                if let Some(background) = background {
                     for line in &mut rendered {
                         line.style = line.style.bg(background);
                         for span in &mut line.spans {
@@ -4145,30 +5414,32 @@ fn render_transcript_entry_inner(
             ContentBlock::Thinking {
                 thinking, redacted, ..
             } => {
-                if *redacted || thinking.trim().is_empty() {
+                if !show_thinking || *redacted || thinking.trim().is_empty() {
                     continue;
                 }
-                if show_thinking {
+                if !reasoning_labeled {
                     lines.push(Line::from(Span::styled(
-                        "Reasoning",
+                        "thinking ·",
                         Style::default()
-                            .fg(theme.thinking_text)
+                            .fg(theme.dim)
                             .add_modifier(Modifier::ITALIC),
                     )));
-                    let mut rendered =
-                        render_markdown(&clean_terminal_text(thinking), theme, theme.thinking_text);
-                    for line in &mut rendered {
-                        line.style = line.style.add_modifier(Modifier::ITALIC);
-                    }
-                    lines.extend(rendered);
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        "Reasoning hidden · Ctrl+T to show",
-                        Style::default()
-                            .fg(theme.thinking_text)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                    reasoning_labeled = true;
                 }
+                let mut rendered = render_transcript_markdown(
+                    &clean_terminal_text(thinking),
+                    theme,
+                    theme.thinking_text,
+                    width,
+                    entry.is_partial,
+                );
+                for line in &mut rendered {
+                    line.style = line.style.add_modifier(Modifier::ITALIC);
+                    for span in &mut line.spans {
+                        span.style = span.style.add_modifier(Modifier::ITALIC);
+                    }
+                }
+                lines.extend(rendered);
                 visible_blocks += 1;
             }
             ContentBlock::Image { data, mime_type } => {
@@ -4216,7 +5487,30 @@ fn render_transcript_entry_inner(
             }
         }
     }
-    lines.push(Line::default());
+    if visible_blocks > 0 {
+        lines.push(Line::default());
+    }
+}
+
+fn saved_session_preview_lines(
+    session: &pi_coding::SessionInfo,
+    marker: &str,
+    show_path: bool,
+) -> Vec<String> {
+    let preview = clean_terminal_text(session_display_name(session));
+    let path = if show_path {
+        format!(" · {}", session.path.display())
+    } else {
+        String::new()
+    };
+    let mut logical_lines = preview.split('\n');
+    let first = logical_lines.next().unwrap_or_default();
+    let mut lines = vec![format!(
+        "{marker} {first} · {} messages{path}",
+        session.messages
+    )];
+    lines.extend(logical_lines.map(|line| format!("  {line}")));
+    lines
 }
 
 fn render_saved_session_selector(
@@ -4225,7 +5519,11 @@ fn render_saved_session_selector(
     theme: Theme,
 ) {
     let visible = selector.visible_sessions();
-    let height = u16::try_from(visible.len().saturating_add(6))
+    let visible_rows = visible
+        .iter()
+        .map(|session| saved_session_preview_lines(session, "", selector.show_path()).len())
+        .sum::<usize>();
+    let height = u16::try_from(visible_rows.saturating_add(6))
         .unwrap_or(u16::MAX)
         .clamp(8, 22);
     let area = centered_rect(
@@ -4287,16 +5585,8 @@ fn render_saved_session_selector(
         } else {
             " "
         };
-        let path = if selector.show_path() {
-            format!(" · {}", session.path.display())
-        } else {
-            String::new()
-        };
-        let text = format!(
-            "{marker} {} · {} messages{path}",
-            session_display_name(session),
-            session.messages
-        );
+        let preview_lines =
+            saved_session_preview_lines(session, marker, selector.show_path());
         let style = if index == selector.selected() {
             Style::default().fg(theme.text).bg(theme.selected_bg)
         } else {
@@ -4306,7 +5596,58 @@ fn render_saved_session_selector(
                 theme.text
             })
         };
-        lines.push(Line::from(Span::styled(clean_terminal_text(&text), style)));
+        lines.extend(preview_lines.into_iter().map(|text| {
+            Line::from(Span::styled(text, style))
+        }));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border_accent)),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+
+fn render_agents_panel(frame: &mut ratatui::Frame<'_>, panel: &AgentsPanel, theme: Theme) {
+    let lines_data = panel.view_lines();
+    let height = u16::try_from(lines_data.len().saturating_add(5))
+        .unwrap_or(u16::MAX)
+        .clamp(8, 24);
+    let area = centered_rect(
+        frame.area().width.saturating_sub(4).min(110).max(40),
+        height,
+        frame.area(),
+    );
+    frame.render_widget(Clear, area);
+    let dirty = if panel.dirty() { " · unsaved" } else { "" };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{}{dirty}", panel.title()),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            panel.help().to_owned(),
+            Style::default().fg(theme.dim),
+        )),
+    ];
+    for row in lines_data {
+        let style = if row.selected {
+            Style::default().fg(theme.text).bg(theme.selected_bg)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        lines.push(Line::from(Span::styled(clean_terminal_text(&row.text), style)));
+    }
+    if let Some(selected) = panel.selected_row() {
+        lines.push(Line::from(Span::styled(
+            clean_terminal_text(&selected.description),
+            Style::default().fg(theme.dim),
+        )));
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -4389,6 +5730,53 @@ fn render_scoped_model_selector(
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_transcript_markdown(
+    text: &str,
+    theme: Theme,
+    base: Color,
+    width: u16,
+    streaming: bool,
+) -> Vec<Line<'static>> {
+    let styles = markdown_ratatui_styles(theme, base);
+    if streaming {
+        render_ratatui_markdown_streaming(text, width, styles).lines
+    } else {
+        render_ratatui_markdown(text, width, styles).lines
+    }
+}
+
+fn markdown_ratatui_styles(theme: Theme, base: Color) -> MarkdownRatatuiStyles {
+    let text = Style::default().fg(base);
+    let heading = Style::default()
+        .fg(theme.md_heading)
+        .add_modifier(Modifier::BOLD);
+    MarkdownRatatuiStyles {
+        text,
+        heading_1: heading,
+        heading_2: heading,
+        heading_3: heading,
+        heading_4: heading,
+        heading_5: heading,
+        heading_6: heading,
+        list_marker: Style::default().fg(theme.md_list_bullet),
+        quote: Style::default().fg(theme.md_quote),
+        code: Style::default().fg(theme.md_code_block),
+        code_fence: Style::default().fg(theme.md_code_block_border),
+        table_border: Style::default().fg(theme.md_code_block_border),
+        table_header: Style::default()
+            .fg(theme.md_heading)
+            .add_modifier(Modifier::BOLD),
+        table_body: text,
+        mermaid_border: Style::default().fg(theme.md_code_block_border),
+        mermaid_node: Style::default().fg(base),
+        mermaid_edge: Style::default().fg(theme.md_list_bullet),
+        diagnostic: Style::default()
+            .fg(theme.warning)
+            .add_modifier(Modifier::ITALIC),
+        thematic_break: Style::default().fg(theme.md_hr),
+    }
 }
 
 fn render_tool_text(text: &str, theme: Theme) -> Vec<Line<'static>> {
@@ -4911,6 +6299,24 @@ fn clean_terminal_text(text: &str) -> String {
     clean
 }
 
+fn normalize_newlines(text: &str) -> Cow<'_, str> {
+    if !text.contains('\r') {
+        return Cow::Borrowed(text);
+    }
+    let mut normalized = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    Cow::Owned(normalized)
+}
 fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
     let width = usize::from(width.max(1));
     lines
@@ -5045,8 +6451,75 @@ mod tests {
         editor.insert_newline();
         editor.insert_char('b');
         editor.move_left();
+
         editor.backspace();
         assert_eq!(editor.text(), "ba");
+    }
+
+    #[test]
+    fn raw_paste_burst_maps_printable_and_enter_but_not_tab_or_control_keys() {
+        assert_eq!(
+            raw_paste_character(KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE)),
+            Some('界')
+        );
+        assert_eq!(
+            raw_paste_character(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some('\n')
+        );
+        assert_eq!(
+            raw_paste_character(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            raw_paste_character(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            raw_paste_character(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn paste_event_normalizes_multiline_crlf_and_preserves_cjk() {
+        let mut state = todo_test_state(Vec::new());
+        handle_paste(&mut state, "first\r\n界🙂\rthird");
+        assert_eq!(state.editor.text(), "first\n界🙂\nthird");
+        assert_eq!((state.editor.row, state.editor.column), (2, "third".len()));
+        assert!(state.transcript.is_empty(), "pasting must not submit a message");
+    }
+
+    #[test]
+    fn paste_event_inserts_7608_plus_characters_once_and_undoes_once() {
+        let mut state = todo_test_state(Vec::new());
+        let payload = "x".repeat(8_193);
+        handle_paste(&mut state, &payload);
+        assert_eq!(state.editor.text(), payload);
+        assert_eq!(state.editor.undo.len(), 1);
+        state.editor.undo();
+        assert!(state.editor.is_empty());
+    }
+
+    #[test]
+    fn oversize_paste_is_rejected_without_mutating_the_draft() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("keep");
+        let undo_entries = state.editor.undo.len();
+        handle_paste(&mut state, &"x".repeat(MAX_PASTE_BYTES + 1));
+        assert_eq!(state.editor.text(), "keep");
+        assert_eq!(state.editor.undo.len(), undo_entries);
+        assert!(state.status.contains("Paste rejected"));
+    }
+
+    #[test]
+    fn multiline_paste_stays_one_draft_until_explicit_enter_and_esc_clears_it() {
+        let mut state = todo_test_state(Vec::new());
+        handle_paste(&mut state, "one\ntwo\nthree");
+        assert_eq!(state.editor.text(), "one\ntwo\nthree");
+        assert!(state.transcript.is_empty());
+
+        state.editor.clear();
+        assert!(state.editor.is_empty(), "Esc abort clears the entire pasted draft");
     }
 
     #[test]
@@ -5117,11 +6590,17 @@ mod tests {
     fn slash_completion_fuzzy_matches_and_accepts_selection() {
         let (background_tx, _background_rx) = mpsc::unbounded_channel();
         let mut state = TuiState {
+            tool_cards: ToolCardPresentationAdapter::new(),
+            job_cards: JobCardPresentationAdapter::new(),
             transcript: Vec::new(),
+            committed_entries: 0,
             editor: EditorState::new(),
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            thinking_level: ThinkingLevel::Off,
             is_streaming: false,
+            animation_frame: 0,
+            pending_user_echo: false,
             show_thinking: true,
             double_escape_action: DoubleEscapeAction::Tree,
             last_escape: None,
@@ -5155,11 +6634,19 @@ mod tests {
                 })
                 .collect(),
             panel: None,
+            settings_panel: None,
+            settings_value_input: None,
             tree_panel: None,
+            process_panel: None,
+            agents_panel: None,
             scoped_models: None,
             session_selector: None,
             scoped_model_selector: None,
             todo_phases: Vec::new(),
+            extension_working_message: None,
+            extension_working_visible: false,
+            extension_hidden_thinking_label: None,
+            extension_title: None,
             active_loops: std::collections::BTreeMap::new(),
         };
         state.editor.insert_char('/');
@@ -5176,11 +6663,17 @@ mod tests {
     fn slash_completion_includes_dynamic_commands_with_descriptions() {
         let (background_tx, _background_rx) = mpsc::unbounded_channel();
         let mut state = TuiState {
+            tool_cards: ToolCardPresentationAdapter::new(),
+            job_cards: JobCardPresentationAdapter::new(),
             transcript: Vec::new(),
+            committed_entries: 0,
             editor: EditorState::new(),
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            thinking_level: ThinkingLevel::Off,
             is_streaming: false,
+            animation_frame: 0,
+            pending_user_echo: false,
             show_thinking: true,
             double_escape_action: DoubleEscapeAction::Tree,
             last_escape: None,
@@ -5211,11 +6704,19 @@ mod tests {
                 source: CommandSource::Skill,
             }],
             panel: None,
+            settings_panel: None,
+            settings_value_input: None,
             tree_panel: None,
+            process_panel: None,
+            agents_panel: None,
             scoped_models: None,
             session_selector: None,
             scoped_model_selector: None,
             todo_phases: Vec::new(),
+            extension_working_message: None,
+            extension_working_visible: false,
+            extension_hidden_thinking_label: None,
+            extension_title: None,
             active_loops: std::collections::BTreeMap::new(),
         };
         state.editor.insert_text("/srl");
@@ -5289,36 +6790,190 @@ mod tests {
     }
 
     #[test]
-    fn markdown_render_distinguishes_heading_code_syntax_link_and_quote() {
-        let lines = render_markdown(
-            "# Heading\n\n[docs](https://example.test) and `inline`\n> quote\n```rust\nfn main() { let value = \"ok\"; }\n```",
-            crate::theme::DARK,
-            crate::theme::DARK.text,
-        );
-        let styles = lines
+    fn assistant_markdown_matches_shared_neutral_output_for_rich_blocks() {
+        let source = "# Heading\n\n1. ordered\n   - [x] nested\n\n| 名称 | 状態 |\n| --- | ---: |\n| 東京 | ✅ |\n\n[docs](https://example.test)\n\n```rust\nlet place = \"東京\";\n```\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: fallback\n```";
+        let width = 40;
+        let expected = pi_coding::markdown::render_markdown(
+            source,
+            &pi_coding::markdown::MarkdownRenderOptions {
+                width: usize::from(width),
+                ..pi_coding::markdown::MarkdownRenderOptions::default()
+            },
+        )
+        .plain_lines();
+        let entry = TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text(source)], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, width);
+        let rendered = lines[..lines.len() - 1]
             .iter()
-            .flat_map(|line| line.spans.iter().map(|span| span.style.fg))
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>();
-        assert!(styles.contains(&Some(crate::theme::DARK.md_heading)));
-        assert!(styles.contains(&Some(crate::theme::DARK.md_link)));
-        assert!(styles.contains(&Some(crate::theme::DARK.md_code)));
-        assert!(styles.contains(&Some(crate::theme::DARK.md_quote)));
-        assert!(styles.contains(&Some(crate::theme::DARK.syntax_keyword)));
-        assert!(styles.contains(&Some(crate::theme::DARK.syntax_string)));
+        assert_eq!(rendered, expected);
+        assert!(rendered.iter().any(|line| line.starts_with("┌─ mermaid · flowchart")));
+        assert!(rendered.iter().any(|line| line.contains("source fallback")));
+        assert!(rendered.iter().all(|line| display_width(line) <= width));
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(lines.iter().all(|line| {
+            line.spans
+                .iter()
+                .all(|span| span.content.as_ref() != "Assistant")
+        }));
     }
 
     #[test]
-    fn custom_transcript_uses_custom_theme_roles() {
-        let entry = TranscriptEntry {
-            kind: TranscriptKind::Custom,
-            content: vec![ContentBlock::text("extension notice")],
-            tool_name: Some("release-note".to_owned()),
-            is_error: false,
-            is_partial: false,
-        };
+    fn streaming_assistant_matches_shared_tail_semantics_without_prefix_duplication() {
+        let width = 32;
+        let source = "# Stable\n\nmutable tail\n\n| 名称 | 状態 |\n| --- | --- |\n| 東京 | ✅ |";
+        let rendered = render_transcript_markdown(
+            source,
+            crate::theme::DARK,
+            crate::theme::DARK.text,
+            width,
+            true,
+        );
+        let plain = rendered
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let expected = pi_coding::markdown::render_markdown_streaming(
+            source,
+            &pi_coding::markdown::MarkdownRenderOptions {
+                width: usize::from(width),
+                ..pi_coding::markdown::MarkdownRenderOptions::default()
+            },
+        )
+        .plain_lines();
+        assert_eq!(plain, expected);
+        assert_eq!(plain.iter().filter(|line| line.as_str() == "Stable").count(), 1);
+        assert!(plain.iter().any(|line| line.contains("東京")));
+        assert!(plain.iter().all(|line| display_width(line) <= width));
+
+        let finalized = render_transcript_markdown(
+            source,
+            crate::theme::DARK,
+            crate::theme::DARK.text,
+            width,
+            false,
+        );
+        assert!(finalized.iter().any(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .starts_with('┌')
+        }));
+    }
+
+    #[test]
+    fn streaming_updates_replace_the_live_entry_without_repeating_frozen_blocks() {
+        let width = 32;
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::AgentStart));
+        for delta in ["# Stable\n\nmutable", " tail"] {
+            let mut partial = pi_ai::AssistantMessage::pending(&Model::default());
+            partial.content = vec![ContentBlock::text(format!(
+                "{}{}",
+                state.streaming_text, delta
+            ))];
+            state.apply(ApplicationEvent::Agent(AgentEvent::MessageUpdate {
+                message: Message::Assistant(partial.clone()),
+                assistant_message_event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: delta.to_owned(),
+                    partial,
+                },
+            }));
+            let rendered = render_transcript_markdown(
+                &state.streaming_text,
+                crate::theme::DARK,
+                crate::theme::DARK.text,
+                width,
+                true,
+            );
+            let stable = rendered
+                .iter()
+                .filter(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        == "Stable"
+                })
+                .count();
+            assert_eq!(stable, 1);
+        }
+        assert_eq!(state.streaming_text, "# Stable\n\nmutable tail");
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn compact_roles_hide_repeated_labels_and_empty_entries() {
+        let assistant = TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text("answer")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
+        let user = TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text("prompt")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
+        let empty = TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text("  "), ContentBlock::thinking("hidden")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
+        let reasoning = TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::thinking("useful analysis"), ContentBlock::text("answer")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false };
+
         let mut lines = Vec::new();
-        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK);
-        assert_eq!(lines[0].spans[0].content, "release-note");
+        render_transcript_entry(&mut lines, &user, true, true, crate::theme::DARK, 80);
+        render_transcript_entry(&mut lines, &assistant, true, true, crate::theme::DARK, 80);
+        let text = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!text.contains("You"));
+        assert!(!text.contains("Assistant"));
+        assert!(lines[0].spans[0].content.starts_with("  "));
+        assert_eq!(lines[0].spans[0].style.bg, Some(crate::theme::DARK.user_message_bg));
+
+        let before = lines.len();
+        render_transcript_entry(&mut lines, &empty, false, true, crate::theme::DARK, 80);
+        assert_eq!(lines.len(), before);
+
+        let mut reasoning_lines = Vec::new();
+        render_transcript_entry(&mut reasoning_lines, &reasoning, true, true, crate::theme::DARK, 80);
+        let labels = reasoning_lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.content.as_ref() == "thinking ·")
+            .count();
+        assert_eq!(labels, 1);
+        assert!(reasoning_lines.iter().flat_map(|line| &line.spans).all(|span| {
+            span.content.as_ref() != "Reasoning"
+                && !span.content.contains("Reasoning hidden")
+        }));
+    }
+
+    #[test]
+    fn system_and_custom_labels_are_compact_without_card_background() {
+        for entry in [
+            TranscriptEntry { kind: TranscriptKind::System, content: vec![ContentBlock::text("failure")], tool_name: Some("Error".to_owned()), tool_card: None, job_card: None, is_error: true, is_partial: false },
+            TranscriptEntry { kind: TranscriptKind::Custom, content: vec![ContentBlock::text("notice")], tool_name: Some("release-note".to_owned()), tool_card: None, job_card: None, is_error: false, is_partial: false },
+        ] {
+            let mut lines = Vec::new();
+            render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+            assert!(lines[0].spans[0].content.ends_with(" ·"));
+            assert!(lines.iter().flat_map(|line| &line.spans).all(|span| {
+                span.style.bg != Some(crate::theme::DARK.custom_message_bg)
+            }));
+        }
+    }
+    #[test]
+    fn custom_transcript_uses_custom_theme_roles() {
+        let entry = TranscriptEntry { kind: TranscriptKind::Custom, content: vec![ContentBlock::text("extension notice")], tool_name: Some("release-note".to_owned()), tool_card: None, job_card: None, is_error: false, is_partial: false };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+        assert_eq!(lines[0].spans[0].content, "release-note ·");
         assert_eq!(
             lines[0].spans[0].style.fg,
             Some(crate::theme::DARK.custom_message_label)
@@ -5328,47 +6983,49 @@ mod tests {
                 .iter()
                 .skip(1)
                 .flat_map(|line| &line.spans)
-                .any(|span| {
-                    span.style.fg == Some(crate::theme::DARK.custom_message_text)
-                        && span.style.bg == Some(crate::theme::DARK.custom_message_bg)
-                })
+                .any(|span| span.style.fg == Some(crate::theme::DARK.custom_message_text))
         );
+        assert!(lines.iter().flat_map(|line| &line.spans).all(|span| {
+            span.style.bg != Some(crate::theme::DARK.custom_message_bg)
+        }));
     }
 
     #[test]
-    fn tool_diff_and_reasoning_render_with_semantic_roles_and_no_ansi() {
-        let entry = TranscriptEntry {
-            kind: TranscriptKind::Tool,
-            content: vec![
-                ContentBlock::text("\u{1b}[31m@@ -1 +1 @@\u{1b}[0m\n- old\n+ new"),
-                ContentBlock::thinking("private analysis"),
-            ],
-            tool_name: Some("edit".to_owned()),
-            is_error: false,
-            is_partial: false,
-        };
-        let mut lines = Vec::new();
-        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK);
-        let spans = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .collect::<Vec<_>>();
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.style.fg == Some(crate::theme::DARK.tool_diff_removed))
-        );
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.style.fg == Some(crate::theme::DARK.tool_diff_added))
-        );
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.style.fg == Some(crate::theme::DARK.thinking_text))
-        );
-        assert!(spans.iter().all(|span| !span.content.contains('\u{1b}')));
+    fn tool_reducer_reconciles_ids_statuses_and_expanded_render() {
+        use pi_agent::AgentToolResult;
+        use pi_ai::{ToolResultMessage, now_millis};
+
+        let mut state = todo_test_state(Vec::new());
+        for event in [
+            AgentEvent::ToolExecutionStart { tool_call_id: "a".to_owned(), tool_name: "read".to_owned(), arguments: serde_json::json!({"path": "a.rs"}) },
+            AgentEvent::ToolExecutionStart { tool_call_id: "b".to_owned(), tool_name: "read".to_owned(), arguments: serde_json::json!({"path": "b.rs"}) },
+            AgentEvent::ToolExecutionEnd { tool_call_id: "b".to_owned(), tool_name: "read".to_owned(), result: AgentToolResult::text("body-b"), is_error: false },
+            AgentEvent::MessageEnd { message: Message::ToolResult(ToolResultMessage { tool_call_id: "b".to_owned(), tool_name: "read".to_owned(), content: vec![ContentBlock::text("body-b")], usage: None, details: None, added_tool_names: Vec::new(), is_error: false, timestamp: now_millis() }) },
+            AgentEvent::ToolExecutionEnd { tool_call_id: "a".to_owned(), tool_name: "read".to_owned(), result: AgentToolResult::text("not found"), is_error: true },
+        ] {
+            state.apply(ApplicationEvent::Agent(event));
+        }
+        assert_eq!(state.transcript.iter().filter(|entry| entry.kind == TranscriptKind::Tool).count(), 2);
+        assert_eq!(state.transcript.iter().filter(|entry| entry.tool_card.as_ref().is_some_and(|tool| tool.compact.tool_call_id == "b")).count(), 1);
+        assert_eq!(state.transcript[0].tool_card.as_ref().unwrap().compact.status, ToolCallViewStatus::Failed);
+
+        let mut bash = todo_test_state(Vec::new());
+        let body = (1..=30).map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+        bash.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart { tool_call_id: "bash".to_owned(), tool_name: "bash".to_owned(), arguments: serde_json::json!({"command": "seq 1 30"}) }));
+        bash.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd { tool_call_id: "bash".to_owned(), tool_name: "bash".to_owned(), result: AgentToolResult::text(body), is_error: false }));
+        let entry = bash.transcript.last().unwrap();
+        let mut compact = Vec::new();
+        render_transcript_entry(&mut compact, entry, true, false, crate::theme::DARK, 80);
+        let compact_text = compact.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+        assert!(compact_text.contains("$ seq 1 30"));
+        assert!(compact_text.contains("… 11 more lines ⟦Ctrl+O: Expand⟧"));
+        assert!(!compact_text.contains("bash done"));
+        let mut expanded = Vec::new();
+        render_transcript_entry(&mut expanded, entry, true, true, crate::theme::DARK, 80);
+        let expanded_text = expanded.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+        assert!(expanded_text.contains("1"));
+        assert!(!expanded_text.contains("Ctrl+O: Expand"));
+        assert!(compact.iter().filter(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>().starts_with('╭')).count() == 1);
     }
 
     fn interaction(request: ExtensionUiRequest) -> ExtensionUiInteraction {
@@ -5557,6 +7214,327 @@ mod tests {
         assert_eq!(state.editor.text(), "main");
     }
 
+    #[tokio::test]
+    async fn extension_canonical_queries_and_setters_bind_tui_reducer_state() {
+        use pi_coding::{ExtensionCancellation, ExtensionUiHost, ExtensionUiResponse};
+
+        let adapter = ExtensionUiAdapter::new();
+        let mut events = adapter.subscribe();
+        let mut state = dialog_test_state(adapter.clone());
+        state.editor.set_text("host-buffer");
+        state.expand_tools = false;
+        state.sync_extension_host_bindings();
+
+        assert_eq!(
+            adapter
+                .request(
+                    tui_context(1),
+                    ExtensionUiRequest::GetEditorText,
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::EditorText {
+                value: "host-buffer".to_owned()
+            }
+        );
+        assert_eq!(
+            adapter
+                .request(
+                    tui_context(1),
+                    ExtensionUiRequest::GetToolsExpanded,
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::ToolsExpanded { expanded: false }
+        );
+        let themes = match adapter
+            .request(
+                tui_context(1),
+                ExtensionUiRequest::GetAllThemes,
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap()
+        {
+            ExtensionUiResponse::Themes { themes } => themes,
+            other => panic!("expected themes, got {other:?}"),
+        };
+        assert!(themes.iter().any(|theme| theme.name == "dark"));
+        assert!(themes.iter().any(|theme| theme.name == "light"));
+
+        adapter
+            .request(
+                tui_context(1),
+                ExtensionUiRequest::SetEditorText {
+                    text: "from-extension".to_owned(),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        assert_eq!(state.editor.text(), "from-extension");
+
+        adapter
+            .request(
+                tui_context(1),
+                ExtensionUiRequest::SetToolsExpanded { expanded: true },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        assert!(state.expand_tools);
+
+        adapter
+            .request(
+                tui_context(1),
+                ExtensionUiRequest::SetWorkingMessage {
+                    message: Some("building".to_owned()),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        adapter
+            .request(
+                tui_context(1),
+                ExtensionUiRequest::SetWorkingVisible { visible: true },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        assert_eq!(state.extension_working_message.as_deref(), Some("building"));
+        assert!(state.extension_working_visible);
+        assert_eq!(state.status, "building");
+
+        adapter
+            .request(
+                tui_context(1),
+                ExtensionUiRequest::SetHiddenThinkingLabel {
+                    label: Some("quiet thinking".to_owned()),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        assert_eq!(
+            state.extension_hidden_thinking_label.as_deref(),
+            Some("quiet thinking")
+        );
+
+        assert_eq!(
+            adapter
+                .request(
+                    tui_context(1),
+                    ExtensionUiRequest::SetTheme {
+                        name: "light".to_owned(),
+                    },
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::ThemeSet {
+                success: true,
+                error: None,
+            }
+        );
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        assert_eq!(state.themes.active_name(), "light");
+
+        assert_eq!(
+            adapter
+                .request(
+                    tui_context(1),
+                    ExtensionUiRequest::GetEditorText,
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::EditorText {
+                value: "from-extension".to_owned()
+            }
+        );
+        assert_eq!(
+            adapter
+                .request(
+                    tui_context(1),
+                    ExtensionUiRequest::GetToolsExpanded,
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::ToolsExpanded { expanded: true }
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_dispatch_avoids_model_turn_and_preserves_editor_on_usage_error() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        let application = Application::new(session.clone()).await;
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("/goal create --tokens nope keep this");
+        assert!(!dispatch_goal_command(
+            &application,
+            &mut state,
+            Some("create --tokens nope keep this"),
+        ));
+        assert_eq!(state.editor.text(), "/goal create --tokens nope keep this");
+        assert!(state.status.contains("positive integer"));
+        assert!(session.history().is_empty());
+
+        assert!(dispatch_goal_command(
+            &application,
+            &mut state,
+            Some("create --tokens 20 ship cleanly"),
+        ));
+        assert!(state.status.contains("active · 0/20 tokens · ship cleanly"));
+        assert!(session.history().is_empty(), "goal command must not run the agent");
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn extension_unsupported_canonical_queries_error_when_disabled() {
+        use pi_coding::{ExtensionCancellation, ExtensionUiHost};
+
+        let adapter = ExtensionUiAdapter::new();
+        adapter.set_canonical_queries_supported(false);
+        let mut state = dialog_test_state(adapter.clone());
+        state.sync_extension_host_bindings();
+
+        for request in [
+            ExtensionUiRequest::GetEditorText,
+            ExtensionUiRequest::GetAllThemes,
+            ExtensionUiRequest::GetTheme {
+                name: "dark".to_owned(),
+            },
+            ExtensionUiRequest::SetTheme {
+                name: "dark".to_owned(),
+            },
+            ExtensionUiRequest::GetToolsExpanded,
+        ] {
+            let error = adapter
+                .request(tui_context(1), request, ExtensionCancellation::new())
+                .await
+                .expect_err("disabled canonical path must fail closed");
+            assert!(
+                error.to_string().contains("canonical host state"),
+                "{error:#}"
+            );
+        }
+    }
+
+    fn session_info_with_preview(preview: &str) -> pi_coding::SessionInfo {
+        pi_coding::SessionInfo {
+            path: PathBuf::from("/sessions/preview.jsonl"),
+            id: "preview".to_owned(),
+            cwd: PathBuf::from("/workspace"),
+            timestamp: "2026-08-01T00:00:00Z".to_owned(),
+            messages: 3,
+            name: None,
+            first_message: preview.to_owned(),
+            all_messages_text: preview.to_owned(),
+        }
+    }
+
+    #[test]
+    fn saved_session_preview_preserves_logical_line_breaks() {
+        let session = session_info_with_preview("first line\nsecond line\nthird line");
+        assert_eq!(
+            saved_session_preview_lines(&session, "•", false),
+            vec![
+                "• first line · 3 messages".to_owned(),
+                "  second line".to_owned(),
+                "  third line".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn effective_thinking_state_uses_hidden_override_and_effective_level() {
+        let mut state = todo_test_state(Vec::new());
+        state.thinking_level = ThinkingLevel::High;
+        state.show_thinking = false;
+        state.extension_hidden_thinking_label = Some("thinking quietly".to_owned());
+        let effective = state.effective_thinking_state();
+        assert_eq!(effective.level, ThinkingLevel::High);
+        assert!(!effective.show_thinking);
+        assert_eq!(effective.label, "thinking quietly");
+
+        state.extension_hidden_thinking_label = None;
+        assert_eq!(state.effective_thinking_state().label, "high hidden");
+    }
+
+    #[tokio::test]
+    async fn transcript_replacement_resets_ledger_streaming_and_partial_state() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session
+            .load_history(vec![Message::user_text("replacement", 1)])
+            .await
+            .expect("history");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        for index in 0..64 {
+            state.push_message(Message::user_text(format!("old {index}"), index as i64));
+        }
+        state.committed_entries = state.transcript.len();
+        state.transcript_scroll = 99;
+        state.transcript_page_rows.set(42);
+        state.streaming_text = "draft answer".to_owned();
+        state.streaming_thinking = "draft reasoning".to_owned();
+        state.is_streaming = true;
+        state.pending_user_echo = true;
+
+        state.replace_transcript_from_application(&application);
+
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.committed_entries, 0);
+        assert_eq!(state.transcript_scroll, 0);
+        assert_eq!(state.transcript_page_rows.get(), 1);
+        assert!(state.streaming_text.is_empty());
+        assert!(state.streaming_thinking.is_empty());
+        assert!(!state.is_streaming);
+        assert!(!state.pending_user_echo);
+        assert_eq!(state.settled_commit_batch().len(), 1);
+        assert!(state.overflow_commit_batch(80, 20).is_empty());
+        application.cleanup().await;
+    }
+
     #[test]
     fn extension_snapshot_renders_title_status_widgets_and_editor() {
         use crate::extension_ui::{ExtensionStatusItem, ExtensionWidgetItem};
@@ -5581,6 +7559,13 @@ mod tests {
             notifications: Vec::new(),
             title: Some("Extension Title".to_owned()),
             editor_text: "extension editor".to_owned(),
+            working_message: None,
+            working_visible: false,
+            working_indicator: None,
+            hidden_thinking_label: None,
+            themes: Vec::new(),
+            active_theme: None,
+            tools_expanded: false,
         };
         let widgets = extension_widget_lines(
             &snapshot,
@@ -5611,11 +7596,17 @@ mod tests {
     fn todo_test_state(phases: Vec<TodoPhase>) -> TuiState {
         let (background_tx, _background_rx) = mpsc::unbounded_channel();
         TuiState {
+            tool_cards: ToolCardPresentationAdapter::new(),
+            job_cards: JobCardPresentationAdapter::new(),
             transcript: Vec::new(),
+            committed_entries: 0,
             editor: EditorState::new(),
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            thinking_level: ThinkingLevel::Off,
             is_streaming: false,
+            animation_frame: 0,
+            pending_user_echo: false,
             show_thinking: true,
             double_escape_action: DoubleEscapeAction::Tree,
             last_escape: None,
@@ -5642,13 +7633,90 @@ mod tests {
             clipboard_write_busy: false,
             commands: Vec::new(),
             panel: None,
+            settings_panel: None,
+            settings_value_input: None,
             tree_panel: None,
+            process_panel: None,
+            agents_panel: None,
             scoped_models: None,
             session_selector: None,
             scoped_model_selector: None,
             todo_phases: phases,
+            extension_working_message: None,
+            extension_working_visible: false,
+            extension_hidden_thinking_label: None,
+            extension_title: None,
             active_loops: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn job_events_update_one_inline_card_through_terminal_and_parked_states() {
+        let mut state = todo_test_state(Vec::new());
+        let mut job = pi_coding::JobSnapshot {
+            id: "job-1".to_owned(),
+            agent_id: "Child".to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: Some("inspect the workspace".to_owned()),
+            status: pi_coding::JobStatus::Queued,
+            created_at: 1_000,
+            started_at: None,
+            finished_at: None,
+            result: None,
+        };
+        let event = |job| pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job,
+        };
+
+        state.apply(ApplicationEvent::Orchestration(event(job.clone())));
+        job.status = pi_coding::JobStatus::Running;
+        job.started_at = Some(1_100);
+        state.apply(ApplicationEvent::Orchestration(event(job.clone())));
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::AgentUpdated {
+                group_id: "group".to_owned(),
+                agent: pi_coding::AgentSnapshot {
+                    id: "Child".to_owned(),
+                    display_name: "task: inspect the workspace".to_owned(),
+                    parent_id: Some("Main".to_owned()),
+                    status: pi_coding::AgentStatus::Parked,
+                    created_at: 1_000,
+                    last_activity: 1_200,
+                    unread: 0,
+                    artifact_ref: None,
+                    history_ref: None,
+                },
+            },
+        ));
+        job.status = pi_coding::JobStatus::Completed;
+        job.finished_at = Some(2_100);
+        let completed = event(job);
+        state.apply(ApplicationEvent::Orchestration(completed.clone()));
+        state.apply(ApplicationEvent::Orchestration(completed));
+
+        let job_entries = state
+            .transcript
+            .iter()
+            .filter(|entry| entry.kind == TranscriptKind::Job)
+            .collect::<Vec<_>>();
+        assert_eq!(job_entries.len(), 1, "terminal updates must replace by job id");
+        assert!(!job_entries[0].is_partial);
+        let card = job_entries[0].job_card.as_ref().expect("job card");
+        assert_eq!(card.job_status, pi_coding::JobStatus::Completed);
+        assert_eq!(card.agent_status, Some(pi_coding::AgentStatus::Parked));
+        assert!(card.rows[0].text.contains("completed · parked"));
+
+        let mut rendered = Vec::new();
+        render_job_card(&mut rendered, card, crate::theme::DARK);
+        let text = rendered
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("inspect the workspace"));
+        assert!(text.contains("completed · parked"));
     }
 
     #[test]
@@ -5777,5 +7845,363 @@ mod tests {
         state.apply(ApplicationEvent::TodoReminder { phases });
         assert_eq!(state.todo_phases.len(), 1);
         assert!(state.status.contains("Todo reminder"));
+    }
+
+    #[test]
+    fn user_prompt_echo_renders_exactly_one_you_entry() {
+        // One submitted user prompt must produce exactly one "You" transcript
+        // entry. The immediate "You" echo (editor submit / startup positional
+        // prompt) and the agent's `MessageEnd` for the persisted
+        // `Message::User` must reconcile into a single row, not duplicate.
+
+        // Case 1: immediate display, then the canonical MessageEnd. The
+        // MessageEnd must replace the immediate-display slot (carrying the
+        // persisted image block) instead of appending a second "You" row.
+        let mut state = todo_test_state(Vec::new());
+        state.push_lines("You", "hello".to_owned(), Color::Reset);
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript[0].kind, TranscriptKind::User);
+        assert!(state.pending_user_echo);
+        let canonical = Message::User(pi_ai::UserMessage {
+            content: vec![
+                ContentBlock::text("hello"),
+                ContentBlock::Image {
+                    data: "aW1n".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                },
+            ],
+            timestamp: 1,
+        });
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: canonical,
+        }));
+        assert!(!state.pending_user_echo);
+        assert_eq!(
+            state
+                .transcript
+                .iter()
+                .filter(|entry| entry.kind == TranscriptKind::User)
+                .count(),
+            1,
+            "immediate-display path must keep exactly one You entry"
+        );
+        let entry = &state.transcript[0];
+        assert_eq!(entry.kind, TranscriptKind::User);
+        // Reconciled to the canonical persisted content, so the image block
+        // survives (proving replacement rather than a bare skip).
+        assert_eq!(entry.content.len(), 2);
+        assert!(matches!(entry.content[1], ContentBlock::Image { .. }));
+
+        // Case 2: scheduled loop turns arrive as typed hidden custom messages.
+        // The TUI projects one visible Loop/System card and never a You row or
+        // the internal model wrapper.
+        let mut state = todo_test_state(Vec::new());
+        assert!(!state.pending_user_echo);
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: Message::Custom(pi_ai::CustomMessage {
+                custom_type: "loop_scheduled_turn".to_owned(),
+                content: "<system-reminder>internal</system-reminder>\n\nloop prompt".into(),
+                display: false,
+                details: Some(serde_json::json!({
+                    "taskId": "abc123",
+                    "prompt": "loop prompt",
+                    "schedule": "every 3 seconds",
+                })),
+                timestamp: 2,
+            }),
+        }));
+        assert_eq!(state.transcript.len(), 1);
+        let loop_entry = &state.transcript[0];
+        assert_eq!(loop_entry.kind, TranscriptKind::System);
+        assert_eq!(loop_entry.tool_name.as_deref(), Some("Loop abc123 · every 3 seconds"));
+        assert_eq!(content_text(&loop_entry.content), "loop prompt");
+        assert!(!content_text(&loop_entry.content).contains("system-reminder"));
+        assert!(!state.transcript.iter().any(|entry| entry.kind == TranscriptKind::User));
+        state.push_message(Message::Custom(pi_ai::CustomMessage {
+            custom_type: "loop_scheduled_turn".to_owned(),
+            content: "<system-reminder>internal second</system-reminder>\n\nloop prompt".into(),
+            display: false,
+            details: Some(serde_json::json!({
+                "taskId": "abc123",
+                "prompt": "loop prompt",
+                "schedule": "every 3 seconds",
+            })),
+            timestamp: 3,
+        }));
+        assert_eq!(state.transcript.len(), 2, "one public card per persisted run");
+        assert!(state.transcript.iter().all(|entry| entry.kind == TranscriptKind::System));
+    }
+
+    #[test]
+    fn settled_entries_commit_once_and_partial_rows_wait() {
+        let mut state = todo_test_state(Vec::new());
+        state.push_entry(TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text("prompt")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false });
+        state.push_entry(TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text("answer")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false });
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "partial-read".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({"path": "a"}),
+        }));
+
+        assert!(state.overflow_commit_batch(80, 20).is_empty());
+        let overflow = state.overflow_commit_batch(80, 1);
+        assert_eq!(overflow.len(), 2);
+        assert_eq!(overflow[0].kind, TranscriptKind::User);
+        assert_eq!(overflow[1].kind, TranscriptKind::Assistant);
+        state.finish_commit(overflow.len());
+        assert_eq!(state.committed_entries, 2);
+        assert!(state.overflow_commit_batch(80, 20).is_empty());
+    }
+
+    #[test]
+    fn finalized_user_and_assistant_stay_visible_across_draw_ticks_and_resize() {
+        let mut state = todo_test_state(Vec::new());
+        state.push_lines("You", "hello".to_owned(), Color::Reset);
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: Message::user_text("hello", 1),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: {
+                let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+                message.content = vec![ContentBlock::text("world")];
+                message.stop_reason = pi_ai::StopReason::Stop;
+                Message::Assistant(message)
+            },
+        }));
+
+        assert!(state.overflow_commit_batch(163, 20).is_empty());
+        assert!(state.overflow_commit_batch(163, 20).is_empty());
+        assert!(state.overflow_commit_batch(90, 20).is_empty());
+        assert!(state.overflow_commit_batch(163, 20).is_empty());
+
+        assert_eq!(state.committed_entries, 0);
+
+        let overflow = state.overflow_commit_batch(90, 1);
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0].kind, TranscriptKind::User);
+        state.finish_commit(overflow.len());
+        assert_eq!(state.committed_entries, 1);
+        assert!(state.overflow_commit_batch(163, 20).is_empty());
+    }
+
+    #[test]
+    fn idle_theme_tick_is_a_noop_without_binding_sync_or_redraw() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text(&"x".repeat(7_608));
+        assert!(!state.poll_theme_reload());
+        assert!(!state.reconcile_extension_dialog());
+        assert_eq!(state.editor.text().len(), 7_608);
+    }
+
+    #[test]
+    fn live_viewport_is_compact_without_live_transcript_and_expands_for_overlays() {
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "/tmp/project".to_owned();
+        assert_eq!(live_viewport_height(&state, 80, 24), 3);
+
+        state.editor.set_text("one\ntwo");
+        assert_eq!(live_viewport_height(&state, 80, 24), 4);
+
+        state.panel = Some(SelectorPanel {
+            title: "Models".to_owned(),
+            help: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            query: String::new(),
+        });
+        assert_eq!(live_viewport_height(&state, 80, 24), 16);
+    }
+
+    #[test]
+    fn streaming_submit_behavior_is_steer() {
+        assert_eq!(streaming_submit_behavior(false), None);
+        assert_eq!(
+            streaming_submit_behavior(true),
+            Some(StreamingBehavior::Steer)
+        );
+    }
+
+    #[test]
+    fn pending_user_echo_and_streaming_assistant_never_duplicate_on_settle() {
+        let mut state = todo_test_state(Vec::new());
+        state.push_lines("You", "hello".to_owned(), Color::Reset);
+        assert!(state.settled_commit_batch().is_empty());
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd { message: Message::user_text("hello", 1) }));
+        assert_eq!(state.settled_commit_batch().len(), 1);
+        state.finish_commit(1);
+        state.streaming_text = "draft".to_owned();
+        assert!(state.settled_commit_batch().is_empty());
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd { message: {
+            let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+            message.content = vec![ContentBlock::text("final")];
+            message.stop_reason = pi_ai::StopReason::Stop;
+            Message::Assistant(message)
+        }}));
+        let batch = state.settled_commit_batch();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].kind, TranscriptKind::Assistant);
+    }
+
+    #[test]
+    fn composer_wraps_unicode_input_inside_borders() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("界🙂abcdefghij界🙂abcdefghij界🙂abcdefghij");
+        let lines = composer_border_lines(&state, 24, crate::theme::DARK);
+        let rendered = lines.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+        assert!(rendered.len() > 3);
+        assert!(rendered.first().is_some_and(|line| line.starts_with('╭')));
+        assert!(rendered.last().is_some_and(|line| line.starts_with('╰')));
+        assert!(rendered.iter().all(|line| display_width(line) == 24));
+        assert!(rendered[1..rendered.len() - 1].iter().all(|line| line.starts_with('│') && line.ends_with('│')));
+    }
+
+    #[test]
+    fn command_prefix_acceptance_is_unambiguous_and_nonexecuting() {
+        let mut state = todo_test_state(Vec::new());
+        state.commands = vec![
+            InteractiveCommand { name: "settings".to_owned(), description: String::new(), source: CommandSource::Builtin },
+            InteractiveCommand { name: "branch".to_owned(), description: String::new(), source: CommandSource::Builtin },
+            InteractiveCommand { name: "login".to_owned(), description: String::new(), source: CommandSource::Builtin },
+            InteractiveCommand { name: "logout".to_owned(), description: String::new(), source: CommandSource::Builtin },
+        ];
+        state.editor.set_text("/set"); assert!(state.accept_unambiguous_command_prefix()); assert_eq!(state.editor.text(), "/settings");
+        state.editor.set_text("/br"); assert!(state.accept_unambiguous_command_prefix()); assert_eq!(state.editor.text(), "/branch");
+        state.editor.set_text("/lo"); assert!(!state.accept_unambiguous_command_prefix()); assert_eq!(state.editor.text(), "/lo");
+    }
+
+    #[test]
+    fn omp_completion_composer_is_three_rows() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("/branch");
+        state.completions.items = vec![CompletionItem { value: "/branch".to_owned(), label: "branch".to_owned(), description: "Create a new branch from a previous message".to_owned(), is_directory: false }];
+        state.completions.context = Some(CompletionContext::Slash);
+        let rendered = composer_border_lines(&state, 90, crate::theme::DARK).into_iter().map(|line| line.spans.into_iter().map(|span| span.content.into_owned()).collect::<String>()).collect::<Vec<_>>();
+        assert_eq!(rendered.len(), 3);
+        assert!(rendered[1].starts_with("│  /branch"));
+        assert!(rendered.iter().all(|line| display_width(line) == 90));
+    }
+
+    #[test]
+    fn completion_acceptance_is_explicit_and_consumed_once() {
+        let mut state = todo_test_state(Vec::new());
+        state.commands = vec![InteractiveCommand { name: "branch".to_owned(), description: String::new(), source: CommandSource::Builtin }];
+        state.editor.set_text("/br");
+        state.completions.items = vec![CompletionItem { value: "/branch".to_owned(), label: "branch".to_owned(), description: String::new(), is_directory: false }];
+        state.completions.context = Some(CompletionContext::Slash);
+        state.editor.insert_char('a');
+        assert_eq!(state.editor.text(), "/bra");
+        state.refresh_completions();
+        assert_eq!(state.editor.text(), "/bra");
+        state.accept_completion();
+        assert_eq!(state.editor.text(), "/branch");
+        assert!(state.completions.items.is_empty());
+        state.editor.insert_char('h');
+        assert_eq!(state.editor.text(), "/branchh");
+    }
+
+    #[test]
+    fn animation_changes_only_while_streaming() {
+        let mut state = todo_test_state(Vec::new());
+        state.is_streaming = true;
+        let first = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        state.animation_frame = 1;
+        let second = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert_ne!(first, second);
+        state.is_streaming = false;
+        let idle_first = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        state.animation_frame = 3;
+        let idle_second = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert_eq!(idle_first, idle_second);
+    }
+
+    #[test]
+    fn page_up_renders_retained_committed_entries_without_resetting_ledger() {
+        let mut state = todo_test_state(Vec::new());
+        state.push_entry(TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text("old prompt")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false });
+        state.push_entry(TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text("recent answer")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false });
+        state.finish_commit(1);
+        state.transcript_scroll = 1;
+        assert_eq!(state.committed_entries, 1);
+        assert_eq!(state.transcript.len(), 2);
+        assert!(state.transcript.iter().any(|entry| content_text(&entry.content).contains("old prompt")));
+    }
+
+    #[test]
+    fn omp_single_line_composer_is_two_rows_with_input_in_lower_border() {
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "/home/test/Downloads".to_owned();
+        state.editor.set_text("visible input");
+        let lines = composer_border_lines(&state, 90, crate::theme::DARK);
+        assert_eq!(lines.len(), 2);
+        let top = lines[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let bottom = lines[1].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert!(top.starts_with("╭── π  > ⬢ faux/faux-1 · ◑ med > 📁 "));
+        assert!(top.ends_with('╮'));
+        assert!(bottom.starts_with("╰─ visible input "));
+        assert!(bottom.ends_with('╯'));
+        assert_eq!(display_width(&top), 90);
+        assert_eq!(display_width(&bottom), 90);
+    }
+
+    #[test]
+    fn omp_multiline_composer_expands_without_losing_lines() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("first\nsecond");
+        let lines = composer_border_lines(&state, 90, crate::theme::DARK);
+        assert_eq!(lines.len(), 4);
+        let rendered = lines.iter().map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+        assert!(rendered[0].starts_with('╭'));
+        assert!(rendered[1].contains("first"));
+        assert!(rendered[2].contains("second"));
+        assert!(rendered[3].starts_with('╰'));
+        assert!(rendered[3].ends_with('╯'));
+        assert!(rendered.iter().all(|line| display_width(line) == 90));
+    }
+
+    #[test]
+    fn compact_inline_render_has_model_cwd_editor_without_dashboard_labels() {
+        use ratatui::backend::TestBackend;
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "/tmp/project".to_owned();
+        state.editor.set_text("draft prompt");
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut images = TerminalImageRenderer::default();
+        terminal.draw(|frame| { let _ = render(frame, &state, &mut images); }).unwrap();
+        let rendered = terminal.backend().buffer().content.iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("faux/faux-1"));
+        assert!(rendered.contains("/tmp/project"));
+        assert!(rendered.contains("draft prompt"));
+        assert!(!rendered.contains("Conversation"));
+        assert!(!rendered.contains("pi (rs)"));
+    }
+
+    #[test]
+    fn bounded_composer_materializes_only_visible_rows_for_large_and_cjk_pastes() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text(&format!("{}{}", "x".repeat(7_608), "界".repeat(200)));
+        let lines = composer_border_lines_bounded(&state, 80, crate::theme::DARK, 9);
+        assert!(lines.len() <= 9);
+        let (_, cursor_column) = editor_wrapped_position(&state, 75);
+        assert!(cursor_column < 75);
+    }
+
+    #[test]
+    fn terminal_lifecycle_commands_enable_and_disable_bracketed_paste() {
+        let mut bytes = Vec::new();
+        acquire_terminal(&mut bytes).unwrap();
+        release_terminal(&mut bytes).unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(!output.contains("\u{1b}[?1049h"));
+        assert!(!output.contains("\u{1b}[?1049l"));
+        assert!(output.contains("\u{1b}[?2004h"));
+        assert!(output.contains("\u{1b}[?2004l"));
+        assert!(output.contains("\u{1b}[?25l"));
+        assert!(output.contains("\u{1b}[?25h"));
     }
 }

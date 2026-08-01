@@ -91,6 +91,9 @@ async fn builder_defaults_to_no_resource_discovery_and_injects_settings_tools_an
     let prompt = built.session.system_prompt().await;
     assert!(!prompt.contains("project-only-marker"));
     assert!(!prompt.contains("project-only-skill-marker"));
+    let selection = built.session.select_for_request("project-only-skill-marker").await;
+    assert!(selection.skills.is_empty());
+    assert!(selection.autoload_skills.is_empty());
     Ok(())
 }
 

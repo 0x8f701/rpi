@@ -90,11 +90,9 @@ pi sessions
 # Resume the newest session for this directory
 pi --continue
 
-# Resume a specific session file
-pi --resume <agent-dir>/sessions/--<workspace>--/...jsonl
-
-# Import a Codex rollout and resume it
-pi --resume-codex rollout-abc123.jsonl
+# Resume a native or foreign session by path, exact id, or prefix
+pi --resume rollout-abc123.jsonl
+pi --resume abc123
 ```
 
 Sessions are stored as append-only JSONL files under `<agent-dir>/sessions/`.

@@ -123,6 +123,79 @@ pub fn expand_resource_command(
     Ok(Some(if arguments.is_empty() { block } else { format!("{block}\n\n{arguments}") }))
 }
 
+/// Parse `/run` arguments into `(command_name, remainder)`.
+pub fn parse_run_invocation(arguments: &str) -> anyhow::Result<(&str, &str)> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("usage: /run <command> [args]");
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or_default().trim();
+    if name.is_empty() {
+        anyhow::bail!("usage: /run <command> [args]");
+    }
+    if name.starts_with('/') {
+        anyhow::bail!("extension command names must not include the leading slash");
+    }
+    let rest = parts.next().unwrap_or("").trim_start();
+    Ok((name, rest))
+}
+
+/// Parse `/chain` / `/run-chain` into ordered `(command, args)` steps.
+///
+/// Steps are separated by `|`. Each step must name a real installed extension
+/// command at dispatch time; this parser only validates non-empty shape.
+pub fn parse_chain_invocation(arguments: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("usage: /chain <command> [args] [| <command> [args] ...]");
+    }
+    let mut steps = Vec::new();
+    for raw_step in trimmed.split('|') {
+        let step = raw_step.trim();
+        if step.is_empty() {
+            anyhow::bail!("empty step in /chain; separate commands with |");
+        }
+        let (name, rest) = parse_run_invocation(step)
+            .map_err(|_| anyhow::anyhow!("invalid /chain step {step:?}"))?;
+        steps.push((name.to_owned(), rest.to_owned()));
+    }
+    if steps.is_empty() {
+        anyhow::bail!("usage: /chain <command> [args] [| <command> [args] ...]");
+    }
+    Ok(steps)
+}
+
+/// Invoke one trusted installed extension command by registered name.
+pub async fn invoke_extension_command(
+    application: &pi_coding::Application,
+    name: &str,
+    arguments: String,
+) -> anyhow::Result<serde_json::Value> {
+    let runtime = application
+        .extension_runtime()
+        .ok_or_else(|| anyhow::anyhow!("extension runtime is not loaded"))?;
+    if !runtime.commands().iter().any(|command| command.name == name) {
+        anyhow::bail!(
+            "unknown or untrusted extension command {name:?}; only commands registered by installed trusted extensions can run"
+        );
+    }
+    runtime.invoke_command(name, arguments, None, None).await
+}
+
+/// Invoke a sequence of trusted installed extension commands.
+pub async fn invoke_extension_chain(
+    application: &pi_coding::Application,
+    steps: &[(String, String)],
+) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    let mut outputs = Vec::with_capacity(steps.len());
+    for (name, arguments) in steps {
+        let value = invoke_extension_command(application, name, arguments.clone()).await?;
+        outputs.push((name.clone(), value));
+    }
+    Ok(outputs)
+}
+
 fn strip_frontmatter(content: &str) -> &str {
     let Some(rest) = content.strip_prefix("---\n") else {
         return content;
@@ -139,8 +212,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "settings",
-        description: "Open settings menu",
-        argument_hint: None,
+        description: "Inspect and edit schema-driven settings",
+        argument_hint: Some("[list|search|set|reset|validate|apply|cancel] ..."),
     },
     BuiltinCommand {
         name: "model",
@@ -208,6 +281,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("[name|next|prev]"),
     },
     BuiltinCommand {
+        name: "branch",
+        description: "Create a new branch from a previous message",
+        argument_hint: None,
+    },
+    BuiltinCommand {
         name: "fork",
         description: "Fork from a previous user message",
         argument_hint: None,
@@ -233,9 +311,24 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
     },
     BuiltinCommand {
+        name: "loop-update",
+        description: "Update a recurring loop by ID",
+        argument_hint: Some("<id> [interval] [prompt]"),
+    },
+    BuiltinCommand {
+        name: "loop-delete",
+        description: "Delete a recurring loop by ID without aborting its active turn",
+        argument_hint: Some("<id>"),
+    },
+    BuiltinCommand {
         name: "loop-cancel",
         description: "Cancel a recurring loop by ID",
         argument_hint: Some("<id>"),
+    },
+    BuiltinCommand {
+        name: "goal",
+        description: "Create, inspect, pause, resume, complete, or drop the session goal",
+        argument_hint: Some("[show|create [--tokens N] <objective>|pause|resume|complete|drop]"),
     },
     BuiltinCommand {
         name: "todo",
@@ -274,13 +367,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "resume",
-        description: "Resume a different session",
-        argument_hint: Some("[path]"),
-    },
-    BuiltinCommand {
-        name: "resume-codex",
-        description: "Import and resume a Codex session",
-        argument_hint: Some("<path|id>"),
+        description: "Resume a native or foreign session",
+        argument_hint: Some("[path|id|prefix]"),
     },
     BuiltinCommand {
         name: "ps",
@@ -293,9 +381,29 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("<start|describe|logs|send|resize|signal|stop|wait> ..."),
     },
     BuiltinCommand {
+        name: "agents",
+        description: "Manage agent definitions and model overrides",
+        argument_hint: None,
+    },
+    BuiltinCommand {
         name: "reload",
         description: "Reload extensions and project resources",
         argument_hint: None,
+    },
+    BuiltinCommand {
+        name: "run",
+        description: "Run a trusted installed extension command",
+        argument_hint: Some("<command> [args]"),
+    },
+    BuiltinCommand {
+        name: "chain",
+        description: "Run trusted installed extension commands in sequence",
+        argument_hint: Some("<command> [args] [| <command> [args] ...]"),
+    },
+    BuiltinCommand {
+        name: "run-chain",
+        description: "Alias for /chain over trusted installed extension commands",
+        argument_hint: Some("<command> [args] [| <command> [args] ...]"),
     },
     BuiltinCommand {
         name: "quit",
@@ -315,6 +423,154 @@ pub fn usage(command: &BuiltinCommand) -> String {
         || format!("/{}", command.name),
         |hint| format!("/{} {hint}", command.name),
     )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InteractiveSettingsCommand {
+    Inspect { scope: pi_coding::SettingsScope },
+    Search { scope: pi_coding::SettingsScope, query: String },
+    Set { scope: pi_coding::SettingsScope, key: String, value: serde_json::Value },
+    Reset { scope: pi_coding::SettingsScope, key: String },
+    Validate { scope: pi_coding::SettingsScope, key: Option<String>, value: Option<serde_json::Value> },
+    Apply { scope: pi_coding::SettingsScope, key: String, value: serde_json::Value },
+    Cancel { scope: pi_coding::SettingsScope },
+}
+
+pub fn parse_interactive_settings_command(
+    name: &str,
+    argument: Option<&str>,
+) -> anyhow::Result<Option<InteractiveSettingsCommand>> {
+    if name != "settings" {
+        return Ok(None);
+    }
+    let arguments = pi_coding::parse_command_args(argument.unwrap_or_default());
+    let mut parts = arguments.into_iter();
+    let action = parts.next().unwrap_or_else(|| "list".to_owned());
+    let mut rest = parts.collect::<Vec<_>>();
+    let scope = if rest.first().is_some_and(|value| value == "--project") {
+        rest.remove(0);
+        pi_coding::SettingsScope::Project
+    } else if rest.first().is_some_and(|value| value == "--global") {
+        rest.remove(0);
+        pi_coding::SettingsScope::Global
+    } else {
+        pi_coding::SettingsScope::Global
+    };
+    let command = match action.as_str() {
+        "list" | "inspect" | "open" => {
+            if !rest.is_empty() {
+                anyhow::bail!("usage: /settings list [--global|--project]");
+            }
+            InteractiveSettingsCommand::Inspect { scope }
+        }
+        "search" => {
+            if rest.is_empty() {
+                anyhow::bail!("usage: /settings search [--global|--project] <query>");
+            }
+            InteractiveSettingsCommand::Search { scope, query: rest.join(" ") }
+        }
+        "set" => {
+            let key = rest.first().cloned().ok_or_else(|| anyhow::anyhow!(
+                "usage: /settings set [--global|--project] <key> <json-value>"
+            ))?;
+            if rest.len() != 2 {
+                anyhow::bail!("usage: /settings set [--global|--project] <key> <json-value>");
+            }
+            let value = serde_json::from_str(&rest[1])
+                .map_err(|error| anyhow::anyhow!("invalid JSON setting value: {error}"))?;
+            InteractiveSettingsCommand::Set { scope, key, value }
+        }
+        "reset" => {
+            if rest.len() != 1 {
+                anyhow::bail!("usage: /settings reset [--global|--project] <key>");
+            }
+            InteractiveSettingsCommand::Reset { scope, key: rest.remove(0) }
+        }
+        "validate" => {
+            let (key, value) = match rest.as_slice() {
+                [] => (None, None),
+                [key, value] => (
+                    Some(key.clone()),
+                    Some(serde_json::from_str(value).map_err(|error| {
+                        anyhow::anyhow!("invalid JSON setting value: {error}")
+                    })?),
+                ),
+                _ => anyhow::bail!("usage: /settings validate [--global|--project] [<key> <json-value>]"),
+            };
+            InteractiveSettingsCommand::Validate { scope, key, value }
+        }
+        "apply" => {
+            if rest.len() != 2 {
+                anyhow::bail!("usage: /settings apply [--global|--project] <key> <json-value>");
+            }
+            let key = rest.remove(0);
+            let value = serde_json::from_str(&rest[0])
+                .map_err(|error| anyhow::anyhow!("invalid JSON setting value: {error}"))?;
+            InteractiveSettingsCommand::Apply { scope, key, value }
+        }
+        "cancel" => {
+            if !rest.is_empty() {
+                anyhow::bail!("usage: /settings cancel [--global|--project]");
+            }
+            InteractiveSettingsCommand::Cancel { scope }
+        }
+        _ => anyhow::bail!("unknown /settings action {action:?}"),
+    };
+    Ok(Some(command))
+}
+
+pub async fn execute_interactive_settings_command(
+    application: &pi_coding::Application,
+    command: InteractiveSettingsCommand,
+) -> anyhow::Result<String> {
+    let scope = match &command {
+        InteractiveSettingsCommand::Inspect { scope }
+        | InteractiveSettingsCommand::Search { scope, .. }
+        | InteractiveSettingsCommand::Set { scope, .. }
+        | InteractiveSettingsCommand::Reset { scope, .. }
+        | InteractiveSettingsCommand::Validate { scope, .. }
+        | InteractiveSettingsCommand::Apply { scope, .. }
+        | InteractiveSettingsCommand::Cancel { scope } => *scope,
+    };
+    let mut panel = crate::settings_panel::SettingsPanel::from_application(application, scope)?;
+    match command {
+        InteractiveSettingsCommand::Inspect { .. } => {
+            Ok(serde_json::to_string_pretty(&panel.snapshot()?)?)
+        }
+        InteractiveSettingsCommand::Search { query, .. } => {
+            panel.set_search(query);
+            Ok(serde_json::to_string_pretty(&panel.snapshot()?)?)
+        }
+        InteractiveSettingsCommand::Set { key, value, .. } => {
+            panel.set_value(&key, value)?;
+            panel.validate()?;
+            let outcome = panel.apply(application).await?;
+            Ok(serde_json::to_string_pretty(&outcome)?)
+        }
+        InteractiveSettingsCommand::Reset { key, .. } => {
+            panel.reset(&key)?;
+            panel.validate()?;
+            let outcome = panel.apply(application).await?;
+            Ok(serde_json::to_string_pretty(&outcome)?)
+        }
+        InteractiveSettingsCommand::Validate { key, value, .. } => {
+            if let (Some(key), Some(value)) = (key, value) {
+                panel.set_value(&key, value)?;
+            }
+            panel.validate()?;
+            Ok("settings are valid".to_owned())
+        }
+        InteractiveSettingsCommand::Apply { key, value, .. } => {
+            panel.set_value(&key, value)?;
+            panel.validate()?;
+            let outcome = panel.apply(application).await?;
+            Ok(serde_json::to_string_pretty(&outcome)?)
+        }
+        InteractiveSettingsCommand::Cancel { .. } => {
+            panel.cancel()?;
+            Ok("settings draft cancelled".to_owned())
+        }
+    }
 }
 
 #[must_use]
@@ -364,11 +620,43 @@ mod tests {
             "/loop [interval] <prompt>"
         );
         assert_eq!(
+            usage(builtin("loop-update").expect("loop update command")),
+            "/loop-update <id> [interval] [prompt]"
+        );
+        assert_eq!(
+            usage(builtin("loop-delete").expect("loop delete command")),
+            "/loop-delete <id>"
+        );
+        assert_eq!(
             usage(builtin("loop-cancel").expect("loop cancel command")),
             "/loop-cancel <id>"
         );
         assert_eq!(usage(builtin("todo").expect("todo command")), "/todo [markdown]");
         assert_eq!(usage(builtin("process").expect("process command")), "/process <start|describe|logs|send|resize|signal|stop|wait> ...");
+        assert_eq!(usage(builtin("settings").expect("settings command")), "/settings [list|search|set|reset|validate|apply|cancel] ...");
+        assert_eq!(
+            usage(builtin("resume").expect("resume command")),
+            "/resume [path|id|prefix]"
+        );
+        assert!(builtin("resume-codex").is_none());
+    }
+
+    #[test]
+    fn parses_typed_settings_actions() {
+        assert!(matches!(
+            parse_interactive_settings_command("settings", Some("search --project retry")).unwrap(),
+            Some(InteractiveSettingsCommand::Search { scope: pi_coding::SettingsScope::Project, query }) if query == "retry"
+        ));
+        assert!(matches!(
+            parse_interactive_settings_command("settings", Some("set compaction.enabled false")).unwrap(),
+            Some(InteractiveSettingsCommand::Set { scope: pi_coding::SettingsScope::Global, key, value }) if key == "compaction.enabled" && value == serde_json::json!(false)
+        ));
+        assert!(matches!(
+            parse_interactive_settings_command("settings", Some("apply --global compaction.enabled false")).unwrap(),
+            Some(InteractiveSettingsCommand::Apply { scope: pi_coding::SettingsScope::Global, key, value }) if key == "compaction.enabled" && value == serde_json::json!(false)
+        ));
+        assert!(parse_interactive_settings_command("settings", Some("apply compaction.enabled")).is_err());
+        assert!(parse_interactive_settings_command("settings", Some("set theme not-json")).is_err());
     }
 
     #[tokio::test]
@@ -421,5 +709,29 @@ mod tests {
     fn closest_builtin_is_contextual_but_not_noisy() {
         assert_eq!(closest_builtin("relaod"), Some("reload"));
         assert_eq!(closest_builtin("not-remotely-a-command"), None);
+    }
+
+    #[test]
+    fn run_and_chain_parsers_require_named_extension_commands() {
+        assert!(parse_run_invocation("").is_err());
+        assert!(parse_run_invocation("/leading").is_err());
+        let (name, args) = parse_run_invocation("hello  world").unwrap();
+        assert_eq!(name, "hello");
+        assert_eq!(args, "world");
+
+        assert!(parse_chain_invocation("").is_err());
+        assert!(parse_chain_invocation("a | | b").is_err());
+        let steps = parse_chain_invocation("one | two arg | three").unwrap();
+        assert_eq!(
+            steps,
+            vec![
+                ("one".to_owned(), String::new()),
+                ("two".to_owned(), "arg".to_owned()),
+                ("three".to_owned(), String::new()),
+            ]
+        );
+        assert!(builtin("run").is_some());
+        assert!(builtin("chain").is_some());
+        assert!(builtin("run-chain").is_some());
     }
 }

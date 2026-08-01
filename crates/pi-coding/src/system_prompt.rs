@@ -21,6 +21,8 @@ pub struct BuildSystemPromptOptions {
     pub prompt_guidelines: Vec<String>,
     pub append_system_prompt: String,
     pub cwd: String,
+    /// Canonical workspace roots after the primary cwd, in user-selected order.
+    pub additional_workspace_roots: Vec<String>,
     pub context_files: Vec<ContextFile>,
     pub skills: Vec<Skill>,
     /// Absolute pi documentation paths; empty values fall back to
@@ -34,6 +36,7 @@ pub struct BuildSystemPromptOptions {
 /// project context, and footer. Port of `buildSystemPrompt`.
 pub fn build_system_prompt(opts: BuildSystemPromptOptions) -> String {
     let prompt_cwd = opts.cwd.replace('\\', "/");
+    let workspace_section = build_workspace_section(&opts.additional_workspace_roots);
 
     let append_section = if !opts.append_system_prompt.is_empty() {
         format!("\n\n{}", opts.append_system_prompt)
@@ -56,7 +59,10 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions) -> String {
     };
 
     if !opts.custom_prompt.is_empty() {
-        let mut prompt = format!("{}{append_section}{context_section}{skills_section}", opts.custom_prompt);
+        let mut prompt = format!(
+            "{}{append_section}{context_section}{skills_section}{workspace_section}",
+            opts.custom_prompt
+        );
         prompt.push_str("\nCurrent working directory: ");
         prompt.push_str(&prompt_cwd);
         return prompt;
@@ -138,10 +144,38 @@ Pi documentation (read only when the user asks about pi itself, its SDK, extensi
 - Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
     );
 
-    let mut prompt = format!("{prompt}{append_section}{context_section}{skills_section}");
+    let mut prompt = format!(
+        "{prompt}{append_section}{context_section}{skills_section}{workspace_section}"
+    );
     prompt.push_str("\nCurrent working directory: ");
     prompt.push_str(&prompt_cwd);
     prompt
+}
+
+fn build_workspace_section(additional_roots: &[String]) -> String {
+    const MAX_ROOTS: usize = 64;
+    const MAX_PATH_CHARS: usize = 4_096;
+
+    if additional_roots.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "\n\n<workspace_roots>\nFiles may be accessed only under the current working directory or these explicitly trusted additional roots:\n",
+    );
+    for root in additional_roots.iter().take(MAX_ROOTS) {
+        let normalized = root.replace('\\', "/");
+        let bounded = normalized.chars().take(MAX_PATH_CHARS).collect::<String>();
+        let _ = writeln!(section, "- {bounded}");
+    }
+    if additional_roots.len() > MAX_ROOTS {
+        let _ = writeln!(
+            section,
+            "- ... ({} additional roots omitted)",
+            additional_roots.len() - MAX_ROOTS
+        );
+    }
+    section.push_str("</workspace_roots>");
+    section
 }
 
 fn build_context_section(context_files: &[ContextFile]) -> String {
@@ -205,6 +239,22 @@ mod tests {
         assert!(got.ends_with("Current working directory: /proj"));
         assert!(!got.contains("<available_skills>"));
         assert!(!got.contains("<project_context>"));
+    }
+
+    #[test]
+    fn additional_workspace_roots_are_bounded_and_absent_by_default() {
+        let default_prompt = build_system_prompt(base_opts());
+        assert!(!default_prompt.contains("<workspace_roots>"));
+
+        let mut opts = base_opts();
+        opts.additional_workspace_roots = vec![
+            "/tmp/agent-loader".to_owned(),
+            "x".repeat(4_106),
+        ];
+        let prompt = build_system_prompt(opts);
+        assert!(prompt.contains("<workspace_roots>"));
+        assert!(prompt.contains("- /tmp/agent-loader"));
+        assert!(!prompt.contains(&"x".repeat(4_097)));
     }
 
     #[test]

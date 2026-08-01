@@ -138,3 +138,49 @@ async fn print_mode_expands_text_and_image_arguments() {
         pi_ai::ContentBlock::Image { mime_type, .. } if mime_type == "image/png"
     )));
 }
+
+#[tokio::test]
+async fn print_mode_executes_goal_command_without_agent_turn() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let session = Session::new(SessionOptions {
+        model: Model::default(),
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+    })
+    .expect("session");
+    session
+        .record(
+            pi_coding::start_session_in(
+                cwd.path(),
+                session.model().as_ref(),
+                Some("off"),
+                Some(cwd.path()),
+                Some("print-goal"),
+                None,
+            )
+            .expect("recorder"),
+        )
+        .expect("attach recorder");
+    let application = Application::new(session.clone()).await;
+    let mut output = Vec::new();
+    let result = pi_cli::session_run::run_print_to(
+        &application,
+        "/goal create --tokens 20 ship cleanly",
+        &mut output,
+        false,
+    )
+    .await
+    .expect("goal command");
+    assert!(result.contains("active · 0/20 tokens · ship cleanly"));
+    assert_eq!(session.history().len(), 0, "goal command must not run the agent");
+    assert_eq!(String::from_utf8(output).unwrap(), format!("{result}\n"));
+}

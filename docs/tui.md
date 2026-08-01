@@ -355,6 +355,8 @@ not shadowed by a built-in.
 | `/tree` | Navigate the current session tree (TUI tree panel) |
 | `/loop [interval] <prompt>` | Run a prompt on a recurring interval |
 | `/loops` | List active recurring loops |
+| `/loop-update <id> [interval] [prompt]` | Update a loop interval, prompt, or both |
+| `/loop-delete <id>` | Delete a loop without aborting an already-running turn |
 | `/loop-cancel <id>` | Cancel a recurring loop by ID |
 | `/todo [markdown]` | Show or edit the task list |
 | `/trust` | Save a project trust decision (TUI trust panel) |
@@ -363,12 +365,13 @@ not shadowed by a built-in.
 | `/llama [status, configure, refresh, load, unload]` | Manage the llama.cpp router |
 | `/new` | Start a new session |
 | `/compact [instructions]` | Manually compact session context |
-| `/resume [path]` | Resume a different session (TUI selector when no path) |
-| `/resume-codex <path or id>` | Import and resume a Codex session |
+| `/resume [path, id, or prefix]` | List or resume native and discovered OMP, Codex, Claude, Grok, or Droid sessions |
 | `/ps` | List supervised processes |
 | `/process <start, describe, logs, send, resize, signal, stop, wait> ...` | Control a supervised process |
 | `/reload` | Reload extensions and project resources |
 | `/quit` | Quit pi (or use `Ctrl+D` on empty input) |
+
+Loop intervals accept positive bare seconds (`/loop 300 check status`) or compact `s`, `m`, `h`, and `d` units (`/loop 3s echo hello`, `/loop 30m check deploy`). Scheduled turns appear as `Loop <id> · <cadence>` system cards; the internal model instruction wrapper is not shown as a user message.
 
 ## TUI vs REPL-only limitations
 

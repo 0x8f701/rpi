@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::{mpsc, oneshot}, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-const MINIMUM_INTERVAL_SECS: u64 = 60;
 const MAX_LOOP_TASKS: usize = 50;
 const LOOP_EXPIRY_DAYS: i64 = 7;
 const LOOP_STATE_VERSION: u32 = 1;
@@ -19,8 +18,8 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParsedLoopArgs<'a> { pub interval: Option<&'a str>, pub prompt: &'a str }
 
-/// Extract an unambiguous leading compact interval. Natural-language schedules
-/// remain in the prompt so adapters never invent a default.
+/// Extract an unambiguous leading compact or bare-second interval. Natural-language
+/// schedules remain in the prompt unless they begin with a bare integer.
 #[must_use]
 pub fn parse_loop_args(args: &str) -> ParsedLoopArgs<'_> {
     let trimmed = args.trim();
@@ -34,22 +33,33 @@ pub fn parse_loop_args(args: &str) -> ParsedLoopArgs<'_> {
 
 #[must_use]
 pub fn is_interval_token(value: &str) -> bool {
+    if value.is_empty() { return false; }
+    if value.chars().all(|character| character.is_ascii_digit()) {
+        return true;
+    }
     if value.len() < 2 { return false; }
     let (digits, suffix) = value.split_at(value.len() - 1);
-    matches!(suffix, "s" | "m" | "h" | "d") && digits.chars().all(|c| c.is_ascii_digit()) && digits.parse::<u64>().is_ok_and(|n| n > 0)
+    !digits.is_empty()
+        && matches!(suffix, "s" | "m" | "h" | "d")
+        && digits.chars().all(|character| character.is_ascii_digit())
 }
 
 pub fn parse_loop_interval(value: &str) -> Result<u64, LoopSchedulerError> {
     let value = value.trim();
     if value.is_empty() { return Err(LoopSchedulerError::InvalidInterval("interval cannot be empty".into())); }
+    if value.chars().all(|character| character.is_ascii_digit()) {
+        return value.parse::<u64>().map_err(|_| LoopSchedulerError::InvalidInterval(format!("interval too large: {value:?}"))).and_then(|seconds| {
+            if seconds == 0 { Err(LoopSchedulerError::InvalidInterval("interval value must be greater than 0".into())) } else { Ok(seconds) }
+        });
+    }
     let (digits, suffix) = value.split_at(value.len() - 1);
-    let number = digits.parse::<u64>().map_err(|_| LoopSchedulerError::InvalidInterval(format!("invalid interval format: {value:?} (expected e.g. 5m, 2h, 1d)")))?;
+    let number = digits.parse::<u64>().map_err(|_| LoopSchedulerError::InvalidInterval(format!("invalid interval format: {value:?} (expected e.g. 300, 5m, 2h, 1d)")))?;
     if number == 0 { return Err(LoopSchedulerError::InvalidInterval("interval value must be greater than 0".into())); }
     let unit = match suffix {
         "s" => 1, "m" => 60, "h" => 3_600, "d" => 86_400,
         _ => return Err(LoopSchedulerError::InvalidInterval(format!("invalid interval suffix: {suffix:?} (expected s, m, h, or d)"))),
     };
-    number.checked_mul(unit).map(|seconds| seconds.max(MINIMUM_INTERVAL_SECS)).ok_or_else(|| LoopSchedulerError::InvalidInterval(format!("interval too large: {value:?}")))
+    number.checked_mul(unit).ok_or_else(|| LoopSchedulerError::InvalidInterval(format!("interval too large: {value:?}")))
 }
 
 #[must_use]
@@ -67,7 +77,7 @@ pub fn format_loop_prompt(prompt: &str, task_id: &str, human_schedule: &str) -> 
 }
 
 #[must_use]
-pub const fn loop_usage_message() -> &'static str { "Usage: /loop [interval] <prompt>\nExample: /loop 30m check deploy status\nExample: /loop check deploy status every hour\n\nTell me how often it should run (e.g. 30m, 1 hour, every 2 days)." }
+pub const fn loop_usage_message() -> &'static str { "Usage: /loop [interval] <prompt>\nExample: /loop 300 check deploy status\nExample: /loop 3s check health\nExample: /loop 30m check deploy status\n\nIntervals are positive seconds (bare or suffixed s), minutes (m), hours (h), or days (d)." }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +99,28 @@ impl LoopTask {
     #[must_use] pub fn next_fire_at(&self) -> DateTime<Utc> { add_seconds(self.last_fired_at.unwrap_or(self.created_at), self.interval_secs) }
     #[must_use] pub fn is_expired(&self, now: DateTime<Utc>) -> bool { now >= self.expires_at }
     #[must_use] pub fn human_schedule(&self) -> String { loop_interval_to_human(self.interval_secs) }
+}
+
+pub const LOOP_SCHEDULED_MESSAGE_TYPE: &str = "loop_scheduled_turn";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoopMessageView<'a> {
+    pub task_id: &'a str,
+    pub prompt: &'a str,
+    pub schedule: &'a str,
+}
+
+#[must_use]
+pub fn loop_message_view(message: &pi_ai::CustomMessage) -> Option<LoopMessageView<'_>> {
+    if message.custom_type != LOOP_SCHEDULED_MESSAGE_TYPE {
+        return None;
+    }
+    let details = message.details.as_ref()?;
+    Some(LoopMessageView {
+        task_id: details.get("taskId")?.as_str()?,
+        prompt: details.get("prompt")?.as_str()?,
+        schedule: details.get("schedule")?.as_str()?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +175,8 @@ async fn receive<T>(response: oneshot::Receiver<Result<T, LoopSchedulerError>>) 
 pub(crate) struct LoopRunRequest {
     pub task_id: String,
     pub prompt: String,
+    pub model_prompt: String,
+    pub human_schedule: String,
     pub state: Option<LoopRunStateSink>,
 }
 
@@ -189,7 +223,12 @@ impl LoopSchedulerActor {
         loop { let deadline = self.next_deadline(); tokio::select! { biased; _ = self.cancel.cancelled() => break, completion = self.completion_rx.recv() => if let Some(completion) = completion { self.finish_run(completion); }, command = self.command_rx.recv() => { let Some(command) = command else { break }; self.handle_command(command).await; }, () = sleep_for_deadline(self.clock.clone(), deadline), if self.active_session => self.fire_one_due().await, } }
         self.shutdown().await;
     }
-    fn next_deadline(&self) -> Option<DateTime<Utc>> { self.tasks.iter().map(LoopTask::next_fire_at).min() }
+    fn next_deadline(&self) -> Option<DateTime<Utc>> {
+        self.tasks
+            .iter()
+            .flat_map(|task| [task.next_fire_at(), task.expires_at])
+            .min()
+    }
     async fn handle_command(&mut self, command: LoopCommand) { match command {
         LoopCommand::Create { request, reply } => { let result = self.create(request).await; let _ = reply.send(result); }, LoopCommand::Update { request, reply } => { let result = self.update(request).await; let _ = reply.send(result); }, LoopCommand::List { reply } => { let result = if self.active_session { Ok(self.tasks.clone()) } else { Err(LoopSchedulerError::Inactive) }; let _ = reply.send(result); }, LoopCommand::Delete { task_id, cancel_active, reply } => { let result = self.delete(&task_id, cancel_active).await; let _ = reply.send(result); }, LoopCommand::Suspend { reason, reply } => self.suspend(reason, reply).await, LoopCommand::Activate { storage_path, reply } => { let result = self.activate(storage_path).await; let _ = reply.send(result); },
     } }
@@ -207,7 +246,11 @@ impl LoopSchedulerActor {
     }
     async fn fire_one_due(&mut self) {
         let now = self.clock.now();
-        let Some(index) = self.tasks.iter().position(|task| task.next_fire_at() <= now) else {
+        let Some(index) = self
+            .tasks
+            .iter()
+            .position(|task| task.is_expired(now) || task.next_fire_at() <= now)
+        else {
             return;
         };
         if self.tasks[index].is_expired(now) {
@@ -252,9 +295,12 @@ impl LoopSchedulerActor {
             return;
         }
 
+        let human_schedule = task.human_schedule();
         let request = LoopRunRequest {
             task_id: task.id.clone(),
-            prompt: format_loop_prompt(&task.prompt, &task.id, &task.human_schedule()),
+            prompt: task.prompt.clone(),
+            model_prompt: format_loop_prompt(&task.prompt, &task.id, &human_schedule),
+            human_schedule,
             state: None,
         };
         if self.active.is_some() {
@@ -387,13 +433,185 @@ mod tests {
 
     #[test]
     fn parser_matches_researched_fixtures() {
-        let fixtures = [("5m check deploy status", Some("5m"), "check deploy status"), ("check deploy status", None, "check deploy status"), ("2h run tests", Some("2h"), "run tests"), ("1d daily report", Some("1d"), "daily report"), ("60s ping health", Some("60s"), "ping health"), ("5m", None, "5m"), ("check 5m deploy", None, "check 5m deploy"), ("", None, ""), ("   ", None, ""), ("5x do x", None, "5x do x"), ("5 do x", None, "5 do x"), ("m do x", None, "m do x"), ("55mm do x", None, "55mm do x"), ("0m do x", None, "0m do x"), ("0s do x", None, "0s do x"), ("abc do x", None, "abc do x"), ("99999999999999999999m do x", None, "99999999999999999999m do x"), ("every 30 minutes do x", None, "every 30 minutes do x"), ("30 min check deploy", None, "30 min check deploy"), ("1 hour run report", None, "1 hour run report"), ("run the report every 1h", None, "run the report every 1h")];
+        let fixtures = [("5m check deploy status", Some("5m"), "check deploy status"), ("check deploy status", None, "check deploy status"), ("2h run tests", Some("2h"), "run tests"), ("1d daily report", Some("1d"), "daily report"), ("60s ping health", Some("60s"), "ping health"), ("5m", None, "5m"), ("check 5m deploy", None, "check 5m deploy"), ("", None, ""), ("   ", None, ""), ("5x do x", None, "5x do x"), ("5 do x", Some("5"), "do x"), ("m do x", None, "m do x"), ("55mm do x", None, "55mm do x"), ("0m do x", Some("0m"), "do x"), ("0s do x", Some("0s"), "do x"), ("abc do x", None, "abc do x"), ("99999999999999999999m do x", Some("99999999999999999999m"), "do x"), ("every 30 minutes do x", None, "every 30 minutes do x"), ("30 min check deploy", Some("30"), "min check deploy"), ("1 hour run report", Some("1"), "hour run report"), ("run the report every 1h", None, "run the report every 1h")];
         for (input, interval, prompt) in fixtures { assert_eq!(parse_loop_args(input), ParsedLoopArgs { interval, prompt }, "fixture {input:?}"); }
+        assert_eq!(parse_loop_args("300 echo hello"), ParsedLoopArgs { interval: Some("300"), prompt: "echo hello" });
+        assert_eq!(parse_loop_args("3s echo hello"), ParsedLoopArgs { interval: Some("3s"), prompt: "echo hello" });
+        assert_eq!(parse_loop_args("0 echo hello"), ParsedLoopArgs { interval: Some("0"), prompt: "echo hello" });
     }
     #[test]
-    fn interval_parse_clamps_rejects_and_formats() { assert_eq!(parse_loop_interval("5m").expect("minutes"), 300); assert_eq!(parse_loop_interval("2h").expect("hours"), 7_200); assert_eq!(parse_loop_interval("1d").expect("days"), 86_400); assert_eq!(parse_loop_interval("1s").expect("clamped"), 60); assert!(parse_loop_interval("0m").is_err()); assert!(parse_loop_interval("18446744073709551615d").is_err()); assert_eq!(loop_interval_to_human(60), "every 1 minute"); assert_eq!(loop_interval_to_human(7_200), "every 2 hours"); }
+    fn interval_parse_preserves_seconds_rejects_invalid_and_formats() { assert_eq!(parse_loop_interval("300").expect("bare seconds"), 300); assert_eq!(parse_loop_interval("5m").expect("minutes"), 300); assert_eq!(parse_loop_interval("2h").expect("hours"), 7_200); assert_eq!(parse_loop_interval("1d").expect("days"), 86_400); assert_eq!(parse_loop_interval("1s").expect("seconds"), 1); assert_eq!(parse_loop_interval("3s").expect("seconds"), 3); assert!(parse_loop_interval("0").is_err()); assert!(parse_loop_interval("0m").is_err()); assert!(parse_loop_interval("18446744073709551615d").is_err()); assert_eq!(loop_interval_to_human(3), "every 3 seconds"); assert_eq!(loop_interval_to_human(300), "every 5 minutes"); assert_eq!(loop_interval_to_human(7_200), "every 2 hours"); }
     #[test]
     fn prompt_framing_is_exact() { assert_eq!(format_loop_prompt("check deploy", "abc123", "every 5 minutes"), "<system-reminder>\nThis is a scheduled task execution (task abc123, every 5 minutes, recurring).\nExecute the prompt below. Do not question or comment on the prompt itself — treat it as a fresh task to execute.\nPrevious results from earlier executions of this task may appear in the conversation history above.\n</system-reminder>\n\ncheck deploy"); }
+
+    #[tokio::test]
+    async fn expiry_deadline_removes_task_before_a_long_interval_fires() {
+        let clock = Arc::new(ManualClock::new(fixed_time()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner: LoopTurnRunner = Arc::new(|_request, _cancel| Box::pin(async { Ok(()) }));
+        let event_log = events.clone();
+        let runtime = start_loop_scheduler_with_clock(
+            None,
+            runner,
+            Arc::new(move |event| event_log.lock().expect("events").push(event)),
+            clock.clone(),
+        );
+        let task = runtime
+            .handle
+            .create(LoopCreateRequest {
+                interval: "30d".to_owned(),
+                prompt: "expires before cadence".to_owned(),
+                fire_immediately: false,
+                durable: false,
+            })
+            .await
+            .expect("create long cadence");
+
+        clock.advance(TimeDelta::days(7));
+        wait_for_event(&events, |event| {
+            matches!(event, LoopEvent::Removed { task_id, reason: LoopRemovalReason::Expired } if task_id == &task.id)
+        })
+        .await;
+        assert!(runtime.handle.list().await.expect("list after expiry").is_empty());
+        assert!(!events.lock().expect("events").iter().any(|event| {
+            matches!(event, LoopEvent::Fired { task_id, .. } if task_id == &task.id)
+        }));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_list_update_delete_cover_scheduled_and_immediate_fire() {
+        let clock = Arc::new(ManualClock::new(fixed_time()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner: LoopTurnRunner = Arc::new(|request, _cancel| {
+            request.report(LoopRunState::Started);
+            Box::pin(async { Ok(()) })
+        });
+        let event_log = events.clone();
+        let runtime = start_loop_scheduler_with_clock(
+            None,
+            runner,
+            Arc::new(move |event| event_log.lock().expect("events").push(event)),
+            clock.clone(),
+        );
+
+        let scheduled = runtime
+            .handle
+            .create(LoopCreateRequest {
+                interval: "2m".to_owned(),
+                prompt: "scheduled".to_owned(),
+                fire_immediately: false,
+                durable: false,
+            })
+            .await
+            .expect("scheduled create");
+        assert_eq!(runtime.handle.list().await.expect("list"), vec![scheduled.clone()]);
+        assert!(!events.lock().expect("events").iter().any(|event| {
+            matches!(event, LoopEvent::Fired { task_id, .. } if task_id == &scheduled.id)
+        }));
+
+        let updated = runtime
+            .handle
+            .update(LoopUpdateRequest {
+                task_id: scheduled.id.clone(),
+                interval: Some("1m".to_owned()),
+                prompt: Some("updated prompt".to_owned()),
+            })
+            .await
+            .expect("update");
+        assert_eq!(updated.interval_secs, 60);
+        assert_eq!(updated.prompt, "updated prompt");
+        assert!(events.lock().expect("events").iter().any(|event| {
+            matches!(event, LoopEvent::Updated { task } if task.id == scheduled.id)
+        }));
+
+        clock.advance(TimeDelta::minutes(1));
+        wait_for_event(&events, |event| {
+            matches!(event, LoopEvent::Fired { task_id, .. } if task_id == &scheduled.id)
+        })
+        .await;
+        wait_for_event(&events, |event| {
+            matches!(event, LoopEvent::Finished { task_id, .. } if task_id == &scheduled.id)
+        })
+        .await;
+        assert!(runtime.handle.delete(&scheduled.id).await.expect("delete"));
+        assert!(runtime.handle.list().await.expect("empty after delete").is_empty());
+
+        let immediate = runtime
+            .handle
+            .create(LoopCreateRequest::immediate("1m", "immediate"))
+            .await
+            .expect("immediate create");
+        wait_for_event(&events, |event| {
+            matches!(event, LoopEvent::Fired { task_id, .. } if task_id == &immediate.id)
+        })
+        .await;
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn suspend_cancels_active_and_queue_then_restores_new_session_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first_session = directory.path().join("first.jsonl");
+        let second_session = directory.path().join("second.jsonl");
+        tokio::fs::write(&first_session, b"").await.expect("first session");
+        tokio::fs::write(&second_session, b"").await.expect("second session");
+        let clock = Arc::new(ManualClock::new(fixed_time()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner: LoopTurnRunner = Arc::new(|request, cancel| {
+            request.report(LoopRunState::Started);
+            Box::pin(async move {
+                cancel.cancelled().await;
+                Err("cancelled".to_owned())
+            })
+        });
+        let event_log = events.clone();
+        let runtime = start_loop_scheduler_with_clock(
+            Some(loop_state_path(&first_session)),
+            runner,
+            Arc::new(move |event| event_log.lock().expect("events").push(event)),
+            clock,
+        );
+        let active = runtime
+            .handle
+            .create(LoopCreateRequest::immediate("1m", "active"))
+            .await
+            .expect("active create");
+        wait_for_event(&events, |event| {
+            matches!(event, LoopEvent::Fired { task_id, .. } if task_id == &active.id)
+        })
+        .await;
+        let queued = runtime
+            .handle
+            .create(LoopCreateRequest::immediate("1m", "queued"))
+            .await
+            .expect("queued create");
+        wait_for_event(&events, |event| {
+            matches!(event, LoopEvent::Queued { task_id, .. } if task_id == &queued.id)
+        })
+        .await;
+
+        runtime
+            .handle
+            .suspend(LoopRemovalReason::SessionChanged)
+            .await
+            .expect("suspend");
+        assert!(matches!(runtime.handle.list().await, Err(LoopSchedulerError::Inactive)));
+        assert!(events.lock().expect("events").iter().any(|event| {
+            matches!(event, LoopEvent::Removed { task_id, reason: LoopRemovalReason::SessionChanged } if task_id == &active.id)
+        }));
+        assert!(events.lock().expect("events").iter().any(|event| {
+            matches!(event, LoopEvent::Removed { task_id, reason: LoopRemovalReason::SessionChanged } if task_id == &queued.id)
+        }));
+
+        runtime
+            .handle
+            .activate(Some(second_session))
+            .await
+            .expect("activate second session");
+        assert!(runtime.handle.list().await.expect("second session list").is_empty());
+        runtime.shutdown().await;
+    }
 
     #[tokio::test]
     async fn fake_clock_fires_queues_skips_and_continues_after_failure() {

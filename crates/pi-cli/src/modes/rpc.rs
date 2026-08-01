@@ -9,8 +9,9 @@ use base64::Engine as _;
 use pi_agent::{QueueMode, ThinkingLevel};
 use pi_ai::{ContentBlock, Message, Model};
 use pi_coding::{
-    Application, ApplicationState, LoopCreateRequest, LoopUpdateRequest, ProcessId, ProcessKey,
-    ProcessSignal, ProcessSpawnSpec, ProcessTerminalSize, StreamingBehavior, TodoPhase,
+    Application, ApplicationEvent, ApplicationState, GoalState, GoalUsageDelta, LoopCreateRequest,
+    LoopUpdateRequest, ProcessId, ProcessKey, ProcessSignal, ProcessSpawnSpec, ProcessTerminalSize,
+    StreamingBehavior, TodoPhase,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -293,6 +294,99 @@ pub enum RpcCommand {
         #[serde(default, rename = "timeoutMs")]
         timeout_ms: Option<u64>,
     },
+    GoalCreate {
+        #[serde(default)]
+        id: Option<String>,
+        objective: String,
+        #[serde(default, rename = "tokenBudget")]
+        token_budget: Option<u64>,
+    },
+    GoalGet {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    GoalPause {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    GoalResume {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    GoalComplete {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    GoalDrop {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    GoalUpdateUsage {
+        #[serde(default)]
+        id: Option<String>,
+        tokens: u64,
+        #[serde(default, rename = "activeTimeSeconds")]
+        active_time_seconds: u64,
+    },
+    /// Return the redacted schema catalog, effective values, provenance, and paths.
+    /// Wire shape: `{ "type": "settings_inspect", "id"?: string }`.
+    SettingsInspect {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Search schema keys, descriptions, and categories.
+    /// Wire shape: `{ "type": "settings_search", "query": string, "id"?: string }`.
+    SettingsSearch {
+        #[serde(default)]
+        id: Option<String>,
+        query: String,
+    },
+    /// Open a server-held atomic draft in `global` or `project` scope.
+    /// Returns a generated `draftId` used by all mutating commands.
+    SettingsOpenDraft {
+        #[serde(default)]
+        id: Option<String>,
+        scope: pi_coding::SettingsScope,
+    },
+    SettingsGetDraft {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "draftId")]
+        draft_id: String,
+    },
+    SettingsSet {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "draftId")]
+        draft_id: String,
+        key: String,
+        value: Value,
+    },
+    SettingsReset {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "draftId")]
+        draft_id: String,
+        key: String,
+    },
+    SettingsValidate {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "draftId")]
+        draft_id: String,
+    },
+    SettingsApply {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "draftId")]
+        draft_id: String,
+    },
+    SettingsCancel {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "draftId")]
+        draft_id: String,
+    },
 }
 impl RpcCommand {
     fn id(&self) -> Option<String> {
@@ -344,6 +438,22 @@ impl RpcCommand {
             | Self::ProcessResize { id, .. }
             | Self::ProcessSignal { id, .. }
             | Self::ProcessStop { id, .. }
+            | Self::GoalCreate { id, .. }
+            | Self::GoalGet { id }
+            | Self::GoalPause { id }
+            | Self::GoalResume { id }
+            | Self::GoalComplete { id }
+            | Self::GoalDrop { id }
+            | Self::GoalUpdateUsage { id, .. }
+            | Self::SettingsInspect { id }
+            | Self::SettingsSearch { id, .. }
+            | Self::SettingsOpenDraft { id, .. }
+            | Self::SettingsGetDraft { id, .. }
+            | Self::SettingsSet { id, .. }
+            | Self::SettingsReset { id, .. }
+            | Self::SettingsValidate { id, .. }
+            | Self::SettingsApply { id, .. }
+            | Self::SettingsCancel { id, .. }
             | Self::ProcessWait { id, .. } => id.clone(),
         }
     }
@@ -397,6 +507,22 @@ impl RpcCommand {
             Self::ProcessSignal { .. } => "process_signal",
             Self::ProcessStop { .. } => "process_stop",
             Self::ProcessWait { .. } => "process_wait",
+            Self::GoalCreate { .. } => "goal_create",
+            Self::GoalGet { .. } => "goal_get",
+            Self::GoalPause { .. } => "goal_pause",
+            Self::GoalResume { .. } => "goal_resume",
+            Self::GoalComplete { .. } => "goal_complete",
+            Self::GoalDrop { .. } => "goal_drop",
+            Self::GoalUpdateUsage { .. } => "goal_update_usage",
+            Self::SettingsInspect { .. } => "settings_inspect",
+            Self::SettingsSearch { .. } => "settings_search",
+            Self::SettingsOpenDraft { .. } => "settings_open_draft",
+            Self::SettingsGetDraft { .. } => "settings_get_draft",
+            Self::SettingsSet { .. } => "settings_set",
+            Self::SettingsReset { .. } => "settings_reset",
+            Self::SettingsValidate { .. } => "settings_validate",
+            Self::SettingsApply { .. } => "settings_apply",
+            Self::SettingsCancel { .. } => "settings_cancel",
         }
     }
 }
@@ -404,7 +530,18 @@ impl RpcCommand {
     const fn runs_inline(&self) -> bool {
         matches!(
             self,
-            Self::Abort { .. } | Self::AbortRetry { .. } | Self::AbortBash { .. }
+            Self::Abort { .. }
+                | Self::AbortRetry { .. }
+                | Self::AbortBash { .. }
+                | Self::SettingsInspect { .. }
+                | Self::SettingsSearch { .. }
+                | Self::SettingsOpenDraft { .. }
+                | Self::SettingsGetDraft { .. }
+                | Self::SettingsSet { .. }
+                | Self::SettingsReset { .. }
+                | Self::SettingsValidate { .. }
+                | Self::SettingsApply { .. }
+                | Self::SettingsCancel { .. }
         )
     }
 }
@@ -435,6 +572,7 @@ pub struct RpcSessionState {
     pub message_count: usize,
     pub pending_message_count: usize,
     pub todo_phases: Vec<TodoPhase>,
+    pub goal: GoalState,
     pub runtime_settings: pi_coding::RuntimeSettingsState,
 }
 impl RpcSessionState {
@@ -456,6 +594,7 @@ impl RpcSessionState {
             message_count: s.message_count,
             pending_message_count: s.pending_message_count,
             todo_phases: s.todo_phases,
+            goal: s.goal,
             runtime_settings,
         }
     }
@@ -550,11 +689,13 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: Write + Send + 'static,
 {
+    extension_ui.set_canonical_queries_supported(false);
     let mut events = application.subscribe();
     let mut ui_events = extension_ui.subscribe();
     let (lines_tx, mut lines_rx) = mpsc::channel(JSONL_CHANNEL_CAPACITY);
     let reader = tokio::spawn(read_jsonl(input, lines_tx));
     let output = Arc::new(StdMutex::new(output));
+    let settings = crate::settings_rpc::SettingsRpcState::default();
     let mut commands = tokio::task::JoinSet::new();
     let mut input_open = true;
     loop {
@@ -566,7 +707,7 @@ where
                 match line {
                     Some(JsonlFrame::Line(line)) => match parse_input(&line) {
                         Ok(RpcInput::Command(command)) if command.runs_inline() => {
-                            let response = handle_command(&application, command).await;
+                            let response = handle_command(&application, &settings, command).await;
                             write_shared_json(&output, &response)?;
                         }
                         Ok(RpcInput::Command(command)) if commands.len() >= MAX_CONCURRENT_COMMANDS => {
@@ -579,9 +720,10 @@ where
                         }
                         Ok(RpcInput::Command(command)) => {
                             let application = application.clone();
+                            let settings = settings.clone();
                             let output = output.clone();
                             commands.spawn(async move {
-                                let response = handle_command(&application, command).await;
+                                let response = handle_command(&application, &settings, command).await;
                                 write_shared_json(&output, &response)
                             });
                         }
@@ -618,6 +760,12 @@ where
                 }
             }
             event = events.recv() => match event {
+                Ok(ApplicationEvent::Agent(pi_agent::AgentEvent::MessageStart { message })) => {
+                    write_shared_json(&output, &ApplicationEvent::Agent(pi_agent::AgentEvent::MessageStart { message: public_message(message) }))?
+                }
+                Ok(ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message })) => {
+                    write_shared_json(&output, &ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message: public_message(message) }))?
+                }
                 Ok(event) => write_shared_json(&output, &event)?,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => write_shared_json(
                     &output,
@@ -737,56 +885,125 @@ fn handle_ui_response(adapter: &ExtensionUiAdapter, r: RpcExtensionUiResponse) -
     bail!("extension UI response must contain value, confirmed, or cancelled: true")
 }
 fn ui_event_request(event: ExtensionUiEvent) -> Result<Option<RpcExtensionUiRequest>> {
-    use pi_coding::ExtensionUiRequest;
-    let (id, request) = match event {
+    let id = uuid::Uuid::new_v4().to_string();
+    let request = match event {
         ExtensionUiEvent::InteractionRequested { interaction } => {
-            return ui_request(interaction.id, interaction.request).map(Some);
+            let mut projected = ui_request(interaction.id, interaction.request)?;
+            if let Some(object) = projected.request.as_object_mut() {
+                object.insert(
+                    "extensionId".to_owned(),
+                    json!(interaction.context.instance.extension_id),
+                );
+                object.insert(
+                    "generation".to_owned(),
+                    json!(interaction.context.instance.generation),
+                );
+            }
+            return Ok(Some(projected));
         }
-        ExtensionUiEvent::Notification { notification } => (
-            uuid::Uuid::new_v4().to_string(),
-            ExtensionUiRequest::Notify {
-                message: notification.message,
-                level: notification.level,
+        ExtensionUiEvent::Notification { notification } => json!({
+            "method": "notify",
+            "message": notification.message,
+            "notifyType": match notification.level {
+                pi_coding::UiNotificationLevel::Info => "info",
+                pi_coding::UiNotificationLevel::Warning => "warning",
+                pi_coding::UiNotificationLevel::Error => "error",
             },
-        ),
-        ExtensionUiEvent::StatusChanged { item } => (
-            uuid::Uuid::new_v4().to_string(),
-            ExtensionUiRequest::Status {
-                key: item.key,
-                text: Some(item.text),
+            "extensionId": notification.instance.extension_id,
+            "generation": notification.instance.generation,
+        }),
+        ExtensionUiEvent::StatusChanged { item } => json!({
+            "method": "setStatus",
+            "statusKey": item.key,
+            "statusText": item.text,
+            "extensionId": item.instance.extension_id,
+            "generation": item.instance.generation,
+        }),
+        ExtensionUiEvent::StatusCleared { instance, key } => json!({
+            "method": "setStatus",
+            "statusKey": key,
+            "statusText": Value::Null,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::WidgetChanged { item } => json!({
+            "method": "setWidget",
+            "widgetKey": item.key,
+            "widgetLines": item.lines,
+            "widgetPlacement": match item.placement {
+                pi_coding::UiWidgetPlacement::AboveEditor => "aboveEditor",
+                pi_coding::UiWidgetPlacement::BelowEditor => "belowEditor",
             },
-        ),
-        ExtensionUiEvent::StatusCleared { key, .. } => (
-            uuid::Uuid::new_v4().to_string(),
-            ExtensionUiRequest::Status { key, text: None },
-        ),
-        ExtensionUiEvent::WidgetChanged { item } => (
-            uuid::Uuid::new_v4().to_string(),
-            ExtensionUiRequest::Widget {
-                key: item.key,
-                lines: Some(item.lines),
-                placement: item.placement,
-            },
-        ),
-        ExtensionUiEvent::WidgetCleared { key, .. } => (
-            uuid::Uuid::new_v4().to_string(),
-            ExtensionUiRequest::Widget {
-                key,
-                lines: None,
-                placement: pi_coding::UiWidgetPlacement::AboveEditor,
-            },
-        ),
-        ExtensionUiEvent::TitleChanged { title, .. } => (
-            uuid::Uuid::new_v4().to_string(),
-            ExtensionUiRequest::Title { title },
-        ),
-        ExtensionUiEvent::EditorTextChanged { text, .. } => (
-            uuid::Uuid::new_v4().to_string(),
-            ExtensionUiRequest::SetEditorText { text },
-        ),
-        ExtensionUiEvent::ExtensionCleared { .. } => return Ok(None),
+            "extensionId": item.instance.extension_id,
+            "generation": item.instance.generation,
+        }),
+        ExtensionUiEvent::WidgetCleared { instance, key } => json!({
+            "method": "setWidget",
+            "widgetKey": key,
+            "widgetLines": Value::Null,
+            "widgetPlacement": "aboveEditor",
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::TitleChanged { instance, title } => json!({
+            "method": "setTitle",
+            "title": title,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::EditorTextChanged { instance, text } => json!({
+            "method": "set_editor_text",
+            "text": text,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::WorkingMessageChanged { instance, message } => json!({
+            "method": "set_working_message",
+            "message": message,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::WorkingVisibilityChanged { instance, visible } => json!({
+            "method": "set_working_visible",
+            "visible": visible,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::WorkingIndicatorChanged { instance, options } => json!({
+            "method": "set_working_indicator",
+            "options": options,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::HiddenThinkingLabelChanged { instance, label } => json!({
+            "method": "set_hidden_thinking_label",
+            "label": label,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::ThemeChanged { instance, name } => json!({
+            "method": "set_theme",
+            "name": name,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::ToolsExpandedChanged { instance, expanded } => json!({
+            "method": "set_tools_expanded",
+            "expanded": expanded,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::ExtensionCleared { instance } => json!({
+            "method": "extension_cleared",
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
     };
-    ui_request(id, request).map(Some)
+    Ok(Some(RpcExtensionUiRequest {
+        record_type: "extension_ui_request",
+        id,
+        request,
+    }))
 }
 
 fn ui_request(id: String, request: pi_coding::ExtensionUiRequest) -> Result<RpcExtensionUiRequest> {
@@ -824,6 +1041,47 @@ fn ui_request(id: String, request: pi_coding::ExtensionUiRequest) -> Result<RpcE
         ExtensionUiRequest::SetEditorText { text } => {
             json!({ "method": "set_editor_text", "text": text })
         }
+        ExtensionUiRequest::GetEditorText => {
+            bail!(
+                "getEditorText requires canonical host editor state and is unsupported by the RPC shadow adapter"
+            )
+        }
+        ExtensionUiRequest::PasteToEditor { text } => {
+            json!({ "method": "paste_to_editor", "text": text })
+        }
+        ExtensionUiRequest::SetWorkingMessage { message } => {
+            json!({ "method": "set_working_message", "message": message })
+        }
+        ExtensionUiRequest::SetWorkingVisible { visible } => {
+            json!({ "method": "set_working_visible", "visible": visible })
+        }
+        ExtensionUiRequest::SetWorkingIndicator { options } => {
+            json!({ "method": "set_working_indicator", "options": options })
+        }
+        ExtensionUiRequest::SetHiddenThinkingLabel { label } => {
+            json!({ "method": "set_hidden_thinking_label", "label": label })
+        }
+        ExtensionUiRequest::GetAllThemes => {
+            bail!(
+                "getAllThemes requires canonical host theme state and is unsupported by the RPC shadow adapter"
+            )
+        }
+        ExtensionUiRequest::GetTheme { .. } => {
+            bail!(
+                "getTheme requires canonical host theme state and is unsupported by the RPC shadow adapter"
+            )
+        }
+        ExtensionUiRequest::SetTheme { name } => {
+            json!({ "method": "set_theme", "name": name })
+        }
+        ExtensionUiRequest::GetToolsExpanded => {
+            bail!(
+                "getToolsExpanded requires canonical host tool expansion state and is unsupported by the RPC shadow adapter"
+            )
+        }
+        ExtensionUiRequest::SetToolsExpanded { expanded } => {
+            json!({ "method": "set_tools_expanded", "expanded": expanded })
+        }
     };
     Ok(RpcExtensionUiRequest {
         record_type: "extension_ui_request",
@@ -831,16 +1089,77 @@ fn ui_request(id: String, request: pi_coding::ExtensionUiRequest) -> Result<RpcE
         request,
     })
 }
-async fn handle_command(app: &Application, c: RpcCommand) -> RpcResponse {
+async fn handle_command(
+    app: &Application,
+    settings: &crate::settings_rpc::SettingsRpcState,
+    c: RpcCommand,
+) -> RpcResponse {
     let id = c.id();
     let name = c.command_name();
-    match handle_command_inner(app, c).await {
+    match handle_command_inner(app, settings, c).await {
         Ok(data) => RpcResponse::success(id, name, data),
         Err(e) => RpcResponse::failure(id, name, e.to_string()),
     }
 }
-async fn handle_command_inner(app: &Application, c: RpcCommand) -> Result<Option<Value>> {
+async fn handle_command_inner(
+    app: &Application,
+    settings: &crate::settings_rpc::SettingsRpcState,
+    c: RpcCommand,
+) -> Result<Option<Value>> {
     match c {
+        RpcCommand::GoalCreate {
+            objective,
+            token_budget,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            app.goal_create(objective, token_budget)?,
+        )?)),
+        RpcCommand::GoalGet { .. } => Ok(Some(serde_json::to_value(app.goal_state())?)),
+        RpcCommand::GoalPause { .. } => Ok(Some(serde_json::to_value(app.goal_pause()?)?)),
+        RpcCommand::GoalResume { .. } => Ok(Some(serde_json::to_value(app.goal_resume()?)?)),
+        RpcCommand::GoalComplete { .. } => Ok(Some(serde_json::to_value(app.goal_complete()?)?)),
+        RpcCommand::GoalDrop { .. } => Ok(Some(serde_json::to_value(app.goal_drop()?)?)),
+        RpcCommand::GoalUpdateUsage {
+            tokens,
+            active_time_seconds,
+            ..
+        } => Ok(Some(serde_json::to_value(app.goal_update_usage(
+            GoalUsageDelta::new(tokens, active_time_seconds),
+        )?)?)),
+        RpcCommand::SettingsInspect { .. } => Ok(Some(serde_json::to_value(
+            crate::settings_rpc::SettingsRpcState::inspect(app)
+                .ok_or_else(|| anyhow!("session has no resource manager"))?,
+        )?)),
+        RpcCommand::SettingsSearch { query, .. } => Ok(Some(serde_json::to_value(
+            crate::settings_rpc::SettingsRpcState::search(app, &query)?,
+        )?)),
+        RpcCommand::SettingsOpenDraft { scope, .. } => {
+            Ok(Some(serde_json::to_value(settings.open(app, scope)?)?))
+        }
+        RpcCommand::SettingsGetDraft { draft_id, .. } => {
+            Ok(Some(serde_json::to_value(settings.get(&draft_id)?)?))
+        }
+        RpcCommand::SettingsSet {
+            draft_id,
+            key,
+            value,
+            ..
+        } => Ok(Some(serde_json::to_value(
+            settings.set(&draft_id, &key, value)?,
+        )?)),
+        RpcCommand::SettingsReset { draft_id, key, .. } => Ok(Some(serde_json::to_value(
+            settings.reset(&draft_id, &key)?,
+        )?)),
+        RpcCommand::SettingsValidate { draft_id, .. } => {
+            Ok(Some(serde_json::to_value(settings.validate(&draft_id)?)?))
+        }
+        RpcCommand::SettingsApply { draft_id, .. } => Ok(Some(serde_json::to_value(
+            settings.apply(app, &draft_id).await?,
+        )?)),
+        RpcCommand::SettingsCancel { draft_id, .. } => {
+            settings.cancel(&draft_id)?;
+            Ok(Some(json!({"cancelled":true})))
+        }
         RpcCommand::Prompt {
             message,
             images,
@@ -884,8 +1203,13 @@ async fn handle_command_inner(app: &Application, c: RpcCommand) -> Result<Option
             Ok(Some(json!({"models":available_models().await?})))
         }
         RpcCommand::SetThinkingLevel { level, .. } => {
-            app.set_thinking_level(level);
-            Ok(None)
+            let change = app.set_thinking_level(level);
+            Ok(Some(json!({
+                "requested": change.requested,
+                "level": change.effective,
+                "clamped": change.clamped,
+                "message": change.message,
+            })))
         }
         RpcCommand::CycleThinkingLevel { .. } => {
             let s = app.state().await;
@@ -901,8 +1225,13 @@ async fn handle_command_inner(app: &Application, c: RpcCommand) -> Result<Option
                 .position(|l| *l == s.thinking_level)
                 .unwrap_or(0);
             let level = levels[(index + 1) % levels.len()];
-            app.set_thinking_level(level);
-            Ok(Some(json!({"level":level})))
+            let change = app.set_thinking_level(level);
+            Ok(Some(json!({
+                "requested": change.requested,
+                "level": change.effective,
+                "clamped": change.clamped,
+                "message": change.message,
+            })))
         }
         RpcCommand::GetAvailableThinkingLevels { .. } => Ok(Some(
             json!({"levels":app.state().await.model.as_ref().map_or_else(||vec![ThinkingLevel::Off],available_thinking_levels)}),
@@ -954,17 +1283,38 @@ async fn handle_command_inner(app: &Application, c: RpcCommand) -> Result<Option
             Ok(Some(json!({"cancelled":false})))
         }
         RpcCommand::Fork { entry_id, .. } => {
-            let text = app.fork_session(&entry_id).await?;
-            Ok(Some(json!({"text":text,"cancelled":false})))
+            app.fork_session(&entry_id).await?;
+            Ok(Some(json!({"cancelled":false})))
         }
         RpcCommand::Clone { .. } => {
             app.clone_session().await?;
             Ok(Some(json!({"cancelled":false})))
         }
         RpcCommand::GetForkMessages { .. } => Ok(Some(json!({"messages":app.fork_messages()?}))),
-        RpcCommand::GetEntries { since, .. } => Ok(Some(serde_json::to_value(
-            app.session_entries(since.as_deref())?,
-        )?)),
+        RpcCommand::GetEntries { since, .. } => {
+            let mut entries = app.session_entries(since.as_deref())?;
+            for entry in &mut entries.entries {
+                if entry.custom_type.as_deref() == Some(pi_coding::LOOP_SCHEDULED_MESSAGE_TYPE) {
+                    let details = entry.details.as_ref();
+                    let task_id = details
+                        .and_then(|value| value.get("taskId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let schedule = details
+                        .and_then(|value| value.get("schedule"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("scheduled");
+                    let prompt = details
+                        .and_then(|value| value.get("prompt"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    entry.custom_type = Some(format!("Loop {task_id} · {schedule}"));
+                    entry.content = Some(prompt.into());
+                    entry.display = Some(true);
+                }
+            }
+            Ok(Some(serde_json::to_value(entries)?))
+        }
         RpcCommand::GetTree { .. } => Ok(Some(serde_json::to_value(app.session_tree()?)?)),
         RpcCommand::GetLastAssistantText { .. } => {
             Ok(Some(json!({"text":app.last_assistant_text()})))
@@ -977,7 +1327,7 @@ async fn handle_command_inner(app: &Application, c: RpcCommand) -> Result<Option
             Ok(None)
         }
         RpcCommand::GetMessages { .. } => {
-            let messages: Vec<Message> = app.messages();
+            let messages: Vec<Message> = app.messages().into_iter().map(public_message).collect();
             Ok(Some(json!({"messages":messages})))
         }
         RpcCommand::GetCommands { .. } => Ok(Some(json!({"commands":app.commands_catalog()}))),
@@ -1064,6 +1414,22 @@ async fn handle_command_inner(app: &Application, c: RpcCommand) -> Result<Option
         )?)),
     }
 }
+fn public_message(message: Message) -> Message {
+    let Message::Custom(custom) = message else {
+        return message;
+    };
+    let Some(loop_message) = pi_coding::loop_message_view(&custom) else {
+        return Message::Custom(custom);
+    };
+    Message::Custom(pi_ai::CustomMessage {
+        custom_type: format!("Loop {} · {}", loop_message.task_id, loop_message.schedule),
+        content: loop_message.prompt.into(),
+        display: true,
+        details: custom.details.clone(),
+        timestamp: custom.timestamp,
+    })
+}
+
 fn public_model(mut model: Model) -> Model {
     model.headers = None;
     model
@@ -1133,6 +1499,10 @@ fn available_thinking_levels(model: &Model) -> Vec<ThinkingLevel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn settings_state() -> crate::settings_rpc::SettingsRpcState {
+        crate::settings_rpc::SettingsRpcState::default()
+    }
+
     #[test]
     fn all_command_fixtures_deserialize() {
         let fixtures = [
@@ -1184,6 +1554,22 @@ mod tests {
             json!({"type":"process_signal","processId":"00000000-0000-7000-8000-000000000000","signal":"SIGTERM"}),
             json!({"type":"process_stop","processId":"00000000-0000-7000-8000-000000000000"}),
             json!({"type":"process_wait","processId":"00000000-0000-7000-8000-000000000000","timeoutMs":500}),
+            json!({"type":"goal_create","objective":"ship","tokenBudget":100}),
+            json!({"type":"goal_get"}),
+            json!({"type":"goal_pause"}),
+            json!({"type":"goal_resume"}),
+            json!({"type":"goal_complete"}),
+            json!({"type":"goal_drop"}),
+            json!({"type":"goal_update_usage","tokens":5,"activeTimeSeconds":1}),
+            json!({"type":"settings_inspect"}),
+            json!({"type":"settings_search","query":"retry"}),
+            json!({"type":"settings_open_draft","scope":"global"}),
+            json!({"type":"settings_get_draft","draftId":"draft"}),
+            json!({"type":"settings_set","draftId":"draft","key":"compaction.enabled","value":false}),
+            json!({"type":"settings_reset","draftId":"draft","key":"theme"}),
+            json!({"type":"settings_validate","draftId":"draft"}),
+            json!({"type":"settings_apply","draftId":"draft"}),
+            json!({"type":"settings_cancel","draftId":"draft"}),
         ];
         for f in fixtures {
             assert!(
@@ -1258,6 +1644,164 @@ mod tests {
             request: json!({"method":"confirm"}),
         };
         assert!(serde_json::from_str::<Value>(&serde_json::to_string(&e).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn extension_working_indicator_preserves_structured_options() {
+        let request = ui_request(
+            "working".to_owned(),
+            pi_coding::ExtensionUiRequest::SetWorkingIndicator {
+                options: Some(pi_coding::WorkingIndicatorOptions {
+                    frames: Some(vec!["·".to_owned(), "●".to_owned()]),
+                    interval_ms: Some(120),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(request.request["method"], "set_working_indicator");
+        assert_eq!(request.request["options"]["frames"], json!(["·", "●"]));
+        assert_eq!(request.request["options"]["intervalMs"], 120);
+    }
+
+    #[tokio::test]
+    async fn rpc_shadow_queries_fail_instead_of_reporting_canonical_state() {
+        let adapter = ExtensionUiAdapter::new();
+        adapter.set_canonical_queries_supported(false);
+        let context = pi_coding::ExtensionUiContext {
+            instance: pi_coding::ExtensionInstanceId {
+                extension_id: "rpc-query".to_owned(),
+                generation: 1,
+            },
+            mode: pi_coding::ExtensionMode::Rpc,
+        };
+        for request in [
+            pi_coding::ExtensionUiRequest::GetEditorText,
+            pi_coding::ExtensionUiRequest::GetAllThemes,
+            pi_coding::ExtensionUiRequest::GetTheme {
+                name: "dark".to_owned(),
+            },
+            pi_coding::ExtensionUiRequest::GetToolsExpanded,
+        ] {
+            let error = pi_coding::ExtensionUiHost::request(
+                &adapter,
+                context.clone(),
+                request,
+                pi_coding::ExtensionCancellation::new(),
+            )
+            .await
+            .expect_err("shadow-only queries must be explicit unsupported errors");
+            assert!(error.to_string().contains("canonical host state"));
+        }
+    }
+
+    #[test]
+    fn rpc_shadow_serializer_rejects_canonical_theme_queries() {
+        for request in [
+            pi_coding::ExtensionUiRequest::GetEditorText,
+            pi_coding::ExtensionUiRequest::GetAllThemes,
+            pi_coding::ExtensionUiRequest::GetTheme {
+                name: "dark".to_owned(),
+            },
+            pi_coding::ExtensionUiRequest::GetToolsExpanded,
+        ] {
+            let error = ui_request("shadow".to_owned(), request)
+                .expect_err("canonical query serializers must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported by the RPC shadow adapter"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_projection_emits_owner_identity_and_extension_cleared() {
+        let status = ui_event_request(ExtensionUiEvent::StatusChanged {
+            item: crate::extension_ui::ExtensionStatusItem {
+                instance: pi_coding::ExtensionInstanceId {
+                    extension_id: "owner-a".to_owned(),
+                    generation: 1,
+                },
+                key: "phase".to_owned(),
+                text: "running".to_owned(),
+            },
+        })
+        .expect("status projection")
+        .expect("status event should project");
+        assert_eq!(status.request["method"], "setStatus");
+        assert_eq!(status.request["statusKey"], "phase");
+        assert_eq!(status.request["statusText"], "running");
+        assert_eq!(status.request["extensionId"], "owner-a");
+        assert_eq!(status.request["generation"], 1);
+
+        let widget = ui_event_request(ExtensionUiEvent::WidgetChanged {
+            item: crate::extension_ui::ExtensionWidgetItem {
+                instance: pi_coding::ExtensionInstanceId {
+                    extension_id: "owner-b".to_owned(),
+                    generation: 2,
+                },
+                key: "panel".to_owned(),
+                lines: vec!["line".to_owned()],
+                placement: pi_coding::UiWidgetPlacement::AboveEditor,
+            },
+        })
+        .expect("widget projection")
+        .expect("widget event should project");
+        assert_eq!(widget.request["method"], "setWidget");
+        assert_eq!(widget.request["widgetKey"], "panel");
+        assert_eq!(widget.request["extensionId"], "owner-b");
+        assert_eq!(widget.request["generation"], 2);
+
+        let cleared = ui_event_request(ExtensionUiEvent::ExtensionCleared {
+            instance: pi_coding::ExtensionInstanceId {
+                extension_id: "owner-a".to_owned(),
+                generation: 1,
+            },
+        })
+        .expect("clear projection")
+        .expect("ExtensionCleared must project a canonical cleanup event");
+        assert_eq!(cleared.request["method"], "extension_cleared");
+        assert_eq!(cleared.request["extensionId"], "owner-a");
+        assert_eq!(cleared.request["generation"], 1);
+    }
+
+    #[test]
+    fn rpc_interaction_request_carries_owner_identity_for_cleanup() {
+        let projected = ui_event_request(ExtensionUiEvent::InteractionRequested {
+            interaction: crate::extension_ui::ExtensionUiInteraction {
+                id: "dialog-1".to_owned(),
+                context: pi_coding::ExtensionUiContext {
+                    instance: pi_coding::ExtensionInstanceId {
+                        extension_id: "owner-dialog".to_owned(),
+                        generation: 7,
+                    },
+                    mode: pi_coding::ExtensionMode::Rpc,
+                },
+                request: pi_coding::ExtensionUiRequest::Confirm {
+                    title: "Continue?".to_owned(),
+                    message: "Apply change".to_owned(),
+                },
+            },
+        })
+        .expect("interaction projection")
+        .expect("interaction event should project");
+        assert_eq!(projected.id, "dialog-1");
+        assert_eq!(projected.request["method"], "confirm");
+        assert_eq!(projected.request["extensionId"], "owner-dialog");
+        assert_eq!(projected.request["generation"], 7);
+
+        let cleared = ui_event_request(ExtensionUiEvent::ExtensionCleared {
+            instance: pi_coding::ExtensionInstanceId {
+                extension_id: "owner-dialog".to_owned(),
+                generation: 7,
+            },
+        })
+        .expect("clear projection")
+        .expect("ExtensionCleared must project");
+        assert_eq!(cleared.request["method"], "extension_cleared");
+        assert_eq!(cleared.request["extensionId"], "owner-dialog");
+        assert_eq!(cleared.request["generation"], 7);
     }
     #[tokio::test]
     async fn malformed_then_valid_recovers() {
@@ -1404,6 +1948,350 @@ mod tests {
         reg.unregister();
         app
     }
+    async fn build_compact_app(
+        model_id: &str,
+        responses: Vec<pi_ai::providers::FauxResponse>,
+    ) -> Application {
+        let mut model = Model::default();
+        model.id = model_id.into();
+        model.name = model_id.into();
+        model.api = format!("{model_id}-api");
+        model.provider = "faux".into();
+        model.base_url = "http://localhost:0".into();
+        let responses = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(responses)));
+        let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
+            let responses = responses.clone();
+            Box::pin(async move {
+                let response = responses
+                    .lock()
+                    .expect("response queue")
+                    .pop_front()
+                    .expect("queued response");
+                let mut message = pi_ai::AssistantMessage::pending(&model);
+                message.content = response.content;
+                message.stop_reason = response.stop_reason;
+                message.error_message = response.error_message;
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let event = if message.stop_reason == pi_ai::StopReason::Error {
+                    pi_ai::AssistantMessageEvent::Error {
+                        reason: message.stop_reason,
+                        error: message.clone(),
+                    }
+                } else {
+                    pi_ai::AssistantMessageEvent::Done {
+                        reason: message.stop_reason,
+                        message: message.clone(),
+                    }
+                };
+                stream.push(event).await;
+                stream.end(Some(message)).await;
+                stream
+            })
+        });
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model,
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "faux".into(),
+            compaction: Some(pi_coding::CompactionSettings {
+                enabled: true,
+                reserve_tokens: 20,
+                keep_recent_tokens: 4,
+            }),
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+        })
+        .expect("session");
+        let mut assistant = pi_ai::AssistantMessage::pending(&session.model().expect("model"));
+        assistant.content = vec![ContentBlock::text("old answer")];
+        assistant.stop_reason = pi_ai::StopReason::Stop;
+        assistant.timestamp = 2;
+        session
+            .load_history(vec![
+                Message::user_text("old request ".repeat(20), 1),
+                Message::Assistant(assistant),
+                Message::user_text("recent request", 3),
+            ])
+            .await
+            .expect("load history");
+        Application::new(session).await
+    }
+
+    #[tokio::test]
+    async fn compact_rpc_uses_application_path_and_returns_sanitized_result() {
+        let app = build_compact_app(
+            "faux-rpc-compact",
+            vec![pi_ai::providers::FauxResponse::text("rpc checkpoint")],
+        )
+        .await;
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            RpcCommand::Compact {
+                id: Some("compact-1".into()),
+                custom_instructions: Some("preserve decisions".into()),
+            },
+        )
+        .await;
+
+        assert!(response.success, "compact failed: {:?}", response.error);
+        assert_eq!(response.id.as_deref(), Some("compact-1"));
+        assert_eq!(response.command, "compact");
+        assert_eq!(response.error, None);
+        let data = response.data.expect("compaction result");
+        assert!(data["summary"].as_str().is_some_and(|summary| summary.ends_with("rpc checkpoint")));
+        assert!(data.get("apiKey").is_none());
+        assert!(matches!(app.messages().first(), Some(Message::CompactionSummary(_))));
+
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn compact_rpc_reports_actionable_error_without_leaking_result_data() {
+        let app = build_compact_app(
+            "faux-rpc-compact-error",
+            vec![pi_ai::providers::FauxResponse::error("summary rejected")],
+        )
+        .await;
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            RpcCommand::Compact {
+                id: Some("compact-error".into()),
+                custom_instructions: None,
+            },
+        )
+        .await;
+
+        assert!(!response.success);
+        assert_eq!(response.id.as_deref(), Some("compact-error"));
+        assert_eq!(response.command, "compact");
+        assert!(response.data.is_none());
+        assert!(response.error.as_deref().is_some_and(|error| error.contains("summary rejected")));
+
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn clone_rpc_clones_recorded_session_branch() {
+        let app = build_todo_app("faux-rpc-clone", "faux-rpc-clone-api").await;
+        let session_dir = tempfile::tempdir().expect("session dir");
+        let recorder = pi_coding::start_session_in(
+            session_dir.path(),
+            None,
+            None,
+            Some(session_dir.path()),
+            None,
+            None,
+        )
+        .expect("start recorded session");
+        recorder
+            .record_message(&Message::user_text("clone me", 1))
+            .expect("record clone source entry");
+        recorder
+            .persist_now()
+            .expect("persist clone source session");
+        app.session().record(recorder).expect("attach recorder");
+        let source_file = app.state().await.session_file.expect("source session file");
+
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            RpcCommand::Clone {
+                id: Some("clone-1".into()),
+            },
+        )
+        .await;
+
+        assert!(response.success, "clone failed: {:?}", response.error);
+        assert_eq!(response.id.as_deref(), Some("clone-1"));
+        assert_eq!(response.data, Some(json!({"cancelled":false})));
+        let cloned_file = app.state().await.session_file.expect("cloned session file");
+        assert_ne!(cloned_file, source_file);
+        assert!(app.messages().iter().any(|message| {
+            matches!(message, Message::User(user) if user.content.iter().any(|block| matches!(block, ContentBlock::Text { text, .. } if text == "clone me")))
+        }));
+        app.cleanup().await;
+    }
+    #[tokio::test]
+    async fn goal_rpc_mutations_and_malformed_recovery_share_application_state() {
+        let app = build_todo_app("faux-rpc-goal", "faux-rpc-goal-api").await;
+        let settings = settings_state();
+        let malformed = parse_input(br#"{"type":"goal_create","objective":12}"#)
+            .expect_err("malformed goal command");
+        assert!(!malformed.success);
+        assert_eq!(malformed.command, "goal_create");
+
+        let created = handle_command(
+            &app,
+            &settings,
+            RpcCommand::GoalCreate {
+                id: Some("create".into()),
+                objective: "ship safely".into(),
+                token_budget: Some(10),
+            },
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        assert_eq!(created.data.expect("goal")["objective"], "ship safely");
+
+        let charged = handle_command(
+            &app,
+            &settings,
+            RpcCommand::GoalUpdateUsage {
+                id: Some("usage".into()),
+                tokens: 10,
+                active_time_seconds: 2,
+            },
+        )
+        .await;
+        assert!(charged.success, "{charged:?}");
+        let state = handle_command(
+            &app,
+            &settings,
+            RpcCommand::GoalGet {
+                id: Some("get".into()),
+            },
+        )
+        .await;
+        let data = state.data.expect("goal state");
+        assert_eq!(data["current"]["lifecycle"], "paused");
+        assert_eq!(data["current"]["pauseReason"], "budget_exhausted");
+
+        let after_malformed = handle_command(
+            &app,
+            &settings,
+            RpcCommand::GetState {
+                id: Some("state".into()),
+            },
+        )
+        .await;
+        assert!(after_malformed.success);
+        assert_eq!(
+            after_malformed.data.expect("application state")["goal"]["current"]["usage"]["tokensUsed"],
+            10
+        );
+    }
+
+    async fn build_settings_app() -> (tempfile::TempDir, Application) {
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        resource_options.agent_dir = agent.path().to_path_buf();
+        resource_options.project_trust_override = Some(true);
+        let resources = pi_coding::ResourceManager::new(resource_options).expect("resources");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".into(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session
+            .attach_resources(resources)
+            .await
+            .expect("attach resources");
+        (agent, Application::new(session).await)
+    }
+
+    #[tokio::test]
+    async fn settings_rpc_open_set_validate_apply_and_malformed_recovery() {
+        let (agent, app) = build_settings_app().await;
+        let settings = settings_state();
+        let opened = handle_command(
+            &app,
+            &settings,
+            RpcCommand::SettingsOpenDraft {
+                id: Some("open".into()),
+                scope: pi_coding::SettingsScope::Global,
+            },
+        )
+        .await;
+        assert!(opened.success);
+        let draft_id = opened.data.expect("draft data")["draftId"]
+            .as_str()
+            .expect("draft id")
+            .to_owned();
+        let invalid = handle_command(
+            &app,
+            &settings,
+            RpcCommand::SettingsSet {
+                id: Some("invalid".into()),
+                draft_id: draft_id.clone(),
+                key: "compaction.enabled".into(),
+                value: json!("false"),
+            },
+        )
+        .await;
+        assert!(!invalid.success);
+        let valid = handle_command(
+            &app,
+            &settings,
+            RpcCommand::SettingsSet {
+                id: Some("set".into()),
+                draft_id: draft_id.clone(),
+                key: "compaction.enabled".into(),
+                value: json!(false),
+            },
+        )
+        .await;
+        assert!(valid.success);
+        assert!(
+            handle_command(
+                &app,
+                &settings,
+                RpcCommand::SettingsValidate {
+                    id: Some("validate".into()),
+                    draft_id: draft_id.clone(),
+                },
+            )
+            .await
+            .success
+        );
+        let applied = handle_command(
+            &app,
+            &settings,
+            RpcCommand::SettingsApply {
+                id: Some("apply".into()),
+                draft_id,
+            },
+        )
+        .await;
+        assert!(applied.success);
+        assert_eq!(applied.data.expect("outcome")["appliedLive"], true);
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(agent.path().join("settings.json")).expect("settings"),
+        )
+        .expect("json");
+        assert_eq!(saved["compaction"]["enabled"], false);
+
+        let Err(malformed) = parse_input(
+            br#"{"type":"settings_set","id":"bad","draftId":7,"key":"theme","value":"x"}"#,
+        ) else {
+            panic!("malformed settings command must fail")
+        };
+        assert_eq!(malformed.id.as_deref(), Some("bad"));
+        assert_eq!(malformed.command, "settings_set");
+        assert!(matches!(
+            parse_input(br#"{"type":"settings_inspect","id":"after"}"#),
+            Ok(RpcInput::Command(RpcCommand::SettingsInspect { id })) if id.as_deref() == Some("after")
+        ));
+    }
+
     #[tokio::test]
     async fn set_todos_round_trips_through_application() {
         use pi_coding::{TodoItem, TodoPhase, TodoStatus};
@@ -1417,6 +2305,7 @@ mod tests {
         }];
         let r = handle_command(
             &app,
+            &settings_state(),
             RpcCommand::SetTodos {
                 id: Some("t1".into()),
                 phases,
@@ -1445,6 +2334,7 @@ mod tests {
         .expect("set_todos");
         let r = handle_command(
             &app,
+            &settings_state(),
             RpcCommand::GetState {
                 id: Some("s1".into()),
             },

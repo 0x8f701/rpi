@@ -458,7 +458,7 @@ impl PackageManager {
     pub fn installed_path(&self, source: &str, scope: PackageScope) -> Result<Option<PathBuf>> {
         self.assert_scope_trusted(scope)?;
         if source.trim_start().starts_with("npm:") {
-            return Ok(None);
+            bail!(npm_deferred_error());
         }
         let parsed = self.parse_configured_source(source, scope)?;
         let path = self.installed_root(&parsed, scope)?;
@@ -535,7 +535,11 @@ impl PackageManager {
         for entry in configured {
             let scope = entry.scope;
             if entry.source.trim_start().starts_with("npm:") {
-                continue;
+                bail!(
+                    "{}; configured source {} cannot be updated",
+                    npm_deferred_error(),
+                    entry.source
+                );
             }
             let parsed = self.parse_configured_source(&entry.source, scope)?;
             operations.push(self.install_locked(parsed, entry.source, scope, false)?);
@@ -595,6 +599,8 @@ impl PackageManager {
         let mut paths = HashSet::new();
         for entry in effective {
             if entry.source.trim_start().starts_with("npm:") {
+                // Resource resolution must not invent installs for npm entries.
+                // Surface them as unsupported at list/config time; never load.
                 continue;
             }
             let parsed = self.parse_configured_source(&entry.source, entry.scope)?;
@@ -863,6 +869,8 @@ impl PackageManager {
         let mut updates = Vec::new();
         for entry in self.load_configured_scope(scope)? {
             if entry.source.trim_start().starts_with("npm:") {
+                // Preview only: list already marks npm as unsupported. Never
+                // fabricate update metadata that would imply install support.
                 continue;
             }
             let parsed = self.parse_configured_source(&entry.source, scope)?;
@@ -916,6 +924,8 @@ impl PackageManager {
         let mut out = Vec::new();
         for entry in self.load_configured_scope(scope)? {
             if entry.source.trim_start().starts_with("npm:") {
+                // Config discovery never mutates; npm entries stay list-only
+                // unsupported and cannot contribute resources.
                 continue;
             }
             let parsed = self.parse_configured_source(&entry.source, scope)?;

@@ -91,68 +91,32 @@ pub struct Theme {
     pub tool_pending_bg: Color,
     pub tool_success_bg: Color,
     pub tool_error_bg: Color,
+    /// Optional HTML export backgrounds (`export` in upstream theme JSON).
+    pub export: ThemeExport,
 }
 
-/// Built-in dark palette, faithful to the installed Oh My Pi 17.1.8
-/// `titanium` theme (`src/modes/theme/defaults/titanium.json`). Upstream
-/// variable references are resolved to RGB for ratatui. Upstream empty-string
-/// roles (`text`, `userMessageText`, `customMessageText`, `toolTitle`) mean
-/// "default terminal color" and map to `Color::Reset`, matching the live TUI
-/// rendering path. `thinkingMax` is optional upstream and falls back to
-/// `thinkingXhigh` (`titaniumGold` = `#d4c090`) when omitted.
+/// Resolved optional colors for HTML session export.
+///
+/// Upstream themes may set `export.pageBg` / `cardBg` / `infoBg`. When absent,
+/// HTML export derives defaults from the TUI palette (typically `userMessageBg`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThemeExport {
+    pub page_bg: Option<Color>,
+    pub card_bg: Option<Color>,
+    pub info_bg: Option<Color>,
+}
+
+/// Built-in dark palette matching OMP's observed titanium interaction theme.
 pub const DARK: Theme = Theme {
-    accent: rgb(0x00, 0xb4, 0xff),
-    border: rgb(0x2a, 0x30, 0x38),
-    border_accent: rgb(0x00, 0xb4, 0xff),
-    border_muted: rgb(0x1f, 0x25, 0x2d),
-    success: rgb(0x00, 0xff, 0x88),
-    error: rgb(0xff, 0x47, 0x57),
-    warning: rgb(0xff, 0xb3, 0x47),
-    muted: rgb(0x9c, 0xa3, 0xb0),
-    dim: rgb(0x6b, 0x72, 0x80),
-    text: Color::Reset,
-    thinking_text: rgb(0x9c, 0xa3, 0xb0),
-    user_message_text: Color::Reset,
-    custom_message_text: Color::Reset,
-    custom_message_label: rgb(0xd4, 0xc0, 0x90),
-    tool_title: Color::Reset,
-    tool_output: rgb(0x9c, 0xa3, 0xb0),
-    md_heading: rgb(0x00, 0xb4, 0xff),
-    md_link: rgb(0x00, 0xb4, 0xff),
-    md_link_url: rgb(0x00, 0x82, 0xb3),
-    md_code: rgb(0x00, 0xff, 0x88),
-    md_code_block: rgb(0x9c, 0xa3, 0xb0),
-    md_code_block_border: rgb(0x2a, 0x30, 0x38),
-    md_quote: rgb(0x9c, 0xa3, 0xb0),
-    md_quote_border: rgb(0x2a, 0x30, 0x38),
-    md_hr: rgb(0x2a, 0x30, 0x38),
-    md_list_bullet: rgb(0x00, 0xb4, 0xff),
-    tool_diff_added: rgb(0x00, 0xff, 0x88),
-    tool_diff_removed: rgb(0xff, 0x47, 0x57),
-    tool_diff_context: rgb(0x9c, 0xa3, 0xb0),
-    syntax_comment: rgb(0x6b, 0x72, 0x80),
-    syntax_keyword: rgb(0x00, 0xb4, 0xff),
-    syntax_function: rgb(0x00, 0xff, 0x88),
-    syntax_variable: rgb(0xe8, 0xec, 0xf4),
-    syntax_string: rgb(0xd4, 0xc0, 0x90),
-    syntax_number: rgb(0xff, 0xb3, 0x47),
-    syntax_type: rgb(0x00, 0xb4, 0xff),
-    syntax_operator: rgb(0x00, 0xb4, 0xff),
-    syntax_punctuation: rgb(0x9c, 0xa3, 0xb0),
-    thinking_off: rgb(0x4a, 0x50, 0x58),
-    thinking_minimal: rgb(0x5a, 0x60, 0x68),
-    thinking_low: rgb(0x6a, 0x70, 0x78),
-    thinking_medium: rgb(0x9c, 0xa3, 0xb0),
-    thinking_high: rgb(0x00, 0xb4, 0xff),
-    thinking_xhigh: rgb(0xd4, 0xc0, 0x90),
-    thinking_max: rgb(0xd4, 0xc0, 0x90),
-    bash_mode: rgb(0x00, 0xff, 0x88),
-    selected_bg: rgb(0x00, 0x82, 0xb3),
-    user_message_bg: rgb(0x0f, 0x12, 0x16),
-    custom_message_bg: rgb(0x2a, 0x30, 0x38),
-    tool_pending_bg: rgb(0x0f, 0x12, 0x16),
-    tool_success_bg: rgb(0x0f, 0x12, 0x16),
-    tool_error_bg: rgb(0x1a, 0x0f, 0x10),
+    accent: rgb(0x00, 0xb4, 0xff), border: rgb(0x2a, 0x30, 0x38), border_accent: rgb(0x00, 0xb4, 0xff), border_muted: rgb(0x1f, 0x25, 0x2d),
+    success: rgb(0x00, 0xff, 0x88), error: rgb(0xff, 0x47, 0x57), warning: rgb(0xff, 0xb3, 0x47), muted: rgb(0x9c, 0xa3, 0xb0), dim: rgb(0x6b, 0x72, 0x80), text: Color::Reset,
+    thinking_text: rgb(0x9c, 0xa3, 0xb0), user_message_text: Color::Reset, custom_message_text: Color::Reset, custom_message_label: rgb(0xd4, 0xc0, 0x90), tool_title: Color::Reset, tool_output: rgb(0x9c, 0xa3, 0xb0),
+    md_heading: rgb(0x00, 0xb4, 0xff), md_link: rgb(0x00, 0xb4, 0xff), md_link_url: rgb(0x00, 0x82, 0xb3), md_code: rgb(0x00, 0xff, 0x88), md_code_block: rgb(0x9c, 0xa3, 0xb0), md_code_block_border: rgb(0x2a, 0x30, 0x38), md_quote: rgb(0x9c, 0xa3, 0xb0), md_quote_border: rgb(0x2a, 0x30, 0x38), md_hr: rgb(0x2a, 0x30, 0x38), md_list_bullet: rgb(0x00, 0xb4, 0xff),
+    tool_diff_added: rgb(0x00, 0xff, 0x88), tool_diff_removed: rgb(0xff, 0x47, 0x57), tool_diff_context: rgb(0x9c, 0xa3, 0xb0),
+    syntax_comment: rgb(0x6b, 0x72, 0x80), syntax_keyword: rgb(0x00, 0xb4, 0xff), syntax_function: rgb(0x00, 0xff, 0x88), syntax_variable: rgb(0xe8, 0xec, 0xf4), syntax_string: rgb(0xd4, 0xc0, 0x90), syntax_number: rgb(0xff, 0xb3, 0x47), syntax_type: rgb(0x00, 0xb4, 0xff), syntax_operator: rgb(0x00, 0xb4, 0xff), syntax_punctuation: rgb(0x9c, 0xa3, 0xb0),
+    thinking_off: rgb(0x4a, 0x50, 0x58), thinking_minimal: rgb(0x5a, 0x60, 0x68), thinking_low: rgb(0x6a, 0x70, 0x78), thinking_medium: rgb(0x9c, 0xa3, 0xb0), thinking_high: rgb(0x00, 0xb4, 0xff), thinking_xhigh: rgb(0xd4, 0xc0, 0x90), thinking_max: rgb(0xd4, 0xc0, 0x90), bash_mode: rgb(0x00, 0xff, 0x88),
+    selected_bg: rgb(0x00, 0x82, 0xb3), user_message_bg: rgb(0x0f, 0x12, 0x16), custom_message_bg: rgb(0x2a, 0x30, 0x38), tool_pending_bg: rgb(0x0f, 0x12, 0x16), tool_success_bg: rgb(0x0f, 0x12, 0x16), tool_error_bg: rgb(0x1a, 0x0f, 0x10),
+    export: ThemeExport { page_bg: Some(rgb(0x15, 0x18, 0x20)), card_bg: Some(rgb(0x0f, 0x12, 0x16)), info_bg: Some(rgb(0x2a, 0x30, 0x38)) },
 };
 
 /// Built-in light palette, faithful to the installed Oh My Pi 17.1.8 `light`
@@ -215,6 +179,11 @@ pub const LIGHT: Theme = Theme {
     tool_pending_bg: rgb(0xe8, 0xe8, 0xf0),
     tool_success_bg: rgb(0xe8, 0xf0, 0xe8),
     tool_error_bg: rgb(0xf0, 0xe8, 0xe8),
+    export: ThemeExport {
+        page_bg: None,
+        card_bg: None,
+        info_bg: None,
+    },
 };
 
 const fn rgb(red: u8, green: u8, blue: u8) -> Color {
@@ -483,6 +452,17 @@ enum ColorValue {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ThemeExportFile {
+    #[serde(default, rename = "pageBg")]
+    page_bg: Option<ColorValue>,
+    #[serde(default, rename = "cardBg")]
+    card_bg: Option<ColorValue>,
+    #[serde(default, rename = "infoBg")]
+    info_bg: Option<ColorValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ThemeFile {
     #[serde(default, rename = "$schema")]
     _schema: Option<String>,
@@ -494,6 +474,9 @@ struct ThemeFile {
     vars: BTreeMap<String, ColorValue>,
     #[serde(default)]
     colors: BTreeMap<String, ColorValue>,
+    /// Optional HTML export palette (`pageBg` / `cardBg` / `infoBg`).
+    #[serde(default)]
+    export: Option<ThemeExportFile>,
 }
 
 fn load_theme_file(path: &Path) -> Result<(String, Theme), String> {
@@ -506,6 +489,7 @@ fn load_theme_file(path: &Path) -> Result<(String, Theme), String> {
         extends,
         vars,
         colors,
+        export,
     } = parsed;
     let name = name
         .map(|value| value.trim().to_owned())
@@ -531,6 +515,25 @@ fn load_theme_file(path: &Path) -> Result<(String, Theme), String> {
     for (role, value) in &colors {
         let color = resolve_color(value, &vars, &mut BTreeSet::new())?;
         theme.apply_role(role, color)?;
+    }
+    if let Some(export) = export {
+        theme.export = ThemeExport {
+            page_bg: export
+                .page_bg
+                .as_ref()
+                .map(|value| resolve_color(value, &vars, &mut BTreeSet::new()))
+                .transpose()?,
+            card_bg: export
+                .card_bg
+                .as_ref()
+                .map(|value| resolve_color(value, &vars, &mut BTreeSet::new()))
+                .transpose()?,
+            info_bg: export
+                .info_bg
+                .as_ref()
+                .map(|value| resolve_color(value, &vars, &mut BTreeSet::new()))
+                .transpose()?,
+        };
     }
     Ok((name, theme))
 }
@@ -921,47 +924,30 @@ mod tests {
     }
 
     #[test]
-    fn dark_palette_matches_omp_titanium_resolved_values() {
-        // Source: @oh-my-pi/pi-coding-agent 17.1.8
-        // src/modes/theme/defaults/titanium.json. Variable refs (electricBlue,
-        // subtleGray, darkTitanium, titaniumGold, readoutGreen, alertRed,
-        // warningAmber, dimAluminum, deepBlue, brightAluminum) resolved to RGB.
-        // accent / borders
+    fn dark_palette_matches_observed_omp_titanium_values() {
         assert_eq!(DARK.accent, Color::Rgb(0x00, 0xb4, 0xff));
         assert_eq!(DARK.border, Color::Rgb(0x2a, 0x30, 0x38));
         assert_eq!(DARK.border_accent, Color::Rgb(0x00, 0xb4, 0xff));
-        assert_eq!(DARK.border_muted, Color::Rgb(0x1f, 0x25, 0x2d));
-        // messages: empty upstream roles map to terminal default (Color::Reset)
+        assert_eq!(DARK.muted, Color::Rgb(0x9c, 0xa3, 0xb0));
+        assert_eq!(DARK.syntax_variable, Color::Rgb(0xe8, 0xec, 0xf4));
+        assert_eq!(DARK.user_message_bg, Color::Rgb(0x0f, 0x12, 0x16));
         assert_eq!(DARK.user_message_text, Color::Reset);
         assert_eq!(DARK.custom_message_text, Color::Reset);
         assert_eq!(DARK.tool_title, Color::Reset);
         assert_eq!(DARK.custom_message_label, Color::Rgb(0xd4, 0xc0, 0x90));
-        assert_eq!(DARK.user_message_bg, Color::Rgb(0x0f, 0x12, 0x16));
         assert_eq!(DARK.custom_message_bg, Color::Rgb(0x2a, 0x30, 0x38));
-        // markdown
         assert_eq!(DARK.md_heading, Color::Rgb(0x00, 0xb4, 0xff));
         assert_eq!(DARK.md_link, Color::Rgb(0x00, 0xb4, 0xff));
-        assert_eq!(DARK.md_link_url, Color::Rgb(0x00, 0x82, 0xb3));
         assert_eq!(DARK.md_code, Color::Rgb(0x00, 0xff, 0x88));
-        assert_eq!(DARK.md_code_block_border, Color::Rgb(0x2a, 0x30, 0x38));
-        // diff
         assert_eq!(DARK.tool_diff_added, Color::Rgb(0x00, 0xff, 0x88));
         assert_eq!(DARK.tool_diff_removed, Color::Rgb(0xff, 0x47, 0x57));
-        assert_eq!(DARK.tool_diff_context, Color::Rgb(0x9c, 0xa3, 0xb0));
-        // syntax
         assert_eq!(DARK.syntax_comment, Color::Rgb(0x6b, 0x72, 0x80));
         assert_eq!(DARK.syntax_keyword, Color::Rgb(0x00, 0xb4, 0xff));
         assert_eq!(DARK.syntax_function, Color::Rgb(0x00, 0xff, 0x88));
-        assert_eq!(DARK.syntax_variable, Color::Rgb(0xe8, 0xec, 0xf4));
-        assert_eq!(DARK.syntax_string, Color::Rgb(0xd4, 0xc0, 0x90));
-        assert_eq!(DARK.syntax_number, Color::Rgb(0xff, 0xb3, 0x47));
-        // thinking: thinkingMax is absent upstream and falls back to thinkingXhigh
         assert_eq!(DARK.thinking_off, Color::Rgb(0x4a, 0x50, 0x58));
         assert_eq!(DARK.thinking_xhigh, Color::Rgb(0xd4, 0xc0, 0x90));
         assert_eq!(DARK.thinking_max, DARK.thinking_xhigh);
-        // bash
         assert_eq!(DARK.bash_mode, Color::Rgb(0x00, 0xff, 0x88));
-        // backgrounds
         assert_eq!(DARK.selected_bg, Color::Rgb(0x00, 0x82, 0xb3));
         assert_eq!(DARK.tool_pending_bg, Color::Rgb(0x0f, 0x12, 0x16));
         assert_eq!(DARK.tool_success_bg, Color::Rgb(0x0f, 0x12, 0x16));
@@ -1028,5 +1014,73 @@ mod tests {
         .unwrap();
         let (_, theme) = load_theme_file(&path).unwrap();
         assert_eq!(theme.text, Color::Reset);
+    }
+
+    #[test]
+    fn theme_export_object_parses_canonical_keys_and_rejects_unknown() {
+        // Upstream @earendil-works/pi-coding-agent@0.82.1 theme-schema.json
+        // defines optional top-level `export` with pageBg/cardBg/infoBg only
+        // (additionalProperties: false). Canonical gruvbox-shaped themes ship
+        // this block; unknown nested keys and unknown top-level fields stay
+        // rejected via deny_unknown_fields.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dark-gruvbox.json");
+        fs::write(
+            &path,
+            r##"{
+                "name": "dark-gruvbox",
+                "extends": "dark",
+                "vars": {
+                    "bg0": "#282828",
+                    "bg1": "#3c3836",
+                    "userMsgBg": "#1d2021"
+                },
+                "colors": {
+                    "accent": "bg1",
+                    "userMessageBg": "userMsgBg"
+                },
+                "export": {
+                    "pageBg": "userMsgBg",
+                    "cardBg": "bg0",
+                    "infoBg": "#3c3836"
+                }
+            }"##,
+        )
+        .unwrap();
+        let (name, theme) = load_theme_file(&path).unwrap();
+        assert_eq!(name, "dark-gruvbox");
+        assert_eq!(theme.user_message_bg, Color::Rgb(0x1d, 0x20, 0x21));
+        assert_eq!(
+            theme.export,
+            ThemeExport {
+                page_bg: Some(Color::Rgb(0x1d, 0x20, 0x21)),
+                card_bg: Some(Color::Rgb(0x28, 0x28, 0x28)),
+                info_bg: Some(Color::Rgb(0x3c, 0x38, 0x36)),
+            }
+        );
+
+        let bad_export = directory.path().join("bad-export.json");
+        fs::write(
+            &bad_export,
+            r##"{"name":"bad","colors":{"accent":"#ffffff"},"export":{"pageBg":"#000000","mystery":"#ff0000"}}"##,
+        )
+        .unwrap();
+        let error = load_theme_file(&bad_export).unwrap_err();
+        assert!(
+            error.contains("unknown field") && error.contains("mystery"),
+            "expected unknown export key rejection, got: {error}"
+        );
+
+        let bad_top = directory.path().join("bad-top.json");
+        fs::write(
+            &bad_top,
+            r##"{"name":"bad","colors":{"accent":"#ffffff"},"notAField":true}"##,
+        )
+        .unwrap();
+        let error = load_theme_file(&bad_top).unwrap_err();
+        assert!(
+            error.contains("unknown field") && error.contains("notAField"),
+            "expected unknown top-level rejection, got: {error}"
+        );
     }
 }

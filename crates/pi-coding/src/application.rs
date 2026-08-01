@@ -1,9 +1,9 @@
-use std::{path::{Path, PathBuf}, sync::{Arc, Weak, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{collections::HashSet, path::{Path, PathBuf}, sync::{Arc, Weak, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
-use pi_agent::{AgentEvent, Subscription, ThinkingLevel};
-use pi_ai::{ContentBlock, CustomMessage, Message, Model};
+use pi_agent::{AgentEvent, AgentTool, AgentToolResult, Subscription, ThinkingLevel};
+use pi_ai::{ContentBlock, CustomMessage, Message, Model, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{sync::{Mutex as AsyncMutex, broadcast}, task::JoinHandle};
@@ -12,9 +12,9 @@ use crate::{
     CompactionReason, ExtensionActionHost, ExtensionCancellation, ExtensionCommandDescriptor,
     ExtensionContextSnapshot, ExtensionContextUsage, ExtensionEvent, ExtensionFuture,
     ExtensionInstanceId, ExtensionMessageDelivery, ExtensionPermissionSet, ExtensionRuntime,
-    ExtensionRuntimeAction, MessageDelivery, ProcessEvent, ProcessId, ProcessInfo, ProcessKey,
-    ProcessLogs, ProcessManager, ProcessOwnerId, ProcessSignal, ProcessSpawnSpec,
-    ProcessTerminalSize, Session, SessionEvent,
+    ExtensionRuntimeAction, Goal, GoalContinuationDecision, GoalError, GoalState, GoalUsageDelta,
+    MessageDelivery, ProcessEvent, ProcessId, ProcessInfo, ProcessKey, ProcessLogs, ProcessManager,
+    ProcessOwnerId, ProcessSignal, ProcessSpawnSpec, ProcessTerminalSize, Session, SessionEvent,
 };
 
 const EVENT_BUFFER_CAPACITY: usize = 512;
@@ -44,6 +44,7 @@ pub struct ApplicationState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_selection: Option<crate::SelectionPlan>,
     pub todo_phases: Vec<crate::TodoPhase>,
+    pub goal: GoalState,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +77,24 @@ pub struct ApplicationCommand {
     pub description: Option<String>,
     pub source: String,
     pub source_info: CommandSourceInfo,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingApplyOutcome {
+    pub writes: Vec<crate::SettingWriteResult>,
+    pub applied_live: bool,
+    pub reloaded: bool,
+    pub restart_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload_generation: Option<u64>,
+}
+
+impl SettingApplyOutcome {
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        !self.writes.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,12 +161,24 @@ pub enum ApplicationEvent {
     Process(ProcessEvent),
     Selection(crate::SelectionPlan),
     Loop(crate::LoopEvent),
+    Orchestration(crate::OrchestrationEvent),
     TodoUpdated {
         phases: Vec<crate::TodoPhase>,
         completed_tasks: Vec<crate::TodoCompletionTransition>,
     },
     TodoReminder {
         phases: Vec<crate::TodoPhase>,
+    },
+    GoalUpdated {
+        operation: &'static str,
+        state: GoalState,
+    },
+    GoalUsageCharged {
+        delta: GoalUsageDelta,
+        state: GoalState,
+    },
+    GoalContinuation {
+        decision: GoalContinuationDecision,
     },
 }
 
@@ -192,6 +223,7 @@ impl Serialize for ApplicationEvent {
                 serde_json::json!({ "type": "selection", "selection": plan }).serialize(serializer)
             }
             Self::Loop(event) => event.serialize(serializer),
+            Self::Orchestration(event) => event.serialize(serializer),
             Self::TodoUpdated { phases, completed_tasks } => {
                 serde_json::json!({
                     "type": "todo_updated",
@@ -204,6 +236,18 @@ impl Serialize for ApplicationEvent {
                 serde_json::json!({ "type": "todo_reminder", "phases": phases })
                     .serialize(serializer)
             }
+            Self::GoalUpdated { operation, state } => {
+                serde_json::json!({ "type": "goal_updated", "operation": operation, "state": state })
+                    .serialize(serializer)
+            }
+            Self::GoalUsageCharged { delta, state } => {
+                serde_json::json!({ "type": "goal_usage_charged", "delta": delta, "state": state })
+                    .serialize(serializer)
+            }
+            Self::GoalContinuation { decision } => {
+                serde_json::json!({ "type": "goal_continuation", "decision": decision })
+                    .serialize(serializer)
+            }
         }
     }
 }
@@ -213,6 +257,68 @@ pub struct Application {
     inner: Arc<ApplicationInner>,
 }
 
+#[derive(Clone, Default)]
+pub struct GoalToolBinding {
+    application: Arc<Mutex<Option<Weak<ApplicationInner>>>>,
+}
+
+impl GoalToolBinding {
+    #[must_use]
+    pub fn tool(&self) -> AgentTool {
+        let binding = self.clone();
+        AgentTool::new(
+            "goal",
+            "Inspect the session goal, pause it, or explicitly complete it. Creation, resumption, dropping, and usage accounting remain host-controlled.",
+            goal_tool_schema(),
+            move |context| {
+                let binding = binding.clone();
+                async move {
+                    let arguments: GoalToolArguments = serde_json::from_value(context.arguments)
+                        .map_err(|error| anyhow!("invalid goal arguments: {error}"))?;
+                    let application = binding
+                        .application
+                        .lock()
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .map(|inner| Application { inner })
+                        .ok_or_else(|| anyhow!("goal tool is not attached to an application"))?;
+                    match arguments.op.as_str() {
+                        "get" => {}
+                        "pause" => {
+                            application.goal_pause()?;
+                        }
+                        "complete" => {
+                            application.goal_complete()?;
+                        }
+                        operation => return Err(anyhow!("unsupported goal operation {operation:?}")),
+                    }
+                    let state = application.goal_state();
+                    Ok(AgentToolResult {
+                        content: vec![ContentBlock::text(serde_json::to_string_pretty(&state)?)],
+                        details: serde_json::to_value(&state)?,
+                        ..AgentToolResult::default()
+                    })
+                }
+            },
+        )
+    }
+
+    pub fn bind(&self, application: &Application) -> Result<()> {
+        let mut binding = self.application.lock();
+        if binding.as_ref().and_then(Weak::upgrade).is_some() {
+            return Err(anyhow!("goal tool is already attached to an application"));
+        }
+        *binding = Some(Arc::downgrade(&application.inner));
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoalToolArguments {
+    op: String,
+}
+
 struct ApplicationInner {
     session: Session,
     events: broadcast::Sender<ApplicationEvent>,
@@ -220,6 +326,9 @@ struct ApplicationInner {
     active_run: Mutex<Option<JoinHandle<()>>>,
     extension_runtime: Mutex<Option<(ExtensionRuntime, ExtensionPermissionSet)>>,
     orchestration_runtime: Mutex<Option<crate::OrchestrationRuntime>>,
+    orchestration_events: Mutex<Option<JoinHandle<()>>>,
+    charged_goal_jobs: Mutex<HashSet<String>>,
+    goal_tool_binding: Mutex<Option<GoalToolBinding>>,
     orchestration_explicit: AtomicBool,
     runtime_settings: Mutex<Arc<crate::RuntimeSettingsSnapshot>>,
     process_manager: ProcessManager,
@@ -255,7 +364,7 @@ impl Application {
         runtime: crate::OrchestrationRuntime,
     ) -> Self {
         let application = Self::build(session, None).await;
-        *application.inner.orchestration_runtime.lock() = Some(runtime);
+        application.attach_orchestration(runtime).expect("fresh application accepts orchestration");
         application
             .inner
             .orchestration_explicit
@@ -284,6 +393,9 @@ impl Application {
             session_events: Mutex::new(None),
             extension_runtime: Mutex::new(extension_runtime),
             orchestration_runtime: Mutex::new(None),
+            orchestration_events: Mutex::new(None),
+            charged_goal_jobs: Mutex::new(HashSet::new()),
+            goal_tool_binding: Mutex::new(None),
             orchestration_explicit: AtomicBool::new(false),
             runtime_settings: Mutex::new(Arc::new(runtime_settings)),
             process_manager: process_manager.clone(),
@@ -529,7 +641,98 @@ impl Application {
     pub fn runtime_settings_state(&self) -> crate::RuntimeSettingsState {
         self.runtime_settings().state()
     }
+
+    pub fn settings_manager(&self) -> Result<crate::SettingsManager> {
+        self.inner
+            .session
+            .resource_manager()
+            .map(|resources| resources.settings_manager())
+            .ok_or_else(|| anyhow!("session has no resource manager"))
+    }
+
     #[must_use]
+    pub fn settings_catalog_snapshot(&self) -> Option<crate::SettingsCatalogSnapshot> {
+        self.settings_manager()
+            .ok()
+            .map(|manager| crate::SettingsCatalog::inspect(&manager))
+    }
+    pub fn settings_draft(&self, scope: crate::SettingsScope) -> Result<crate::SettingsDraft> {
+        let mut draft = crate::SettingsCatalog::draft(&self.settings_manager()?, scope)?;
+        draft.overlay_runtime_thinking_level(self.inner.session.thinking_level());
+        Ok(draft)
+    }
+
+    /// Persist one atomic settings draft and dispatch its runtime behavior.
+    /// Reload changes are only reported as applied when the reload succeeds;
+    /// restart changes persist but truthfully remain pending process restart.
+    pub async fn apply_settings_draft(
+        &self,
+        draft: crate::SettingsDraft,
+    ) -> Result<SettingApplyOutcome> {
+        let manager = self.settings_manager()?;
+        let writes = draft.apply(&manager)?;
+        if writes.is_empty() {
+            return Ok(SettingApplyOutcome {
+                writes,
+                applied_live: true,
+                reloaded: false,
+                restart_required: false,
+                reload_generation: None,
+            });
+        }
+        let needs_reload = writes.iter().any(|write| write.needs_reload);
+        let restart_required = writes.iter().any(|write| write.needs_restart);
+        if needs_reload {
+            let reload = self.reload().await?;
+            return Ok(SettingApplyOutcome {
+                writes,
+                applied_live: true,
+                reloaded: true,
+                restart_required,
+                reload_generation: Some(reload.generation),
+            });
+        }
+        if restart_required {
+            let has_live = writes
+                .iter()
+                .any(|write| write.behavior == crate::SettingApplyBehavior::Live);
+            if has_live {
+                let settings = manager.settings().runtime_settings()?;
+                self.inner.session.apply_runtime_settings(settings.clone()).await;
+                *self.inner.runtime_settings.lock() = Arc::new(settings);
+            }
+            return Ok(SettingApplyOutcome {
+                writes,
+                applied_live: has_live,
+                reloaded: false,
+                restart_required: true,
+                reload_generation: None,
+            });
+        }
+
+        let settings = manager.settings().runtime_settings()?;
+        self.inner.session.apply_runtime_settings(settings.clone()).await;
+        *self.inner.runtime_settings.lock() = Arc::new(settings);
+        Ok(SettingApplyOutcome {
+            writes,
+            applied_live: true,
+            reloaded: false,
+
+            restart_required: false,
+            reload_generation: None,
+        })
+    }
+    #[must_use]
+    pub fn attach_goal_tool(&self, binding: GoalToolBinding) -> Result<()> {
+        binding.bind(self)?;
+        let mut current = self.inner.goal_tool_binding.lock();
+        if current.is_some() {
+            return Err(anyhow!("application goal tool is already configured"));
+        }
+        *current = Some(binding);
+        Ok(())
+    }
+
     pub fn orchestration_runtime(&self) -> Option<crate::OrchestrationRuntime> {
         self.inner.orchestration_runtime.lock().as_ref().cloned()
     }
@@ -547,7 +750,32 @@ impl Application {
         if current.is_some() {
             return Err(anyhow!("application orchestration is already configured"));
         }
+        let mut events = runtime.subscribe();
+        let event_runtime = runtime.clone();
+        let event_inner = Arc::downgrade(&self.inner);
+        let event_task = tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        let Some(inner) = event_inner.upgrade() else {
+                            break;
+                        };
+                        inner.publish(ApplicationEvent::Orchestration(event));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(inner) = event_inner.upgrade() else {
+                            break;
+                        };
+                        for event in event_runtime.presentation_events() {
+                            inner.publish(ApplicationEvent::Orchestration(event));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         *current = Some(runtime);
+        *self.inner.orchestration_events.lock() = Some(event_task);
         self.inner.orchestration_explicit.store(explicit, Ordering::Release);
         Ok(())
     }
@@ -610,6 +838,87 @@ impl Application {
         });
         Ok(result)
     }
+    #[must_use]
+    pub fn goal_state(&self) -> GoalState {
+        self.inner.session.goal_runtime().get()
+    }
+
+    pub fn goal_create(&self, objective: impl Into<String>, token_budget: Option<u64>) -> Result<Goal> {
+        self.goal_mutation("create", |runtime| runtime.create(objective, token_budget))
+    }
+
+    pub fn goal_pause(&self) -> Result<Goal> {
+        self.goal_mutation("pause", |runtime| runtime.pause())
+    }
+
+    pub fn goal_resume(&self) -> Result<Goal> {
+        self.goal_mutation("resume", |runtime| runtime.resume())
+    }
+
+    pub fn goal_complete(&self) -> Result<Goal> {
+        self.goal_mutation("complete", |runtime| runtime.complete())
+    }
+
+    pub fn goal_drop(&self) -> Result<Goal> {
+        self.goal_mutation("drop", |runtime| runtime.drop())
+    }
+
+    pub fn goal_update_usage(&self, delta: GoalUsageDelta) -> Result<Goal> {
+        let goal = self
+            .inner
+            .session
+            .goal_runtime()
+            .update_usage(delta)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.inner.publish(ApplicationEvent::GoalUsageCharged {
+            delta,
+            state: self.goal_state(),
+        });
+        Ok(goal)
+    }
+
+    #[must_use]
+    pub fn goal_continuation_decision(&self) -> GoalContinuationDecision {
+        let decision = self.inner.session.goal_runtime().continuation_decision();
+        self.inner.publish(ApplicationEvent::GoalContinuation {
+            decision: decision.clone(),
+        });
+        decision
+    }
+
+    fn goal_mutation<F>(&self, operation: &'static str, mutation: F) -> Result<Goal>
+    where
+        F: FnOnce(&crate::GoalRuntime) -> std::result::Result<Goal, GoalError>,
+    {
+        let goal = mutation(&self.inner.session.goal_runtime())
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.inner.publish(ApplicationEvent::GoalUpdated {
+            operation,
+            state: self.goal_state(),
+        });
+        Ok(goal)
+    }
+
+    pub fn prepare_resumed_goal(&self, forked: bool) -> Result<()> {
+        let runtime = self.inner.session.goal_runtime();
+        let Some(source) = runtime.get().current else {
+            return Ok(());
+        };
+        if forked {
+            runtime
+                .fork_clone(&source)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            self.inner.publish(ApplicationEvent::GoalUpdated {
+                operation: "fork_clone",
+                state: runtime.get(),
+            });
+        } else {
+            self.inner.pause_goal_after_resume()?;
+        }
+        self.inner.charged_goal_jobs.lock().clear();
+        Ok(())
+    }
+
     pub async fn loop_create(
         &self,
         request: crate::LoopCreateRequest,
@@ -736,6 +1045,7 @@ impl Application {
             pending_message_count: session.pending_message_count().await,
             last_selection: session.last_selection(),
             todo_phases: session.todo_state().phases,
+            goal: session.goal_runtime().get(),
         }
     }
 
@@ -812,11 +1122,26 @@ impl Application {
             });
         }
         let turn_guard = turn_guard;
+        let goal_was_active = self
+            .inner
+            .session
+            .goal_runtime()
+            .get()
+            .current
+            .is_some_and(|goal| goal.lifecycle == crate::GoalLifecycle::Active);
+        inner.publish(ApplicationEvent::GoalContinuation {
+            decision: session.goal_runtime().continuation_decision(),
+        });
         let handle = tokio::spawn(async move {
-            if let Err(error) = session.run(&message, images).await {
-                inner.publish(ApplicationEvent::RunFailed {
-                    message: error.to_string(),
-                });
+            let started = Instant::now();
+            match session.run(&message, images).await {
+                Ok(result) => inner.finish_goal_turn(result.usage, started, goal_was_active),
+                Err(error) => {
+                    inner.publish(ApplicationEvent::RunFailed {
+                        message: error.to_string(),
+                    });
+                    inner.finish_goal_turn(pi_ai::Usage::default(), started, goal_was_active);
+                }
             }
             inner.publish(ApplicationEvent::AgentSettled);
             drop(turn_guard);
@@ -924,6 +1249,13 @@ impl Application {
     }
 
     pub async fn new_session_with_parent(&self, parent_session: Option<&Path>) -> Result<()> {
+        if let Some(runtime) = self.extension_runtime()
+            && runtime
+                .reduce_before_switch(serde_json::json!({ "reason": "new" }))
+                .await?
+        {
+            return Err(anyhow!("session switch cancelled by extension"));
+        }
         let loops = self.loop_handle()?;
         let previous = self.inner.session.recorder_info().map(|(_, path)| path);
         loops.suspend(crate::LoopRemovalReason::SessionChanged).await?;
@@ -944,6 +1276,7 @@ impl Application {
         }
         let current = self.inner.session.recorder_info().map(|(_, path)| path);
         loops.activate(current).await?;
+        self.inner.charged_goal_jobs.lock().clear();
         Ok(())
     }
 
@@ -955,6 +1288,16 @@ impl Application {
         self.inner.session.compact(custom_instructions).await
     }
     pub async fn switch_session(&self, path: &Path) -> Result<()> {
+        if let Some(runtime) = self.extension_runtime()
+            && runtime
+                .reduce_before_switch(serde_json::json!({
+                    "reason": "resume",
+                    "targetSessionFile": path,
+                }))
+                .await?
+        {
+            return Err(anyhow!("session switch cancelled by extension"));
+        }
         let loops = self.loop_handle()?;
         let previous = self.inner.session.recorder_info().map(|(_, path)| path);
         loops.suspend(crate::LoopRemovalReason::SessionChanged).await?;
@@ -969,10 +1312,27 @@ impl Application {
         }
         let current = self.inner.session.recorder_info().map(|(_, path)| path);
         loops.activate(current).await?;
+        self.inner.pause_goal_after_resume()?;
+        self.inner.charged_goal_jobs.lock().clear();
         Ok(())
     }
 
     pub async fn fork_session(&self, entry_id: &str) -> Result<String> {
+        let source_goal = self.inner.session.goal_runtime().get().current;
+        let restore_conversation = if let Some(runtime) = self.extension_runtime() {
+            let reduction = runtime
+                .reduce_before_fork(serde_json::json!({
+                    "entryId": entry_id,
+                    "position": "before",
+                }))
+                .await?;
+            if reduction.cancel {
+                return Err(anyhow!("session fork cancelled by extension"));
+            }
+            !reduction.skip_conversation_restore
+        } else {
+            true
+        };
         let loops = self.loop_handle()?;
         let previous = self.inner.session.recorder_info().map(|(_, path)| path);
         loops.suspend(crate::LoopRemovalReason::SessionChanged).await?;
@@ -982,7 +1342,7 @@ impl Application {
             .shutdown_owner(&self.inner.process_owner_id)
             .await;
         self.inner.publish(ApplicationEvent::SessionBeforeFork(SessionBeforeForkEvent { target_id: entry_id.to_owned() }));
-        let editor_text = match self.inner.session.fork_session(entry_id).await {
+        let editor_text = match self.inner.session.fork_session(entry_id, restore_conversation).await {
             Ok(editor_text) => editor_text,
             Err(error) => {
                 let _ = loops.activate(previous).await;
@@ -991,11 +1351,60 @@ impl Application {
         };
         let (session_id, session_file) = self.inner.session.recorder_info().ok_or_else(|| anyhow!("forked session recording is unavailable"))?;
         loops.activate(Some(session_file.clone())).await?;
+        if let Some(source_goal) = source_goal {
+            self.inner
+                .session
+                .goal_runtime()
+                .fork_clone(&source_goal)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            self.inner.publish(ApplicationEvent::GoalUpdated {
+                operation: "fork_clone",
+                state: self.goal_state(),
+            });
+        }
+        self.inner.charged_goal_jobs.lock().clear();
         self.inner.publish(ApplicationEvent::SessionForked(SessionForkedEvent { target_id: entry_id.to_owned(), session_id, session_file: session_file.to_string_lossy().into_owned(), editor_text: editor_text.clone() }));
         Ok(editor_text)
     }
 
     pub async fn navigate_tree(&self, entry_id: &str, options: crate::NavigateTreeOptions) -> Result<crate::NavigateTreeResult> {
+        let mut options = options;
+        if let Some(runtime) = self.extension_runtime() {
+            let reduction = runtime
+                .reduce_before_tree(serde_json::json!({
+                    "preparation": {
+                        "targetId": entry_id,
+                        "userWantsSummary": options.summarize,
+                        "customInstructions": options.custom_instructions.as_deref(),
+                        "replaceInstructions": options.replace_instructions,
+                        "label": options.label.as_deref(),
+                    }
+                }))
+                .await?;
+            if reduction.cancel {
+                let active_leaf_id = self.inner.session.session_tree()?.active_leaf_id;
+                return Ok(crate::NavigateTreeResult {
+                    editor_text: None,
+                    active_leaf_id,
+                    summary_entry_id: None,
+                    changed: false,
+                    cancelled: true,
+                });
+            }
+            if let Some(summary) = reduction.summary {
+                options.summary = Some(summary.summary);
+                options.summarize = true;
+            }
+            if reduction.custom_instructions.is_some() {
+                options.custom_instructions = reduction.custom_instructions;
+            }
+            if reduction.replace_instructions.is_some() {
+                options.replace_instructions = reduction.replace_instructions;
+            }
+            if reduction.label.is_some() {
+                options.label = reduction.label;
+            }
+        }
         self.wait_for_idle().await;
         self.inner.publish(ApplicationEvent::SessionBeforeTree(SessionBeforeTreeEvent { target_id: entry_id.to_owned(), summarize: options.summarize }));
         let result = self.inner.session.navigate_tree(entry_id, options).await?;
@@ -1008,6 +1417,7 @@ impl Application {
     }
 
     pub async fn clone_session(&self) -> Result<()> {
+        let source_goal = self.inner.session.goal_runtime().get().current;
         let loops = self.loop_handle()?;
         let previous = self.inner.session.recorder_info().map(|(_, path)| path);
         loops.suspend(crate::LoopRemovalReason::SessionChanged).await?;
@@ -1022,6 +1432,18 @@ impl Application {
         }
         let current = self.inner.session.recorder_info().map(|(_, path)| path);
         loops.activate(current).await?;
+        if let Some(source_goal) = source_goal {
+            self.inner
+                .session
+                .goal_runtime()
+                .fork_clone(&source_goal)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            self.inner.publish(ApplicationEvent::GoalUpdated {
+                operation: "fork_clone",
+                state: self.goal_state(),
+            });
+        }
+        self.inner.charged_goal_jobs.lock().clear();
         Ok(())
     }
 
@@ -1122,27 +1544,82 @@ impl Application {
         config.max_recursion_depth = settings.orchestration_max_recursion_depth;
         config.mailbox_capacity = settings.orchestration_mailbox_capacity;
         config.max_tools_per_agent = settings.orchestration_max_tools_per_agent;
-        if let Some(selector) = snapshot.settings.selector.clone() {
-            config = config.with_selector_settings(selector);
+        config = config.with_selector_settings(snapshot.settings.selector.clone().unwrap_or_default());
+        config.agent_settings = snapshot.settings.agents.clone();
+        if let Some(model) = self.inner.session.model() {
+            config.parent_model = model;
         }
-        let resolver = crate::OrchestrationRuntime::read_uri_resolver_for_artifact_dir(
-            &config.artifact_dir,
-        )?;
-        let factory = crate::OrchestrationRuntime::child_factory_from_snapshot_and_uri(
-            self.inner.session.child_session_options_snapshot(),
+        // Live parent model so /model switches apply to child resolution without rebuild.
+        let session_for_parent = self.inner.session.clone();
+        config = config.with_parent_model_provider(std::sync::Arc::new(move || {
+            session_for_parent.model().unwrap_or_default()
+        }));
+        let resolver_slot = Arc::new(Mutex::new(None::<crate::InternalUriResolverFn>));
+        let child_resolver_slot = resolver_slot.clone();
+        let resolver: crate::InternalUriResolverFn = Arc::new(move |uri| {
+            child_resolver_slot
+                .lock()
+                .as_ref()
+                .ok_or_else(|| anyhow!("orchestration URI resolver is not initialized"))?(uri)
+        });
+        let factory = crate::OrchestrationRuntime::child_factory_from_session_and_uri(
+            &self.inner.session,
             Some(resolver),
         );
-        Ok(Some(crate::OrchestrationRuntime::new(config, factory)?))
+        let runtime = crate::OrchestrationRuntime::new(config, factory)?;
+        if let Some(current) = self.orchestration_runtime()
+            && current.runtime_equivalent(&runtime)
+        {
+            return Ok(Some(current));
+        }
+        *resolver_slot.lock() = Some(runtime.read_uri_resolver());
+        Ok(Some(runtime))
     }
 
     async fn commit_orchestration_candidate(
         &self,
         candidate: Option<crate::OrchestrationRuntime>,
     ) {
-        let previous = {
+        let next_runtime = candidate.as_ref().cloned();
+        let (previous, runtime_changed) = {
             let mut current = self.inner.orchestration_runtime.lock();
-            std::mem::replace(&mut *current, candidate)
+            if current
+                .as_ref()
+                .zip(candidate.as_ref())
+                .is_some_and(|(current, candidate)| current.shares_runtime(candidate))
+            {
+                (None, false)
+            } else {
+                (std::mem::replace(&mut *current, candidate), true)
+            }
         };
+        if runtime_changed {
+            if let Some(task) = self.inner.orchestration_events.lock().take() {
+                task.abort();
+            }
+            if let Some(runtime) = next_runtime {
+                let mut events = runtime.subscribe();
+                let event_runtime = runtime.clone();
+                let event_inner = Arc::downgrade(&self.inner);
+                *self.inner.orchestration_events.lock() = Some(tokio::spawn(async move {
+                    loop {
+                        match events.recv().await {
+                            Ok(event) => {
+                                let Some(inner) = event_inner.upgrade() else { break; };
+                                inner.publish(ApplicationEvent::Orchestration(event));
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                let Some(inner) = event_inner.upgrade() else { break; };
+                                for event in event_runtime.presentation_events() {
+                                    inner.publish(ApplicationEvent::Orchestration(event));
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }));
+            }
+        }
         if let Some(previous) = previous {
             previous.shutdown().await;
         }
@@ -1167,6 +1644,9 @@ impl Application {
             if let Some(orchestration) = &orchestration_candidate {
                 additional_tools.extend(orchestration.agent_tools("Main", 0));
             }
+            if let Some(binding) = self.inner.goal_tool_binding.lock().as_ref() {
+                additional_tools.push(binding.tool());
+            }
             let update = self
                 .inner
                 .session
@@ -1187,6 +1667,9 @@ impl Application {
         let mut additional_tools = extension_candidate.agent_tools(&runtime);
         if let Some(orchestration) = &orchestration_candidate {
             additional_tools.extend(orchestration.agent_tools("Main", 0));
+        }
+        if let Some(binding) = self.inner.goal_tool_binding.lock().as_ref() {
+            additional_tools.push(binding.tool());
         }
         let update = match self.inner.session.prepare_resource_update(
             resource_candidate.snapshot(),
@@ -1258,16 +1741,19 @@ impl Application {
         self.reload().await
     }
 
-    pub fn set_model(&self, model: Model, api_key: String) {
-        self.inner.session.set_model(model, api_key);
+    pub fn set_model(&self, model: Model, api_key: String) -> crate::ThinkingLevelChange {
+        self.inner.session.set_model(model, api_key)
     }
 
-    pub async fn set_model_with_resolved_auth(&self, model: Model) -> Result<()> {
+    pub async fn set_model_with_resolved_auth(
+        &self,
+        model: Model,
+    ) -> Result<crate::ThinkingLevelChange> {
         self.inner.session.set_model_with_resolved_auth(model).await
     }
 
-    pub fn set_thinking_level(&self, level: ThinkingLevel) {
-        self.inner.session.set_thinking_level(level);
+    pub fn set_thinking_level(&self, level: ThinkingLevel) -> crate::ThinkingLevelChange {
+        self.inner.session.set_thinking_level(level)
     }
 
     /// Stops every runtime owned by this application. Safe to call repeatedly;
@@ -1284,6 +1770,9 @@ impl Application {
         let loop_scheduler = self.inner.loop_scheduler.lock().take();
         if let Some(runtime) = loop_scheduler {
             runtime.shutdown().await;
+        }
+        if let Some(task) = self.inner.orchestration_events.lock().take() {
+            task.abort();
         }
         let orchestration_runtime = self.inner.orchestration_runtime.lock().take();
         if let Some(runtime) = orchestration_runtime {
@@ -1378,6 +1867,12 @@ impl ApplicationExtensionHost {
     }
 }
 
+/// Extension/process hosts must never observe credential-bearing model headers.
+fn public_extension_model(mut model: Model) -> Model {
+    model.headers = None;
+    model
+}
+
 impl ExtensionActionHost for ApplicationExtensionHost {
     fn context_snapshot(&self) -> ExtensionFuture<'_, Result<ExtensionContextSnapshot>> {
         Box::pin(async move {
@@ -1416,8 +1911,9 @@ impl ExtensionActionHost for ApplicationExtensionHost {
                 active_tools: application.get_active_tool_names(),
                 all_tools,
                 commands,
+                flag_values: std::collections::BTreeMap::new(),
                 system_prompt: application.inner.session.current_system_prompt().await,
-                model: state.model,
+                model: state.model.map(public_extension_model),
                 thinking_level: state.thinking_level,
             })
         })
@@ -1498,7 +1994,7 @@ impl ExtensionActionHost for ApplicationExtensionHost {
                             model.provider,
                             model.id
                         ))?;
-                    application
+                    let _ = application
                         .inner
                         .session
                         .set_model_with_resolved_auth(canonical)
@@ -1506,8 +2002,8 @@ impl ExtensionActionHost for ApplicationExtensionHost {
                     Ok(Value::Bool(true))
                 }
                 ExtensionRuntimeAction::SetThinkingLevel { level } => {
-                    application.set_thinking_level(level);
-                    Ok(Value::Null)
+                    let change = application.set_thinking_level(level);
+                    Ok(serde_json::to_value(change)?)
                 }
                 ExtensionRuntimeAction::Abort => {
                     application.abort().await;
@@ -1528,6 +2024,10 @@ impl ExtensionActionHost for ApplicationExtensionHost {
                     application.wait_for_idle().await;
                     Ok(Value::Null)
                 }
+                // GetFlag is resolved from extension registrations by the runtime
+                // before reaching the action host; this arm is a compile-time
+                // fallback that is never reached in practice.
+                ExtensionRuntimeAction::GetFlag { .. } => Ok(Value::Null),
             }
         })
     }
@@ -1546,10 +2046,105 @@ impl ApplicationInner {
     fn publish(&self, event: ApplicationEvent) {
         let _ = self.events.send(event);
     }
+
+    fn finish_goal_turn(
+        &self,
+        parent_usage: pi_ai::Usage,
+        started: Instant,
+        goal_was_active: bool,
+    ) {
+        if self.session.goal_runtime().get().current.is_none() {
+            return;
+        }
+        let mut tokens = usage_tokens(&parent_usage);
+        let mut settled_jobs = Vec::new();
+        if let Some(runtime) = self.orchestration_runtime.lock().as_ref() {
+            let charged = self.charged_goal_jobs.lock();
+            for job in runtime.jobs(None) {
+                if !job.status.is_settled() || charged.contains(&job.id) {
+                    continue;
+                }
+                let usage = job
+                    .result
+                    .as_ref()
+                    .map_or(0, |result| usage_tokens(&result.usage));
+                tokens = tokens.saturating_add(usage);
+                settled_jobs.push(job.id);
+            }
+        }
+        let elapsed = if goal_was_active {
+            started.elapsed().as_secs()
+        } else {
+            0
+        };
+        if tokens != 0 || elapsed != 0 {
+            let delta = GoalUsageDelta::new(tokens, elapsed);
+            match self.session.goal_runtime().update_usage(delta) {
+                Ok(_) => {
+                    self.charged_goal_jobs.lock().extend(settled_jobs);
+                    self.publish(ApplicationEvent::GoalUsageCharged {
+                        delta,
+                        state: self.session.goal_runtime().get(),
+                    });
+                }
+                Err(error) => self.publish(ApplicationEvent::RunFailed {
+                    message: format!("failed to charge goal usage: {error}"),
+                }),
+            }
+        } else {
+            self.charged_goal_jobs.lock().extend(settled_jobs);
+        }
+        self.publish(ApplicationEvent::GoalContinuation {
+            decision: self.session.goal_runtime().continuation_decision(),
+        });
+    }
+
+    fn pause_goal_after_resume(&self) -> Result<()> {
+        let runtime = self.session.goal_runtime();
+        let Some(goal) = runtime.get().current else {
+            return Ok(());
+        };
+        if goal.lifecycle != crate::GoalLifecycle::Active {
+            return Ok(());
+        }
+        runtime
+            .pause_on_resume()
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.publish(ApplicationEvent::GoalUpdated {
+            operation: "resume_safety_pause",
+            state: runtime.get(),
+        });
+        Ok(())
+    }
+}
+
+fn usage_tokens(usage: &pi_ai::Usage) -> u64 {
+    [usage.input, usage.output, usage.cache_read, usage.cache_write]
+        .into_iter()
+        .map(|tokens| u64::try_from(tokens).unwrap_or(0))
+        .fold(0, u64::saturating_add)
+}
+
+fn goal_tool_schema() -> Schema {
+    let mut operation = Schema {
+        schema_type: Some(Value::String("string".to_owned())),
+        description: Some("Operation: get, pause, or complete".to_owned()),
+        ..Schema::default()
+    };
+    operation.enum_values = ["get", "pause", "complete"]
+        .into_iter()
+        .map(|value| Value::String(value.to_owned()))
+        .collect();
+    let mut schema = Schema::object_ordered(vec![("op".to_owned(), operation, true)]);
+    schema.additional_properties = Some(Value::Bool(false));
+    schema
 }
 impl Drop for ApplicationInner {
     fn drop(&mut self) {
         self.process_manager.shutdown_owner_now(&self.process_owner_id);
+        if let Some(task) = self.orchestration_events.get_mut().take() {
+            task.abort();
+        }
         if let Some(task) = self.process_events.get_mut().take() {
             task.abort();
         }
@@ -1618,9 +2213,19 @@ async fn run_loop_turn(
         return Err("loop cancelled".to_owned());
     }
     request.report(crate::LoopRunState::Started);
-    inner.loop_turn_active.store(true, Ordering::Release);
     let session = inner.session.clone();
-    let run = session.run(&request.prompt, Vec::new());
+    let loop_message = Message::Custom(pi_ai::CustomMessage {
+        custom_type: crate::LOOP_SCHEDULED_MESSAGE_TYPE.to_owned(),
+        content: request.model_prompt.into(),
+        display: false,
+        details: Some(serde_json::json!({
+            "taskId": request.task_id,
+            "prompt": request.prompt,
+            "schedule": request.human_schedule,
+        })),
+        timestamp: pi_ai::now_millis(),
+    });
+    let run = session.run_messages(vec![loop_message]);
     tokio::pin!(run);
     let result = tokio::select! {
         result = &mut run => result.map(|_| ()).map_err(|error| error.to_string()),
@@ -1649,13 +2254,7 @@ fn process_event_owner(event: &ProcessEvent) -> &ProcessOwnerId {
 
 fn session_extension_event(event: &SessionEvent) -> Option<ExtensionEvent> {
     let (name, data) = match event {
-        SessionEvent::CompactionStart { reason } => (
-            "session_before_compact",
-            serde_json::json!({
-                "reason": reason,
-                "willRetry": matches!(reason, CompactionReason::Overflow),
-            }),
-        ),
+        SessionEvent::CompactionStart { .. } => return None,
         SessionEvent::CompactionEnd {
             reason,
             result: Some(result),
@@ -1780,3 +2379,139 @@ fn user_message(text: String, images: Vec<ContentBlock>) -> Message {
     })
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::{Application, public_extension_model};
+    use pi_ai::Model;
+    use std::collections::HashMap;
+
+    #[test]
+    fn public_extension_model_strips_headers_and_keeps_identity() {
+        let secret = "Bearer unit-model-header-secret";
+        let model = Model {
+            id: "sanitized-id".to_owned(),
+            name: "Sanitized Model".to_owned(),
+            api: "openai-completions".to_owned(),
+            provider: "fixture".to_owned(),
+            headers: Some(HashMap::from([
+                ("Authorization".to_owned(), secret.to_owned()),
+                ("X-Probe".to_owned(), "unit-probe-secret".to_owned()),
+            ])),
+            ..Model::default()
+        };
+        let public = public_extension_model(model.clone());
+        assert!(public.headers.is_none());
+        assert_eq!(public.id, model.id);
+        assert_eq!(public.name, model.name);
+        assert_eq!(public.provider, model.provider);
+        assert_eq!(public.api, model.api);
+        let encoded = serde_json::to_string(&public).expect("serialize sanitized model");
+        assert!(!encoded.contains(secret));
+        assert!(!encoded.contains("unit-probe-secret"));
+    }
+
+    fn resource_application(
+        global_settings: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Application) {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(agent.path().join("settings.json"), global_settings)
+            .expect("global settings");
+        let mut options = crate::ResourceManagerOptions::new(cwd.path());
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = crate::ResourceManager::new(options).expect("resources");
+        let session = crate::Session::new(crate::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: "test".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(session.attach_resources(resources)).expect("attach resources");
+        let application = runtime.block_on(Application::new(session));
+        (agent, cwd, application)
+    }
+
+    #[test]
+    fn settings_apply_dispatches_live_reload_and_restart_truthfully() {
+        let (agent, _cwd, application) = resource_application("{}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let mut live = application.settings_draft(crate::SettingsScope::Global).expect("live draft");
+        live.set("compaction.enabled", serde_json::json!(false)).expect("live setting");
+        let live = runtime.block_on(application.apply_settings_draft(live)).expect("live apply");
+        assert!(live.applied_live);
+        assert!(!live.reloaded);
+        assert!(!live.restart_required);
+        assert!(!application.runtime_settings().compaction.enabled);
+
+        let mut reload = application.settings_draft(crate::SettingsScope::Global).expect("reload draft");
+        reload.set("enableSkillCommands", serde_json::json!(false)).expect("reload setting");
+        let reload = runtime.block_on(application.apply_settings_draft(reload)).expect("reload apply");
+        assert!(reload.applied_live);
+        assert!(reload.reloaded);
+        assert!(!reload.restart_required);
+
+        let generation = application.resource_generation().expect("generation");
+        let mut restart = application.settings_draft(crate::SettingsScope::Global).expect("restart draft");
+        restart.set("defaultProvider", serde_json::json!("future-provider")).expect("restart setting");
+        let restart = runtime.block_on(application.apply_settings_draft(restart)).expect("restart apply");
+        assert!(!restart.applied_live);
+        assert!(!restart.reloaded);
+        assert!(restart.restart_required);
+        assert_eq!(application.resource_generation(), Some(generation));
+        let mut mixed = application.settings_draft(crate::SettingsScope::Global).expect("mixed draft");
+        mixed.set("defaultModel", serde_json::json!("future-model")).expect("restart field");
+        mixed.set("compaction.enabled", serde_json::json!(true)).expect("live field");
+        let mixed = runtime.block_on(application.apply_settings_draft(mixed)).expect("mixed apply");
+        assert!(mixed.applied_live);
+        assert!(!mixed.reloaded);
+        assert!(mixed.restart_required);
+        assert!(application.runtime_settings().compaction.enabled);
+
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(agent.path().join("settings.json")).expect("settings file"),
+        )
+        .expect("settings json");
+        assert_eq!(saved["defaultProvider"], "future-provider");
+    }
+
+    #[test]
+    fn failed_settings_reload_never_claims_live_application() {
+        let (_agent, cwd, application) = resource_application("{}");
+        let project_settings = cwd.path().join(".pi/settings.json");
+        std::fs::create_dir_all(project_settings.parent().expect("settings parent"))
+            .expect("project settings dir");
+        std::fs::write(&project_settings, "{ malformed")
+            .expect("broken project settings");
+        let generation = application.resource_generation();
+        let mut draft = application.settings_draft(crate::SettingsScope::Global).expect("draft");
+        draft.set("enableSkillCommands", serde_json::json!(false)).expect("setting");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(application.apply_settings_draft(draft))
+            .expect_err("reload must fail");
+        assert!(!error.to_string().is_empty());
+        assert_eq!(application.resource_generation(), generation);
+    }
+}

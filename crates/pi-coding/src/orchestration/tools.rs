@@ -7,7 +7,7 @@ use pi_ai::Schema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{AgentStatus, OrchestrationRuntime, TaskItem};
+use super::{AgentStatus, DeliveryOutcome, JobSnapshot, JobStatus, OrchestrationRuntime, TaskItem};
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TASK_BATCH: usize = 64;
@@ -27,16 +27,15 @@ impl OrchestrationRuntime {
         let runtime = self.clone();
         let caller_id = caller_id.to_owned();
         let agents = self
-            .catalog()
-            .agents()
-            .iter()
+            .enabled_agents()
+            .into_iter()
             .map(|agent| format!("{} — {}", agent.name, agent.description))
             .collect::<Vec<_>>()
             .join("\n");
         AgentTool::new(
             "task",
             format!(
-                "Delegate one or more independent assignments to real child coding sessions. Batch children run concurrently within the configured bound. Available agents:\n{agents}"
+                "Start one or more independent child coding-session jobs. Returns immediately with stable job and agent ids; use hub jobs/wait/cancel to supervise completion. Available agents:\n{agents}"
             ),
             task_schema(),
             move |context| {
@@ -46,14 +45,12 @@ impl OrchestrationRuntime {
                     let parameters: TaskParameters = serde_json::from_value(context.arguments)
                         .map_err(|error| anyhow!("invalid task arguments: {error}"))?;
                     let items = parameters.into_items(&runtime)?;
-                    let results = runtime
-                        .run_tasks(&caller_id, depth, items, context.abort)
-                        .await?;
+                    let spawns = runtime.spawn_tasks(&caller_id, depth, items)?;
                     Ok(AgentToolResult {
                         content: vec![pi_ai::ContentBlock::text(
-                            OrchestrationRuntime::task_results_text(&results),
+                            OrchestrationRuntime::task_spawns_text(&spawns),
                         )],
-                        details: serde_json::to_value(&results)?,
+                        details: serde_json::to_value(&spawns)?,
                         ..AgentToolResult::default()
                     })
                 }
@@ -116,6 +113,7 @@ impl TaskParameters {
                     bail!("task must not be empty");
                 }
                 let agent = runtime.select_agent(&task, self.agent.as_deref());
+                runtime.ensure_agent_enabled(&agent)?;
                 Ok(vec![TaskItem {
                     index: 0,
                     id: self
@@ -150,6 +148,7 @@ impl TaskParameters {
                             format!("{shared}\n\n{}", item.task)
                         };
                         let agent = runtime.select_agent(&assignment, item.agent.as_deref());
+                        runtime.ensure_agent_enabled(&agent)?;
                         Ok(TaskItem {
                             index,
                             id: item
@@ -209,9 +208,20 @@ async fn execute_hub(
             let receipts = runtime.send(&caller_id, &to, &message, parameters.reply_to);
             let mut lines = receipts
                 .iter()
-                .map(|receipt| match &receipt.error {
-                    Some(error) => format!("- {}: failed — {error}", receipt.to),
-                    None => format!("- {}: queued", receipt.to),
+                .map(|receipt| {
+                    let label = match receipt.outcome {
+                        DeliveryOutcome::Queued => "queued",
+                        DeliveryOutcome::Woken => "woken",
+                        DeliveryOutcome::Revived => "revived",
+                        DeliveryOutcome::Failed => "failed",
+                    };
+                    match (&receipt.error, receipt.outcome) {
+                        (Some(error), DeliveryOutcome::Failed) => {
+                            format!("- {}: failed — {error}", receipt.to)
+                        }
+                        (Some(error), _) => format!("- {}: {} — {error}", receipt.to, label),
+                        (None, _) => format!("- {}: {}", receipt.to, label),
+                    }
                 })
                 .collect::<Vec<_>>();
             if parameters.await_reply
@@ -243,6 +253,20 @@ async fn execute_hub(
                 json!({ "op": "send", "receipts": receipts }),
             ))
         }
+        "wait" if parameters.ids.as_ref().is_some_and(|ids| !ids.is_empty()) => {
+            let ids = parameters.ids.expect("ids were checked");
+            let jobs = runtime
+                .wait_jobs(
+                    &ids,
+                    parameters.timeout_ms.map(Duration::from_millis),
+                    Some(abort),
+                )
+                .await?;
+            Ok(result(
+                jobs_text(&jobs, "No job completed before timeout."),
+                json!({ "op": "wait", "jobs": jobs }),
+            ))
+        }
         "wait" => {
             let timeout = parameters.timeout_ms.map(Duration::from_millis);
             let message = runtime
@@ -267,7 +291,7 @@ async fn execute_hub(
             };
             Ok(result(text, json!({ "op": "inbox", "messages": messages })))
         }
-        "list" | "jobs" => {
+        "list" => {
             let peers = runtime.list(&caller_id);
             let text = if peers.is_empty() {
                 "No other agents.".to_owned()
@@ -276,6 +300,7 @@ async fn execute_hub(
                     .iter()
                     .map(|peer| {
                         let status = match peer.status {
+                            AgentStatus::Queued => "queued",
                             AgentStatus::Running => "running",
                             AgentStatus::Idle => "idle",
                             AgentStatus::Parked => "parked",
@@ -292,14 +317,21 @@ async fn execute_hub(
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            Ok(result(text, json!({ "op": parameters.op, "peers": peers })))
+            Ok(result(text, json!({ "op": "list", "peers": peers })))
+        }
+        "jobs" => {
+            let jobs = runtime.jobs(parameters.ids.as_deref());
+            Ok(result(
+                jobs_text(&jobs, "No child jobs."),
+                json!({ "op": "jobs", "jobs": jobs }),
+            ))
         }
         "cancel" => {
             let ids = parameters
                 .ids
                 .filter(|ids| !ids.is_empty())
                 .ok_or_else(|| anyhow!("ids is required for cancel"))?;
-            let cancelled = runtime.cancel(&ids);
+            let cancelled = runtime.cancel_jobs(&ids);
             Ok(result(
                 if cancelled.is_empty() {
                     "No running child tasks matched.".to_owned()
@@ -311,6 +343,39 @@ async fn execute_hub(
         }
         operation => bail!("unsupported hub operation {operation:?}"),
     }
+}
+
+fn jobs_text(jobs: &[JobSnapshot], empty: &str) -> String {
+    if jobs.is_empty() {
+        return empty.to_owned();
+    }
+    jobs
+        .iter()
+        .map(|job| {
+            let status = match job.status {
+                JobStatus::Queued => "queued",
+                JobStatus::Running => "running",
+                JobStatus::Completed => "completed",
+                JobStatus::Failed => "failed",
+                JobStatus::Cancelled => "cancelled",
+            };
+            let result = job.result.as_ref().map_or_else(String::new, |result| {
+                if result.output.is_empty() {
+                    result
+                        .error
+                        .as_ref()
+                        .map_or_else(String::new, |error| format!(" — {error}"))
+                } else {
+                    format!(" — {}", result.output)
+                }
+            });
+            format!(
+                "- {} [{}; agent {} ({})]{}",
+                job.id, status, job.agent_id, job.agent, result
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn result(text: String, details: Value) -> AgentToolResult {
@@ -386,7 +451,7 @@ fn hub_schema() -> Schema {
             },
             false,
         ),
-        ("from", string_schema("Only wait for this sender", None), false),
+        ("from", string_schema("Only wait for this message sender", None), false),
         (
             "timeoutMs",
             Schema {
@@ -408,7 +473,7 @@ fn hub_schema() -> Schema {
             "ids",
             Schema {
                 schema_type: Some(Value::String("array".to_owned())),
-                items: Some(Box::new(string_schema("Child id", Some(1)))),
+                items: Some(Box::new(string_schema("Job id or child agent id", Some(1)))),
                 min_items: Some(1),
                 ..Schema::default()
             },
@@ -458,5 +523,56 @@ fn string_schema(description: &str, min_length: Option<usize>) -> Schema {
         description: Some(description.to_owned()),
         min_length,
         ..Schema::default()
+    }
+}
+
+
+#[cfg(test)]
+mod advertisement_tests {
+    use super::*;
+    use crate::{AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentRuntimeSettings, OrchestrationConfig};
+    use pi_agent::ThinkingLevel;
+    use std::sync::Arc;
+
+    fn def(name: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: name.to_owned(),
+            description: format!("{name} description"),
+            system_prompt: "p".to_owned(),
+            tools: Some(Vec::new()),
+            autoload_skills: Vec::new(),
+            model: None,
+            thinking_level: Some(ThinkingLevel::Off),
+            source: AgentDefinitionSource::Bundled,
+            path: None,
+            trusted: true,
+        }
+    }
+
+    #[test]
+    fn disabled_agents_excluded_from_task_description() {
+        let dir = tempfile::tempdir().expect("artifacts");
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![def("task"), def("reviewer")]),
+            dir.path(),
+        );
+        config.agent_settings.insert(
+            "reviewer".to_owned(),
+            AgentRuntimeSettings {
+                enabled: Some(false),
+                model: None,
+                tools: None,
+            },
+        );
+        let runtime = OrchestrationRuntime::new(
+            config,
+            Arc::new(|_| Box::pin(async { panic!("unused") })),
+        )
+        .expect("runtime");
+        let tools = runtime.agent_tools("Main", 0);
+        let task = tools.iter().find(|tool| tool.name == "task").expect("task tool");
+        assert!(task.description.contains("task —"));
+        assert!(!task.description.contains("reviewer —"), "{}", task.description);
+        assert_eq!(runtime.select_agent("anything", None), "task");
     }
 }

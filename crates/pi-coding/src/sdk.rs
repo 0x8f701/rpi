@@ -282,6 +282,9 @@ impl AgentSessionBuilder {
             if settings.process_tool_enabled() {
                 self.tool_selection.enable_process = true;
             }
+            if settings.glob_tool_enabled() {
+                self.tool_selection.enable_glob = true;
+            }
         }
 
         let mut model_fallback_message = None;
@@ -345,7 +348,7 @@ impl AgentSessionBuilder {
             }
         }
         if let Some(recorder) = self.recorder {
-            session.record(recorder);
+            session.record(recorder)?;
         }
         let application = match self.extensions {
             Some(prepared) => {

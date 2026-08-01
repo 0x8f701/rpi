@@ -40,6 +40,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+unicode-segmentation.workspace = true
 unicode-width.workspace = true
 uuid.workspace = true
 

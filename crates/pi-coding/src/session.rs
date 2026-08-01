@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     future::Future,
     io::Write,
     path::{Path, PathBuf},
@@ -28,17 +28,32 @@ use uuid::Uuid;
 
 use crate::system_prompt::BuildSystemPromptOptions;
 use crate::{
-    BashProcessContext, CompactionDetails, CompactionResult, CompactionSettings, ProcessManager,
-    ProcessOwnerId, RequestAuth, ResourceManager, SessionRecorder, SUMMARIZATION_PROMPT,
-    SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
-    TodoApplyResult, TodoOp, TodoPhase, TodoRuntime, TodoState, TodoStorage, apply_checkpoint,
-    build_system_prompt, compute_file_lists, create_todo_tool,
+    BashProcessContext, CompactionDetails, CompactionResult, CompactionSettings, GoalRuntime,
+    ProcessManager, ProcessOwnerId, RequestAuth, ResourceManager, SessionRecorder,
+    SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
+    UPDATE_SUMMARIZATION_PROMPT, TodoApplyResult, TodoOp, TodoPhase, TodoRuntime, TodoState,
+    TodoStorage, apply_checkpoint, build_system_prompt, compute_file_lists, create_todo_tool,
     estimate_context_tokens_usage_aware, find_cut_point, format_file_operations,
-    is_context_overflow, is_retryable_assistant_error, load_context_files, load_project_context_files,
-    load_skills, load_skills_trusted, messages_as_llm, process_tool, serialize_conversation,
-    should_compact, tool_snippet,
+    is_context_overflow, is_retryable_assistant_error, load_context_files,
+    load_project_context_files, load_skills, load_skills_trusted, messages_as_llm, process_tool,
+    serialize_conversation, should_compact, tool_snippet,
 };
 pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
+
+/// Result of applying a thinking-level change after model capability clamping.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingLevelChange {
+    /// Level the caller requested.
+    pub requested: ThinkingLevel,
+    /// Level actually stored after clamping to the active model.
+    pub effective: ThinkingLevel,
+    /// True when `effective` differs from `requested`.
+    pub clamped: bool,
+    /// Actionable status line for product surfaces.
+    pub message: String,
+}
+
 
 pub type SessionAuthResolver = Arc<
     dyn Fn(Model) -> pi_agent::BoxFuture<Result<RequestAuth>> + Send + Sync,
@@ -90,6 +105,7 @@ pub struct SessionOptions {
     pub auth_resolver: Option<SessionAuthResolver>,
 }
 
+
 struct SessionState {
     model: Model,
     thinking_level: ThinkingLevel,
@@ -116,6 +132,7 @@ struct CompactionRuntime {
 struct SessionRuntime {
     state: RwLock<SessionState>,
     recorder: Mutex<Option<Arc<SessionRecorder>>>,
+    goal: RwLock<GoalRuntime>,
     compaction: RwLock<Option<CompactionSettings>>,
     compaction_runtime: Mutex<CompactionRuntime>,
     compaction_active: AtomicBool,
@@ -138,6 +155,9 @@ struct SessionRuntime {
     branch_summary: RwLock<crate::EffectiveBranchSummarySettings>,
     expose_session_environment: AtomicBool,
     last_selection: RwLock<Option<crate::SelectionPlan>>,
+    /// Detached bash success-path spill files owned by this session.
+    /// Cleaned via [`Session::cleanup_bash_spills`] / Drop — never process-wide drain.
+    bash_spill_paths: Mutex<HashSet<String>>,
 }
 
 struct CompactionActivityGuard {
@@ -159,12 +179,12 @@ impl Drop for CompactionActivityGuard {
 
 struct SessionInner {
     cwd: PathBuf,
+    workspace: crate::WorkspaceRoots,
     system_prompt: String,
     base_tools: Vec<pi_agent::AgentTool>,
     tools: RwLock<Vec<pi_agent::AgentTool>>,
     all_tools: RwLock<Vec<pi_agent::AgentTool>>,
     tool_selection: ToolSelection,
-    todo_explicit: bool,
     shared: Arc<SessionRuntime>,
     agent: Agent,
     _history_subscription: Subscription,
@@ -439,6 +459,9 @@ pub struct ToolSelection {
     pub disable_all: bool,
     pub disable_builtins: bool,
     pub enable_process: bool,
+    /// When true, the main catalog includes the native sandboxed `glob` tool
+    /// without changing the default [read,bash,edit,write] baseline.
+    pub enable_glob: bool,
 }
 
 #[derive(Clone)]
@@ -503,6 +526,7 @@ impl Session {
             true,
             resource_discovery,
             None,
+            None,
         )
     }
 
@@ -519,6 +543,7 @@ impl Session {
             selection,
             true,
             resource_discovery,
+            None,
             uri_resolver,
         )
     }
@@ -560,6 +585,7 @@ impl Session {
             false,
             resource_discovery,
             None,
+            None,
         )
     }
 
@@ -576,6 +602,45 @@ impl Session {
             selection,
             false,
             resource_discovery,
+            None,
+            uri_resolver,
+        )
+    }
+
+    pub fn new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(
+        options: SessionOptions,
+        additional_tools: Vec<AgentTool>,
+        selection: ToolSelection,
+        resource_discovery: ResourceDiscovery,
+        workspace: crate::WorkspaceRoots,
+        uri_resolver: Option<crate::InternalUriResolverFn>,
+    ) -> Result<Self> {
+        Self::new_configured(
+            options,
+            additional_tools,
+            selection,
+            true,
+            resource_discovery,
+            Some(workspace),
+            uri_resolver,
+        )
+    }
+
+    pub fn new_with_additional_tools_filtered_discovery_workspace_and_uri(
+        options: SessionOptions,
+        additional_tools: Vec<AgentTool>,
+        selection: ToolSelection,
+        resource_discovery: ResourceDiscovery,
+        workspace: crate::WorkspaceRoots,
+        uri_resolver: Option<crate::InternalUriResolverFn>,
+    ) -> Result<Self> {
+        Self::new_configured(
+            options,
+            additional_tools,
+            selection,
+            false,
+            resource_discovery,
+            Some(workspace),
             uri_resolver,
         )
     }
@@ -586,14 +651,19 @@ impl Session {
         selection: ToolSelection,
         todo_enabled: bool,
         resource_discovery: ResourceDiscovery,
+        workspace: Option<crate::WorkspaceRoots>,
         uri_resolver: Option<crate::InternalUriResolverFn>,
     ) -> Result<Self> {
-        let cwd = if options.cwd.as_os_str().is_empty() {
+        let configured_cwd = if options.cwd.as_os_str().is_empty() {
             std::env::current_dir()?
         } else {
             options.cwd
         };
-        let cwd = cwd.canonicalize().unwrap_or(cwd);
+        let workspace = match workspace {
+            Some(workspace) => workspace,
+            None => crate::WorkspaceRoots::new(&configured_cwd, Vec::<PathBuf>::new())?,
+        };
+        let cwd = workspace.cwd().to_path_buf();
         let cwd_text = cwd.to_string_lossy().into_owned();
         let custom_tools = options.tools;
         let custom_prompt = options.system_prompt;
@@ -631,6 +701,7 @@ impl Session {
             }),
             pending_next_turn: Mutex::new(Vec::new()),
             recorder: Mutex::new(None),
+            goal: RwLock::new(GoalRuntime::memory()),
             compaction: RwLock::new(compaction),
             compaction_runtime: Mutex::new(CompactionRuntime::default()),
             compaction_active: AtomicBool::new(false),
@@ -655,6 +726,7 @@ impl Session {
             }),
             expose_session_environment: AtomicBool::new(true),
             last_selection: RwLock::new(None),
+            bash_spill_paths: Mutex::new(HashSet::new()),
         });
         let storage_shared = shared.clone();
         let persist_shared = shared.clone();
@@ -717,8 +789,8 @@ impl Session {
             Arc::new(move || skills_runtime.read().clone());
 
         let base_tools = custom_tools.unwrap_or_else(|| {
-            crate::create_coding_tools_with_context_and_resolver(
-                &cwd_text,
+            crate::create_coding_tools_for_workspace_with_context_and_resolver(
+                workspace.clone(),
                 Some(session_env),
                 Some(skill_provider),
                 Some(BashProcessContext {
@@ -743,6 +815,14 @@ impl Session {
                 process_manager.clone(),
                 process_owner_id.clone(),
             ));
+        }
+        let glob_requested = selection.enable_glob
+            || selection
+                .allow
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool == "glob"));
+        if glob_requested && !available_tools.iter().any(|tool| tool.name == "glob") {
+            available_tools.push(crate::create_glob_tool_for_workspace(workspace.clone()));
         }
         let tools = select_tools(available_tools.clone(), &selection)?;
         let selected_tools = tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
@@ -770,6 +850,11 @@ impl Session {
             tool_snippets,
             prompt_guidelines,
             cwd: cwd_text.clone(),
+            additional_workspace_roots: workspace
+                .additional_roots()
+                .iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect(),
             context_files,
             skills: initial_skills,
             readme_path,
@@ -812,9 +897,13 @@ impl Session {
             get_api_key: Some(Arc::new(move |_| {
                 Some(key_runtime.state.read().api_key.clone())
             })),
+            convert_to_llm: Some(Arc::new(|messages| Ok(pi_ai::messages_to_llm(&messages)))),
             transform_context: None,
             before_tool_call,
-            after_tool_call,
+            after_tool_call: Some(compose_bash_spill_after_tool_call(
+                shared.clone(),
+                after_tool_call,
+            )),
             stream_fn,
             ..AgentOptions::default()
         });
@@ -831,13 +920,13 @@ impl Session {
         Ok(Self {
             inner: Arc::new(SessionInner {
                 cwd,
+                workspace,
                 system_prompt,
                 abort_notify: Notify::new(),
-                base_tools: select_tools(base_tools, &selection)?,
+                base_tools,
                 all_tools: RwLock::new(available_tools),
                 tools: RwLock::new(tools),
                 tool_selection: selection,
-                todo_explicit: todo_enabled,
                 shared,
                 agent,
                 _history_subscription: history_subscription,
@@ -859,6 +948,11 @@ impl Session {
     #[must_use]
     pub fn cwd(&self) -> &Path {
         &self.inner.cwd
+    }
+
+    #[must_use]
+    pub fn workspace_roots(&self) -> &crate::WorkspaceRoots {
+        &self.inner.workspace
     }
 
     pub async fn system_prompt(&self) -> String {
@@ -1219,7 +1313,6 @@ impl Session {
     ) -> Result<SessionResourceUpdate> {
         let runtime_settings = snapshot.settings.runtime_settings()?;
         if runtime_settings.process_tool_enabled
-            && !self.inner.tool_selection.enable_process
             && !additional_tools.iter().any(|tool| tool.name == "process")
         {
             additional_tools.push(process_tool(
@@ -1229,10 +1322,16 @@ impl Session {
             ));
         }
         if runtime_settings.todo_tool_enabled
-            && !self.inner.todo_explicit
             && !additional_tools.iter().any(|tool| tool.name == "todo")
         {
             additional_tools.push(create_todo_tool(self.inner.todo.clone()));
+        }
+        if runtime_settings.glob_tool_enabled
+            && !additional_tools.iter().any(|tool| tool.name == "glob")
+        {
+            additional_tools.push(crate::create_glob_tool_for_workspace(
+                self.inner.workspace.clone(),
+            ));
         }
         let all_tools = merge_tools(&self.inner.base_tools, additional_tools)?;
         let tools = select_tools(all_tools.clone(), &self.inner.tool_selection)?;
@@ -1286,16 +1385,30 @@ impl Session {
             prompt_guidelines,
             append_system_prompt: snapshot.append_system_prompt.join("\n\n"),
             cwd: self.inner.cwd.to_string_lossy().into_owned(),
+            additional_workspace_roots: self
+                .inner
+                .workspace
+                .additional_roots()
+                .iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect(),
             context_files: snapshot.context_files.clone(),
             skills: snapshot.skills.clone(),
             ..BuildSystemPromptOptions::default()
         });
+        let agents = crate::enabled_agent_definitions(
+            &snapshot.agents,
+            &snapshot.settings.agents,
+        )
+        .into_iter()
+        .cloned()
+        .collect();
         Ok(SessionResourceUpdate {
             tools,
             all_tools,
             system_prompt,
             skills: snapshot.skills.clone(),
-            agents: snapshot.agents.clone(),
+            agents,
             selector_settings: snapshot.settings.selector.clone().unwrap_or_default(),
             runtime_settings,
         })
@@ -1325,6 +1438,12 @@ impl Session {
             .shared
             .expose_session_environment
             .store(settings.expose_session_environment, Ordering::Release);
+    }
+
+    /// Applies only runtime-projected settings without rebuilding resources,
+    /// extensions, tools, or prompt state.
+    pub(crate) async fn apply_runtime_settings(&self, settings: crate::RuntimeSettingsSnapshot) {
+        self.commit_runtime_settings(settings).await;
     }
 
     pub(crate) async fn commit_resource_update(&self, update: SessionResourceUpdate) {
@@ -1376,6 +1495,7 @@ impl Session {
                 disable_all: false,
                 disable_builtins: self.inner.tool_selection.disable_builtins,
                 enable_process: self.inner.tool_selection.enable_process,
+                enable_glob: self.inner.tool_selection.enable_glob,
             },
         )?;
         let snapshot = self
@@ -1401,23 +1521,29 @@ impl Session {
     }
 
 
-    pub fn set_model(&self, model: Model, api_key: String) {
-        {
+    pub fn set_model(&self, model: Model, api_key: String) -> ThinkingLevelChange {
+        let change = {
             let mut state = self.inner.shared.state.write();
-            state.thinking_level = clamp_thinking_level(&model, state.thinking_level);
+            let requested = state.thinking_level;
+            let effective = clamp_thinking_level(&model, requested);
+            state.thinking_level = effective;
             state.model = model.clone();
             state.api_key = api_key;
-        }
+            thinking_level_change(&model, requested, effective)
+        };
         if let Some(recorder) = self.inner.shared.recorder.lock().as_ref() {
             let _ = recorder.record_model_change(&model.provider, &model.id);
+            if change.clamped {
+                let _ = recorder.record_thinking_level(thinking_level_name(change.effective));
+            }
         }
+        change
     }
 
-    pub async fn set_model_with_resolved_auth(&self, model: Model) -> Result<()> {
+    pub async fn set_model_with_resolved_auth(&self, model: Model) -> Result<ThinkingLevelChange> {
         if let Some(resolver) = &self.inner.shared.auth_resolver {
             let auth = resolver(model.clone()).await?;
-            self.set_model(model, auth.api_key);
-            return Ok(());
+            return Ok(self.set_model(model, auth.api_key));
         }
         let current = self.inner.shared.state.read();
         if current.model.provider != model.provider {
@@ -1427,19 +1553,20 @@ impl Session {
         }
         let api_key = current.api_key.clone();
         drop(current);
-        self.set_model(model, api_key);
-        Ok(())
+        Ok(self.set_model(model, api_key))
     }
 
-    pub fn set_thinking_level(&self, level: ThinkingLevel) {
-        let serialized = {
+    pub fn set_thinking_level(&self, level: ThinkingLevel) -> ThinkingLevelChange {
+        let change = {
             let mut state = self.inner.shared.state.write();
-            state.thinking_level = clamp_thinking_level(&state.model, level);
-            thinking_level_name(state.thinking_level)
+            let effective = clamp_thinking_level(&state.model, level);
+            state.thinking_level = effective;
+            thinking_level_change(&state.model, level, effective)
         };
         if let Some(recorder) = self.inner.shared.recorder.lock().as_ref() {
-            let _ = recorder.record_thinking_level(serialized);
+            let _ = recorder.record_thinking_level(thinking_level_name(change.effective));
         }
+        change
     }
 
     pub async fn load_history(&self, messages: Vec<Message>) -> Result<()> {
@@ -1465,6 +1592,8 @@ impl Session {
         *self.inner.shared.compaction_runtime.lock() = CompactionRuntime::default();
         self.inner.shared.compaction_active.store(false, Ordering::Release);
         *self.inner.shared.session_name.write() = None;
+        // Prior conversation is discarded; release any detached bash spill files.
+        self.cleanup_bash_spills();
         guard.release();
         Ok(())
     }
@@ -1676,7 +1805,9 @@ impl Session {
         })
     }
 
-    pub fn record(&self, recorder: SessionRecorder) {
+    pub fn record(&self, recorder: SessionRecorder) -> Result<()> {
+        let goal = GoalRuntime::from_session_recorder(recorder.clone())
+            .map_err(|error| anyhow!(error.to_string()))?;
         let phases = recorder
             .latest_todo_state()
             .ok()
@@ -1685,6 +1816,8 @@ impl Session {
         let _ = self.inner.todo.restore_open(phases);
         *self.inner.shared.session_name.write() = recorder.session_name();
         *self.inner.shared.recorder.lock() = Some(Arc::new(recorder));
+        *self.inner.shared.goal.write() = goal;
+        Ok(())
     }
 
     pub fn start_new_recording(&self) -> Result<()> {
@@ -1695,8 +1828,7 @@ impl Session {
             Some(thinking_level_name(state.thinking_level)),
         )?;
         drop(state);
-        self.record(recorder);
-        Ok(())
+        self.record(recorder)
     }
 
     pub fn start_new_recording_with_parent(&self, parent_session: Option<&Path>) -> Result<()> {
@@ -1708,8 +1840,7 @@ impl Session {
             parent_session,
         )?;
         drop(state);
-        self.record(recorder);
-        Ok(())
+        self.record(recorder)
     }
 
     pub async fn switch_session(&self, path: &Path) -> Result<()> {
@@ -1721,6 +1852,8 @@ impl Session {
                 self.inner.cwd.display()
             ));
         }
+        // Drop spills from the outgoing conversation before loading the new one.
+        self.cleanup_bash_spills();
         let context = tree.build_context(None);
         self.load_history(context.messages).await?;
         if let Some(provider) = context.provider.as_deref()
@@ -1731,7 +1864,7 @@ impl Session {
             self.set_model(model, api_key);
         }
         self.set_thinking_level(parse_recorded_thinking_level(&context.thinking_level));
-        self.record(crate::resume_session(path)?);
+        self.record(crate::resume_session(path)?)?;
         Ok(())
     }
 
@@ -1796,6 +1929,8 @@ impl Session {
         self.inner.shared.state.write().messages = context.messages;
         *self.inner.shared.compaction_runtime.lock() = CompactionRuntime::default();
         self.inner.shared.compaction_active.store(false, Ordering::Release);
+        *self.inner.shared.goal.write() = GoalRuntime::from_session_recorder((*recorder).clone())
+            .map_err(|error| anyhow!(error.to_string()))?;
         Ok(NavigateTreeResult { editor_text, active_leaf_id, summary_entry_id, changed: true, cancelled: false })
     }
 
@@ -1805,7 +1940,7 @@ impl Session {
         Ok(())
     }
 
-    pub async fn fork_session(&self, entry_id: &str) -> Result<String> {
+    pub async fn fork_session(&self, entry_id: &str, restore_conversation: bool) -> Result<String> {
         let recorder = self.current_recorder()?;
         let tree = recorder.tree()?;
         let selected = tree
@@ -1830,9 +1965,13 @@ impl Session {
             )?
         };
         replacement.persist_now()?;
-        let context = replacement.tree()?.build_context(None);
-        self.load_history(context.messages).await?;
-        self.record(replacement);
+        if restore_conversation {
+            let context = replacement.tree()?.build_context(None);
+            self.load_history(context.messages).await?;
+        } else {
+            self.load_history(Vec::new()).await?;
+        }
+        self.record(replacement)?;
         Ok(text)
     }
 
@@ -1844,8 +1983,7 @@ impl Session {
         let replacement = crate::create_branched_session(recorder.path(), &leaf_id)?;
         let context = replacement.tree()?.build_context(None);
         self.load_history(context.messages).await?;
-        self.record(replacement);
-        Ok(())
+        self.record(replacement)
     }
 
     pub fn fork_messages(&self) -> Result<Vec<crate::ForkMessage>> {
@@ -1903,6 +2041,19 @@ impl Session {
             .ok_or_else(|| anyhow!("session recording is unavailable"))
     }
 
+
+    #[must_use]
+    pub fn goal_runtime(&self) -> GoalRuntime {
+        self.inner.shared.goal.read().clone()
+    }
+
+    pub fn rebuild_goal_runtime(&self) -> Result<()> {
+        let recorder = self.current_recorder()?;
+        let runtime = GoalRuntime::from_session_recorder((*recorder).clone())
+            .map_err(|error| anyhow!(error.to_string()))?;
+        *self.inner.shared.goal.write() = runtime;
+        Ok(())
+    }
 
     #[must_use]
     pub fn recorder_info(&self) -> Option<(String, PathBuf)> {
@@ -1991,7 +2142,11 @@ impl Session {
     }
 
     pub fn set_after_tool_call(&self, hook: Option<AfterToolCallFn>) {
-        self.inner.agent.set_after_tool_call(hook);
+        // Compose with spill tracking so agent `bash` tool success paths are
+        // registered even when Application/extensions replace the after-hook.
+        self.inner.agent.set_after_tool_call(Some(
+            compose_bash_spill_after_tool_call(self.inner.shared.clone(), hook),
+        ));
     }
 
     pub async fn execute_bash(&self, command: &str, exclude_from_context: bool) -> Result<crate::BashResult> {
@@ -2045,6 +2200,9 @@ impl Session {
         exclude_from_context: bool,
         result: &crate::BashResult,
     ) -> Result<()> {
+        if let Some(path) = result.full_output_path.as_deref() {
+            self.track_bash_spill_path(path);
+        }
         let bash_message = BashExecutionMessage {
             command: command.to_owned(),
             output: result.output.clone(),
@@ -2059,6 +2217,19 @@ impl Session {
         self.append_bash_message(message).await?;
         self.publish_session_event(SessionEvent::BashExecutionEnd { message: bash_message });
         Ok(())
+    }
+
+    /// Records a detached bash spill path so [`Self::cleanup_bash_spills`] can
+    /// remove it later. Empty paths are ignored. Paths remain readable until cleanup.
+    pub fn track_bash_spill_path(&self, path: &str) {
+        track_bash_spill_path(&self.inner.shared, path);
+    }
+
+    /// Removes every bash spill file tracked by this session. Idempotent.
+    /// Safe to call repeatedly; does not touch untracked/unrelated files and
+    /// never drains the process-wide spill registry.
+    pub fn cleanup_bash_spills(&self) {
+        cleanup_bash_spills(&self.inner.shared);
     }
 
     pub fn abort_bash(&self) {
@@ -2609,6 +2780,58 @@ impl Session {
 
 }
 
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        // Last Session clone dropped: release any remaining detached spills.
+        cleanup_bash_spills(&self.shared);
+    }
+}
+
+fn track_bash_spill_path(shared: &SessionRuntime, path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    shared.bash_spill_paths.lock().insert(path.to_owned());
+}
+
+fn track_bash_spill_from_details(shared: &SessionRuntime, details: &serde_json::Value) {
+    if let Some(path) = details
+        .get("fullOutputPath")
+        .and_then(serde_json::Value::as_str)
+    {
+        track_bash_spill_path(shared, path);
+    }
+}
+
+fn cleanup_bash_spills(shared: &SessionRuntime) {
+    let paths: Vec<String> = {
+        let mut set = shared.bash_spill_paths.lock();
+        set.drain().collect()
+    };
+    for path in paths {
+        crate::cleanup_full_output_path(&path);
+    }
+}
+
+fn compose_bash_spill_after_tool_call(
+    shared: Arc<SessionRuntime>,
+    hook: Option<AfterToolCallFn>,
+) -> AfterToolCallFn {
+    Arc::new(move |context| {
+        let hook = hook.clone();
+        let shared = shared.clone();
+        Box::pin(async move {
+            if context.tool_call.name == "bash" && !context.is_error {
+                track_bash_spill_from_details(&shared, &context.result.details);
+            }
+            match hook {
+                Some(hook) => hook(context).await,
+                None => Ok(AfterToolCallResult::default()),
+            }
+        })
+    })
+}
+
 fn todo_after_tool_call(callback: Option<AfterToolCallFn>) -> AfterToolCallFn {
     Arc::new(move |context| {
         let callback = callback.clone();
@@ -3057,5 +3280,190 @@ fn thinking_level_name(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",
         ThinkingLevel::Xhigh => "xhigh",
+    }
+}
+
+fn thinking_level_change(
+    model: &Model,
+    requested: ThinkingLevel,
+    effective: ThinkingLevel,
+) -> ThinkingLevelChange {
+    let clamped = requested != effective;
+    let message = if !clamped {
+        format!("Thinking level: {}", thinking_level_name(effective))
+    } else if !model.reasoning {
+        format!(
+            "Thinking level {} unsupported by {}/{} (reasoning disabled); using {}",
+            thinking_level_name(requested),
+            model.provider,
+            model.id,
+            thinking_level_name(effective)
+        )
+    } else {
+        format!(
+            "Thinking level {} unsupported by {}/{}; using {}",
+            thinking_level_name(requested),
+            model.provider,
+            model.id,
+            thinking_level_name(effective)
+        )
+    };
+    ThinkingLevelChange {
+        requested,
+        effective,
+        clamped,
+        message,
+    }
+}
+
+#[cfg(test)]
+mod thinking_level_change_tests {
+    use super::*;
+
+    fn model(reasoning: bool) -> Model {
+        Model {
+            id: if reasoning {
+                "reasoner".to_owned()
+            } else {
+                "qwen".to_owned()
+            },
+            provider: "test".to_owned(),
+            reasoning,
+            ..Model::default()
+        }
+    }
+
+    fn session_with(model: Model) -> Session {
+        Session::new(SessionOptions {
+            model,
+            cwd: std::env::temp_dir(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session")
+    }
+
+    #[test]
+    fn unsupported_reasoning_model_clamps_high_to_off_with_actionable_status() {
+        let session = session_with(model(false));
+        let change = session.set_thinking_level(ThinkingLevel::High);
+        assert!(change.clamped);
+        assert_eq!(change.requested, ThinkingLevel::High);
+        assert_eq!(change.effective, ThinkingLevel::Off);
+        assert_eq!(session.thinking_level(), ThinkingLevel::Off);
+        assert!(
+            change.message.contains("unsupported") && change.message.contains("off"),
+            "{}",
+            change.message
+        );
+        // Must not report the requested level as success.
+        assert!(!change.message.eq_ignore_ascii_case("Thinking level: high"));
+    }
+
+    #[test]
+    fn supported_reasoning_model_keeps_high() {
+        let session = session_with(model(true));
+        let change = session.set_thinking_level(ThinkingLevel::High);
+        assert!(!change.clamped);
+        assert_eq!(change.effective, ThinkingLevel::High);
+        assert_eq!(session.thinking_level(), ThinkingLevel::High);
+        assert_eq!(change.message, "Thinking level: high");
+    }
+
+    #[test]
+    fn model_switch_reclamps_existing_thinking_level() {
+        let session = session_with(model(true));
+        let _ = session.set_thinking_level(ThinkingLevel::High);
+        let change = session.set_model(model(false), String::new());
+        assert!(change.clamped);
+        assert_eq!(change.effective, ThinkingLevel::Off);
+        assert_eq!(session.thinking_level(), ThinkingLevel::Off);
+        assert!(change.message.contains("unsupported"), "{}", change.message);
+    }
+}
+
+#[cfg(test)]
+mod bash_spill_lifecycle_tests {
+    use super::*;
+    use std::fs;
+
+    fn test_session(cwd: &Path) -> Session {
+        Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session")
+    }
+
+    #[test]
+    fn cleanup_bash_spills_removes_tracked_only_and_is_idempotent() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let dir = crate::bash_spill_dir();
+        fs::create_dir_all(&dir).expect("spill dir");
+        let spill = dir.join(format!("session-tracked-{}.log", Uuid::now_v7()));
+        let unrelated = dir.join(format!("session-unrelated-{}.log", Uuid::now_v7()));
+        fs::write(&spill, b"tracked").expect("write spill");
+        fs::write(&unrelated, b"keep").expect("write unrelated");
+        let spill_s = spill.to_string_lossy().into_owned();
+
+        session.track_bash_spill_path(&spill_s);
+        assert!(spill.exists(), "spill must remain available while session is live");
+        assert!(unrelated.exists());
+
+        session.cleanup_bash_spills();
+        assert!(!spill.exists(), "tracked spill must be removed on cleanup");
+        assert!(unrelated.exists(), "unrelated file must not be touched");
+
+        // Double cleanup must succeed without error or collateral damage.
+        session.cleanup_bash_spills();
+        assert!(!spill.exists());
+        assert!(unrelated.exists());
+
+        let _ = fs::remove_file(&unrelated);
+    }
+
+    #[tokio::test]
+    async fn execute_bash_success_spill_exists_then_cleanup_removes() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        // >50 KiB display cap → success path detaches a full-output spill file.
+        let result = session
+            .execute_bash("yes x | head -c 60000", false)
+            .await
+            .expect("bash");
+        let path = result
+            .full_output_path
+            .expect("successful truncated bash must publish full_output_path");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "spill must remain readable during the active session: {path}"
+        );
+
+        session.cleanup_bash_spills();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "session cleanup must remove the detached success spill"
+        );
+        // Idempotent second cleanup.
+        session.cleanup_bash_spills();
     }
 }

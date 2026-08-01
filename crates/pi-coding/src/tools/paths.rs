@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::WorkspaceRoots;
+
 /// The narrow no-break space (U+202F) pi substitutes before AM/PM in macOS
 /// screenshot filenames.
 const NARROW_NO_BREAK_SPACE: char = '\u{202F}';
@@ -118,50 +120,70 @@ pub(crate) fn resolve_to_cwd(path: &str, cwd: &str) -> String {
     clean_path(&format!("{base}/{normalized}"))
 }
 
-/// Resolves a tool path and rejects traversal outside the session working directory.
-/// Existing paths are canonicalized so symlinks cannot escape the boundary; for
-/// new files, the nearest existing ancestor is checked instead.
-pub(crate) fn resolve_scoped_path(path: &str, cwd: &str) -> anyhow::Result<String> {
-    let resolved = PathBuf::from(resolve_to_cwd(path, cwd));
-    let lexical_root = PathBuf::from(clean_path(cwd));
-    if !resolved.starts_with(&lexical_root) {
-        anyhow::bail!("Path escapes working directory: {path}");
+/// Resolves a tool path and rejects traversal outside the configured workspace
+/// roots. Relative paths are resolved against the primary working directory.
+/// Existing paths are canonicalized so symlinks cannot escape the boundary;
+/// for new files, the nearest filesystem entry (including a broken symlink) is
+/// canonicalized and checked instead.
+fn escape_error(workspace: &WorkspaceRoots, path: &str) -> anyhow::Error {
+    if workspace.additional_roots().is_empty() {
+        anyhow::anyhow!("Path escapes working directory: {path}")
+    } else {
+        anyhow::anyhow!("Path escapes workspace roots: {path}")
+    }
+}
+
+pub(crate) fn resolve_scoped_path(
+    path: &str,
+    workspace: &WorkspaceRoots,
+) -> anyhow::Result<String> {
+    let cwd = workspace.cwd().to_string_lossy();
+    let resolved = PathBuf::from(resolve_to_cwd(path, &cwd));
+    if !workspace.roots().iter().any(|root| resolved.starts_with(root)) {
+        return Err(escape_error(workspace, path));
     }
 
-    let canonical_root = std::fs::canonicalize(&lexical_root).unwrap_or(lexical_root);
     let mut existing = resolved.as_path();
-    while !existing.exists() {
+    while std::fs::symlink_metadata(existing).is_err() {
         existing = existing
             .parent()
-            .ok_or_else(|| anyhow::anyhow!("Path escapes working directory: {path}"))?;
+            .ok_or_else(|| escape_error(workspace, path))?;
     }
     let canonical_existing = std::fs::canonicalize(existing)
         .map_err(|error| anyhow::anyhow!("Could not resolve path {path}: {error}"))?;
-    if !canonical_existing.starts_with(&canonical_root) {
-        anyhow::bail!("Path escapes working directory: {path}");
+    if !workspace
+        .roots()
+        .iter()
+        .any(|root| canonical_existing.starts_with(root))
+    {
+        return Err(escape_error(workspace, path));
     }
     Ok(resolved.to_string_lossy().into_owned())
 }
-pub(crate) fn resolve_read_path(path: &str, cwd: &str) -> anyhow::Result<String> {
-    let resolved = resolve_scoped_path(path, cwd)?;
+
+pub(crate) fn resolve_read_path(
+    path: &str,
+    workspace: &WorkspaceRoots,
+) -> anyhow::Result<String> {
+    let resolved = resolve_scoped_path(path, workspace)?;
     if path_exists(&resolved) {
         return Ok(resolved);
     }
     let amp = mac_ampm_variant(&resolved);
     if amp != resolved && path_exists(&amp) {
-        return resolve_scoped_path(&amp, cwd);
+        return resolve_scoped_path(&amp, workspace);
     }
     let nfd: String = resolved.nfd().collect();
     if nfd != resolved && path_exists(&nfd) {
-        return resolve_scoped_path(&nfd, cwd);
+        return resolve_scoped_path(&nfd, workspace);
     }
     let curly = resolved.replace('\'', "\u{2019}");
     if curly != resolved && path_exists(&curly) {
-        return resolve_scoped_path(&curly, cwd);
+        return resolve_scoped_path(&curly, workspace);
     }
     let nfd_curly: String = nfd.replace('\'', "\u{2019}");
     if nfd_curly != resolved && path_exists(&nfd_curly) {
-        return resolve_scoped_path(&nfd_curly, cwd);
+        return resolve_scoped_path(&nfd_curly, workspace);
     }
     Ok(resolved)
 }
@@ -240,10 +262,46 @@ mod tests {
     fn scoped_paths_reject_traversal() {
         let root = std::env::temp_dir().join(format!("pi-scoped-path-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create scoped root");
-        let root = root.to_string_lossy();
-        assert!(resolve_scoped_path("inside.txt", &root).is_ok());
-        assert!(resolve_scoped_path("../outside.txt", &root).is_err());
-        assert!(resolve_scoped_path("/system/hosts", &root).is_err());
+        let workspace = WorkspaceRoots::new(&root, Vec::<PathBuf>::new()).expect("workspace");
+        assert!(resolve_scoped_path("inside.txt", &workspace).is_ok());
+        assert!(resolve_scoped_path("../outside.txt", &workspace).is_err());
+        assert!(resolve_scoped_path("/system/hosts", &workspace).is_err());
+    }
+
+    #[test]
+    fn additional_root_accepts_absolute_paths_and_rejects_external_paths() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let additional = tempfile::tempdir().expect("additional");
+        let external = tempfile::tempdir().expect("external");
+        let workspace = WorkspaceRoots::new(cwd.path(), [additional.path()]).expect("workspace");
+        let accepted = additional.path().join("new.txt");
+        assert_eq!(
+            resolve_scoped_path(&accepted.to_string_lossy(), &workspace).expect("additional path"),
+            accepted.to_string_lossy()
+        );
+        assert!(
+            resolve_scoped_path(&external.path().join("no.txt").to_string_lossy(), &workspace)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_paths_reject_symlink_escape_for_existing_and_new_paths() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let external = tempfile::tempdir().expect("external");
+        std::fs::write(external.path().join("secret.txt"), "secret").expect("secret");
+        std::os::unix::fs::symlink(external.path(), cwd.path().join("escape"))
+            .expect("directory symlink");
+        std::os::unix::fs::symlink(
+            external.path().join("missing.txt"),
+            cwd.path().join("broken"),
+        )
+        .expect("broken symlink");
+        let workspace = WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new()).expect("workspace");
+        assert!(resolve_scoped_path("escape/secret.txt", &workspace).is_err());
+        assert!(resolve_scoped_path("escape/new.txt", &workspace).is_err());
+        assert!(resolve_scoped_path("broken", &workspace).is_err());
     }
 
     #[test]

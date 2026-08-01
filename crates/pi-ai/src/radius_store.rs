@@ -30,6 +30,18 @@ struct StoreDocument {
     providers: BTreeMap<String, RadiusCatalogSnapshot>,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum StoreFormatError {
+    #[error("unsupported Radius catalog store version {found} in {path} (expected {expected})")]
+    UnsupportedVersion {
+        found: u32,
+        expected: u32,
+        path: String,
+    },
+    #[error("invalid Radius catalog store document {path}")]
+    InvalidDocument { path: String },
+}
+
 impl Default for StoreDocument {
     fn default() -> Self {
         Self {
@@ -53,6 +65,31 @@ impl RadiusCatalogStore {
     pub fn read(&self, provider_id: &str) -> Result<Option<RadiusCatalogSnapshot>> {
         validate_provider_id(provider_id)?;
         let document = read_document(&self.path)?;
+        Ok(document.providers.get(provider_id).cloned())
+    }
+
+    pub fn read_quarantining_invalid(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<RadiusCatalogSnapshot>> {
+        validate_provider_id(provider_id)?;
+        match self.read(provider_id) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) if is_invalid_document_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        let lock = StoreLock::acquire(&self.path)?;
+        let document = match read_document(&self.path) {
+            Ok(document) => document,
+            Err(error) if is_invalid_document_error(&error) => {
+                quarantine_document_locked(&self.path)?;
+                drop(lock);
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        drop(lock);
         Ok(document.providers.get(provider_id).cloned())
     }
 
@@ -123,20 +160,57 @@ fn read_document(path: &Path) -> Result<StoreDocument> {
     let document: StoreDocument = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing Radius catalog store {}", path.display()))?;
     if document.version != RADIUS_CATALOG_STORE_VERSION {
-        bail!(
-            "unsupported Radius catalog store version {} in {} (expected {})",
-            document.version,
-            path.display(),
-            RADIUS_CATALOG_STORE_VERSION
-        )
+        return Err(StoreFormatError::UnsupportedVersion {
+            found: document.version,
+            expected: RADIUS_CATALOG_STORE_VERSION,
+            path: path.display().to_string(),
+        }
+        .into());
     }
     for (provider_id, snapshot) in &document.providers {
-        validate_provider_id(provider_id)
-            .with_context(|| format!("validating Radius catalog store {}", path.display()))?;
-        validate_radius_snapshot(provider_id, snapshot)
-            .with_context(|| format!("validating Radius catalog store {}", path.display()))?;
+        if validate_provider_id(provider_id).is_err()
+            || validate_radius_snapshot(provider_id, snapshot).is_err()
+        {
+            return Err(StoreFormatError::InvalidDocument {
+                path: path.display().to_string(),
+            }
+            .into());
+        }
     }
     Ok(document)
+}
+
+fn is_invalid_document_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<serde_json::Error>().is_some()
+            || cause.downcast_ref::<StoreFormatError>().is_some()
+    })
+}
+
+fn quarantine_document_locked(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("models-store.json");
+    let quarantine = parent.join(format!(
+        "{file_name}.invalid-{}",
+        Uuid::new_v4().simple()
+    ));
+    fs::rename(path, &quarantine).with_context(|| {
+        format!(
+            "quarantining invalid Radius catalog store {} as {}",
+            path.display(),
+            quarantine.display()
+        )
+    })?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("syncing Radius catalog store directory {}", parent.display()))?;
+    Ok(quarantine)
 }
 
 fn write_document_atomic(path: &Path, document: &StoreDocument) -> Result<()> {

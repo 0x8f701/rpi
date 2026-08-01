@@ -379,7 +379,15 @@ impl TreePanel {
         }
         false
     }
+    fn is_hidden_message(&self, node: &Node) -> bool {
+        matches!(node.entry.message.as_ref(), Some(Message::Custom(message)) if !message.display)
+            || (node.entry.entry_type == "custom_message" && node.entry.display == Some(false))
+    }
+
     fn matches(&self, n: &Node) -> bool {
+        if self.is_hidden_message(n) {
+            return false;
+        }
         let ok = match self.filter {
             TreeFilterMode::Default => !matches!(
                 n.entry.entry_type.as_str(),
@@ -547,6 +555,29 @@ mod tests {
         assert_eq!(panel.selected_id(), Some("3"));
         assert!(panel.selected_is_forkable());
     }
+    #[test]
+    fn hidden_custom_messages_never_appear_in_tree_selectors() {
+        let mut hidden = e("2", Some("1"), "internal");
+        hidden.message = Some(Message::Custom(pi_ai::CustomMessage {
+            custom_type: pi_coding::LOOP_SCHEDULED_MESSAGE_TYPE.to_owned(),
+            content: "<system-reminder>internal</system-reminder>".into(),
+            display: false,
+            details: None,
+            timestamp: 1,
+        }));
+        let mut panel = TreePanel::new(
+            SessionTreeResult {
+                tree: vec![n(e("1", None, "visible"), vec![n(hidden, vec![])])],
+                leaf_id: Some("2".into()),
+                active_leaf_id: Some("2".into()),
+            },
+            TreePanelMode::Navigate,
+        );
+        assert_eq!(panel.visible().iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), ["1"]);
+        panel.apply_action(Action::TreeFilterAll, 10);
+        assert_eq!(panel.visible().iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), ["1"]);
+    }
+
     #[test]
     fn filters_search_fold_and_label_timestamp_are_stateful() {
         let mut labeled = n(e("2", Some("1"), "needle"), vec![]);

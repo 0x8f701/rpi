@@ -1,12 +1,9 @@
 //! PTY lifecycle tests for the `pi` TUI terminal guard.
 //!
-//! Spawns the `pi` binary on a pseudoterminal and verifies that the terminal
-//! is restored (cursor shown, alternate screen left) across the six required
-//! paths: clean exit, initialization error, panic, SIGTERM, SIGHUP, and
-//! suspend/resume. Restoration is idempotent — each path leaves the alternate
-//! screen exactly once — and the signal handler itself performs no terminal
-//! IO (tokio's async-signal-safe self-pipe writer only; restoration happens in
-//! normal async context).
+//! Spawns the `pi` binary on a pseudoterminal and verifies that raw mode and
+//! cursor ownership are restored across clean exit, initialization error,
+//! panic, SIGTERM, SIGHUP, and suspend/resume. The default TUI must never enter
+//! the alternate screen, so ordinary transcript output remains in scrollback.
 //!
 //! The `pi` TUI is selected by giving the child a PTY as stdout (`is_terminal`
 //! is true) and `--model faux/faux-1` so `build_session` succeeds with the
@@ -27,12 +24,12 @@ use nix::sys::termios::Termios;
 use nix::unistd::Pid;
 use tempfile::TempDir;
 
-/// crossterm `EnterAlternateScreen` escape — written exactly once per TUI
-/// epoch (on enter and on each suspend reacquire).
 const ENTER_ALT: &str = "\x1b[?1049h";
-/// crossterm `LeaveAlternateScreen` escape — written exactly once per restore
-/// (clean exit, panic hook, signal exit, and each suspend yield).
-const LEAVE_ALT: &str = "\x1b[?1049l";
+const HIDE_CURSOR: &str = "\x1b[?25l";
+const SHOW_CURSOR: &str = "\x1b[?25h";
+const CLEAR_AFTER_CURSOR: &str = "\x1b[J";
+const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
+const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
 
 /// Ctrl+D byte. In raw mode crossterm maps 0x04 to `Char('d') + CONTROL`, which
 /// the keybindings resolve to `Action::Quit`; with an empty editor the TUI
@@ -99,9 +96,17 @@ impl PtyProbe {
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let s = String::from_utf8_lossy(&chunk[..n]).into_owned();
+                        let bytes = &chunk[..n];
+                        let s = String::from_utf8_lossy(bytes).into_owned();
                         if let Ok(mut guard) = buf.lock() {
                             guard.push_str(&s);
+                        }
+                        // Ratatui's inline viewport asks the terminal for its
+                        // cursor position (CSI 6n). A bare PTY has no emulator,
+                        // so answer like a terminal at row 1, column 1.
+                        if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                            let _ = reader.write_all(b"\x1b[1;1R");
+                            let _ = reader.flush();
                         }
                     }
                     Err(_) => break,
@@ -177,26 +182,30 @@ impl Drop for PtyProbe {
     }
 }
 
-/// Wait for the alternate screen to be entered (TUI ready), with a generous
-/// timeout covering debug-build session setup.
+/// Wait for the inline TUI to acquire the cursor, with a generous timeout
+/// covering debug-build session setup.
 fn await_entered(probe: &PtyProbe) -> bool {
-    probe.wait_for_count(ENTER_ALT, 1, Duration::from_secs(30))
+    probe.wait_for_count(HIDE_CURSOR, 1, Duration::from_secs(30))
 }
 
 #[test]
 fn pty_clean_exit_restores_terminal() {
     let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"], &[]);
+    assert!(await_entered(&probe), "TUI must acquire the inline viewport: {}", probe.snapshot());
+    assert!(!probe.snapshot().contains(ENTER_ALT), "default TUI must not enter alternate screen");
     assert!(
-        await_entered(&probe),
-        "TUI must enter the alternate screen on startup: {}",
-        probe.snapshot()
+        probe.snapshot().contains(ENABLE_BRACKETED_PASTE),
+        "TUI must enable bracketed paste while active"
     );
-    // Empty editor + Ctrl+D => Action::Quit => clean exit => Drop restores.
     probe.send(&[CTRL_D]);
     assert!(
-        probe.wait_for_count(LEAVE_ALT, 1, Duration::from_secs(15)),
-        "clean exit must leave the alternate screen exactly once: {}",
+        probe.wait_for_count(SHOW_CURSOR, 1, Duration::from_secs(15)),
+        "clean exit must restore the cursor without erasing normal output: {}",
         probe.snapshot()
+    );
+    assert!(
+        probe.snapshot().contains(DISABLE_BRACKETED_PASTE),
+        "clean exit must disable bracketed paste"
     );
     let status = probe
         .wait_exit(Duration::from_secs(15))
@@ -205,13 +214,20 @@ fn pty_clean_exit_restores_terminal() {
         status.success(),
         "clean exit must report success: {status:?}"
     );
+    assert!(
+        probe.snapshot().contains(CLEAR_AFTER_CURSOR),
+        "clean exit must clear only the live inline viewport"
+    );
+    let output = probe.snapshot();
+    let after_clear = output.rsplit_once(CLEAR_AFTER_CURSOR).map_or("", |(_, tail)| tail);
+    assert!(!after_clear.contains("faux/faux-1"));
+    assert!(!after_clear.contains("ready"));
 }
 
 #[test]
 fn pty_initialization_error_leaves_terminal_clean() {
     // No --model and no auth (cleared env) => build_session fails before the
-    // TUI is ever entered, so no alternate-screen escape is emitted and the
-    // process exits non-zero with an actionable diagnostic.
+    // TUI is ever entered, so no terminal-acquisition escape is emitted.
     let mut probe = PtyProbe::spawn(&[], &[]);
     assert!(
         probe.wait_for_count(
@@ -242,15 +258,11 @@ fn pty_panic_restores_terminal() {
         &["--model", "faux/faux-1"],
         &[("PI_TEST_PANIC_AFTER_ENTER", "1")],
     );
+    assert!(await_entered(&probe), "TUI must acquire the cursor before panicking: {}", probe.snapshot());
+    assert!(!probe.snapshot().contains(ENTER_ALT));
     assert!(
-        await_entered(&probe),
-        "TUI must enter the alternate screen before panicking: {}",
-        probe.snapshot()
-    );
-    // The panic hook runs before the unwind propagates, restoring the terminal.
-    assert!(
-        probe.wait_for_count(LEAVE_ALT, 1, Duration::from_secs(15)),
-        "panic hook must leave the alternate screen: {}",
+        probe.wait_for_count(SHOW_CURSOR, 1, Duration::from_secs(15)),
+        "panic hook must restore the cursor: {}",
         probe.snapshot()
     );
     let status = probe
@@ -266,17 +278,13 @@ fn pty_panic_restores_terminal() {
 #[test]
 fn pty_sigterm_restores_terminal_and_exits_cleanly() {
     let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"], &[]);
-    assert!(
-        await_entered(&probe),
-        "TUI must enter the alternate screen: {}",
-        probe.snapshot()
-    );
-    // Let the event loop settle so the signal stream is being polled.
+    assert!(await_entered(&probe), "TUI must acquire inline viewport: {}", probe.snapshot());
+    assert!(!probe.snapshot().contains(ENTER_ALT));
     thread::sleep(Duration::from_millis(200));
     probe.signal(Signal::SIGTERM);
     assert!(
-        probe.wait_for_count(LEAVE_ALT, 1, Duration::from_secs(15)),
-        "SIGTERM must leave the alternate screen: {}",
+        probe.wait_for_count(SHOW_CURSOR, 1, Duration::from_secs(15)),
+        "SIGTERM must restore the cursor: {}",
         probe.snapshot()
     );
     let status = probe
@@ -291,16 +299,13 @@ fn pty_sigterm_restores_terminal_and_exits_cleanly() {
 #[test]
 fn pty_sighup_restores_terminal_and_exits_cleanly() {
     let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"], &[]);
-    assert!(
-        await_entered(&probe),
-        "TUI must enter the alternate screen: {}",
-        probe.snapshot()
-    );
+    assert!(await_entered(&probe), "TUI must acquire inline viewport: {}", probe.snapshot());
+    assert!(!probe.snapshot().contains(ENTER_ALT));
     thread::sleep(Duration::from_millis(200));
     probe.signal(Signal::SIGHUP);
     assert!(
-        probe.wait_for_count(LEAVE_ALT, 1, Duration::from_secs(15)),
-        "SIGHUP must leave the alternate screen: {}",
+        probe.wait_for_count(SHOW_CURSOR, 1, Duration::from_secs(15)),
+        "SIGHUP must restore the cursor: {}",
         probe.snapshot()
     );
     let status = probe
@@ -315,31 +320,23 @@ fn pty_sighup_restores_terminal_and_exits_cleanly() {
 #[test]
 fn pty_suspend_resume_yields_and_reacquires_terminal() {
     let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"], &[]);
+    assert!(await_entered(&probe), "TUI must acquire inline viewport: {}", probe.snapshot());
+    assert!(!probe.snapshot().contains(ENTER_ALT));
+    probe.send(b"/logout anthropic\r");
     assert!(
-        await_entered(&probe),
-        "TUI must enter the alternate screen: {}",
-        probe.snapshot()
-    );
-    // `/logout <provider>` with no stored credential errors fast inside
-    // TerminalGuard::suspend: it yields the terminal (leave alt + show cursor),
-    // runs the failing op, then reacquires (enter alt + hide cursor).
-    probe.send(b"/logout anthropic\n");
-    assert!(
-        probe.wait_for_count(LEAVE_ALT, 1, Duration::from_secs(15)),
-        "suspend must leave the alternate screen: {}",
+        probe.wait_for_count(SHOW_CURSOR, 1, Duration::from_secs(15)),
+        "suspend must restore the cursor: {}",
         probe.snapshot()
     );
     assert!(
-        probe.wait_for_count(ENTER_ALT, 2, Duration::from_secs(15)),
-        "resume must re-enter the alternate screen: {}",
+        probe.wait_for_count(HIDE_CURSOR, 2, Duration::from_secs(15)),
+        "resume must reacquire the cursor: {}",
         probe.snapshot()
     );
-    // Editor is cleared after a slash command; Ctrl+D exits cleanly and the
-    // final restore leaves the alternate screen exactly once more.
     probe.send(&[CTRL_D]);
     assert!(
-        probe.wait_for_count(LEAVE_ALT, 2, Duration::from_secs(15)),
-        "exit after resume must leave the alternate screen: {}",
+        probe.wait_for_count(SHOW_CURSOR, 2, Duration::from_secs(15)),
+        "exit after resume must restore the cursor again: {}",
         probe.snapshot()
     );
     let status = probe

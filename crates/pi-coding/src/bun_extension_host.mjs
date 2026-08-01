@@ -30,6 +30,8 @@ const supportedEvents = new Set([
 const commands = new Map();
 const tools = new Map();
 const hooks = new Map();
+const shortcuts = new Map();
+const registeredFlags = new Map();
 const invocations = new Map();
 const runtimeRequests = new Map();
 const uiRequests = new Map();
@@ -237,7 +239,7 @@ function createApi() {
         },
       });
     },
-    getSessionName: () => invocationState().sessionName,
+    getSessionName: () => invocationState().sessionName ?? "",
     getThinkingLevel: () => invocationState().thinkingLevel,
     getActiveTools: () => invocationState().activeTools ?? [],
     getAllTools: () => invocationState().allTools ?? [],
@@ -260,9 +262,57 @@ function createApi() {
     setActiveTools(toolNames) { queuedAction({ kind: "set_active_tools", toolNames: toolNames.map(String) }); },
     setThinkingLevel(level) { queuedAction({ kind: "set_thinking_level", level }); },
     setModel(model) { const state = invocationState(); return requestAction({ kind: "set_model", model }, state.signal); },
-    registerShortcut: () => unavailable("registerShortcut"),
-    registerFlag: () => unavailable("registerFlag"),
-    getFlag: () => unavailable("getFlag"),
+    registerShortcut(key, options) {
+      requireCapability("commands", "shortcut registration");
+      if (typeof key !== "string" || !key) throw new Error("registerShortcut requires a key");
+      if (!options || typeof options.handler !== "function") {
+        throw new Error("registerShortcut requires an options object with a handler");
+      }
+      if (shortcuts.has(key)) throw new Error(`duplicate shortcut ${key}`);
+      shortcuts.set(key, options.handler);
+      send({
+        type: "register",
+        registration: {
+          kind: "shortcut",
+          shortcut: {
+            key,
+            ...(options.description === undefined ? {} : { description: String(options.description) }),
+          },
+        },
+      });
+    },
+    registerFlag(name, options) {
+      requireCapability("commands", "flag registration");
+      if (typeof name !== "string" || !name) throw new Error("registerFlag requires a name");
+      if (!options || (options.type !== "boolean" && options.type !== "string")) {
+        throw new Error("registerFlag requires type \"boolean\" or \"string\"");
+      }
+      if (options.default !== undefined && typeof options.default !== options.type) {
+        throw new Error(`registerFlag default for ${name} must be ${options.type}`);
+      }
+      if (registeredFlags.has(name)) throw new Error(`duplicate flag ${name}`);
+      const flag = {
+        name,
+        ...(options.description === undefined ? {} : { description: String(options.description) }),
+        type: options.type,
+        ...(options.default === undefined ? {} : { default: options.default }),
+      };
+      registeredFlags.set(name, flag);
+      send({ type: "register", registration: { kind: "flag", flag } });
+    },
+    getFlag(name) {
+      const flagName = String(name);
+      const state = invocationState();
+      if (state?.flagValues && Object.prototype.hasOwnProperty.call(state.flagValues, flagName)) {
+        return state.flagValues[flagName];
+      }
+      if (registeredFlags.has(flagName)) {
+        throw new Error(
+          `extension flag ${JSON.stringify(flagName)} is registered but CLI flag dispatch is unsupported in this startup architecture`,
+        );
+      }
+      return undefined;
+    },
     registerMessageRenderer: () => unavailable("registerMessageRenderer"),
     registerEntryRenderer: () => unavailable("registerEntryRenderer"),
     exec: () => unavailable("exec"),
@@ -356,24 +406,68 @@ function createUi(controller, queue) {
     setTitle(title) { enqueueUi(queue, { type: "title", title: String(title) }, controller.signal); },
     setEditorText(text) { enqueueUi(queue, { type: "set_editor_text", text: String(text) }, controller.signal); },
     onTerminalInput: () => unavailable("ui.onTerminalInput"),
-    setWorkingMessage: () => unavailable("ui.setWorkingMessage"),
-    setWorkingVisible: () => unavailable("ui.setWorkingVisible"),
-    setWorkingIndicator: () => unavailable("ui.setWorkingIndicator"),
-    setHiddenThinkingLabel: () => unavailable("ui.setHiddenThinkingLabel"),
+    setWorkingMessage(message) {
+      enqueueUi(queue, { type: "set_working_message", ...(message === undefined ? {} : { message: String(message) }) }, controller.signal);
+    },
+    setWorkingVisible(visible) {
+      enqueueUi(queue, { type: "set_working_visible", visible: Boolean(visible) }, controller.signal);
+    },
+    setWorkingIndicator(options) {
+      if (options !== undefined && (options === null || typeof options !== "object" || Array.isArray(options))) {
+        throw new Error("ui.setWorkingIndicator requires an options object");
+      }
+      const normalized = options === undefined ? undefined : {
+        ...(options.frames === undefined ? {} : {
+          frames: Array.isArray(options.frames) ? options.frames.map(String) : (() => { throw new Error("ui.setWorkingIndicator frames must be an array"); })(),
+        }),
+        ...(options.intervalMs === undefined ? {} : {
+          intervalMs: Number.isSafeInteger(options.intervalMs) && options.intervalMs >= 0
+            ? options.intervalMs
+            : (() => { throw new Error("ui.setWorkingIndicator intervalMs must be a non-negative integer"); })(),
+        }),
+      };
+      enqueueUi(queue, { type: "set_working_indicator", ...(normalized === undefined ? {} : { options: normalized }) }, controller.signal);
+    },
+    setHiddenThinkingLabel(label) {
+      enqueueUi(queue, { type: "set_hidden_thinking_label", ...(label === undefined ? {} : { label: String(label) }) }, controller.signal);
+    },
     setFooter: () => unavailable("ui.setFooter component factories"),
     setHeader: () => unavailable("ui.setHeader component factories"),
     custom: () => unavailable("ui.custom component factories"),
-    pasteToEditor: () => unavailable("ui.pasteToEditor"),
-    getEditorText: () => unavailable("ui.getEditorText"),
+    pasteToEditor(text) {
+      enqueueUi(queue, { type: "paste_to_editor", text: String(text) }, controller.signal);
+    },
+    getEditorText() {
+      return requestUi({ request: { type: "get_editor_text" } }, controller.signal)
+        .then(response => response?.value ?? "");
+    },
     addAutocompleteProvider: () => unavailable("ui.addAutocompleteProvider"),
     setEditorComponent: () => unavailable("ui.setEditorComponent factories"),
     getEditorComponent: () => unavailable("ui.getEditorComponent"),
-    get theme() { return unavailable("ui.theme"); },
-    getAllThemes: () => unavailable("ui.getAllThemes"),
-    getTheme: () => unavailable("ui.getTheme"),
-    setTheme: () => unavailable("ui.setTheme"),
-    getToolsExpanded: () => unavailable("ui.getToolsExpanded"),
-    setToolsExpanded: () => unavailable("ui.setToolsExpanded"),
+    get theme() { return invocationState()?.theme ?? null; },
+    getAllThemes() {
+      return requestUi({ request: { type: "get_all_themes" } }, controller.signal)
+        .then(response => Array.isArray(response?.themes) ? response.themes : []);
+    },
+    getTheme(name) {
+      return requestUi({ request: { type: "get_theme", name: String(name) } }, controller.signal)
+        .then(response => response?.theme);
+    },
+    setTheme(name) {
+      const requestedName = typeof name === "string" ? name : name?.name;
+      if (typeof requestedName !== "string" || !requestedName) {
+        return Promise.resolve({ success: false, error: "process-hosted extensions can only set themes by name" });
+      }
+      return requestUi({ request: { type: "set_theme", name: requestedName } }, controller.signal)
+        .then(response => ({ success: response?.success === true, ...(response?.error === undefined ? {} : { error: String(response.error) }) }));
+    },
+    getToolsExpanded() {
+      return requestUi({ request: { type: "get_tools_expanded" } }, controller.signal)
+        .then(response => Boolean(response?.expanded));
+    },
+    setToolsExpanded(expanded) {
+      enqueueUi(queue, { type: "set_tools_expanded", expanded: Boolean(expanded) }, controller.signal);
+    },
   });
 }
 
@@ -447,6 +541,11 @@ async function invoke(id, invocation, context) {
         if (!tool) throw new Error(`unknown tool ${invocation.name}`);
         const onUpdate = update => send({ type: "update", id, value: jsonValue(update, {}) });
         return tool.execute(invocation.callId, invocation.arguments, controller.signal, onUpdate, contextValue);
+      }
+      if (invocation.kind === "shortcut") {
+        const handler = shortcuts.get(invocation.key);
+        if (!handler) throw new Error(`unknown shortcut ${invocation.key}`);
+        return handler(contextValue);
       }
       if (invocation.kind !== "event") unavailable(`invocation ${invocation.kind}`);
       const name = invocation.event.name;

@@ -12,6 +12,8 @@ publish = false
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+cap-fs-ext = { version = "4.0.2", default-features = false, features = ["std"] }
+cap-std = { version = "4.0.2", default-features = false }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
@@ -51,6 +53,7 @@ unicode-normalization = "0.1"
 # Fast, poison-free sync locks (project rule: prefer parking_lot over
 # std::sync::Mutex when the guard is immediately unwrapped).
 parking_lot = "0.12"
+unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
 [profile.release-dist]

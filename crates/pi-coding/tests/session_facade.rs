@@ -384,6 +384,58 @@ async fn session_stats_aggregate_history_usage_cost_and_tool_calls() {
 }
 
 #[tokio::test]
+async fn hidden_custom_message_reaches_provider_as_user_but_stays_typed_in_history() {
+    let _guard = REGISTRY_LOCK.lock().expect("registry lock");
+    let contexts = Arc::new(Mutex::new(Vec::<Context>::new()));
+    let captured = contexts.clone();
+    let stream_fn: pi_agent::StreamFn = Arc::new(move |model, context, _options| {
+        let captured = captured.clone();
+        Box::pin(async move {
+            captured.lock().expect("contexts").push(context);
+            let stream = new_assistant_message_event_stream();
+            let producer = stream.clone();
+            tokio::spawn(async move {
+                let mut message = AssistantMessage::pending(&model);
+                message.content.push(ContentBlock::text("done"));
+                message.stop_reason = StopReason::Stop;
+                producer.end(Some(message)).await;
+            });
+            stream
+        })
+    });
+    let mut model = Model::default();
+    model.id = "custom-provider-projection".into();
+    model.name = "Custom Provider Projection".into();
+    model.api = "custom-provider-projection".into();
+    model.provider = "test".into();
+    let cwd = tempfile::tempdir().expect("cwd");
+    let session = Session::new(SessionOptions {
+        model,
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: SimpleStreamOptions::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: Some(stream_fn),
+        auth_resolver: None,
+    }).expect("session");
+    session.run_messages(vec![Message::Custom(pi_ai::CustomMessage {
+        custom_type: "loop_scheduled_turn".into(),
+        content: "<system-reminder>internal</system-reminder>\n\necho hello".into(),
+        display: false,
+        details: Some(json!({"prompt":"echo hello"})),
+        timestamp: 1,
+    })]).await.expect("run custom message");
+    assert!(matches!(session.history().first(), Some(Message::Custom(custom)) if !custom.display));
+    let contexts = contexts.lock().expect("contexts");
+    assert!(matches!(contexts[0].messages.first(), Some(Message::User(user)) if matches!(&user.content[0], ContentBlock::Text { text, .. } if text.contains("system-reminder"))));
+}
+
+#[tokio::test]
 async fn next_turn_custom_message_is_delivered_once_after_user_prompt() {
     let _guard = REGISTRY_LOCK.lock().expect("registry lock");
     let (session, registration) = make_session(vec![

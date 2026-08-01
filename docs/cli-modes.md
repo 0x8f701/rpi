@@ -27,8 +27,7 @@ Multiple positional `[PROMPT]` arguments are joined with a single space. An empt
 | `--print` | `-p` | | Force print mode. |
 | `--mode <text\|json\|rpc>` | | protocol | Headless output protocol. `text` is the default interactive run; `json` streams one-shot events; `rpc` reads JSONL commands on stdin. |
 | `--continue` | `-c` | | Resume the most recent session for this directory. |
-| `--resume <PATH>` | | session file | Resume a specific native Pi v3 session file. |
-| `--resume-codex <PATH\|ID>` | | path or id | Import a Codex rollout and resume it. |
+| `--resume <PATH_OR_ID>` | | path or id | Resume a native Pi session or import and resume a discovered OMP, Codex, Claude, Grok, or Droid session. Exact ids and unambiguous prefixes are accepted. |
 | `--session <PATH_OR_ID>` | | path or id | Open a session by file path, exact id, or unambiguous prefix. |
 | `--session-id <ID>` | | exact id | Open an exact project session id, creating it when absent. |
 | `--fork <PATH_OR_ID>` | | path or id | Fork a session by file path, exact id, or unambiguous prefix. |
@@ -180,8 +179,7 @@ Both the TUI and the line REPL accept these commands:
 | `/name [name]` | Set or show the session name |
 | `/session` | Show current session info |
 | `/sessions` | List saved sessions for this directory |
-| `/resume [path]` | Resume a different session |
-| `/resume-codex <path\|id>` | Import and resume a Codex session |
+| `/resume [path\|id\|prefix]` | List or resume native and discovered foreign sessions through the unified catalog |
 | `/import <path.jsonl>` | Import and resume a native Pi v3 JSONL session |
 | `/export [path]` | Export the session to HTML, or JSONL if the path ends in `.jsonl` |
 | `/share` | Share the session via a private GitHub gist |
@@ -191,6 +189,8 @@ Both the TUI and the line REPL accept these commands:
 | `/tree` | Show or navigate the current session tree |
 | `/loop [interval] <prompt>` | Run a prompt on a recurring interval |
 | `/loops` | List active recurring loops |
+| `/loop-update <id> [interval] [prompt]` | Update a loop interval, prompt, or both |
+| `/loop-delete <id>` | Delete a loop without aborting an already-running turn |
 | `/loop-cancel <id>` | Cancel a loop by id |
 | `/compact [instructions]` | Manually compact session context |
 | `/todo [markdown]` | Show or edit the task list |
@@ -203,6 +203,8 @@ Both the TUI and the line REPL accept these commands:
 | `/changelog` | Show version history |
 | `/hotkeys` | Show keyboard shortcuts |
 | `/quit` / `/exit` | Exit |
+
+Loop intervals accept positive bare seconds (`/loop 300 check status`) or compact `s`, `m`, `h`, and `d` units (`/loop 3s echo hello`, `/loop 30m check deploy`). Values are honored exactly; zero and overflow are rejected.
 
 ## REPL-only additions
 
@@ -262,7 +264,7 @@ Session files live under:
 
 `<workspace>` is the encoded cwd: the absolute path with leading separators removed and `/`, `\`, and `:` replaced by `-`.
 
-Imported sessions always get a fresh id; only convertible user/assistant text messages are preserved. Tool calls, reasoning, attachments, and branches are dropped.
+`--resume` and `/resume` share one catalog spanning native Pi plus OMP, Codex, Claude, Grok, and Droid homes. Native selections open the existing file without copying. Foreign selections are converted to Pi v3 once, retain source lineage, and reuse that native conversion on later resumes. Only convertible user/assistant text messages are preserved; tool calls, reasoning, attachments, and branches are dropped.
 
 ## Model spec syntax
 

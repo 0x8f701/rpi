@@ -12,23 +12,12 @@ interface ExtensionApi {
 export default function (pi: ExtensionApi): void {
   const unsupportedMethods = [
     "onTerminalInput",
-    "setWorkingMessage",
-    "setWorkingVisible",
-    "setWorkingIndicator",
-    "setHiddenThinkingLabel",
     "setFooter",
     "setHeader",
     "custom",
-    "pasteToEditor",
-    "getEditorText",
     "addAutocompleteProvider",
     "setEditorComponent",
     "getEditorComponent",
-    "getAllThemes",
-    "getTheme",
-    "setTheme",
-    "getToolsExpanded",
-    "setToolsExpanded",
   ] as const;
 
   for (const method of unsupportedMethods) {

@@ -421,6 +421,14 @@ impl SessionTree {
     }
 }
 
+/// Snapshot used to compare-and-append a durable custom record without allowing
+/// branch navigation or another recorder mutation to redirect the append.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionAppendToken {
+    active_leaf_id: Option<String>,
+    revision: u64,
+}
+
 #[derive(Debug)]
 struct RecorderState {
     path: PathBuf,
@@ -430,6 +438,7 @@ struct RecorderState {
     parent_session: Option<String>,
     last_id: Option<String>,
     active_leaf_id: Option<String>,
+    revision: u64,
     used_ids: HashSet<String>,
     pending: Vec<Value>,
     file: Option<File>,
@@ -476,18 +485,31 @@ impl SessionRecorder {
     pub fn active_leaf_id(&self) -> Option<String> {
         self.inner.lock().active_leaf_id.clone()
     }
+    /// Captures the active leaf and recorder revision for a later atomic append.
+    #[must_use]
+    pub fn append_token(&self) -> SessionAppendToken {
+        let state = self.inner.lock();
+        append_token_from_state(&state)
+    }
+
 
     pub fn branch(&self, entry_id: &str) -> Result<()> {
         let mut state = self.inner.lock();
         if !state.used_ids.contains(entry_id) {
             bail!("Entry not found: {entry_id}");
         }
-        state.active_leaf_id = Some(entry_id.to_owned());
+        if state.active_leaf_id.as_deref() != Some(entry_id) {
+            state.active_leaf_id = Some(entry_id.to_owned());
+            state.revision = state.revision.saturating_add(1);
+        }
         Ok(())
     }
 
     pub fn reset_leaf(&self) {
-        self.inner.lock().active_leaf_id = None;
+        let mut state = self.inner.lock();
+        if state.active_leaf_id.take().is_some() {
+            state.revision = state.revision.saturating_add(1);
+        }
     }
 
     pub fn branch_with_summary(
@@ -502,7 +524,12 @@ impl SessionRecorder {
             bail!("Entry not found: {entry_id}");
         }
         let previous_active_leaf_id = state.active_leaf_id.clone();
-        state.active_leaf_id = branch_from_id.map(str::to_owned);
+        let previous_revision = state.revision;
+        let target_leaf = branch_from_id.map(str::to_owned);
+        if state.active_leaf_id != target_leaf {
+            state.active_leaf_id = target_leaf;
+            state.revision = state.revision.saturating_add(1);
+        }
         let result = append_entry(
             &mut state,
             "branch_summary",
@@ -513,6 +540,7 @@ impl SessionRecorder {
         );
         if result.is_err() {
             state.active_leaf_id = previous_active_leaf_id;
+            state.revision = previous_revision;
         }
         result
     }
@@ -538,8 +566,12 @@ impl SessionRecorder {
 
     pub fn fork_from(&self, entry_id: Option<&str>) {
         let mut state = self.inner.lock();
-        state.last_id = entry_id.map(str::to_owned);
-        state.active_leaf_id = entry_id.map(str::to_owned);
+        let entry_id = entry_id.map(str::to_owned);
+        if state.active_leaf_id != entry_id || state.last_id != entry_id {
+            state.last_id.clone_from(&entry_id);
+            state.active_leaf_id = entry_id;
+            state.revision = state.revision.saturating_add(1);
+        }
     }
 
     pub fn record_message(&self, message: &Message) -> Result<String> {
@@ -570,6 +602,34 @@ impl SessionRecorder {
         let mut state = self.inner.lock();
         append_entry(&mut state, "custom", Value::Object(fields))
     }
+
+    /// Compare-and-appends a typed custom record after validating the live tree.
+    ///
+    /// Token check, tree capture, validation, append, flush, and sync all happen
+    /// under the recorder mutex so branch/reset cannot redirect the append.
+    pub fn record_custom_entry_durable_checked<T, F>(
+        &self,
+        expected: &SessionAppendToken,
+        custom_type: &str,
+        data: &T,
+        validate: F,
+    ) -> Result<String>
+    where
+        T: serde::Serialize,
+        F: FnOnce(&SessionTree) -> Result<()>,
+    {
+        let mut state = self.inner.lock();
+        if state.active_leaf_id != expected.active_leaf_id || state.revision != expected.revision {
+            bail!("session changed before durable custom append");
+        }
+        let tree = session_tree_from_state(&state)?;
+        validate(&tree)?;
+        let mut fields = Map::new();
+        fields.insert("customType".to_owned(), Value::String(custom_type.to_owned()));
+        fields.insert("data".to_owned(), serde_json::to_value(data)?);
+        append_entry_durable(&mut state, "custom", Value::Object(fields))
+    }
+
 
     pub fn record_custom_message(&self, message: &CustomMessage) -> Result<String> {
         let mut fields = serde_json::to_value(message)?;
@@ -647,14 +707,14 @@ impl SessionRecorder {
     }
 
     pub fn tree(&self) -> Result<SessionTree> {
+        session_tree_from_state(&self.inner.lock())
+    }
+
+    /// Returns a consistent tree and append token captured under one recorder lock.
+    pub fn tree_with_append_token(&self) -> Result<(SessionTree, SessionAppendToken)> {
         let state = self.inner.lock();
-        let mut tree = if state.flushed {
-            load_session_tree(&state.path)?
-        } else {
-            session_tree_from_values(&state.path, &state.pending)?
-        };
-        tree.active_leaf_id.clone_from(&state.active_leaf_id);
-        Ok(tree)
+        let tree = session_tree_from_state(&state)?;
+        Ok((tree, append_token_from_state(&state)))
     }
 
     pub fn persist_now(&self) -> Result<()> {
@@ -732,7 +792,7 @@ pub fn start_session_in(
     });
     let recorder = SessionRecorder { inner: Arc::new(Mutex::new(RecorderState {
         path: directory.join(filename), id, timestamp, cwd, parent_session,
-        last_id: None, active_leaf_id: None, used_ids: HashSet::new(),
+        last_id: None, active_leaf_id: None, revision: 0, used_ids: HashSet::new(),
         pending: vec![header], file: None, flushed: false,
         has_assistant: false, session_name: None,
     })) };
@@ -796,6 +856,7 @@ pub fn create_branched_session(source_path: impl AsRef<Path>, leaf_id: &str) -> 
             parent_session,
             last_id: Some(leaf_id.to_owned()),
             active_leaf_id: Some(leaf_id.to_owned()),
+            revision: 0,
             used_ids,
             pending,
             file: None,
@@ -846,7 +907,7 @@ pub fn fork_session_in(
     let leaf_id = branch.last().map(|entry| entry.id.clone());
     let recorder = SessionRecorder { inner: Arc::new(Mutex::new(RecorderState {
         path, id, timestamp, cwd: target_cwd, parent_session,
-        last_id: leaf_id.clone(), active_leaf_id: leaf_id, used_ids, pending,
+        last_id: leaf_id.clone(), active_leaf_id: leaf_id, revision: 0, used_ids, pending,
         file: None, flushed: false, has_assistant, session_name,
     })) };
     if has_assistant { persist(&mut recorder.inner.lock())?; }
@@ -893,6 +954,7 @@ pub fn resume_session(path: impl AsRef<Path>) -> Result<SessionRecorder> {
             parent_session: tree.header.parent_session,
             last_id: tree.leaf_id,
             active_leaf_id,
+            revision: 0,
             used_ids,
             pending: Vec::new(),
             file: Some(file),
@@ -1278,11 +1340,99 @@ pub(crate) fn normalize_session_name(name: &str) -> Option<String> {
     (!normalized.is_empty()).then(|| normalized.to_owned())
 }
 
+fn append_token_from_state(state: &RecorderState) -> SessionAppendToken {
+    SessionAppendToken {
+        active_leaf_id: state.active_leaf_id.clone(),
+        revision: state.revision,
+    }
+}
+
+fn session_tree_from_state(state: &RecorderState) -> Result<SessionTree> {
+    let mut tree = if state.flushed {
+        let persisted = load_session_tree(&state.path)?;
+        if state.pending.is_empty() {
+            persisted
+        } else {
+            let mut values = vec![json!({
+                "type": "session",
+                "version": persisted.header.version,
+                "id": persisted.header.id,
+                "timestamp": persisted.header.timestamp,
+                "cwd": persisted.header.cwd,
+                "parentSession": persisted.header.parent_session,
+            })];
+            values.extend(
+                persisted
+                    .entries
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
+            values.extend(state.pending.iter().cloned());
+            session_tree_from_values(&state.path, &values)?
+        }
+    } else {
+        session_tree_from_values(&state.path, &state.pending)?
+    };
+    tree.active_leaf_id.clone_from(&state.active_leaf_id);
+    Ok(tree)
+}
+
 fn append_entry(state: &mut RecorderState, entry_type: &str, fields: Value) -> Result<String> {
-    let id = unique_entry_id(&state.used_ids);
     let previous_last_id = state.last_id.clone();
     let previous_active_leaf_id = state.active_leaf_id.clone();
     let previous_pending_len = state.pending.len();
+    let id = prepare_entry(state, entry_type, fields);
+    if let Err(error) = persist(state) {
+        state.last_id = previous_last_id;
+        state.active_leaf_id = previous_active_leaf_id;
+        state.used_ids.remove(&id);
+        state.pending.truncate(previous_pending_len);
+        return Err(error);
+    }
+    state.revision = state.revision.saturating_add(1);
+    Ok(id)
+}
+
+fn append_entry_durable(
+    state: &mut RecorderState,
+    entry_type: &str,
+    fields: Value,
+) -> Result<String> {
+    let previous_last_id = state.last_id.clone();
+    let previous_active_leaf_id = state.active_leaf_id.clone();
+    let previous_pending_len = state.pending.len();
+    let previous_file_len = state
+        .file
+        .as_ref()
+        .map(File::metadata)
+        .transpose()
+        .context("reading session length before durable append")?
+        .map(|metadata| metadata.len());
+    let id = prepare_entry(state, entry_type, fields);
+    if let Err(error) = persist_durable(state) {
+        state.last_id = previous_last_id;
+        state.active_leaf_id = previous_active_leaf_id;
+        state.used_ids.remove(&id);
+        state.pending.truncate(previous_pending_len);
+        if let (Some(file), Some(previous_file_len)) = (state.file.as_mut(), previous_file_len) {
+            file.set_len(previous_file_len)
+                .and_then(|()| file.sync_all())
+                .with_context(|| {
+                    format!(
+                        "rolling back durable session append after error: {error:#}"
+                    )
+                })?;
+        }
+        return Err(error);
+    }
+    state.revision = state.revision.saturating_add(1);
+    Ok(id)
+}
+
+fn prepare_entry(state: &mut RecorderState, entry_type: &str, fields: Value) -> String {
+    let id = unique_entry_id(&state.used_ids);
+    let parent_id = state.active_leaf_id.clone();
     state.used_ids.insert(id.clone());
     let mut entry = match fields {
         Value::Object(object) => object,
@@ -1292,22 +1442,40 @@ fn append_entry(state: &mut RecorderState, entry_type: &str, fields: Value) -> R
     entry.insert("id".to_owned(), Value::String(id.clone()));
     entry.insert(
         "parentId".to_owned(),
-        previous_active_leaf_id
-            .as_ref()
-            .map_or(Value::Null, |parent| Value::String(parent.clone())),
+        parent_id.map_or(Value::Null, Value::String),
     );
     entry.insert("timestamp".to_owned(), Value::String(iso_now()));
     state.last_id = Some(id.clone());
     state.active_leaf_id = Some(id.clone());
     state.pending.push(Value::Object(entry));
-    if let Err(error) = persist(state) {
-        state.last_id = previous_last_id;
-        state.active_leaf_id = previous_active_leaf_id;
-        state.used_ids.remove(&id);
-        state.pending.truncate(previous_pending_len);
-        return Err(error);
+    id
+}
+
+
+fn persist_durable(state: &mut RecorderState) -> Result<()> {
+    if !state.flushed {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(true)
+            .create_new(true)
+            .open(&state.path)
+            .with_context(|| format!("creating session {}", state.path.display()))?;
+        if let Err(error) = write_records_durable(&mut file, &state.pending) {
+            drop(file);
+            let _ = fs::remove_file(&state.path);
+            return Err(error);
+        }
+        state.file = Some(file);
+        state.flushed = true;
+        state.pending.clear();
+        return Ok(());
     }
-    Ok(id)
+    if let Some(file) = state.file.as_mut() {
+        write_records_durable(file, &state.pending)?;
+        state.pending.clear();
+    }
+    Ok(())
 }
 
 fn persist(state: &mut RecorderState) -> Result<()> {
@@ -1332,9 +1500,7 @@ fn persist(state: &mut RecorderState) -> Result<()> {
         return Ok(());
     }
     if let Some(file) = state.file.as_mut() {
-        if let Some(record) = state.pending.last() {
-            write_records(file, std::slice::from_ref(record))?;
-        }
+        write_records(file, &state.pending)?;
         state.pending.clear();
     }
     Ok(())
@@ -1356,7 +1522,7 @@ impl RecordAppendSink for File {
     }
 
     fn sync_rollback(&mut self) -> io::Result<()> {
-        self.sync_data()
+        self.sync_all()
     }
 }
 
@@ -1367,6 +1533,39 @@ fn write_records(file: &mut File, records: &[Value]) -> Result<()> {
         serialized.push(b'\n');
     }
     append_serialized_records(file, &serialized).context("writing session record")
+}
+
+fn write_records_durable(file: &mut File, records: &[Value]) -> Result<()> {
+    let mut serialized = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut serialized, record).context("serializing session record")?;
+        serialized.push(b'\n');
+    }
+    append_serialized_records_durable(file, &serialized).context("writing durable session record")
+}
+
+fn append_serialized_records_durable<S: RecordAppendSink>(
+    sink: &mut S,
+    serialized: &[u8],
+) -> io::Result<()> {
+    let previous_len = sink.append_len()?;
+    let write_result = sink
+        .write_all(serialized)
+        .and_then(|()| sink.flush())
+        .and_then(|()| sink.sync_rollback());
+    if let Err(write_error) = write_result {
+        if let Err(rollback_error) = sink
+            .truncate_append(previous_len)
+            .and_then(|()| sink.sync_rollback())
+        {
+            return Err(io::Error::new(
+                write_error.kind(),
+                format!("{write_error}; rolling back partial session append failed: {rollback_error}"),
+            ));
+        }
+        return Err(write_error);
+    }
+    Ok(())
 }
 
 fn append_serialized_records<S: RecordAppendSink>(sink: &mut S, serialized: &[u8]) -> io::Result<()> {
@@ -1419,6 +1618,7 @@ fn message_search_text(message: &Message) -> String {
         Message::Assistant(message) => content_search_text(&message.content),
         Message::ToolResult(message) => content_search_text(&message.content),
         Message::BashExecution(message) => format!("{}\n{}", message.command, message.output),
+        Message::Custom(message) if !message.display => String::new(),
         Message::Custom(message) => content_search_text(&message.content.to_blocks()),
         Message::BranchSummary(message) => message.summary.clone(),
         Message::CompactionSummary(message) => message.summary.clone(),
@@ -1530,6 +1730,26 @@ fn encode_cwd_safe_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hidden_custom_messages_are_excluded_from_selector_search_text() {
+        let hidden = Message::Custom(CustomMessage {
+            custom_type: crate::LOOP_SCHEDULED_MESSAGE_TYPE.to_owned(),
+            content: "<system-reminder>internal</system-reminder>".into(),
+            display: false,
+            details: None,
+            timestamp: 1,
+        });
+        let visible = Message::Custom(CustomMessage {
+            custom_type: "visible".to_owned(),
+            content: "public note".into(),
+            display: true,
+            details: None,
+            timestamp: 2,
+        });
+        assert!(message_search_text(&hidden).is_empty());
+        assert_eq!(message_search_text(&visible), "public note");
+    }
+
 
     fn session_header_line(cwd: &Path) -> String {
         serde_json::to_string(&json!({
@@ -1670,6 +1890,62 @@ mod tests {
         }
     }
 
+    struct FailingFlushSink {
+        bytes: Vec<u8>,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingFlushSink {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                self.fail_flush = false;
+                return Err(io::Error::new(io::ErrorKind::Other, "injected flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    impl RecordAppendSink for FailingFlushSink {
+        fn append_len(&self) -> io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn truncate_append(&mut self, len: u64) -> io::Result<()> {
+            self.bytes.truncate(len as usize);
+            Ok(())
+        }
+
+        fn sync_rollback(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn durable_partial_write_and_flush_failures_restore_file_boundary() {
+        let original = b"{\"type\":\"session\"}\n".to_vec();
+        let mut partial = FailingAppendSink {
+            bytes: original.clone(),
+            fail_after: 8,
+            written: 0,
+        };
+        append_serialized_records_durable(&mut partial, b"{\"type\":\"custom\"}\n")
+            .expect_err("partial durable append must fail");
+        assert_eq!(partial.bytes, original);
+
+        let mut flush = FailingFlushSink {
+            bytes: original.clone(),
+            fail_flush: true,
+        };
+        append_serialized_records_durable(&mut flush, b"{\"type\":\"custom\"}\n")
+            .expect_err("durable flush must fail");
+        assert_eq!(flush.bytes, original);
+    }
+
     #[test]
     fn failed_partial_append_restores_valid_jsonl_boundary() {
         let original = b"{\"type\":\"session\"}\n".to_vec();
@@ -1705,6 +1981,7 @@ mod tests {
                 parent_session: None,
                 last_id: None,
                 active_leaf_id: None,
+                revision: 0,
                 used_ids: HashSet::new(),
                 pending: vec![json!({
                     "type": "session",
@@ -2314,7 +2591,7 @@ mod tests {
         fs::write(&occupied, b"occupied").expect("occupy path");
         let recorder = SessionRecorder { inner: Arc::new(Mutex::new(RecorderState {
             path: occupied, id: "summary-session".to_owned(), timestamp: "2026-01-01T00:00:00.000Z".to_owned(), cwd: directory.clone(), parent_session: None,
-            last_id: Some("b".to_owned()), active_leaf_id: Some("b".to_owned()), used_ids: HashSet::from(["a".to_owned(), "b".to_owned()]),
+            last_id: Some("b".to_owned()), active_leaf_id: Some("b".to_owned()), revision: 0, used_ids: HashSet::from(["a".to_owned(), "b".to_owned()]),
             pending: vec![json!({"type":"session", "version":CURRENT_SESSION_VERSION, "id":"summary-session", "timestamp":"2026-01-01T00:00:00.000Z", "cwd":directory})],
             file: None, flushed: false, has_assistant: true, session_name: None,
         })) };

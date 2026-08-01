@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use super::{ImportSessionError, ImportedMessage, ImportedMessageRole, SourceSessionFormat};
+use super::{
+    ImportSessionError, ImportedMessage, ImportedMessageRole, OpenedSource, OpenedSourceParts,
+    SourceSessionFormat,
+};
 
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
@@ -35,12 +38,28 @@ pub(super) fn parse_source(
     source: SourceSessionFormat,
     path: &Path,
 ) -> Result<ParsedSession, ImportSessionError> {
+    let opened = super::open_source_direct(source, path)?;
+    parse_opened_source(source, opened)
+}
+
+pub(super) fn parse_opened_source(
+    source: SourceSessionFormat,
+    opened: OpenedSource,
+) -> Result<ParsedSession, ImportSessionError> {
+    let OpenedSourceParts {
+        path,
+        primary,
+        grok_chat,
+        grok_cwd,
+    } = opened.into_parts();
     match source {
-        SourceSessionFormat::Pi | SourceSessionFormat::Omp => parse_native(source, path),
-        SourceSessionFormat::Codex => parse_codex(path),
-        SourceSessionFormat::Claude => parse_claude(path),
-        SourceSessionFormat::Grok => parse_grok(path),
-        SourceSessionFormat::Droid => parse_droid(path),
+        SourceSessionFormat::Pi | SourceSessionFormat::Omp => {
+            parse_native(source, &path, primary)
+        }
+        SourceSessionFormat::Codex => parse_codex(&path, primary),
+        SourceSessionFormat::Claude => parse_claude(&path, primary),
+        SourceSessionFormat::Grok => parse_grok(&path, primary, grok_chat, grok_cwd),
+        SourceSessionFormat::Droid => parse_droid(&path, primary),
     }
 }
 
@@ -48,8 +67,17 @@ pub(super) fn source_id(
     source: SourceSessionFormat,
     path: &Path,
 ) -> Result<Option<String>, ImportSessionError> {
+    let opened = super::open_source_direct(source, path)?;
+    source_id_opened(source, opened)
+}
+
+pub(super) fn source_id_opened(
+    source: SourceSessionFormat,
+    opened: OpenedSource,
+) -> Result<Option<String>, ImportSessionError> {
+    let OpenedSourceParts { path, primary, .. } = opened.into_parts();
     match source {
-        SourceSessionFormat::Grok => read_json(path).map(|value| {
+        SourceSessionFormat::Grok => read_json(primary, &path).map(|value| {
             value
                 .pointer("/info/id")
                 .and_then(Value::as_str)
@@ -57,7 +85,7 @@ pub(super) fn source_id(
                 .map(str::to_owned)
         }),
         _ => {
-            let values = read_jsonl(path)?;
+            let values = read_jsonl(primary, &path)?;
             let id = match source {
                 SourceSessionFormat::Pi | SourceSessionFormat::Omp => values
                     .iter()
@@ -91,8 +119,9 @@ pub(super) fn source_id(
 fn parse_native(
     source: SourceSessionFormat,
     path: &Path,
+    file: fs::File,
 ) -> Result<ParsedSession, ImportSessionError> {
-    let contents = read_bounded_text(path, MAX_SOURCE_BYTES)?;
+    let contents = read_bounded_text_from(file, path, MAX_SOURCE_BYTES)?;
     if contents.trim().is_empty() {
         return Err(ImportSessionError::NoConvertibleMessages {
             format: source,
@@ -248,8 +277,8 @@ fn active_messages(nodes: &[TreeNode]) -> Vec<ImportedMessage> {
         .collect()
 }
 
-fn parse_codex(path: &Path) -> Result<ParsedSession, ImportSessionError> {
-    let values = read_jsonl(path)?;
+fn parse_codex(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSessionError> {
+    let values = read_jsonl(file, path)?;
     let mut source_session_id = None;
     let mut cwd = PathBuf::new();
     let mut started_at = None;
@@ -302,8 +331,8 @@ fn parse_codex(path: &Path) -> Result<ParsedSession, ImportSessionError> {
     })
 }
 
-fn parse_claude(path: &Path) -> Result<ParsedSession, ImportSessionError> {
-    let values = read_jsonl(path)?;
+fn parse_claude(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSessionError> {
+    let values = read_jsonl(file, path)?;
     let mut source_session_id = None;
     let mut cwd = PathBuf::new();
     for value in &values {
@@ -393,8 +422,13 @@ fn parse_claude(path: &Path) -> Result<ParsedSession, ImportSessionError> {
     })
 }
 
-fn parse_grok(path: &Path) -> Result<ParsedSession, ImportSessionError> {
-    let summary = read_json(path)?;
+fn parse_grok(
+    path: &Path,
+    summary_file: fs::File,
+    chat_file: Option<fs::File>,
+    cwd_file: Option<fs::File>,
+) -> Result<ParsedSession, ImportSessionError> {
+    let summary = read_json(summary_file, path)?;
     let source_session_id = summary
         .pointer("/info/id")
         .and_then(Value::as_str)
@@ -411,17 +445,16 @@ fn parse_grok(path: &Path) -> Result<ParsedSession, ImportSessionError> {
         .and_then(Value::as_str)
         .filter(|cwd| !cwd.is_empty())
         .map(PathBuf::from)
-        .or_else(|| grok_cwd_fallback(path))
+        .or_else(|| grok_cwd_fallback(path, cwd_file))
         .unwrap_or_default();
     let started_at = ["created_at", "updated_at", "last_active_at"]
         .into_iter()
         .find_map(|key| summary.get(key).and_then(Value::as_str))
         .map(str::to_owned);
     let chat_path = path.with_file_name("chat_history.jsonl");
-    let values = if chat_path.is_file() {
-        read_jsonl(&chat_path)?
-    } else {
-        Vec::new()
+    let values = match chat_file {
+        Some(file) => read_jsonl(file, &chat_path)?,
+        None => Vec::new(),
     };
     let messages = values
         .iter()
@@ -449,8 +482,8 @@ fn parse_grok(path: &Path) -> Result<ParsedSession, ImportSessionError> {
     })
 }
 
-fn parse_droid(path: &Path) -> Result<ParsedSession, ImportSessionError> {
-    let values = read_jsonl(path)?;
+fn parse_droid(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSessionError> {
+    let values = read_jsonl(file, path)?;
     let start = values.iter().find_map(|value| {
         (value.get("type").and_then(Value::as_str) == Some("session_start"))
             .then(|| value.as_object())
@@ -518,14 +551,15 @@ fn first_direct_text(content: &Value) -> Option<&str> {
     }
 }
 
-fn grok_cwd_fallback(summary_path: &Path) -> Option<PathBuf> {
+fn grok_cwd_fallback(summary_path: &Path, cwd_file: Option<fs::File>) -> Option<PathBuf> {
     let cwd_directory = summary_path.parent()?.parent()?;
     let encoded = cwd_directory.file_name()?.to_str()?;
     let decoded = percent_decode(encoded)?;
     if decoded.starts_with('/') || decoded.as_bytes().get(1) == Some(&b':') {
         return Some(PathBuf::from(decoded));
     }
-    let cwd = read_bounded_text(&cwd_directory.join(".cwd"), MAX_CWD_SIDECAR_BYTES).ok()?;
+    let cwd_path = cwd_directory.join(".cwd");
+    let cwd = read_bounded_text_from(cwd_file?, &cwd_path, MAX_CWD_SIDECAR_BYTES).ok()?;
     let cwd = cwd.trim();
     (!cwd.is_empty()).then(|| PathBuf::from(cwd))
 }
@@ -586,16 +620,16 @@ fn string_field(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
     })
 }
 
-fn read_json(path: &Path) -> Result<Value, ImportSessionError> {
-    let bytes = read_bounded_bytes(path, MAX_SOURCE_BYTES)?;
+fn read_json(file: fs::File, path: &Path) -> Result<Value, ImportSessionError> {
+    let bytes = read_bounded_bytes_from(file, path, MAX_SOURCE_BYTES)?;
     serde_json::from_slice(&bytes).map_err(|source| ImportSessionError::Json {
         path: path.to_path_buf(),
         source,
     })
 }
 
-fn read_jsonl(path: &Path) -> Result<Vec<Value>, ImportSessionError> {
-    read_jsonl_with_limits(path, MAX_SOURCE_BYTES, MAX_LINE_BYTES, MAX_RECORDS)
+fn read_jsonl(file: fs::File, path: &Path) -> Result<Vec<Value>, ImportSessionError> {
+    read_jsonl_from(file, path, MAX_SOURCE_BYTES, MAX_LINE_BYTES, MAX_RECORDS)
 }
 
 pub(super) fn read_jsonl_with_limits(
@@ -605,6 +639,17 @@ pub(super) fn read_jsonl_with_limits(
     max_records: usize,
 ) -> Result<Vec<Value>, ImportSessionError> {
     let file = open_bounded_file(path, max_bytes)?;
+    read_jsonl_from(file, path, max_bytes, max_line_bytes, max_records)
+}
+
+fn read_jsonl_from(
+    file: fs::File,
+    path: &Path,
+    max_bytes: u64,
+    max_line_bytes: usize,
+    max_records: usize,
+) -> Result<Vec<Value>, ImportSessionError> {
+    validate_file_size(&file, path, max_bytes)?;
     let mut reader = BufReader::new(file);
     let mut values = Vec::new();
     let mut records = 0_usize;
@@ -666,21 +711,37 @@ fn open_bounded_file(path: &Path, max_bytes: u64) -> Result<fs::File, ImportSess
         path: path.to_path_buf(),
         source,
     })?;
+    validate_file_size(&file, path, max_bytes)?;
+    Ok(file)
+}
+
+fn validate_file_size(
+    file: &fs::File,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(), ImportSessionError> {
     let metadata = file.metadata().map_err(|source| ImportSessionError::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    if !metadata.is_file() {
+        return Err(resource_limit(path, "source is not a regular file".to_owned()));
+    }
     if metadata.len() > max_bytes {
         return Err(resource_limit(
             path,
             format!("file is {} bytes; maximum is {max_bytes}", metadata.len()),
         ));
     }
-    Ok(file)
+    Ok(())
 }
 
-fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ImportSessionError> {
-    let file = open_bounded_file(path, max_bytes)?;
+fn read_bounded_bytes_from(
+    file: fs::File,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ImportSessionError> {
+    validate_file_size(&file, path, max_bytes)?;
     let capacity = file
         .metadata()
         .ok()
@@ -701,6 +762,21 @@ fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ImportSess
     }
     Ok(bytes)
 }
+
+fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ImportSessionError> {
+    let file = open_bounded_file(path, max_bytes)?;
+    read_bounded_bytes_from(file, path, max_bytes)
+}
+
+fn read_bounded_text_from(
+    file: fs::File,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<String, ImportSessionError> {
+    String::from_utf8(read_bounded_bytes_from(file, path, max_bytes)?)
+        .map_err(|_| resource_limit(path, "source is not valid UTF-8".to_owned()))
+}
+
 pub(super) fn read_bounded_text(path: &Path, max_bytes: u64) -> Result<String, ImportSessionError> {
     String::from_utf8(read_bounded_bytes(path, max_bytes)?)
         .map_err(|_| resource_limit(path, "source is not valid UTF-8".to_owned()))

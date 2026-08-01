@@ -7,8 +7,73 @@
 //! agent runtime types); this module is pure and unit-testable.
 
 use crate::truncate::{truncate_tail, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
+use std::sync::LazyLock;
+
+/// Contained spill root under the process temp dir. Each process uses a
+/// private PID subdirectory so concurrent pi processes never share files.
+pub(crate) const BASH_SPILL_DIR_NAME: &str = "pi-rs-bash";
+
+/// Process-wide registry of detached (success-path) spill files for THIS
+/// process only. Detached paths are registered on take and removed on
+/// explicit cleanup or [`cleanup_all_bash_spills`].
+///
+/// Multi-session note: this registry is process-scoped. A Session Drop must
+/// NOT call [`cleanup_all_bash_spills`] (that would delete other live
+/// sessions' paths). Session should track the paths it published and call
+/// [`cleanup_full_output_path`] per path; Application/process exit calls
+/// [`cleanup_all_bash_spills`].
+static SPILL_REGISTRY: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn register_spill_path(path: &str) {
+    if !path.is_empty() {
+        SPILL_REGISTRY.lock().insert(path.to_owned());
+    }
+}
+
+fn unregister_spill_path(path: &str) {
+    if !path.is_empty() {
+        SPILL_REGISTRY.lock().remove(path);
+    }
+}
+
+/// Absolute path of this process's private spill directory
+/// (`$TMPDIR/pi-rs-bash/<pid>/`). Concurrent pi processes never share files.
+pub fn bash_spill_dir() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(BASH_SPILL_DIR_NAME)
+        .join(std::process::id().to_string())
+}
+
+/// Removes one detached spill file and unregisters it. Idempotent.
+/// Safe for per-Session cleanup of paths that Session published.
+pub fn cleanup_full_output_path(path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    unregister_spill_path(path);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Drains every spill path registered by THIS process. Does NOT sweep the
+/// spill directory on disk (that would delete other live pi processes' files
+/// under a shared parent, and other live Sessions' files under this PID).
+///
+/// Call from Application/process exit only — not from per-Session Drop.
+/// Session Drop should call [`cleanup_full_output_path`] for paths it owns.
+pub fn cleanup_all_bash_spills() {
+    let paths: Vec<String> = {
+        let mut reg = SPILL_REGISTRY.lock();
+        reg.drain().collect()
+    };
+    for path in paths {
+        let _ = std::fs::remove_file(&path);
+    }
+}
 
 /// Hard cap on the bytes written to the full-output temp file. Bounds per-command
 /// disk usage so a runaway command cannot exhaust the disk; the in-memory
@@ -235,7 +300,7 @@ impl OutputAccumulator {
         // Contained, pi-rs-owned temp dir so spill files are isolated and the
         // application can clean the whole dir on shutdown. Create lazily; if the
         // dir is unavailable we degrade to the bounded tail (no full-output path).
-        let dir = std::env::temp_dir().join("pi-rs-bash");
+        let dir = bash_spill_dir();
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
@@ -285,7 +350,14 @@ impl OutputAccumulator {
     pub(crate) fn take_temp_file(&mut self) -> Option<String> {
         self.temp_file = None;
         let path = std::mem::take(&mut self.temp_file_path);
-        (!path.is_empty()).then_some(path)
+        if path.is_empty() {
+            None
+        } else {
+            // Register so Application/Session (or cleanup_all_bash_spills) can
+            // drain success-path leaks on shutdown.
+            register_spill_path(&path);
+            Some(path)
+        }
     }
 }
 
@@ -386,7 +458,29 @@ mod tests {
         assert_eq!(taken.as_deref(), Some(path.as_str()));
         drop(acc);
         assert!(std::path::Path::new(&path).exists(), "detached file must survive Drop");
-        let _ = std::fs::remove_file(&path);
+        // Detached path is registered; explicit cleanup removes + unregisters.
+        cleanup_full_output_path(&path);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn cleanup_all_bash_spills_drains_registry() {
+        let mut a = OutputAccumulator::new(0, 10, "pi-test-reg-a");
+        let mut b = OutputAccumulator::new(0, 10, "pi-test-reg-b");
+        a.append(b"12345678901234567890\n");
+        b.append(b"12345678901234567890\n");
+        let pa = a.snapshot(true).full_output_path;
+        let pb = b.snapshot(true).full_output_path;
+        assert!(!pa.is_empty() && !pb.is_empty());
+        let _ = a.take_temp_file();
+        let _ = b.take_temp_file();
+        drop(a);
+        drop(b);
+        assert!(std::path::Path::new(&pa).exists());
+        assert!(std::path::Path::new(&pb).exists());
+        cleanup_all_bash_spills();
+        assert!(!std::path::Path::new(&pa).exists(), "cleanup_all must drain registered path a");
+        assert!(!std::path::Path::new(&pb).exists(), "cleanup_all must drain registered path b");
     }
 
     #[test]

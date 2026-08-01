@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use pi_agent::ThinkingLevel;
+use pi_ai::Model;
 
 use crate::resources::CONFIG_DIR_NAME;
+use crate::settings::{AgentRuntimeSettings, Settings};
 
 const MAX_AGENT_NAME_LENGTH: usize = 64;
 const MAX_AGENT_DESCRIPTION_LENGTH: usize = 1024;
@@ -53,7 +55,7 @@ impl AgentDiscoveryOptions {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentCatalog {
     agents: Vec<AgentDefinition>,
 }
@@ -118,6 +120,318 @@ impl AgentCatalog {
     pub fn is_empty(&self) -> bool {
         self.agents.is_empty()
     }
+}
+
+/// Why a child session model was chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentModelSource {
+    /// Explicit `settings.agents.<name>.model` override.
+    SettingsOverride,
+    /// First matching entry from the agent definition `model` list.
+    DefinitionFallback,
+    /// Parent session model when no override/list match exists.
+    Parent,
+}
+
+/// Resolved child-session model plus the precedence tier that produced it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedAgentModel {
+    pub model: Model,
+    pub source: AgentModelSource,
+    /// Pattern that matched when source is SettingsOverride or DefinitionFallback.
+    pub matched_pattern: Option<String>,
+    /// Thinking level parsed from a model suffix such as `:high` or `:max`.
+    pub thinking_level: Option<ThinkingLevel>,
+}
+
+/// Actionable error when a disabled agent is requested for spawn.
+pub fn agent_disabled_error(name: &str) -> anyhow::Error {
+    anyhow!(
+        "agent `{name}` is disabled in settings; enable it with /agents or settings.agents.{name}.enabled"
+    )
+}
+
+/// Effective child-tool allow-list after applying the canonical settings override.
+#[must_use]
+pub fn effective_agent_tool_names<'a>(
+    definition: &'a AgentDefinition,
+    settings: Option<&'a AgentRuntimeSettings>,
+) -> Option<&'a [String]> {
+    settings
+        .and_then(AgentRuntimeSettings::tools_override)
+        .or(definition.tools.as_deref())
+}
+
+/// Unsupported tools requested by an agent's effective child-tool allow-list.
+#[must_use]
+pub fn unsupported_agent_tools(
+    definition: &AgentDefinition,
+    settings: Option<&AgentRuntimeSettings>,
+) -> Vec<String> {
+    effective_agent_tool_names(definition, settings)
+        .into_iter()
+        .flatten()
+        .filter(|tool| {
+            !matches!(tool.as_str(), "todo" | "process" | "task" | "hub" | "goal")
+                && !crate::TOOL_NAMES.contains(&tool.as_str())
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Actionable error when an agent requests child tools this runtime cannot provide.
+pub fn agent_unsupported_tools_error(name: &str, unsupported: &[String]) -> anyhow::Error {
+    anyhow!(
+        "agent `{name}` is unavailable because it requests unsupported child tools: {}; remove those tools from the agent definition or settings.agents.{name}.tools; supported child tools: {}",
+        unsupported.join(", "),
+        crate::TOOL_NAMES.join(", "),
+    )
+}
+
+/// Actionable error when an agent has an invalid model configuration.
+pub fn agent_model_error(name: &str, error: &anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "agent `{name}` is unavailable because its model configuration is invalid: {error}; choose a valid model with /agents or settings.agents.{name}.model"
+    )
+}
+
+/// Whether `name` may be spawned given effective settings. Missing entries default to enabled.
+#[must_use]
+pub fn is_agent_enabled(name: &str, settings: &Settings) -> bool {
+    settings.is_agent_enabled(name)
+}
+
+/// Filter agent definitions to those enabled and compatible with this runtime.
+#[must_use]
+pub fn enabled_agent_definitions<'a>(
+    agents: &'a [AgentDefinition],
+    agent_settings: &std::collections::BTreeMap<String, AgentRuntimeSettings>,
+) -> Vec<&'a AgentDefinition> {
+    let available = available_models();
+    let parent_model = Model::default();
+    agents
+        .iter()
+        .filter(|agent| {
+            let settings = agent_settings.get(&agent.name);
+            settings.map_or(true, AgentRuntimeSettings::is_enabled)
+                && agent_compatibility_error(agent, settings, &parent_model, &available).is_none()
+        })
+        .collect()
+}
+
+/// Whether an agent is compatible with the runtime's supported tools and model catalog.
+#[must_use]
+pub fn agent_compatibility_error(
+    definition: &AgentDefinition,
+    settings: Option<&AgentRuntimeSettings>,
+    parent_model: &Model,
+    available: &[Model],
+) -> Option<anyhow::Error> {
+    let unsupported = unsupported_agent_tools(definition, settings);
+    if !unsupported.is_empty() {
+        return Some(agent_unsupported_tools_error(&definition.name, &unsupported));
+    }
+    resolve_agent_model(definition, settings, parent_model, available)
+        .err()
+        .map(|error| agent_model_error(&definition.name, &error))
+}
+
+
+/// Resolve the model a child session should use.
+///
+/// Precedence:
+/// 1. settings override (`settings.agents.<name>.model`)
+/// 2. first matching entry in `definition.model`
+/// 3. parent session model
+///
+/// An explicit settings override is an operator request, not a fallback hint, so
+/// an invalid override is rejected instead of silently using the definition or
+/// parent model.
+pub fn resolve_agent_model(
+    definition: &AgentDefinition,
+    agent_settings: Option<&AgentRuntimeSettings>,
+    parent_model: &Model,
+    available: &[Model],
+) -> Result<ResolvedAgentModel> {
+    if let Some(pattern) = agent_settings.and_then(AgentRuntimeSettings::model_override) {
+        let (model_pattern, thinking_level) = split_agent_model_thinking_suffix(pattern);
+        let model = match_model_pattern(model_pattern, available, parent_model).map_err(|error| {
+            anyhow!(
+                "settings.agents.{}.model override {}: {error}",
+                definition.name,
+                pattern,
+            )
+        })?;
+        return Ok(ResolvedAgentModel {
+            model,
+            source: AgentModelSource::SettingsOverride,
+            matched_pattern: Some(pattern.to_owned()),
+            thinking_level,
+        });
+    }
+
+    if let Some(patterns) = definition.model.as_ref() {
+        for pattern in patterns {
+            let pattern = pattern.trim();
+            if pattern.is_empty() {
+                continue;
+            }
+            let (model_pattern, thinking_level) = split_agent_model_thinking_suffix(pattern);
+            match match_model_pattern(model_pattern, available, parent_model) {
+                Ok(model) => {
+                    return Ok(ResolvedAgentModel {
+                        model,
+                        source: AgentModelSource::DefinitionFallback,
+                        matched_pattern: Some(pattern.to_owned()),
+                        thinking_level,
+                    });
+                }
+                Err(error) if error.to_string().contains("ambiguous") => {
+                    return Err(anyhow!(
+                        "agent {:?} model list pattern {}: {error}",
+                        definition.name,
+                        pattern
+                    ));
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Ok(ResolvedAgentModel {
+        model: parent_model.clone(),
+        source: AgentModelSource::Parent,
+        matched_pattern: None,
+        thinking_level: None,
+    })
+}
+
+/// Convenience wrapper that pulls the agent entry from effective [`Settings`].
+pub fn resolve_agent_model_from_settings(
+    definition: &AgentDefinition,
+    settings: &Settings,
+    parent_model: &Model,
+    available: &[Model],
+) -> Result<ResolvedAgentModel> {
+    resolve_agent_model(
+        definition,
+        settings.agent_settings(&definition.name),
+        parent_model,
+        available,
+    )
+}
+
+pub(crate) fn available_models() -> Vec<Model> {
+    let mut providers = pi_ai::get_providers();
+    providers.sort();
+    let mut available = Vec::new();
+    for provider in providers {
+        let mut models = pi_ai::get_models(&provider);
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        available.extend(models);
+    }
+    available
+}
+
+fn split_agent_model_thinking_suffix(pattern: &str) -> (&str, Option<ThinkingLevel>) {
+    let trimmed = pattern.trim();
+    let Some((model, suffix)) = trimmed.rsplit_once(':') else {
+        return (trimmed, None);
+    };
+    let thinking_level = match suffix.to_ascii_lowercase().as_str() {
+        "off" => ThinkingLevel::Off,
+        "minimal" => ThinkingLevel::Minimal,
+        "low" => ThinkingLevel::Low,
+        "medium" => ThinkingLevel::Medium,
+        "high" => ThinkingLevel::High,
+        "xhigh" | "max" => ThinkingLevel::Xhigh,
+        _ => return (trimmed, None),
+    };
+    (model, Some(thinking_level))
+}
+
+fn match_model_pattern(pattern: &str, available: &[Model], parent_model: &Model) -> Result<Model> {
+    if let Some(model) = find_matching_model(pattern, available)? {
+        return Ok(model);
+    }
+    // Keep parent when the pattern literally names the parent even if the catalog
+    // is empty or filtered (tests and offline child factories).
+    if model_matches_pattern(parent_model, pattern) {
+        return Ok(parent_model.clone());
+    }
+    // When a catalog was supplied, do not invent models for unmatched patterns —
+    // settings overrides must fail fast instead of silently materialising junk.
+    if !available.is_empty() {
+        bail!(
+            "did not match an available model; use /models or --list-models to inspect valid models"
+        );
+    }
+    // Empty catalog (offline/tests): materialise provider/id via global resolver.
+    crate::resolve_model(pattern).map_err(|error| anyhow!("{error}"))
+}
+
+/// Unique catalog match for `pattern`, or an actionable ambiguity error.
+fn find_matching_model(pattern: &str, available: &[Model]) -> Result<Option<Model>> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    // Prefer exact provider/id uniqueness first.
+    let exact = available
+        .iter()
+        .filter(|model| model_id(model).eq_ignore_ascii_case(pattern))
+        .cloned()
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [single] => return Ok(Some(single.clone())),
+        [] => {}
+        many => {
+            let ids = many.iter().map(model_id).collect::<Vec<_>>().join(", ");
+            bail!(
+                "is ambiguous (exact id matches: {ids}); use a unique provider/id"
+            );
+        }
+    }
+    let matches = available
+        .iter()
+        .filter(|model| model_matches_pattern(model, pattern))
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [single] => Ok(Some(single.clone())),
+        many => {
+            let ids = many.iter().map(model_id).collect::<Vec<_>>().join(", ");
+            bail!(
+                "is ambiguous (matches: {ids}); use provider/id to select exactly one model"
+            );
+        }
+    }
+}
+
+#[must_use]
+pub fn model_id(model: &Model) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
+#[must_use]
+pub fn model_matches_pattern(model: &Model, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    let full = model_id(model);
+    if full.eq_ignore_ascii_case(pattern) || model.id.eq_ignore_ascii_case(pattern) {
+        return true;
+    }
+    if let Some((provider, id)) = pattern.split_once('/') {
+        return model.provider.eq_ignore_ascii_case(provider.trim())
+            && model.id.eq_ignore_ascii_case(id.trim());
+    }
+    // Provider-only / bare patterns may match multiple models; callers must treat multi-match as error.
+    model.provider.eq_ignore_ascii_case(pattern)
 }
 
 fn bundled_agents() -> Vec<AgentDefinition> {
@@ -439,5 +753,220 @@ mod size_tests {
         }
         let error = AgentCatalog::discover(&AgentDiscoveryOptions::new(root.path(), root.path())).expect_err("aggregate rejected").to_string();
         assert!(error.contains("catalog exceeds maximum size"));
+    }
+}
+
+
+#[cfg(test)]
+mod model_resolution_tests {
+    use super::*;
+    use crate::settings::AgentRuntimeSettings;
+
+    fn model(provider: &str, id: &str) -> Model {
+        Model {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: id.to_owned(),
+            ..Model::default()
+        }
+    }
+
+    fn def(name: &str, models: Option<Vec<&str>>) -> AgentDefinition {
+        AgentDefinition {
+            name: name.to_owned(),
+            description: "d".to_owned(),
+            system_prompt: "p".to_owned(),
+            tools: Some(vec!["read".to_owned()]),
+            autoload_skills: vec!["rust".to_owned()],
+            model: models.map(|values| values.into_iter().map(str::to_owned).collect()),
+            thinking_level: Some(ThinkingLevel::Low),
+            source: AgentDefinitionSource::Bundled,
+            path: None,
+            trusted: true,
+        }
+    }
+
+    #[test]
+    fn settings_override_parses_max_thinking_suffix() {
+        let parent = model("openai", "gpt-4.1");
+        let available = vec![model("cliproxy", "gpt-5.6-sol")];
+        let definition = def("coordinate", None);
+        let settings = AgentRuntimeSettings {
+            enabled: Some(true),
+            model: Some("cliproxy/gpt-5.6-sol:max".to_owned()),
+            tools: None,
+        };
+        let resolved = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+            .expect("valid model with max suffix must resolve");
+        assert_eq!(resolved.model.provider, "cliproxy");
+        assert_eq!(resolved.model.id, "gpt-5.6-sol");
+        assert_eq!(resolved.thinking_level, Some(ThinkingLevel::Xhigh));
+        assert_eq!(
+            resolved.matched_pattern.as_deref(),
+            Some("cliproxy/gpt-5.6-sol:max"),
+        );
+    }
+
+    #[test]
+    fn settings_override_beats_definition_and_parent() {
+        let parent = model("openai", "gpt-4.1");
+        let available = vec![
+            model("anthropic", "claude-sonnet-4-5"),
+            model("openai", "gpt-4.1"),
+            model("google", "gemini-2.5-pro"),
+        ];
+        let definition = def("reviewer", Some(vec!["google/gemini-2.5-pro"]));
+        let settings = AgentRuntimeSettings {
+            enabled: Some(true),
+            model: Some("anthropic/claude-sonnet-4-5".to_owned()),
+                tools: None,
+            };
+        let resolved = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+            .expect("settings override must resolve");
+        assert_eq!(resolved.source, AgentModelSource::SettingsOverride);
+        assert_eq!(resolved.model.provider, "anthropic");
+        assert_eq!(resolved.model.id, "claude-sonnet-4-5");
+        assert_eq!(resolved.matched_pattern.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn definition_fallback_list_selects_first_available() {
+        let parent = model("openai", "gpt-4.1");
+        let available = vec![
+            model("openai", "gpt-4.1"),
+            model("anthropic", "claude-sonnet-4-5"),
+        ];
+        let definition = def(
+            "reviewer",
+            Some(vec!["missing/model", "anthropic/claude-sonnet-4-5", "openai/gpt-4.1"]),
+        );
+        let resolved = resolve_agent_model(&definition, None, &parent, &available)
+            .expect("definition fallback must resolve");
+        assert_eq!(resolved.source, AgentModelSource::DefinitionFallback);
+        assert_eq!(resolved.model.provider, "anthropic");
+        assert_eq!(resolved.matched_pattern.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn parent_model_used_when_no_override_or_match() {
+        let parent = model("openai", "gpt-4.1");
+        let available = vec![model("anthropic", "claude-sonnet-4-5")];
+        let definition = def("task", Some(vec!["missing/one", "missing/two"]));
+        let resolved = resolve_agent_model(&definition, None, &parent, &available)
+            .expect("parent fallback must resolve");
+        assert_eq!(resolved.source, AgentModelSource::Parent);
+        assert_eq!(resolved.model.id, "gpt-4.1");
+        assert!(resolved.matched_pattern.is_none());
+    }
+
+    #[test]
+    fn disabled_error_is_actionable() {
+        let error = agent_disabled_error("reviewer").to_string();
+        assert!(error.contains("disabled"));
+        assert!(error.contains("/agents"));
+        assert!(error.contains("reviewer"));
+    }
+
+    #[test]
+    fn is_agent_enabled_defaults_true() {
+        let mut settings = Settings::default();
+        assert!(is_agent_enabled("task", &settings));
+        settings.set_agent_settings(
+            "task",
+            AgentRuntimeSettings {
+                enabled: Some(false),
+                model: None,
+                tools: None,
+            },
+        );
+        assert!(!is_agent_enabled("task", &settings));
+    }
+
+    #[test]
+    fn ambiguous_provider_pattern_is_rejected() {
+        let parent = model("openai", "gpt-4.1");
+        let available = vec![
+            model("openai", "gpt-4.1"),
+            model("openai", "gpt-4.1-mini"),
+            model("anthropic", "claude-sonnet-4-5"),
+        ];
+        let definition = def("reviewer", None);
+        let settings = AgentRuntimeSettings {
+            enabled: Some(true),
+            model: Some("openai".to_owned()),
+                tools: None,
+            };
+        let error = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+            .expect_err("provider-only multi-match must fail");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(message.contains("openai/gpt-4.1"), "{message}");
+    }
+
+    #[test]
+    fn ambiguous_bare_id_pattern_is_rejected() {
+        let parent = model("other", "x");
+        let available = vec![
+            model("openai", "shared-id"),
+            model("anthropic", "shared-id"),
+        ];
+        let definition = def("reviewer", Some(vec!["shared-id"]));
+        let error = resolve_agent_model(&definition, None, &parent, &available)
+            .expect_err("bare id multi-match must fail");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(message.contains("provider/id"), "{message}");
+    }
+
+    #[test]
+    fn exact_provider_id_still_unique_among_siblings() {
+        let parent = model("openai", "gpt-4.1");
+        let available = vec![
+            model("openai", "gpt-4.1"),
+            model("openai", "gpt-4.1-mini"),
+        ];
+        let definition = def("reviewer", None);
+        let settings = AgentRuntimeSettings {
+            enabled: Some(true),
+            model: Some("openai/gpt-4.1-mini".to_owned()),
+                tools: None,
+            };
+        let resolved = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+            .expect("exact provider/id must resolve");
+        assert_eq!(resolved.model.id, "gpt-4.1-mini");
+    }
+
+    #[test]
+    fn enabled_agent_definitions_filters_disabled() {
+        let agents = vec![def("task", None), def("reviewer", None)];
+        let mut settings = std::collections::BTreeMap::new();
+        settings.insert(
+            "reviewer".to_owned(),
+            AgentRuntimeSettings {
+                enabled: Some(false),
+                model: None,
+                tools: None,
+            },
+        );
+        let enabled = enabled_agent_definitions(&agents, &settings);
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].name, "task");
+    }
+
+    #[test]
+    fn settings_override_unknown_pattern_is_rejected() {
+        let parent = model("openai", "gpt-4.1");
+        let available = vec![model("anthropic", "claude-sonnet-4-5")];
+        let definition = def("reviewer", Some(vec!["anthropic/claude-sonnet-4-5"]));
+        let settings = AgentRuntimeSettings {
+            enabled: Some(true),
+            model: Some("totally-missing/model".to_owned()),
+                tools: None,
+            };
+        let error = resolve_agent_model(&definition, Some(&settings), &parent, &available)
+            .expect_err("invalid settings override must not fall through");
+        let message = error.to_string();
+        assert!(message.contains("settings.agents.reviewer.model"), "{message}");
+        assert!(message.contains("totally-missing/model"), "{message}");
     }
 }

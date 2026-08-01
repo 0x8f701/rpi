@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
@@ -322,16 +323,19 @@ async fn stream_assistant_response(
                 .await?;
             }
             AssistantMessageEvent::Done { message, .. } => {
+                let message =
+                    normalize_terminal_assistant_message(context, message, added_partial);
                 replace_or_append_assistant(context, message.clone(), added_partial);
-                emit_assistant_completion(message, added_partial, emit.clone()).await?;
-                return Ok(message.clone());
+                emit_assistant_completion(&message, added_partial, emit.clone()).await?;
+                return Ok(message);
             }
             AssistantMessageEvent::Error { error, .. } => {
+                let error = normalize_terminal_assistant_message(context, error, added_partial);
                 replace_or_append_assistant(context, error.clone(), added_partial);
-                let _listener_error = emit_assistant_completion(error, added_partial, emit.clone())
+                let _listener_error = emit_assistant_completion(&error, added_partial, emit.clone())
                     .await
                     .err();
-                return Ok(error.clone());
+                return Ok(error);
             }
             _ => {
                 if let Some(partial) = event.partial() {
@@ -350,6 +354,7 @@ async fn stream_assistant_response(
         .result()
         .await
         .ok_or_else(|| anyhow!("assistant stream ended without a final message"))?;
+    let message = normalize_terminal_assistant_message(context, &message, added_partial);
     replace_or_append_assistant(context, message.clone(), added_partial);
     let completion = emit_assistant_completion(&message, added_partial, emit).await;
     if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -845,6 +850,175 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+
+const SYNTHESIZED_TOOL_CALL_ID_LEN: usize = 9;
+
+/// Normalize tool-call IDs on a terminal assistant message before it is stored,
+/// emitted as completion/MessageEnd, used for tool execution, or returned.
+///
+/// Empty IDs and duplicates (within the message or against prior assistant
+/// messages in context) are replaced with deterministic 9-char alphanumeric
+/// IDs (`p` + 8 base36 chars). Unique nonempty provider IDs are preserved.
+/// Partial streaming updates may remain raw.
+fn normalize_terminal_assistant_message(
+    context: &AgentContext,
+    message: &AssistantMessage,
+    exclude_trailing_partial: bool,
+) -> AssistantMessage {
+    let prior_messages = prior_context_messages(&context.messages, exclude_trailing_partial);
+    let mut used = collect_prior_tool_call_ids(prior_messages);
+    // Ordinal/length exclude the in-flight partial so synthesis stays stable
+    // whether Start already pushed a placeholder assistant or not.
+    let assistant_ordinal = prior_messages
+        .iter()
+        .filter(|message| matches!(message, Message::Assistant(_)))
+        .count();
+    let context_len = prior_messages.len();
+    let mut normalized = message.clone();
+
+    for (content_index, block) in normalized.content.iter_mut().enumerate() {
+        let ContentBlock::ToolCall(call) = block else {
+            continue;
+        };
+        let original_id = call.id.clone();
+        if !original_id.is_empty() && used.insert(original_id.clone()) {
+            continue;
+        }
+        let mut probe = 0u64;
+        let synthesized = loop {
+            let candidate = synthesize_tool_call_id(
+                assistant_ordinal,
+                context_len,
+                message.timestamp,
+                content_index,
+                &call.name,
+                &original_id,
+                probe,
+            );
+            if used.insert(candidate.clone()) {
+                break candidate;
+            }
+            probe = probe.saturating_add(1);
+        };
+        call.id = synthesized;
+    }
+
+    normalized
+}
+
+fn prior_context_messages(
+    messages: &[AgentMessage],
+    exclude_trailing_partial: bool,
+) -> &[AgentMessage] {
+    if exclude_trailing_partial && !messages.is_empty() {
+        &messages[..messages.len() - 1]
+    } else {
+        messages
+    }
+}
+
+fn collect_prior_tool_call_ids(messages: &[AgentMessage]) -> HashSet<String> {
+    let mut used = HashSet::new();
+    for message in messages {
+        match message {
+            Message::Assistant(assistant) => {
+                for block in &assistant.content {
+                    if let ContentBlock::ToolCall(call) = block {
+                        if !call.id.is_empty() {
+                            used.insert(call.id.clone());
+                        }
+                    }
+                }
+            }
+            Message::ToolResult(result) => {
+                if !result.tool_call_id.is_empty() {
+                    used.insert(result.tool_call_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    used
+}
+
+fn synthesize_tool_call_id(
+    assistant_ordinal: usize,
+    context_len: usize,
+    timestamp: i64,
+    content_index: usize,
+    tool_name: &str,
+    original_id: &str,
+    probe: u64,
+) -> String {
+    let mut hasher = Fnv1a64::new();
+    hasher.write_u64(assistant_ordinal as u64);
+    hasher.write_u64(context_len as u64);
+    hasher.write_i64(timestamp);
+    hasher.write_u64(content_index as u64);
+    hasher.write_str(tool_name);
+    hasher.write_str(original_id);
+    hasher.write_u64(probe);
+    let digest = hasher.finish();
+    let mut id = String::with_capacity(SYNTHESIZED_TOOL_CALL_ID_LEN);
+    id.push('p');
+    append_base36_fixed(&mut id, digest);
+    debug_assert_eq!(id.len(), SYNTHESIZED_TOOL_CALL_ID_LEN);
+    debug_assert!(id.chars().all(|ch| ch.is_ascii_alphanumeric()));
+    id
+}
+
+fn append_base36_fixed(out: &mut String, mut value: u64) {
+    // Exactly 8 base36 digits → `p` + 8 = 9-char Mistral-safe IDs.
+    let mut digits = [b'0'; 8];
+    for slot in digits.iter_mut().rev() {
+        let digit = (value % 36) as u8;
+        *slot = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
+        value /= 36;
+    }
+    out.push_str(std::str::from_utf8(&digits).expect("base36 digits are ASCII"));
+}
+
+/// Fixed FNV-1a 64-bit hasher for cross-process / cross-Rust-version stability.
+struct Fnv1a64 {
+    state: u64,
+}
+
+impl Fnv1a64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x100_0000_01b3;
+
+    fn new() -> Self {
+        Self { state: Self::OFFSET }
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state ^= u64::from(*byte);
+            self.state = self.state.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn write_str(&mut self, value: &str) {
+        self.write_u64(value.len() as u64);
+        self.write_bytes(value.as_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write_bytes(&value.to_le_bytes());
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.write_u64(value as u64);
+    }
+
+    fn finish(self) -> u64 {
+        self.state
+    }
+}
 fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let duration = SystemTime::now()

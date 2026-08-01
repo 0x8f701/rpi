@@ -6,9 +6,9 @@ use std::{
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 use pi_coding::{
-    ExtensionCancellation, ExtensionFuture, ExtensionInstanceId, ExtensionUiContext,
-    ExtensionUiHost, ExtensionUiRequest, ExtensionUiResponse, UiNotificationLevel,
-    UiWidgetPlacement,
+    ExtensionCancellation, ExtensionFuture, ExtensionInstanceId, ExtensionThemeDescriptor,
+    ExtensionUiContext, ExtensionUiHost, ExtensionUiRequest, ExtensionUiResponse,
+    UiNotificationLevel, UiWidgetPlacement, WorkingIndicatorOptions,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot};
@@ -63,6 +63,20 @@ pub struct ExtensionUiSnapshot {
     pub title: Option<String>,
     #[serde(default)]
     pub editor_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_message: Option<String>,
+    #[serde(default)]
+    pub working_visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_indicator: Option<WorkingIndicatorOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_thinking_label: Option<String>,
+    #[serde(default)]
+    pub themes: Vec<ExtensionThemeDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_theme: Option<String>,
+    #[serde(default)]
+    pub tools_expanded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +109,30 @@ pub enum ExtensionUiEvent {
     EditorTextChanged {
         instance: ExtensionInstanceId,
         text: String,
+    },
+    WorkingMessageChanged {
+        instance: ExtensionInstanceId,
+        message: Option<String>,
+    },
+    WorkingVisibilityChanged {
+        instance: ExtensionInstanceId,
+        visible: bool,
+    },
+    WorkingIndicatorChanged {
+        instance: ExtensionInstanceId,
+        options: Option<WorkingIndicatorOptions>,
+    },
+    HiddenThinkingLabelChanged {
+        instance: ExtensionInstanceId,
+        label: Option<String>,
+    },
+    ThemeChanged {
+        instance: ExtensionInstanceId,
+        name: String,
+    },
+    ToolsExpandedChanged {
+        instance: ExtensionInstanceId,
+        expanded: bool,
     },
     ExtensionCleared {
         instance: ExtensionInstanceId,
@@ -130,7 +168,15 @@ struct AdapterState {
     widgets: BTreeMap<(ExtensionInstanceId, String), ExtensionWidgetItem>,
     notifications: VecDeque<ExtensionNotification>,
     title: Option<(ExtensionInstanceId, String)>,
-    editor_text: String,
+    editor_text: Option<(ExtensionInstanceId, String)>,
+    working_message: Option<(ExtensionInstanceId, Option<String>)>,
+    working_visible: Option<(ExtensionInstanceId, bool)>,
+    working_indicator: Option<(ExtensionInstanceId, Option<WorkingIndicatorOptions>)>,
+    hidden_thinking_label: Option<(ExtensionInstanceId, Option<String>)>,
+    themes: Vec<ExtensionThemeDescriptor>,
+    active_theme: Option<(ExtensionInstanceId, String)>,
+    tools_expanded: Option<(ExtensionInstanceId, bool)>,
+    canonical_queries_supported: bool,
 }
 
 struct PendingInteraction {
@@ -143,9 +189,13 @@ impl ExtensionUiAdapter {
     #[must_use]
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(UI_EVENT_BUFFER);
+        let state = AdapterState {
+            canonical_queries_supported: true,
+            ..AdapterState::default()
+        };
         Self {
             inner: Arc::new(AdapterInner {
-                state: Mutex::new(AdapterState::default()),
+                state: Mutex::new(state),
                 pending: Mutex::new(HashMap::new()),
                 events,
             }),
@@ -173,8 +223,67 @@ impl ExtensionUiAdapter {
             widgets: state.widgets.values().cloned().collect(),
             notifications: state.notifications.iter().cloned().collect(),
             title: state.title.as_ref().map(|(_, title)| title.clone()),
-            editor_text: state.editor_text.clone(),
+            editor_text: state
+                .editor_text
+                .as_ref()
+                .map_or_else(String::new, |(_, text)| text.clone()),
+            working_message: state
+                .working_message
+                .as_ref()
+                .and_then(|(_, message)| message.clone()),
+            working_visible: state
+                .working_visible
+                .as_ref()
+                .is_some_and(|(_, visible)| *visible),
+            working_indicator: state
+                .working_indicator
+                .as_ref()
+                .and_then(|(_, options)| options.clone()),
+            hidden_thinking_label: state
+                .hidden_thinking_label
+                .as_ref()
+                .and_then(|(_, label)| label.clone()),
+            themes: state.themes.clone(),
+            active_theme: state.active_theme.as_ref().map(|(_, name)| name.clone()),
+            tools_expanded: state
+                .tools_expanded
+                .as_ref()
+                .is_some_and(|(_, expanded)| *expanded),
         }
+    }
+
+    /// Replaces the canonical theme catalog supplied by the real host.
+    pub fn set_themes(&self, themes: Vec<ExtensionThemeDescriptor>) {
+        self.inner.state.lock().themes = themes;
+    }
+
+    /// Sets the canonical active theme supplied by the real host. Extension
+    /// writes remain owner-scoped so cleanup cannot erase another extension's
+    /// later theme selection.
+    pub fn set_active_theme(&self, name: Option<String>) {
+        let mut state = self.inner.state.lock();
+        state.active_theme = name.map(|name| (host_instance(), name));
+    }
+
+    /// Publishes the host editor buffer so `GetEditorText` reads authoritative
+    /// TUI state instead of a shadow default.
+    pub fn set_host_editor_text(&self, text: impl Into<String>) {
+        let mut state = self.inner.state.lock();
+        state.editor_text = Some((host_instance(), text.into()));
+    }
+
+    /// Publishes the host tool-expansion flag so `GetToolsExpanded` reads the
+    /// live TUI reducer value.
+    pub fn set_host_tools_expanded(&self, expanded: bool) {
+        let mut state = self.inner.state.lock();
+        state.tools_expanded = Some((host_instance(), expanded));
+    }
+
+    /// Controls whether queries can be answered from state bound to the real
+    /// host. RPC disables this because its adapter otherwise only sees its own
+    /// extension-originated events.
+    pub fn set_canonical_queries_supported(&self, supported: bool) {
+        self.inner.state.lock().canonical_queries_supported = supported;
     }
 
     #[must_use]
@@ -267,9 +376,24 @@ impl ExtensionUiHost for NonInteractiveExtensionUiHost {
                 ))
             });
         }
+        if matches!(
+            request,
+            ExtensionUiRequest::GetEditorText
+                | ExtensionUiRequest::GetAllThemes
+                | ExtensionUiRequest::GetTheme { .. }
+                | ExtensionUiRequest::SetTheme { .. }
+                | ExtensionUiRequest::GetToolsExpanded
+        ) {
+            return Box::pin(async move {
+                Err(anyhow!(
+                    "extension UI request {:?} requires canonical interactive host state",
+                    request.capability()
+                ))
+            });
+        }
         self.adapter.request(context, request, cancellation)
-    }
 
+    }
     fn clear_extension(&self, instance: ExtensionInstanceId) -> ExtensionFuture<'_, Result<()>> {
         self.adapter.clear_extension(instance)
     }
@@ -288,6 +412,20 @@ impl ExtensionUiHost for ExtensionUiAdapter {
                 return Ok(ExtensionUiResponse::Cancelled);
             }
             if !request.is_interactive() {
+                let canonical_query = matches!(
+                    request,
+                    ExtensionUiRequest::GetEditorText
+                        | ExtensionUiRequest::GetAllThemes
+                        | ExtensionUiRequest::GetTheme { .. }
+                        | ExtensionUiRequest::SetTheme { .. }
+                        | ExtensionUiRequest::GetToolsExpanded
+                );
+                if canonical_query && !inner.state.lock().canonical_queries_supported {
+                    return Err(anyhow!(
+                        "extension UI request {:?} requires canonical host state",
+                        request.capability()
+                    ));
+                }
                 return apply_action(&inner, context, request);
             }
 
@@ -358,19 +496,42 @@ impl ExtensionUiHost for ExtensionUiAdapter {
                 let mut state = inner.state.lock();
                 state.statuses.retain(|(owner, _), _| owner != &instance);
                 state.widgets.retain(|(owner, _), _| owner != &instance);
-                if state
-                    .title
-                    .as_ref()
-                    .is_some_and(|(owner, _)| owner == &instance)
-                {
-                    state.title = None;
-                }
+                state
+                    .notifications
+                    .retain(|notification| notification.instance != instance);
+                clear_if_owned(&mut state.title, &instance);
+                clear_if_owned(&mut state.editor_text, &instance);
+                clear_if_owned(&mut state.working_message, &instance);
+                clear_if_owned(&mut state.working_visible, &instance);
+                clear_if_owned(&mut state.working_indicator, &instance);
+                clear_if_owned(&mut state.hidden_thinking_label, &instance);
+                clear_if_owned(&mut state.active_theme, &instance);
+                clear_if_owned(&mut state.tools_expanded, &instance);
             }
             let _ = inner
                 .events
                 .send(ExtensionUiEvent::ExtensionCleared { instance });
             Ok(())
         })
+    }
+}
+
+fn clear_if_owned<T>(
+    value: &mut Option<(ExtensionInstanceId, T)>,
+    instance: &ExtensionInstanceId,
+) {
+    if value
+        .as_ref()
+        .is_some_and(|(owner, _)| owner == instance)
+    {
+        *value = None;
+    }
+}
+
+fn host_instance() -> ExtensionInstanceId {
+    ExtensionInstanceId {
+        extension_id: "host".to_owned(),
+        generation: 0,
     }
 }
 
@@ -452,18 +613,128 @@ fn apply_action(
                 });
             }
         }
+        ExtensionUiRequest::SetEditorText { text } => {
+            inner
+                .state
+                .lock()
+                .editor_text = Some((context.instance.clone(), text.clone()));
+            let _ = inner.events.send(ExtensionUiEvent::EditorTextChanged {
+                instance: context.instance,
+                text,
+            });
+        }
+        ExtensionUiRequest::GetEditorText => {
+            let text = inner
+                .state
+                .lock()
+                .editor_text
+                .as_ref()
+                .map_or_else(String::new, |(_, text)| text.clone());
+            return Ok(ExtensionUiResponse::EditorText { value: text });
+        }
+        ExtensionUiRequest::PasteToEditor { text } => {
+            let updated = {
+                let mut state = inner.state.lock();
+                let current = state
+                    .editor_text
+                    .as_ref()
+                    .map_or_else(String::new, |(_, text)| text.clone());
+                let mut updated = current;
+                updated.push_str(&text);
+                state.editor_text = Some((context.instance.clone(), updated.clone()));
+                updated
+            };
+            let _ = inner.events.send(ExtensionUiEvent::EditorTextChanged {
+                instance: context.instance,
+                text: updated,
+            });
+        }
+        ExtensionUiRequest::SetWorkingMessage { message } => {
+            inner.state.lock().working_message = Some((context.instance.clone(), message.clone()));
+            let _ = inner.events.send(ExtensionUiEvent::WorkingMessageChanged {
+                instance: context.instance,
+                message,
+            });
+        }
+        ExtensionUiRequest::SetWorkingVisible { visible } => {
+            inner.state.lock().working_visible = Some((context.instance.clone(), visible));
+            let _ = inner.events.send(ExtensionUiEvent::WorkingVisibilityChanged {
+                instance: context.instance,
+                visible,
+            });
+        }
+        ExtensionUiRequest::SetWorkingIndicator { options } => {
+            inner.state.lock().working_indicator = Some((context.instance.clone(), options.clone()));
+            let _ = inner.events.send(ExtensionUiEvent::WorkingIndicatorChanged {
+                instance: context.instance,
+                options,
+            });
+        }
+        ExtensionUiRequest::SetHiddenThinkingLabel { label } => {
+            inner.state.lock().hidden_thinking_label = Some((context.instance.clone(), label.clone()));
+            let _ = inner.events.send(ExtensionUiEvent::HiddenThinkingLabelChanged {
+                instance: context.instance,
+                label,
+            });
+        }
+        ExtensionUiRequest::GetAllThemes => {
+            let themes = inner.state.lock().themes.clone();
+            return Ok(ExtensionUiResponse::Themes { themes });
+        }
+        ExtensionUiRequest::GetTheme { name } => {
+            let theme = inner
+                .state
+                .lock()
+                .themes
+                .iter()
+                .find(|candidate| candidate.name == name)
+                .cloned();
+            return Ok(ExtensionUiResponse::Theme { theme });
+        }
+        ExtensionUiRequest::SetTheme { name } => {
+            let accepted = inner
+                .state
+                .lock()
+                .themes
+                .iter()
+                .any(|candidate| candidate.name == name);
+            if !accepted {
+                return Ok(ExtensionUiResponse::ThemeSet {
+                    success: false,
+                    error: Some(format!("unknown or unavailable theme {name:?}")),
+                });
+            }
+            inner.state.lock().active_theme = Some((context.instance.clone(), name.clone()));
+            let _ = inner.events.send(ExtensionUiEvent::ThemeChanged {
+                instance: context.instance,
+                name,
+            });
+            return Ok(ExtensionUiResponse::ThemeSet {
+                success: true,
+                error: None,
+            });
+        }
+        ExtensionUiRequest::GetToolsExpanded => {
+            let expanded = inner
+                .state
+                .lock()
+                .tools_expanded
+                .as_ref()
+                .is_some_and(|(_, expanded)| *expanded);
+            return Ok(ExtensionUiResponse::ToolsExpanded { expanded });
+        }
+        ExtensionUiRequest::SetToolsExpanded { expanded } => {
+            inner.state.lock().tools_expanded = Some((context.instance.clone(), expanded));
+            let _ = inner.events.send(ExtensionUiEvent::ToolsExpandedChanged {
+                instance: context.instance,
+                expanded,
+            });
+        }
         ExtensionUiRequest::Title { title } => {
             inner.state.lock().title = Some((context.instance.clone(), title.clone()));
             let _ = inner.events.send(ExtensionUiEvent::TitleChanged {
                 instance: context.instance,
                 title,
-            });
-        }
-        ExtensionUiRequest::SetEditorText { text } => {
-            inner.state.lock().editor_text.clone_from(&text);
-            let _ = inner.events.send(ExtensionUiEvent::EditorTextChanged {
-                instance: context.instance,
-                text,
             });
         }
         ExtensionUiRequest::Select { .. }
@@ -481,14 +752,18 @@ mod tests {
     use super::*;
     use pi_coding::ExtensionMode;
 
-    fn context() -> ExtensionUiContext {
+    fn context_for(extension_id: &str) -> ExtensionUiContext {
         ExtensionUiContext {
             instance: ExtensionInstanceId {
-                extension_id: "test".to_owned(),
+                extension_id: extension_id.to_owned(),
                 generation: 1,
             },
             mode: ExtensionMode::Print,
         }
+    }
+
+    fn context() -> ExtensionUiContext {
+        context_for("test")
     }
 
     #[tokio::test]
@@ -557,5 +832,409 @@ mod tests {
                 value: Some("Lovelace".to_owned())
             }
         );
+    }
+    #[tokio::test]
+    async fn cleanup_only_removes_state_owned_by_the_cleared_extension() {
+        let adapter = ExtensionUiAdapter::new();
+        let first = context_for("first");
+        let second = context_for("second");
+        adapter.set_themes(vec![ExtensionThemeDescriptor {
+            name: "dark".to_owned(),
+            path: Some("/themes/dark.json".to_owned()),
+        }]);
+
+        for request in [
+            ExtensionUiRequest::SetEditorText {
+                text: "first editor".to_owned(),
+            },
+            ExtensionUiRequest::SetWorkingMessage {
+                message: Some("first working".to_owned()),
+            },
+            ExtensionUiRequest::SetWorkingVisible { visible: true },
+            ExtensionUiRequest::SetWorkingIndicator {
+                options: Some(WorkingIndicatorOptions {
+                    frames: Some(vec!["first".to_owned()]),
+                    interval_ms: Some(80),
+                }),
+            },
+            ExtensionUiRequest::SetHiddenThinkingLabel {
+                label: Some("first hidden".to_owned()),
+            },
+            ExtensionUiRequest::SetTheme {
+                name: "dark".to_owned(),
+            },
+            ExtensionUiRequest::SetToolsExpanded { expanded: true },
+        ] {
+            adapter
+                .request(first.clone(), request, ExtensionCancellation::new())
+                .await
+                .unwrap();
+        }
+
+        for request in [
+            ExtensionUiRequest::SetEditorText {
+                text: "second editor".to_owned(),
+            },
+            ExtensionUiRequest::SetWorkingMessage {
+                message: Some("second working".to_owned()),
+            },
+            ExtensionUiRequest::SetWorkingVisible { visible: false },
+            ExtensionUiRequest::SetWorkingIndicator {
+                options: Some(WorkingIndicatorOptions {
+                    frames: Some(vec!["second".to_owned()]),
+                    interval_ms: Some(120),
+                }),
+            },
+            ExtensionUiRequest::SetHiddenThinkingLabel {
+                label: Some("second hidden".to_owned()),
+            },
+            ExtensionUiRequest::SetTheme {
+                name: "dark".to_owned(),
+            },
+            ExtensionUiRequest::SetToolsExpanded { expanded: false },
+        ] {
+            adapter
+                .request(second.clone(), request, ExtensionCancellation::new())
+                .await
+                .unwrap();
+        }
+
+        adapter
+            .clear_extension(first.instance.clone())
+            .await
+            .unwrap();
+        let snapshot = adapter.snapshot();
+        assert_eq!(snapshot.editor_text, "second editor");
+        assert_eq!(snapshot.working_message.as_deref(), Some("second working"));
+        assert!(!snapshot.working_visible);
+        assert_eq!(
+            snapshot.working_indicator,
+            Some(WorkingIndicatorOptions {
+                frames: Some(vec!["second".to_owned()]),
+                interval_ms: Some(120),
+            })
+        );
+        assert_eq!(snapshot.hidden_thinking_label.as_deref(), Some("second hidden"));
+        assert_eq!(snapshot.active_theme.as_deref(), Some("dark"));
+        assert!(!snapshot.tools_expanded);
+
+        adapter.clear_extension(second.instance).await.unwrap();
+        let snapshot = adapter.snapshot();
+        assert_eq!(snapshot.editor_text, "");
+        assert_eq!(snapshot.working_message, None);
+        assert!(!snapshot.working_visible);
+        assert_eq!(snapshot.working_indicator, None);
+        assert_eq!(snapshot.hidden_thinking_label, None);
+        assert_eq!(snapshot.active_theme, None);
+        assert!(!snapshot.tools_expanded);
+        assert_eq!(snapshot.themes[0].name, "dark", "canonical catalog is host-owned");
+    }
+
+    #[tokio::test]
+    async fn cleanup_drops_only_cleared_extension_notifications() {
+        let adapter = ExtensionUiAdapter::new();
+        let first = context_for("first");
+        let second = context_for("second");
+
+        adapter
+            .request(
+                first.clone(),
+                ExtensionUiRequest::Notify {
+                    message: "first note".to_owned(),
+                    level: UiNotificationLevel::Info,
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        adapter
+            .request(
+                second.clone(),
+                ExtensionUiRequest::Notify {
+                    message: "second note".to_owned(),
+                    level: UiNotificationLevel::Warning,
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+
+        adapter
+            .clear_extension(first.instance.clone())
+            .await
+            .unwrap();
+        let snapshot = adapter.snapshot();
+        assert_eq!(
+            snapshot
+                .notifications
+                .iter()
+                .map(|notification| notification.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second note"],
+            "clearing first must drop only first-owned notifications"
+        );
+        assert_eq!(
+            snapshot.notifications[0].instance.extension_id, "second",
+            "remaining notification must keep its owner identity"
+        );
+
+        adapter.clear_extension(second.instance).await.unwrap();
+        assert!(
+            adapter.snapshot().notifications.is_empty(),
+            "clearing the remaining owner must empty retained notifications"
+        );
+    }
+
+    #[tokio::test]
+    async fn theme_queries_use_the_canonical_catalog_and_set_theme_reports_result() {
+        let adapter = ExtensionUiAdapter::new();
+        adapter.set_themes(vec![ExtensionThemeDescriptor {
+            name: "dark".to_owned(),
+            path: Some("/themes/dark.json".to_owned()),
+        }]);
+        assert_eq!(
+            adapter
+                .request(
+                    context(),
+                    ExtensionUiRequest::GetTheme {
+                        name: "dark".to_owned(),
+                    },
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::Theme {
+                theme: Some(ExtensionThemeDescriptor {
+                    name: "dark".to_owned(),
+                    path: Some("/themes/dark.json".to_owned()),
+                })
+            }
+        );
+        assert_eq!(
+            adapter
+                .request(
+                    context(),
+                    ExtensionUiRequest::SetTheme {
+                        name: "missing".to_owned(),
+                    },
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::ThemeSet {
+                success: false,
+                error: Some("unknown or unavailable theme \"missing\"".to_owned()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn host_bound_editor_theme_and_tools_queries_read_authoritative_state() {
+        let adapter = ExtensionUiAdapter::new();
+        adapter.set_host_editor_text("from-host-editor");
+        adapter.set_host_tools_expanded(true);
+        adapter.set_themes(vec![ExtensionThemeDescriptor {
+            name: "light".to_owned(),
+            path: None,
+        }]);
+        adapter.set_active_theme(Some("light".to_owned()));
+
+        assert_eq!(
+            adapter
+                .request(
+                    context(),
+                    ExtensionUiRequest::GetEditorText,
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::EditorText {
+                value: "from-host-editor".to_owned()
+            }
+        );
+        assert_eq!(
+            adapter
+                .request(
+                    context(),
+                    ExtensionUiRequest::GetToolsExpanded,
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::ToolsExpanded { expanded: true }
+        );
+        assert_eq!(
+            adapter
+                .request(
+                    context(),
+                    ExtensionUiRequest::GetAllThemes,
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::Themes {
+                themes: vec![ExtensionThemeDescriptor {
+                    name: "light".to_owned(),
+                    path: None,
+                }]
+            }
+        );
+        assert_eq!(adapter.snapshot().active_theme.as_deref(), Some("light"));
+
+        // Unrelated owner cleanup must not erase host-owned bindings.
+        adapter
+            .clear_extension(context_for("other").instance)
+            .await
+            .unwrap();
+        assert_eq!(adapter.snapshot().editor_text, "from-host-editor");
+        assert!(adapter.snapshot().tools_expanded);
+        assert_eq!(adapter.snapshot().active_theme.as_deref(), Some("light"));
+    }
+
+    #[tokio::test]
+    async fn working_theme_tools_and_editor_mutations_update_authoritative_snapshot() {
+        let adapter = ExtensionUiAdapter::new();
+        adapter.set_themes(vec![
+            ExtensionThemeDescriptor {
+                name: "dark".to_owned(),
+                path: None,
+            },
+            ExtensionThemeDescriptor {
+                name: "light".to_owned(),
+                path: None,
+            },
+        ]);
+
+        adapter
+            .request(
+                context(),
+                ExtensionUiRequest::SetEditorText {
+                    text: "typed-by-extension".to_owned(),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        adapter
+            .request(
+                context(),
+                ExtensionUiRequest::SetWorkingMessage {
+                    message: Some("compiling".to_owned()),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        adapter
+            .request(
+                context(),
+                ExtensionUiRequest::SetWorkingVisible { visible: true },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        adapter
+            .request(
+                context(),
+                ExtensionUiRequest::SetHiddenThinkingLabel {
+                    label: Some("thinking quietly".to_owned()),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        adapter
+            .request(
+                context(),
+                ExtensionUiRequest::SetToolsExpanded { expanded: true },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter
+                .request(
+                    context(),
+                    ExtensionUiRequest::SetTheme {
+                        name: "light".to_owned(),
+                    },
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::ThemeSet {
+                success: true,
+                error: None,
+            }
+        );
+
+        let snapshot = adapter.snapshot();
+        assert_eq!(snapshot.editor_text, "typed-by-extension");
+        assert_eq!(snapshot.working_message.as_deref(), Some("compiling"));
+        assert!(snapshot.working_visible);
+        assert_eq!(
+            snapshot.hidden_thinking_label.as_deref(),
+            Some("thinking quietly")
+        );
+        assert!(snapshot.tools_expanded);
+        assert_eq!(snapshot.active_theme.as_deref(), Some("light"));
+
+        assert_eq!(
+            adapter
+                .request(
+                    context(),
+                    ExtensionUiRequest::GetEditorText,
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::EditorText {
+                value: "typed-by-extension".to_owned()
+            }
+        );
+        assert_eq!(
+            adapter
+                .request(
+                    context(),
+                    ExtensionUiRequest::GetToolsExpanded,
+                    ExtensionCancellation::new(),
+                )
+                .await
+                .unwrap(),
+            ExtensionUiResponse::ToolsExpanded { expanded: true }
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_canonical_queries_error_when_flag_disabled() {
+        let adapter = ExtensionUiAdapter::new();
+        adapter.set_canonical_queries_supported(false);
+        adapter.set_host_editor_text("shadow-must-not-leak");
+        adapter.set_host_tools_expanded(true);
+        adapter.set_themes(vec![ExtensionThemeDescriptor {
+            name: "dark".to_owned(),
+            path: None,
+        }]);
+
+        for request in [
+            ExtensionUiRequest::GetEditorText,
+            ExtensionUiRequest::GetAllThemes,
+            ExtensionUiRequest::GetTheme {
+                name: "dark".to_owned(),
+            },
+            ExtensionUiRequest::SetTheme {
+                name: "dark".to_owned(),
+            },
+            ExtensionUiRequest::GetToolsExpanded,
+        ] {
+            let error = adapter
+                .request(context(), request, ExtensionCancellation::new())
+                .await
+                .expect_err("disabled canonical queries must fail closed");
+            assert!(
+                error.to_string().contains("canonical host state"),
+                "{error:#}"
+            );
+        }
     }
 }

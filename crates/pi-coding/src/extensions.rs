@@ -69,10 +69,15 @@ pub enum ExtensionUiCapability {
     Widget,
     Title,
     SetEditorText,
+    EditorText,
+    Working,
+    HiddenThinking,
+    Theme,
+    ToolsExpanded,
 }
 
 impl ExtensionUiCapability {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 14] = [
         Self::Select,
         Self::Confirm,
         Self::Input,
@@ -82,6 +87,11 @@ impl ExtensionUiCapability {
         Self::Widget,
         Self::Title,
         Self::SetEditorText,
+        Self::EditorText,
+        Self::Working,
+        Self::HiddenThinking,
+        Self::Theme,
+        Self::ToolsExpanded,
     ];
 }
 
@@ -595,6 +605,13 @@ impl ExtensionSpec {
                 bail!("Bun extensions do not support the provider_metadata capability");
             }
         }
+        if let ExtensionSpecRuntime::Bun { .. } = &self.runtime {
+            if let Some(configured) = self.environment.get("PI_BUN_EXECUTABLE")
+                && !Path::new(configured).is_file()
+            {
+                bail!("Bun runtime is unavailable; install Bun or set PI_BUN_EXECUTABLE");
+            }
+        }
         const RESERVED_ENV: [&str; 7] = [
             "PI_EXTENSION_PROTOCOL_VERSION",
             "PI_EXTENSION_ID",
@@ -732,6 +749,31 @@ pub struct ExtensionProviderMetadata {
     #[serde(default)]
     pub metadata: Value,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionFlagType {
+    Boolean,
+    String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionShortcutDescriptor {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionFlagDescriptor {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub r#type: ExtensionFlagType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
@@ -751,6 +793,12 @@ pub enum ExtensionRegistration {
     ProviderMetadata {
         provider: ExtensionProviderMetadata,
     },
+    Shortcut {
+        shortcut: ExtensionShortcutDescriptor,
+    },
+    Flag {
+        flag: ExtensionFlagDescriptor,
+    },
 }
 
 impl ExtensionRegistration {
@@ -761,6 +809,7 @@ impl ExtensionRegistration {
             Self::EventHook { .. } => ExtensionCapability::EventHooks,
             Self::MessageRenderer { .. } => ExtensionCapability::MessageRenderers,
             Self::ProviderMetadata { .. } => ExtensionCapability::ProviderMetadata,
+            Self::Shortcut { .. } | Self::Flag { .. } => ExtensionCapability::Commands,
         }
     }
 }
@@ -825,6 +874,9 @@ pub enum ExtensionInvocation {
     RenderMessage {
         request: MessageRenderRequest,
     },
+    Shortcut {
+        key: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -849,6 +901,23 @@ pub enum UiNotificationLevel {
 pub enum UiWidgetPlacement {
     AboveEditor,
     BelowEditor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkingIndicatorOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionThemeDescriptor {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -895,6 +964,36 @@ pub enum ExtensionUiRequest {
     SetEditorText {
         text: String,
     },
+    GetEditorText,
+    PasteToEditor {
+        text: String,
+    },
+    SetWorkingMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    SetWorkingVisible {
+        visible: bool,
+    },
+    SetWorkingIndicator {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<WorkingIndicatorOptions>,
+    },
+    SetHiddenThinkingLabel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    GetAllThemes,
+    GetTheme {
+        name: String,
+    },
+    SetTheme {
+        name: String,
+    },
+    GetToolsExpanded,
+    SetToolsExpanded {
+        expanded: bool,
+    },
 }
 
 impl ExtensionUiRequest {
@@ -910,6 +1009,19 @@ impl ExtensionUiRequest {
             Self::Widget { .. } => ExtensionUiCapability::Widget,
             Self::Title { .. } => ExtensionUiCapability::Title,
             Self::SetEditorText { .. } => ExtensionUiCapability::SetEditorText,
+            Self::GetEditorText { .. } | Self::PasteToEditor { .. } => {
+                ExtensionUiCapability::EditorText
+            }
+            Self::SetWorkingMessage { .. }
+            | Self::SetWorkingVisible { .. }
+            | Self::SetWorkingIndicator { .. } => ExtensionUiCapability::Working,
+            Self::SetHiddenThinkingLabel { .. } => ExtensionUiCapability::HiddenThinking,
+            Self::GetAllThemes { .. } | Self::GetTheme { .. } | Self::SetTheme { .. } => {
+                ExtensionUiCapability::Theme
+            }
+            Self::GetToolsExpanded { .. } | Self::SetToolsExpanded { .. } => {
+                ExtensionUiCapability::ToolsExpanded
+            }
         }
     }
 
@@ -942,6 +1054,24 @@ pub enum ExtensionUiResponse {
     },
     Acknowledged,
     Cancelled,
+    EditorText {
+        value: String,
+    },
+    Themes {
+        themes: Vec<ExtensionThemeDescriptor>,
+    },
+    Theme {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        theme: Option<ExtensionThemeDescriptor>,
+    },
+    ThemeSet {
+        success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    ToolsExpanded {
+        expanded: bool,
+    },
 }
 
 impl ExtensionUiResponse {
@@ -961,6 +1091,29 @@ impl ExtensionUiResponse {
                 ExtensionUiRequest::Editor { .. },
                 Self::Edited { .. } | Self::Cancelled
             ) | (
+                ExtensionUiRequest::GetEditorText { .. },
+                Self::EditorText { .. }
+            ) | (
+                ExtensionUiRequest::GetAllThemes { .. },
+                Self::Themes { .. }
+            ) | (
+                ExtensionUiRequest::GetTheme { .. },
+                Self::Theme { .. }
+            ) | (
+                ExtensionUiRequest::GetToolsExpanded { .. },
+                Self::ToolsExpanded { .. }
+            ) | (
+                ExtensionUiRequest::PasteToEditor { .. }
+                    | ExtensionUiRequest::SetWorkingMessage { .. }
+                    | ExtensionUiRequest::SetWorkingVisible { .. }
+                    | ExtensionUiRequest::SetWorkingIndicator { .. }
+                    | ExtensionUiRequest::SetHiddenThinkingLabel { .. }
+                    | ExtensionUiRequest::SetToolsExpanded { .. },
+                Self::Acknowledged
+            ) | (
+                ExtensionUiRequest::SetTheme { .. },
+                Self::ThemeSet { .. }
+            ) | (
                 ExtensionUiRequest::Notify { .. }
                     | ExtensionUiRequest::Status { .. }
                     | ExtensionUiRequest::Widget { .. }
@@ -976,6 +1129,7 @@ impl ExtensionUiResponse {
         }
     }
 }
+
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1033,6 +1187,8 @@ pub struct ExtensionContextSnapshot {
     pub all_tools: Vec<String>,
     #[serde(default)]
     pub commands: Vec<ExtensionCommandDescriptor>,
+    #[serde(default)]
+    pub flag_values: BTreeMap<String, Value>,
     pub system_prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Model>,
@@ -1077,6 +1233,9 @@ pub enum ExtensionRuntimeAction {
     },
     Reload,
     WaitForIdle,
+    GetFlag {
+        name: String,
+    },
 }
 
 pub trait ExtensionActionHost: Send + Sync {
@@ -1925,6 +2084,12 @@ impl ExtensionRuntime {
         host.context_snapshot().await.ok()
     }
 
+    async fn invocation_context(&self) -> Option<ExtensionContextSnapshot> {
+        let mut context = self.context_snapshot().await?;
+        context.flag_values = BTreeMap::new();
+        Some(context)
+    }
+
     fn action_host(&self) -> Option<Arc<dyn ExtensionActionHost>> {
         self.inner.action_host.lock().clone()
     }
@@ -2337,6 +2502,30 @@ impl ExtensionRuntime {
             .collect()
     }
 
+    #[must_use]
+    pub fn shortcuts(&self) -> Vec<ExtensionShortcutDescriptor> {
+        self.inner
+            .state
+            .lock()
+            .registry
+            .shortcuts
+            .values()
+            .map(|registered| registered.descriptor.clone())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn flags(&self) -> Vec<ExtensionFlagDescriptor> {
+        self.inner
+            .state
+            .lock()
+            .registry
+            .flags
+            .values()
+            .map(|registered| registered.descriptor.clone())
+            .collect()
+    }
+
     pub async fn invoke_command(
         &self,
         name: &str,
@@ -2361,7 +2550,7 @@ impl ExtensionRuntime {
                         name: name.to_owned(),
                         arguments,
                     },
-                    context: self.context_snapshot().await,
+                    context: self.invocation_context().await,
                 },
                 timeout_override.unwrap_or(self.inner.options.invocation_timeout),
                 cancellation,
@@ -2370,6 +2559,27 @@ impl ExtensionRuntime {
             )
             .await
             .map_err(|error| anyhow!("running extension command {name}: {error:#}"))
+    }
+
+    pub async fn invoke_shortcut(
+        &self,
+        key: &str,
+        _timeout_override: Option<Duration>,
+        _cancellation: Option<ExtensionCancellation>,
+    ) -> Result<Value> {
+        if !self
+            .inner
+            .state
+            .lock()
+            .registry
+            .shortcuts
+            .contains_key(key)
+        {
+            bail!("unknown extension shortcut {key:?}");
+        }
+        bail!(
+            "extension shortcut invocation is unsupported: the current TUI has no safe extension shortcut dispatcher"
+        )
     }
 
     pub async fn invoke_tool(
@@ -2406,7 +2616,7 @@ impl ExtensionRuntime {
                         call_id,
                         arguments,
                     },
-                    context: self.context_snapshot().await,
+                    context: self.invocation_context().await,
                 },
                 self.inner.options.invocation_timeout,
                 None,
@@ -2418,7 +2628,6 @@ impl ExtensionRuntime {
         serde_json::from_value(value).context("decoding extension tool result")
     }
 
-    #[must_use]
     pub fn agent_tools(&self) -> Vec<AgentTool> {
         let registry = self.inner.state.lock().registry.clone();
         agent_tools_from_registry(self, &registry)
@@ -2446,7 +2655,7 @@ impl ExtensionRuntime {
             .request_value(
                 ExtensionHostRequest::Invoke {
                     invocation: ExtensionInvocation::RenderMessage { request },
-                    context: self.context_snapshot().await,
+                    context: self.invocation_context().await,
                 },
                 self.inner.options.invocation_timeout,
                 cancellation,
@@ -2458,14 +2667,13 @@ impl ExtensionRuntime {
             .map(Some)
             .context("decoding extension message renderer output")
     }
-
     async fn reduce_event<T, EventData, Apply>(&self, name: &str, state: &mut T, mut event_data: EventData, mut apply: Apply) -> Result<()>
     where EventData: FnMut(&T) -> Result<Value>, Apply: FnMut(&mut T, Value) -> Result<()> {
         let instances = self.inner.state.lock().registry.hooks.get(name).cloned().unwrap_or_default();
         for instance in instances {
             let result = instance.request_value(ExtensionHostRequest::Invoke {
                 invocation: ExtensionInvocation::Event { event: ExtensionEvent::new(name, event_data(state)?) },
-                context: self.context_snapshot().await,
+                context: self.invocation_context().await,
             }, self.inner.options.hook_timeout, None, None, None).await
                 .with_context(|| format!("extension {} generation {} failed {name} hook", instance.id.extension_id, instance.id.generation))?;
             if !result.is_null() { apply(state, result).with_context(|| format!("extension {} generation {} returned invalid {name} hook result", instance.id.extension_id, instance.id.generation))?; }
@@ -2487,7 +2695,7 @@ impl ExtensionRuntime {
         for instance in instances {
             let result = instance.request_value(ExtensionHostRequest::Invoke {
                 invocation: ExtensionInvocation::Event { event: ExtensionEvent::new(name, event_data(state)?) },
-                context: self.context_snapshot().await,
+                context: self.invocation_context().await,
             }, self.inner.options.hook_timeout, None, None, None).await
                 .with_context(|| format!("extension {} generation {} failed {name} hook", instance.id.extension_id, instance.id.generation))?;
             if !result.is_null() && apply(state, result)
@@ -2498,22 +2706,44 @@ impl ExtensionRuntime {
         Ok(())
     }
 
-
-    pub async fn reduce_before_agent_start(&self, mut event: Value, system_prompt: String) -> Result<ExtensionBeforeAgentStartReduction> {
-        let mut reduction = ExtensionBeforeAgentStartReduction { system_prompt, messages: Vec::new() };
-        self.reduce_event("before_agent_start", &mut reduction, |state| {
-            event.as_object_mut().ok_or_else(|| anyhow!("before_agent_start event data must be an object"))?.insert("systemPrompt".to_owned(), Value::String(state.system_prompt.clone()));
-            Ok(event.clone())
-        }, |state, value| {
-            let wire: BeforeAgentStartWire = serde_json::from_value(value)?;
-            if let Some(system_prompt) = wire.system_prompt { state.system_prompt = system_prompt; }
-            if wire.messages.is_empty() {
-                if let Some(message) = wire.message { state.messages.push(message); }
-            } else {
-                state.messages.extend(wire.messages);
-            }
-            Ok(())
-        }).await?;
+    pub async fn reduce_before_agent_start(
+        &self,
+        mut event: Value,
+        system_prompt: String,
+    ) -> Result<ExtensionBeforeAgentStartReduction> {
+        let mut reduction = ExtensionBeforeAgentStartReduction {
+            system_prompt,
+            messages: Vec::new(),
+        };
+        self.reduce_event(
+            "before_agent_start",
+            &mut reduction,
+            |state| {
+                event
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow!("before_agent_start event data must be an object"))?
+                    .insert(
+                        "systemPrompt".to_owned(),
+                        Value::String(state.system_prompt.clone()),
+                    );
+                Ok(event.clone())
+            },
+            |state, value| {
+                let wire: BeforeAgentStartWire = serde_json::from_value(value)?;
+                if let Some(system_prompt) = wire.system_prompt {
+                    state.system_prompt = system_prompt;
+                }
+                if wire.messages.is_empty() {
+                    if let Some(message) = wire.message {
+                        state.messages.push(message);
+                    }
+                } else {
+                    state.messages.extend(wire.messages);
+                }
+                Ok(())
+            },
+        )
+        .await?;
         Ok(reduction)
     }
 
@@ -2694,7 +2924,7 @@ impl ExtensionRuntime {
                         invocation: ExtensionInvocation::Event {
                             event: event.clone(),
                         },
-                        context: self.context_snapshot().await,
+                        context: self.invocation_context().await,
                     },
                     self.inner.options.hook_timeout,
                     None,
@@ -2809,6 +3039,8 @@ struct RuntimeRegistry {
     hooks: BTreeMap<String, Vec<Arc<ExtensionInstance>>>,
     renderers: BTreeMap<String, RegisteredRenderer>,
     providers: BTreeMap<String, RegisteredProvider>,
+    shortcuts: BTreeMap<String, RegisteredShortcut>,
+    flags: BTreeMap<String, RegisteredFlag>,
 }
 
 impl RuntimeRegistry {
@@ -2881,6 +3113,34 @@ impl RuntimeRegistry {
                     |registered| &registered.instance,
                 );
             }
+            for descriptor in &instance.registrations.shortcuts {
+                insert_unique(
+                    &mut registry.shortcuts,
+                    descriptor.key.clone(),
+                    RegisteredShortcut {
+                        descriptor: descriptor.clone(),
+                        instance: instance.clone(),
+                    },
+                    ExtensionCapability::Commands,
+                    instance,
+                    &mut collisions,
+                    |registered| &registered.instance,
+                );
+            }
+            for descriptor in &instance.registrations.flags {
+                insert_unique(
+                    &mut registry.flags,
+                    descriptor.name.clone(),
+                    RegisteredFlag {
+                        descriptor: descriptor.clone(),
+                        instance: instance.clone(),
+                    },
+                    ExtensionCapability::Commands,
+                    instance,
+                    &mut collisions,
+                    |registered| &registered.instance,
+                );
+            }
         }
         (registry, collisions)
     }
@@ -2933,6 +3193,18 @@ struct RegisteredProvider {
     instance: Arc<ExtensionInstance>,
 }
 
+#[derive(Clone)]
+struct RegisteredShortcut {
+    descriptor: ExtensionShortcutDescriptor,
+    instance: Arc<ExtensionInstance>,
+}
+
+#[derive(Clone)]
+struct RegisteredFlag {
+    descriptor: ExtensionFlagDescriptor,
+    instance: Arc<ExtensionInstance>,
+}
+
 #[derive(Clone, Default)]
 struct ExtensionRegistrations {
     commands: Vec<ExtensionCommandDescriptor>,
@@ -2940,6 +3212,8 @@ struct ExtensionRegistrations {
     hooks: Vec<ExtensionEventHookDescriptor>,
     renderers: Vec<ExtensionMessageRendererDescriptor>,
     providers: Vec<ExtensionProviderMetadata>,
+    shortcuts: Vec<ExtensionShortcutDescriptor>,
+    flags: Vec<ExtensionFlagDescriptor>,
 }
 
 struct RegistrationBuilder<'a> {
@@ -2951,6 +3225,8 @@ struct RegistrationBuilder<'a> {
     hooks: BTreeSet<String>,
     renderers: BTreeSet<String>,
     providers: BTreeSet<String>,
+    shortcuts: BTreeSet<String>,
+    flags: BTreeSet<String>,
 }
 
 impl<'a> RegistrationBuilder<'a> {
@@ -2967,6 +3243,8 @@ impl<'a> RegistrationBuilder<'a> {
             hooks: BTreeSet::new(),
             renderers: BTreeSet::new(),
             providers: BTreeSet::new(),
+            shortcuts: BTreeSet::new(),
+            flags: BTreeSet::new(),
         }
     }
 
@@ -3018,6 +3296,32 @@ impl<'a> RegistrationBuilder<'a> {
                 }
                 insert_local(&mut self.providers, &provider.id, "provider metadata")?;
                 self.registrations.providers.push(provider);
+            }
+            ExtensionRegistration::Shortcut { shortcut } => {
+                validate_text(&shortcut.key, "shortcut key", 128)?;
+                if let Some(description) = &shortcut.description {
+                    validate_text(description, "shortcut description", 4096)?;
+                }
+                insert_local(&mut self.shortcuts, &shortcut.key, "shortcut")?;
+                self.registrations.shortcuts.push(shortcut);
+            }
+            ExtensionRegistration::Flag { flag } => {
+                validate_identifier(&flag.name, "flag name")?;
+                if let Some(description) = &flag.description {
+                    validate_text(description, "flag description", 4096)?;
+                }
+                if let Some(default) = &flag.default {
+                    let valid = matches!(
+                        (&flag.r#type, default),
+                        (ExtensionFlagType::Boolean, Value::Bool(_))
+                            | (ExtensionFlagType::String, Value::String(_))
+                    );
+                    if !valid {
+                        bail!("extension flag default does not match its declared type");
+                    }
+                }
+                insert_local(&mut self.flags, &flag.name, "flag")?;
+                self.registrations.flags.push(flag);
             }
         }
         Ok(())
@@ -3333,6 +3637,26 @@ impl ExtensionInstance {
                             "permission_denied",
                             "session action capability was not granted",
                         )
+                        .await;
+                }
+                if let ExtensionRuntimeAction::GetFlag { name } = &action {
+                    let result = match self
+                        .registrations
+                        .flags
+                        .iter()
+                        .find(|flag| &flag.name == name)
+                    {
+                        Some(_) => ProtocolResult::failure(
+                            "unsupported_extension_flag",
+                            format!(
+                                "extension flag {name:?} is registered but CLI flag dispatch is unsupported in this startup architecture"
+                            ),
+                        ),
+                        None => ProtocolResult::success(Value::Null),
+                    };
+                    return self
+                        .transport
+                        .send(&ExtensionHostFrame::Response { id, result })
                         .await;
                 }
                 let Some(host) = self.action_host.lock().clone() else {

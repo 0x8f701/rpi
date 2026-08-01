@@ -105,6 +105,28 @@ fn result_at(state: &AgentState, index: usize) -> &ToolResultMessage {
         message => panic!("not result: {message:?}"),
     }
 }
+fn assistant_at(state: &AgentState, index: usize) -> &AssistantMessage {
+    match &state.messages[index] {
+        Message::Assistant(message) => message,
+        message => panic!("not assistant: {message:?}"),
+    }
+}
+fn tool_call_ids(message: &AssistantMessage) -> Vec<String> {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(call.id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+fn is_synthesized_tool_call_id(id: &str) -> bool {
+    id.len() == 9
+        && id.starts_with('p')
+        && id.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
 
 #[tokio::test]
 async fn no_tool_turn_has_complete_lifecycle() {
@@ -503,6 +525,7 @@ async fn ergonomic_stream_options_forward_to_the_canonical_snapshot() {
     assert_eq!(agent.transport().await, Transport::Sse);
     assert_eq!(agent.max_retry_delay().await, None);
 }
+
 #[tokio::test]
 async fn terminal_provider_error_returns_original_error_without_duplicate_lifecycle() {
     let mut terminal = assistant(vec![ContentBlock::text("failed")], StopReason::Error);
@@ -1730,4 +1753,216 @@ async fn dropped_run_future_releases_claim_across_runtime_shutdown() {
     agent.prompt("again").await.unwrap();
     agent.wait_for_idle().await;
     assert!(!agent.state().await.is_streaming);
+}
+
+#[tokio::test]
+async fn empty_duplicate_tool_call_ids_are_normalized_distinctly() {
+    let executed = Arc::new(Mutex::new(vec![]));
+    let seen = executed.clone();
+    let tool = AgentTool::new("echo", "echo", Schema::default(), move |context| {
+        let seen = seen.clone();
+        async move {
+            seen.lock().push(context.tool_call_id.clone());
+            Ok(AgentToolResult::text(context.tool_call_id))
+        }
+    });
+    let mut first = assistant(
+        vec![call("", "echo"), call("", "echo")],
+        StopReason::ToolUse,
+    );
+    first.timestamp = 1_700_000_000_000;
+    let stream = scripted(vec![
+        first,
+        assistant(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]);
+    let mut opts = options(stream, vec![tool]);
+    opts.tool_execution = ToolExecutionMode::Sequential;
+    let agent = Agent::new(opts);
+
+    let lifecycle = Arc::new(Mutex::new(vec![]));
+    let observed = lifecycle.clone();
+    let _sub = agent
+        .subscribe_simple(move |event| {
+            let observed = observed.clone();
+            async move {
+                match event {
+                    AgentEvent::ToolExecutionStart { tool_call_id, .. }
+                    | AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                        observed.lock().push(tool_call_id);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        })
+        .await;
+
+    agent.prompt("go").await.unwrap();
+    let state = agent.state().await;
+    let ids = tool_call_ids(assistant_at(&state, 1));
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "empty same-name IDs must become distinct");
+    assert!(ids.iter().all(|id| is_synthesized_tool_call_id(id)));
+    assert_eq!(*executed.lock(), ids);
+    assert_eq!(result_at(&state, 2).tool_call_id, ids[0]);
+    assert_eq!(result_at(&state, 3).tool_call_id, ids[1]);
+    assert_eq!(
+        *lifecycle.lock(),
+        vec![
+            ids[0].clone(),
+            ids[0].clone(),
+            ids[1].clone(),
+            ids[1].clone()
+        ]
+    );
+
+    // Deterministic: same inputs yield the same synthesized pair.
+    let mut again = assistant(
+        vec![call("", "echo"), call("", "echo")],
+        StopReason::ToolUse,
+    );
+    again.timestamp = 1_700_000_000_000;
+    let agent2 = Agent::new({
+        let mut opts = options(
+            scripted(vec![
+                again,
+                assistant(vec![ContentBlock::text("done")], StopReason::Stop),
+            ]),
+            vec![AgentTool::new(
+                "echo",
+                "echo",
+                Schema::default(),
+                |_| async { Ok(AgentToolResult::text("ok")) },
+            )],
+        );
+        opts.tool_execution = ToolExecutionMode::Sequential;
+        opts
+    });
+    agent2.prompt("go").await.unwrap();
+    assert_eq!(tool_call_ids(assistant_at(&agent2.state().await, 1)), ids);
+}
+
+#[tokio::test]
+async fn duplicate_nonempty_tool_call_id_preserves_first_and_replaces_rest() {
+    let tool = AgentTool::new("echo", "echo", Schema::default(), |context| async move {
+        Ok(AgentToolResult::text(context.tool_call_id))
+    });
+    let mut message = assistant(
+        vec![call("same", "echo"), call("same", "echo")],
+        StopReason::ToolUse,
+    );
+    message.timestamp = 42;
+    let stream = scripted(vec![
+        message,
+        assistant(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]);
+    let mut opts = options(stream, vec![tool]);
+    opts.tool_execution = ToolExecutionMode::Sequential;
+    let agent = Agent::new(opts);
+    agent.prompt("go").await.unwrap();
+    let state = agent.state().await;
+    let ids = tool_call_ids(assistant_at(&state, 1));
+    assert_eq!(ids[0], "same");
+    assert_ne!(ids[1], "same");
+    assert!(is_synthesized_tool_call_id(&ids[1]));
+    assert_eq!(result_at(&state, 2).tool_call_id, "same");
+    assert_eq!(result_at(&state, 3).tool_call_id, ids[1]);
+}
+
+#[tokio::test]
+async fn tool_call_id_colliding_with_prior_turn_is_replaced() {
+    let tool = AgentTool::new("echo", "echo", Schema::default(), |context| async move {
+        Ok(AgentToolResult::text(context.tool_call_id))
+    });
+    let mut first = assistant(vec![call("shared", "echo")], StopReason::ToolUse);
+    first.timestamp = 10;
+    let mut second = assistant(vec![call("shared", "echo")], StopReason::ToolUse);
+    second.timestamp = 20;
+    let stream = scripted(vec![
+        first,
+        assistant(vec![ContentBlock::text("mid")], StopReason::Stop),
+        second,
+        assistant(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]);
+    let mut opts = options(stream, vec![tool]);
+    opts.tool_execution = ToolExecutionMode::Sequential;
+    let agent = Agent::new(opts);
+    agent.prompt("first").await.unwrap();
+    agent.prompt("second").await.unwrap();
+    let state = agent.state().await;
+
+    let first_ids = tool_call_ids(assistant_at(&state, 1));
+    assert_eq!(first_ids, vec!["shared".to_string()]);
+    let second_assistant = state
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| match message {
+            Message::Assistant(assistant)
+                if assistant
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+                    && index > 1 =>
+            {
+                Some(assistant)
+            }
+            _ => None,
+        })
+        .next()
+        .expect("second tool assistant");
+    let second_ids = tool_call_ids(second_assistant);
+    assert_eq!(second_ids.len(), 1);
+    assert_ne!(second_ids[0], "shared");
+    assert!(is_synthesized_tool_call_id(&second_ids[0]));
+    let second_result = state
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResult(result) if result.tool_call_id != "shared" => Some(result),
+            _ => None,
+        })
+        .next()
+        .expect("second tool result");
+    assert_eq!(second_result.tool_call_id, second_ids[0]);
+}
+
+#[tokio::test]
+async fn unique_valid_provider_tool_call_id_is_preserved() {
+    let tool = AgentTool::new("echo", "echo", Schema::default(), |context| async move {
+        Ok(AgentToolResult::text(context.tool_call_id))
+    });
+    let stream = scripted(vec![
+        assistant(vec![call("call_abc1", "echo")], StopReason::ToolUse),
+        assistant(vec![ContentBlock::text("done")], StopReason::Stop),
+    ]);
+    let agent = Agent::new(options(stream, vec![tool]));
+    let lifecycle = Arc::new(Mutex::new(vec![]));
+    let observed = lifecycle.clone();
+    let _sub = agent
+        .subscribe_simple(move |event| {
+            let observed = observed.clone();
+            async move {
+                match event {
+                    AgentEvent::ToolExecutionStart { tool_call_id, .. }
+                    | AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                        observed.lock().push(tool_call_id);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        })
+        .await;
+    agent.prompt("go").await.unwrap();
+    let state = agent.state().await;
+    assert_eq!(
+        tool_call_ids(assistant_at(&state, 1)),
+        vec!["call_abc1".to_string()]
+    );
+    assert_eq!(result_at(&state, 2).tool_call_id, "call_abc1");
+    assert_eq!(
+        *lifecycle.lock(),
+        vec!["call_abc1".to_string(), "call_abc1".to_string()]
+    );
 }

@@ -4,6 +4,7 @@
 //! paths as the binary (arg parsing, subcommands, session setup, print mode,
 //! and the REPL) without spawning a subprocess.
 
+mod agents_panel;
 pub mod args;
 pub mod auth_commands;
 pub mod clipboard;
@@ -12,10 +13,14 @@ pub mod extension_ui;
 pub mod file_args;
 pub mod file_search;
 pub mod human_event_renderer;
+pub mod goal_commands;
 pub mod image_pipeline;
+pub mod job_card_adapter;
 pub mod interactive_commands;
 pub mod keybindings;
 pub mod llama_commands;
+pub mod loop_commands;
+pub mod markdown;
 pub mod models_config;
 pub mod modes;
 pub mod output;
@@ -23,11 +28,15 @@ pub mod package_commands;
 pub mod package_config;
 pub mod process_commands;
 pub mod repl;
+pub mod resume_catalog;
 mod saved_session_selector;
 mod scoped_model_selector;
 pub mod self_update;
 pub mod session_run;
+pub mod settings_panel;
+pub mod settings_rpc;
 pub mod terminal_images;
+pub mod tool_card_adapter;
 pub mod theme;
 pub(crate) mod tree_panel;
 pub mod tui;
@@ -127,7 +136,9 @@ async fn main_run(cli: &Cli) -> Result<()> {
     match cli.mode {
         Some(Mode::Json) => run_structured(|| modes::json::run(cli)).await,
         Some(Mode::Rpc) => run_structured(|| modes::rpc::run(cli)).await,
-        _ if cli.is_print_mode() => session_run::print_mode(cli).await,
+        _ if cli.is_print_mode() || ((!stdin_tty || !stdout_tty) && !cli.prompt.is_empty()) => {
+            session_run::print_mode(cli).await
+        }
         Some(Mode::Text) | None => {
             let session_run::RunSession {
                 application,

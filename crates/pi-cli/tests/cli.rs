@@ -1,12 +1,10 @@
 //! CLI integration tests that drive the `pi` binary as a subprocess.
 //!
-//! Covers: `--help`, `--version`, `models`/`models <filter>`, bold provider
-//! headers, case-sensitive model filter, silent empty model filter results,
-//! `sessions` (including global `--cwd`), empty joined positional prompt not
-//! forcing print mode, `import-session` dispatch (valid codex fixture, bogus
-//! source, no convertible messages), and `--resume-codex` error + success.
-//! All session storage is redirected into a per-test temp `HOME` so no real
-//! user state is touched.
+//! Covers: help/version/model and session subcommands, import dispatch, native
+//! continuation, and unified native/OMP/Codex/Claude/Grok/Droid resume by path
+//! or id/prefix, including ambiguity, malformed/oversized rejection,
+//! idempotency, injected homes, and the line REPL catalog surface.
+//! All session storage is redirected into per-test temporary homes.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,10 +39,94 @@ fn codex_empty_fixture(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
     path
 }
 
-fn run(home: &std::path::Path, args: &[&str]) -> (bool, String, String) {
-    let output = Command::new(pi_bin())
-        .args(args)
+fn foreign_fixture(home: &Path, cwd: &Path, source: &str, id: &str) -> PathBuf {
+    let cwd = cwd.display().to_string().replace('\\', "\\\\");
+    let (path, body) = match source {
+        "omp" => (
+            home.join(".omp/agent/sessions/project").join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"title\",\"v\":1,\"title\":\"OMP fixture\",\"updatedAt\":\"2026-01-01T00:00:00Z\",\"pad\":\" \"}}\n{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"omp question\"}}}}\n{{\"type\":\"message\",\"id\":\"a\",\"parentId\":\"u\",\"message\":{{\"role\":\"assistant\",\"content\":\"omp answer\"}}}}\n"
+            ),
+        ),
+        "codex" => (
+            home.join(".codex/sessions").join(format!("rollout-{id}.jsonl")),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"codex question\"}}]}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"codex answer\"}}]}}}}\n"
+            ),
+        ),
+        "claude" => (
+            home.join(".claude/projects/project").join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"u\",\"parentUuid\":null,\"isSidechain\":false,\"sessionId\":\"{id}\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":\"claude question\"}}}}\n{{\"type\":\"assistant\",\"uuid\":\"a\",\"parentUuid\":\"u\",\"isSidechain\":false,\"sessionId\":\"{id}\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"assistant\",\"content\":\"claude answer\"}}}}\n{{\"type\":\"last-prompt\",\"leafUuid\":\"a\",\"sessionId\":\"{id}\"}}\n"
+            ),
+        ),
+        "grok" => {
+            let directory = home.join(".grok/sessions").join(id).join("state");
+            let path = directory.join("summary.json");
+            fs::create_dir_all(&directory).expect("grok directory");
+            fs::write(
+                directory.join("chat_history.jsonl"),
+                "{\"type\":\"user\",\"content\":\"grok question\"}\n{\"type\":\"assistant\",\"content\":\"grok answer\"}\n",
+            )
+            .expect("grok chat");
+            (
+                path,
+                format!("{{\"info\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}}}"),
+            )
+        }
+        "droid" => (
+            home.join(".factory/sessions").join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"session_start\",\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"droid question\"}}}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":\"droid answer\"}}}}\n"
+            ),
+        ),
+        other => panic!("unsupported fixture source {other}"),
+    };
+    fs::create_dir_all(path.parent().expect("foreign parent")).expect("foreign parent");
+    fs::write(&path, body).expect("foreign fixture");
+    path
+}
+
+fn command(home: &Path) -> Command {
+    let mut command = Command::new(pi_bin());
+    command
         .env("HOME", home)
+        .env("SESSIONS_HOME", home)
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("CLAUDE_CONFIG_DIR");
+    command
+}
+
+fn run_stdin(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> (bool, String, String) {
+    use std::io::Write as _;
+
+    let mut child = command(home)
+        .args(args)
+        .arg("--cwd")
+        .arg(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pi");
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait for pi");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn run(home: &std::path::Path, args: &[&str]) -> (bool, String, String) {
+    let output = command(home)
+        .args(args)
         .stdin(Stdio::null())
         .output()
         .expect("run pi");
@@ -159,7 +241,7 @@ fn help_lists_flags_and_subcommands() {
     let home = TempDir::new().unwrap();
     let (ok, out, _) = run(home.path(), &["--help"]);
     assert!(ok, "--help must exit 0");
-    for flag in ["--provider", "--system-prompt", "--append-system-prompt", "--session", "--session-id", "--models", "--tools", "--extension", "--list-models", "--offline"] {
+    for flag in ["--provider", "--system-prompt", "--append-system-prompt", "--add-dir", "--session", "--session-id", "--models", "--tools", "--extension", "--list-models", "--offline"] {
         assert!(out.contains(flag), "help lists {flag}");
     }
     for command in ["import-session", "models", "sessions", "install", "remove", "update", "config"] {
@@ -182,6 +264,40 @@ fn models_lists_default_catalog() {
     assert!(ok, "models exits 0");
     assert!(out.contains("faux"), "models include the faux provider");
     assert!(out.contains("faux-1"), "models include the faux-1 model");
+}
+
+#[test]
+fn models_quarantines_malformed_optional_radius_cache_once_and_stays_quiet() {
+    let home = TempDir::new().unwrap();
+    let agent_dir = home.path().join(".pi/agent");
+    fs::create_dir_all(&agent_dir).expect("create agent directory");
+    let store = agent_dir.join("models-store.json");
+    fs::write(&store, b"{}").expect("write malformed Radius cache");
+
+    let (ok, out, err) = run(home.path(), &["--offline", "models"]);
+    assert!(ok, "models must recover from malformed optional cache: {err}");
+    assert!(out.contains("faux-1"), "builtin catalog must remain available: {out}");
+    assert!(err.trim().is_empty(), "normal models output must stay quiet: {err:?}");
+    assert!(!out.contains("models-store"), "cache diagnostics leaked to stdout: {out}");
+    assert!(!store.exists(), "malformed cache must be quarantined");
+    assert_eq!(
+        fs::read_dir(&agent_dir)
+            .expect("read agent directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("models-store.json.invalid-")
+            })
+            .count(),
+        1
+    );
+
+    let (ok, out, err) = run(home.path(), &["--offline", "models"]);
+    assert!(ok, "subsequent models launch must stay healthy: {err}");
+    assert!(out.contains("faux-1"));
+    assert!(err.trim().is_empty(), "subsequent launch repeated warning: {err:?}");
 }
 
 #[test]
@@ -376,47 +492,221 @@ fn import_session_no_convertible_fails() {
     );
 }
 
+
+
+
 #[test]
-fn resume_codex_missing_path_fails() {
-    let home = TempDir::new().unwrap();
+fn unified_resume_honors_sessions_home_for_native_and_foreign() {
+    let process_home = TempDir::new().expect("process home");
+    let sessions_home = TempDir::new().expect("sessions home");
+    let cwd = TempDir::new().expect("cwd");
+    plant_full_session(
+        sessions_home.path(),
+        cwd.path(),
+        "sessions-home-native",
+        "2026-07-02T00:00:00.000Z",
+    );
+    foreign_fixture(
+        sessions_home.path(),
+        cwd.path(),
+        "droid",
+        "sessions-home-droid",
+    );
+
+    for input in ["sessions-home-native", "sessions-home-droid"] {
+        let output = Command::new(pi_bin())
+            .args([
+                "-m",
+                "faux/faux-1",
+                "--cwd",
+                cwd.path().to_str().expect("cwd str"),
+                "--resume",
+                input,
+            ])
+            .env("HOME", process_home.path())
+            .env("SESSIONS_HOME", sessions_home.path())
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("CODEX_HOME")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .stdin(Stdio::null())
+            .output()
+            .expect("resume from sessions home");
+        assert!(
+            output.status.success(),
+            "{input} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+#[test]
+fn unified_resume_supports_every_source_by_id_or_prefix() {
+    for (source, id, input) in [
+        ("omp", "omp-resume", "omp-res"),
+        ("codex", "codex-resume", "codex-res"),
+        ("claude", "claude-resume", "claude-res"),
+        ("grok", "grok-resume", "grok-res"),
+        ("droid", "droid-resume", "droid-res"),
+    ] {
+        let home = TempDir::new().expect("home");
+        let cwd = TempDir::new().expect("cwd");
+        let source_path = foreign_fixture(home.path(), cwd.path(), source, id);
+        let inputs = [source_path.to_str().expect("source path"), input];
+        for input in inputs {
+            let (ok, out, err) = run(
+                home.path(),
+                &[
+                    "-m",
+                    "faux/faux-1",
+                    "--cwd",
+                    cwd.path().to_str().expect("cwd str"),
+                    "--resume",
+                    input,
+                ],
+            );
+            assert!(ok, "{source} resume {input} failed: {err}");
+            assert!(
+                err.contains("resumed 2 messages"),
+                "{source} history not loaded: {err}"
+            );
+            assert!(out.contains("faux/faux-1"), "{source} model header: {out}");
+        }
+    }
+
+    let home = TempDir::new().expect("native home");
+    let cwd = TempDir::new().expect("native cwd");
+    plant_full_session(
+        home.path(),
+        cwd.path(),
+        "pi-resume",
+        "2026-07-01T00:00:00.000Z",
+    );
     let (ok, _, err) = run(
         home.path(),
-        &["--resume-codex", "/nonexistent/rollout-x.jsonl"],
+        &[
+            "--cwd",
+            cwd.path().to_str().expect("cwd str"),
+            "--resume",
+            "pi-res",
+        ],
     );
-    assert!(!ok, "missing resume-codex input must fail");
-    assert!(
-        err.contains("codex") && err.contains("not found"),
-        "error reports codex not found: {err}"
-    );
+    assert!(ok, "native prefix resume failed: {err}");
+    assert!(err.contains("resumed 2 messages"), "native history: {err}");
 }
 
 #[test]
-fn resume_codex_success_loads_history() {
-    let home = TempDir::new().unwrap();
-    let fixtures = TempDir::new().unwrap();
-    let fixture = codex_fixture(fixtures.path(), "res1");
+fn unified_resume_accepts_foreign_path_and_reuses_idempotent_import() {
+    let home = TempDir::new().expect("home");
+    let cwd = TempDir::new().expect("cwd");
+    let source = foreign_fixture(home.path(), cwd.path(), "codex", "idempotent-path");
 
-    // Resume the imported codex session into an interactive session that
-    // exits immediately on EOF (stdin null). A faux model needs no real key,
-    // so this exercises import -> load -> REPL-start end to end.
-    let output = Command::new(pi_bin())
-        .args(["-m", "faux/faux-1", "--resume-codex"])
-        .arg(&fixture)
-        .env("HOME", home.path())
-        .stdin(Stdio::null())
-        .output()
-        .expect("run resume-codex");
-    assert!(output.status.success(), "resume-codex success exits 0");
-    let err = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        err.contains("resumed") && err.contains("2 messages"),
-        "stderr reports resumed history: {err}"
-    );
-    let out = String::from_utf8_lossy(&output.stdout);
-    assert!(out.contains("(rs)"), "REPL header printed: {out}");
-    assert!(out.contains("faux/faux-1"), "REPL shows the model: {out}");
+    for input in [source.to_str().expect("source path"), "idempotent-path"] {
+        let (ok, _, err) = run(
+            home.path(),
+            &[
+                "-m",
+                "faux/faux-1",
+                "--cwd",
+                cwd.path().to_str().expect("cwd str"),
+                "--resume",
+                input,
+            ],
+        );
+        assert!(ok, "resume {input} failed: {err}");
+    }
+
+    let native_root = home.path().join(".pi/agent/sessions");
+    let emitted = walk_files(&native_root)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "jsonl"))
+        .collect::<Vec<_>>();
+    assert_eq!(emitted.len(), 1, "idempotent resume emitted {emitted:?}");
 }
 
+#[test]
+fn unified_resume_rejects_ambiguous_malformed_and_oversized_inputs() {
+    let home = TempDir::new().expect("home");
+    let cwd = TempDir::new().expect("cwd");
+    foreign_fixture(home.path(), cwd.path(), "codex", "ambiguous-one");
+    foreign_fixture(home.path(), cwd.path(), "claude", "ambiguous-two");
+    let (ok, _, err) = run(
+        home.path(),
+        &[
+            "--cwd",
+            cwd.path().to_str().expect("cwd str"),
+            "--resume",
+            "ambiguous",
+        ],
+    );
+    assert!(!ok, "ambiguous prefix must fail");
+    assert!(err.contains("ambiguous"), "ambiguity error: {err}");
+
+    let malformed = home.path().join(".codex/sessions/rollout-malformed.jsonl");
+    fs::create_dir_all(malformed.parent().expect("malformed parent")).unwrap();
+    fs::write(&malformed, "{not-json\n").unwrap();
+    let (ok, _, err) = run(
+        home.path(),
+        &[
+            "--cwd",
+            cwd.path().to_str().expect("cwd str"),
+            "--resume",
+            malformed.to_str().expect("malformed path"),
+        ],
+    );
+    assert!(!ok, "malformed foreign input must fail");
+    assert!(
+        err.contains("invalid") || err.contains("JSON") || err.contains("json"),
+        "malformed error: {err}"
+    );
+
+    let oversized = home.path().join(".codex/sessions/rollout-oversized.jsonl");
+    let file = fs::File::create(&oversized).expect("oversized file");
+    file.set_len(65 * 1024 * 1024).expect("oversized length");
+    let (ok, _, err) = run(
+        home.path(),
+        &[
+            "--cwd",
+            cwd.path().to_str().expect("cwd str"),
+            "--resume",
+            oversized.to_str().expect("oversized path"),
+        ],
+    );
+    assert!(!ok, "oversized foreign input must fail");
+    assert!(err.contains("exceeds import limits"), "oversized error: {err}");
+}
+
+
+#[test]
+fn repl_resume_lists_unified_catalog_and_switches_by_id() {
+    let home = TempDir::new().expect("home");
+    let cwd = TempDir::new().expect("cwd");
+    foreign_fixture(home.path(), cwd.path(), "grok", "repl-grok");
+    let (ok, out, err) = run_stdin(
+        home.path(),
+        cwd.path(),
+        &["-m", "faux/faux-1"],
+        "/resume\n/resume repl-grok\n",
+    );
+    assert!(ok, "REPL resume failed: {err}");
+    assert!(out.contains("[grok/hyper"), "unified row missing: {out}");
+    assert!(out.contains("repl-grok"), "session id missing: {out}");
+    assert!(out.contains("resumed "), "switch result missing: {out}");
+}
+
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if !root.is_dir() {
+        return files;
+    }
+    for entry in fs::read_dir(root).expect("read directory") {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            files.extend(walk_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
 #[test]
 fn resume_native_restores_faux_model_and_message_count() {
     let home = TempDir::new().unwrap();
@@ -511,6 +801,8 @@ fn continue_latest_selects_newest_session() {
         "cont-new",
         "2026-06-01T00:00:00.000Z",
     );
+    // A foreign session is present too; --continue must remain native-only.
+    foreign_fixture(home.path(), cwd.path(), "codex", "foreign-newer");
 
     let (ok, out, err) = run(
         home.path(),

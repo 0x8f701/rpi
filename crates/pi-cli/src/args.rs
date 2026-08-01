@@ -45,27 +45,24 @@ pub struct Cli {
     pub mode: Option<Mode>,
 
     /// Resume the most recent session for this directory.
-    #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "resume_codex", "session", "session_id", "fork", "no_session"])]
+    #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "session", "session_id", "fork", "no_session"])]
     pub continue_latest: bool,
 
-    /// Resume a specific session file (legacy pi-rs path form).
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["continue_latest", "resume_codex", "session", "session_id", "fork", "no_session"])]
-    pub resume: Option<PathBuf>,
+    /// Resume a native or foreign session by path, exact id, or unambiguous prefix.
+    #[arg(long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "session", "session_id", "fork", "no_session"])]
+    pub resume: Option<String>,
 
-    /// Import a Codex session (path or source id) then resume it.
-    #[arg(long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "resume", "session", "session_id", "fork", "no_session"])]
-    pub resume_codex: Option<String>,
 
     /// Open a session by file path, exact id, or unambiguous id prefix.
-    #[arg(long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "resume", "resume_codex", "session_id", "fork", "no_session"])]
+    #[arg(long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "resume", "session_id", "fork", "no_session"])]
     pub session: Option<String>,
 
     /// Open an exact project session id, creating it when absent.
-    #[arg(long, value_name = "ID", conflicts_with_all = ["continue_latest", "resume", "resume_codex", "session", "no_session"])]
+    #[arg(long, value_name = "ID", conflicts_with_all = ["continue_latest", "resume", "session", "no_session"])]
     pub session_id: Option<String>,
 
     /// Fork a session by file path, exact id, or unambiguous id prefix.
-    #[arg(long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "resume", "resume_codex", "session", "no_session"])]
+    #[arg(long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "resume", "session", "no_session"])]
     pub fork: Option<String>,
 
     /// Override the directory used for session storage and id lookup.
@@ -73,7 +70,7 @@ pub struct Cli {
     pub session_dir: Option<PathBuf>,
 
     /// Do not persist a session file for this run.
-    #[arg(long, conflicts_with_all = ["continue_latest", "resume", "resume_codex", "session", "session_id", "fork"])]
+    #[arg(long, conflicts_with_all = ["continue_latest", "resume", "session", "session_id", "fork"])]
     pub no_session: bool,
 
     /// Set the session display name.
@@ -92,6 +89,10 @@ pub struct Cli {
     /// such as `sessions` honor `-C`/`--cwd` in either position.
     #[arg(short = 'C', long, value_name = "DIR", global = true)]
     pub cwd: Option<PathBuf>,
+
+    /// Add a trusted workspace directory for file tools and @file expansion; repeatable.
+    #[arg(long = "add-dir", value_name = "DIR", action = clap::ArgAction::Append)]
+    pub add_dirs: Vec<PathBuf>,
 
     /// Reasoning level: off|minimal|low|medium|high|xhigh|max.
     #[arg(long = "thinking", alias = "think", value_name = "LEVEL")]
@@ -178,11 +179,6 @@ pub struct Cli {
     #[arg(value_name = "PROMPT")]
     pub prompt: Vec<String>,
 
-    /// Reserved extension flags after extension registration. The current
-    /// process-extension protocol does not register CLI flags, so clap rejects
-    /// unknown long options rather than accepting and ignoring them.
-    #[arg(skip)]
-    pub extension_cli_flags: Vec<(String, Option<String>)>,
 }
 
 /// Headless application adapters.
@@ -513,8 +509,10 @@ mod tests {
             "--verbose", "-t", "read,custom", "-xt", "bash,task", "-e", "one-ext",
             "--extension", "two-ext", "--skill", "skill-a", "--skill", "skill-b",
             "--prompt-template", "prompt-a", "--prompt-template", "prompt-b",
-            "--theme", "theme-a", "--theme", "theme-b",
-        ]).expect("parse parity flags");
+            "--theme", "theme-a", "--theme", "theme-b", "--add-dir", "workspace-a",
+            "--add-dir", "workspace-b",
+        ])
+        .expect("parse parity flags");
         assert_eq!(cli.provider.as_deref(), Some("openai"));
         assert_eq!(cli.model.as_deref(), Some("gpt-5"));
         assert_eq!(cli.models.as_ref().map(Vec::len), Some(2));
@@ -530,6 +528,7 @@ mod tests {
         assert_eq!(cli.skills.len(), 2);
         assert_eq!(cli.prompt_templates.len(), 2);
         assert_eq!(cli.themes.len(), 2);
+        assert_eq!(cli.add_dirs, [PathBuf::from("workspace-a"), PathBuf::from("workspace-b")]);
         assert!(cli.offline && cli.verbose);
     }
 
@@ -547,6 +546,14 @@ mod tests {
         let searched = Cli::try_parse_from(["pi", "--list-models", "sonnet"])
             .expect("list search");
         assert_eq!(searched.list_models.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn parses_unified_resume_and_rejects_removed_codex_flag() {
+        let unified = Cli::try_parse_from(["pi", "--resume", "grok-prefix"])
+            .expect("unified resume");
+        assert_eq!(unified.resume.as_deref(), Some("grok-prefix"));
+        assert!(Cli::try_parse_from(["pi", "--resume-codex", "codex-id"]).is_err());
     }
 
     #[test]

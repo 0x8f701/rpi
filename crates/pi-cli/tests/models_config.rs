@@ -137,6 +137,35 @@ async fn explicit_radius_store_restores_offline_catalog() {
     );
 }
 
+#[tokio::test]
+async fn malformed_optional_radius_store_is_quarantined_once() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let directory = TempDir::new().expect("temporary directory");
+    let store_path = directory.path().join("models-store.json");
+    fs::write(&store_path, b"{}").expect("write malformed optional store");
+
+    assert!(
+        load_radius_catalog_from(&store_path, false)
+            .await
+            .expect("malformed optional store is recoverable")
+            .is_none()
+    );
+    assert!(!store_path.exists(), "malformed store must be quarantined");
+    let quarantined = fs::read_dir(directory.path())
+        .expect("read store directory")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .filter(|name| name.to_string_lossy().starts_with("models-store.json.invalid-"))
+        .count();
+    assert_eq!(quarantined, 1, "one quarantined cache is retained");
+
+    assert!(
+        load_radius_catalog_from(&store_path, false)
+            .await
+            .expect("subsequent launch stays quiet")
+            .is_none()
+    );
+}
+
 #[test]
 fn loads_custom_model_and_resolves_config_key() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());

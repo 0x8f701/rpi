@@ -13,6 +13,9 @@
 //! Stored writes are atomic (temp-file-in-same-dir + rename) and errors are
 //! contextualized with the target path.
 
+mod markdown;
+
+use markdown::render_markdown_html;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -339,7 +342,7 @@ fn render_assistant(message: &pi_ai::AssistantMessage) -> String {
         match block {
             ContentBlock::Text { text, .. } => {
                 if !text.is_empty() {
-                    body.push_str(&format!("<p>{}</p>", escape_text(text)));
+                    body.push_str(&render_markdown_html(text));
                     has_visible = true;
                 }
             }
@@ -440,6 +443,16 @@ fn render_bash_execution(message: &pi_ai::BashExecutionMessage) -> String {
 }
 
 fn render_custom_message(message: &pi_ai::CustomMessage) -> String {
+    if let Some(loop_message) = crate::loop_message_view(message) {
+        return entry_html(
+            "system",
+            &format!("Loop {} · {}", loop_message.task_id, loop_message.schedule),
+            None,
+            Some(&format_timestamp_millis(message.timestamp)),
+            &render_content(&[ContentBlock::text(loop_message.prompt)]),
+            false,
+        );
+    }
     if !message.display {
         return String::new();
     }
@@ -455,6 +468,20 @@ fn render_custom_message(message: &pi_ai::CustomMessage) -> String {
 }
 
 fn render_custom_entry(entry: &SessionEntry) -> String {
+    if entry.custom_type.as_deref() == Some(crate::LOOP_SCHEDULED_MESSAGE_TYPE) {
+        let details = entry.details.as_ref();
+        let task_id = details.and_then(|value| value.get("taskId")).and_then(Value::as_str).unwrap_or("unknown");
+        let schedule = details.and_then(|value| value.get("schedule")).and_then(Value::as_str).unwrap_or("scheduled");
+        let prompt = details.and_then(|value| value.get("prompt")).and_then(Value::as_str).unwrap_or_default();
+        return entry_html(
+            "system",
+            &format!("Loop {task_id} · {schedule}"),
+            None,
+            Some(&format_timestamp(&entry.timestamp)),
+            &render_content(&[ContentBlock::text(prompt)]),
+            false,
+        );
+    }
     if entry.display != Some(true) {
         return String::new();
     }
@@ -514,7 +541,7 @@ fn render_content(content: &[ContentBlock]) -> String {
         match block {
             ContentBlock::Text { text, .. } => {
                 if !text.is_empty() {
-                    parts.push(format!("<p>{}</p>", escape_text(text)));
+                    parts.push(render_markdown_html(text));
                 }
             }
             ContentBlock::Image { data, mime_type } => {
@@ -832,6 +859,25 @@ mod tests {
         assert!(html.contains("Output truncated. Full output: /tmp/&lt;full&gt;.log"));
         assert!(!html.contains("printf '<script>'"));
         assert!(!html.contains("<img onerror"));
+    }
+
+    #[test]
+    fn loop_message_export_shows_public_prompt_without_internal_wrapper() {
+        let messages = vec![Message::Custom(pi_ai::CustomMessage {
+            custom_type: "loop_scheduled_turn".into(),
+            content: "<system-reminder>internal</system-reminder>\n\necho hello".into(),
+            display: false,
+            details: Some(serde_json::json!({
+                "taskId": "abc123",
+                "prompt": "echo hello",
+                "schedule": "every 3 seconds",
+            })),
+            timestamp: 1,
+        })];
+        let html = render_messages_html(&messages, &ExportMetadata::default(), &ExportOptions::default());
+        assert!(html.contains("Loop abc123 · every 3 seconds"));
+        assert!(html.contains("echo hello"));
+        assert!(!html.contains("system-reminder"));
     }
 
     #[test]

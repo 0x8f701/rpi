@@ -238,7 +238,7 @@ pub async fn load_radius_catalog_from(
         pi_ai::providers::DEFAULT_RADIUS_GATEWAY,
         store_path,
     )?;
-    let restored = catalog.restore_stored_snapshot()?;
+    let restored = catalog.restore_stored_snapshot_quarantining_invalid()?;
     if !allow_network {
         return Ok(restored);
     }

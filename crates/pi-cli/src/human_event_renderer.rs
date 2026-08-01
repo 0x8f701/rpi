@@ -1,12 +1,16 @@
 //! Shared human-readable rendering for `Application` turns.
 
 use std::future::Future;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, Result, anyhow, bail};
 use pi_agent::AgentEvent;
 use pi_ai::{AssistantMessageEvent, Message};
 use pi_coding::{Application, ApplicationEvent, SessionEvent};
+use pi_coding::markdown::{
+    MarkdownRenderOptions, StreamingMarkdownRenderer, render_markdown,
+    render_markdown_streaming,
+};
 
 use crate::output::{DIM, RED, RESET};
 
@@ -15,6 +19,9 @@ use crate::output::{DIM, RED, RESET};
 /// The renderer owns no session or agent state. Print mode and the line REPL
 /// can therefore consume the same ordered event stream without creating a
 /// second, renderer-specific session.
+
+const FALLBACK_MARKDOWN_WIDTH: usize = 80;
+const MAX_HEADLESS_MARKDOWN_WIDTH: usize = 1_000;
 #[derive(Clone, Copy, Default)]
 enum TerminalControlState {
     #[default]
@@ -36,11 +43,23 @@ pub struct HumanEventRenderer<'a, W> {
     thinking_open: bool,
     current_assistant_streamed_text: bool,
     untrusted_state: TerminalControlState,
+    assistant_markdown: StreamingMarkdownRenderer,
+    markdown_width: usize,
 }
 
 impl<'a, W: Write> HumanEventRenderer<'a, W> {
     #[must_use]
     pub fn new(writer: &'a mut W, ansi: bool) -> Self {
+        Self::with_width(writer, ansi, human_markdown_width())
+    }
+
+    /// Construct with an explicit terminal column width.
+    ///
+    /// Print mode and the REPL use [`Self::new`]; tests and embedders may use
+    /// this seam to guarantee output agreement with neutral/TUI adapters.
+    #[must_use]
+    pub fn with_width(writer: &'a mut W, ansi: bool, width: usize) -> Self {
+        let markdown_width = width.clamp(1, MAX_HEADLESS_MARKDOWN_WIDTH);
         Self {
             writer,
             ansi,
@@ -49,6 +68,8 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
             thinking_open: false,
             current_assistant_streamed_text: false,
             untrusted_state: TerminalControlState::Ground,
+            assistant_markdown: new_streaming_markdown(markdown_width),
+            markdown_width,
         }
     }
 
@@ -65,6 +86,7 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
     /// Append the mode adapter's historical trailing newline and flush.
     pub fn finish_turn(&mut self) -> io::Result<()> {
         self.close_thinking()?;
+        self.write_rendered_assistant_markdown()?;
         self.writer.write_all(b"\n")?;
         self.writer.flush()?;
         self.wrote_output = true;
@@ -79,6 +101,7 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
             } => {
                 self.current_assistant_streamed_text = false;
                 self.untrusted_state = TerminalControlState::Ground;
+                self.assistant_markdown = new_streaming_markdown(self.markdown_width);
                 Ok(())
             }
             AgentEvent::MessageUpdate {
@@ -112,16 +135,27 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
                     self.ensure_line_boundary()?;
                 }
                 self.current_assistant_streamed_text = true;
-                self.write_untrusted(delta)
+                self.append_assistant_markdown(delta);
+                Ok(())
+            }
+            AgentEvent::MessageEnd {
+                message: Message::Custom(message),
+            } if pi_coding::loop_message_view(message).is_some() => {
+                let loop_message = pi_coding::loop_message_view(message).expect("guarded loop message");
+                self.ensure_line_boundary()?;
+                self.write_styled_line(DIM, &format!("Loop {} · {}", loop_message.task_id, loop_message.schedule))?;
+                if loop_message.prompt.is_empty() { Ok(()) } else { self.write_markdown(loop_message.prompt) }
             }
             AgentEvent::MessageEnd {
                 message: Message::Assistant(message),
             } => {
                 self.close_thinking()?;
-                if !self.current_assistant_streamed_text {
+                if self.current_assistant_streamed_text {
+                    self.write_rendered_assistant_markdown()?;
+                } else {
                     let text = message.text();
                     if !text.is_empty() {
-                        self.write_untrusted(&text)?;
+                        self.write_markdown(&text)?;
                     }
                 }
                 self.untrusted_state = TerminalControlState::Ground;
@@ -134,6 +168,7 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
                 ..
             } => {
                 self.close_thinking()?;
+                self.write_rendered_assistant_markdown()?;
                 self.ensure_line_boundary()?;
                 let arguments = compact_tool_arguments(arguments);
                 self.write_styled_line(DIM, &format!("· {tool_name}({arguments})"))
@@ -274,6 +309,33 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
         Ok(())
     }
 
+    fn append_assistant_markdown(&mut self, text: &str) {
+        let mut sanitized = String::with_capacity(text.len());
+        sanitize_terminal_chunk(text, &mut self.untrusted_state, &mut sanitized);
+        self.assistant_markdown.push_str(&sanitized);
+    }
+
+    fn write_rendered_assistant_markdown(&mut self) -> io::Result<()> {
+        let rendered = self.assistant_markdown.output().plain_text();
+        if !rendered.is_empty() {
+            self.write_trusted_raw(&rendered)?;
+        }
+        self.assistant_markdown = new_streaming_markdown(self.markdown_width);
+        Ok(())
+    }
+
+    fn write_markdown(&mut self, text: &str) -> io::Result<()> {
+        let sanitized = sanitize_terminal_text(text);
+        let rendered = render_markdown(
+            &sanitized,
+            &MarkdownRenderOptions {
+                width: self.markdown_width,
+                ..MarkdownRenderOptions::default()
+            },
+        );
+        self.write_trusted_raw(&rendered.plain_text())
+    }
+
     fn write_untrusted(&mut self, text: &str) -> io::Result<()> {
         let mut sanitized = String::with_capacity(text.len());
         sanitize_terminal_chunk(text, &mut self.untrusted_state, &mut sanitized);
@@ -288,6 +350,22 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
         }
         Ok(())
     }
+}
+
+fn human_markdown_width() -> usize {
+    if !io::stdout().is_terminal() {
+        return FALLBACK_MARKDOWN_WIDTH;
+    }
+    crossterm::terminal::size()
+        .map(|(columns, _)| usize::from(columns).clamp(1, MAX_HEADLESS_MARKDOWN_WIDTH))
+        .unwrap_or(FALLBACK_MARKDOWN_WIDTH)
+}
+
+fn new_streaming_markdown(width: usize) -> StreamingMarkdownRenderer {
+    StreamingMarkdownRenderer::new(MarkdownRenderOptions {
+        width: width.clamp(1, MAX_HEADLESS_MARKDOWN_WIDTH),
+        ..MarkdownRenderOptions::default()
+    })
 }
 
 fn sanitize_terminal_text(text: &str) -> String {
@@ -481,7 +559,7 @@ where
     }
 
     let session = application.session();
-    let expanded = crate::file_args::expand_prompt(prompt, session.cwd())?;
+    let expanded = crate::file_args::expand_prompt_in_workspace(prompt, session.workspace_roots())?;
     let events = application.subscribe();
     application
         .prompt(expanded.prompt, expanded.images, None)
@@ -630,6 +708,32 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_turn_renders_public_loop_card_without_internal_wrapper() {
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::new(&mut output, false);
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: Message::Custom(pi_ai::CustomMessage {
+                    custom_type: "loop_scheduled_turn".to_owned(),
+                    content: "<system-reminder>internal</system-reminder>\n\necho hello".into(),
+                    display: false,
+                    details: Some(json!({
+                        "taskId": "abc123",
+                        "prompt": "echo hello",
+                        "schedule": "every 3 seconds",
+                    })),
+                    timestamp: 1,
+                }),
+            }))
+            .expect("render loop turn");
+        drop(renderer);
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(output.contains("Loop abc123 · every 3 seconds"));
+        assert!(output.contains("echo hello"));
+        assert!(!output.contains("system-reminder"));
+    }
+
+    #[test]
     fn renders_thinking_tools_and_assistant_in_event_order_without_ansi() {
         let mut output = Vec::new();
         let mut renderer = HumanEventRenderer::new(&mut output, false);
@@ -719,6 +823,11 @@ mod tests {
                 }))
                 .expect("render sanitized delta");
         }
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: assistant("safeafter"),
+            }))
+            .expect("end sanitized stream");
         drop(renderer);
 
         assert_eq!(String::from_utf8(output).expect("utf8"), "safeafter");
@@ -760,6 +869,68 @@ mod tests {
             .expect("end");
         drop(renderer);
         assert_eq!(String::from_utf8(output).expect("utf8"), "complete");
+    }
+
+    #[test]
+    fn print_output_matches_shared_neutral_markdown() {
+        let source = "# Heading\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: nope\n```";
+        let width = 48;
+        let expected = render_markdown(
+            source,
+            &MarkdownRenderOptions {
+                width,
+                ..MarkdownRenderOptions::default()
+            },
+        )
+        .plain_text();
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::with_width(&mut output, false, width);
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: assistant(source),
+            }))
+            .expect("render markdown");
+        drop(renderer);
+        assert_eq!(String::from_utf8(output).expect("utf8"), expected);
+    }
+
+    #[test]
+    fn streamed_markdown_is_emitted_once_at_message_end() {
+        let source = "# Stable\n\n| a | b |\n| --- | --- |\n| 1 | 2 |";
+        let expected = render_markdown_streaming(
+            source,
+            &MarkdownRenderOptions {
+                width: 40,
+                ..MarkdownRenderOptions::default()
+            },
+        )
+        .plain_text();
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::with_width(&mut output, false, 40);
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageStart {
+                message: assistant(""),
+            }))
+            .expect("start");
+        for delta in ["# Stable\n\n| a |", " b |\n| --- | --- |\n", "| 1 | 2 |"] {
+            renderer
+                .render(&ApplicationEvent::Agent(AgentEvent::MessageUpdate {
+                    message: assistant(""),
+                    assistant_message_event: AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: delta.to_owned(),
+                        partial: partial(),
+                    },
+                }))
+                .expect("delta");
+        }
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: assistant(source),
+            }))
+            .expect("end");
+        drop(renderer);
+        assert_eq!(String::from_utf8(output).expect("utf8"), expected);
     }
 
     #[test]

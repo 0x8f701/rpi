@@ -181,3 +181,56 @@ fn installed_git_symlink_escape_is_rejected() {
     let error = manager.installed_path("git:https://example.test/owner/repo", PackageScope::Global).unwrap_err();
     assert!(error.to_string().contains("escapes its scope root"));
 }
+
+#[test]
+fn npm_sources_fail_closed_without_state_mutation() {
+    let sandbox = TempDir::new().unwrap();
+    let cwd = sandbox.path().join("workspace");
+    let agent_dir = sandbox.path().join("agent");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+    let settings_path = agent_dir.join("settings.json");
+    fs::write(
+        &settings_path,
+        r#"{"packages":["npm:future-pkg"]}"#,
+    )
+    .unwrap();
+    let before = fs::read(&settings_path).unwrap();
+    let manager = manager(&cwd, &agent_dir, true);
+
+    let install_error = manager
+        .install("npm:future-pkg", PackageScope::Global)
+        .unwrap_err();
+    assert!(
+        install_error
+            .to_string()
+            .contains("npm package sources are not supported yet"),
+        "{install_error:#}"
+    );
+
+    let path_error = manager
+        .installed_path("npm:future-pkg", PackageScope::Global)
+        .unwrap_err();
+    assert!(
+        path_error
+            .to_string()
+            .contains("npm package sources are not supported yet"),
+        "{path_error:#}"
+    );
+
+    let update_error = manager.update_all().unwrap_err();
+    assert!(
+        update_error
+            .to_string()
+            .contains("npm package sources are not supported yet"),
+        "{update_error:#}"
+    );
+
+    assert_eq!(fs::read(&settings_path).unwrap(), before);
+    assert!(!agent_dir.join("package-state.json").exists());
+
+    let listed = manager.list().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].supported);
+    assert_eq!(listed[0].source, "npm:future-pkg");
+}

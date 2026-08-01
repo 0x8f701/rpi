@@ -173,19 +173,24 @@ pub fn select_deterministic(input: SelectionInput<'_>) -> SelectionPlan {
         input.settings,
     );
     let selected_agent = select_default_agent(&agents, input.settings);
-    let mut autoload_skills = BTreeSet::new();
+    let mut autoload_skills = Vec::new();
+    let mut seen_autoload_skills = BTreeSet::new();
     for skill in input.skills.iter().filter(|skill| {
         skill.trusted && skill.always_apply && !skill.disable_model_invocation
     }) {
-        autoload_skills.insert(skill.name.clone());
+        if seen_autoload_skills.insert(skill.name.clone()) {
+            autoload_skills.push(skill.name.clone());
+        }
     }
     for hit in skills.iter().filter(|hit| {
         hit.score >= input.settings.autoload_threshold
             && input.skills.iter().any(|skill| {
-                skill.name == hit.name && skill.trusted && skill.always_apply
+                skill.name == hit.name && skill.trusted && !skill.disable_model_invocation
             })
     }) {
-        autoload_skills.insert(hit.name.clone());
+        if seen_autoload_skills.insert(hit.name.clone()) {
+            autoload_skills.push(hit.name.clone());
+        }
     }
     if let Some(name) = selected_agent.as_deref()
         && let Some(agent) = input
@@ -198,8 +203,9 @@ pub fn select_deterministic(input: SelectionInput<'_>) -> SelectionPlan {
                 skill.trusted
                     && !skill.disable_model_invocation
                     && skill.name == *skill_name
-            }) {
-                autoload_skills.insert(skill_name.clone());
+            }) && seen_autoload_skills.insert(skill_name.clone())
+            {
+                autoload_skills.push(skill_name.clone());
             }
         }
     }
@@ -209,7 +215,7 @@ pub fn select_deterministic(input: SelectionInput<'_>) -> SelectionPlan {
         request: input.request.to_owned(),
         skills,
         agents,
-        autoload_skills: autoload_skills.into_iter().collect(),
+        autoload_skills,
         selected_agent,
         classifier_used: false,
         fallback_reason,
@@ -970,6 +976,30 @@ mod tests {
         assert_eq!(plan.selected_agent.as_deref(), Some("security-reviewer"));
         assert_eq!(plan.autoload_skills, vec!["security"]);
     }
+
+    #[test]
+    fn ranked_skills_autoload_in_rank_order_and_dedupe_agent_declarations() {
+        let rust = skill("rust-review", "Review Rust code for memory safety");
+        let security = skill("security-audit", "Audit security vulnerabilities");
+        let mut reviewer = agent("reviewer", "Review Rust security patches");
+        reviewer.autoload_skills = vec!["rust-review".to_owned()];
+        let settings = SelectorSettings {
+            autoload_threshold: 1,
+            auto_select_threshold: 1,
+            confidence_margin: 0,
+            min_score: 0,
+            ..SelectorSettings::default()
+        };
+        let plan = select_deterministic(SelectionInput {
+            request: "reviewer audit security vulnerabilities in Rust code",
+            skills: &[rust, security],
+            agents: &[reviewer],
+            settings: &settings,
+        });
+        assert_eq!(plan.selected_agent.as_deref(), Some("reviewer"));
+        assert_eq!(plan.autoload_skills, vec!["security-audit", "rust-review"]);
+    }
+
 
     #[test]
     fn skill_uri_rejects_traversal_but_allows_hidden() {

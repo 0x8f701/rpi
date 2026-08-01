@@ -10,9 +10,11 @@ mod parsers;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -112,11 +114,38 @@ pub struct ImportedSession {
     pub source: SourceSessionFormat,
     pub source_path: PathBuf,
     pub source_session_id: Option<String>,
-    /// Newly generated native Pi session id.
+    /// Newly generated native Pi session id (or reused id when idempotent).
     pub id: String,
     pub path: PathBuf,
     pub cwd: PathBuf,
     pub messages: Vec<ImportedMessage>,
+    /// True when an existing native conversion was returned without rewriting.
+    pub reused_existing: bool,
+}
+
+/// Durable foreign-source lineage stamped into emitted Pi sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportLineage {
+    pub source: SourceSessionFormat,
+    pub source_session_id: String,
+    pub source_path: PathBuf,
+    pub content_fingerprint: Option<String>,
+    pub imported_at: String,
+}
+
+impl ImportLineage {
+    #[must_use]
+    pub fn parent_session_value(&self) -> String {
+        if self.source_session_id.is_empty() {
+            format!(
+                "{}:{}",
+                self.source.as_str(),
+                self.source_path.to_string_lossy()
+            )
+        } else {
+            format!("{}:{}", self.source.as_str(), self.source_session_id)
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -170,12 +199,266 @@ pub enum ImportSessionError {
     },
 }
 
+/// Open source files held by descriptor so parsers never reopen ambient paths.
+#[derive(Debug)]
+pub(crate) struct OpenedSource {
+    path: PathBuf,
+    primary: fs::File,
+    metadata: fs::Metadata,
+    grok_chat: Option<fs::File>,
+    grok_cwd: Option<fs::File>,
+}
+
+impl OpenedSource {
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub(crate) fn metadata(&self) -> &fs::Metadata {
+        &self.metadata
+    }
+
+    fn into_parts(self) -> OpenedSourceParts {
+        OpenedSourceParts {
+            path: self.path,
+            primary: self.primary,
+            grok_chat: self.grok_chat,
+            grok_cwd: self.grok_cwd,
+        }
+    }
+
+    pub(crate) fn into_primary(self) -> fs::File {
+        self.primary
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct OpenedSourceParts {
+    pub(super) path: PathBuf,
+    pub(super) primary: fs::File,
+    pub(super) grok_chat: Option<fs::File>,
+    pub(super) grok_cwd: Option<fs::File>,
+}
+
+/// Open one recognized session relative to its configured root. Ambient
+/// authority establishes the root capability only; all source and companion
+/// opens are relative, escape-confined, and final-component no-follow.
+pub(crate) fn open_source_under_root(
+    source: SourceSessionFormat,
+    root: &Path,
+    path: &Path,
+) -> Result<OpenedSource, ImportSessionError> {
+    open_source_under_root_inner(source, root, path, true)
+}
+
+fn open_source_under_absolute_root(
+    source: SourceSessionFormat,
+    root: &Path,
+    path: &Path,
+) -> Result<OpenedSource, ImportSessionError> {
+    let relative = path.strip_prefix(&root).map_err(|_| {
+        invalid_source_open(
+            source,
+            &path,
+            "path is outside the configured source root".to_owned(),
+        )
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(invalid_source_open(
+            source,
+            &path,
+            "path is not a normal relative source path".to_owned(),
+        ));
+    }
+
+    let directory = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).map_err(|error| {
+        invalid_source_open(
+            source,
+            &path,
+            format!("cannot open configured source root {}: {error}", root.display()),
+        )
+    })?;
+    let primary = open_capability_file(&directory, relative, source, &path)?;
+    let metadata = primary.metadata().map_err(|source_error| ImportSessionError::Io {
+        path: path.to_path_buf(),
+        source: source_error,
+    })?;
+    if !metadata.is_file() {
+        return Err(invalid_source_open(
+            source,
+            &path,
+            "source is not a regular file".to_owned(),
+        ));
+    }
+
+    let (grok_chat, grok_cwd) = if source == SourceSessionFormat::Grok {
+        let chat_relative = relative.with_file_name("chat_history.jsonl");
+        let chat_path = root.join(&chat_relative);
+        let chat = open_optional_capability_file(&directory, &chat_relative, source, &chat_path)?;
+        let cwd_relative = relative
+            .parent()
+            .and_then(Path::parent)
+            .map(|parent| parent.join(".cwd"));
+        let cwd = match cwd_relative {
+            Some(relative) => {
+                let cwd_path = root.join(&relative);
+                open_optional_capability_file(&directory, &relative, source, &cwd_path)?
+            }
+            None => None,
+        };
+        (chat, cwd)
+    } else {
+        (None, None)
+    };
+
+    Ok(OpenedSource {
+        path: path.to_path_buf(),
+        primary,
+        metadata,
+        grok_chat,
+        grok_cwd,
+    })
+}
+
+pub(crate) fn open_source_direct(
+    source: SourceSessionFormat,
+    path: &Path,
+) -> Result<OpenedSource, ImportSessionError> {
+    let path = absolute_path(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            invalid_source_open(source, &path, "source path has no parent directory".to_owned())
+        })?;
+    let root = if source == SourceSessionFormat::Grok {
+        parent.parent().unwrap_or(parent)
+    } else {
+        parent
+    };
+    open_source_under_root_inner(source, root, &path, false)
+}
+
+fn open_source_under_root_inner(
+    source: SourceSessionFormat,
+    root: &Path,
+    path: &Path,
+    require_candidate: bool,
+) -> Result<OpenedSource, ImportSessionError> {
+    if require_candidate && !is_source_candidate(source, path) {
+        return Err(invalid_source_open(
+            source,
+            path,
+            "path is not a recognized source session".to_owned(),
+        ));
+    }
+    let root = absolute_path(root)?;
+    let path = absolute_path(path)?;
+    open_source_under_absolute_root(source, &root, &path)
+}
+
+fn open_capability_file(
+    directory: &Dir,
+    relative: &Path,
+    source: SourceSessionFormat,
+    display_path: &Path,
+) -> Result<fs::File, ImportSessionError> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    directory
+        .open_with(relative, &options)
+        .map(cap_std::fs::File::into_std)
+        .map_err(|error| {
+            invalid_source_open(
+                source,
+                display_path,
+                format!("secure no-follow open under the configured root failed: {error}"),
+            )
+        })
+}
+
+fn open_optional_capability_file(
+    directory: &Dir,
+    relative: &Path,
+    source: SourceSessionFormat,
+    display_path: &Path,
+) -> Result<Option<fs::File>, ImportSessionError> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    match directory.open_with(relative, &options) {
+        Ok(file) => {
+            let file = file.into_std();
+            let metadata = file.metadata().map_err(|source_error| ImportSessionError::Io {
+                path: display_path.to_path_buf(),
+                source: source_error,
+            })?;
+            if !metadata.is_file() {
+                return Err(invalid_source_open(
+                    source,
+                    display_path,
+                    "companion is not a regular file".to_owned(),
+                ));
+            }
+            Ok(Some(file))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(invalid_source_open(
+            source,
+            display_path,
+            format!("secure no-follow companion open failed: {error}"),
+        )),
+    }
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, ImportSessionError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|source| ImportSessionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+}
+
+fn invalid_source_open(
+    source: SourceSessionFormat,
+    path: &Path,
+    reason: String,
+) -> ImportSessionError {
+    ImportSessionError::InvalidInput {
+        format: source,
+        path: path.to_path_buf(),
+        reason,
+    }
+}
+
 /// Resolve `input` as either a direct path or a source-specific session id,
 /// convert it, and write a new Pi v3 session beneath the default per-cwd
 /// session directory.
 pub fn import_session(
     source: SourceSessionFormat,
     input: impl AsRef<Path>,
+) -> Result<ImportedSession, ImportSessionError> {
+    import_session_with_lineage(source, input, None)
+}
+
+/// Like [`import_session`] but stamps optional durable lineage metadata.
+pub fn import_session_with_lineage(
+    source: SourceSessionFormat,
+    input: impl AsRef<Path>,
+    lineage: Option<&ImportLineage>,
 ) -> Result<ImportedSession, ImportSessionError> {
     let source_path = resolve_input(source, input.as_ref())?;
     let parsed = parse_source(source, &source_path)?;
@@ -184,7 +467,8 @@ pub fn import_session(
     let id = Uuid::now_v7().to_string();
     let start = session_start(&parsed);
     let output = default_session_dir(&cwd).join(session_filename(start, &id));
-    emit(source, source_path, parsed, cwd, id, output)
+    let lineage = lineage.cloned().unwrap_or_else(|| default_lineage(source, &source_path, &parsed));
+    emit(source, source_path, parsed, cwd, id, output, Some(&lineage))
 }
 
 /// Resolve `input`, convert it, and write a new Pi v3 session to `output`.
@@ -195,7 +479,30 @@ pub fn import_session_to(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
 ) -> Result<ImportedSession, ImportSessionError> {
-    let source_path = resolve_input(source, input.as_ref())?;
+    import_session_to_with_lineage_inner(source, input, output, None)
+}
+
+/// Import into `output` while stamping durable lineage metadata.
+pub fn import_session_to_with_lineage(
+    source: SourceSessionFormat,
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    lineage: &ImportLineage,
+) -> Result<ImportedSession, ImportSessionError> {
+    import_session_to_with_lineage_inner(source, input, output, Some(lineage))
+}
+
+fn import_session_to_with_lineage_inner(
+    source: SourceSessionFormat,
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    lineage: Option<&ImportLineage>,
+) -> Result<ImportedSession, ImportSessionError> {
+    let source_path = if input.as_ref().is_file() {
+        normalize_direct_path(source, input.as_ref().to_path_buf())?
+    } else {
+        resolve_input(source, input.as_ref())?
+    };
     let parsed = parse_source(source, &source_path)?;
     ensure_messages(source, &source_path, &parsed)?;
     let cwd = usable_cwd(&parsed.cwd)?;
@@ -207,7 +514,163 @@ pub fn import_session_to(
     } else {
         requested.to_path_buf()
     };
-    emit(source, source_path, parsed, cwd, id, output)
+    let lineage = lineage.cloned().unwrap_or_else(|| default_lineage(source, &source_path, &parsed));
+    emit(source, source_path, parsed, cwd, id, output, Some(&lineage))
+}
+
+/// Public resolve helper for the unified session catalog.
+pub fn resolve_input_public(
+    source: SourceSessionFormat,
+    input: &Path,
+) -> Result<PathBuf, ImportSessionError> {
+    resolve_input(source, input)
+}
+
+/// Parse a source through the secure direct-path compatibility boundary.
+pub fn parse_source_public(
+    source: SourceSessionFormat,
+    path: &Path,
+) -> Result<ParsedSessionPublic, ImportSessionError> {
+    parse_source(source, path).map(ParsedSessionPublic::from)
+}
+
+/// Parse a catalog source through its configured root capability.
+pub(crate) fn parse_source_under_root_public(
+    source: SourceSessionFormat,
+    root: &Path,
+    path: &Path,
+) -> Result<ParsedSessionPublic, ImportSessionError> {
+    let opened = open_source_under_root(source, root, path)?;
+    parsers::parse_opened_source(source, opened).map(ParsedSessionPublic::from)
+}
+
+/// Parse an already secured source handle without reopening its path.
+pub(crate) fn parse_opened_source_public(
+    source: SourceSessionFormat,
+    opened: OpenedSource,
+) -> Result<ParsedSessionPublic, ImportSessionError> {
+    parsers::parse_opened_source(source, opened).map(ParsedSessionPublic::from)
+}
+
+/// Lossy parse result shared with the session catalog (no private parser types).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSessionPublic {
+    pub source_session_id: Option<String>,
+    pub cwd: PathBuf,
+    pub started_at: Option<String>,
+    pub messages: Vec<ImportedMessage>,
+}
+
+impl From<ParsedSession> for ParsedSessionPublic {
+    fn from(parsed: ParsedSession) -> Self {
+        Self {
+            source_session_id: parsed.source_session_id,
+            cwd: parsed.cwd,
+            started_at: parsed.started_at,
+            messages: parsed.messages,
+        }
+    }
+}
+
+impl From<ParsedSessionPublic> for ParsedSession {
+    fn from(parsed: ParsedSessionPublic) -> Self {
+        Self {
+            source_session_id: parsed.source_session_id,
+            cwd: parsed.cwd,
+            started_at: parsed.started_at,
+            messages: parsed.messages,
+        }
+    }
+}
+
+/// Public source-id helper for catalog resolution.
+pub fn source_id_public(
+    source: SourceSessionFormat,
+    path: &Path,
+) -> Result<Option<String>, ImportSessionError> {
+    source_id(source, path)
+}
+
+/// Read an id through the catalog's configured root capability.
+pub(crate) fn source_id_under_root_public(
+    source: SourceSessionFormat,
+    root: &Path,
+    path: &Path,
+) -> Result<Option<String>, ImportSessionError> {
+    let opened = open_source_under_root(source, root, path)?;
+    parsers::source_id_opened(source, opened)
+}
+
+/// Emit a caller-parsed session at a caller-reserved deterministic path.
+pub(crate) fn emit_parsed_session_at_with_lineage(
+    source: SourceSessionFormat,
+    source_path: PathBuf,
+    parsed: ParsedSessionPublic,
+    cwd: PathBuf,
+    id: String,
+    output: PathBuf,
+    lineage: &ImportLineage,
+) -> Result<ImportedSession, ImportSessionError> {
+    let parsed = ParsedSession::from(parsed);
+    ensure_messages(source, &source_path, &parsed)?;
+    emit(
+        source,
+        source_path,
+        parsed,
+        cwd,
+        id,
+        output,
+        Some(lineage),
+    )
+}
+
+/// Resolve a source root, optionally overriding Codex/Claude homes.
+pub fn source_root_for(
+    source: SourceSessionFormat,
+    codex_home: Option<&Path>,
+    claude_config_dir: Option<&Path>,
+) -> Result<PathBuf, ImportSessionError> {
+    match source {
+        SourceSessionFormat::Codex => Ok(codex_home
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+            .unwrap_or(home_dir()?.join(".codex"))
+            .join("sessions")),
+        SourceSessionFormat::Claude => Ok(claude_config_dir
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from))
+            .unwrap_or(home_dir()?.join(".claude"))
+            .join("projects")),
+        SourceSessionFormat::Pi => Ok(home_dir()?.join(".pi/agent/sessions")),
+        SourceSessionFormat::Omp => Ok(home_dir()?.join(".omp/agent/sessions")),
+        SourceSessionFormat::Grok => Ok(home_dir()?.join(".grok/sessions")),
+        SourceSessionFormat::Droid => Ok(home_dir()?.join(".factory/sessions")),
+    }
+}
+
+fn default_lineage(
+    source: SourceSessionFormat,
+    source_path: &Path,
+    parsed: &ParsedSession,
+) -> ImportLineage {
+    ImportLineage {
+        source,
+        source_session_id: parsed
+            .source_session_id
+            .clone()
+            .unwrap_or_default(),
+        source_path: source_path.to_path_buf(),
+        content_fingerprint: fs::metadata(source_path).ok().map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_secs())
+                .unwrap_or(0);
+            format!("{}:{}", modified, metadata.len())
+        }),
+        imported_at: format_timestamp(Utc::now()),
+    }
 }
 
 fn emit(
@@ -217,8 +680,9 @@ fn emit(
     cwd: PathBuf,
     id: String,
     output: PathBuf,
+    lineage: Option<&ImportLineage>,
 ) -> Result<ImportedSession, ImportSessionError> {
-    let records = pi_records(source, &parsed, &cwd, &id);
+    let records = pi_records(source, &parsed, &cwd, &id, lineage);
     write_jsonl_new(&output, &records)?;
     Ok(ImportedSession {
         source,
@@ -228,6 +692,7 @@ fn emit(
         path: output,
         cwd,
         messages: parsed.messages,
+        reused_existing: false,
     })
 }
 
@@ -269,21 +734,27 @@ fn pi_records(
     session: &ParsedSession,
     cwd: &Path,
     session_id: &str,
+    lineage: Option<&ImportLineage>,
 ) -> Vec<Value> {
     let start = session_start(session);
     let header_timestamp = format_timestamp(start);
     let model_entry_id = short_id();
     let thinking_entry_id = short_id();
+    let lineage_entry_id = short_id();
     let provider = "pi-rs-import";
     let model = format!("converted-from-{source}");
+    let parent_session = lineage.map(ImportLineage::parent_session_value);
+    let mut header = serde_json::Map::new();
+    header.insert("type".to_owned(), json!("session"));
+    header.insert("version".to_owned(), json!(3));
+    header.insert("id".to_owned(), json!(session_id));
+    header.insert("timestamp".to_owned(), json!(header_timestamp));
+    header.insert("cwd".to_owned(), json!(cwd));
+    if let Some(parent) = parent_session.clone() {
+        header.insert("parentSession".to_owned(), json!(parent));
+    }
     let mut records = vec![
-        json!({
-            "type": "session",
-            "version": 3,
-            "id": session_id,
-            "timestamp": header_timestamp,
-            "cwd": cwd,
-        }),
+        Value::Object(header),
         json!({
             "type": "model_change",
             "id": model_entry_id,
@@ -302,6 +773,35 @@ fn pi_records(
     ];
 
     let mut parent_id = thinking_entry_id;
+    if let Some(lineage) = lineage {
+        let mut data = serde_json::Map::new();
+        data.insert("source".to_owned(), json!(source.as_str()));
+        data.insert(
+            "sourceSessionId".to_owned(),
+            json!(lineage.source_session_id),
+        );
+        data.insert(
+            "sourcePath".to_owned(),
+            json!(lineage.source_path.to_string_lossy()),
+        );
+        data.insert("importedAt".to_owned(), json!(lineage.imported_at));
+        if let Some(fingerprint) = &lineage.content_fingerprint {
+            data.insert("contentFingerprint".to_owned(), json!(fingerprint));
+        }
+        if let Some(parent) = parent_session {
+            data.insert("parentSession".to_owned(), json!(parent));
+        }
+        records.push(json!({
+            "type": "custom",
+            "id": lineage_entry_id,
+            "parentId": parent_id,
+            "timestamp": format_timestamp(start + TimeDelta::milliseconds(3)),
+            "customType": "import_lineage",
+            "data": Value::Object(data),
+        }));
+        parent_id = lineage_entry_id;
+    }
+
     for (index, message) in session.messages.iter().enumerate() {
         let timestamp = message
             .timestamp
@@ -411,20 +911,31 @@ fn write_jsonl_new(path: &Path, records: &[Value]) -> Result<(), ImportSessionEr
         })?;
         bytes.push(b'\n');
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| ImportSessionError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| ImportSessionError::Io {
+
+    let temporary = parent.join(format!(".pi-import-{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|source| ImportSessionError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|source| ImportSessionError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        drop(file);
+        fs::hard_link(&temporary, path).map_err(|source| ImportSessionError::Io {
             path: path.to_path_buf(),
             source,
         })
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
 }
 
 fn resolve_input(
@@ -747,12 +1258,18 @@ mod tests {
         assert_eq!(values[0]["type"], "session");
         assert_eq!(values[0]["version"], 3);
         assert_eq!(values[0]["id"], imported.id);
+        assert_eq!(values[0]["parentSession"], "codex:old-id");
         assert_eq!(values[1]["type"], "model_change");
         assert_eq!(values[2]["type"], "thinking_level_change");
-        assert_eq!(values[3]["message"]["content"][0]["text"], "question");
-        assert_eq!(values[3]["timestamp"], "2026-06-01T00:00:01Z");
-        assert_eq!(values[4]["message"]["content"][0]["text"], "answer");
+        assert_eq!(values[3]["type"], "custom");
+        assert_eq!(values[3]["customType"], "import_lineage");
+        assert_eq!(values[3]["data"]["source"], "codex");
+        assert_eq!(values[3]["data"]["sourceSessionId"], "old-id");
+        assert_eq!(values[4]["message"]["content"][0]["text"], "question");
+        assert_eq!(values[4]["timestamp"], "2026-06-01T00:00:01Z");
         assert_eq!(values[4]["parentId"], values[3]["id"]);
+        assert_eq!(values[5]["message"]["content"][0]["text"], "answer");
+        assert_eq!(values[5]["parentId"], values[4]["id"]);
     }
 
     #[test]

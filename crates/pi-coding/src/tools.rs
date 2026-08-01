@@ -38,8 +38,8 @@ use pi_ai::{ConstrainedSampling, ConstrainedSamplingStrictness, ContentBlock, Sc
 
 use crate::truncate::{
     format_size, truncate_head, truncate_line, TruncationResult, DEFAULT_MAX_BYTES,
-    DEFAULT_MAX_LINES, FIND_DEFAULT_LIMIT, GREP_DEFAULT_LIMIT, GREP_MAX_LINE_LENGTH,
-    LS_DEFAULT_LIMIT, utf16_len,
+    DEFAULT_MAX_LINES, FIND_DEFAULT_LIMIT, GLOB_DEFAULT_LIMIT, GLOB_MAX_LIMIT,
+    GREP_DEFAULT_LIMIT, GREP_MAX_LINE_LENGTH, LS_DEFAULT_LIMIT, utf16_len,
 };
 use crate::todo::{TodoRuntime, TodoToolDetails, TODO_ERROR_MARKER, deserialize_todo_op, tool_failure_result};
 
@@ -98,8 +98,12 @@ pub struct BashProcessContext {
     pub owner_id: crate::ProcessOwnerId,
 }
 
+fn factory_workspace(cwd: &str) -> crate::WorkspaceRoots {
+    crate::WorkspaceRoots::for_tool_factory(cwd)
+}
+
 /// Built-in coding tool identifiers.
-pub const TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
+pub const TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "glob", "ls"];
 
 /// One-line prompt snippets keyed by tool name.
 #[must_use]
@@ -111,6 +115,7 @@ pub fn tool_snippet(name: &str) -> Option<&'static str> {
         "write" => "Create or overwrite files",
         "grep" => "Search file contents for patterns (respects .gitignore)",
         "find" => "Find files by glob pattern (respects .gitignore)",
+        "glob" => "Match files by glob pattern under workspace roots (sandboxed, bounded)",
         "ls" => "List directory contents",
         "todo" => "Track phased session work and completion state",
         _ => return None,
@@ -224,6 +229,7 @@ pub fn create_tool_with_session_env(
         "write" => Ok(write_tool(cwd)),
         "grep" => Ok(grep_tool(cwd)),
         "find" => Ok(find_tool(cwd)),
+        "glob" => Ok(glob_tool(cwd)),
         "ls" => Ok(ls_tool(cwd)),
         "todo" => Ok(todo_tool(TodoRuntime::memory())),
         _ => Err(anyhow!("Unknown tool name: {name}")),
@@ -256,6 +262,23 @@ pub fn create_tool_with_context_and_resolver(
         "read" => Ok(read_tool_with_resolver(cwd, skills, resolver)),
         _ => create_tool_with_session_env(name, cwd, session_env),
     }
+}
+
+/// Workspace-aware variant used by sessions with explicit additional roots.
+pub fn create_coding_tools_for_workspace_with_context_and_resolver(
+    workspace: crate::WorkspaceRoots,
+    session_env: Option<SessionEnvFn>,
+    skills: Option<SkillSnapshotFn>,
+    process: Option<BashProcessContext>,
+    resolver: Option<InternalUriResolverFn>,
+) -> Vec<AgentTool> {
+    let cwd = workspace.cwd().to_string_lossy().into_owned();
+    vec![
+        read_tool_for_workspace(workspace.clone(), skills, resolver),
+        bash_tool(&cwd, session_env, process),
+        edit_tool_for_workspace(workspace.clone()),
+        write_tool_for_workspace(workspace),
+    ]
 }
 
 /// Default coding tools with live session metadata and safe `skill://` resolution.
@@ -312,9 +335,9 @@ pub fn create_coding_tools_with_session_env(
     ]
 }
 
-/// Read-only built-ins in upstream order: `[read, grep, find, ls]`.
+/// Read-only built-ins in upstream order: `[read, grep, find, glob, ls]`.
 pub fn create_read_only_tools(cwd: &str) -> Vec<AgentTool> {
-    vec![read_tool(cwd), grep_tool(cwd), find_tool(cwd), ls_tool(cwd)]
+    vec![read_tool(cwd), grep_tool(cwd), find_tool(cwd), glob_tool(cwd), ls_tool(cwd)]
 }
 
 /// Serializable definitions for the read-only built-ins.
@@ -370,7 +393,7 @@ pub fn create_all_tool_definitions_map(cwd: &str) -> HashMap<String, pi_ai::Tool
 }
 
 
-/// All seven built-in tools, no session metadata.
+/// All built-in tools (including `glob`), no session metadata.
 pub fn create_all_tools(cwd: &str) -> Vec<AgentTool> {
     vec![
         read_tool(cwd),
@@ -379,12 +402,12 @@ pub fn create_all_tools(cwd: &str) -> Vec<AgentTool> {
         write_tool(cwd),
         grep_tool(cwd),
         find_tool(cwd),
+        glob_tool(cwd),
         ls_tool(cwd),
     ]
 }
 
-/// All seven built-in tools with the session-metadata provider threaded into
-/// bash.
+/// All built-in tools with the session-metadata provider threaded into bash.
 pub fn create_all_tools_with_session_env(
     cwd: &str,
     session_env: Option<SessionEnvFn>,
@@ -396,13 +419,14 @@ pub fn create_all_tools_with_session_env(
         write_tool(cwd),
         grep_tool(cwd),
         find_tool(cwd),
+        glob_tool(cwd),
         ls_tool(cwd),
     ]
 }
 
-/// All seven built-in tools with session metadata, skills, the bash process
-/// context, and an internal-URI resolver threaded into the `read` tool for
-/// `agent://`, `history://`, and `artifact://` URIs.
+/// All built-in tools with session metadata, skills, the bash process context,
+/// and an internal-URI resolver threaded into the `read` tool for `agent://`,
+/// `history://`, and `artifact://` URIs.
 pub fn create_all_tools_with_context_and_resolver(
     cwd: &str,
     session_env: Option<SessionEnvFn>,
@@ -417,6 +441,7 @@ pub fn create_all_tools_with_context_and_resolver(
         write_tool(cwd),
         grep_tool(cwd),
         find_tool(cwd),
+        glob_tool(cwd),
         ls_tool(cwd),
     ]
 }
@@ -546,11 +571,11 @@ fn todo_tool(runtime: TodoRuntime) -> AgentTool {
 // ---------------------------------------------------------------------------
 
 fn read_tool(cwd: &str) -> AgentTool {
-    read_tool_with_resolver(cwd, None, None)
+    read_tool_for_workspace(factory_workspace(cwd), None, None)
 }
 
 fn read_tool_with_skills(cwd: &str, skills: Option<SkillSnapshotFn>) -> AgentTool {
-    read_tool_with_resolver(cwd, skills, None)
+    read_tool_for_workspace(factory_workspace(cwd), skills, None)
 }
 
 /// Builds the `read` tool with an optional internal-URI resolver for
@@ -564,7 +589,14 @@ pub fn read_tool_with_resolver(
     skills: Option<SkillSnapshotFn>,
     resolver: Option<InternalUriResolverFn>,
 ) -> AgentTool {
-    let cwd = cwd.to_string();
+    read_tool_for_workspace(factory_workspace(cwd), skills, resolver)
+}
+
+fn read_tool_for_workspace(
+    workspace: crate::WorkspaceRoots,
+    skills: Option<SkillSnapshotFn>,
+    resolver: Option<InternalUriResolverFn>,
+) -> AgentTool {
     let params = s_object(
         vec![
             ("path", s_string("Path to the file to read (relative or absolute)")),
@@ -579,12 +611,12 @@ pub fn read_tool_with_resolver(
         DEFAULT_MAX_BYTES / 1024
     );
     AgentTool::new("read", description, params, move |ctx| {
-        let cwd = cwd.clone();
+        let workspace = workspace.clone();
         let skills = skills.clone();
         let resolver = resolver.clone();
         async move {
             run_read(
-                &cwd,
+                &workspace,
                 ctx.arguments,
                 skills.as_ref(),
                 resolver.as_ref(),
@@ -609,7 +641,7 @@ fn internal_uri_scheme(path: &str) -> Option<&'static str> {
 }
 
 fn run_read(
-    cwd: &str,
+    workspace: &crate::WorkspaceRoots,
     args: Value,
     skills: Option<&SkillSnapshotFn>,
     resolver: Option<&InternalUriResolverFn>,
@@ -629,7 +661,7 @@ fn run_read(
             .ok_or_else(|| anyhow!("{scheme}:// resolution is unavailable for this read tool"))?;
         resolver(&path)?.to_string_lossy().into_owned()
     } else {
-        resolve_read_path(&path, cwd)?
+        resolve_read_path(&path, workspace)?
     };
     check_aborted(&abort)?;
     let info = std::fs::metadata(&abs).map_err(|e| anyhow!("{}", e))?;
@@ -773,7 +805,10 @@ fn run_read(
 // ---------------------------------------------------------------------------
 
 fn write_tool(cwd: &str) -> AgentTool {
-    let cwd = cwd.to_string();
+    write_tool_for_workspace(factory_workspace(cwd))
+}
+
+fn write_tool_for_workspace(workspace: crate::WorkspaceRoots) -> AgentTool {
     let params = s_object(
         vec![
             ("path", s_string("Path to the file to write (relative or absolute)")),
@@ -786,17 +821,21 @@ fn write_tool(cwd: &str) -> AgentTool {
         "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
         params,
         move |ctx| {
-            let cwd = cwd.clone();
-            async move { run_write(&cwd, ctx.arguments, ctx.abort).await }
+            let workspace = workspace.clone();
+            async move { run_write(&workspace, ctx.arguments, ctx.abort).await }
         },
     )
     .with_prompt_guidelines(vec!["Use write only for new files or complete rewrites.".to_string()])
 }
 
-async fn run_write(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
+async fn run_write(
+    workspace: &crate::WorkspaceRoots,
+    args: Value,
+    abort: AbortSignal,
+) -> Result<AgentToolResult> {
     let path = arg_str(&args, "path");
     let content = arg_str(&args, "content");
-    let abs = resolve_scoped_path(&path, cwd)?;
+    let abs = resolve_scoped_path(&path, workspace)?;
     with_file_mutation_queue(&abs, || async {
         check_aborted(&abort)?;
         if let Some(parent) = Path::new(&abs).parent() {
@@ -821,7 +860,10 @@ async fn run_write(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentTo
 // ---------------------------------------------------------------------------
 
 fn edit_tool(cwd: &str) -> AgentTool {
-    let cwd = cwd.to_string();
+    edit_tool_for_workspace(factory_workspace(cwd))
+}
+
+fn edit_tool_for_workspace(workspace: crate::WorkspaceRoots) -> AgentTool {
     let edit_obj = s_object(
         vec![
             ("oldText", s_string("Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.")),
@@ -841,8 +883,8 @@ fn edit_tool(cwd: &str) -> AgentTool {
         "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
         params,
         move |ctx| {
-            let cwd = cwd.clone();
-            async move { run_edit(&cwd, ctx.arguments, ctx.abort).await }
+            let workspace = workspace.clone();
+            async move { run_edit(&workspace, ctx.arguments, ctx.abort).await }
         },
     )
     .with_prompt_guidelines(vec![
@@ -854,7 +896,7 @@ fn edit_tool(cwd: &str) -> AgentTool {
     .with_prepare_arguments(prepare_edit_arguments)
 }
 
-async fn run_edit(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
+async fn run_edit(workspace: &crate::WorkspaceRoots, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
     let path = arg_str(&args, "path");
     let raw_edits = args
         .get("edits")
@@ -871,7 +913,7 @@ async fn run_edit(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToo
         let new = re.get("newText").and_then(|v| v.as_str()).unwrap_or("").to_string();
         edits.push(EditEntry { old_text: old, new_text: new });
     }
-    let abs = resolve_scoped_path(&path, cwd)?;
+    let abs = resolve_scoped_path(&path, workspace)?;
     // Serialize edits/writes to the same file (different files run in parallel).
     with_file_mutation_queue(&abs, || async {
         check_aborted(&abort)?;
@@ -1511,12 +1553,9 @@ pub async fn execute_bash(
 /// `bash` tool or `execute_bash`). Idempotent: a missing file or empty path is a
 /// no-op. The application/session should call this for any `full_output_path` it
 /// no longer needs (e.g. on shutdown, or once the agent has consumed it) so
-/// successful commands don't leak temp files.
-pub fn cleanup_full_output_path(path: &str) {
-    if !path.is_empty() {
-        let _ = std::fs::remove_file(path);
-    }
-}
+/// successful commands don't leak temp files. Also unregisters the path from the
+/// process-wide spill registry.
+pub use bash::{bash_spill_dir, cleanup_all_bash_spills, cleanup_full_output_path};
 
 /// Formats an f64 the way JS `String(number)` does for the common bash timeout
 /// values (shortest round-trippable decimal, no trailing `.0` for integers).
@@ -1543,7 +1582,7 @@ async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(mut r: R, state: Arc<Mutex<B
 // ---------------------------------------------------------------------------
 
 fn ls_tool(cwd: &str) -> AgentTool {
-    let cwd = cwd.to_string();
+    let workspace = factory_workspace(cwd);
     let params = s_object(
         vec![
             ("path", s_string("Directory to list (default: current directory)")),
@@ -1557,16 +1596,16 @@ fn ls_tool(cwd: &str) -> AgentTool {
         DEFAULT_MAX_BYTES / 1024
     );
     AgentTool::new("ls", description, params, move |ctx| {
-        let cwd = cwd.clone();
-        async move { run_ls(&cwd, ctx.arguments, ctx.abort) }
+        let workspace = workspace.clone();
+        async move { run_ls(&workspace, ctx.arguments, ctx.abort) }
     })
 }
 
-fn run_ls(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
+fn run_ls(workspace: &crate::WorkspaceRoots, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
     check_aborted(&abort)?;
     let dir = match args.get("path").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-        Some(p) => resolve_scoped_path(p, cwd)?,
-        None => cwd.to_string(),
+        Some(p) => resolve_scoped_path(p, workspace)?,
+        None => workspace.cwd().to_string_lossy().into_owned(),
     };
     let limit = arg_int(&args, "limit")?.map(|l| l.max(0) as usize).unwrap_or(LS_DEFAULT_LIMIT);
     let info = std::fs::metadata(&dir).map_err(|_| anyhow!("Path not found: {dir}"))?;
@@ -1641,7 +1680,7 @@ fn run_ls(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResult>
 // ---------------------------------------------------------------------------
 
 fn find_tool(cwd: &str) -> AgentTool {
-    let cwd = cwd.to_string();
+    let workspace = factory_workspace(cwd);
     let params = s_object(
         vec![
             ("pattern", s_string("Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'")),
@@ -1656,17 +1695,17 @@ fn find_tool(cwd: &str) -> AgentTool {
         DEFAULT_MAX_BYTES / 1024
     );
     AgentTool::new("find", description, params, move |ctx| {
-        let cwd = cwd.clone();
-        async move { run_find(&cwd, ctx.arguments, ctx.abort) }
+        let workspace = workspace.clone();
+        async move { run_find(&workspace, ctx.arguments, ctx.abort) }
     })
 }
 
-fn run_find(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
+fn run_find(workspace: &crate::WorkspaceRoots, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
     check_aborted(&abort)?;
     let pattern = arg_str(&args, "pattern");
     let root = match args.get("path").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-        Some(p) => resolve_scoped_path(p, cwd)?,
-        None => cwd.to_string(),
+        Some(p) => resolve_scoped_path(p, workspace)?,
+        None => workspace.cwd().to_string_lossy().into_owned(),
     };
     // Keep the raw signed limit (Go/pi): non-positive = unlimited; limit=0 still
     // reports the odd "0 results limit reached" notice (fd 0-is-unlimited).
@@ -1727,11 +1766,220 @@ fn run_find(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResul
 }
 
 // ---------------------------------------------------------------------------
+// glob (sandboxed native file matcher for child agents / OMP parity)
+// ---------------------------------------------------------------------------
+
+fn glob_tool(cwd: &str) -> AgentTool {
+    glob_tool_for_workspace(factory_workspace(cwd))
+}
+
+/// Builds the sandboxed `glob` tool for an explicit multi-root workspace.
+/// Used when the main session optionally enables glob without broadening the
+/// default coding tool set.
+#[must_use]
+pub fn create_glob_tool_for_workspace(workspace: crate::WorkspaceRoots) -> AgentTool {
+    glob_tool_for_workspace(workspace)
+}
+
+fn glob_tool_for_workspace(workspace: crate::WorkspaceRoots) -> AgentTool {
+    let params = s_object(
+        vec![
+            (
+                "pattern",
+                s_string("Glob pattern to match, e.g. '*.rs', '**/*.ts', or 'src/**/*.spec.ts'"),
+            ),
+            (
+                "path",
+                s_string(
+                    "Directory, file, or semicolon-separated targets to search (default: workspace cwd). Each target is confined to workspace roots.",
+                ),
+            ),
+            (
+                "hidden",
+                s_boolean("Include hidden files and directories (default: false)"),
+            ),
+            (
+                "gitignore",
+                s_boolean("Respect .gitignore rules (default: true)"),
+            ),
+            (
+                "limit",
+                s_number(&format!(
+                    "Maximum number of matches to return (default: {GLOB_DEFAULT_LIMIT}, max: {GLOB_MAX_LIMIT})"
+                )),
+            ),
+        ],
+        vec!["pattern"],
+    );
+    let description = format!(
+        "Match files and directories by glob pattern under the configured workspace roots. Sandboxed (no traversal or symlink escape). Does not shell out. Hidden entries are skipped unless hidden=true. Respects .gitignore unless gitignore=false. Output is truncated to at most {GLOB_MAX_LIMIT} results or {}KB.",
+        DEFAULT_MAX_BYTES / 1024
+    );
+    AgentTool::new("glob", description, params, move |ctx| {
+        let workspace = workspace.clone();
+        async move { run_glob(&workspace, ctx.arguments, ctx.abort) }
+    })
+}
+
+fn run_glob(
+    workspace: &crate::WorkspaceRoots,
+    args: Value,
+    abort: AbortSignal,
+) -> Result<AgentToolResult> {
+    check_aborted(&abort)?;
+    let pattern = arg_str(&args, "pattern");
+    if pattern.is_empty() {
+        return Err(anyhow!("pattern is required"));
+    }
+    let include_hidden = arg_bool(&args, "hidden");
+    // Default true: treat missing as true (OMP/child-agent default).
+    let use_gitignore = args
+        .get("gitignore")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let limit = arg_int(&args, "limit")?
+        .map(|l| l.max(1) as usize)
+        .unwrap_or(GLOB_DEFAULT_LIMIT)
+        .min(GLOB_MAX_LIMIT);
+
+    let path_arg = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let targets: Vec<String> = if path_arg.is_empty() {
+        vec![workspace.cwd().to_string_lossy().into_owned()]
+    } else {
+        path_arg
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve_scoped_path(s, workspace))
+            .collect::<Result<Vec<_>>>()?
+    };
+    if targets.is_empty() {
+        return Err(anyhow!("path resolved to no targets"));
+    }
+
+    let mut results: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut limit_reached = false;
+
+    'targets: for target in &targets {
+        check_aborted(&abort)?;
+        if !path_exists(target) {
+            return Err(anyhow!("Path not found: {target}"));
+        }
+        let meta =
+            std::fs::metadata(target).map_err(|e| anyhow!("Path not found: {target}: {e}"))?;
+        if meta.is_file() {
+            let name = Path::new(target)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if !include_hidden && name.starts_with('.') {
+                continue;
+            }
+            if match_fd_glob(&pattern, name, target) {
+                let rel = pathdiff_rel(workspace.cwd(), target);
+                if seen.insert(rel.clone()) {
+                    results.push(rel);
+                    if results.len() >= limit {
+                        limit_reached = true;
+                        break 'targets;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let mut ig = if use_gitignore {
+            IgnoreStack::new(target, false, true)
+        } else {
+            IgnoreStack::without_gitignore(target)
+        };
+        walk(target, &mut ig, &mut |abs, rel, is_dir| {
+            if abort.is_aborted() {
+                return WalkControl::Stop;
+            }
+            if results.len() >= limit {
+                limit_reached = true;
+                return WalkControl::Stop;
+            }
+            let base = Path::new(rel)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(rel);
+            if !include_hidden && base.starts_with('.') {
+                return if is_dir {
+                    WalkControl::SkipDir
+                } else {
+                    WalkControl::Continue
+                };
+            }
+            if match_fd_glob(&pattern, rel, abs) {
+                // Paths relative to the search target (OMP/find parity).
+                let out = rel.replace('\\', "/");
+                if seen.insert(out.clone()) {
+                    results.push(out);
+                    if results.len() >= limit {
+                        limit_reached = true;
+                        return WalkControl::Stop;
+                    }
+                }
+            }
+            WalkControl::Continue
+        });
+        if limit_reached {
+            break;
+        }
+    }
+    check_aborted(&abort)?;
+
+    results.sort();
+    if results.is_empty() {
+        return Ok(text_result("No files found matching pattern"));
+    }
+    let raw_output = results.join("\n");
+    let tr = truncate_head(&raw_output, usize::MAX, 0);
+    let mut output = tr.content.clone();
+    let mut details = json!({ "count": results.len() });
+    let mut notices = Vec::new();
+    if limit_reached {
+        notices.push(format!(
+            "{limit} results limit reached (max {GLOB_MAX_LIMIT}). Refine pattern or path"
+        ));
+        details["resultLimitReached"] = json!(limit);
+    }
+    if tr.truncated {
+        notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+        details["truncation"] = json!(tr);
+    }
+    if !notices.is_empty() {
+        output.push_str("\n\n[");
+        output.push_str(&notices.join(". "));
+        output.push(']');
+    }
+    let mut res = text_result(output);
+    res.details = details;
+    Ok(res)
+}
+
+/// Relative path of `abs` under `base` when possible; otherwise the absolute path.
+fn pathdiff_rel(base: &Path, abs: &str) -> String {
+    let abs_path = Path::new(abs);
+    abs_path
+        .strip_prefix(base)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| abs.replace('\\', "/"))
+}
+
+// ---------------------------------------------------------------------------
 // grep
 // ---------------------------------------------------------------------------
 
 fn grep_tool(cwd: &str) -> AgentTool {
-    let cwd = cwd.to_string();
+    let workspace = factory_workspace(cwd);
     let params = s_object(
         vec![
             ("pattern", s_string("Search pattern (regex or literal string)")),
@@ -1751,8 +1999,8 @@ fn grep_tool(cwd: &str) -> AgentTool {
         GREP_MAX_LINE_LENGTH
     );
     AgentTool::new("grep", description, params, move |ctx| {
-        let cwd = cwd.clone();
-        async move { run_grep(&cwd, ctx.arguments, ctx.abort) }
+        let workspace = workspace.clone();
+        async move { run_grep(&workspace, ctx.arguments, ctx.abort) }
     })
 }
 
@@ -1830,12 +2078,12 @@ fn grep_search_file(
     true
 }
 
-fn run_grep(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
+fn run_grep(workspace: &crate::WorkspaceRoots, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
     check_aborted(&abort)?;
     let pattern_str = arg_str(&args, "pattern");
     let root = match args.get("path").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-        Some(p) => resolve_scoped_path(p, cwd)?,
-        None => cwd.to_string(),
+        Some(p) => resolve_scoped_path(p, workspace)?,
+        None => workspace.cwd().to_string_lossy().into_owned(),
     };
     let glob_pat = arg_str(&args, "glob");
     // pi: Math.max(1, limit ?? 100) — non-positive limits clamp to 1.
@@ -2351,8 +2599,12 @@ mod tests {
         let cwd = cwd.to_string_lossy();
         assert_eq!(
             create_read_only_tools(&cwd).into_iter().map(|tool| tool.name).collect::<Vec<_>>(),
-            ["read", "grep", "find", "ls"]
+            ["read", "grep", "find", "glob", "ls"]
         );
+        assert_eq!(create_tool("glob", &cwd).unwrap().name, "glob");
+        assert!(create_tool("lsp", &cwd).is_err());
+        assert!(create_tool("ast", &cwd).is_err());
+        assert_eq!(create_read_only_tool_definitions(&cwd).len(), 5);
         let tools = create_all_tools_by_name(&cwd);
         assert_eq!(tools.len(), TOOL_NAMES.len());
         for name in TOOL_NAMES {
@@ -2362,7 +2614,7 @@ mod tests {
         assert_eq!(definitions.len(), TOOL_NAMES.len());
         assert_eq!(create_tool_definition("read", &cwd).unwrap().name, "read");
         assert_eq!(create_coding_tool_definitions(&cwd).len(), 4);
-        assert_eq!(create_read_only_tool_definitions(&cwd).len(), 4);
+        assert_eq!(create_read_only_tool_definitions(&cwd).len(), 5);
         assert_eq!(create_all_tools_map(&cwd).len(), TOOL_NAMES.len());
         assert_eq!(create_all_tool_definitions(&cwd).len(), TOOL_NAMES.len());
         assert_eq!(create_all_tool_definitions_map(&cwd).len(), TOOL_NAMES.len());
@@ -2377,6 +2629,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "Path escapes working directory: ../outside.txt");
+    }
+
+    #[tokio::test]
+    async fn workspace_tools_accept_added_root_and_reject_other_absolute_paths() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let added = tempfile::tempdir().expect("added");
+        let external = tempfile::tempdir().expect("external");
+        let accepted = added.path().join("accepted.txt");
+        let rejected = external.path().join("rejected.txt");
+        fs::write(&accepted, "accepted").expect("accepted file");
+        fs::write(&rejected, "rejected").expect("rejected file");
+        let workspace = crate::WorkspaceRoots::new(cwd.path(), [added.path()]).expect("workspace");
+        let read = create_coding_tools_for_workspace_with_context_and_resolver(
+            workspace,
+            None,
+            None,
+            None,
+            None,
+        )
+        .into_iter()
+        .find(|tool| tool.name == "read")
+        .expect("read tool");
+
+        let result = (read.execute)(make_ctx(json!({ "path": accepted })))
+            .await
+            .expect("read added root");
+        assert_eq!(text_of(&result), "accepted");
+        let error = (read.execute)(make_ctx(json!({ "path": rejected })))
+            .await
+            .expect_err("reject untrusted root")
+            .to_string();
+        assert!(error.contains("Path escapes workspace roots"), "{error}");
     }
 
     #[tokio::test]
@@ -2668,6 +2952,14 @@ mod tests {
         let text = text_of(&res);
         let path = extract_full_output_path(&text);
         assert!(!path.is_empty(), "expected Full output path in: {text}");
+        // Path must live inside this process's private spill dir (no
+        // path-substitution / cross-process collision hazard).
+        let spill_dir = bash_spill_dir();
+        let path_buf = std::path::PathBuf::from(&path);
+        assert!(
+            path_buf.starts_with(&spill_dir),
+            "spill path must be under contained dir {spill_dir:?}: {path}"
+        );
         assert!(std::path::Path::new(&path).exists(), "success spill file should persist for reads: {path}");
         // Application-owned cleanup removes it.
         cleanup_full_output_path(&path);
@@ -2678,16 +2970,18 @@ mod tests {
     async fn bash_full_output_spill_removed_on_nonzero_exit() {
         let d = tmpdir();
         let tool = bash_tool(&d.to_string_lossy(), None, None);
-        // Big output (spill) + nonzero exit: run_bash must clean up the spill file.
+        // Big output (spill) + nonzero exit: run_bash must clean up the spill
+        // and must NOT publish a (dead) Full output path in the error text.
+        // (Owned-file cleanup is covered race-free by bash.rs Drop/take unit
+        // tests; this test asserts the no-dead-path error contract.)
         let err = (tool.execute)(make_ctx(json!({ "command": "yes x | head -c 60000; exit 7", "timeout": 10 })))
             .await
             .unwrap_err()
             .to_string();
-        let path = extract_full_output_path(&err);
-        assert!(!path.is_empty(), "expected Full output path in error: {err}");
+        assert!(err.contains("exited with code 7"), "got: {err}");
         assert!(
-            !std::path::Path::new(&path).exists(),
-            "nonzero-exit must clean up the spill file (no leak): {path}"
+            !err.contains("Full output:"),
+            "error path must not publish a dead full-output path: {err}"
         );
     }
 
@@ -2695,19 +2989,17 @@ mod tests {
     async fn bash_full_output_spill_removed_on_timeout() {
         let d = tmpdir();
         let tool = bash_tool(&d.to_string_lossy(), None, None);
-        // Produce output continuously, then time out: spill file must be cleaned up.
+        // Produce output continuously, then time out: spill must be cleaned up
+        // and the error must not publish a dead Full output path.
         let err = (tool.execute)(make_ctx(json!({ "command": "yes x", "timeout": 0.5 })))
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("timed out"), "got: {err}");
-        let path = extract_full_output_path(&err);
-        if !path.is_empty() {
-            assert!(
-                !std::path::Path::new(&path).exists(),
-                "timeout must clean up the spill file (no leak): {path}"
-            );
-        }
+        assert!(
+            !err.contains("Full output:"),
+            "timeout must not publish a dead full-output path: {err}"
+        );
     }
 
     #[test]
@@ -2751,6 +3043,76 @@ mod tests {
         let text = text_of(&res);
         assert!(text.contains("src/a.ts"), "got: {text}");
         assert!(!text.contains("b.go"), "gitignored file leaked: {text}");
+    }
+
+    #[tokio::test]
+    async fn glob_tool_matches_and_respects_gitignore_by_default() {
+        let d = tmpdir();
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::write(d.join("src/a.ts"), b"x").unwrap();
+        fs::write(d.join("src/b.go"), b"x").unwrap();
+        fs::write(d.join(".gitignore"), b"*.go\n").unwrap();
+        fs::write(d.join(".git"), b"").unwrap();
+        let tool = create_tool("glob", &d.to_string_lossy()).unwrap();
+        assert_eq!(tool.name, "glob");
+        let res = (tool.execute)(make_ctx(json!({ "pattern": "*.ts" }))).await.unwrap();
+        let text = text_of(&res);
+        assert!(text.contains("src/a.ts"), "got: {text}");
+        assert!(!text.contains("b.go"), "gitignored file leaked: {text}");
+    }
+
+    #[tokio::test]
+    async fn glob_tool_hidden_and_gitignore_flags() {
+        let d = tmpdir();
+        fs::write(d.join("visible.rs"), b"x").unwrap();
+        fs::write(d.join(".secret.rs"), b"x").unwrap();
+        fs::write(d.join("ignored.rs"), b"x").unwrap();
+        fs::write(d.join(".gitignore"), b"ignored.rs\n").unwrap();
+        fs::write(d.join(".git"), b"").unwrap();
+        let tool = create_tool("glob", &d.to_string_lossy()).unwrap();
+
+        let def = (tool.execute)(make_ctx(json!({ "pattern": "*.rs" }))).await.unwrap();
+        let def_text = text_of(&def);
+        assert!(def_text.contains("visible.rs"), "got: {def_text}");
+        assert!(!def_text.contains(".secret.rs"), "hidden leaked: {def_text}");
+        assert!(!def_text.contains("ignored.rs"), "gitignored leaked: {def_text}");
+
+        let hid = (tool.execute)(make_ctx(json!({ "pattern": "*.rs", "hidden": true }))).await.unwrap();
+        let hid_text = text_of(&hid);
+        assert!(hid_text.contains(".secret.rs"), "hidden=true should include: {hid_text}");
+
+        let no_gi = (tool.execute)(make_ctx(json!({ "pattern": "*.rs", "gitignore": false }))).await.unwrap();
+        let no_gi_text = text_of(&no_gi);
+        assert!(no_gi_text.contains("ignored.rs"), "gitignore=false should include: {no_gi_text}");
+    }
+
+    #[tokio::test]
+    async fn glob_tool_rejects_path_escape_and_clamps_limit() {
+        let d = tmpdir();
+        for i in 0..5 {
+            fs::write(d.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let tool = create_tool("glob", &d.to_string_lossy()).unwrap();
+        let err = (tool.execute)(make_ctx(json!({ "pattern": "*", "path": ".." })))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("escapes") || err.contains("working directory") || err.contains("workspace"),
+            "expected confinement error, got: {err}"
+        );
+
+        let res = (tool.execute)(make_ctx(json!({ "pattern": "*.txt", "limit": 2 }))).await.unwrap();
+        let text = text_of(&res);
+        let count = text.lines().filter(|l| l.ends_with(".txt")).count();
+        assert_eq!(count, 2, "limit=2 should return 2 matches: {text}");
+        assert!(text.contains("results limit reached"), "expected limit notice: {text}");
+        assert_eq!(res.details.get("resultLimitReached"), Some(&json!(2)));
+
+        // Hard max is 200 even if caller asks for more.
+        let res_hi = (tool.execute)(make_ctx(json!({ "pattern": "*.txt", "limit": 9999 }))).await.unwrap();
+        let n = text_of(&res_hi).lines().filter(|l| l.ends_with(".txt")).count();
+        assert_eq!(n, 5, "all five files under hard max: {}", text_of(&res_hi));
     }
 
     #[tokio::test]

@@ -414,6 +414,20 @@ impl IgnoreStack {
         s
     }
 
+    /// Builds a stack that never applies gitignore rules (still skips `.git`
+    /// via [`Self::ignored`]).
+    pub(crate) fn without_gitignore(root: &str) -> IgnoreStack {
+        IgnoreStack {
+            root: root.to_string(),
+            use_gitignore: false,
+            repo_root: String::new(),
+            boundaries: false,
+            static_sources: Vec::new(),
+            loaded: HashMap::new(),
+            git_dir: HashMap::new(),
+        }
+    }
+
     /// Reports whether the root-relative dir contains a `.git` entry (a
     /// repository boundary). Results are cached.
     fn has_git_dir(&mut self, rel_dir: &str) -> bool {

@@ -103,6 +103,49 @@ fn corrupt_store_fails_closed_without_deleting_live_catalog() {
 }
 
 #[test]
+fn optional_invalid_store_is_quarantined_once_and_preserves_live_catalog() {
+    let directory = TempDir::new().expect("temporary store directory");
+    let path = directory.path().join("models-store.json");
+    let provider = "radius-optional-invalid-fixture";
+    let catalog = RadiusCatalog::with_store(provider, DEFAULT_RADIUS_GATEWAY, &path)
+        .expect("catalog");
+    let live = snapshot(provider, "live", 7);
+    catalog
+        .restore_snapshot(live.clone())
+        .expect("install live snapshot");
+    fs::write(&path, b"{}").expect("write invalid optional store");
+
+    assert!(
+        catalog
+            .restore_stored_snapshot_quarantining_invalid()
+            .expect("invalid optional cache is recoverable")
+            .is_none()
+    );
+    assert_eq!(catalog.snapshot(), live);
+    assert!(get_model(provider, "live").is_some());
+    assert!(!path.exists());
+    assert_eq!(
+        fs::read_dir(directory.path())
+            .expect("read directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("models-store.json.invalid-")
+            })
+            .count(),
+        1
+    );
+    assert!(
+        catalog
+            .restore_stored_snapshot_quarantining_invalid()
+            .expect("subsequent optional read is quiet")
+            .is_none()
+    );
+}
+
+#[test]
 fn invalid_stored_model_is_never_registered() {
     let directory = TempDir::new().expect("temporary store directory");
     let path = directory.path().join("models-store.json");

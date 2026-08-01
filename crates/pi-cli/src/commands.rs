@@ -114,22 +114,20 @@ pub fn import_session_command(source: &str, input: &Path, output: Option<&Path>)
     Ok(())
 }
 
-/// Convert a Codex session (path or source id) to native Pi v3 JSONL and
-/// return the emitted session path, ready to be loaded for resume.
-///
-/// Used by `pi --resume-codex PATH_OR_ID`.
-pub fn import_codex_for_resume(input: &str) -> Result<std::path::PathBuf> {
-    let path = std::path::Path::new(input);
-    let imported = pi_coding::import_session(pi_coding::SourceSessionFormat::Codex, path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    if imported.messages.is_empty() {
-        warn_line(&format!(
-            "warning: imported session {} has no convertible messages",
-            imported.id
-        ));
-    }
-    Ok(imported.path)
+/// Resolve a unified resume input to a native path using the environment-backed catalog.
+pub fn resolve_resume_for_startup(
+    input: &str,
+    preferred_cwd: Option<&Path>,
+) -> Result<crate::resume_catalog::ResumeSelectionResult> {
+    let catalog = pi_coding::SessionCatalog::from_env().map_err(anyhow::Error::new)?;
+    crate::resume_catalog::resolve_resume_selection(
+        &catalog,
+        &crate::resume_catalog::ResumeSelectionRequest::Input(input.to_owned()),
+        preferred_cwd,
+    )
+    .map_err(anyhow::Error::new)
 }
+
 
 /// Resolve a model spec to a model, surfacing a resolver warning on stderr
 /// without aborting. Mirrors the Go CLI's handling of `ResolveModelPattern`.
