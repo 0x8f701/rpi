@@ -225,49 +225,11 @@ jobs:
       - name: Install Rust 1.88.0
         shell: bash
         run: |
-          case "${{ matrix.target }}" in
-            aarch64-apple-darwin)
-              rustup_host=aarch64-apple-darwin
-              rustup_filename=rustup-init
-              rustup_sha256=20ef5516c31b1ac2290084199ba77dbbcaa1406c45c1d978ca68558ef5964ef5
-              ;;
-            x86_64-apple-darwin)
-              rustup_host=x86_64-apple-darwin
-              rustup_filename=rustup-init
-              rustup_sha256=9c331076f62b4d0edeae63d9d1c9442d5fe39b37b05025ec8d41c5ed35486496
-              ;;
-            x86_64-pc-windows-msvc)
-              rustup_host=x86_64-pc-windows-msvc
-              rustup_filename=rustup-init.exe
-              rustup_sha256=88d8258dcf6ae4f7a80c7d1088e1f36fa7025a1cfd1343731b4ee6f385121fc0
-              ;;
-            *)
-              echo "Unsupported rustup host for ${{ matrix.target }}" >&2
-              exit 1
-              ;;
-          esac
-          rustup_init="$RUNNER_TEMP/$rustup_filename"
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
-            "https://static.rust-lang.org/rustup/archive/1.28.2/${rustup_host}/${rustup_filename}" \
-            --output "$rustup_init"
-          if command -v sha256sum >/dev/null 2>&1; then
-            actual_sha256="$(sha256sum "$rustup_init" | cut -d ' ' -f 1)"
-          elif command -v shasum >/dev/null 2>&1; then
-            actual_sha256="$(shasum -a 256 "$rustup_init" | cut -d ' ' -f 1)"
-          else
-            echo "No SHA-256 tool is available" >&2
-            exit 1
-          fi
-          [ "$actual_sha256" = "$rustup_sha256" ] || {
-            echo "rustup-init SHA-256 mismatch" >&2
-            exit 1
-          }
-          chmod 0755 "$rustup_init"
-          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" target add --toolchain 1.88.0 "${{ matrix.target }}"
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+          rustup target add --toolchain 1.88.0 "${{ matrix.target }}"
 
-          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
+          rustc_version="$(rustc +1.88.0 --version)"
           echo "$rustc_version"
           case "$rustc_version" in
             "rustc 1.88.0 "*) ;;
