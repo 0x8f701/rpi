@@ -780,23 +780,30 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
         r#"{"type":"loop_create","id":"loop-create","interval":"3s","prompt":"rpc scheduled","fireImmediately":true,"durable":false}"#,
     );
     let deadline = Instant::now() + Duration::from_secs(20);
-    let (create_events, created) = session.read_until(deadline, |line| {
-        is_response(line) && line.get("id").and_then(Value::as_str) == Some("loop-create")
-    });
+    let mut created = None;
+    let mut created_event = None;
+    while created.is_none() || created_event.is_none() {
+        let line = session.read_json_deadline(deadline);
+        if is_response(&line)
+            && line.get("id").and_then(Value::as_str) == Some("loop-create")
+        {
+            created = Some(line);
+            continue;
+        }
+        if line.get("type").and_then(Value::as_str) == Some("loop_created") {
+            created_event = Some(line);
+        }
+    }
+    let created = created.expect("loop create response");
     assert_success(&created, "loop_create", "loop-create");
     assert_eq!(created["data"]["intervalSecs"], 3);
     let task_id = created["data"]["id"]
         .as_str()
         .expect("loop_create returns task id")
         .to_owned();
-    assert!(
-        create_events.iter().any(|line| {
-            line.get("type").and_then(Value::as_str) == Some("loop_created")
-                && line["task"]["id"] == task_id
-        }),
-        "ApplicationEvent::Loop must reach the RPC wire: {create_events:?}"
-    );
-    let mut loop_turn_events = create_events;
+    let created_event = created_event.expect("loop_created event");
+    assert_eq!(created_event["task"]["id"], task_id);
+    let mut loop_turn_events = vec![created_event];
     if !loop_turn_events.iter().any(|line| {
         matches!(line.get("type").and_then(Value::as_str), Some("loop_finished" | "loop_failed"))
     }) {
