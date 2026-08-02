@@ -11,7 +11,8 @@ The companion headless binary remains `pi-rpc`.
 
 ## Install
 
-macOS / Linux:
+Install the prebuilt `rpi` binary from GitHub Releases. The installer selects
+the current platform archive, verifies `SHA256SUMS`, and activates the binary:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | sh
@@ -23,43 +24,52 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.ps1 | iex
 ```
 
-Pin a release:
+Pin the installer and release to `v0.2.1`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | bash -s -- --version v0.2.0
+curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/v0.2.1/install.sh | bash -s -- --version v0.2.1
 ```
 
-Build and install from source:
+The release archive contains the compiled `rpi` executable; users do not need
+Rust or a source checkout. Maintainers who need a local source build can follow
+the explicitly separated developer fallback in [`docs/install.md`](docs/install.md).
 
-```sh
-cargo install --path crates/pi-cli --locked --bin rpi
-```
-
-The one-line installer places the active binary at `~/.pi-rs/bin/rpi`
-(`%USERPROFILE%\.pi-rs\bin\rpi.exe` on Windows). See
-[`docs/install.md`](docs/install.md) for manual builds, verification, and
-platform requirements.
+The release installer places the active binary at `~/.pi-rs/bin/rpi`
+(`%USERPROFILE%\.pi-rs\bin\rpi.exe` on Windows) and adds that directory to
+the user `PATH` when needed. Open a new terminal before running `rpi` if the
+installer reports that it changed `PATH`. See [`docs/install.md`](docs/install.md)
+for supported platforms, manual verification, and rollback behavior.
 
 ## Quick start
 
+Configure one provider before the first model request:
+
+```sh
+rpi login anthropic
+# Or set an environment variable instead:
+export ANTHROPIC_API_KEY="<your-anthropic-key>"
+```
+
+Then run:
+
 ```sh
 # Non-interactive print mode
-rpi --print -m openai/gpt-5.5 "List the Rust files in this directory"
+rpi --print -m anthropic/claude-sonnet-4-5 "List the Rust files in this directory"
 
 # JSON event stream (headless, one-shot)
 rpi --mode json -m anthropic/claude-sonnet-4-5 "List Rust files"
 
-# Interactive session (TUI if the terminal supports it, otherwise line REPL)
+# Interactive inline TUI (or line REPL when no terminal is available)
 rpi -m anthropic/claude-sonnet-4-5
 
 # List available models
 rpi models
 
-# Continue the most recent session for the current directory
+# Continue the newest saved session for the current directory
 rpi --continue
 ```
 
-See [`docs/quickstart.md`](docs/quickstart.md) for a walkthrough and
+See [`docs/quickstart.md`](docs/quickstart.md) for the first-run walkthrough and
 [`docs/cli-modes.md`](docs/cli-modes.md) for every flag and subcommand.
 
 ## Documentation
@@ -89,7 +99,7 @@ Runnable examples are in [`examples/`](examples/).
 | Area | Status |
 |------|--------|
 | Print mode, line REPL, TUI, JSON/RPC headless modes | Implemented |
-| Default coding tools (`read`, `bash`, `edit`, `write`); optional `grep`, `find`, `ls` tools | Implemented |
+| Default coding tools (`read`, `bash`, `edit`, `write`); optional `grep`, `find`, `glob`, `ls` tools | Implemented |
 | Native Pi v3 session storage, resume, import, export, and share | Implemented |
 | Built-in model catalog + custom models via `models.json` | Implemented |
 | Authentication via env vars, `auth.json`, `models.json`, `rpi login`/`logout` | Implemented |
@@ -113,7 +123,7 @@ Runnable examples are in [`examples/`](examples/).
 - `rpi login [provider]` / `rpi logout [provider]` — manage stored credentials
 - `rpi reload` — validate and print active resources
 - `rpi install SOURCE [--local]` / `rpi remove SOURCE [--local]` / `rpi list` — manage local/git packages
-- `rpi update [--self|--extensions] [PACKAGE]` — update rpi or configured packages
+- `rpi update [--self] [--extensions] [--all] [--models] [--extension SOURCE] [PACKAGE]` — update rpi, packages, or model catalogs
 - `rpi llama configure|status|refresh|load|unload|search|details|download|installed` — manage local models
 
 See [`docs/cli-modes.md`](docs/cli-modes.md) for details.

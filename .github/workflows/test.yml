@@ -1,0 +1,136 @@
+name: Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: workspace and product contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup_init="$RUNNER_TEMP/rustup-init"
+          rustup_sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init" \
+            --output "$rustup_init"
+          actual_sha256="$(sha256sum "$rustup_init" | cut -d ' ' -f 1)"
+          [ "$actual_sha256" = "$rustup_sha256" ] || {
+            echo "rustup-init SHA-256 mismatch" >&2
+            exit 1
+          }
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *)
+              echo "Expected rustc 1.88.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: test
+
+      - name: Install Bun 1.3.14
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Check workspace
+        run: cargo +1.88.0 check --workspace --all-targets --locked
+
+      - name: Test workspace contracts
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-ai --test registry_catalog_invariant --locked
+          cargo +1.88.0 test --package pi-agent --test loop_runtime_continue --locked
+
+      - name: Test coding tool and todo lifecycles
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-coding --test coding_tools_lifecycle --locked -- --nocapture
+          cargo +1.88.0 test --package pi-coding --test todo_dag_lifecycle --locked -- --nocapture
+
+      - name: Test process and session lifecycles
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-coding --test application_process --locked
+          cargo +1.88.0 test --package pi-coding --test application_runtime --locked state_tracks_modes_pending_counts_and_new_session_reset
+
+      - name: Test structured output modes
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-cli --test print_mode --locked
+          cargo +1.88.0 test --package pi-cli --test json_mode_binary --locked
+          cargo +1.88.0 test --package pi-cli --test rpc_binary --locked
+
+      - name: Test extensions with real Bun
+        env:
+          BUN_REQUIRED: "1"
+        shell: bash
+        run: |
+          bun --version
+          cargo +1.88.0 test --package pi-coding --test extensions --locked
+          cargo +1.88.0 test --package pi-coding --test extension_api_conformance --locked
+          cargo +1.88.0 test --package pi-cli --test extension_run_chain_tui --locked
+          cargo +1.88.0 test --package pi-cli --test extension_ui_tui --locked
+
+      - name: Test self-update
+        run: cargo +1.88.0 test --package pi-cli --lib self_update::tests --locked
+
+      - name: Check installers
+        shell: bash
+        run: |
+          sh -n install.sh
+          sh install.sh --help >/dev/null
+          sh tests/install-sh-static.sh
+
+      - name: Check PowerShell installer
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path './install.ps1'),
+            [ref]$null,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
+      - name: Build and smoke-test release binary
+        shell: bash
+        run: |
+          cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
+          target/release-dist/rpi --version
+
+      - name: Run deterministic product E2E
+        env:
+          RPI_BIN: target/release-dist/rpi
+        run: E2E.d/ci.sh run
+
+      - name: Run multi-workflow product E2E
+        env:
+          RPI_BIN: target/release-dist/rpi
+        run: E2E.d/ci/workflow.sh run

@@ -5,7 +5,9 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use pi_agent::AbortSignal;
+use pi_ai::ContentBlock;
 use pi_coding::{
     ExtensionActionHost, ExtensionCancellation, ExtensionCapability, ExtensionContextSnapshot,
     ExtensionContextUsage, ExtensionEvent, ExtensionFlagType, ExtensionFuture, ExtensionMode,
@@ -881,6 +883,77 @@ async fn real_bun_extension_apis_reject_when_no_ui_host_is_bound() -> Result<()>
         message.contains("no extension UI adapter") || message.contains("ui_unavailable"),
         "expected a no-UI-adapter rejection, got: {message}",
     );
+    runtime.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_bun_tools_register_and_execute_across_the_process_boundary() -> Result<()> {
+    let Some(bun) = bun_executable() else {
+        return Ok(());
+    };
+    let runtime = ExtensionRuntime::process(None, options());
+    let report = runtime
+        .load(vec![bun_spec(
+            "bun-tool",
+            "bun-tool.ts",
+            &bun,
+            [ExtensionCapability::Tools],
+            [],
+        )])
+        .await;
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+
+    let tools = runtime.tools();
+    let echo = tools
+        .iter()
+        .find(|tool| tool.name == "bun_echo")
+        .expect("bun_echo must be registered by the bun extension");
+    assert_eq!(echo.label, "Bun Echo");
+    assert_eq!(echo.description, "Echo text through the Bun extension host");
+    let schema = serde_json::to_value(&echo.parameters).context("serializing tool schema")?;
+    assert_eq!(schema["type"], json!("object"));
+    assert_eq!(schema["properties"]["text"]["type"], json!("string"));
+    assert_eq!(schema["required"], json!(["text"]));
+
+    let result = runtime
+        .invoke_tool(
+            "bun_echo",
+            "call-1".to_owned(),
+            json!({ "text": "hello-e2e" }),
+            AbortSignal::none(),
+            None,
+        )
+        .await
+        .context("invoking bun_echo through the real bun process")?;
+    let echoed = result
+        .content
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("tool result must carry a text block");
+    assert_eq!(
+        echoed, "hello-e2e",
+        "tool result must round-trip across the process boundary"
+    );
+
+    let error = runtime
+        .invoke_tool(
+            "bun_echo",
+            "call-2".to_owned(),
+            json!({ "text": 42 }),
+            AbortSignal::none(),
+            None,
+        )
+        .await
+        .expect_err("non-string text must surface an error from the bun host");
+    assert!(
+        !error.to_string().is_empty(),
+        "bun host error must be actionable"
+    );
+
     runtime.shutdown().await;
     Ok(())
 }

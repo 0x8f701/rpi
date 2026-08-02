@@ -1,10 +1,10 @@
 # TUI and keybindings
 
-The TUI is a full-screen terminal interface built with `crossterm` and
-`ratatui`. It is selected automatically when stdout is a TTY and raw mode can
-be entered; otherwise the CLI falls back to the line REPL (see [TUI vs
-REPL-only limitations](#tui-vs-repl-only-limitations)). The TUI branch is selected at `crates/pi-cli/src/lib.rs:138` and entered at
-`lib.rs:139`.
+The TUI is a normal-screen inline terminal interface built with `crossterm` and
+`ratatui`. It preserves terminal and tmux scrollback instead of switching to the
+alternate screen. It is selected when both stdin and stdout are terminals;
+otherwise the CLI uses print mode for positional prompts or the line REPL for a
+text session. The dispatch lives in `crates/pi-cli/src/lib.rs:138-169`.
 
 ## Layout
 
@@ -136,7 +136,7 @@ hard-coded chords; it resolves every key event to an `Action` (`keybindings.rs:2
 | `pagedown` | Scroll transcript down one page | `tui.editor.pageDown` |
 | `ctrl+w`, `alt+backspace` | Delete word backward | `tui.editor.deleteWordBackward` |
 | `alt+d`, `alt+delete` | Delete word forward | `tui.editor.deleteWordForward` |
-| `ctrl+u` | Delete to line start | `tui.editor.deleteToLineStart` |
+| `ctrl+u` | Clear the entire composer | `tui.editor.clear` |
 | `ctrl+k` | Delete to line end | `tui.editor.deleteToLineEnd` |
 | `ctrl+y` | Yank | `tui.editor.yank` |
 | `alt+y` | Yank pop | `tui.editor.yankPop` |
@@ -251,8 +251,8 @@ scalar (`a`, `/`, `1`).
 
 ## Selectors, tree, fork, and dialogs
 
-The TUI uses several full-screen panels. Each panel is modal: typing filters
-the list, `Enter` confirms the selection, and `Esc` closes the panel.
+The TUI uses several modal page overlays inside the inline viewport. Typing
+filters the list, `Enter` confirms the selection, and `Esc` closes the overlay.
 
 - **Model selector** (`ctrl+l` or `/model` with no argument): searchable list
   of configured providers and models (`open_model_panel` in `tui.rs:1963`).
@@ -289,8 +289,8 @@ the list, `Enter` confirms the selection, and `Esc` closes the panel.
 
 ## Terminal image behavior
 
-Images are rendered only in the full-screen TUI. The line REPL and structured
-modes never receive image protocol bytes (`terminal_images.rs:3`).
+Images are rendered only in the inline TUI. The line REPL and structured modes
+never receive image protocol bytes (`terminal_images.rs:3`).
 
 **Protocol detection** is deterministic from environment variables
 (`detect_protocol` in `terminal_images.rs:62`):
@@ -327,49 +327,29 @@ on cleanup; iTerm images use the inline `1337` sequence with
 
 ## Slash commands
 
-The TUI and line REPL share the same built-in catalog. The canonical list is
-`BUILTIN_COMMANDS` in `crates/pi-cli/src/interactive_commands.rs:134`. Prompt
-templates, skills, and extension commands are mixed into the live catalog by
-`executable_catalog` (`interactive_commands.rs:30`) when they are enabled and
-not shadowed by a built-in.
+The TUI and line REPL can execute the same built-ins, but `/help`, slash
+completion, and RPC discovery expose only the 12 commands in
+`PRIMARY_COMMAND_NAMES` (`interactive_commands.rs`). Prompt templates, dynamic
+skills, and extension commands remain executable through their namespaced paths.
 
 | Command | Description |
 |---------|-------------|
-| `/help` | Show available commands |
-| `/settings` | Open the settings panel (TUI) or print current settings (REPL) |
+| `/settings` | Inspect settings or open the settings page |
 | `/model [provider/model]` | Select or switch model |
-| `/scoped-models` | Enable or disable models for cycling (TUI selector) |
-| `/models [filter]` | List available models |
+| `/branch` | Create a branch from a previous message |
+| `/resume [path, id, or prefix]` | Resume native or discovered foreign sessions |
+| `/fork` | Fork from a previous user message |
 | `/export [path]` | Export session to HTML or JSONL |
-| `/import <path.jsonl>` | Import and resume a JSONL session |
-| `/share` | Share session as a private GitHub gist |
-| `/copy` | Copy the last assistant message |
-| `/name [name]` | Set or show the session name |
-| `/session` | Show current session information |
-| `/sessions` | List saved sessions (TUI selector) |
-| `/changelog` | Show version history |
-| `/hotkeys` | Show keyboard shortcuts |
-| `/theme [name, next, prev]` | Show, switch, or cycle the active theme |
-| `/fork` | Fork from a previous user message (TUI tree panel) |
-| `/clone` | Clone the current active branch |
-| `/tree` | Navigate the current session tree (TUI tree panel) |
-| `/loop [interval] <prompt>` | Run a prompt on a recurring interval |
-| `/loops` | List active recurring loops |
-| `/loop-update <id> [interval] [prompt]` | Update a loop interval, prompt, or both |
-| `/loop-delete <id>` | Delete a loop without aborting an already-running turn |
-| `/loop-cancel <id>` | Cancel a recurring loop by ID |
-| `/todo [markdown]` | Show or edit the task list |
-| `/trust` | Save a project trust decision (TUI trust panel) |
-| `/login [provider]` | Configure provider authentication |
-| `/logout [provider]` | Remove provider authentication |
-| `/llama [status, configure, refresh, load, unload]` | Manage the llama.cpp router |
-| `/new` | Start a new session |
+| `/agents` | Manage agent definitions and model overrides |
 | `/compact [instructions]` | Manually compact session context |
-| `/resume [path, id, or prefix]` | List or resume native and discovered OMP, Codex, Claude, Grok, or Droid sessions |
 | `/ps` | List supervised processes |
-| `/process <start, describe, logs, send, resize, signal, stop, wait> ...` | Control a supervised process |
-| `/reload` | Reload extensions and project resources |
-| `/quit` | Quit rpi (or use `Ctrl+D` on empty input) |
+| `/loop [interval] <prompt>` | Run a recurring prompt |
+| `/goal` | Manage the durable session goal |
+| `/workflow` | Manage isolated concurrent workflows |
+
+Other built-ins such as `/help`, `/new`, `/sessions`, `/tree`, `/todo`,
+`/share`, `/copy`, `/login`, `/logout`, `/process`, `/theme`, and `/quit`
+remain manually executable but are intentionally omitted from primary discovery.
 
 Loop intervals accept positive bare seconds (`/loop 300 check status`) or compact `s`, `m`, `h`, and `d` units (`/loop 3s echo hello`, `/loop 30m check deploy`). Scheduled turns appear as `Loop <id> · <cadence>` system cards; the internal model instruction wrapper is not shown as a user message.
 
@@ -377,13 +357,12 @@ Loop intervals accept positive bare seconds (`/loop 300 check status`) or compac
 
 When stdout is not a TTY, `main_run` falls back to `repl::interactive`
 (`lib.rs:142`). The REPL shares the same slash-command
-catalog but lacks the full-screen TUI facilities:
+catalog but lacks the TUI's modal page overlays:
 
-- **No full-screen panels**: model, settings, trust, saved-session, scoped-model,
+- **No modal pages**: model, settings, trust, saved-session, scoped-model,
   session-tree, and fork selectors are TUI-only. In the REPL, `/scoped-models`
-  and `/theme` report that they require the TUI (`repl.rs:117,120`), `/tree` prints
-  JSON, `/fork` with no argument prints candidate messages, and `/model` only
-  accepts a concrete spec.
+  and `/theme` report that they require the TUI, `/tree` prints JSON, `/fork`
+  with no argument prints candidate messages, and `/model` accepts a concrete spec.
 - **No configurable keybindings or themes**: the REPL uses a fixed
   line-editing interface and ignores theme files.
 - **No terminal image rendering**: image attachments are processed and sent

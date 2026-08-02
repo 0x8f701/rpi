@@ -6,7 +6,7 @@
 #
 # Usage:
 #   irm https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.ps1 | iex
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.0
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.1
 #
 # Environment:
 #   PI_HOME                install root (default: %USERPROFILE%\.pi-rs)

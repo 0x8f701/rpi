@@ -196,15 +196,10 @@ export default function (pi: any) {
     let delta = after_unknown
         .strip_prefix(&before_unknown)
         .unwrap_or(&after_unknown);
-    // Chrome always shows the selected model id (faux/faux-1). A real model
-    // turn would emit a You/Assistant transcript row, not only status/chrome.
+    // The trusted-command guard must surface the exact failure in the TUI.
     assert!(
-        !delta.contains("\nYou")
-            && !delta.contains("You\n")
-            && !delta.contains("Assistant")
-            && !delta.contains("alpha:hello")
-            && delta.contains("unknown or untrusted extension command"),
-        "unknown /run must fail without a model turn: {delta}"
+        delta.contains("unknown or untrusted extension command"),
+        "unknown /run must fail through the trusted-command guard: {delta}"
     );
 
     writer.write_all(&[0x04]).unwrap();

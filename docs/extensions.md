@@ -111,7 +111,7 @@ package in `settings.json`:
 ```json
 {
   "packages": [
-    { "source": "git:owner/pi-weather", "extensions": ["pi-weather"] }
+    { "source": "git:github.com/owner/pi-weather", "extensions": ["pi-weather"] }
   ]
 }
 ```

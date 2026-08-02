@@ -1,7 +1,7 @@
 # Export and share
 
 `rpi` can export a session to a self-contained HTML file or to a Pi v3 JSONL
-branch, and it can share a session as a private GitHub gist. The export step
+branch, and it can share a session as a secret GitHub gist. The export step
 needs no model, auth, or network access; only gist sharing requires the `gh`
 CLI.
 
@@ -84,11 +84,11 @@ Source: `crates/pi-cli/src/modes/rpc.rs:138-141`,
 ```
 
 `/share` is available in the TUI, the REPL, and through the application API. It
-exports the current session to HTML and uploads it as a **private** GitHub gist
-using `gh gist create --private --desc "Pi session export"`.
-Source: `crates/pi-cli/src/interactive_commands.rs:170-174`,
-`crates/pi-cli/src/repl.rs:333-349`,
-`crates/pi-coding/src/share.rs:147-163`.
+exports the current session to HTML and uploads it as a **secret** GitHub gist
+using `gh gist create --desc "Pi session export"`. The command intentionally
+omits visibility flags so GitHub CLI's secret-gist default applies.
+Source: `crates/pi-cli/src/interactive_commands.rs`,
+`crates/pi-cli/src/repl.rs`, `crates/pi-coding/src/share.rs`.
 
 Requirements:
 

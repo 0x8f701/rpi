@@ -9,7 +9,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | sh
-#   sh install.sh --version v0.2.0      # pin a specific release
+#   sh install.sh --version v0.2.1      # pin a specific release
 #
 # Environment:
 #   PI_HOME                install root (default: ~/.pi-rs)

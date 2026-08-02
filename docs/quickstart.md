@@ -6,20 +6,23 @@
    ```sh
    curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | sh
    ```
-   See [`install.md`](install.md) for Windows, pinned versions, manual builds, and verification.
+   See [`install.md`](install.md) for Windows, pinned binary releases, manual
+   archive verification, and rollback behavior.
 
 2. **Verify** the binary:
    ```sh
    rpi --version
    ```
 
-3. **Configure credentials** with an environment variable:
+3. **Configure one provider credential**. For example, either log in or set the
+   environment variable used by the model in the next step:
    ```sh
-   export OPENAI_API_KEY="<your-openai-key>"
+   rpi login anthropic
+   # Or, instead of interactive login:
    export ANTHROPIC_API_KEY="<your-anthropic-key>"
-   export GEMINI_API_KEY="<your-gemini-key>"
    ```
-   For `auth.json`, `models.json`, `rpi login`, and precedence rules, see [`authentication.md`](authentication.md).
+   Do not export placeholder values. For other providers, `auth.json`,
+   `models.json`, and precedence rules, see [`authentication.md`](authentication.md).
 
 4. **Run a non-interactive task** to confirm the end-to-end path:
    ```sh
@@ -30,7 +33,9 @@
    ```sh
    rpi -m anthropic/claude-sonnet-4-5
    ```
-   The CLI picks the full-screen TUI when stdout is a terminal and raw mode works; otherwise it falls back to the line REPL. See [`cli-modes.md`](cli-modes.md) for every flag, subcommand, and slash command.
+   The CLI opens the normal-screen inline TUI when both stdin and stdout are
+   terminals; otherwise it uses the line REPL. See [`cli-modes.md`](cli-modes.md)
+   for every flag, subcommand, and slash command.
 
 ## Non-interactive print mode
 
@@ -41,14 +46,13 @@ rpi --print "Explain this crate" -m anthropic/claude-sonnet-4-5
 rpi --mode json -m openai/gpt-5.5 "List all unfinished task markers in src/"
 ```
 
-Print mode is also implied when you pass a positional prompt:
+Positional prompts initialize the interactive session on a terminal. They select
+print mode only when stdin or stdout is not a terminal; use `--print` when a
+script must be non-interactive:
 
 ```sh
-rpi -m openai/gpt-5.5 "List all unfinished task markers in src/"
+rpi -m openai/gpt-5.5 "Review this repository"
 ```
-
-If the joined prompt is empty (for example `rpi ""`), the CLI enters the
-interactive session instead of failing. See [`cli-modes.md`](cli-modes.md).
 
 ## Interactive session
 
@@ -56,13 +60,12 @@ interactive session instead of failing. See [`cli-modes.md`](cli-modes.md).
 rpi -m anthropic/claude-sonnet-4-5
 ```
 
-- If `stdout` is a terminal and the TUI can enter raw mode, you get the
-  full-screen TUI.
+- If both `stdin` and `stdout` are terminals, you get the normal-screen inline TUI.
 - Otherwise you get the line REPL (`> ` prompt).
 
-In both modes you can type a message or use slash commands. Type `/help` for
-available commands. Model and thinking-level switches work as slash commands in
-the line REPL (in the TUI use keybindings such as `Ctrl+L` and `Ctrl+T`).
+In both modes you can type a message or use slash commands. Type `/help` for the
+12 primary commands. Model and thinking-level switches work as slash commands in
+the line REPL; the TUI uses `/model` plus keybindings such as `Ctrl+L` and `Ctrl+T`.
 
 ## Switch models and reasoning level
 
@@ -129,14 +132,14 @@ rpi export <agent-dir>/sessions/--<workspace>--/timestamp_id.jsonl
 rpi export session.jsonl --jsonl --output backup.jsonl
 ```
 
-In the TUI or REPL, `/share` creates a private GitHub gist via the `gh` CLI.
+In the TUI or REPL, `/share` creates a secret GitHub gist via the `gh` CLI.
 See [`export-share.md`](export-share.md) for formats and sharing.
 
 ## Use a local model
 
 ```sh
-rpi llama configure http://localhost:8080
-rpi -m llama/llama-3.1-8b --print "Hello"
+rpi llama configure http://127.0.0.1:8080
+rpi -m llama.cpp/<model-id> --print "Hello"
 ```
 
 See [`local-llama.md`](local-llama.md) for router setup and GGUF downloads.
@@ -144,7 +147,7 @@ See [`local-llama.md`](local-llama.md) for router setup and GGUF downloads.
 ## Manage packages
 
 ```sh
-rpi install git:owner/pi-my-tools
+rpi install git:github.com/owner/pi-my-tools
 rpi list
 rpi update --extensions
 ```

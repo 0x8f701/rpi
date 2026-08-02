@@ -10,9 +10,10 @@ The release workflow builds five native targets:
 - `x86_64-pc-windows-msvc`
 - `x86_64-unknown-linux-gnu` (glibc 2.31 baseline)
 
-Binaries are published as GitHub Release assets named `rpi-<version>-<target>.tar.gz`
-(or `.zip` on Windows) plus a `SHA256SUMS` manifest. The installers download,
-checksum, and atomically activate the matching artifact.
+Prebuilt binaries are published as GitHub Release assets named
+`rpi-<version>-<target>.tar.gz` (or `.zip` on Windows), alongside a
+`SHA256SUMS` manifest. Installation does not require Rust or a source checkout.
+The installers download, verify, and atomically activate the matching binary.
 
 Or use the built-in updater after installation:
 
@@ -22,10 +23,10 @@ rpi update --self
 
 ## Supported install paths
 
-- **One-line installer** — `install.sh` (macOS / Linux) or `install.ps1` (Windows).
-- **GitHub Release asset** — download the matching `.tar.gz` / `.zip` and `SHA256SUMS`, then verify and extract manually.
-- **Manual build** — build from source with `cargo`.
+- **Prebuilt binary installer** — `install.sh` (macOS / Linux) or `install.ps1` (Windows); recommended for users.
+- **Prebuilt GitHub Release asset** — download the matching `.tar.gz` / `.zip` and `SHA256SUMS`, then verify and extract manually.
 - **Self-update** — `rpi update --self` after the binary is installed.
+- **Source build** — developer fallback requiring Rust 1.88 or later.
 
 See [`docs/update.md`](update.md) for release-check behavior and in-place update safety.
 
@@ -43,17 +44,23 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.ps1 | iex
 ```
 
-By default the installer resolves the **latest** stable release. It ignores
-prereleases because GitHub marks them `make_latest=false`.
+By default the installer resolves the **latest published stable binary release**.
+If the release does not contain the exact platform archive and `SHA256SUMS`, the
+installer fails without changing the existing installation.
 
 ## Pin a version
 
+Pin both the installer script and the requested release tag:
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | bash -s -- --version v0.2.0
+curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/v0.2.1/install.sh | bash -s -- --version v0.2.1
 ```
 
+On Windows, download the script from the same tag before invoking it:
+
 ```powershell
-powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.0
+irm https://raw.githubusercontent.com/0x8f701/pi-rs/v0.2.1/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.1
 ```
 
 ## What the installer does
@@ -64,14 +71,19 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.0
 4. Verifies the archive digest.
 5. Extracts the `rpi` / `rpi.exe` binary.
 6. Smoke-tests the binary with `--version`.
-7. Writes it to a content-addressed path under `PI_HOME/downloads` and swaps
-   the active symlink at `PI_HOME/bin/rpi` (or `rpi.exe` on Windows) atomically.
+7. Writes it to a content-addressed path under `PI_HOME/downloads` and atomically
+   swaps `PI_HOME/bin/rpi` to that path on Unix. Windows atomically replaces
+   `PI_HOME/bin/rpi.exe` because a running executable cannot be a symlink target.
 8. Records the installed identity in `PI_HOME/update-state.json`.
 9. On Unix, removes a legacy installer-managed `PI_HOME/bin/pi` symlink only
    when it still points at a previous installer-owned download path.
 
 If any step fails, the installer rolls back the active symlink and leaves the
 previous install untouched.
+
+When the install directory is not already on `PATH`, the Unix installer updates
+the detected shell profile and the Windows installer updates the user `PATH`.
+Open a new terminal before running `rpi` after such a change.
 
 ## Installer environment variables
 
@@ -83,9 +95,9 @@ previous install untouched.
 
 The token is sent **only** to the GitHub API endpoint, never to release-asset hosts.
 
-## Manual build from source
+## Developer source build
 
-Requires Rust **1.88** or later.
+This is not the normal installation path. It requires Rust **1.88** or later.
 
 ```sh
 git clone https://github.com/0x8f701/pi-rs.git
@@ -110,9 +122,14 @@ cargo build --package pi-cli --bin pi-rpc --profile release-dist --locked
 
 ## Verifying a downloaded release
 
+After a release is published, replace `<version>` and `<target>` with an actual
+tag version and one of the supported target triples:
+
 ```sh
-curl -fsSL -O https://github.com/0x8f701/pi-rs/releases/download/v0.2.0/rpi-0.2.0-x86_64-unknown-linux-gnu.tar.gz
-curl -fsSL -O https://github.com/0x8f701/pi-rs/releases/download/v0.2.0/SHA256SUMS
+version="<version>"
+target="x86_64-unknown-linux-gnu"
+curl -fsSL -O "https://github.com/0x8f701/pi-rs/releases/download/v${version}/rpi-${version}-${target}.tar.gz"
+curl -fsSL -O "https://github.com/0x8f701/pi-rs/releases/download/v${version}/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
