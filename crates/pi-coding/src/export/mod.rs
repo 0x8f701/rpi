@@ -204,7 +204,7 @@ fn build_html(metadata: &ExportMetadata, body: &str, options: &ExportOptions) ->
         options
             .title
             .as_deref()
-            .unwrap_or("Pi session export"),
+            .unwrap_or("rpi session export"),
     );
     let theme_attr = match options.theme {
         Theme::Light => "data-theme=\"light\"",

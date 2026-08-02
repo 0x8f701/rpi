@@ -413,7 +413,7 @@ fn import_or_resume_idempotent_and_writes_lineage() {
     assert!(body.contains("\"parentSession\":\"codex:once-id\"") || body.contains("codex:once-id"));
     assert!(body.contains(LINEAGE_CUSTOM_TYPE));
     assert!(body.contains("sourceSessionId"));
-    assert!(body.contains("pi-rs-import"));
+    assert!(body.contains("rpi-import"));
     assert!(body.contains("converted-from-codex"));
 
     let second = catalog

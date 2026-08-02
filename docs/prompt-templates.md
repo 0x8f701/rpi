@@ -198,13 +198,13 @@ With the default role section, the prompt contains:
    - `Use bash for file operations like ls, rg, find` when `bash` is present without `grep`/`find`/`ls`.
    - `Be concise in your responses`.
    - `Show file paths clearly when working with files`.
-4. A block pointing to the pi docs and examples paths.
+4. A block pointing to the rpi docs and examples paths.
 5. The `--append-system-prompt` text, if any.
 6. The `<project_context>` block, if any context files are loaded.
 7. The `<available_skills>` block, **only when the `read` tool is selected**.
 8. `Current working directory: <cwd>`.
 
-When `--system-prompt` is provided, the custom text replaces the default role section, tool list, guidelines, and pi documentation block. Any `--append-system-prompt`, `<project_context>`, and `<available_skills>` blocks are still appended.
+When `--system-prompt` is provided, the custom text replaces the default role section, tool list, guidelines, and rpi documentation block. Any `--append-system-prompt`, `<project_context>`, and `<available_skills>` blocks are still appended.
 
 The `read` tool supports `skill://<name>` and `skill://<name>/<relative-path>` paths. The skill resolver in [`crates/pi-coding/src/selector.rs`](../crates/pi-coding/src/selector.rs) confines access to the skill's base directory.
 

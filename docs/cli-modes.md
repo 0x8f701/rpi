@@ -114,7 +114,7 @@ Export a native Pi v3 session file to a self-contained HTML file (default) or to
 
 ### `rpi install <SOURCE> [--local]` / `rpi remove <SOURCE> [--local]` / `rpi list`
 
-Install, remove, or list local/git Pi packages. `--local` persists the package in the project's `.pi/settings.json` instead of the global agent settings. Project packages are only loaded when the project is trusted.
+Install, remove, or list local/git rpi packages. `--local` persists the package in the project's `.pi/settings.json` instead of the global agent settings. Project packages are only loaded when the project is trusted.
 
 ### `rpi config [-l|--local]`
 

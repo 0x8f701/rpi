@@ -1,6 +1,6 @@
 # Update safety
 
-`rpi` can update itself from GitHub releases and reconcile configured Pi packages.
+`rpi` can update itself from GitHub releases and reconcile configured rpi packages.
 Both paths are designed so a failed update never leaves the installation in an
 unusable state.
 
@@ -34,7 +34,7 @@ Source: `crates/pi-cli/src/args.rs:270-288`, `crates/pi-cli/src/lib.rs:85-94`.
 `rpi update --self` downloads the latest GitHub release for the current platform,
 verifies it, smoke-tests it, and activates it atomically. It fails early if
 `PI_OFFLINE` is enabled. The updater expects a managed install layout rooted at
-`$PI_HOME` (default `~/.pi-rs` on Unix, `%USERPROFILE%\.pi-rs` on Windows; the
+`$PI_HOME` (default `~/.rpi` on Unix, `%USERPROFILE%\.rpi` on Windows; the
 self-updater otherwise derives the root from the running executable's location)
 with an `update-state.json` file.
 Source: `crates/pi-cli/src/self_update.rs:211-223`, `crates/pi-cli/src/self_update.rs:480-524`.
@@ -149,8 +149,8 @@ Source: `crates/pi-coding/src/packages.rs:948-954`.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PI_HOME` | `~/.pi-rs` (Unix) / `%USERPROFILE%\.pi-rs` (Windows) | Install root for the binary and update state |
-| `PI_UPDATE_BASE_URL` | `https://api.github.com/repos/0x8f701/pi-rs/releases` | Release API base (must match the installer scripts) |
+| `PI_HOME` | `~/.rpi` (Unix) / `%USERPROFILE%\.rpi` (Windows) | Install root for the binary and update state |
+| `PI_UPDATE_BASE_URL` | `https://api.github.com/repos/0x8f701/rpi/releases` | Release API base (must match the installer scripts) |
 | `GITHUB_TOKEN` | (none) | Authenticate GitHub API calls for release metadata |
 | `PI_OFFLINE` | (none) | Disables all updater networking |
 | `PI_SKIP_VERSION_CHECK` | (none) | Disables only the nonfatal interactive startup version check |

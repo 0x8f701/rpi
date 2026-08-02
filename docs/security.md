@@ -252,12 +252,12 @@ the security-relevant parts are:
   platform asset, recomputes the digest locally, and aborts on mismatch.
 - A smoke test runs the staged binary with `--version` before activation.
 - Unix: the versioned binary is placed with a single `rename(2)`, then the
-  active `bin/pi` symlink is swapped with another `rename(2)`. The active path
+  active `bin/rpi` symlink is swapped with another `rename(2)`. The active path
   is never missing. The prior symlink target is captured so rollback restores
   exactly what was live. Source: `install.sh` and
   `crates/pi-cli/src/self_update.rs`.
 - Windows: `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` performs an atomic
-  same-volume replace. If the running `pi.exe` is locked, the installer fails
+  same-volume replace. If the running `rpi.exe` is locked, the installer fails
   with a clear message instead of leaving a window where the executable is
   absent. A preemptive backup allows rollback to restore the previous binary.
   Source: `install.ps1` and `crates/pi-cli/src/self_update.rs`.

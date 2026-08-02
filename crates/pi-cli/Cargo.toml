@@ -15,8 +15,8 @@ name = "rpi"
 path = "src/main.rs"
 
 [[bin]]
-name = "pi-rpc"
-path = "src/bin/pi-rpc.rs"
+name = "rpi-rpc"
+path = "src/bin/rpi-rpc.rs"
 
 [dependencies]
 anyhow.workspace = true

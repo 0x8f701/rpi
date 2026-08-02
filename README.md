@@ -1,13 +1,13 @@
-# rpi (Rust port of pi)
+# rpi
 
-`rpi` is a Rust port of the pi coding agent. It provides a self-contained CLI
-for interactive and non-interactive AI-assisted coding, with pluggable
+`rpi` is a self-contained Rust coding agent CLI for interactive and
+non-interactive AI-assisted coding, with pluggable
 provider support, automatic context compaction, and native Pi v3 session
 storage.
 
-The executable binary is `rpi`. Runtime configuration still uses the upstream
-pi layout (`~/.pi/agent`, project `.pi/`, and `PI_*` environment variables).
-The companion headless binary remains `pi-rpc`.
+The executable binary is `rpi`. Runtime configuration remains compatible with
+the upstream Pi layout (`~/.pi/agent`, project `.pi/`, and `PI_*` environment variables).
+The companion headless binary is `rpi-rpc`.
 
 ## Install
 
@@ -15,27 +15,27 @@ Install the prebuilt `rpi` binary from GitHub Releases. The installer selects
 the current platform archive, verifies `SHA256SUMS`, and activates the binary:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
 ```
 
-Pin the installer and release to `v0.2.1`:
+Pin the installer and release to `v0.2.2`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/v0.2.1/install.sh | bash -s -- --version v0.2.1
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.2/install.sh | bash -s -- --version v0.2.2
 ```
 
 The release archive contains the compiled `rpi` executable; users do not need
 Rust or a source checkout. Maintainers who need a local source build can follow
 the explicitly separated developer fallback in [`docs/install.md`](docs/install.md).
 
-The release installer places the active binary at `~/.pi-rs/bin/rpi`
-(`%USERPROFILE%\.pi-rs\bin\rpi.exe` on Windows) and adds that directory to
+The release installer places the active binary at `~/.rpi/bin/rpi`
+(`%USERPROFILE%\.rpi\bin\rpi.exe` on Windows) and adds that directory to
 the user `PATH` when needed. Open a new terminal before running `rpi` if the
 installer reports that it changed `PATH`. See [`docs/install.md`](docs/install.md)
 for supported platforms, manual verification, and rollback behavior.
@@ -108,7 +108,7 @@ Runnable examples are in [`examples/`](examples/).
 | Automatic context compaction | Implemented |
 | `AGENTS.md` / `CLAUDE.md` project context and `.pi/skills` | Implemented |
 | Local/self-hosted models via `rpi llama` + llama.cpp router | Implemented |
-| JSON-RPC / stdio server (`--mode rpc` and `pi-rpc`) | Implemented |
+| JSON-RPC / stdio server (`--mode rpc` and `rpi-rpc`) | Implemented |
 | Custom TUI themes and keybindings | Implemented |
 | Local/git packages (`rpi install/remove/list/update`) | Implemented |
 | Process extension protocol via `pi-extension.json` manifests | Implemented |

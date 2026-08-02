@@ -25,7 +25,7 @@ pub struct BuildSystemPromptOptions {
     pub additional_workspace_roots: Vec<String>,
     pub context_files: Vec<ContextFile>,
     pub skills: Vec<Skill>,
-    /// Absolute pi documentation paths; empty values fall back to
+    /// Absolute rpi documentation paths; empty values fall back to
     /// `readme_path()`/`docs_path()`/`examples_path()`.
     pub readme_path: String,
     pub docs_path: String,
@@ -127,7 +127,7 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions) -> String {
     };
 
     let prompt = format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\
+        "You are an expert coding assistant operating inside rpi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\
 \n\
 Available tools:\n\
 {tools_list}\n\
@@ -137,14 +137,14 @@ In addition to the tools above, you may have access to other custom tools depend
 Guidelines:\n\
 {gb}\n\
 \n\
-Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n\
+rpi documentation (read only when the user asks about rpi itself, its SDK, extensions, themes, skills, or TUI):\n\
 - Main documentation: {readme_path}\n\
 - Additional docs: {docs_path}\n\
 - Examples: {examples_path} (extensions, custom tools, SDK)\n\
-- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n\
-- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n\
-- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n\
-- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
+- When reading rpi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n\
+- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), rpi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n\
+- When working on rpi topics, read the docs and examples, and follow .md cross-references before implementing\n\
+- Always read rpi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
     );
 
     let mut prompt = format!(
@@ -231,8 +231,8 @@ mod tests {
     fn default_prompt_golden_shape() {
         let opts = base_opts();
         let got = build_system_prompt(opts);
-        assert!(got.starts_with("You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n- read: Read file contents\n- bash: Execute finite foreground shell commands, or supervised long-running commands with background=true\n- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n- write: Create or overwrite files\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n"));
-        assert!(got.contains("Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):"));
+        assert!(got.starts_with("You are an expert coding assistant operating inside rpi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n- read: Read file contents\n- bash: Execute finite foreground shell commands, or supervised long-running commands with background=true\n- edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n- write: Create or overwrite files\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n"));
+        assert!(got.contains("rpi documentation (read only when the user asks about rpi itself, its SDK, extensions, themes, skills, or TUI):"));
         assert!(got.contains("- Main documentation: /pkg/README.md"));
         assert!(got.contains("- Additional docs: /pkg/docs"));
         assert!(got.contains("- Examples: /pkg/examples (extensions, custom tools, SDK)"));

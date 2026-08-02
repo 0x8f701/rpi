@@ -65,11 +65,37 @@ async fn run_host_sample() -> Result<()> {
                             ExtensionUiRequest::Editor { prefill, .. } => {
                                 ExtensionUiResponse::Edited { value: prefill }
                             }
+                            ExtensionUiRequest::GetEditorText => {
+                                ExtensionUiResponse::EditorText {
+                                    value: String::new(),
+                                }
+                            }
+                            ExtensionUiRequest::GetAllThemes => {
+                                ExtensionUiResponse::Themes { themes: Vec::new() }
+                            }
+                            ExtensionUiRequest::GetTheme { .. } => {
+                                ExtensionUiResponse::Theme { theme: None }
+                            }
+                            ExtensionUiRequest::SetTheme { .. } => {
+                                ExtensionUiResponse::ThemeSet {
+                                    success: true,
+                                    error: None,
+                                }
+                            }
+                            ExtensionUiRequest::GetToolsExpanded => {
+                                ExtensionUiResponse::ToolsExpanded { expanded: false }
+                            }
                             ExtensionUiRequest::Notify { .. }
                             | ExtensionUiRequest::Status { .. }
                             | ExtensionUiRequest::Widget { .. }
                             | ExtensionUiRequest::Title { .. }
-                            | ExtensionUiRequest::SetEditorText { .. } => {
+                            | ExtensionUiRequest::SetEditorText { .. }
+                            | ExtensionUiRequest::PasteToEditor { .. }
+                            | ExtensionUiRequest::SetWorkingMessage { .. }
+                            | ExtensionUiRequest::SetWorkingVisible { .. }
+                            | ExtensionUiRequest::SetWorkingIndicator { .. }
+                            | ExtensionUiRequest::SetHiddenThinkingLabel { .. }
+                            | ExtensionUiRequest::SetToolsExpanded { .. } => {
                                 ExtensionUiResponse::Acknowledged
                             }
                         };
@@ -121,20 +147,25 @@ async fn run_host_sample() -> Result<()> {
         false,
         CHILD_ARGUMENT,
     );
-    let report = runtime.load(vec![valid, malformed, untrusted]).await;
+    let report = runtime.load(vec![valid]).await;
     ensure!(report.loaded.len() == 1, "valid extension did not load");
+    ensure!(report.failures.is_empty(), "valid extension reported a failure");
+
+    let rejected = runtime.stage_reload(vec![malformed, untrusted]).await;
+    let rejected_report = rejected.report();
     ensure!(
-        report.failures.len() == 2,
+        rejected_report.failures.len() == 2,
         "malformed and untrusted extensions were not isolated"
     );
     ensure!(
-        report
+        rejected_report
             .failures
             .iter()
             .any(|failure| failure.extension_id == "sample.untrusted"
                 && failure.message.contains("untrusted project extension")),
         "project trust gating did not reject the extension"
     );
+    runtime.discard_reload(rejected).await;
 
     let command = runtime
         .invoke_command("sample", "from-host".to_owned(), None, None)
@@ -301,7 +332,7 @@ fn run_extension_child() -> Result<()> {
                     let _ = await_ui_response(&mut input, &mut line, &ui_id)?;
                     write_success(&mut output, id, Value::Null)?;
                 }
-                ExtensionHostRequest::Invoke { invocation } => match invocation {
+                ExtensionHostRequest::Invoke { invocation, .. } => match invocation {
                     ExtensionInvocation::Event { event } => {
                         received_events.push(event.name.clone());
                         write_success(&mut output, id, json!({ "received": event.name }))?;
@@ -362,6 +393,12 @@ fn run_extension_child() -> Result<()> {
                         id,
                         "not_registered",
                         "sample has no renderer",
+                    )?,
+                    ExtensionInvocation::Shortcut { key } => write_failure(
+                        &mut output,
+                        id,
+                        "not_registered",
+                        &format!("sample has no shortcut for {key}"),
                     )?,
                 },
             },

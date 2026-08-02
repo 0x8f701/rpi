@@ -1,4 +1,4 @@
-//! Versioned Pi package schemas and the local/git package backend.
+//! Versioned rpi package schemas and the local/git package backend.
 //!
 //! Package operations are serialized, settings and package state are replaced
 //! atomically, and git is always invoked directly with an argv vector.
@@ -174,7 +174,7 @@ impl PackageManifest {
     fn validate(&self) -> Result<()> {
         if self.schema_version != PACKAGE_MANIFEST_SCHEMA_VERSION {
             bail!(
-                "unsupported Pi package manifest schema version {}; expected {}",
+                "unsupported rpi package manifest schema version {}; expected {}",
                 self.schema_version,
                 PACKAGE_MANIFEST_SCHEMA_VERSION
             );
@@ -1047,7 +1047,7 @@ fn input_identity_candidates(source: &str, cwd: &Path) -> Result<HashSet<String>
     identities.insert(parse_cli_source(source, cwd)?.identity());
     if !source.starts_with("git:") && !has_git_protocol(source) {
         let shorthand = format!("git:{source}");
-        if let Some(git) = parse_git_source(&shorthand)? {
+        if let Ok(Some(git)) = parse_git_source(&shorthand) {
             identities.insert(git.identity());
         }
     }
@@ -1589,7 +1589,7 @@ fn read_package_manifest(root: &Path) -> Result<Option<PackageManifest>> {
         bail!("package manifest `pi` field must be an object: {}", path.display());
     }
     let manifest: PackageManifest = serde_json::from_value(pi.clone())
-        .with_context(|| format!("parsing Pi package manifest in {}", path.display()))?;
+        .with_context(|| format!("parsing rpi package manifest in {}", path.display()))?;
     manifest.validate()?;
     Ok(Some(manifest))
 }

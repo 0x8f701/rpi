@@ -665,6 +665,7 @@ pub struct ExtensionRuntimeOptions {
     pub hook_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub max_frame_bytes: usize,
+    pub max_parallel_loads: usize,
 }
 
 impl Default for ExtensionRuntimeOptions {
@@ -678,6 +679,7 @@ impl Default for ExtensionRuntimeOptions {
             hook_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(2),
             max_frame_bytes: DEFAULT_MAX_EXTENSION_FRAME_BYTES,
+            max_parallel_loads: 4,
         }
     }
 }
@@ -1402,7 +1404,7 @@ fn resolve_bun_executable(spec: &ExtensionSpec) -> Option<PathBuf> {
 
 fn write_bun_bridge() -> Result<(PathBuf, PathBuf)> {
     let directory = std::env::temp_dir().join(format!(
-        "pi-rs-extension-host-v1-{}",
+        "rpi-extension-host-v1-{}",
         Uuid::new_v4()
     ));
     std::fs::create_dir(&directory)
@@ -2148,28 +2150,44 @@ impl ExtensionRuntime {
             let state = self.inner.state.lock();
             (state.generation, state.generation.saturating_add(1))
         };
-        let mut staged = Vec::new();
-        let mut failures = Vec::new();
-        for spec in specs {
-            let extension_id = spec.id.clone();
-            let path = spec.executable.clone();
-            match self.load_one(spec, next_generation).await {
-                Ok(instance) => staged.push(instance),
-                Err(error) => {
-                    let message = error.to_string();
-                    failures.push(ExtensionLoadFailure {
-                        extension_id: extension_id.clone(),
-                        path: path.clone(),
-                        message: message.clone(),
-                    });
-                    let _ = self.inner.events.send(ExtensionRuntimeEvent::LoadFailed {
-                        extension_id,
-                        path: path.display().to_string(),
-                        message,
-                    });
+        let max_parallel_loads = self.inner.options.max_parallel_loads.max(1);
+        let mut staged_by_index = vec![None; specs.len()];
+        let mut failures_by_index = vec![None; specs.len()];
+        let mut pending = specs.into_iter().enumerate();
+        loop {
+            let batch = pending
+                .by_ref()
+                .take(max_parallel_loads)
+                .map(|(index, spec)| async move {
+                    let extension_id = spec.id.clone();
+                    let path = spec.executable.clone();
+                    (index, extension_id, path, self.load_one(spec, next_generation).await)
+                })
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            for (index, extension_id, path, result) in futures_util::future::join_all(batch).await {
+                match result {
+                    Ok(instance) => staged_by_index[index] = Some(instance),
+                    Err(error) => {
+                        let message = error.to_string();
+                        failures_by_index[index] = Some(ExtensionLoadFailure {
+                            extension_id: extension_id.clone(),
+                            path: path.clone(),
+                            message: message.clone(),
+                        });
+                        let _ = self.inner.events.send(ExtensionRuntimeEvent::LoadFailed {
+                            extension_id,
+                            path: path.display().to_string(),
+                            message,
+                        });
+                    }
                 }
             }
         }
+        let staged = staged_by_index.into_iter().flatten().collect::<Vec<_>>();
+        let failures = failures_by_index.into_iter().flatten().collect::<Vec<_>>();
         let (registry, collisions) = RuntimeRegistry::from_instances(&staged);
         ExtensionReloadCandidate {
             owner: Arc::downgrade(&self.inner),

@@ -1,4 +1,4 @@
-# pi-rs End-to-End Verification
+# rpi End-to-End Verification
 
 This handbook defines the release verification contract for `rpi` 0.2.0. It uses repository-relative paths and isolated temporary homes. Do not record local absolute paths, private endpoints, credential filenames, or credential values in committed evidence.
 
@@ -7,9 +7,9 @@ All prose, fixtures, agent definitions, skill bodies, and faux responses used by
 ## Product contract
 
 - Primary executable: `rpi`.
-- RPC companion executable: `pi-rpc`.
-- Managed install root: `~/.pi-rs` by default, overridden by `PI_HOME`.
-- Active executable: `~/.pi-rs/bin/rpi` on Unix and `%USERPROFILE%\.pi-rs\bin\rpi.exe` on Windows.
+- RPC companion executable: `rpi-rpc`.
+- Managed install root: `~/.rpi` by default, overridden by `PI_HOME`.
+- Active executable: `~/.rpi/bin/rpi` on Unix and `%USERPROFILE%\.rpi\bin\rpi.exe` on Windows.
 - Runtime configuration remains compatible with the upstream Pi layout: `~/.pi/agent`, project `.pi/`, and `PI_*` environment variables.
 - Native sessions use append-only Pi v3 JSONL.
 - Release assets use `rpi-<version>-<target-triple>.tar.gz`, or `.zip` for Windows.

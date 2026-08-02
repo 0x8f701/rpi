@@ -2948,7 +2948,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             headers
                 .get("x-opencode-client")
                 .and_then(|value| value.to_str().ok()),
-            Some("pi")
+        Some("rpi")
         );
         assert_eq!(
             headers

@@ -33,10 +33,10 @@ const CLOUDFLARE_API_HOST: &str = "api.cloudflare.com";
 const CLOUDFLARE_AI_GATEWAY_HOST: &str = "gateway.ai.cloudflare.com";
 
 const OPENROUTER_REFERER: &str = "https://pi.dev";
-const OPENROUTER_TITLE: &str = "pi";
+const OPENROUTER_TITLE: &str = "rpi";
 const OPENROUTER_CATEGORIES: &str = "cli-agent";
-const OPENCODE_CLIENT: &str = "pi";
-const CLOUDFLARE_USER_AGENT: &str = "pi-coding-agent";
+const OPENCODE_CLIENT: &str = "rpi";
+const CLOUDFLARE_USER_AGENT: &str = "rpi-coding-agent";
 
 /// Lowercase hostname of `url`, or `None` when the URL cannot be parsed.
 ///
@@ -172,12 +172,12 @@ mod tests {
 
     const OPENROUTER_DEFAULTS: &[(&str, &str)] = &[
         ("HTTP-Referer", "https://pi.dev"),
-        ("X-OpenRouter-Title", "pi"),
+        ("X-OpenRouter-Title", "rpi"),
         ("X-OpenRouter-Categories", "cli-agent"),
     ];
     const SESSION_DEFAULTS: &[(&str, &str)] = &[
         ("x-opencode-session", "opencode-session"),
-        ("x-opencode-client", "pi"),
+        ("x-opencode-client", "rpi"),
     ];
 
     fn cases() -> Vec<Case> {
@@ -230,7 +230,7 @@ mod tests {
                 ],
                 expected: Some(&[
                     ("HTTP-Referer", "https://provider.example"),
-                    ("X-OpenRouter-Title", "pi"),
+                    ("X-OpenRouter-Title", "rpi"),
                     ("X-OpenRouter-Categories", "provider-category"),
                 ]),
             },
@@ -266,7 +266,7 @@ mod tests {
                 expected: Some(&[
                     ("http-referer", "lower"),
                     ("HTTP-Referer", "https://pi.dev"),
-                    ("X-OpenRouter-Title", "pi"),
+                    ("X-OpenRouter-Title", "rpi"),
                     ("X-OpenRouter-Categories", "cli-agent"),
                 ]),
             },
@@ -286,7 +286,7 @@ mod tests {
                 session_id: Some("s1"),
                 telemetry: true,
                 existing: &[],
-                expected: Some(&[("x-opencode-session", "s1"), ("x-opencode-client", "pi")]),
+                expected: Some(&[("x-opencode-session", "s1"), ("x-opencode-client", "rpi")]),
             },
             Case {
                 name: "opencode_go_provider",
@@ -295,7 +295,7 @@ mod tests {
                 session_id: Some("s2"),
                 telemetry: true,
                 existing: &[],
-                expected: Some(&[("x-opencode-session", "s2"), ("x-opencode-client", "pi")]),
+                expected: Some(&[("x-opencode-session", "s2"), ("x-opencode-client", "rpi")]),
             },
             Case {
                 name: "opencode_without_session",
@@ -346,7 +346,7 @@ mod tests {
                 session_id: Some("s4"),
                 telemetry: false,
                 existing: &[],
-                expected: Some(&[("x-opencode-session", "s4"), ("x-opencode-client", "pi")]),
+                expected: Some(&[("x-opencode-session", "s4"), ("x-opencode-client", "rpi")]),
             },
             Case {
                 name: "bare_host_without_scheme_not_matched",
@@ -364,7 +364,7 @@ mod tests {
                 session_id: None,
                 telemetry: true,
                 existing: &[],
-                expected: Some(&[("User-Agent", "pi-coding-agent")]),
+                expected: Some(&[("User-Agent", "rpi-coding-agent")]),
             },
             Case {
                 name: "cloudflare_ai_gateway_user_agent",
@@ -373,7 +373,7 @@ mod tests {
                 session_id: None,
                 telemetry: true,
                 existing: &[],
-                expected: Some(&[("User-Agent", "pi-coding-agent")]),
+                expected: Some(&[("User-Agent", "rpi-coding-agent")]),
             },
             Case {
                 name: "cloudflare_api_hostname_match",
@@ -382,7 +382,7 @@ mod tests {
                 session_id: None,
                 telemetry: true,
                 existing: &[],
-                expected: Some(&[("User-Agent", "pi-coding-agent")]),
+                expected: Some(&[("User-Agent", "rpi-coding-agent")]),
             },
             Case {
                 name: "cloudflare_gateway_hostname_match",
@@ -391,7 +391,7 @@ mod tests {
                 session_id: None,
                 telemetry: true,
                 existing: &[],
-                expected: Some(&[("User-Agent", "pi-coding-agent")]),
+                expected: Some(&[("User-Agent", "rpi-coding-agent")]),
             },
             Case {
                 name: "cloudflare_uppercase_hostname",
@@ -400,7 +400,7 @@ mod tests {
                 session_id: None,
                 telemetry: true,
                 existing: &[],
-                expected: Some(&[("User-Agent", "pi-coding-agent")]),
+                expected: Some(&[("User-Agent", "rpi-coding-agent")]),
             },
             Case {
                 name: "cloudflare_telemetry_disabled",

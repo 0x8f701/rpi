@@ -2,8 +2,8 @@
 
 `rpi` supports long-lived process extensions over the strict versioned LF JSONL
 protocol. A manifest can launch either an existing executable or an optional
-Bun-hosted TypeScript/JavaScript entry through Pi's bundled bridge. Bun remains
-an external child process; Pi does not embed a JavaScript runtime.
+Bun-hosted TypeScript/JavaScript entry through rpi's bundled bridge. Bun remains
+an external child process; rpi does not embed a JavaScript runtime.
 
 ## Manifest (`pi-extension.json`)
 
@@ -104,7 +104,7 @@ a tool, an event hook, session actions, and UI actions.
 
 ## Packaging
 
-Extensions are distributed through Pi packages (local or git). Place the
+Extensions are distributed through rpi packages (local or git). Place the
 manifest and executable in a package under `extensions/` and reference the
 package in `settings.json`:
 

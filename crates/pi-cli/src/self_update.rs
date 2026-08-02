@@ -1,6 +1,6 @@
 //! Installer-compatible GitHub release notification and native self-update.
 //!
-//! `PI_UPDATE_BASE_URL` overrides the default `0x8f701/pi-rs` GitHub releases
+//! `PI_UPDATE_BASE_URL` overrides the default `0x8f701/rpi` GitHub releases
 //! API, matching `install.sh` and `install.ps1`. `PI_OFFLINE=1|true|yes`
 //! disables updater networking; `PI_SKIP_VERSION_CHECK` disables only the
 //! nonfatal interactive startup check.
@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-const DEFAULT_API: &str = "https://api.github.com/repos/0x8f701/pi-rs/releases";
+const DEFAULT_API: &str = "https://api.github.com/repos/0x8f701/rpi/releases";
 const API_LIMIT: u64 = 4 * 1024 * 1024;
 const SUMS_LIMIT: u64 = 1024 * 1024;
 const FILE_LIMIT: u64 = 1024 * 1024 * 1024;
@@ -105,7 +105,7 @@ impl ReleaseClient {
             authenticate: api == DEFAULT_API,
             api,
             http: Client::builder()
-                .user_agent(format!("pi-rs/{}", env!("CARGO_PKG_VERSION")))
+                .user_agent(format!("rpi/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(REQUEST_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::limited(5))
                 .build()
@@ -821,7 +821,7 @@ async fn activate(
 #[cfg(any(windows, test))]
 const WINDOWS_LOCKER: &str = r#"param([string]$Root,[int]$ParentId,[string]$Command,[string]$Ready,[string]$Script)
 $ErrorActionPreference='Stop'
-$mutexName='Local\pi-rs-install-' + ($Root -replace '[\\/:]','_')
+$mutexName='Local\rpi-install-' + ($Root -replace '[\\/:]','_')
 $mutex=New-Object Threading.Mutex($false,$mutexName)
 $mutexAcquired=$false
 try {
@@ -970,7 +970,7 @@ fn windows_mutex_name(root: &Path) -> String {
             other => other,
         })
         .collect::<String>();
-    format!("Local\\pi-rs-install-{sanitized}")
+    format!("Local\\rpi-install-{sanitized}")
 }
 
 fn windows_activation_payload(command: &WindowsActivationCommand) -> Result<Vec<u8>> {
@@ -1380,7 +1380,7 @@ fn timestamp() -> Result<u64> {
 
 fn unknown_install() -> anyhow::Error {
     anyhow!(
-        "running rpi is not an installer-managed ~/.pi-rs binary; refusing to overwrite an unknown install method (use install.sh or install.ps1)"
+        "running rpi is not an installer-managed ~/.rpi binary; refusing to overwrite an unknown install method (use install.sh or install.ps1)"
     )
 }
 
@@ -1391,8 +1391,8 @@ mod tests {
     #[test]
     fn Windows_mutex_name_matches_installer_replacement() {
         assert_eq!(
-            windows_mutex_name(Path::new(r"C:\Users\pi\.pi-rs")),
-            "Local\\pi-rs-install-C__Users_pi_.pi-rs"
+            windows_mutex_name(Path::new(r"C:\Users\pi\.rpi")),
+            "Local\\rpi-install-C__Users_pi_.rpi"
         );
     }
 

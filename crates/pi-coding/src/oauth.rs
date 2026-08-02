@@ -36,7 +36,6 @@ const CODEX_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/call
 const CODEX_DEVICE_VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
 
 const GOOGLE_CLIENT_ID: &str = "681255809395-oo8ft2oprdnq9e3aqf6av3hmdib135j.apps.googleusercontent.com";
-const GOOGLE_CLIENT_SECRET: &str = "GOCSPX-4uHgMPm-1o7Sk-6eV6Cu5clXFsl";
 const GOOGLE_REDIRECT_URI: &str = "http://localhost:8085/oauth2callback";
 const GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -105,15 +104,11 @@ pub async fn refresh(provider: &str, credential: &Credential, client: &Client) -
         }
         "google-gemini-cli" => {
             let project_id = required_field_string(fields, "projectId", "Google credential")?;
+            let refresh_fields = google_refresh_form(refresh);
             let body = post_form(
                 client,
                 GOOGLE_TOKEN_URL,
-                &[
-                    ("client_id", GOOGLE_CLIENT_ID),
-                    ("client_secret", GOOGLE_CLIENT_SECRET),
-                    ("refresh_token", refresh),
-                    ("grant_type", "refresh_token"),
-                ],
+                &refresh_fields,
                 "Google Cloud token refresh",
             )
             .await?;
@@ -152,6 +147,27 @@ pub async fn refresh(provider: &str, credential: &Credential, client: &Client) -
         }
         _ => bail!("provider {provider:?} does not support OAuth refresh"),
     }
+}
+
+fn google_refresh_form<'a>(refresh: &'a str) -> [(&'static str, &'a str); 3] {
+    [
+        ("client_id", GOOGLE_CLIENT_ID),
+        ("refresh_token", refresh),
+        ("grant_type", "refresh_token"),
+    ]
+}
+
+fn google_code_exchange_form<'a>(
+    code: &'a str,
+    verifier: &'a str,
+) -> [(&'static str, &'a str); 5] {
+    [
+        ("client_id", GOOGLE_CLIENT_ID),
+        ("code", code),
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", GOOGLE_REDIRECT_URI),
+        ("code_verifier", verifier),
+    ]
 }
 
 pub fn to_request_auth(provider: &str, credential: &Credential) -> Result<RequestAuth> {
@@ -290,7 +306,7 @@ async fn login_codex_browser(
             ("state", &state),
             ("id_token_add_organizations", "true"),
             ("codex_cli_simplified_flow", "true"),
-            ("originator", "pi"),
+            ("originator", "rpi"),
         ],
     )?;
     interaction.notify(AuthEvent::AuthUrl {
@@ -425,20 +441,8 @@ async fn login_google(
     if returned_state.as_deref().is_some_and(|value| value != state) {
         bail!("Google OAuth state mismatch")
     }
-    let body = post_form(
-        client,
-        GOOGLE_TOKEN_URL,
-        &[
-            ("client_id", GOOGLE_CLIENT_ID),
-            ("client_secret", GOOGLE_CLIENT_SECRET),
-            ("code", &code),
-            ("grant_type", "authorization_code"),
-            ("redirect_uri", GOOGLE_REDIRECT_URI),
-            ("code_verifier", &verifier),
-        ],
-        "Google token exchange",
-    )
-    .await?;
+    let fields = google_code_exchange_form(&code, &verifier);
+    let body = post_form(client, GOOGLE_TOKEN_URL, &fields, "Google token exchange").await?;
     let access = required_string(&body, "access_token", "Google token exchange")?;
     let project_id = discover_google_project(client, &access, interaction).await?;
     let mut fields = Map::new();
@@ -574,7 +578,7 @@ async fn login_xai(
                 "scope",
                 "openid profile email offline_access grok-cli:access api:access",
             ),
-            ("referrer", "pi"),
+            ("referrer", "rpi"),
         ],
         "xAI device authorization",
     )
@@ -968,6 +972,21 @@ fn parse_authorization_input(input: &str) -> Result<(String, Option<String>)> {
         return Ok((code, state));
     }
     Ok((value.to_owned(), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{google_code_exchange_form, google_refresh_form};
+
+    #[test]
+    fn google_native_token_forms_never_send_client_secret() {
+        for fields in [
+            google_refresh_form("refresh").to_vec(),
+            google_code_exchange_form("code", "verifier").to_vec(),
+        ] {
+            assert!(fields.iter().all(|(name, _)| *name != "client_secret"));
+        }
+    }
 }
 
 fn codex_account_id(access_token: &str) -> Result<String> {

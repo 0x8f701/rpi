@@ -183,6 +183,28 @@ fn installed_git_symlink_escape_is_rejected() {
 }
 
 #[test]
+fn local_package_can_be_updated_and_removed_by_absolute_path() {
+    let sandbox = TempDir::new().unwrap();
+    let cwd = sandbox.path().join("workspace");
+    let agent_dir = sandbox.path().join("agent");
+    let package = sandbox.path().join("local-package");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+    local_package(&package);
+    let source = package.to_str().unwrap();
+    let manager = manager(&cwd, &agent_dir, true);
+
+    manager.install(source, PackageScope::Global).unwrap();
+    fs::write(package.join("skills/added.md"), "new\n").unwrap();
+    let updated = manager.update_one(source).unwrap();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].source, source);
+
+    assert!(manager.remove(source, PackageScope::Global).unwrap());
+    assert!(manager.list().unwrap().is_empty());
+}
+
+#[test]
 fn npm_sources_fail_closed_without_state_mutation() {
     let sandbox = TempDir::new().unwrap();
     let cwd = sandbox.path().join("workspace");

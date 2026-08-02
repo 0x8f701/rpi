@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
         while let Ok(event) = events.recv().await {
             let envelope = json!({
                 "jsonrpc": "2.0",
-                "method": format!("pi.{}" , event_type(&event)),
+                "method": format!("rpi.{}" , event_type(&event)),
                 "params": event,
             });
             println!("{}", serde_json::to_string(&envelope)?);
@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
         Result::<(), anyhow::Error>::Ok(())
     });
 
-    app.prompt("Say hello".to_owned(), vec![], None)?;
+    app.prompt("Say hello".to_owned(), vec![], None).await?;
     app.wait_for_idle().await;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -80,13 +80,29 @@ async fn main() -> Result<()> {
 fn event_type(event: &pi_coding::ApplicationEvent) -> String {
     use pi_coding::ApplicationEvent;
     match event {
+        ApplicationEvent::RuntimeChanged { .. } => "runtimeChanged",
         ApplicationEvent::SessionStarted(_) => "sessionStarted",
+        ApplicationEvent::Session(_) => "session",
         ApplicationEvent::Agent(_) => "agent",
         ApplicationEvent::RunFailed { .. } => "runFailed",
         ApplicationEvent::AgentSettled => "agentSettled",
         ApplicationEvent::Exported { .. } => "exported",
         ApplicationEvent::ShareSucceeded { .. } => "shareSucceeded",
         ApplicationEvent::ShareFailed { .. } => "shareFailed",
+        ApplicationEvent::SessionBeforeTree(_) => "sessionBeforeTree",
+        ApplicationEvent::SessionTree(_) => "sessionTree",
+        ApplicationEvent::SessionBeforeFork(_) => "sessionBeforeFork",
+        ApplicationEvent::SessionForked(_) => "sessionForked",
+        ApplicationEvent::Process(_) => "process",
+        ApplicationEvent::Selection(_) => "selection",
+        ApplicationEvent::Loop(_) => "loop",
+        ApplicationEvent::Orchestration(_) => "orchestration",
+        ApplicationEvent::Workflow(_) => "workflow",
+        ApplicationEvent::TodoUpdated { .. } => "todoUpdated",
+        ApplicationEvent::TodoReminder { .. } => "todoReminder",
+        ApplicationEvent::GoalUpdated { .. } => "goalUpdated",
+        ApplicationEvent::GoalUsageCharged { .. } => "goalUsageCharged",
+        ApplicationEvent::GoalContinuation { .. } => "goalContinuation",
     }
     .to_owned()
 }

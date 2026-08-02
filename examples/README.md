@@ -1,4 +1,4 @@
-# pi examples
+# rpi examples
 
 The compiled examples live in `examples/src/bin/` and can be run from the
 `examples/` directory with:

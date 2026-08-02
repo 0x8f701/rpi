@@ -9,7 +9,7 @@ lists are grouped by function rather than priority.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PI_HOME` | Auto-detected from the running executable layout | Binary install root used by the self-updater |
-| `PI_UPDATE_BASE_URL` | `https://api.github.com/repos/0x8f701/pi-rs/releases` | Release API endpoint for update checks and self-update |
+| `PI_UPDATE_BASE_URL` | `https://api.github.com/repos/0x8f701/rpi/releases` | Release API endpoint for update checks and self-update |
 | `GITHUB_TOKEN` | (none) | Authenticate GitHub API calls when the updater hits `api.github.com` |
 | `PI_OFFLINE` | (none) | Disables updater networking, llama.cpp router refresh, and other non-essential network calls when set to `1`, `true`, or `yes` |
 | `PI_SKIP_VERSION_CHECK` | (none) | Disables only the nonfatal interactive startup version check when set |

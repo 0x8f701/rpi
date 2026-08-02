@@ -10,12 +10,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-/// `rpi` — Rust port of the pi coding agent.
+/// `rpi` — Rust coding agent.
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "rpi",
     version,
-    about = "rpi - Rust port of the pi coding agent",
+    about = "rpi - Rust coding agent",
     long_about = None,
     args_override_self = true,
 )]

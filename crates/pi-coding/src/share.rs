@@ -166,7 +166,7 @@ pub async fn share_session_file(
 ) -> Result<ShareResult> {
     check_gh_available().await?;
     let html = export::export_session_html(session_path, None, options)?;
-    let url = create_gist(&html, "Pi session export").await?;
+    let url = create_gist(&html, "rpi session export").await?;
     let viewer = derive_viewer_url(&url);
     Ok(ShareResult {
         gist_url: url,
@@ -183,7 +183,7 @@ pub async fn share_session(
 ) -> Result<ShareResult> {
     check_gh_available().await?;
     let html = export::export_live_session(session, None, options)?;
-    let url = create_gist(&html, "Pi session export").await?;
+    let url = create_gist(&html, "rpi session export").await?;
     let viewer = derive_viewer_url(&url);
     Ok(ShareResult {
         gist_url: url,
@@ -270,14 +270,14 @@ mod tests {
 
     #[test]
     fn gist_create_args_omits_visibility_flags() {
-        let args = gist_create_args("Pi session export", Path::new("/tmp/export.html"));
+        let args = gist_create_args("rpi session export", Path::new("/tmp/export.html"));
         assert_eq!(
             args,
             vec![
                 "gist",
                 "create",
                 "--desc",
-                "Pi session export",
+                "rpi session export",
                 "/tmp/export.html",
             ]
         );

@@ -1,7 +1,7 @@
 # Process extension example
 
 Process extensions are implemented in this release. An extension is a
-subprocess that communicates with `pi` over newline-delimited JSON on stdin
+subprocess that communicates with `rpi` over newline-delimited JSON on stdin
 and stdout.
 
 A runnable Rust sample is at [`src/bin/process_extension.rs`](src/bin/process_extension.rs).
@@ -56,7 +56,7 @@ pi-weather/
 ## Install the package
 
 ```sh
-pi install local:./pi-weather
+rpi install local:./pi-weather
 ```
 
 ## Minimal extension (Node.js sketch)

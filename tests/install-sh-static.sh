@@ -56,6 +56,10 @@ run_install() {
   grep -Fq '"installed_asset": "rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz"' "$install_root/update-state.json"
   grep -Fq '"installed_binary": "rpi-0.1.0-linux-x86_64-sha256-' "$install_root/update-state.json"
 }
+DEFAULT_HOME="$ROOT/home-default"; mkdir -p "$DEFAULT_HOME"
+TEST_FIXTURES="$FIXTURES" HOME="$DEFAULT_HOME" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >/dev/null
+[ -L "$DEFAULT_HOME/.rpi/bin/rpi" ]
+[ ! -e "$DEFAULT_HOME/.pi-rs/bin/rpi" ] && [ ! -L "$DEFAULT_HOME/.pi-rs/bin/rpi" ]
 FRESH="$ROOT/fresh"; run_install "$FRESH" "$ROOT/home-fresh"; [ ! -e "$FRESH/bin/pi" ]
 MANAGED="$ROOT/managed"
 OLD_DIGEST='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'

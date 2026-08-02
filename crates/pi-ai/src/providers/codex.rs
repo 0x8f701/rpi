@@ -940,8 +940,8 @@ fn build_codex_headers(
     common::insert_header_map(&mut headers, &options.headers)?;
     common::insert_header(&mut headers, "authorization", &format!("Bearer {token}"))?;
     common::insert_header(&mut headers, "chatgpt-account-id", account_id)?;
-    common::insert_header(&mut headers, "originator", "pi")?;
-    common::insert_header(&mut headers, "user-agent", &format!("pi ({}; {})", std::env::consts::OS, std::env::consts::ARCH))?;
+    common::insert_header(&mut headers, "originator", "rpi")?;
+    common::insert_header(&mut headers, "user-agent", &format!("rpi ({}; {})", std::env::consts::OS, std::env::consts::ARCH))?;
     if websocket {
         headers.remove("accept");
         headers.remove("content-type");

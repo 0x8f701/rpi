@@ -1,6 +1,23 @@
 # Changelog
 
-All notable changes to the `pi-rs` project are documented in this file.
+All notable changes to `rpi` are documented in this file.
+
+## [0.2.2] - 2026-08-02
+
+### Changed
+
+- The managed binary install root is now `~/.rpi` on Unix and
+  `%USERPROFILE%\.rpi` on Windows. Runtime configuration remains under
+  `~/.pi/agent`, project `.pi/`, and the existing `PI_*` environment variables.
+- Renamed the standalone RPC companion binary from `pi-rpc` to `rpi-rpc` and
+  completed the user-visible `rpi` branding in README, docs, E2E handbook, and
+  examples.
+- Google desktop OAuth now uses the existing PKCE verifier without embedding a
+  reusable client secret in source code or release binaries.
+- Local package sources can be selected by absolute path for `rpi update` and
+  `rpi remove` without a failed git-shorthand probe aborting identity matching.
+- TUI `/run` dispatch no longer blocks extension UI requests while a command is
+  awaiting a select, input, confirm, or editor interaction.
 
 ## [0.2.0] - 2026-08-01
 
@@ -98,5 +115,7 @@ All notable changes to the `pi-rs` project are documented in this file.
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
 
-[0.2.0]: https://github.com/0x8f701/pi-rs/releases/tag/v0.2.0
-[0.1.0]: https://github.com/0x8f701/pi-rs/releases/tag/v0.1.0
+[0.2.2]: https://github.com/0x8f701/rpi/releases/tag/v0.2.2
+[0.2.1]: https://github.com/0x8f701/rpi/releases/tag/v0.2.1
+[0.2.0]: https://github.com/0x8f701/rpi/releases/tag/v0.2.0
+[0.1.0]: https://github.com/0x8f701/rpi/releases/tag/v0.1.0

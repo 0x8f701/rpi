@@ -4,7 +4,7 @@
 
 1. **Install** `rpi`:
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
    ```
    See [`install.md`](install.md) for Windows, pinned binary releases, manual
    archive verification, and rollback behavior.

@@ -35,13 +35,13 @@ See [`docs/update.md`](update.md) for release-check behavior and in-place update
 macOS / Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
 ```
 
 By default the installer resolves the **latest published stable binary release**.
@@ -53,14 +53,14 @@ installer fails without changing the existing installation.
 Pin both the installer script and the requested release tag:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/v0.2.1/install.sh | bash -s -- --version v0.2.1
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.2/install.sh | bash -s -- --version v0.2.2
 ```
 
 On Windows, download the script from the same tag before invoking it:
 
 ```powershell
-irm https://raw.githubusercontent.com/0x8f701/pi-rs/v0.2.1/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.1
+irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.2/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.2
 ```
 
 ## What the installer does
@@ -89,8 +89,8 @@ Open a new terminal before running `rpi` after such a change.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PI_HOME` | `~/.pi-rs` (Unix) / `%USERPROFILE%\.pi-rs` (Windows) | Install root for the binary and update state |
-| `PI_UPDATE_BASE_URL` | `https://api.github.com/repos/0x8f701/pi-rs/releases` | Release API base |
+| `PI_HOME` | `~/.rpi` (Unix) / `%USERPROFILE%\.rpi` (Windows) | Install root for the binary and update state |
+| `PI_UPDATE_BASE_URL` | `https://api.github.com/repos/0x8f701/rpi/releases` | Release API base |
 | `GITHUB_TOKEN` | (none) | Authenticates the GitHub API call to avoid unauthenticated rate limits |
 
 The token is sent **only** to the GitHub API endpoint, never to release-asset hosts.
@@ -100,8 +100,8 @@ The token is sent **only** to the GitHub API endpoint, never to release-asset ho
 This is not the normal installation path. It requires Rust **1.88** or later.
 
 ```sh
-git clone https://github.com/0x8f701/pi-rs.git
-cd pi-rs
+git clone https://github.com/0x8f701/rpi.git
+cd rpi
 cargo install --path crates/pi-cli --locked --bin rpi
 rpi --version
 ```
@@ -114,10 +114,10 @@ cargo build --package pi-cli --bin rpi --profile release-dist --locked
 ./target/release-dist/rpi --version
 ```
 
-The headless RPC companion binary is built separately as `pi-rpc`:
+The headless RPC companion binary is built separately as `rpi-rpc`:
 
 ```sh
-cargo build --package pi-cli --bin pi-rpc --profile release-dist --locked
+cargo build --package pi-cli --bin rpi-rpc --profile release-dist --locked
 ```
 
 ## Verifying a downloaded release
@@ -128,8 +128,8 @@ tag version and one of the supported target triples:
 ```sh
 version="<version>"
 target="x86_64-unknown-linux-gnu"
-curl -fsSL -O "https://github.com/0x8f701/pi-rs/releases/download/v${version}/rpi-${version}-${target}.tar.gz"
-curl -fsSL -O "https://github.com/0x8f701/pi-rs/releases/download/v${version}/SHA256SUMS"
+curl -fsSL -O "https://github.com/0x8f701/rpi/releases/download/v${version}/rpi-${version}-${target}.tar.gz"
+curl -fsSL -O "https://github.com/0x8f701/rpi/releases/download/v${version}/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
@@ -138,7 +138,7 @@ sha256sum -c --ignore-missing SHA256SUMS
 After installation:
 
 ```text
-$PI_HOME/   # default ~/.pi-rs on Unix, %USERPROFILE%\.pi-rs on Windows
+$PI_HOME/   # default ~/.rpi on Unix, %USERPROFILE%\.rpi on Windows
 ├── bin/
 │   └── rpi -> ../downloads/rpi-<version>-<os>-<arch>-sha256-<digest>
 ├── downloads/

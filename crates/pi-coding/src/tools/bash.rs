@@ -14,8 +14,8 @@ use std::io::Write;
 use std::sync::LazyLock;
 
 /// Contained spill root under the process temp dir. Each process uses a
-/// private PID subdirectory so concurrent pi processes never share files.
-pub(crate) const BASH_SPILL_DIR_NAME: &str = "pi-rs-bash";
+/// private PID subdirectory so concurrent rpi processes never share files.
+pub(crate) const BASH_SPILL_DIR_NAME: &str = "rpi-bash";
 
 /// Process-wide registry of detached (success-path) spill files for THIS
 /// process only. Detached paths are registered on take and removed on
@@ -42,7 +42,7 @@ fn unregister_spill_path(path: &str) {
 }
 
 /// Absolute path of this process's private spill directory
-/// (`$TMPDIR/pi-rs-bash/<pid>/`). Concurrent pi processes never share files.
+/// (`$TMPDIR/rpi-bash/<pid>/`). Concurrent rpi processes never share files.
 pub fn bash_spill_dir() -> std::path::PathBuf {
     std::env::temp_dir()
         .join(BASH_SPILL_DIR_NAME)
@@ -60,7 +60,7 @@ pub fn cleanup_full_output_path(path: &str) {
 }
 
 /// Drains every spill path registered by THIS process. Does NOT sweep the
-/// spill directory on disk (that would delete other live pi processes' files
+/// spill directory on disk (that would delete other live rpi processes' files
 /// under a shared parent, and other live Sessions' files under this PID).
 ///
 /// Call from Application/process exit only — not from per-Session Drop.

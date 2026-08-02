@@ -1,4 +1,4 @@
-//! CLI adapters for Pi package install, removal, listing, and reconciliation.
+//! CLI adapters for rpi package install, removal, listing, and reconciliation.
 
 use std::path::Path;
 

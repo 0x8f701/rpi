@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
         Result::<(), anyhow::Error>::Ok(())
     });
 
-    app.prompt("Say hello".to_owned(), vec![], None)?;
+    app.prompt("Say hello".to_owned(), vec![], None).await?;
     app.wait_for_idle().await;
 
     // Give the printer a moment to drain, then stop waiting.

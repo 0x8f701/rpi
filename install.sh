@@ -4,25 +4,25 @@
 #
 # Downloads the matching platform artifact from this repo's GitHub Releases,
 # verifies its SHA-256 against the release's SHA256SUMS manifest, and installs
-# the binary as ~/.pi-rs/bin/rpi (versioned binary in ~/.pi-rs/downloads/,
+# the binary as ~/.rpi/bin/rpi (versioned binary in ~/.rpi/downloads/,
 # atomic symlink in bin/).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.sh | sh
-#   sh install.sh --version v0.2.1      # pin a specific release
+#   curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
+#   sh install.sh --version v0.2.2      # pin a specific release
 #
 # Environment:
-#   PI_HOME                install root (default: ~/.pi-rs)
+#   PI_HOME                install root (default: ~/.rpi)
 #   PI_UPDATE_BASE_URL     GitHub-Releases-shaped API base (default:
-#                          https://api.github.com/repos/0x8f701/pi-rs/releases)
+#                          https://api.github.com/repos/0x8f701/rpi/releases)
 #
 # Fails fast on any error; never leaves a partial binary as the active rpi.
 
 set -eu
 
-REPO="0x8f701/pi-rs"
+REPO="0x8f701/rpi"
 API_BASE="${PI_UPDATE_BASE_URL:-https://api.github.com/repos/${REPO}/releases}"
-PI_HOME="${PI_HOME:-$HOME/.pi-rs}"
+PI_HOME="${PI_HOME:-$HOME/.rpi}"
 
 err() {
     printf 'install.sh: error: %s\n' "$*" >&2

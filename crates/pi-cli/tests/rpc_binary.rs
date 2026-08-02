@@ -1,4 +1,4 @@
-//! End-to-end wire contracts for the `pi-rpc` binary.
+//! End-to-end wire contracts for the `rpi-rpc` binary.
 //!
 //! These tests drive the real binary over stdin/stdout with a temporary HOME
 //! and the built-in faux model. Every assertion checks JSON objects on the
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 fn rpc_bin() -> String {
-    env!("CARGO_BIN_EXE_pi-rpc").to_owned()
+    env!("CARGO_BIN_EXE_rpi-rpc").to_owned()
 }
 
 struct RpcSession {
@@ -36,7 +36,7 @@ impl RpcSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn pi-rpc");
+            .expect("spawn rpi-rpc");
         let stdout = BufReader::new(child.stdout.take().expect("stdout pipe"));
         Self {
             child,
@@ -77,14 +77,14 @@ impl RpcSession {
             // already closed stdin. Here we rely on the server always answering.
             if Instant::now() > deadline {
                 let _ = self.child.kill();
-                panic!("timed out waiting for next JSONL record from pi-rpc");
+                panic!("timed out waiting for next JSONL record from rpi-rpc");
             }
             match self.stdout.read_line(&mut line) {
                 Ok(0) => {
                     // EOF — collect status for diagnostics.
                     let status = self.child.try_wait().ok().flatten();
                     panic!(
-                        "pi-rpc stdout closed before next JSONL record (status={status:?})"
+                        "rpi-rpc stdout closed before next JSONL record (status={status:?})"
                     );
                 }
                 Ok(_) => {
@@ -105,7 +105,7 @@ impl RpcSession {
                     );
                     return value;
                 }
-                Err(error) => panic!("reading pi-rpc stdout: {error}"),
+                Err(error) => panic!("reading rpi-rpc stdout: {error}"),
             }
         }
     }
@@ -134,7 +134,7 @@ impl RpcSession {
         if let Some(mut err) = self.child.stderr.take() {
             let _ = err.read_to_end(&mut stderr);
         }
-        let status = self.child.wait().expect("wait pi-rpc");
+        let status = self.child.wait().expect("wait rpi-rpc");
         Output {
             status,
             stdout,
@@ -156,7 +156,7 @@ fn run_rpc(stdin: &[u8]) -> (Vec<Value>, Output) {
         if Instant::now() > deadline {
             let _ = session.child.kill();
             panic!(
-                "pi-rpc exceeded deadline; partial lines={lines:?} stderr={}",
+                "rpi-rpc exceeded deadline; partial lines={lines:?} stderr={}",
                 // best-effort
                 String::from_utf8_lossy(
                     &session
@@ -198,7 +198,7 @@ fn run_rpc(stdin: &[u8]) -> (Vec<Value>, Output) {
                 );
                 lines.push(value);
             }
-            Err(error) => panic!("reading pi-rpc stdout: {error}"),
+            Err(error) => panic!("reading rpi-rpc stdout: {error}"),
         }
     }
 
@@ -206,7 +206,7 @@ fn run_rpc(stdin: &[u8]) -> (Vec<Value>, Output) {
     if let Some(mut err) = session.child.stderr.take() {
         let _ = err.read_to_end(&mut stderr);
     }
-    let status = session.child.wait().expect("wait pi-rpc");
+    let status = session.child.wait().expect("wait rpi-rpc");
     // Keep home alive until wait returns.
     drop(session._home);
     (
@@ -278,14 +278,17 @@ fn help_and_version_use_standalone_name() {
     let help = Command::new(rpc_bin())
         .arg("--help")
         .output()
-        .expect("pi-rpc --help");
+        .expect("rpi-rpc --help");
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("pi-rpc"));
+    assert!(
+        String::from_utf8_lossy(&help.stdout)
+            .contains("rpi-rpc - rpi headless RPC server")
+    );
 
     let version = Command::new(rpc_bin())
         .arg("--version")
         .output()
-        .expect("pi-rpc --version");
+        .expect("rpi-rpc --version");
     assert!(version.status.success());
     assert!(String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")));
 }

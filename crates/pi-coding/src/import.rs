@@ -772,7 +772,7 @@ fn pi_records(
     let model_entry_id = short_id();
     let thinking_entry_id = short_id();
     let lineage_entry_id = short_id();
-    let provider = "pi-rs-import";
+    let provider = "rpi-import";
     let model = format!("converted-from-{source}");
     let parent_session = lineage.map(ImportLineage::parent_session_value);
     let mut header = serde_json::Map::new();
@@ -1121,7 +1121,7 @@ mod tests {
 
     impl FixtureDir {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("pi-rs-import-{}", Uuid::new_v4()));
+            let path = std::env::temp_dir().join(format!("rpi-import-{}", Uuid::new_v4()));
             fs::create_dir_all(&path).expect("create fixture directory");
             Self(path)
         }

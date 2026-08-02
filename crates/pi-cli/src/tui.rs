@@ -280,6 +280,29 @@ enum BackgroundEvent {
     },
     ClipboardRead(std::result::Result<Option<ClipboardContent>, String>),
     ClipboardWrite(std::result::Result<(), String>),
+    ExtensionCommandFinished {
+        command: String,
+        result: std::result::Result<serde_json::Value, String>,
+    },
+}
+
+fn spawn_extension_command(
+    application: &Application,
+    tx: mpsc::UnboundedSender<BackgroundEvent>,
+    command: String,
+    arguments: String,
+) {
+    let application = application.clone();
+    tokio::spawn(async move {
+        let result = crate::interactive_commands::invoke_extension_command(
+            &application,
+            &command,
+            arguments,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"));
+        let _ = tx.send(BackgroundEvent::ExtensionCommandFinished { command, result });
+    });
 }
 struct TranscriptImageCandidate {
     line_index: usize,
@@ -2905,6 +2928,11 @@ impl TuiState {
                     Err(error) => self.push_status(format!("Clipboard copy failed: {error}"), true),
                 }
             }
+            BackgroundEvent::ExtensionCommandFinished { command, result } => match result {
+                Ok(value) if !value.is_null() => self.push_status(value.to_string(), false),
+                Ok(_) => self.status = format!("Ran /{command}"),
+                Err(error) => self.push_status(format!("/run {command} failed: {error}"), true),
+            },
         }
     }
 
@@ -5250,20 +5278,14 @@ async fn submit(
             "run" => {
                 match crate::interactive_commands::parse_run_invocation(arg.unwrap_or_default()) {
                     Ok((command, arguments)) => {
-                        match crate::interactive_commands::invoke_extension_command(
+                        let command = command.to_owned();
+                        state.status = format!("Running /{command}");
+                        spawn_extension_command(
                             application,
+                            state.background_tx.clone(),
                             command,
                             arguments.to_owned(),
-                        )
-                        .await
-                        {
-                            Ok(value) if !value.is_null() => {
-                                state.push_status(value.to_string(), false)
-                            }
-                            Ok(_) => state.status = format!("Ran /{command}"),
-                            Err(error) => state
-                                .push_status(format!("/run {command} failed: {error:#}"), true),
-                        }
+                        );
                     }
                     Err(error) => state.push_status(format!("{error:#}"), true),
                 }
@@ -5325,15 +5347,14 @@ async fn submit(
                         Err(error) => state.push_status(format!("Failed to expand /{command}: {error:#}"), true),
                     },
                     Some(CommandSource::Extension) => {
-                        let result = match application.extension_runtime() {
-                            Some(runtime) => runtime.invoke_command(command, arg.unwrap_or_default().to_owned(), None, None).await,
-                            None => Err(anyhow::anyhow!("extension runtime is not loaded")),
-                        };
-                        match result {
-                            Ok(value) if !value.is_null() => state.push_status(value.to_string(), false),
-                            Ok(_) => state.status = format!("Ran /{command}"),
-                            Err(error) => state.push_status(format!("Extension command /{command} failed: {error:#}"), true),
-                        }
+                        let command = command.to_owned();
+                        state.status = format!("Running /{command}");
+                        spawn_extension_command(
+                            application,
+                            state.background_tx.clone(),
+                            command,
+                            arg.unwrap_or_default().to_owned(),
+                        );
                     }
                     Some(CommandSource::Builtin) => {
                         let usage = crate::interactive_commands::builtin(command).map(crate::interactive_commands::usage).unwrap_or_else(|| format!("/{command}"));
@@ -8603,6 +8624,7 @@ mod tests {
                         status: pi_coding::JobStatus::Running,
                         created_at: index,
                         started_at: Some(index),
+
                         finished_at: None,
                         result: None,
                     },
@@ -8613,6 +8635,22 @@ mod tests {
         assert_eq!(state.editor.undo.len(), undo_entries);
         state.editor.insert_char('x');
         assert_eq!(state.editor.text(), "large draftx");
+    }
+
+    #[test]
+    fn extension_command_background_result_updates_status() {
+        let mut state = todo_test_state(Vec::new());
+        state.apply_background(BackgroundEvent::ExtensionCommandFinished {
+            command: "dialog-smoke".to_owned(),
+            result: Ok(serde_json::Value::Null),
+        });
+        assert_eq!(state.status, "Ran /dialog-smoke");
+
+        state.apply_background(BackgroundEvent::ExtensionCommandFinished {
+            command: "dialog-smoke".to_owned(),
+            result: Err("extension failed".to_owned()),
+        });
+        assert!(state.status.contains("extension failed"));
     }
 
     #[test]

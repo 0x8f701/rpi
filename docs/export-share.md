@@ -85,7 +85,7 @@ Source: `crates/pi-cli/src/modes/rpc.rs:138-141`,
 
 `/share` is available in the TUI, the REPL, and through the application API. It
 exports the current session to HTML and uploads it as a **secret** GitHub gist
-using `gh gist create --desc "Pi session export"`. The command intentionally
+using `gh gist create --desc "rpi session export"`. The command intentionally
 omits visibility flags so GitHub CLI's secret-gist default applies.
 Source: `crates/pi-cli/src/interactive_commands.rs`,
 `crates/pi-cli/src/repl.rs`, `crates/pi-coding/src/share.rs`.

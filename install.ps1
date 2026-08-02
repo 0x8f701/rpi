@@ -2,16 +2,16 @@
 #
 # Downloads the x86_64-pc-windows-msvc artifact from this repo's GitHub Releases,
 # verifies its SHA-256 against the release's SHA256SUMS manifest, and installs
-# the binary as %USERPROFILE%\.pi-rs\bin\rpi.exe.
+# the binary as %USERPROFILE%\.rpi\bin\rpi.exe.
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/0x8f701/pi-rs/master/install.ps1 | iex
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.1
+#   irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.2
 #
 # Environment:
-#   PI_HOME                install root (default: %USERPROFILE%\.pi-rs)
+#   PI_HOME                install root (default: %USERPROFILE%\.rpi)
 #   PI_UPDATE_BASE_URL     GitHub-Releases-shaped API base (default:
-#                          https://api.github.com/repos/0x8f701/pi-rs/releases)
+#                          https://api.github.com/repos/0x8f701/rpi/releases)
 
 [CmdletBinding()]
 param(
@@ -134,9 +134,9 @@ $MOVEFILE_REPLACE_EXISTING = 1
 $ERR_SHARING_VIOLATION = 32
 $ERR_ACCESS_DENIED = 5
 
-$Repo = "0x8f701/pi-rs"
+$Repo = "0x8f701/rpi"
 $ApiBase = if ($env:PI_UPDATE_BASE_URL) { $env:PI_UPDATE_BASE_URL } else { "https://api.github.com/repos/$Repo/releases" }
-$PiHome = if ($env:PI_HOME) { $env:PI_HOME } else { Join-Path $env:USERPROFILE ".pi-rs" }
+$PiHome = if ($env:PI_HOME) { $env:PI_HOME } else { Join-Path $env:USERPROFILE ".rpi" }
 $Triple = "x86_64-pc-windows-msvc"
 
 # ── Platform gate ────────────────────────────────────────────────────────────
@@ -320,7 +320,7 @@ try {
     # Serialize concurrent installs over PI_HOME. Downloads run concurrently,
     # but activation is guarded by a named mutex with the same 30-second bound
     # as the self-updater. An abandoned mutex transfers ownership safely.
-    $MutexName = "Local\pi-rs-install-" + ($PiHome -replace '[\\/:]', '_')
+    $MutexName = "Local\rpi-install-" + ($PiHome -replace '[\\/:]', '_')
     $InstallMutex = New-Object System.Threading.Mutex($false, $MutexName)
     try {
         $InstallMutexAcquired = $InstallMutex.WaitOne([TimeSpan]::FromSeconds(30))
