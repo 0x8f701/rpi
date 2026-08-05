@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use parking_lot::Mutex;
-use pi_ai::{BranchSummaryMessage, CompactionSummaryMessage, ContentBlock, CustomMessage, CustomMessageContent, Message, Model};
+use pi_ai::{BranchSummaryMessage, CompactionSummaryMessage, ContentBlock, CustomMessage, CustomMessageContent, Message, Model, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -87,6 +87,12 @@ pub enum SessionRecord {
         tokens_before: i64,
         #[serde(rename = "retainedTail", default, skip_serializing_if = "Vec::is_empty")]
         retained_tail: Vec<Message>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        #[serde(rename = "fromHook", default, skip_serializing_if = "Option::is_none")]
+        from_hook: Option<bool>,
     },
     SessionInfo {
         id: String,
@@ -103,6 +109,12 @@ pub enum SessionRecord {
         #[serde(rename = "fromId")]
         from_id: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        #[serde(rename = "fromHook", default, skip_serializing_if = "Option::is_none")]
+        from_hook: Option<bool>,
     },
     Custom {
         id: String,
@@ -144,6 +156,7 @@ pub enum SessionRecord {
         label: Option<String>,
     },
 }
+
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
@@ -187,6 +200,10 @@ pub struct SessionEntry {
     pub display: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_hook: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -396,6 +413,9 @@ impl SessionTree {
                 context.messages.push(Message::CompactionSummary(CompactionSummaryMessage {
                     summary: summary.to_owned(),
                     tokens_before: compaction.tokens_before.unwrap_or_default(),
+                    details: compaction.details.clone(),
+                    usage: compaction.usage.clone(),
+                    from_hook: compaction.from_hook,
                     timestamp: timestamp_millis(&compaction.timestamp),
                 }));
             }
@@ -449,6 +469,10 @@ struct RecorderState {
     flushed: bool,
     has_assistant: bool,
     session_name: Option<String>,
+    /// When true, every record from the header onward is durable-appended
+    /// (write + flush + fsync) so a crash-durable child transcript survives
+    /// interruption before the first assistant message.
+    durable: bool,
 }
 
 /// A fully parsed native session whose read/append descriptor is retained from
@@ -548,6 +572,7 @@ impl PreparedSessionResume {
                 flushed: true,
                 has_assistant: true,
                 session_name,
+                durable: false,
             })),
         })
     }
@@ -623,6 +648,17 @@ impl SessionRecorder {
         branch_from_id: Option<&str>,
         summary: &str,
     ) -> Result<String> {
+        self.branch_with_summary_metadata(branch_from_id, summary, None, None, None)
+    }
+
+    pub fn branch_with_summary_metadata(
+        &self,
+        branch_from_id: Option<&str>,
+        summary: &str,
+        details: Option<&Value>,
+        usage: Option<&Usage>,
+        from_hook: Option<bool>,
+    ) -> Result<String> {
         let mut state = self.inner.lock();
         if let Some(entry_id) = branch_from_id
             && !state.used_ids.contains(entry_id)
@@ -636,14 +672,22 @@ impl SessionRecorder {
             state.active_leaf_id = target_leaf;
             state.revision = state.revision.saturating_add(1);
         }
-        let result = append_entry(
-            &mut state,
-            "branch_summary",
-            json!({
-                "fromId": branch_from_id.unwrap_or("root"),
-                "summary": summary,
-            }),
+        let mut fields = Map::new();
+        fields.insert(
+            "fromId".to_owned(),
+            Value::String(branch_from_id.unwrap_or("root").to_owned()),
         );
+        fields.insert("summary".to_owned(), Value::String(summary.to_owned()));
+        if let Some(details) = details {
+            fields.insert("details".to_owned(), details.clone());
+        }
+        if let Some(usage) = usage {
+            fields.insert("usage".to_owned(), serde_json::to_value(usage)?);
+        }
+        if let Some(from_hook) = from_hook {
+            fields.insert("fromHook".to_owned(), Value::Bool(from_hook));
+        }
+        let result = append_entry(&mut state, "branch_summary", Value::Object(fields));
         if result.is_err() {
             state.active_leaf_id = previous_active_leaf_id;
             state.revision = previous_revision;
@@ -658,11 +702,12 @@ impl SessionRecorder {
         }
         let previous_last_id = state.last_id.clone();
         let previous_active_leaf_id = state.active_leaf_id.clone();
-        let result = append_entry(
-            &mut state,
-            "label",
-            json!({ "targetId": target_id, "label": label }),
-        );
+        let mut fields = Map::new();
+        fields.insert("targetId".to_owned(), json!(target_id));
+        if let Some(label) = label {
+            fields.insert("label".to_owned(), json!(label));
+        }
+        let result = append_entry(&mut state, "label", Value::Object(fields));
         if result.is_ok() {
             state.last_id = previous_last_id;
             state.active_leaf_id = previous_active_leaf_id;
@@ -782,17 +827,48 @@ impl SessionRecorder {
         tokens_before: i64,
         retained_tail: &[Message],
     ) -> Result<String> {
-        let mut state = self.inner.lock();
-        append_entry(
-            &mut state,
-            "compaction",
-            json!({
-                "summary": summary,
-                "firstKeptEntryId": first_kept_entry_id,
-                "tokensBefore": tokens_before,
-                "retainedTail": retained_tail,
-            }),
+        self.record_compaction_metadata(
+            summary,
+            first_kept_entry_id,
+            tokens_before,
+            retained_tail,
+            None,
+            None,
+            None,
         )
+    }
+
+    pub fn record_compaction_metadata(
+        &self,
+        summary: &str,
+        first_kept_entry_id: Option<&str>,
+        tokens_before: i64,
+        retained_tail: &[Message],
+        details: Option<&Value>,
+        usage: Option<&Usage>,
+        from_hook: Option<bool>,
+    ) -> Result<String> {
+        let mut state = self.inner.lock();
+        let mut fields = Map::new();
+        fields.insert("summary".to_owned(), Value::String(summary.to_owned()));
+        if let Some(first_kept_entry_id) = first_kept_entry_id {
+            fields.insert(
+                "firstKeptEntryId".to_owned(),
+                Value::String(first_kept_entry_id.to_owned()),
+            );
+        }
+        fields.insert("tokensBefore".to_owned(), json!(tokens_before));
+        fields.insert("retainedTail".to_owned(), serde_json::to_value(retained_tail)?);
+        if let Some(details) = details {
+            fields.insert("details".to_owned(), details.clone());
+        }
+        if let Some(usage) = usage {
+            fields.insert("usage".to_owned(), serde_json::to_value(usage)?);
+        }
+        if let Some(from_hook) = from_hook {
+            fields.insert("fromHook".to_owned(), Value::Bool(from_hook));
+        }
+        append_entry(&mut state, "compaction", Value::Object(fields))
     }
 
     pub fn record_session_name(&self, name: &str) -> Result<Option<String>> {
@@ -833,6 +909,25 @@ impl SessionRecorder {
         }
         state.has_assistant = previous_has_assistant;
         Ok(())
+    }
+
+    /// Like [`persist_now`] but forces a durable append (write + flush + fsync).
+    pub fn persist_now_durable(&self) -> Result<()> {
+        let mut state = self.inner.lock();
+        let previous_has_assistant = state.has_assistant;
+        state.has_assistant = true;
+        if let Err(error) = persist_durable(&mut state) {
+            state.has_assistant = previous_has_assistant;
+            return Err(error);
+        }
+        state.has_assistant = previous_has_assistant;
+        Ok(())
+    }
+
+    /// Mark this recorder as durable so all subsequent appends use
+    /// write+flush+fsync from the header onward.
+    pub fn set_durable(&self) {
+        self.inner.lock().durable = true;
     }
 
     pub fn close(&self) -> Result<()> {
@@ -909,7 +1004,7 @@ pub fn start_session_in(
         path, id, timestamp, cwd, parent_session,
         last_id: None, active_leaf_id: None, revision: 0, used_ids: HashSet::new(),
         pending: vec![header], file: None, flushed: false,
-        has_assistant: false, session_name: None,
+        has_assistant: false, session_name: None, durable: false,
     })) };
     if has_explicit_id {
         recorder.persist_now().context("reserving explicit session id")?;
@@ -922,16 +1017,43 @@ pub fn start_session_in(
 }
 
 pub fn create_branched_session(source_path: impl AsRef<Path>, leaf_id: &str) -> Result<SessionRecorder> {
+    create_branched_session_in(source_path, leaf_id, None)
+}
+
+pub fn create_branched_session_in(
+    source_path: impl AsRef<Path>,
+    leaf_id: &str,
+    session_dir: Option<&Path>,
+) -> Result<SessionRecorder> {
     let source_path = source_path.as_ref();
     let tree = load_session_tree(source_path)?;
     if !tree.entries.iter().any(|entry| entry.id == leaf_id) {
         bail!("Entry not found: {leaf_id}");
     }
-    let branch = tree.branch(Some(leaf_id));
-    let directory = source_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_session_dir(&tree.header.cwd));
+
+    let mut retained_entries = Vec::new();
+    let mut retained_ids = HashSet::new();
+    let mut parent_id = None;
+    for entry in tree.branch(Some(leaf_id)) {
+        if entry.entry_type == "label" {
+            continue;
+        }
+        let mut retained = entry.clone();
+        retained.parent_id.clone_from(&parent_id);
+        parent_id = Some(retained.id.clone());
+        retained_ids.insert(retained.id.clone());
+        retained_entries.push(retained);
+    }
+
+    let directory = session_dir.map_or_else(
+        || {
+            source_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| default_session_dir(&tree.header.cwd))
+        },
+        absolute_path,
+    );
     fs::create_dir_all(&directory)
         .with_context(|| format!("creating session directory {}", directory.display()))?;
     let id = Uuid::now_v7().to_string();
@@ -951,16 +1073,48 @@ pub fn create_branched_session(source_path: impl AsRef<Path>, leaf_id: &str) -> 
         "parentSession": parent_session,
     })];
     pending.extend(
-        branch
+        retained_entries
             .iter()
-            .map(|entry| serde_json::to_value(entry))
+            .map(serde_json::to_value)
             .collect::<std::result::Result<Vec<_>, _>>()?,
     );
-    let used_ids = branch.iter().map(|entry| entry.id.clone()).collect();
-    let has_assistant = branch
+
+    let mut allocation_ids = tree
+        .entries
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect::<HashSet<_>>();
+    let mut used_ids = retained_ids.clone();
+    let mut label_parent_id = parent_id.clone();
+    let mut resolved_labels = tree
+        .labels
+        .iter()
+        .filter(|(target_id, _)| retained_ids.contains(*target_id))
+        .collect::<Vec<_>>();
+    resolved_labels.sort_by(|(left_target, left), (right_target, right)| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left_target.cmp(right_target))
+    });
+    for (target_id, resolved) in resolved_labels {
+        let label_id = unique_entry_id(&allocation_ids);
+        allocation_ids.insert(label_id.clone());
+        used_ids.insert(label_id.clone());
+        pending.push(json!({
+            "type": "label",
+            "id": label_id,
+            "parentId": label_parent_id,
+            "timestamp": resolved.timestamp,
+            "targetId": target_id,
+            "label": resolved.label,
+        }));
+        label_parent_id = Some(label_id);
+    }
+
+    let has_assistant = retained_entries
         .iter()
         .any(|entry| matches!(entry.message, Some(Message::Assistant(_))));
-    let session_name = branch
+    let session_name = retained_entries
         .iter()
         .rev()
         .find(|entry| entry.entry_type == "session_info")
@@ -972,8 +1126,8 @@ pub fn create_branched_session(source_path: impl AsRef<Path>, leaf_id: &str) -> 
             timestamp,
             cwd: tree.header.cwd,
             parent_session,
-            last_id: Some(leaf_id.to_owned()),
-            active_leaf_id: Some(leaf_id.to_owned()),
+            last_id: parent_id.clone(),
+            active_leaf_id: parent_id,
             revision: 0,
             used_ids,
             pending,
@@ -981,12 +1135,50 @@ pub fn create_branched_session(source_path: impl AsRef<Path>, leaf_id: &str) -> 
             flushed: false,
             has_assistant,
             session_name,
+            durable: false,
         })),
     };
     if has_assistant {
         persist(&mut recorder.inner.lock())?;
     }
     Ok(recorder)
+}
+
+#[cfg(test)]
+mod session_directory_compat_tests {
+    use super::*;
+
+    #[test]
+    fn create_branched_session_in_uses_selected_directory_and_keeps_parent() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let source_dir = tempfile::tempdir().expect("source directory");
+        let selected_dir = tempfile::tempdir().expect("selected directory");
+        let source = start_session_in(
+            cwd.path(),
+            None,
+            Some("off"),
+            Some(source_dir.path()),
+            Some("source"),
+            None,
+        )
+        .expect("source session");
+        let first = source
+            .record_message(&Message::user_text("first", 0))
+            .expect("first message");
+        source
+            .record_message(&Message::user_text("second", 1))
+            .expect("second message");
+        source.persist_now().expect("persist source");
+        let source_path = source.path();
+
+        let branch = create_branched_session_in(&source_path, &first, Some(selected_dir.path()))
+            .expect("branch session");
+        assert_eq!(branch.path().parent(), Some(selected_dir.path()));
+        assert_eq!(
+            branch.tree().expect("branch tree").header.parent_session.as_deref(),
+            Some(source_path.to_string_lossy().as_ref())
+        );
+    }
 }
 
 pub fn fork_session_in(
@@ -1009,7 +1201,19 @@ pub fn fork_session_in(
     if list_sessions_in(&target_cwd, Some(&directory)).iter().any(|session| session.id == id) {
         bail!("Session already exists with id '{id}'");
     }
-    let branch = tree.branch(tree.leaf_id.as_deref());
+    let mut retained_entries = Vec::new();
+    let mut retained_ids = HashSet::new();
+    let mut leaf_id = None;
+    for entry in tree.branch(tree.leaf_id.as_deref()) {
+        if entry.entry_type == "label" {
+            continue;
+        }
+        let mut retained = entry.clone();
+        retained.parent_id.clone_from(&leaf_id);
+        leaf_id = Some(retained.id.clone());
+        retained_ids.insert(retained.id.clone());
+        retained_entries.push(retained);
+    }
     let timestamp = iso_now();
     let path = new_session_path(&directory, &timestamp, &id, has_explicit_id);
     let parent_session = Some(source_path.to_string_lossy().into_owned());
@@ -1017,17 +1221,35 @@ pub fn fork_session_in(
         "type": "session", "version": CURRENT_SESSION_VERSION, "id": id,
         "timestamp": timestamp, "cwd": target_cwd, "parentSession": parent_session,
     })];
-    pending.extend(branch.iter().map(|entry| serde_json::to_value(entry))
+    pending.extend(retained_entries.iter().map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?);
-    let used_ids = branch.iter().map(|entry| entry.id.clone()).collect();
-    let has_assistant = branch.iter().any(|entry| matches!(entry.message, Some(Message::Assistant(_))));
-    let session_name = branch.iter().rev().find(|entry| entry.entry_type == "session_info")
+
+    let mut allocation_ids = tree.entries.iter().map(|entry| entry.id.clone()).collect::<HashSet<_>>();
+    let mut used_ids = retained_ids.clone();
+    let mut label_parent_id = leaf_id.clone();
+    let mut resolved_labels = tree.labels.iter()
+        .filter(|(target_id, _)| retained_ids.contains(*target_id))
+        .collect::<Vec<_>>();
+    resolved_labels.sort_by(|(left_target, left), (right_target, right)| {
+        left.timestamp.cmp(&right.timestamp).then_with(|| left_target.cmp(right_target))
+    });
+    for (target_id, resolved) in resolved_labels {
+        let label_id = unique_entry_id(&allocation_ids);
+        allocation_ids.insert(label_id.clone());
+        used_ids.insert(label_id.clone());
+        pending.push(json!({
+            "type": "label", "id": label_id, "parentId": label_parent_id,
+            "timestamp": resolved.timestamp, "targetId": target_id, "label": resolved.label,
+        }));
+        label_parent_id = Some(label_id);
+    }
+    let has_assistant = retained_entries.iter().any(|entry| matches!(entry.message, Some(Message::Assistant(_))));
+    let session_name = retained_entries.iter().rev().find(|entry| entry.entry_type == "session_info")
         .and_then(|entry| entry.name.clone());
-    let leaf_id = branch.last().map(|entry| entry.id.clone());
     let recorder = SessionRecorder { inner: Arc::new(Mutex::new(RecorderState {
         path, id, timestamp, cwd: target_cwd, parent_session,
         last_id: leaf_id.clone(), active_leaf_id: leaf_id, revision: 0, used_ids, pending,
-        file: None, flushed: false, has_assistant, session_name,
+        file: None, flushed: false, has_assistant, session_name, durable: false,
     })) };
     if has_explicit_id {
         recorder.persist_now().context("reserving explicit fork session id")?;
@@ -1039,6 +1261,71 @@ pub fn fork_session_in(
 
 pub fn resume_session(path: impl AsRef<Path>) -> Result<SessionRecorder> {
     PreparedSessionResume::prepare_path(path)?.into_recorder()
+}
+
+/// Start a durable child session: the header and every subsequent record is
+/// durable-appended (write + flush + fsync) so a crash mid-turn leaves a
+/// recoverable partial transcript. `session_dir` is the child root (e.g.
+/// `<resolved-session-root>/children/<parent-id>/`). `parent_session` is the
+/// canonical parent JSONL path.
+pub fn start_durable_child_session_in(
+    cwd: impl AsRef<Path>,
+    model: Option<&Model>,
+    thinking_level: Option<&str>,
+    session_dir: &Path,
+    session_id: Option<&str>,
+    parent_session: &Path,
+) -> Result<SessionRecorder> {
+    let cwd = absolute_path(cwd.as_ref());
+    let directory = absolute_path(session_dir);
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("creating durable child session directory {}", directory.display()))?;
+    let has_explicit_id = session_id.is_some();
+    let id = match session_id {
+        Some(id) => { validate_session_id(id)?; id.to_owned() }
+        None => Uuid::now_v7().to_string(),
+    };
+    let timestamp = iso_now();
+    let path = new_session_path(&directory, &timestamp, &id, has_explicit_id);
+    let parent_session_str = parent_session.to_string_lossy().into_owned();
+    let header = json!({
+        "type": "session", "version": CURRENT_SESSION_VERSION, "id": id,
+        "timestamp": timestamp, "cwd": cwd, "parentSession": parent_session_str,
+    });
+    let recorder = SessionRecorder { inner: Arc::new(Mutex::new(RecorderState {
+        path, id, timestamp, cwd, parent_session: Some(parent_session_str),
+        last_id: None, active_leaf_id: None, revision: 0, used_ids: HashSet::new(),
+        pending: vec![header], file: None, flushed: false,
+        has_assistant: false, session_name: None, durable: true,
+    })) };
+    // Durable-append the header immediately so the file exists on disk.
+ recorder.persist_now_durable().context("reserving durable child session header")?;
+    if let Some(model) = model { recorder.record_model_change(&model.provider, &model.id)?; }
+    if let Some(level) = thinking_level.filter(|level| !level.is_empty()) {
+        recorder.record_thinking_level(level)?;
+    }
+    Ok(recorder)
+}
+
+/// Resume a durable child session from an existing JSONL path, continuing with
+/// durable (fsync) appends. The path must be a regular file directly inside the
+/// child root.
+pub fn resume_durable_child_session(path: impl AsRef<Path>) -> Result<SessionRecorder> {
+    let prepared = PreparedSessionResume::prepare_path(path)?;
+    let mut recorder = prepared.into_recorder()?;
+    recorder.inner.lock().durable = true;
+    Ok(recorder)
+}
+
+/// Resume a durable child session from a prepared resume handle, continuing
+/// with durable (fsync) appends. Avoids re-opening the file when the caller
+/// already prepared it for cwd validation.
+pub fn resume_durable_child_session_from_prepared(
+    prepared: PreparedSessionResume,
+) -> Result<SessionRecorder> {
+    let mut recorder = prepared.into_recorder()?;
+    recorder.inner.lock().durable = true;
+    Ok(recorder)
 }
 
 pub fn load_session_tree(path: impl AsRef<Path>) -> Result<SessionTree> {
@@ -1266,6 +1553,11 @@ fn session_tree_from_values(path: &Path, values: &[Value]) -> Result<SessionTree
                 .and_then(|content| serde_json::from_value(content).ok()),
             display: object.get("display").and_then(Value::as_bool),
             details: object.get("details").cloned(),
+            usage: object
+                .get("usage")
+                .cloned()
+                .and_then(|usage| serde_json::from_value(usage).ok()),
+            from_hook: object.get("fromHook").and_then(Value::as_bool),
             data: object.get("data").cloned(),
             name: object.get("name").and_then(Value::as_str).map(str::to_owned),
             label: nonempty_string(object, "label"),
@@ -1280,7 +1572,11 @@ fn session_tree_from_values(path: &Path, values: &[Value]) -> Result<SessionTree
         by_id.insert(id, entries.len());
         entries.push(entry);
     }
-    let leaf_id = entries.last().map(|entry| entry.id.clone());
+    let leaf_id = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.entry_type != "label")
+        .map(|entry| entry.id.clone());
     let (children_by_parent, labels) = build_tree_indexes(&entries, &by_id);
     Ok(SessionTree {
         header,
@@ -1380,15 +1676,37 @@ pub fn list_sessions_in(cwd: impl AsRef<Path>, session_dir: Option<&Path>) -> Ve
     let directory = session_dir.map_or_else(|| default_session_dir(&cwd), absolute_path);
     let filter_cwd = session_dir.is_some();
     let Ok(read_dir) = fs::read_dir(directory) else { return Vec::new(); };
+    // Pair each parsed session with its file last-modified time so the listing
+    // can be ordered by mtime (matching upstream Pi), falling back to the
+    // session timestamp and finally the path for determinism when metadata is
+    // unavailable or two files share an mtime.
     let mut sessions = read_dir
         .take(MAX_SESSION_RECORDS)
         .filter_map(Result::ok)
         .filter(|entry| entry.path().extension().is_some_and(|extension| extension == "jsonl"))
-        .filter_map(|entry| read_session_info(&entry.path()).ok())
-        .filter(|session| !filter_cwd || absolute_path(&session.cwd) == cwd)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let modified = fs::metadata(&path).ok().and_then(|metadata| metadata.modified().ok());
+            read_session_info(&path).ok().map(|session| (session, modified))
+        })
+        .filter(|(session, _)| !filter_cwd || absolute_path(&session.cwd) == cwd)
         .collect::<Vec<_>>();
-    sessions.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
-    sessions
+    sessions.sort_by(compare_session_listing);
+    sessions.into_iter().map(|(session, _)| session).collect()
+}
+
+fn compare_session_listing(
+    left: &(SessionInfo, Option<std::time::SystemTime>),
+    right: &(SessionInfo, Option<std::time::SystemTime>),
+) -> std::cmp::Ordering {
+    match (left.1, right.1) {
+        (Some(left_mtime), Some(right_mtime)) => right_mtime.cmp(&left_mtime),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| right.0.timestamp.cmp(&left.0.timestamp))
+    .then_with(|| left.0.path.cmp(&right.0.path))
 }
 
 #[must_use]
@@ -1615,7 +1933,9 @@ fn persist_durable(state: &mut RecorderState) -> Result<()> {
 }
 
 fn persist(state: &mut RecorderState) -> Result<()> {
-    if !state.has_assistant {
+    // Durable recorders persist every entry from the header onward, so they
+    // do not wait for the first assistant message before writing to disk.
+    if !state.durable && !state.has_assistant {
         return Ok(());
     }
     if !state.flushed {
@@ -1626,7 +1946,12 @@ fn persist(state: &mut RecorderState) -> Result<()> {
             .create_new(true)
             .open(&state.path)
             .with_context(|| format!("creating session {}", state.path.display()))?;
-        if let Err(error) = write_records(&mut file, &state.pending) {
+        let write_result = if state.durable {
+            write_records_durable(&mut file, &state.pending)
+        } else {
+            write_records(&mut file, &state.pending)
+        };
+        if let Err(error) = write_result {
             drop(file);
             let _ = fs::remove_file(&state.path);
             return Err(error);
@@ -1637,7 +1962,11 @@ fn persist(state: &mut RecorderState) -> Result<()> {
         return Ok(());
     }
     if let Some(file) = state.file.as_mut() {
-        write_records(file, &state.pending)?;
+        if state.durable {
+            write_records_durable(file, &state.pending)?;
+        } else {
+            write_records(file, &state.pending)?;
+        }
         state.pending.clear();
     }
     Ok(())
@@ -1800,6 +2129,9 @@ fn append_entry_message(messages: &mut Vec<Message>, entry: &SessionEntry) {
                 messages.push(Message::BranchSummary(BranchSummaryMessage {
                     summary: summary.to_owned(),
                     from_id: entry.from_id.clone().unwrap_or_else(|| "root".to_owned()),
+                    details: entry.details.clone(),
+                    usage: entry.usage.clone(),
+                    from_hook: entry.from_hook,
                     timestamp: timestamp_millis(&entry.timestamp),
                 }));
             }
@@ -1809,6 +2141,9 @@ fn append_entry_message(messages: &mut Vec<Message>, entry: &SessionEntry) {
                 messages.push(Message::CompactionSummary(CompactionSummaryMessage {
                     summary: summary.to_owned(),
                     tokens_before: entry.tokens_before.unwrap_or_default(),
+                    details: entry.details.clone(),
+                    usage: entry.usage.clone(),
+                    from_hook: entry.from_hook,
                     timestamp: timestamp_millis(&entry.timestamp),
                 }));
             }
@@ -2246,6 +2581,7 @@ mod tests {
                 flushed: false,
                 has_assistant: false,
                 session_name: None,
+                durable: false,
             })),
         };
         let assistant = Message::Assistant(pi_ai::AssistantMessage::pending(&Model::default()));
@@ -2301,6 +2637,8 @@ mod tests {
             first_kept_entry_id: None,
             tokens_before: None,
             retained_tail: Vec::new(),
+            usage: None,
+            from_hook: None,
             content: None,
             name: None,
             label: None,
@@ -2527,6 +2865,154 @@ mod tests {
         }
     }
     #[test]
+    fn public_session_record_label_clear_omits_optional_label() {
+        let record = SessionRecord::Label {
+            id: "label-id".to_owned(),
+            parent_id: Some("entry-id".to_owned()),
+            timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
+            target_id: "entry-id".to_owned(),
+            label: None,
+        };
+        let encoded = serde_json::to_value(&record).expect("serialize session record");
+
+        let branch = json!({
+            "type":"branch_summary", "id":"branch-id", "parentId":"entry-id",
+            "timestamp":"2026-01-01T00:00:01.000Z", "fromId":"entry-id", "summary":"branch",
+            "details":{"readFiles":["src/lib.rs"]},
+            "usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"cacheWrite1h":0,"reasoning":0,"totalTokens":3,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},
+            "fromHook":true
+        });
+        let branch_record: SessionRecord = serde_json::from_value(branch.clone()).expect("deserialize branch record");
+        assert_eq!(serde_json::to_value(branch_record).expect("serialize branch record"), branch);
+
+        let compaction = json!({
+            "type":"compaction", "id":"compaction-id", "parentId":"branch-id",
+            "timestamp":"2026-01-01T00:00:02.000Z", "summary":"compact", "tokensBefore":9,
+            "details":{"modifiedFiles":["src/main.rs"]},
+            "usage":{"input":3,"output":4,"cacheRead":0,"cacheWrite":0,"cacheWrite1h":0,"reasoning":0,"totalTokens":7,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},
+            "fromHook":false
+        });
+        let compaction_record: SessionRecord = serde_json::from_value(compaction.clone()).expect("deserialize compaction record");
+        assert_eq!(serde_json::to_value(compaction_record).expect("serialize compaction record"), compaction);
+        assert_eq!(encoded["type"], "label");
+        assert_eq!(encoded["parentId"], "entry-id");
+        assert!(encoded.get("label").is_none());
+        let decoded: SessionRecord = serde_json::from_value(encoded).expect("deserialize session record");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn summary_metadata_round_trips_entries_context_and_recorder() {
+        let directory = tempfile::tempdir().expect("directory");
+        let recorder = start_session_in(
+            directory.path(), None, None, Some(directory.path()), Some("summary-metadata"), None,
+        )
+        .expect("start session");
+        let root_id = recorder.record_message(&Message::user_text("root", 0)).expect("record root");
+        let branch_details = json!({"readFiles":["src/lib.rs"]});
+        let branch_usage = Usage { input: 11, output: 3, total_tokens: 14, ..Usage::default() };
+        let branch_id = recorder
+            .branch_with_summary_metadata(
+                Some(&root_id), "branch summary", Some(&branch_details), Some(&branch_usage), Some(true),
+            )
+            .expect("record branch summary");
+        let compaction_details = json!({"modifiedFiles":["src/main.rs"]});
+        let compaction_usage = Usage { input: 21, output: 5, total_tokens: 26, ..Usage::default() };
+        let compaction_id = recorder
+            .record_compaction_metadata(
+                "compaction summary", None, 1234, &[], Some(&compaction_details), Some(&compaction_usage), Some(false),
+            )
+            .expect("record compaction");
+        recorder.close().expect("close recorder");
+
+        let tree = load_session_tree(recorder.path()).expect("reload summaries");
+        let branch_entry = tree.entries.iter().find(|entry| entry.id == branch_id).expect("branch entry");
+        assert_eq!(branch_entry.details.as_ref(), Some(&branch_details));
+        assert_eq!(branch_entry.usage.as_ref(), Some(&branch_usage));
+        assert_eq!(branch_entry.from_hook, Some(true));
+        assert!(matches!(tree.build_context(Some(&branch_id)).messages.last(),
+            Some(Message::BranchSummary(message))
+                if message.details.as_ref() == Some(&branch_details)
+                    && message.usage.as_ref() == Some(&branch_usage)
+                    && message.from_hook == Some(true)));
+
+        let compaction_entry = tree.entries.iter().find(|entry| entry.id == compaction_id).expect("compaction entry");
+        assert_eq!(compaction_entry.details.as_ref(), Some(&compaction_details));
+        assert_eq!(compaction_entry.usage.as_ref(), Some(&compaction_usage));
+        assert_eq!(compaction_entry.from_hook, Some(false));
+        assert!(matches!(tree.build_context(Some(&compaction_id)).messages.first(),
+            Some(Message::CompactionSummary(message))
+                if message.details.as_ref() == Some(&compaction_details)
+                    && message.usage.as_ref() == Some(&compaction_usage)
+                    && message.from_hook == Some(false)));
+
+        let legacy = start_session_in(
+            directory.path(), None, None, Some(directory.path()), Some("summary-legacy"), None,
+        )
+        .expect("legacy recorder");
+        legacy.record_compaction("legacy", None, 7, &[]).expect("legacy compaction");
+        legacy.close().expect("close legacy recorder");
+        let legacy_rows = fs::read_to_string(legacy.path()).expect("read legacy rows");
+        let legacy_compaction = legacy_rows.lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("parse legacy row"))
+            .find(|row| row["type"] == "compaction")
+            .expect("legacy compaction row");
+        assert!(legacy_compaction.get("details").is_none());
+        assert!(legacy_compaction.get("usage").is_none());
+        assert!(legacy_compaction.get("fromHook").is_none());
+    }
+
+    #[test]
+    fn create_branched_session_rechains_labels_and_recreates_resolved_labels() {
+        let directory = tempfile::tempdir().expect("directory");
+        let source_path = directory.path().join("source.jsonl");
+        let lines = [
+            json!({"type":"session","version":CURRENT_SESSION_VERSION,"id":"source","timestamp":"2026-01-01T00:00:00.000Z","cwd":directory.path()}),
+            json!({"type":"message","id":"a","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":Message::user_text("a", 0)}),
+            json!({"type":"label","id":"label-a","parentId":"a","timestamp":"2026-01-01T00:00:02.000Z","targetId":"a","label":"cleared"}),
+            json!({"type":"message","id":"b","parentId":"label-a","timestamp":"2026-01-01T00:00:03.000Z","message":Message::user_text("b", 0)}),
+            json!({"type":"label","id":"clear-a","parentId":"b","timestamp":"2026-01-01T00:00:04.000Z","targetId":"a"}),
+            json!({"type":"label","id":"old-b","parentId":"clear-a","timestamp":"2026-01-01T00:00:05.000Z","targetId":"b","label":"old"}),
+            json!({"type":"label","id":"new-b","parentId":"old-b","timestamp":"2026-01-01T00:00:06.000Z","targetId":"b","label":"current"}),
+            json!({"type":"message","id":"c","parentId":"new-b","timestamp":"2026-01-01T00:00:07.000Z","message":Message::user_text("c", 0)}),
+            json!({"type":"label","id":"label-c","parentId":"c","timestamp":"2026-01-01T00:00:08.000Z","targetId":"c","label":"leaf"}),
+        ];
+        fs::write(
+            &source_path,
+            lines.iter().map(|line| serde_json::to_string(line).expect("serialize source row")).collect::<Vec<_>>().join("\n"),
+        )
+        .expect("write source");
+
+        let fork = create_branched_session(&source_path, "c").expect("create branch");
+        let fork_path = fork.path();
+        fork.close().expect("close branch");
+        let tree = load_session_tree(&fork_path).expect("load branch");
+        assert_eq!(tree.tree().len(), 1);
+        assert_eq!(tree.active_leaf_id.as_deref(), Some("c"));
+        assert_eq!(message_texts(&tree.build_context(None)), vec!["a", "b", "c"]);
+
+        let normal = tree.entries.iter().filter(|entry| entry.entry_type != "label").collect::<Vec<_>>();
+        assert_eq!(normal.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(normal[0].parent_id, None);
+        assert_eq!(normal[1].parent_id.as_deref(), Some("a"));
+        assert_eq!(normal[2].parent_id.as_deref(), Some("b"));
+
+        let labels = tree.entries.iter().filter(|entry| entry.entry_type == "label").collect::<Vec<_>>();
+        assert_eq!(labels.len(), 2);
+        assert!(labels.iter().all(|entry| !matches!(entry.id.as_str(), "label-a" | "clear-a" | "old-b" | "new-b" | "label-c")));
+        let all_ids = tree.entries.iter().map(|entry| entry.id.as_str()).collect::<HashSet<_>>();
+        assert_eq!(all_ids.len(), tree.entries.len());
+        for pair in tree.entries.windows(2) {
+            assert_eq!(pair[1].parent_id.as_deref(), Some(pair[0].id.as_str()));
+        }
+        assert_eq!(tree.labels.get("a").map(|label| label.label.as_str()), None);
+        assert_eq!(tree.labels.get("b").map(|label| label.label.as_str()), Some("current"));
+        assert_eq!(tree.labels.get("b").map(|label| label.timestamp.as_str()), Some("2026-01-01T00:00:06.000Z"));
+        assert_eq!(tree.labels.get("c").map(|label| label.label.as_str()), Some("leaf"));
+        assert_eq!(tree.labels.get("c").map(|label| label.timestamp.as_str()), Some("2026-01-01T00:00:08.000Z"));
+    }
+
+    #[test]
     fn custom_records_omit_absent_optional_metadata() {
         let directory = std::env::temp_dir().join(format!("pi-session-custom-omit-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).expect("create test directory");
@@ -2709,7 +3195,29 @@ mod tests {
         .expect("fork explicit session");
         assert_eq!(forked.id(), "fork_id");
         forked.close().expect("close fork");
-        assert_eq!(list_sessions_in(cwd.path(), Some(sessions.path())).len(), 2);
+
+        let source_recorder = resume_session(&source).expect("resume source for labels");
+        let leaf = source_recorder
+            .record_message(&Message::user_text("labeled leaf", 2))
+            .expect("record labeled leaf");
+        source_recorder.record_label(&leaf, Some("checkpoint")).expect("label leaf");
+        source_recorder.close().expect("close labeled source");
+        let labeled_fork = fork_session_in(
+            &source,
+            cwd.path(),
+            Some(sessions.path()),
+            Some("fork_labels"),
+        )
+        .expect("fork labeled session");
+        labeled_fork.close().expect("close labeled fork");
+        let fork_tree = load_session_tree(labeled_fork.path()).expect("load labeled fork");
+        assert_eq!(fork_tree.active_leaf_id.as_deref(), Some(leaf.as_str()));
+        assert_eq!(fork_tree.labels.get(&leaf).map(|label| label.label.as_str()), Some("checkpoint"));
+        assert_eq!(fork_tree.tree().len(), 1);
+        for pair in fork_tree.entries.windows(2) {
+            assert_eq!(pair[1].parent_id.as_deref(), Some(pair[0].id.as_str()));
+        }
+        assert_eq!(list_sessions_in(cwd.path(), Some(sessions.path())).len(), 3);
     }
 
     #[test]
@@ -2738,6 +3246,60 @@ mod tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn session_listing_prefers_real_mtime_and_uses_total_fallback_order() {
+        use std::time::{Duration, SystemTime};
+
+        let directory = tempfile::tempdir().expect("session directory");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let older_path = directory.path().join("older-timestamp-newer-mtime.jsonl");
+        let newer_path = directory.path().join("newer-timestamp-older-mtime.jsonl");
+        let older_body = format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "type":"session", "version":CURRENT_SESSION_VERSION, "id":"mtime-wins",
+                "timestamp":"2026-01-01T00:00:01.000Z", "cwd":cwd.path()
+            }))
+            .expect("serialize older timestamp")
+        );
+        let newer_body = format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "type":"session", "version":CURRENT_SESSION_VERSION, "id":"timestamp-loses",
+                "timestamp":"2026-01-01T00:00:02.000Z", "cwd":cwd.path()
+            }))
+            .expect("serialize newer timestamp")
+        );
+        fs::write(&older_path, &older_body).expect("write first session");
+        fs::write(&newer_path, newer_body).expect("write second session");
+        let second_mtime = fs::metadata(&newer_path).expect("second metadata").modified().expect("second mtime");
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(2));
+            fs::write(&older_path, &older_body).expect("touch first session");
+            if fs::metadata(&older_path).expect("first metadata").modified().expect("first mtime") > second_mtime {
+                break;
+            }
+        }
+        assert!(
+            fs::metadata(&older_path).expect("first metadata").modified().expect("first mtime") > second_mtime,
+            "test filesystem did not advance mtime"
+        );
+        let listed = list_sessions_in(cwd.path(), Some(directory.path()));
+        assert_eq!(listed.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), ["mtime-wins", "timestamp-loses"]);
+
+        let first = listed[0].clone();
+        let second = listed[1].clone();
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        assert_eq!(
+            compare_session_listing(&(first.clone(), Some(mtime)), &(second.clone(), None)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_session_listing(&(first, None), &(second, None)),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]
@@ -2786,7 +3348,23 @@ mod tests {
         assert_eq!(recorder.tree().expect("cleared tree").tree()[0].label, None);
         assert_eq!(recorder.active_leaf_id(), active_leaf);
         recorder.close().expect("close recorder");
-        assert_eq!(fs::read_to_string(&path).expect("read file").lines().count(), 4);
+
+        let rows = fs::read_to_string(&path)
+            .expect("read file")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("parse label row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4);
+        let clear = rows.last().expect("clear row");
+        assert_eq!(clear["type"], "label");
+        assert!(clear.get("label").is_none());
+
+        let resumed = resume_session(&path).expect("reopen session");
+        let clone = resumed.clone();
+        assert_eq!(resumed.active_leaf_id(), active_leaf);
+        assert_eq!(clone.active_leaf_id(), active_leaf);
+        assert_eq!(message_texts(&clone.tree().expect("clone tree").build_context(None)), vec!["root"]);
+        clone.close().expect("close clone");
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -2879,7 +3457,7 @@ mod tests {
             path: occupied, id: "summary-session".to_owned(), timestamp: "2026-01-01T00:00:00.000Z".to_owned(), cwd: directory.clone(), parent_session: None,
             last_id: Some("b".to_owned()), active_leaf_id: Some("b".to_owned()), revision: 0, used_ids: HashSet::from(["a".to_owned(), "b".to_owned()]),
             pending: vec![json!({"type":"session", "version":CURRENT_SESSION_VERSION, "id":"summary-session", "timestamp":"2026-01-01T00:00:00.000Z", "cwd":directory})],
-            file: None, flushed: false, has_assistant: true, session_name: None,
+            file: None, flushed: false, has_assistant: true, session_name: None, durable: false,
         })) };
         assert!(recorder.branch_with_summary(Some("a"), "cannot persist").is_err());
         assert_eq!(recorder.active_leaf_id().as_deref(), Some("b"));

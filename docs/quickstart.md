@@ -47,8 +47,9 @@ rpi --mode json -m openai/gpt-5.5 "List all unfinished task markers in src/"
 ```
 
 Positional prompts initialize the interactive session on a terminal. They select
-print mode only when stdin or stdout is not a terminal; use `--print` when a
-script must be non-interactive:
+print mode only when stdin or stdout is not a terminal and `--listen` is absent;
+with `--listen`, a non-terminal run stays on the live line REPL path. Use
+`--print` when a script must be non-interactive:
 
 ```sh
 rpi -m openai/gpt-5.5 "Review this repository"
@@ -64,8 +65,9 @@ rpi -m anthropic/claude-sonnet-4-5
 - Otherwise you get the line REPL (`> ` prompt).
 
 In both modes you can type a message or use slash commands. Type `/help` for the
-12 primary commands. Model and thinking-level switches work as slash commands in
-the line REPL; the TUI uses `/model` plus keybindings such as `Ctrl+L` and `Ctrl+T`.
+14 primary commands, including the TUI-only `/code-review` and `/btw` overlays.
+Model and thinking-level switches work as slash commands in the line REPL; the
+TUI uses `/model` plus keybindings such as `Ctrl+L` and `Ctrl+T`.
 
 ## Switch models and reasoning level
 
@@ -87,10 +89,10 @@ See [`models.md`](models.md) for model-spec syntax and custom providers.
 ## Manage sessions
 
 ```sh
-# List sessions for the current directory
+# List native Pi sessions for the current directory
 rpi sessions
 
-# Resume the newest session for this directory
+# Resume the newest native Pi session for this directory
 rpi --continue
 
 # Resume a native or foreign session by path, exact id, or prefix
@@ -98,8 +100,17 @@ rpi --resume rollout-abc123.jsonl
 rpi --resume abc123
 ```
 
+In the interactive TUI and line REPL, `/resume` and `/sessions` open a
+current-cwd-scoped unified catalog with `[source]` badges for native Pi, OMP,
+Codex, Claude, Grok/Hyper, and Droid sessions. Selecting a foreign session
+imports it once into the effective native session root; later resumes reuse
+the converted file. Foreign source files cannot be renamed or deleted from the
+selector, but native and imported JSONL files can be. `--continue` stays
+native-only and resumes the newest native Pi session for the directory.
+
 Sessions are stored as append-only JSONL files under `<agent-dir>/sessions/`.
-See [`cli-modes.md`](cli-modes.md#session-resume-and-import) for path encoding and import details.
+See [`cli-modes.md`](cli-modes.md#session-resume-and-import) for path encoding,
+import details, and selector management rules.
 
 ## Discover models
 

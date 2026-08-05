@@ -36,6 +36,90 @@ pub type BeforeToolCallFn =
     Arc<dyn Fn(BeforeToolCallContext) -> BoxFuture<Result<BeforeToolCallResult>> + Send + Sync>;
 pub type AfterToolCallFn =
     Arc<dyn Fn(AfterToolCallContext) -> BoxFuture<Result<AfterToolCallResult>> + Send + Sync>;
+
+#[must_use]
+pub fn compose_before_tool_call(
+    first: Option<BeforeToolCallFn>,
+    second: Option<BeforeToolCallFn>,
+) -> Option<BeforeToolCallFn> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(hook), None) | (None, Some(hook)) => Some(hook),
+        (Some(first), Some(second)) => Some(Arc::new(move |context| {
+            let first = first.clone();
+            let second = second.clone();
+            Box::pin(async move {
+                let first_result = first(context.clone()).await?;
+                if first_result.block {
+                    return Ok(first_result);
+                }
+                let mut next_context = context;
+                if let Some(arguments) = first_result.arguments.clone() {
+                    next_context.arguments = arguments;
+                }
+                let second_result = second(next_context).await?;
+                Ok(BeforeToolCallResult {
+                    block: second_result.block,
+                    reason: second_result.reason.or(first_result.reason),
+                    arguments: second_result.arguments.or(first_result.arguments),
+                })
+            })
+        })),
+    }
+}
+
+#[cfg(test)]
+mod before_tool_call_composition_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use pi_ai::{AssistantMessage, Model, ToolCall};
+    use serde_json::json;
+
+    use super::*;
+
+    fn context() -> BeforeToolCallContext {
+        BeforeToolCallContext {
+            assistant_message: AssistantMessage::pending(&Model::default()),
+            tool_call: ToolCall {
+                id: "call".to_owned(),
+                name: "tool".to_owned(),
+                arguments: json!({}),
+                thought_signature: None,
+            },
+            arguments: json!({}),
+            context: AgentContext {
+                system_prompt: String::new(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_first_hook_skips_second() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = calls.clone();
+        let first: BeforeToolCallFn = Arc::new(|_| {
+            Box::pin(async {
+                Ok(BeforeToolCallResult {
+                    block: true,
+                    reason: Some("denied".to_owned()),
+                    arguments: None,
+                })
+            })
+        });
+        let second: BeforeToolCallFn = Arc::new(move |_| {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(BeforeToolCallResult::default()) })
+        });
+        let result = compose_before_tool_call(Some(first), Some(second))
+            .unwrap()(context())
+            .await
+            .unwrap();
+        assert!(result.block);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
 pub type ShouldStopAfterTurnFn = Arc<dyn Fn(&ShouldStopAfterTurnContext) -> bool + Send + Sync>;
 pub type PrepareNextTurnFn =
     Arc<dyn Fn(&ShouldStopAfterTurnContext) -> Option<AgentLoopTurnUpdate> + Send + Sync>;
@@ -50,6 +134,71 @@ pub enum ToolExecutionMode {
     Default,
     Sequential,
     Parallel,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCapability {
+    Read,
+    Write,
+    #[default]
+    Exec,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    #[default]
+    Yolo,
+    Write,
+    Ask,
+}
+
+impl ApprovalMode {
+    #[must_use]
+    pub const fn requires_approval(self, capability: ToolCapability) -> bool {
+        match self {
+            Self::Yolo => false,
+            Self::Write => matches!(capability, ToolCapability::Exec),
+            Self::Ask => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod approval_mode_tests {
+    use super::*;
+
+    #[test]
+    fn policy_matrix_is_capability_only() {
+        for (mode, capability, asks) in [
+            (ApprovalMode::Yolo, ToolCapability::Read, false),
+            (ApprovalMode::Yolo, ToolCapability::Write, false),
+            (ApprovalMode::Yolo, ToolCapability::Exec, false),
+            (ApprovalMode::Write, ToolCapability::Read, false),
+            (ApprovalMode::Write, ToolCapability::Write, false),
+            (ApprovalMode::Write, ToolCapability::Exec, true),
+            (ApprovalMode::Ask, ToolCapability::Read, true),
+            (ApprovalMode::Ask, ToolCapability::Write, true),
+            (ApprovalMode::Ask, ToolCapability::Exec, true),
+        ] {
+            assert_eq!(mode.requires_approval(capability), asks, "{mode:?} {capability:?}");
+        }
+    }
+
+    #[test]
+    fn default_and_wire_values_are_compatibly_yolo_and_lowercase() {
+        assert_eq!(ApprovalMode::default(), ApprovalMode::Yolo);
+        for (mode, wire) in [
+            (ApprovalMode::Yolo, "\"yolo\""),
+            (ApprovalMode::Write, "\"write\""),
+            (ApprovalMode::Ask, "\"ask\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<ApprovalMode>(wire).unwrap(), mode);
+        }
+        assert!(serde_json::from_str::<ApprovalMode>("\"WRITE\"").is_err());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +267,7 @@ pub struct AgentTool {
     pub label: String,
     pub description: String,
     pub parameters: Schema,
+    pub capability: ToolCapability,
     pub execution_mode: ToolExecutionMode,
     pub prepare_arguments: Option<PrepareArgumentsFn>,
     pub prompt_guidelines: Vec<String>,
@@ -133,6 +283,7 @@ impl std::fmt::Debug for AgentTool {
             .field("label", &self.label)
             .field("description", &self.description)
             .field("parameters", &self.parameters)
+            .field("capability", &self.capability)
             .field("execution_mode", &self.execution_mode)
             .field("prompt_guidelines", &self.prompt_guidelines)
             .field("constrained_sampling", &self.constrained_sampling)
@@ -157,6 +308,7 @@ impl AgentTool {
             name,
             description: description.into(),
             parameters,
+            capability: ToolCapability::default(),
             execution_mode: ToolExecutionMode::Default,
             prepare_arguments: None,
             prompt_guidelines: Vec::new(),
@@ -174,6 +326,12 @@ impl AgentTool {
     #[must_use]
     pub fn with_execution_mode(mut self, mode: ToolExecutionMode) -> Self {
         self.execution_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_capability(mut self, capability: ToolCapability) -> Self {
+        self.capability = capability;
         self
     }
 
@@ -200,6 +358,44 @@ impl AgentTool {
             parameters: self.parameters.clone(),
             constrained_sampling: self.constrained_sampling.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_tool_capability_tests {
+    use super::*;
+
+    fn tool_named(name: &str) -> AgentTool {
+        AgentTool::new(name, "test tool", Schema::default(), |_| async {
+            Ok(AgentToolResult::text("ok"))
+        })
+    }
+
+    #[test]
+    fn generic_agent_tools_default_to_exec_without_name_heuristics() {
+        assert_eq!(tool_named("read").capability, ToolCapability::Exec);
+        assert_eq!(tool_named("unknown_custom_tool").capability, ToolCapability::Exec);
+    }
+
+    #[test]
+    fn capability_builder_and_debug_output_expose_metadata() {
+        let tool = tool_named("custom").with_capability(ToolCapability::Read);
+        assert_eq!(tool.capability, ToolCapability::Read);
+        assert!(format!("{tool:?}").contains("capability: Read"));
+    }
+
+    #[test]
+    fn tool_capability_uses_strict_lowercase_wire_values() {
+        for (capability, wire) in [
+            (ToolCapability::Read, "\"read\""),
+            (ToolCapability::Write, "\"write\""),
+            (ToolCapability::Exec, "\"exec\""),
+        ] {
+            assert_eq!(serde_json::to_string(&capability).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<ToolCapability>(wire).unwrap(), capability);
+        }
+        assert!(serde_json::from_str::<ToolCapability>("\"READ\"").is_err());
+        assert!(serde_json::from_str::<ToolCapability>("\"network\"").is_err());
     }
 }
 

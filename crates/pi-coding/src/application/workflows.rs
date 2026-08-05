@@ -14,10 +14,11 @@ use crate::workflow_worktree::{
     WorkflowWorktreeIdentity, WorkflowWorktreeManager,
 };
 use crate::{
-    OrchestrationConcurrencyGate, OrchestrationRuntime, SessionOptions, TodoState,
-    WorkflowIntegration, WorkflowRuntimeFactory, WorkflowRuntimeIdentity, WorkflowRuntimeRequest,
-    WorkflowRuntimeUpdate, WorkflowSnapshot, WorkflowStatus, WorkflowRuntimeProjectionSink,
-    WorkflowSupervisor, WorkflowSupervisorContract, WorkflowSupervisorEvent,
+    ApplicationEvent, OrchestrationConcurrencyGate, OrchestrationEvent, OrchestrationRuntime,
+    SessionOptions, TodoState, WorkflowIntegration, WorkflowRuntimeFactory,
+    WorkflowRuntimeIdentity, WorkflowRuntimeProjectionSink, WorkflowRuntimeRequest,
+    WorkflowRuntimeUpdate, WorkflowSnapshot, WorkflowStatus, WorkflowSupervisor,
+    WorkflowSupervisorContract, WorkflowSupervisorEvent,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -41,11 +42,11 @@ impl WorkflowRuntimeKey {
         }
     }
 }
-
 struct WorkflowChildRuntime {
     backend: Arc<WorkflowApplicationBackend>,
     supervisor: WorkflowSupervisor,
-    event_task: Mutex<Option<JoinHandle<()>>>,
+    projection_task: Mutex<Option<JoinHandle<()>>>,
+    forwarder_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 struct WorkflowRegistryEntry {
@@ -79,7 +80,10 @@ impl fmt::Debug for ApplicationWorkflowRuntimeFactory {
 
 impl WorkflowChildRuntime {
     async fn shutdown(&self) -> Result<()> {
-        if let Some(task) = self.event_task.lock().take() {
+        if let Some(task) = self.projection_task.lock().take() {
+            task.abort();
+        }
+        if let Some(task) = self.forwarder_task.lock().take() {
             task.abort();
         }
         Box::pin(self.backend.cleanup()).await
@@ -164,6 +168,31 @@ impl ApplicationWorkflowRuntimeFactory {
                 message: "workflow supervisor failed".to_owned(),
             }),
             integration,
+        }
+    }
+
+    /// Whether an `ApplicationEvent` is workflow-relevant for the supervisor
+    /// and should be forwarded. Only events the supervisor consumes are
+    /// forwarded: `RunFailed`, workflow-scoped `JobUpdated`, and
+    /// `MessageDelivered`. Foreign/stale `JobUpdated` (different workflow id
+    /// or generation) are filtered here so they never occupy supervisor
+    /// command capacity; the supervisor's own generation/terminal guards
+    /// remain the authoritative backstop.
+    fn supervisor_relevant_event(workflow_id: &str, generation: u64, event: &ApplicationEvent) -> bool {
+        match event {
+            ApplicationEvent::RunFailed { .. } => true,
+            ApplicationEvent::Orchestration(OrchestrationEvent::JobUpdated { job, .. }) => {
+                let foreign_workflow = job
+                    .workflow_id
+                    .as_deref()
+                    .is_some_and(|id| id != workflow_id);
+                let foreign_generation = job
+                    .workflow_generation
+                    .is_some_and(|job_generation| job_generation != generation);
+                !(foreign_workflow || foreign_generation)
+            }
+            ApplicationEvent::Orchestration(OrchestrationEvent::MessageDelivered { .. }) => true,
+            _ => false,
         }
     }
 
@@ -389,36 +418,73 @@ impl ApplicationWorkflowRuntimeFactory {
             )?,
         };
         let mut application_events = application.subscribe();
-        let event_supervisor = supervisor.clone();
+        let forward_supervisor = supervisor.clone();
         let generation = request.generation;
         let workflow_id = request.workflow_id.clone();
         let projection_sink = self.projection_sink()?;
         let mut supervisor_events = supervisor.subscribe();
-        let event_task = tokio::spawn(async move {
+        let projection_workflow_id = workflow_id.clone();
+
+        // Projection forwarding runs in its own task so a blocked supervisor
+        // request (e.g. `prompt_supervisor` awaiting the entire planning turn
+        // via `wait_for_idle`) can never starve `ProjectionChanged` delivery
+        // to the projection sink. The TUI relies on these updates to leave
+        // "queued"/"planning" while planning is in flight.
+        let projection_task = tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    event = application_events.recv() => match event {
-                        Ok(event) => {
-                            let _ = event_supervisor.observe_application_event(generation, event).await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    event = supervisor_events.recv() => match event {
-                        Ok(WorkflowSupervisorEvent::ProjectionChanged { projection }) => {
-                            let update = ApplicationWorkflowRuntimeFactory::projection_update(projection, WorkflowIntegration::None);
-                            let _ = projection_sink.project(&workflow_id, generation, update).await;
-                        }
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
+                match supervisor_events.recv().await {
+                    Ok(WorkflowSupervisorEvent::ProjectionChanged { projection }) => {
+                        let update = ApplicationWorkflowRuntimeFactory::projection_update(
+                            projection,
+                            WorkflowIntegration::None,
+                        );
+                        let _ = projection_sink
+                            .project(&projection_workflow_id, generation, update)
+                            .await;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
+
+        // Application event forwarding is bounded and ordered: a single
+        // forwarder drains the application broadcast serially and awaits
+        // supervisor observation in arrival order (no per-event spawn). Only
+        // events the supervisor consumes (`RunFailed`, workflow-scoped
+        // `JobUpdated`, `MessageDelivered`) are forwarded; foreign/stale
+        // `JobUpdated` are filtered here so they never occupy supervisor
+        // command capacity. When the supervisor actor is busy, this forwarder
+        // blocks on the supervisor command channel and the application
+        // broadcast backpressures by lagging, coalescing unconsumed events.
+        // The projection task above is independent and keeps the projection
+        // sink live during the stall.
+        let forwarder_task = tokio::spawn(async move {
+            loop {
+                match application_events.recv().await {
+                    Ok(event) => {
+                        if !ApplicationWorkflowRuntimeFactory::supervisor_relevant_event(
+                            workflow_id.as_str(),
+                            generation,
+                            &event,
+                        ) {
+                            continue;
+                        }
+                        let _ = forward_supervisor
+                            .observe_application_event(generation, event)
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
         let runtime = Arc::new(WorkflowChildRuntime {
             backend,
             supervisor,
-            event_task: Mutex::new(Some(event_task)),
+            projection_task: Mutex::new(Some(projection_task)),
+            forwarder_task: Mutex::new(Some(forwarder_task)),
         });
         let entry = Arc::new(WorkflowRegistryEntry {
             identity: Mutex::new(identity),
@@ -461,15 +527,17 @@ impl WorkflowRuntimeFactory for ApplicationWorkflowRuntimeFactory {
         match self.build_child(request, identity.clone(), cwd, None).await {
             Ok(entry) => {
                 let runtime = entry.runtime().expect("new child runtime");
-                if let Err(error) = runtime.supervisor.start().await {
-                    self.rollback_create(&key, &identity).await;
-                    return Err(error);
-                }
+                // Start the supervisor asynchronously. The first model call
+                // (planning turn) can take 10+ seconds; awaiting it inline
+                // leaves the TUI stuck on "Creating workflow…". The
+                // supervisor's event loop updates projections (Planning →
+                // Running/Failed) through the projection sink, so the TUI
+                // sees status changes live without blocking creation.
+                let supervisor = runtime.supervisor.clone();
+                tokio::spawn(async move {
+                    let _ = supervisor.start().await;
+                });
                 let projection = runtime.supervisor.projection();
-                if projection.status == WorkflowStatus::Failed {
-                    self.rollback_create(&key, &identity).await;
-                    bail!("workflow supervisor startup failed");
-                }
                 if let Err(error) = self
                     .projection_sink()?
                     .project(
@@ -484,7 +552,10 @@ impl WorkflowRuntimeFactory for ApplicationWorkflowRuntimeFactory {
                 }
                 Ok(Self::runtime_identity(&entry))
             }
-            Err(error) => { self.rollback_create(&key, &identity).await; Err(error) }
+            Err(error) => {
+                self.rollback_create(&key, &identity).await;
+                Err(error)
+            }
         }
     }
 
@@ -657,7 +728,9 @@ impl Application {
         let child = factory
             .child_application(workflow_id, snapshot.generation)
             .ok_or_else(|| anyhow!("workflow runtime is unavailable"))?;
-        child.set_todos(phases)
+        let result = child.set_todos(phases)?;
+        child.execute_todo_dag()?;
+        Ok(result)
     }
 
 

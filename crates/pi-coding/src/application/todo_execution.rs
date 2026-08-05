@@ -49,7 +49,7 @@ pub(super) struct TodoDagCoordinator {
     attempted_task_ids: HashSet<String>,
     handled_terminal_job_ids: HashSet<String>,
     owned_jobs: HashMap<String, OwnedTodoJob>,
-    reconcile_gate: Arc<Mutex<()>>,
+    pub(super) reconcile_gate: Arc<Mutex<()>>,
 }
 
 impl Application {
@@ -77,12 +77,13 @@ impl Application {
 
     #[must_use]
     pub fn todo_dag_status(&self) -> TodoDagExecutionStatus {
-        self.inner.todo_dag.lock().status
+        self.runtime().todo_dag.lock().status
     }
 
     pub async fn wait_todo_dag(&self) -> TodoDagExecutionStatus {
+        let active = self.runtime();
         loop {
-            let changed = self.inner.todo_dag_changed.notified();
+            let changed = active.todo_dag_changed.notified();
             let status = self.todo_dag_status();
             if status.is_terminal() {
                 return status;
@@ -104,7 +105,7 @@ impl ApplicationInner {
     }
 
     pub(super) fn todo_dag_transaction_gate(&self) -> Arc<Mutex<()>> {
-        self.todo_dag.lock().reconcile_gate.clone()
+        self.runtime().todo_dag.lock().reconcile_gate.clone()
     }
 
     pub(super) fn arm_todo_dag_locked(
@@ -112,12 +113,13 @@ impl ApplicationInner {
         runtime: &OrchestrationRuntime,
         reset_attempts: bool,
     ) -> Result<TodoDagExecutionOutcome> {
-        if self.todo_transition_active.load(std::sync::atomic::Ordering::Acquire) {
+        let active = self.runtime();
+        if active.todo_transition_active.load(std::sync::atomic::Ordering::Acquire) {
             return Err(anyhow!("Todo execution rejected during session transition"));
         }
         let jobs = runtime.jobs(None);
         {
-            let mut coordinator = self.todo_dag.lock();
+            let mut coordinator = active.todo_dag.lock();
             coordinator.status = TodoDagExecutionStatus::Active;
             if reset_attempts {
                 let active_job_ids = jobs
@@ -136,7 +138,7 @@ impl ApplicationInner {
                 coordinator.attempted_task_ids.extend(active_task_ids);
             }
         }
-        self.todo_dag_changed.notify_waiters();
+        active.todo_dag_changed.notify_waiters();
         self.reconcile_todo_dag_locked(runtime, true)
     }
     pub(super) fn begin_todo_dag_transition(
@@ -152,12 +154,13 @@ impl ApplicationInner {
         &self,
         runtime: &OrchestrationRuntime,
     ) -> Vec<String> {
+        let active_runtime = self.runtime();
         let active_status = runtime
             .jobs(None)
             .into_iter()
             .map(|job| (job.id, job.status))
             .collect::<HashMap<_, _>>();
-        let mut coordinator = self.todo_dag.lock();
+        let mut coordinator = active_runtime.todo_dag.lock();
         let generation = coordinator.generation;
         let mut active = coordinator
             .owned_jobs
@@ -177,7 +180,7 @@ impl ApplicationInner {
         coordinator.handled_terminal_job_ids.clear();
         coordinator.owned_jobs.clear();
         drop(coordinator);
-        self.todo_dag_changed.notify_waiters();
+        active_runtime.todo_dag_changed.notify_waiters();
         active
     }
 
@@ -188,24 +191,25 @@ impl ApplicationInner {
         event: &OrchestrationEvent,
         allow_spawn: bool,
     ) -> Result<TodoDagExecutionStatus> {
-        let gate = self.todo_dag.lock().reconcile_gate.clone();
+        let gate = self.runtime().todo_dag.lock().reconcile_gate.clone();
         let _reconcile = gate.lock();
         let OrchestrationEvent::JobUpdated { job, .. } = event else {
-            return Ok(self.todo_dag.lock().status);
+            return Ok(self.runtime().todo_dag.lock().status);
         };
         if !job.status.is_settled() {
-            return Ok(self.todo_dag.lock().status);
+            return Ok(self.runtime().todo_dag.lock().status);
         }
         self.record_terminal_todo_job(job)?;
-        if self.todo_dag.lock().status == TodoDagExecutionStatus::Dormant {
+        if self.runtime().todo_dag.lock().status == TodoDagExecutionStatus::Dormant {
             return Ok(TodoDagExecutionStatus::Dormant);
         }
         Ok(self.reconcile_todo_dag_locked(runtime, allow_spawn)?.status)
     }
 
     fn record_terminal_todo_job(&self, job: &JobSnapshot) -> Result<()> {
+        let active = self.runtime();
         let ownership = {
-            let mut coordinator = self.todo_dag.lock();
+            let mut coordinator = active.todo_dag.lock();
             if coordinator.handled_terminal_job_ids.contains(&job.id) {
                 return Ok(());
             }
@@ -225,7 +229,7 @@ impl ApplicationInner {
             owned
         };
         if job.status == JobStatus::Completed {
-            let state = self.session.todo_state();
+            let state = active.session.todo_state();
             let status = state
                 .phases
                 .iter()
@@ -233,7 +237,7 @@ impl ApplicationInner {
                 .find(|task| task.id == ownership.task_id)
                 .map(|task| task.status);
             if matches!(status, Some(TodoStatus::Pending | TodoStatus::InProgress)) {
-                let result = self.session.apply_todo_raw(TodoOp::Done {
+                let result = active.session.apply_todo_raw(TodoOp::Done {
                     task: Some(ownership.task_id),
                     phase: None,
                 })?;
@@ -243,7 +247,7 @@ impl ApplicationInner {
                 });
             }
         }
-        self.todo_dag_changed.notify_waiters();
+        active.todo_dag_changed.notify_waiters();
         Ok(())
     }
 
@@ -252,7 +256,7 @@ impl ApplicationInner {
         runtime: &OrchestrationRuntime,
         allow_spawn: bool,
     ) -> Result<TodoDagExecutionOutcome> {
-        let gate = self.todo_dag.lock().reconcile_gate.clone();
+        let gate = self.runtime().todo_dag.lock().reconcile_gate.clone();
         let _reconcile = gate.lock();
         self.reconcile_todo_dag_locked(runtime, allow_spawn)
     }
@@ -262,7 +266,8 @@ impl ApplicationInner {
         runtime: &OrchestrationRuntime,
         allow_spawn: bool,
     ) -> Result<TodoDagExecutionOutcome> {
-        if self.todo_transition_active.load(std::sync::atomic::Ordering::Acquire) {
+        let active = self.runtime();
+        if active.todo_transition_active.load(std::sync::atomic::Ordering::Acquire) {
             return Err(anyhow!("Todo execution rejected during session transition"));
         }
         let jobs = runtime.jobs(None);
@@ -270,7 +275,7 @@ impl ApplicationInner {
             self.record_terminal_todo_job(job)?;
         }
 
-        let mut coordinator = self.todo_dag.lock();
+        let mut coordinator = active.todo_dag.lock();
         if coordinator.status == TodoDagExecutionStatus::Dormant {
             return Ok(TodoDagExecutionOutcome {
                 status: TodoDagExecutionStatus::Dormant,
@@ -285,7 +290,7 @@ impl ApplicationInner {
             }
         }
 
-        let state = self.session.todo_state();
+        let state = active.session.todo_state();
         let open_count = state
             .phases
             .iter()
@@ -295,7 +300,7 @@ impl ApplicationInner {
         if open_count == 0 {
             coordinator.status = TodoDagExecutionStatus::Settled;
             drop(coordinator);
-            self.todo_dag_changed.notify_waiters();
+            active.todo_dag_changed.notify_waiters();
             return Ok(TodoDagExecutionOutcome {
                 status: TodoDagExecutionStatus::Settled,
                 spawns: Vec::new(),
@@ -339,7 +344,7 @@ impl ApplicationInner {
             {
                 task.status = TodoStatus::InProgress;
             }
-            let started = self.session.set_todos_raw(started_phases)?;
+            let started = active.session.set_todos_raw(started_phases)?;
             let items = selected
                 .iter()
                 .enumerate()
@@ -354,7 +359,7 @@ impl ApplicationInner {
             let spawns = match runtime.spawn_tasks(runtime.main_agent_id(), 0, items) {
                 Ok(spawns) => spawns,
                 Err(error) => {
-                    return match self.session.set_todos_raw(previous_phases) {
+                    return match active.session.set_todos_raw(previous_phases) {
                         Ok(_) => Err(error),
                         Err(rollback_error) => Err(anyhow!(
                             "{error}; additionally failed to restore Todo state: {rollback_error}"
@@ -380,7 +385,7 @@ impl ApplicationInner {
                 phases: started.phases,
                 completed_tasks: started.completed_tasks,
             });
-            self.todo_dag_changed.notify_waiters();
+            active.todo_dag_changed.notify_waiters();
             return Ok(TodoDagExecutionOutcome {
                 status: TodoDagExecutionStatus::Active,
                 spawns,
@@ -403,7 +408,7 @@ impl ApplicationInner {
         };
         let status = coordinator.status;
         drop(coordinator);
-        self.todo_dag_changed.notify_waiters();
+        active.todo_dag_changed.notify_waiters();
         Ok(TodoDagExecutionOutcome {
             status,
             spawns: Vec::new(),

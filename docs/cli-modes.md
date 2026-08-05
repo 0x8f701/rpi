@@ -12,9 +12,9 @@ When no subcommand is given, a top-level run is selected by the flags and termin
 
 1. `--mode json` or `--mode rpc` → headless structured I/O.
 2. `-p` / `--print` → print mode.
-3. A non-empty positional prompt with non-terminal stdin or stdout → print mode.
+3. A non-empty positional prompt with non-terminal stdin or stdout → print mode, unless `--listen` is active.
 4. Both stdin and stdout are terminals → TUI, with positional prompts submitted as initial turns.
-5. Otherwise → line REPL, with positional prompts submitted as initial turns.
+5. Otherwise → line REPL, with positional prompts submitted as initial turns. `--listen` keeps non-terminal prompt runs on this live REPL path so the listener shares the running `Application` until EOF.
 
 Multiple positional `[PROMPT]` arguments are separate initial turns in JSON,
 print, TUI, and REPL modes. An empty prompt is skipped by structured modes and
@@ -29,8 +29,8 @@ does not force print mode.
 | `--models <PATTERNS>` | | comma-separated patterns | Scope interactive model cycling. |
 | `--print` | `-p` | | Force print mode. |
 | `--mode <text\|json\|rpc>` | | protocol | Output protocol. `json` streams one-shot events; `rpc` reads LF-delimited JSON commands on stdin; `text` uses normal terminal selection. |
-| `--continue` | `-c` | | Resume the most recent session for this directory. |
-| `--resume <PATH_OR_ID>` | | path or id | Resume a native Pi session or import and resume a discovered OMP, Codex, Claude, Grok, or Droid session. Exact ids and unambiguous prefixes are accepted. |
+| `--continue` | `-c` | | Resume the newest native Pi session for this directory. Native-only; foreign sessions are never selected. |
+| `--resume <PATH_OR_ID>` | `-r` | path or id | Resume a native Pi session or import and resume a discovered OMP, Codex, Claude, Grok, or Droid session. Exact ids and unambiguous prefixes are accepted. |
 | `--session <PATH_OR_ID>` | | path or id | Open a session by file path, exact id, or unambiguous prefix. |
 | `--session-id <ID>` | | exact id | Open an exact project session id, creating it when absent. |
 | `--fork <PATH_OR_ID>` | | path or id | Fork a session by file path, exact id, or unambiguous prefix. |
@@ -61,6 +61,9 @@ does not force print mode.
 | `--verbose` | | | Force verbose startup diagnostics. |
 | `--approve` | `-a` | | Trust project-local `.pi` settings/resources for this run only. |
 | `--no-approve` | | | Refuse project-local `.pi` settings/resources for this run only. |
+| `--approval-mode <MODE>` | | `yolo\|write\|ask` | Host tool approval policy. `yolo` allows all capabilities, `write` confirms Exec, and `ask` confirms every tool call. Non-interactive confirmation fails closed. This is separate from project trust flags. |
+| `--listen <SOCKET_ADDR>` | | e.g. `127.0.0.1:8765` | Bind an opt-in HTTP/WebSocket control plane around the live TUI/REPL application. Only valid on the text path. |
+| `--listen-token-file <PATH>` | | token file | Require exact Bearer authentication. Required for non-loopback listeners. Tokenless loopback accepts native clients without `Origin` and rejects browser-origin requests. |
 | `--version` | `-v`, `-V` | | Print version and exit. |
 | `--help` | `-h` | | Print help and exit. |
 
@@ -174,7 +177,7 @@ A trailing newline is appended after the final assistant text.
 
 ## Primary slash commands
 
-`/help`, slash completion, and RPC command discovery expose exactly these 12
+`/help`, slash completion, and RPC command discovery expose exactly these 14
 primary commands. Other built-ins remain manually executable where documented.
 
 | Command | Description |
@@ -191,10 +194,24 @@ primary commands. Other built-ins remain manually executable where documented.
 | `/loop [interval] <prompt>` | Run a prompt on a recurring interval |
 | `/goal` | Create and manage the durable session goal |
 | `/workflow` | Create and manage isolated concurrent workflows |
+| `/code-review [<from> <to>]` | Browse a Git diff in a fullscreen tree/diff page: bare shows tracked HEAD→working-tree staged and unstaged changes; two refs compare any two commits/branches/tags |
+| `/btw [prompt]` | Open a persistent detached side conversation forked from the active main branch |
 
 Frequently used hidden built-ins include `/help`, `/new`, `/sessions`, `/tree`,
 `/todo`, `/login`, `/logout`, `/share`, `/copy`, `/process`, `/theme`, and
 `/quit`. They remain executable but do not appear in primary discovery.
+
+`/btw` starts read-only. `Ctrl+T` toggles fresh workspace-scoped edit/exec tools when idle, `Esc` aborts a streaming side turn or closes an idle overlay, `Alt+R` reforks from the current main branch, and `Alt+N` clears the side transcript. Closing the overlay keeps its controller for reopening; leaving the TUI aborts and joins active side work. `peek_main` reads the current active main branch without writing to the main session.
+
+`/code-review` uses direct bounded Git argv with pager, external diff, text conversion, configured filters, and interactive prompts disabled. It never sends repository content to a server. The page supports keyboard and mouse tree/hunk navigation, inline per-hunk comment threads after each complete hunk, fold/unfold controls, and one consolidated answer card per review exchange. `Esc` or `q` closes it and restores normal terminal mouse selection.
+
+`/code-review` accepts zero or exactly two arguments. Bare `/code-review` shows
+tracked HEAD→working-tree staged and unstaged changes. `/code-review <from> <to>`
+resolves each ref — a commit hash, branch, or tag — to a commit and renders a
+commit-to-commit diff labeled `<from> → <to>` in the panel title; working-tree
+changes are ignored on this path. One argument or more than two is invalid: the
+panel does not open and the status line shows `Usage: /code-review [<from> <to>]`.
+Pressing `r` refreshes the snapshot while preserving the selected revision pair.
 
 Loop intervals accept positive bare seconds (`/loop 300 check status`) or compact
 `s`, `m`, `h`, and `d` units (`/loop 3s echo hello`, `/loop 30m check deploy`).
@@ -260,7 +277,11 @@ Session files live under:
 
 `<workspace>` is the encoded cwd: the absolute path with leading separators removed and `/`, `\`, and `:` replaced by `-`.
 
-`--resume` and `/resume` share one catalog spanning native Pi plus OMP, Codex, Claude, Grok, and Droid homes. Native selections open the existing file without copying. Foreign selections are converted to Pi v3 once, retain source lineage, and reuse that native conversion on later resumes. Only convertible user/assistant text messages are preserved; tool calls, reasoning, attachments, and branches are dropped.
+The full-screen TUI selectors opened by `/resume` and `/sessions`, the line REPL bare `/resume` command, and the TUI startup Recent sessions list all draw from the same supported unified catalog. Automatic lists are scoped to the current working directory and display a `[source]` badge next to each row. Supported sources are native Pi (`pi`), OMP (`omp`), Codex (`codex`), Claude (`claude`), Grok/Hyper (`grok/hyper`), and Droid (`droid`).
+
+`--resume` and `/resume` share this catalog. Native selections open the existing file without copying. Foreign selections are converted to Pi v3 once into the effective native session root, retain source lineage, and reuse that converted file on later resumes. In selectors, foreign source files are read-only: they cannot be renamed or deleted. Native Pi sessions and already-imported conversions are regular JSONL files under the session root and can be renamed or deleted from the selector. Only convertible user/assistant text messages are preserved during import; tool calls, reasoning, attachments, and branches are dropped.
+
+`--continue` remains native-only and resumes the newest native Pi session for the directory.
 
 ## Model spec syntax
 

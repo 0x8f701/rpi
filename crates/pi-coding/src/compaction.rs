@@ -320,6 +320,9 @@ pub fn apply_checkpoint(summary: &str, messages: &[Message], prefix_len: usize) 
     let checkpoint = Message::CompactionSummary(pi_ai::CompactionSummaryMessage {
         summary: summary.to_owned(),
         tokens_before: 0,
+        details: None,
+        usage: None,
+        from_hook: None,
         timestamp,
     });
     let mut out = Vec::with_capacity(1 + messages.len().saturating_sub(prefix_len));

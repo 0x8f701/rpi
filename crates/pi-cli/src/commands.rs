@@ -70,8 +70,33 @@ pub async fn refresh_model_catalogs() -> Result<()> {
 }
 
 /// List saved sessions for `cwd` (newest first), matching the Go CLI format.
-pub fn list_sessions(cwd: &Path) -> Result<()> {
-    let infos = pi_coding::list_sessions(cwd);
+pub fn list_sessions(cli: &crate::Cli) -> Result<()> {
+    let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("resolving working directory {}", cwd.display()))?;
+    let mut options = pi_coding::ResourceManagerOptions::new(&cwd);
+    options.headless = true;
+    options.project_trust_override = if cli.approve {
+        Some(true)
+    } else if cli.no_approve {
+        Some(false)
+    } else {
+        None
+    };
+    let resources = pi_coding::ResourceManager::new(options).context("loading settings and resources")?;
+    let settings = resources.snapshot().settings.clone();
+    let session_dir = crate::session_run::effective_session_dir(
+        &cwd,
+        cli.session_dir.as_deref(),
+        settings.session_dir.as_deref(),
+    )?;
+    list_sessions_in(&cwd, &session_dir)
+}
+
+/// List saved sessions from an already-resolved session directory.
+pub fn list_sessions_in(cwd: &Path, session_dir: &Path) -> Result<()> {
+    let infos = pi_coding::list_sessions_in(cwd, Some(session_dir));
     if infos.is_empty() {
         println!("No sessions for this directory.");
         return Ok(());
@@ -93,15 +118,45 @@ pub fn list_sessions(cwd: &Path) -> Result<()> {
 /// Converts an external session to native Pi v3 JSONL and prints the emitted
 /// path plus the number of converted messages. Fails loudly on an unknown
 /// source format or when no convertible messages are present.
-pub fn import_session_command(source: &str, input: &Path, output: Option<&Path>) -> Result<()> {
+pub fn import_session_command(
+    cli: &crate::Cli,
+    source: &str,
+    input: &Path,
+    output: Option<&Path>,
+) -> Result<()> {
     let format = source
         .parse::<pi_coding::SourceSessionFormat>()
         .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("unsupported source format \"{source}\""))?;
+        .with_context(|| format!("unsupported source format {source:?}"))?;
 
     let imported = match output {
         Some(out) => pi_coding::import_session_to(format, input, out),
-        None => pi_coding::import_session(format, input),
+        None => {
+            let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+            let cwd = cwd
+                .canonicalize()
+                .with_context(|| format!("resolving working directory {}", cwd.display()))?;
+            let mut options = pi_coding::ResourceManagerOptions::new(&cwd);
+            options.headless = true;
+            options.project_trust_override = if cli.approve {
+                Some(true)
+            } else if cli.no_approve {
+                Some(false)
+            } else {
+                None
+            };
+            let resources = pi_coding::ResourceManager::new(options)
+                .context("loading settings and resources")?;
+            let settings = resources.snapshot().settings.clone();
+            let session_dir = crate::session_run::effective_session_dir(
+                &cwd,
+                cli.session_dir.as_deref(),
+                settings.session_dir.as_deref(),
+            )?;
+            std::fs::create_dir_all(&session_dir)
+                .with_context(|| format!("creating session directory {}", session_dir.display()))?;
+            pi_coding::import_session_to(format, input, session_dir)
+        }
     }
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -114,16 +169,23 @@ pub fn import_session_command(source: &str, input: &Path, output: Option<&Path>)
     Ok(())
 }
 
-/// Resolve a unified resume input to a native path using the environment-backed catalog.
+/// Resolve an automatic startup-resume input under the effective source policy
+/// while retaining the selected native session root and environment-backed
+/// foreign roots.
 pub fn resolve_resume_for_startup(
     input: &str,
     preferred_cwd: Option<&Path>,
+    session_dir: &Path,
+    sources: &[pi_coding::SessionSourceKind],
 ) -> Result<crate::resume_catalog::ResumeSelectionResult> {
-    let catalog = pi_coding::SessionCatalog::from_env().map_err(anyhow::Error::new)?;
+    let catalog = pi_coding::SessionCatalog::from_env()
+        .map_err(anyhow::Error::new)?
+        .with_native_session_root(session_dir);
     crate::resume_catalog::resolve_resume_selection(
         &catalog,
         &crate::resume_catalog::ResumeSelectionRequest::Input(input.to_owned()),
         preferred_cwd,
+        sources,
     )
     .map_err(anyhow::Error::new)
 }

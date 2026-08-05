@@ -53,14 +53,14 @@ installer fails without changing the existing installation.
 Pin both the installer script and the requested release tag:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.2/install.sh | bash -s -- --version v0.2.2
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.3/install.sh | bash -s -- --version v0.2.3
 ```
 
 On Windows, download the script from the same tag before invoking it:
 
 ```powershell
-irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.2/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.2
+irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.3/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.3
 ```
 
 ## What the installer does

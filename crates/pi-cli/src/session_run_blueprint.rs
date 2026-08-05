@@ -23,8 +23,10 @@ pub(super) struct RunSessionBlueprint {
     tool_policy: MainToolPolicy,
     extension_mode: ExtensionMode,
     extension_ui: Option<ExtensionUiAdapter>,
+    approval_mode_override: Option<pi_agent::ApprovalMode>,
     extension_permissions: ExtensionPermissionSet,
     explicit_api_key: Option<String>,
+    session_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -63,13 +65,24 @@ impl RunSessionBlueprint {
             },
             extension_mode: crate::session_run::extension_mode(cli),
             extension_ui,
+            approval_mode_override: cli.approval_mode.map(Into::into),
             extension_permissions: ExtensionPermissionSet::allow_all(),
             explicit_api_key: cli.api_key.clone(),
+            session_dir: None,
         }
     }
 
     pub(super) fn extension_ui(&self) -> Option<ExtensionUiAdapter> {
         self.extension_ui.clone()
+    }
+
+    fn approval_mode(&self, settings: &pi_coding::Settings) -> pi_agent::ApprovalMode {
+        self.approval_mode_override
+            .unwrap_or_else(|| settings.approval_mode())
+    }
+
+    pub(super) fn set_session_dir(&mut self, session_dir: PathBuf) {
+        self.session_dir = Some(session_dir);
     }
 
     pub(super) async fn build(
@@ -225,6 +238,13 @@ impl RunSessionBlueprint {
         options.system_prompt = resources.snapshot().system_prompt.clone().unwrap_or_default();
         options.auth_resolver = Some(models_config::session_auth_resolver(self.explicit_api_key.clone()));
         settings.apply_session_options(&mut options)?;
+        let approval_mode = self.approval_mode(&settings);
+        options.before_tool_call = Some(crate::approval::host_approval_before_tool_call(
+            approval_mode,
+            self.extension_mode,
+            self.extension_ui.clone(),
+            options.before_tool_call.take(),
+        ));
         let mut gates = self.tool_gates(&settings);
         if force_workflow_runtime {
             gates.orchestration = true;
@@ -307,6 +327,9 @@ impl RunSessionBlueprint {
                 return Err(error).context("building session");
             }
         };
+        if let Some(session_dir) = &self.session_dir {
+            session.set_session_dir(session_dir.clone());
+        }
         session.set_steering_mode(settings.steering_mode()).await;
         session.set_follow_up_mode(settings.follow_up_mode()).await;
         session.set_retry_settings(settings.retry_settings());
@@ -426,6 +449,12 @@ impl RunSessionBlueprint {
     ) -> (bool, bool, bool, bool, bool) {
         let gates = self.tool_gates(settings);
         (gates.orchestration, gates.process, gates.glob, gates.todo, gates.goal)
+    }
+    pub(super) fn test_approval_mode(
+        &self,
+        settings: &pi_coding::Settings,
+    ) -> pi_agent::ApprovalMode {
+        self.approval_mode(settings)
     }
 }
 
@@ -556,6 +585,34 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_default())
+    }
+
+    #[test]
+    fn approval_mode_precedence_is_cli_then_global_setting_then_yolo() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let base = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("cli");
+            RunSessionBlueprint::from_cli(&cli, ResourceManagerOptions::new(&cwd), None)
+        };
+
+        let mut settings = pi_coding::Settings::default();
+        let default_blueprint = base(&["rpi"]);
+        assert_eq!(
+            default_blueprint.test_approval_mode(&settings),
+            pi_agent::ApprovalMode::Yolo
+        );
+
+        settings.approval_mode = Some(pi_agent::ApprovalMode::Ask);
+        assert_eq!(
+            default_blueprint.test_approval_mode(&settings),
+            pi_agent::ApprovalMode::Ask
+        );
+
+        let cli_blueprint = base(&["rpi", "--approval-mode", "write"]);
+        assert_eq!(
+            cli_blueprint.test_approval_mode(&settings),
+            pi_agent::ApprovalMode::Write
+        );
     }
 
     #[tokio::test]

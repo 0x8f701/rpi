@@ -43,16 +43,28 @@ pub fn layout_table(table: &TableBlock, available_width: usize) -> Option<TableL
     let widths = allocate_widths(table, available_width)?;
     let mut lines = Vec::new();
     let mut inline_styles = Vec::new();
-    lines.push(border('┌', '┬', '┐', &widths));
-    inline_styles.push(Vec::new());
+    let top = border('┌', '┬', '┐', &widths);
+    inline_styles.push(vec![InlineStyleRange {
+        range: 0..top.len(),
+        style: super::inline::InlineStyle::TableBorder,
+    }]);
+    lines.push(top);
     append_row(&mut lines, &mut inline_styles, &table.headers, &widths, &table.alignments);
-    lines.push(border('├', '┼', '┤', &widths));
-    inline_styles.push(Vec::new());
+    let middle = border('├', '┼', '┤', &widths);
+    inline_styles.push(vec![InlineStyleRange {
+        range: 0..middle.len(),
+        style: super::inline::InlineStyle::TableBorder,
+    }]);
+    lines.push(middle);
     for row in &table.rows {
         append_row(&mut lines, &mut inline_styles, row, &widths, &table.alignments);
     }
-    lines.push(border('└', '┴', '┘', &widths));
-    inline_styles.push(Vec::new());
+    let bottom = border('└', '┴', '┘', &widths);
+    inline_styles.push(vec![InlineStyleRange {
+        range: 0..bottom.len(),
+        style: super::inline::InlineStyle::TableBorder,
+    }]);
+    lines.push(bottom);
     let width = display_width(lines.first()?);
     Some(TableLayout {
         lines,
@@ -114,49 +126,75 @@ fn allocate_widths(table: &TableBlock, available_width: usize) -> Option<Vec<usi
     let columns = table.headers.len();
     let borders_and_padding = columns * 3 + 1;
     let content_budget = available_width.checked_sub(borders_and_padding)?;
-    let minimum_width = 1;
     if content_budget < columns {
         return None;
     }
 
-    let mut preferred = vec![1; columns];
+    // Raw maximum cell width lets a single prose-heavy column consume nearly
+    // the whole table. Square-root weighting keeps genuinely larger columns
+    // larger while leaving their neighbors enough width to wrap readably.
+    let mut preferred = vec![1usize; columns];
+    let mut demand = vec![1usize; columns];
     for (column, header) in table.headers.iter().enumerate() {
-        preferred[column] = preferred[column].max(display_width(&parse_inline(header).text));
+        let width = display_width(&parse_inline(header).text);
+        preferred[column] = preferred[column].max(width);
+        demand[column] = demand[column].saturating_add(width);
     }
     for row in &table.rows {
         for (column, cell) in row.iter().enumerate().take(columns) {
-            preferred[column] = preferred[column].max(display_width(&parse_inline(cell).text));
+            let width = display_width(&parse_inline(cell).text);
+            preferred[column] = preferred[column].max(width);
+            demand[column] = demand[column].saturating_add(width);
         }
     }
-    let mut widths = vec![minimum_width; columns];
-    let mut remaining = content_budget - columns * minimum_width;
+    if preferred.iter().sum::<usize>() <= content_budget {
+        let mut widths = preferred;
+        let remaining = content_budget - widths.iter().sum::<usize>();
+        distribute_evenly(&mut widths, remaining);
+        return Some(widths);
+    }
+    let weights = demand.into_iter().map(integer_sqrt).collect::<Vec<_>>();
+    let mut widths = vec![1usize; columns];
+    let mut remaining = content_budget - columns;
     while remaining > 0 {
-        let mut candidate = None;
-        for (column, (&width, &want)) in widths.iter().zip(&preferred).enumerate() {
-            if width >= want {
-                continue;
-            }
-            let score = (width, want.saturating_sub(width), usize::MAX - column);
-            if candidate.is_none_or(|(_, current)| score < current) {
-                candidate = Some((column, score));
+        let mut candidate = 0;
+        for column in 1..columns {
+            let candidate_score = widths[candidate].saturating_mul(weights[column]);
+            let column_score = widths[column].saturating_mul(weights[candidate]);
+            if column_score < candidate_score {
+                candidate = column;
             }
         }
-        let Some((column, _)) = candidate else {
-            break;
-        };
-        widths[column] += 1;
+        widths[candidate] += 1;
         remaining -= 1;
     }
+    Some(widths)
+}
+
+fn distribute_evenly(widths: &mut [usize], mut remaining: usize) {
     while remaining > 0 {
-        for width in &mut widths {
+        for width in &mut *widths {
             if remaining == 0 {
-                break;
+                return;
             }
             *width += 1;
             remaining -= 1;
         }
     }
-    Some(widths)
+}
+
+fn integer_sqrt(value: usize) -> usize {
+    let mut low = 1usize;
+    let mut high = value.max(1);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if middle <= value / middle {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    low
 }
 
 fn append_row(
@@ -179,7 +217,10 @@ fn append_row(
     let height = parsed.iter().map(Vec::len).max().unwrap_or(1);
     for line in 0..height {
         let mut rendered = String::from("│");
-        let mut styles = Vec::new();
+        let mut styles = vec![InlineStyleRange {
+            range: 0.."│".len(),
+            style: super::inline::InlineStyle::TableBorder,
+        }];
         for (column, width) in widths.iter().enumerate() {
             let text = parsed[column].get(line).cloned().unwrap_or_default();
             let aligned = align_styled(text, *width, alignments.get(column).copied().unwrap_or_default());
@@ -187,7 +228,12 @@ fn append_row(
             styles.extend(shifted_styles(&aligned.styles, rendered.len()));
             rendered.push_str(&aligned.text);
             rendered.push(' ');
+            let border_start = rendered.len();
             rendered.push('│');
+            styles.push(InlineStyleRange {
+                range: border_start..rendered.len(),
+                style: super::inline::InlineStyle::TableBorder,
+            });
         }
         output.push(rendered);
         output_styles.push(styles);
@@ -405,6 +451,77 @@ mod tests {
             let _ = parse_table_at(&rows, 0, AnalysisMode::Complete);
             let _ = parse_table_at(&rows, 0, AnalysisMode::Streaming);
         }
+    }
+
+    #[test]
+    fn prose_tables_allocate_balanced_readable_columns() {
+        let document_role = TableBlock {
+            headers: vec!["Document".to_owned(), "Role".to_owned()],
+            alignments: vec![TableAlignment::Left; 2],
+            rows: vec![
+                vec![
+                    "Architecture decision record".to_owned(),
+                    "Explains why the terminal renderer keeps committed conversation separate from transient composer frames".to_owned(),
+                ],
+                vec![
+                    "Contributor guide".to_owned(),
+                    "Shows maintainers how to extend rendering without losing inline semantic styles".to_owned(),
+                ],
+            ],
+            source_lines: Vec::new(),
+            line: 1,
+        };
+        let layout = layout_table(&document_role, 72).expect("two-column layout");
+        assert_eq!(layout.width, 72);
+        assert!(layout.column_widths[0] >= 20, "{:?}", layout.column_widths);
+        assert!(layout.column_widths[1] >= 30, "{:?}", layout.column_widths);
+        assert!(layout.lines.iter().all(|line| display_width(line) <= 72));
+
+        let comparison = TableBlock {
+            headers: vec!["Approach".to_owned(), "Strengths".to_owned(), "Trade-offs".to_owned()],
+            alignments: vec![TableAlignment::Left; 3],
+            rows: vec![
+                vec![
+                    "Shared neutral renderer".to_owned(),
+                    "One wrapping implementation preserves output across print and live terminal views".to_owned(),
+                    "Adapters must consume explicit byte ranges for semantic border styling".to_owned(),
+                ],
+                vec![
+                    "TUI-only reparsing".to_owned(),
+                    "Can be prototyped locally".to_owned(),
+                    "Duplicates parsing and risks recoloring content that merely resembles a separator".to_owned(),
+                ],
+            ],
+            source_lines: Vec::new(),
+            line: 1,
+        };
+        let layout = layout_table(&comparison, 88).expect("three-column layout");
+        assert_eq!(layout.width, 88);
+        assert!(layout.column_widths.iter().all(|width| *width >= 17), "{:?}", layout.column_widths);
+        assert!(layout.lines.iter().all(|line| display_width(line) <= 88));
+    }
+
+    #[test]
+    fn every_table_border_glyph_has_an_explicit_border_range() {
+        let table = TableBlock {
+            headers: vec!["**Document**".to_owned(), "Role".to_owned()],
+            alignments: vec![TableAlignment::Left; 2],
+            rows: vec![vec!["Guide".to_owned(), "Use `semantic ranges`".to_owned()]],
+            source_lines: Vec::new(),
+            line: 1,
+        };
+        let layout = layout_table(&table, 40).expect("layout");
+        for (line, ranges) in layout.lines.iter().zip(&layout.inline_styles) {
+            for (offset, character) in line.char_indices().filter(|(_, character)| "┌┬┐├┼┤│└┴┘─".contains(*character)) {
+                assert!(ranges.iter().any(|styled| {
+                    styled.style == super::super::inline::InlineStyle::TableBorder
+                        && styled.range.start <= offset
+                        && styled.range.end >= offset + character.len_utf8()
+                }), "missing border style for {character:?} in {line:?}: {ranges:?}");
+            }
+        }
+        assert!(layout.inline_styles.iter().flatten().any(|styled| styled.style == super::super::inline::InlineStyle::Bold));
+        assert!(layout.inline_styles.iter().flatten().any(|styled| styled.style == super::super::inline::InlineStyle::Code));
     }
 
     #[test]

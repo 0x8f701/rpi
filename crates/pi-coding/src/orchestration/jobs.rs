@@ -93,6 +93,30 @@ struct JobRecord {
     snapshot: JobSnapshot,
     cancel: CancellationToken,
 }
+pub(crate) struct PreparedJobRecords {
+    records: HashMap<String, JobRecord>,
+    snapshots: Vec<JobSnapshot>,
+}
+
+impl PreparedJobRecords {
+    #[must_use]
+    pub(crate) fn snapshots(&self) -> &[JobSnapshot] {
+        &self.snapshots
+    }
+}
+
+pub(crate) struct PreparedJobCancellation {
+    cancelled: Vec<String>,
+    tokens: Vec<CancellationToken>,
+    snapshots: Vec<JobSnapshot>,
+}
+
+impl PreparedJobCancellation {
+    pub(crate) fn take_snapshots(&mut self) -> Vec<JobSnapshot> {
+        std::mem::take(&mut self.snapshots)
+    }
+}
+
 
 pub(crate) struct JobManager {
     records: Mutex<HashMap<String, JobRecord>>,
@@ -126,6 +150,31 @@ impl JobManager {
     pub(crate) fn lock_spawns(&self) -> MutexGuard<'_, ()> {
         self.spawn_lock.lock()
     }
+
+    pub(crate) fn prepare_replacement(&self, snapshots: Vec<JobSnapshot>) -> PreparedJobRecords {
+        let mut records = HashMap::with_capacity(snapshots.len());
+        for snapshot in &snapshots {
+            records.insert(
+                snapshot.id.clone(),
+                JobRecord {
+                    snapshot: snapshot.clone(),
+                    cancel: CancellationToken::new(),
+                },
+            );
+        }
+        PreparedJobRecords { records, snapshots }
+    }
+
+    pub(crate) fn install_replacement(&self, prepared: PreparedJobRecords) {
+        let mut records = self.records.lock();
+        for record in records.values() {
+            record.cancel.cancel();
+        }
+        *records = prepared.records;
+        drop(records);
+        self.changed.notify_waiters();
+    }
+
 
     pub(crate) fn contains_identifier(&self, id: &str) -> bool {
         self.records.lock().values().any(|record| {
@@ -207,6 +256,20 @@ impl JobManager {
         self.changed.notify_waiters();
         Some(snapshot)
     }
+    pub(crate) fn append_result_error(&self, id: &str, error: &str) -> Option<JobSnapshot> {
+        let mut records = self.records.lock();
+        let record = records.get_mut(id)?;
+        record.snapshot.status = JobStatus::Failed;
+        let result = record.snapshot.result.as_mut()?;
+        result.error = Some(match result.error.take() {
+            Some(existing) => format!("{existing}; {error}"),
+            None => error.to_owned(),
+        });
+        let snapshot = record.snapshot.clone();
+        drop(records);
+        self.changed.notify_waiters();
+        Some(snapshot)
+    }
 
     pub(crate) fn prune_candidates(&self) -> Vec<PruneCandidate> {
         let now = (self.clock)();
@@ -264,6 +327,13 @@ impl JobManager {
         self.changed.notify_waiters();
         true
     }
+    pub(crate) fn remove(&self, id: &str) -> bool {
+        let removed = self.records.lock().remove(id).is_some();
+        if removed {
+            self.changed.notify_waiters();
+        }
+        removed
+    }
 
     pub(crate) fn snapshots(&self, ids: Option<&[String]>) -> Vec<JobSnapshot> {
         let records = self.records.lock();
@@ -290,6 +360,75 @@ impl JobManager {
                 .then_with(|| left.id.cmp(&right.id))
         });
         snapshots
+    }
+
+    pub(crate) fn prepare_cancellation(&self, ids: &[String]) -> PreparedJobCancellation {
+        let records = self.records.lock();
+        let mut cancelled = Vec::new();
+        let mut tokens = Vec::new();
+        let mut seen = HashSet::new();
+        for id in ids {
+            for record in records.values().filter(|record| {
+                (record.snapshot.id == *id || record.snapshot.agent_id == *id)
+                    && !record.snapshot.status.is_settled()
+            }) {
+                if seen.insert(record.snapshot.id.clone()) {
+                    cancelled.push(record.snapshot.id.clone());
+                    tokens.push(record.cancel.clone());
+                }
+            }
+        }
+        cancelled.sort();
+        let mut snapshots = records
+            .values()
+            .map(|record| {
+                let mut snapshot = record.snapshot.clone();
+                if seen.contains(&snapshot.id) {
+                    snapshot.status = JobStatus::Cancelled;
+                    snapshot.finished_at = Some((self.clock)());
+                }
+                snapshot
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        PreparedJobCancellation {
+            cancelled,
+            tokens,
+            snapshots,
+        }
+    }
+
+    pub(crate) fn commit_cancellation(
+        &self,
+        prepared: PreparedJobCancellation,
+    ) -> Vec<String> {
+        let PreparedJobCancellation {
+            cancelled,
+            tokens,
+            snapshots,
+        } = prepared;
+        debug_assert!(snapshots.is_empty());
+        let cancelled_ids = cancelled.iter().map(String::as_str).collect::<HashSet<_>>();
+        let timestamp = (self.clock)();
+        let mut records = self.records.lock();
+        for record in records.values_mut() {
+            if cancelled_ids.contains(record.snapshot.id.as_str())
+                && !record.snapshot.status.is_settled()
+            {
+                record.snapshot.status = JobStatus::Cancelled;
+                record.snapshot.finished_at = Some(timestamp);
+            }
+        }
+        for token in tokens {
+            token.cancel();
+        }
+        drop(records);
+        self.changed.notify_waiters();
+        cancelled
     }
 
     pub(crate) fn cancel(&self, ids: &[String]) -> Vec<String> {

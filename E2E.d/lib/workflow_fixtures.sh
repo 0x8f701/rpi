@@ -5,8 +5,8 @@
 #
 # Public wire contract (product-owned; E2E asserts only):
 #   status: queued|planning|running|paused|integrating|completed|failed|cancelled|conflicted
-#   /workflow: bare | create <name> <objective> | list | show [id|name]
-#              | pause | resume | cancel | integrate | remove
+#   /workflow: bare | create <objective> | create <name> <objective> | list
+#              | show [id|name] | pause | resume | cancel | integrate | remove
 #   RPC: workflow_create|list|get|pause|resume|cancel|integrate|remove
 #   ownership: workflowId + todoTaskId (camelCase WorkflowTaskOwnership)
 #   compact header: Workflows · {A} active · {T} total

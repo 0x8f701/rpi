@@ -21,10 +21,10 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::mpsc;
-const MAX_JSONL_FRAME_BYTES: usize = 4 * 1024 * 1024;
+use tokio::sync::{mpsc, Semaphore};
+pub(crate) const MAX_RPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const JSONL_CHANNEL_CAPACITY: usize = 8;
-const MAX_CONCURRENT_COMMANDS: usize = 16;
+pub(crate) const MAX_CONCURRENT_COMMANDS: usize = 16;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -593,12 +593,15 @@ impl RpcCommand {
     }
 }
 impl RpcCommand {
-    const fn runs_inline(&self) -> bool {
+    pub(crate) const fn runs_inline(&self) -> bool {
         matches!(
             self,
             Self::Abort { .. }
                 | Self::AbortRetry { .. }
                 | Self::AbortBash { .. }
+                | Self::LoopCancel { .. }
+                | Self::ProcessSignal { .. }
+                | Self::ProcessStop { .. }
                 | Self::SettingsInspect { .. }
                 | Self::SettingsSearch { .. }
                 | Self::SettingsOpenDraft { .. }
@@ -618,10 +621,22 @@ impl RpcCommand {
                 | Self::WorkflowRemove { .. }
         )
     }
+
+    const fn bypasses_command_slots(&self) -> bool {
+        matches!(
+            self,
+            Self::Abort { .. }
+                | Self::AbortRetry { .. }
+                | Self::AbortBash { .. }
+                | Self::LoopCancel { .. }
+                | Self::ProcessSignal { .. }
+                | Self::ProcessStop { .. }
+        )
+    }
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename = "extension_ui_response")]
-struct RpcExtensionUiResponse {
+pub(crate) struct RpcExtensionUiResponse {
     id: String,
     #[serde(default)]
     value: Option<String>,
@@ -713,7 +728,7 @@ impl RpcResponse {
     }
 }
 #[derive(Clone, Debug, Serialize)]
-struct RpcExtensionUiRequest {
+pub(crate) struct RpcExtensionUiRequest {
     #[serde(rename = "type")]
     record_type: &'static str,
     id: String,
@@ -727,9 +742,97 @@ enum JsonlFrame {
     Unterminated,
 }
 #[derive(Clone, Debug)]
-enum RpcInput {
+pub(crate) enum RpcInput {
     Command(RpcCommand),
     ExtensionUiResponse(RpcExtensionUiResponse),
+}
+
+#[derive(Clone)]
+pub(crate) struct RpcDispatcher {
+    application: Application,
+    settings: crate::settings_rpc::SettingsRpcState,
+    workflows: crate::workflow_rpc::WorkflowRpcState,
+    command_slots: Arc<Semaphore>,
+}
+
+impl RpcDispatcher {
+    #[must_use]
+    pub(crate) fn new(application: Application) -> Self {
+        Self {
+            settings: crate::settings_rpc::SettingsRpcState::default(),
+            workflows: crate::workflow_rpc::WorkflowRpcState::for_application(&application),
+            application,
+            command_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMANDS)),
+        }
+    }
+
+    pub(crate) fn application(&self) -> &Application {
+        &self.application
+    }
+
+    pub(crate) async fn dispatch(&self, command: RpcCommand) -> RpcResponse {
+        if command.bypasses_command_slots() {
+            return handle_command(
+                &self.application,
+                &self.settings,
+                &self.workflows,
+                command,
+            )
+            .await;
+        }
+        let id = command.id();
+        let name = command.command_name();
+        let Ok(_slot) = self.command_slots.clone().try_acquire_owned() else {
+            return RpcResponse::failure(
+                id,
+                name,
+                format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
+            );
+        };
+        handle_command(
+            &self.application,
+            &self.settings,
+            &self.workflows,
+            command,
+        )
+        .await
+    }
+}
+
+pub(crate) fn project_application_event(event: ApplicationEvent) -> Result<Value> {
+    match event {
+        ApplicationEvent::Agent(pi_agent::AgentEvent::MessageStart { message }) => {
+            Ok(serde_json::to_value(ApplicationEvent::Agent(
+                pi_agent::AgentEvent::MessageStart {
+                    message: public_message(message),
+                },
+            ))?)
+        }
+        ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message }) => {
+            Ok(serde_json::to_value(ApplicationEvent::Agent(
+                pi_agent::AgentEvent::MessageEnd {
+                    message: public_message(message),
+                },
+            ))?)
+        }
+        ApplicationEvent::Workflow(event) => Ok(serde_json::to_value(
+            crate::workflow_rpc::project_workflow_event(&event),
+        )?),
+        event => Ok(serde_json::to_value(event)?),
+    }
+}
+
+pub(crate) fn project_extension_ui_event(
+    event: ExtensionUiEvent,
+) -> Result<Option<RpcExtensionUiRequest>> {
+    ui_event_request(event)
+}
+
+pub(crate) fn accept_extension_ui_response(
+    adapter: &ExtensionUiAdapter,
+    response: RpcExtensionUiResponse,
+) -> Result<()> {
+    handle_ui_response(adapter, response)
 }
 
 pub async fn run(cli: &Cli) -> Result<()> {
@@ -769,9 +872,7 @@ where
     let (lines_tx, mut lines_rx) = mpsc::channel(JSONL_CHANNEL_CAPACITY);
     let reader = tokio::spawn(read_jsonl(input, lines_tx));
     let output = Arc::new(StdMutex::new(output));
-    let settings = crate::settings_rpc::SettingsRpcState::default();
-    // Application-owned manager bind (no independent manager open / set_host).
-    let workflows = crate::workflow_rpc::WorkflowRpcState::for_application(&application);
+    let dispatcher = RpcDispatcher::new(application.clone());
     let mut commands = tokio::task::JoinSet::new();
     let mut input_open = true;
     loop {
@@ -783,8 +884,12 @@ where
                 match line {
                     Some(JsonlFrame::Line(line)) => match parse_input(&line) {
                         Ok(RpcInput::Command(command)) if command.runs_inline() => {
-                            let response =
-                                handle_command(&application, &settings, &workflows, command).await;
+                            let response = handle_command(
+                                &application,
+                                &dispatcher.settings,
+                                &dispatcher.workflows,
+                                command,
+                            ).await;
                             write_shared_json(&output, &response)?;
                         }
                         Ok(RpcInput::Command(command)) if commands.len() >= MAX_CONCURRENT_COMMANDS => {
@@ -796,14 +901,15 @@ where
                             write_shared_json(&output, &response)?;
                         }
                         Ok(RpcInput::Command(command)) => {
-                            let application = application.clone();
-                            let settings = settings.clone();
-                            let workflows = workflows.clone();
+                            let dispatcher = dispatcher.clone();
                             let output = output.clone();
                             commands.spawn(async move {
-                                let response =
-                                    handle_command(&application, &settings, &workflows, command)
-                                        .await;
+                                let response = handle_command(
+                                    &dispatcher.application,
+                                    &dispatcher.settings,
+                                    &dispatcher.workflows,
+                                    command,
+                                ).await;
                                 write_shared_json(&output, &response)
                             });
                         }
@@ -822,7 +928,7 @@ where
                         &RpcResponse::failure(
                             None,
                             "parse",
-                            format!("RPC frame exceeds {MAX_JSONL_FRAME_BYTES} bytes"),
+                            format!("RPC frame exceeds {MAX_RPC_MESSAGE_BYTES} bytes"),
                         ),
                     )?,
                     Some(JsonlFrame::Unterminated) => write_shared_json(
@@ -840,17 +946,7 @@ where
                 }
             }
             event = events.recv() => match event {
-                Ok(ApplicationEvent::Agent(pi_agent::AgentEvent::MessageStart { message })) => {
-                    write_shared_json(&output, &ApplicationEvent::Agent(pi_agent::AgentEvent::MessageStart { message: public_message(message) }))?
-                }
-                Ok(ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message })) => {
-                    write_shared_json(&output, &ApplicationEvent::Agent(pi_agent::AgentEvent::MessageEnd { message: public_message(message) }))?
-                }
-                Ok(ApplicationEvent::Workflow(event)) => {
-                    let public = crate::workflow_rpc::project_workflow_event(&event);
-                    write_shared_json(&output, &public)?
-                }
-                Ok(event) => write_shared_json(&output, &event)?,
+                Ok(event) => write_shared_json(&output, &project_application_event(event)?)?,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => write_shared_json(
                     &output,
                     &RpcResponse::failure(None, "events", format!("application event stream lagged by {count} records")),
@@ -859,7 +955,7 @@ where
             },
             event = ui_events.recv() => match event {
                 Ok(event) => {
-                    if let Some(request) = ui_event_request(event)? {
+                    if let Some(request) = project_extension_ui_event(event)? {
                         write_shared_json(&output, &request)?;
                     }
                 }
@@ -911,7 +1007,7 @@ async fn read_jsonl<R: AsyncRead + Unpin>(
                     return Ok(());
                 }
             } else if !oversized {
-                if buffer.len() == MAX_JSONL_FRAME_BYTES {
+                if buffer.len() == MAX_RPC_MESSAGE_BYTES {
                     buffer.clear();
                     oversized = true;
                 } else {
@@ -966,7 +1062,7 @@ fn rpc_command_from_workflow(command: crate::workflow_rpc::WorkflowRpcCommand) -
         }
     }
 }
-fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcResponse> {
+pub(crate) fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcResponse> {
     let value: Value = serde_json::from_slice(line).map_err(|e| {
         RpcResponse::failure(None, "parse", format!("Failed to parse command: {e}"))
     })?;
@@ -1323,9 +1419,10 @@ async fn handle_command_inner(
             Ok(None)
         }
         RpcCommand::NewSession { parent_session, .. } => {
-            app.new_session_with_parent(parent_session.as_deref().map(Path::new))
+            let outcome = app
+                .new_session_with_parent(parent_session.as_deref().map(Path::new))
                 .await?;
-            Ok(Some(json!({"cancelled":false})))
+            Ok(Some(json!({"cancelled":outcome.cancelled})))
         }
         RpcCommand::GetState { .. } => Ok(Some(serde_json::to_value(
             RpcSessionState::from_application(app.state().await, app.runtime_settings_state()),
@@ -1416,16 +1513,19 @@ async fn handle_command_inner(
             json!({"path":app.export_html(output_path.as_deref().map(Path::new))?.to_string_lossy()}),
         )),
         RpcCommand::SwitchSession { session_path, .. } => {
-            app.switch_session(Path::new(&session_path)).await?;
-            Ok(Some(json!({"cancelled":false})))
+            let outcome = app.switch_session(Path::new(&session_path)).await?;
+            Ok(Some(json!({"cancelled":outcome.cancelled})))
         }
         RpcCommand::Fork { entry_id, .. } => {
-            app.fork_session(&entry_id).await?;
-            Ok(Some(json!({"cancelled":false})))
+            let outcome = app.fork_session(&entry_id).await?;
+            Ok(Some(json!({
+                "text": outcome.text,
+                "cancelled": outcome.cancelled,
+            })))
         }
         RpcCommand::Clone { .. } => {
-            app.clone_session().await?;
-            Ok(Some(json!({"cancelled":false})))
+            let outcome = app.clone_session().await?;
+            Ok(Some(json!({"cancelled":outcome.cancelled})))
         }
         RpcCommand::GetForkMessages { .. } => Ok(Some(json!({"messages":app.fork_messages()?}))),
         RpcCommand::GetEntries { since, .. } => {
@@ -1474,7 +1574,7 @@ async fn handle_command_inner(
                     json!({
                         "name": command.name,
                         "description": command.description,
-                        "source": "builtin",
+                        "source": command_source_str(command.source),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1673,6 +1773,16 @@ async fn cycle_model(app: &Application) -> Result<Option<Value>> {
         json!({"model":model,"thinkingLevel":app.state().await.thinking_level,"isScoped":false}),
     ))
 }
+/// Wire name for the source backing an executable command.
+fn command_source_str(source: crate::interactive_commands::CommandSource) -> &'static str {
+    match source {
+        crate::interactive_commands::CommandSource::Builtin => "builtin",
+        crate::interactive_commands::CommandSource::Prompt => "prompt",
+        crate::interactive_commands::CommandSource::Skill => "skill",
+        crate::interactive_commands::CommandSource::Extension => "extension",
+    }
+}
+
 fn available_thinking_levels(model: &Model) -> Vec<ThinkingLevel> {
     pi_ai::supported_thinking_levels(model)
         .into_iter()
@@ -1766,7 +1876,7 @@ mod tests {
             json!({"type":"loop_list"}),
             json!({"type":"loop_delete","taskId":"loop-1"}),
             json!({"type":"loop_cancel","taskId":"loop-1"}),
-            json!({"type":"process_spawn","spec":{"argv":["printf","ok"],"cwd":"/tmp","env":{},"tty":false}}),
+            json!({"type":"process_spawn","spec":{"argv":["printf","ok"],"cwd":".","env":{},"tty":false}}),
             json!({"type":"process_list"}),
             json!({"type":"process_describe","processId":"00000000-0000-7000-8000-000000000000"}),
             json!({"type":"process_logs","processId":"00000000-0000-7000-8000-000000000000","cursor":0,"limitBytes":1024}),
@@ -1811,6 +1921,51 @@ mod tests {
                 "{f}"
             );
         }
+    }
+
+    #[test]
+    fn command_slot_bypass_is_limited_to_recovery_commands() {
+        let parse_command = |value: Value| match parse_input(
+            &serde_json::to_vec(&value).expect("serialize command fixture"),
+        )
+        .expect("parse command fixture")
+        {
+            RpcInput::Command(command) => command,
+            RpcInput::ExtensionUiResponse(_) => panic!("expected RPC command"),
+        };
+
+        for fixture in [
+            json!({"type":"abort"}),
+            json!({"type":"abort_retry"}),
+            json!({"type":"abort_bash"}),
+            json!({"type":"loop_cancel","taskId":"loop-1"}),
+            json!({"type":"process_signal","processId":"00000000-0000-7000-8000-000000000000","signal":"SIGTERM"}),
+            json!({"type":"process_stop","processId":"00000000-0000-7000-8000-000000000000"}),
+        ] {
+            let command = parse_command(fixture.clone());
+            assert!(
+                command.bypasses_command_slots(),
+                "recovery command must bypass saturated slots: {fixture}"
+            );
+        }
+
+        for fixture in [
+            json!({"type":"settings_apply","draftId":"draft"}),
+            json!({"type":"workflow_create","name":"ship","objective":"bounded"}),
+            json!({"type":"workflow_pause","workflowId":"wf-1"}),
+            json!({"type":"workflow_integrate","workflowId":"wf-1"}),
+            json!({"type":"process_wait","processId":"00000000-0000-7000-8000-000000000000"}),
+        ] {
+            let command = parse_command(fixture.clone());
+            assert!(
+                !command.bypasses_command_slots(),
+                "ordinary awaited command must remain bounded: {fixture}"
+            );
+        }
+
+        let settings = parse_command(json!({"type":"settings_apply","draftId":"draft"}));
+        let workflow = parse_command(json!({"type":"workflow_pause","workflowId":"wf-1"}));
+        assert!(settings.runs_inline() && workflow.runs_inline());
     }
     #[test]
     fn public_models_never_serialize_headers() {
@@ -2089,7 +2244,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let task = tokio::spawn(read_jsonl(r, tx));
         use tokio::io::AsyncWriteExt;
-        w.write_all(&vec![b'x'; MAX_JSONL_FRAME_BYTES + 1])
+        w.write_all(&vec![b'x'; MAX_RPC_MESSAGE_BYTES + 1])
             .await
             .unwrap();
         w.write_all(b"\n{\"type\":\"get_state\",\"id\":\"after-limit\"}\n")
@@ -2316,6 +2471,250 @@ mod tests {
         assert!(response.data.is_none());
         assert!(response.error.as_deref().is_some_and(|error| error.contains("summary rejected")));
 
+        app.cleanup().await;
+    }
+
+    struct LifecycleExtensionHost;
+
+    struct LifecycleExtensionTransport {
+        frames: StdMutex<std::collections::VecDeque<Option<pi_coding::ExtensionFrame>>>,
+        ready: tokio::sync::Notify,
+    }
+
+    impl LifecycleExtensionTransport {
+        fn new() -> Self {
+            Self {
+                frames: StdMutex::new(std::collections::VecDeque::new()),
+                ready: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn push(&self, frame: pi_coding::ExtensionFrame) {
+            self.frames.lock().expect("extension frame queue").push_back(Some(frame));
+            self.ready.notify_one();
+        }
+    }
+
+    impl pi_coding::ExtensionTransport for LifecycleExtensionTransport {
+        fn send(
+            &self,
+            frame: &pi_coding::ExtensionHostFrame,
+        ) -> pi_coding::ExtensionFuture<'_, Result<()>> {
+            match frame {
+                pi_coding::ExtensionHostFrame::Hello { .. } => {
+                    self.push(pi_coding::ExtensionFrame::Hello {
+                        protocol_version: pi_coding::EXTENSION_PROTOCOL_VERSION,
+                        manifest: pi_coding::ExtensionCapabilityManifest {
+                            id: "rpc-lifecycle".to_owned(),
+                            name: "RPC lifecycle fixture".to_owned(),
+                            version: "1.0.0".to_owned(),
+                            capabilities: std::collections::BTreeSet::from([
+                                pi_coding::ExtensionCapability::EventHooks,
+                            ]),
+                            ui_capabilities: std::collections::BTreeSet::new(),
+                        },
+                    });
+                }
+                pi_coding::ExtensionHostFrame::Request { id, request, .. } => {
+                    if matches!(request, pi_coding::ExtensionHostRequest::Load) {
+                        for event in ["session_before_switch", "session_before_fork"] {
+                            self.push(pi_coding::ExtensionFrame::Register {
+                                registration: pi_coding::ExtensionRegistration::EventHook {
+                                    hook: pi_coding::ExtensionEventHookDescriptor {
+                                        event: event.to_owned(),
+                                    },
+                                },
+                            });
+                        }
+                    }
+                    let value = match request {
+                        pi_coding::ExtensionHostRequest::Invoke {
+                            invocation:
+                                pi_coding::ExtensionInvocation::Event { event },
+                            ..
+                        } if event.name == "session_before_switch" => json!({"cancel":true}),
+                        pi_coding::ExtensionHostRequest::Invoke {
+                            invocation:
+                                pi_coding::ExtensionInvocation::Event { event },
+                            ..
+                        } if event.name == "session_before_fork" => json!({"cancel":true}),
+                        _ => Value::Null,
+                    };
+                    self.push(pi_coding::ExtensionFrame::Response {
+                        id: id.clone(),
+                        result: pi_coding::ProtocolResult::Success { value },
+                    });
+                }
+                pi_coding::ExtensionHostFrame::Shutdown { .. } => {
+                    self.frames.lock().expect("extension frame queue").push_back(None);
+                    self.ready.notify_one();
+                }
+                pi_coding::ExtensionHostFrame::Response { .. }
+                | pi_coding::ExtensionHostFrame::Cancel { .. } => {}
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive(
+            &self,
+        ) -> pi_coding::ExtensionFuture<'_, Result<Option<pi_coding::ExtensionFrame>>> {
+            Box::pin(async move {
+                loop {
+                    let notified = self.ready.notified();
+                    if let Some(frame) = self.frames.lock().expect("extension frame queue").pop_front() {
+                        return Ok(frame);
+                    }
+                    notified.await;
+                }
+            })
+        }
+
+        fn terminate(&self) -> pi_coding::ExtensionFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn diagnostic_context(&self) -> String {
+            "RPC lifecycle fixture".to_owned()
+        }
+    }
+
+    impl pi_coding::ExtensionHost for LifecycleExtensionHost {
+        fn launch(
+            &self,
+            _launch: pi_coding::ExtensionLaunch,
+        ) -> pi_coding::ExtensionFuture<'_, Result<Arc<dyn pi_coding::ExtensionTransport>>> {
+            Box::pin(async {
+                Ok(Arc::new(LifecycleExtensionTransport::new())
+                    as Arc<dyn pi_coding::ExtensionTransport>)
+            })
+        }
+    }
+
+    async fn build_lifecycle_app(cancel: bool) -> (tempfile::TempDir, Application) {
+        let cwd = tempfile::tempdir().expect("lifecycle cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("lifecycle session");
+        let recorder = pi_coding::start_session_in(
+            cwd.path(),
+            None,
+            None,
+            Some(cwd.path()),
+            None,
+            None,
+        )
+        .expect("record lifecycle session");
+        recorder
+            .record_message(&Message::user_text("fork text", 1))
+            .expect("record fork message");
+        recorder.persist_now().expect("persist lifecycle session");
+        session.record(recorder).expect("attach lifecycle recorder");
+        if !cancel {
+            return (cwd, Application::new(session).await);
+        }
+        let permissions = pi_coding::ExtensionPermissionSet {
+            capabilities: std::collections::BTreeSet::from([
+                pi_coding::ExtensionCapability::EventHooks,
+            ]),
+            ui_capabilities: std::collections::BTreeSet::new(),
+        };
+        let runtime = pi_coding::ExtensionRuntime::new(
+            Arc::new(LifecycleExtensionHost),
+            None,
+            pi_coding::ExtensionRuntimeOptions::default(),
+        );
+        let report = runtime
+            .load(vec![pi_coding::ExtensionSpec::new(
+                "rpc-lifecycle",
+                cwd.path().join("fixture-extension"),
+                cwd.path(),
+                pi_coding::ExtensionOrigin::Project,
+                true,
+                permissions.clone(),
+            )])
+            .await;
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        (
+            cwd,
+            Application::new_with_extensions(session, runtime, permissions).await,
+        )
+    }
+
+    #[tokio::test]
+    async fn lifecycle_rpc_cancellation_is_successful_and_preserves_session() {
+        let (_cwd, app) = build_lifecycle_app(true).await;
+        let before = app.state().await;
+        let messages = app.messages();
+        let entry_id = app.fork_messages().expect("fork messages")[0].entry_id.clone();
+        let switch_path = before.session_file.clone().expect("session file");
+        for (command, expected) in [
+            (RpcCommand::NewSession { id: Some("new".into()), parent_session: None }, json!({"cancelled":true})),
+            (RpcCommand::SwitchSession { id: Some("switch".into()), session_path: switch_path.clone() }, json!({"cancelled":true})),
+            (RpcCommand::Fork { id: Some("fork".into()), entry_id: entry_id.clone() }, json!({"text":"","cancelled":true})),
+            (RpcCommand::Clone { id: Some("clone".into()) }, json!({"cancelled":true})),
+        ] {
+            let response = handle_command(&app, &settings_state(), &workflows_state(), command).await;
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data, Some(expected));
+            let after = app.state().await;
+            assert_eq!(after.session_id, before.session_id);
+            assert_eq!(after.session_file, before.session_file);
+            assert_eq!(app.messages(), messages);
+        }
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn new_and_switch_rpc_return_false_when_not_cancelled() {
+        let (_cwd, app) = build_lifecycle_app(false).await;
+        let switch_path = app.state().await.session_file.expect("session file");
+        let switched = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::SwitchSession { id: Some("switch".into()), session_path: switch_path },
+        )
+        .await;
+        assert!(switched.success, "{switched:?}");
+        assert_eq!(switched.data, Some(json!({"cancelled":false})));
+
+        let created = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::NewSession { id: Some("new".into()), parent_session: None },
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        assert_eq!(created.data, Some(json!({"cancelled":false})));
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn fork_rpc_returns_selected_text_and_false_when_not_cancelled() {
+        let (_cwd, app) = build_lifecycle_app(false).await;
+        let entry_id = app.fork_messages().expect("fork messages")[0].entry_id.clone();
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::Fork { id: Some("fork".into()), entry_id },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data, Some(json!({"text":"fork text","cancelled":false})));
         app.cleanup().await;
     }
 
@@ -2742,8 +3141,236 @@ mod tests {
         app.cleanup().await;
     }
 
+    struct CatalogExtensionHost;
+
+    struct CatalogExtensionTransport {
+        frames: StdMutex<std::collections::VecDeque<Option<pi_coding::ExtensionFrame>>>,
+        ready: tokio::sync::Notify,
+    }
+
+    impl CatalogExtensionTransport {
+        fn new() -> Self {
+            Self {
+                frames: StdMutex::new(std::collections::VecDeque::new()),
+                ready: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn push(&self, frame: pi_coding::ExtensionFrame) {
+            self.frames.lock().expect("extension frame queue").push_back(Some(frame));
+            self.ready.notify_one();
+        }
+    }
+
+    impl pi_coding::ExtensionTransport for CatalogExtensionTransport {
+        fn send(
+            &self,
+            frame: &pi_coding::ExtensionHostFrame,
+        ) -> pi_coding::ExtensionFuture<'_, Result<()>> {
+            match frame {
+                pi_coding::ExtensionHostFrame::Hello { .. } => {
+                    self.push(pi_coding::ExtensionFrame::Hello {
+                        protocol_version: pi_coding::EXTENSION_PROTOCOL_VERSION,
+                        manifest: pi_coding::ExtensionCapabilityManifest {
+                            id: "rpc-catalog".to_owned(),
+                            name: "RPC catalog fixture".to_owned(),
+                            version: "1.0.0".to_owned(),
+                            capabilities: std::collections::BTreeSet::from([
+                                pi_coding::ExtensionCapability::Commands,
+                            ]),
+                            ui_capabilities: std::collections::BTreeSet::new(),
+                        },
+                    });
+                }
+                pi_coding::ExtensionHostFrame::Request { id, request, .. } => {
+                    if matches!(request, pi_coding::ExtensionHostRequest::Load) {
+                        for (name, description) in [
+                            ("extension-only", "Extension only command"),
+                            ("shared", "Extension collision"),
+                            ("help", "Builtin collision"),
+                        ] {
+                            self.push(pi_coding::ExtensionFrame::Register {
+                                registration: pi_coding::ExtensionRegistration::Command {
+                                    command: pi_coding::ExtensionCommandDescriptor {
+                                        name: name.to_owned(),
+                                        description: Some(description.to_owned()),
+                                    },
+                                },
+                            });
+                        }
+                    }
+                    self.push(pi_coding::ExtensionFrame::Response {
+                        id: id.clone(),
+                        result: pi_coding::ProtocolResult::Success { value: Value::Null },
+                    });
+                }
+                pi_coding::ExtensionHostFrame::Shutdown { .. } => {
+                    self.frames.lock().expect("extension frame queue").push_back(None);
+                    self.ready.notify_one();
+                }
+                pi_coding::ExtensionHostFrame::Response { .. }
+                | pi_coding::ExtensionHostFrame::Cancel { .. } => {}
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn receive(
+            &self,
+        ) -> pi_coding::ExtensionFuture<'_, Result<Option<pi_coding::ExtensionFrame>>> {
+            Box::pin(async move {
+                loop {
+                    let notified = self.ready.notified();
+                    if let Some(frame) = self.frames.lock().expect("extension frame queue").pop_front() {
+                        return Ok(frame);
+                    }
+                    notified.await;
+                }
+            })
+        }
+
+        fn terminate(&self) -> pi_coding::ExtensionFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn diagnostic_context(&self) -> String {
+            "RPC catalog fixture".to_owned()
+        }
+    }
+
+    impl pi_coding::ExtensionHost for CatalogExtensionHost {
+        fn launch(
+            &self,
+            _launch: pi_coding::ExtensionLaunch,
+        ) -> pi_coding::ExtensionFuture<'_, Result<Arc<dyn pi_coding::ExtensionTransport>>> {
+            Box::pin(async {
+                Ok(Arc::new(CatalogExtensionTransport::new())
+                    as Arc<dyn pi_coding::ExtensionTransport>)
+            })
+        }
+    }
+
+    async fn build_command_catalog_app() -> (tempfile::TempDir, Application) {
+        let cwd = tempfile::tempdir().expect("catalog cwd");
+        let prompt_dir = cwd.path().join(".pi/prompts");
+        std::fs::create_dir_all(&prompt_dir).expect("prompt directory");
+        for (name, description) in [
+            ("help", "Conflicts with builtin help"),
+            ("shared", "Wins the dynamic collision"),
+            ("prompt-only", "Prompt only command"),
+        ] {
+            std::fs::write(
+                prompt_dir.join(format!("{name}.md")),
+                format!("---\ndescription: {description}\n---\nprompt body\n"),
+            )
+            .expect("prompt template");
+        }
+        let skill_dir = cwd.path().join(".pi/skills/catalog-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: catalog-skill\ndescription: Skill only command\n---\nskill body\n",
+        )
+        .expect("skill definition");
+
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("catalog session");
+        let mut resource_options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        resource_options.project_trust_override = Some(true);
+        session
+            .attach_resources(pi_coding::ResourceManager::new(resource_options).expect("resources"))
+            .await
+            .expect("attach resources");
+
+        let permissions = pi_coding::ExtensionPermissionSet {
+            capabilities: std::collections::BTreeSet::from([
+                pi_coding::ExtensionCapability::Commands,
+            ]),
+            ui_capabilities: std::collections::BTreeSet::new(),
+        };
+        let runtime = pi_coding::ExtensionRuntime::new(
+            Arc::new(CatalogExtensionHost),
+            None,
+            pi_coding::ExtensionRuntimeOptions::default(),
+        );
+        let spec = pi_coding::ExtensionSpec::new(
+            "rpc-catalog",
+            cwd.path().join("fixture-extension"),
+            cwd.path(),
+            pi_coding::ExtensionOrigin::Project,
+            true,
+            permissions.clone(),
+        );
+        let report = runtime.load(vec![spec]).await;
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        (
+            cwd,
+            Application::new_with_extensions(session, runtime, permissions).await,
+        )
+    }
+
     #[tokio::test]
-    async fn get_commands_includes_workflow() {
+    async fn get_commands_exactly_projects_ordered_primary_catalog() {
+        let (_cwd, app) = build_command_catalog_app().await;
+        let expected = crate::interactive_commands::visible_catalog()
+            .iter()
+            .map(|command| {
+                json!({
+                    "name": command.name,
+                    "description": command.description,
+                    "source": command_source_str(command.source),
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::GetCommands {
+                id: Some("catalog".to_owned()),
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        let data = response.data.expect("get_commands data");
+        assert_eq!(data, json!({ "commands": expected }));
+
+        let commands = data["commands"].as_array().expect("commands array");
+        let names = commands
+            .iter()
+            .map(|command| command["name"].as_str().expect("command name"))
+            .collect::<Vec<_>>();
+        assert_eq!(names, crate::interactive_commands::PRIMARY_COMMAND_NAMES);
+        assert!(commands.iter().all(|command| command["source"] == "builtin"));
+        assert!(!names.contains(&"prompt-only"));
+        assert!(!names.contains(&"skill:catalog-skill"));
+        assert!(!names.contains(&"extension-only"));
+        app.cleanup().await;
+    }
+
+    #[test]
+    fn command_source_str_maps_every_variant_exhaustively() {
+        use crate::interactive_commands::CommandSource;
+        assert_eq!(command_source_str(CommandSource::Builtin), "builtin");
+        assert_eq!(command_source_str(CommandSource::Prompt), "prompt");
+        assert_eq!(command_source_str(CommandSource::Skill), "skill");
+        assert_eq!(command_source_str(CommandSource::Extension), "extension");
+    }
+
+    #[tokio::test]
+    async fn get_commands_includes_workflow_and_builtins_source() {
         let app = build_todo_app("faux-rpc-workflow-cmds", "faux-rpc-workflow-cmds-api").await;
         let r = handle_command(
             &app,
@@ -2762,6 +3389,20 @@ mod tests {
         assert!(
             commands.iter().any(|c| c["name"] == "workflow"),
             "expected workflow in {commands:?}"
+        );
+        // Every command carries a lowercase source string.
+        for cmd in &commands {
+            let src = cmd["source"].as_str().expect("source is a string");
+            assert!(
+                matches!(src, "builtin" | "prompt" | "skill" | "extension"),
+                "unexpected source {src:?} for command {}",
+                cmd["name"]
+            );
+        }
+        // At least one builtin is present (e.g. help).
+        assert!(
+            commands.iter().any(|c| c["source"] == "builtin"),
+            "expected at least one builtin command in {commands:?}"
         );
         app.cleanup().await;
     }

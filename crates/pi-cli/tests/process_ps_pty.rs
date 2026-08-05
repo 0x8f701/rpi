@@ -26,6 +26,7 @@ const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
 const CTRL_D: u8 = 0x04;
 const ESC: u8 = 0x1b;
+const CTRL_RIGHT_BRACKET: u8 = 0x1d;
 
 fn rpi_bin() -> String {
     env!("CARGO_BIN_EXE_rpi").to_owned()
@@ -130,6 +131,43 @@ impl PtyProbe {
             }
             if Instant::now() >= deadline {
                 return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn wait_for_after(&self, marker: usize, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snap = self.snapshot();
+            if snap.get(marker..).is_some_and(|delta| delta.contains(needle)) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn wait_for_any_after(
+        &self,
+        marker: usize,
+        needles: &[&str],
+        timeout: Duration,
+    ) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snap = self.snapshot();
+            if let Some(delta) = snap.get(marker..) {
+                for needle in needles {
+                    if delta.contains(needle) {
+                        return Some((*needle).to_owned());
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -394,6 +432,99 @@ fn pty_process_start_ps_panel_unknown_key_esc_focus_stop_cleanup() {
     );
 }
 
+
+/// Contract: attach to a supervised PTY, send printable/Enter as direct
+/// terminal input, observe child output, and consume Ctrl+] locally.
+#[test]
+fn pty_process_attach_type_interrupt_and_detach() {
+    let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"]);
+    assert!(await_entered(&probe), "TUI must start: {}", probe.snapshot());
+    thread::sleep(Duration::from_millis(400));
+
+    let first_start = probe.len();
+    probe.send(b"/process start --tty sh -c \"read line; echo CHILD:$line\"\r");
+    assert!(
+        probe
+            .wait_for_any_after(first_start, &["running", "Running", "sh -c"], Duration::from_secs(20))
+            .is_some(),
+        "PTY process must start: {}",
+        probe.snapshot(),
+    );
+    thread::sleep(Duration::from_millis(300));
+
+    let first_panel = probe.len();
+    probe.type_chars("/ps");
+    probe.send(b"\r");
+    assert!(
+        probe
+            .wait_for_any_after(first_panel, &["Processes", "a attach PTY"], Duration::from_secs(15))
+            .is_some(),
+        "process panel must open: {}",
+        probe.snapshot(),
+    );
+    let first_attach = probe.len();
+    probe.send(b"a");
+    assert!(
+        probe.wait_for_after(first_attach, "direct input", Duration::from_secs(10)),
+        "attach overlay must open: {}",
+        probe.snapshot(),
+    );
+
+    let before_input = probe.len();
+    probe.send(b"hello\r");
+    assert!(
+        probe.wait_for_after(before_input, "CHILD:hello", Duration::from_secs(10)),
+        "child output must reach attachment overlay: {}",
+        &probe.snapshot()[before_input.min(probe.len())..],
+    );
+    assert!(
+        probe
+            .wait_for_any_after(
+                before_input,
+                &["PTY process exited; detached", "PTY process exited; detach"],
+                Duration::from_secs(10),
+            )
+            .is_some(),
+        "process exit must auto-detach: {}",
+        probe.snapshot(),
+    );
+
+    // Re-run with a live PTY to prove the safe detach chord is consumed locally.
+    let second_start = probe.len();
+    probe.type_chars("/process start --tty sleep 30");
+    probe.send(b"\r");
+    assert!(probe.wait_for_any_after(second_start, &["running", "Running", "sleep"], Duration::from_secs(15)).is_some());
+    let second_panel = probe.len();
+    probe.type_chars("/ps");
+    probe.send(b"\r");
+    assert!(probe.wait_for_any_after(second_panel, &["Processes", "a attach PTY"], Duration::from_secs(15)).is_some());
+    let second_attach = probe.len();
+    probe.send(b"a");
+    assert!(probe.wait_for_after(second_attach, "direct input", Duration::from_secs(10)));
+    thread::sleep(Duration::from_millis(100));
+
+    let before_detach = probe.len();
+    probe.send(&[CTRL_RIGHT_BRACKET]);
+    assert!(
+        probe.wait_for_after(before_detach, "Detached from PTY", Duration::from_secs(10)),
+        "Ctrl+] must detach locally; full snapshot: {}",
+        probe.snapshot(),
+    );
+    let detached = probe.snapshot();
+    assert!(
+        !detached[before_detach.min(detached.len())..].contains("^]"),
+        "detach chord must not be echoed by the child",
+    );
+    thread::sleep(Duration::from_millis(100));
+    let after_detach = probe.snapshot();
+    assert!(
+        !after_detach[before_detach.min(after_detach.len())..].contains("exited"),
+        "detach must leave the child running",
+    );
+
+    probe.send(&[CTRL_D]);
+    assert!(probe.wait_exit(Duration::from_secs(20)).is_some());
+}
 /// Contract: cfg gate is actionable — this module only compiles on unix; the
 /// empty non-unix stub below documents the skip for other CI targets.
 #[cfg(unix)]

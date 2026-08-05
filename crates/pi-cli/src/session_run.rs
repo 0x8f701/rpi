@@ -44,6 +44,10 @@ pub struct RunSession {
     pub extension_ui: Option<ExtensionUiAdapter>,
     pub model: pi_ai::Model,
     pub scoped_models: Option<Vec<pi_ai::Model>>,
+    /// Non-fatal startup warnings (settings deprecations, resource diagnostics)
+    /// collected for interactive TUI display. Empty for non-interactive modes
+    /// where warnings are emitted directly to stderr instead.
+    pub startup_warnings: Vec<String>,
 }
 
 pub(crate) fn extension_mode(cli: &Cli) -> ExtensionMode {
@@ -213,6 +217,58 @@ pub(crate) fn resolve_prompt_input(
     Ok((String::new(), Some(canonical)))
 }
 
+const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
+
+/// Resolve the single session storage and lookup directory for a working directory.
+/// Precedence matches upstream: CLI, non-empty environment, effective settings,
+/// then the existing per-cwd default.
+pub(crate) fn effective_session_dir(
+    cwd: &Path,
+    cli_session_dir: Option<&Path>,
+    settings_session_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let env_session_dir = std::env::var_os(SESSION_DIR_ENV).filter(|value| !value.is_empty());
+    resolve_effective_session_dir(
+        cwd,
+        cli_session_dir,
+        env_session_dir.as_deref().map(Path::new),
+        settings_session_dir,
+    )
+}
+
+fn resolve_effective_session_dir(
+    cwd: &Path,
+    cli_session_dir: Option<&Path>,
+    env_session_dir: Option<&Path>,
+    settings_session_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let configured = cli_session_dir
+        .or(env_session_dir)
+        .or(settings_session_dir);
+    let Some(configured) = configured else {
+        return pi_coding::canonical_path(&pi_coding::default_session_dir(cwd))
+            .context("resolving default session directory");
+    };
+    let expanded = expand_session_dir_tilde(configured)?;
+    pi_coding::canonical_path(&expanded).context("resolving effective session directory")
+}
+
+fn expand_session_dir_tilde(path: &Path) -> Result<PathBuf> {
+    if path == Path::new("~") || path.strip_prefix(Path::new("~")).is_ok() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("home directory is unavailable for session directory {}", path.display()))?;
+        return Ok(if path == Path::new("~") {
+            home
+        } else {
+            home.join(path.strip_prefix(Path::new("~")).expect("tilde prefix checked"))
+        });
+    }
+    Ok(path.to_path_buf())
+}
+
 fn resolve_session_argument(
     argument: &str,
     cwd: &Path,
@@ -220,13 +276,19 @@ fn resolve_session_argument(
 ) -> Result<PathBuf> {
     let path_like = argument.contains('/') || argument.contains('\\') || argument.ends_with(".jsonl");
     if path_like {
-        let root = session_dir
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| pi_coding::default_session_dir(cwd));
         let path = Path::new(argument);
         let path = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
-        return pi_coding::validated_saved_session_path(&root, &path)
-            .with_context(|| format!("validating explicit session path {argument:?}"));
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("reading explicit session path {argument:?}"))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            bail!("explicit session path is not a regular file: {}", path.display());
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            bail!("explicit session path is not a .jsonl file: {}", path.display());
+        }
+        return path
+            .canonicalize()
+            .with_context(|| format!("resolving explicit session path {argument:?}"));
     }
     let sessions = pi_coding::list_sessions_in(cwd, session_dir);
     if let Some(exact) = sessions.iter().find(|session| session.id == argument) {
@@ -289,26 +351,71 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     cwd = cwd
         .canonicalize()
         .with_context(|| format!("resolving working directory {}", cwd.display()))?;
-    let mut workspace = pi_coding::WorkspaceRoots::new(&cwd, &cli.add_dirs)?;
-    let session_dir = cli.session_dir.as_deref();
     if let Some(id) = cli.session_id.as_deref() {
         pi_coding::validate_session_id(id)?;
     }
+
+    let mut resource_options = ResourceManagerOptions::new(&cwd);
+    let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let stdout_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    resource_options.headless = matches!(cli.mode, Some(crate::args::Mode::Json | crate::args::Mode::Rpc))
+        || cli.is_print_mode()
+        || !stdin_tty
+        || !stdout_tty;
+    // Interactive TUI mode: capture settings diagnostics so they can be shown
+    // in the UI after startup instead of vanishing into pre-TUI stderr. Non-
+    // interactive modes keep the existing stderr behavior.
+    let is_tui = !resource_options.headless;
+    if is_tui {
+        pi_coding::arm_settings_diagnostic_capture();
+    }
+    resource_options.project_trust_override = if cli.approve {
+        Some(true)
+    } else if cli.no_approve {
+        Some(false)
+    } else {
+        None
+    };
+    resource_options.explicit_extension_paths.clone_from(&cli.extensions);
+    resource_options.explicit_skill_paths.clone_from(&cli.skills);
+    resource_options.explicit_prompt_paths.clone_from(&cli.prompt_templates);
+    resource_options.explicit_theme_paths.clone_from(&cli.themes);
+    resource_options.disable_extensions = cli.no_extensions;
+    resource_options.disable_skills = cli.no_skills;
+    resource_options.disable_prompt_templates = cli.no_prompt_templates;
+    resource_options.disable_themes = cli.no_themes;
+    resource_options.disable_context_files = cli.no_context_files;
+    let mut blueprint = RunSessionBlueprint::from_cli(
+        cli,
+        resource_options,
+        matches!(extension_mode(cli), ExtensionMode::Tui | ExtensionMode::Rpc)
+            .then(ExtensionUiAdapter::new),
+    );
+    let mut preview_resources = pi_coding::ResourceManager::new(
+        blueprint.resource_options_for_startup(&cwd)?,
+    )
+    .context("loading settings and resources")?;
+    let mut settings = preview_resources.snapshot().settings.clone();
+    let session_dir = effective_session_dir(&cwd, cli.session_dir.as_deref(), settings.session_dir.as_deref())?;
+    blueprint.set_session_dir(session_dir.clone());
+
+
     let resume_path: Option<PathBuf> = if let Some(input) = cli.resume.as_deref() {
-        Some(resolve_resume_for_startup(input, Some(&cwd))?.path)
+        let sources = settings.effective_session_import_sources();
+        Some(resolve_resume_for_startup(input, Some(&cwd), &session_dir, &sources)?.path)
     } else if let Some(argument) = cli.session.as_deref() {
-        Some(resolve_session_argument(argument, &cwd, session_dir)?)
+        Some(resolve_session_argument(argument, &cwd, Some(&session_dir))?)
     } else if let Some(argument) = cli.fork.as_deref() {
-        Some(resolve_session_argument(argument, &cwd, session_dir)?)
+        Some(resolve_session_argument(argument, &cwd, Some(&session_dir))?)
     } else if cli.continue_latest {
         // Deliberately native-only: `--continue` must never surprise-import a
         // foreign session merely because it is newer.
-        pi_coding::list_sessions_in(&cwd, session_dir)
+        pi_coding::list_sessions_in(&cwd, Some(&session_dir))
             .into_iter()
             .next()
             .map(|session| session.path)
     } else if let Some(id) = cli.session_id.as_deref() {
-        pi_coding::list_sessions_in(&cwd, session_dir)
+        pi_coding::list_sessions_in(&cwd, Some(&session_dir))
             .into_iter()
             .find(|session| session.id == id)
             .map(|session| session.path)
@@ -329,51 +436,37 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
                 format!("resolving resumed working directory {}", tree.header.cwd.display())
             })?;
         }
-        workspace = pi_coding::WorkspaceRoots::new(&cwd, &cli.add_dirs)?;
         resume_has_thinking_entry = tree.has_thinking_entry();
         resume_ctx = Some(tree.build_context(None));
+        preview_resources = preview_resources
+            .rebuild_for_cwd(&cwd)
+            .context("reloading settings and resources for resumed working directory")?;
+        settings = preview_resources.snapshot().settings.clone();
     }
 
-    let mut resource_options = ResourceManagerOptions::new(&cwd);
-    let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let stdout_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    resource_options.headless = matches!(cli.mode, Some(crate::args::Mode::Json | crate::args::Mode::Rpc))
-        || cli.is_print_mode()
-        || !stdin_tty
-        || !stdout_tty;
-    resource_options.project_trust_override = if cli.approve {
-        Some(true)
-    } else if cli.no_approve {
-        Some(false)
-    } else {
-        None
-    };
-    resource_options.explicit_extension_paths.clone_from(&cli.extensions);
-    resource_options.explicit_skill_paths.clone_from(&cli.skills);
-    resource_options.explicit_prompt_paths.clone_from(&cli.prompt_templates);
-    resource_options.explicit_theme_paths.clone_from(&cli.themes);
-    resource_options.disable_extensions = cli.no_extensions;
-    resource_options.disable_skills = cli.no_skills;
-    resource_options.disable_prompt_templates = cli.no_prompt_templates;
-    resource_options.disable_themes = cli.no_themes;
-    resource_options.disable_context_files = cli.no_context_files;
-    let blueprint = RunSessionBlueprint::from_cli(
-        cli,
-        resource_options,
-        matches!(extension_mode(cli), ExtensionMode::Tui | ExtensionMode::Rpc)
-            .then(ExtensionUiAdapter::new),
-    );
-    let preview_resources = pi_coding::ResourceManager::new(
-        blueprint.resource_options_for_startup(&cwd)?,
-    )
-    .context("loading settings and resources")?;
-    let settings = preview_resources.snapshot().settings.clone();
     if cli.verbose {
         for diagnostic in preview_resources.diagnostics() {
             let path = diagnostic.path.as_ref().map_or(String::new(), |path| {
                 format!(" ({})", path.display())
             });
             eprintln!("{:?}: {}{}", diagnostic.level, diagnostic.message, path);
+        }
+    }
+    // Collect non-fatal startup warnings for TUI display. Settings diagnostics
+    // were captured (stderr suppressed) when the TUI capture is armed; resource
+    // diagnostics are collected from the snapshot. Error-level resource
+    // diagnostics already bailed inside build_candidate, so only warnings remain.
+    let mut startup_warnings = if is_tui {
+        pi_coding::drain_settings_diagnostics()
+    } else {
+        Vec::new()
+    };
+    if is_tui {
+        for diagnostic in preview_resources.diagnostics() {
+            let path = diagnostic.path.as_ref().map_or(String::new(), |path| {
+                format!(" ({})", path.display())
+            });
+            startup_warnings.push(format!("{:?}: {}{}", diagnostic.level, diagnostic.message, path));
         }
     }
     let model_patterns = cli.models.as_deref().or_else(|| settings.scoped_model_patterns());
@@ -479,6 +572,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         orchestration,
         goal_tool,
     } = candidate;
+    session.set_session_dir(session_dir.clone());
 
     let setup_result: Result<()> = async {
         if let Some(path) = &resume_path {
@@ -495,7 +589,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
                     pi_coding::fork_session_in(
                         path,
                         &cwd,
-                        session_dir,
+                        Some(&session_dir),
                         cli.session_id.as_deref(),
                     )?
                 } else {
@@ -511,7 +605,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
                 &cwd,
                 Some(&model),
                 Some(thinking_level_str(thinking_level)),
-                session_dir,
+                Some(&session_dir),
                 cli.session_id.as_deref(),
                 None,
             )?;
@@ -556,11 +650,18 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         application.cleanup().await;
         return Err(error);
     }
+    // Drain any settings diagnostics emitted after the initial resource load
+    // (e.g. by blueprint.build which reloads resources). Due to process-wide
+    // dedupe, these are typically empty unless new paths were loaded.
+    if is_tui {
+        startup_warnings.extend(pi_coding::drain_settings_diagnostics());
+    }
     Ok(RunSession {
         application,
         extension_ui: blueprint.extension_ui(),
         model,
         scoped_models,
+        startup_warnings,
     })
 }
 
@@ -683,9 +784,60 @@ mod tests {
         RunSessionBlueprint::from_cli(
             cli,
             ResourceManagerOptions::new(std::env::current_dir().expect("cwd")),
-
             None,
         )
+    }
+
+
+    #[test]
+    fn effective_session_dir_obeys_cli_env_settings_default_precedence() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let cli = cwd.path().join("cli");
+        let env = cwd.path().join("env");
+        let settings = cwd.path().join("settings");
+
+        assert_eq!(
+            resolve_effective_session_dir(cwd.path(), Some(&cli), Some(&env), Some(&settings))
+                .expect("CLI"),
+            cli
+        );
+        assert_eq!(
+            resolve_effective_session_dir(cwd.path(), None, Some(&env), Some(&settings))
+                .expect("environment"),
+            env
+        );
+        assert_eq!(
+            resolve_effective_session_dir(cwd.path(), None, None, Some(&settings))
+                .expect("settings"),
+            settings
+        );
+        assert_eq!(
+            resolve_effective_session_dir(cwd.path(), None, None, None).expect("default"),
+            pi_coding::default_session_dir(cwd.path())
+        );
+        assert_eq!(
+            resolve_effective_session_dir(
+                cwd.path(),
+                None,
+                None,
+                Some(Path::new("relative-sessions")),
+            )
+            .expect("relative settings"),
+            pi_coding::canonical_path(Path::new("relative-sessions")).expect("relative path")
+        );
+    }
+
+    #[test]
+    fn effective_session_dir_ignores_empty_environment_value() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let settings = cwd.path().join("settings");
+        let env_session_dir = std::ffi::OsStr::new("");
+        let env_session_dir = (!env_session_dir.is_empty()).then(|| Path::new(env_session_dir));
+        assert_eq!(
+            resolve_effective_session_dir(cwd.path(), None, env_session_dir, Some(&settings))
+                .expect("settings"),
+            settings
+        );
     }
 
     #[test]
@@ -935,6 +1087,125 @@ mod tests {
             .expect("factory observed ChildSessionRequest.model");
         assert_eq!(captured.provider, parent_model.provider);
         assert_eq!(captured.id, parent_model.id);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bind_parent_session_binds_and_recovers_existing_sidecar() {
+        let artifacts = tempfile::tempdir().expect("artifacts");
+        let session_dir = tempfile::tempdir().expect("session dir");
+        let test_model = pi_ai::Model {
+            id: "durable-bind-test".to_owned(),
+            name: "Durable Bind Test".to_owned(),
+            api: "durable-bind-test".to_owned(),
+            provider: "durable-bind-test".to_owned(),
+            ..pi_ai::Model::default()
+        };
+        // Create a parent session with a recorder.
+        let recorder = pi_coding::start_session_in(
+            artifacts.path(),
+            Some(&test_model),
+            None,
+            Some(session_dir.path()),
+            None,
+            None,
+        )
+        .expect("parent recorder");
+        let parent = Session::new(pi_coding::SessionOptions {
+            model: test_model.clone(),
+            cwd: artifacts.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("parent session");
+        parent.record(recorder).expect("record");
+
+        let factory: ChildSessionFactory = Arc::new(|_| {
+            Box::pin(async { Err(anyhow!("test factory should not be called")) })
+        });
+        let mut config = pi_coding::OrchestrationConfig::new(
+            pi_coding::AgentCatalog::from_agents(vec![pi_coding::AgentDefinition {
+                name: "task".to_owned(),
+                description: "task".to_owned(),
+                system_prompt: "task".to_owned(),
+                tools: Some(Vec::new()),
+                autoload_skills: Vec::new(),
+                model: None,
+                thinking_level: Some(ThinkingLevel::Off),
+                source: pi_coding::AgentDefinitionSource::Bundled,
+                path: None,
+                trusted: true,
+            }]),
+            artifacts.path(),
+        );
+        config.parent_model = test_model;
+        config.idle_ttl = None;
+        let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
+
+        runtime.bind_parent_session(&parent).expect("bind");
+        assert!(runtime.is_durable());
+        assert!(
+            runtime.recover().is_err(),
+            "plain bind must not create or overwrite missing durable state"
+        );
+        runtime
+            .recover_or_initialize()
+            .expect("initialize fresh durable state");
+        runtime.recover().expect("recover initialized state");
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bind_parent_session_fails_without_recorder() {
+        let artifacts = tempfile::tempdir().expect("artifacts");
+        let parent = Session::new(pi_coding::SessionOptions {
+            model: pi_ai::Model::default(),
+            cwd: artifacts.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("parent session");
+        // No recorder attached — bind should fail.
+        let factory: ChildSessionFactory = Arc::new(|_| {
+            Box::pin(async { Err(anyhow!("should not be called")) })
+        });
+        let config = pi_coding::OrchestrationConfig::new(
+            pi_coding::AgentCatalog::from_agents(vec![pi_coding::AgentDefinition {
+                name: "task".to_owned(),
+                description: "task".to_owned(),
+                system_prompt: "task".to_owned(),
+                tools: Some(Vec::new()),
+                autoload_skills: Vec::new(),
+                model: None,
+                thinking_level: Some(ThinkingLevel::Off),
+                source: pi_coding::AgentDefinitionSource::Bundled,
+                path: None,
+                trusted: true,
+            }]),
+            artifacts.path(),
+        );
+        let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
+        let error = runtime
+            .bind_parent_session(&parent)
+            .expect_err("bind without recorder should fail");
+        assert!(error.to_string().contains("recording is unavailable"));
+        assert!(!runtime.is_durable());
         runtime.shutdown().await;
     }
 }

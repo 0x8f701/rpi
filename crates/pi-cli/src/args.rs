@@ -49,7 +49,7 @@ pub struct Cli {
     pub continue_latest: bool,
 
     /// Resume a native or foreign session by path, exact id, or unambiguous prefix.
-    #[arg(long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "session", "session_id", "fork", "no_session"])]
+    #[arg(short = 'r', long, value_name = "PATH_OR_ID", conflicts_with_all = ["continue_latest", "session", "session_id", "fork", "no_session"])]
     pub resume: Option<String>,
 
 
@@ -174,11 +174,22 @@ pub struct Cli {
     #[arg(long = "no-approve", conflicts_with = "approve", global = true)]
     pub no_approve: bool,
 
+    /// Host tool approval policy: yolo, write, or ask.
+    #[arg(long = "approval-mode", value_enum, value_name = "MODE", global = true)]
+    pub approval_mode: Option<ApprovalModeArg>,
+
     /// Prompt turns. On a terminal these initialize the interactive UI; in
     /// print/structured modes each positional is sent as a separate turn.
     #[arg(value_name = "PROMPT")]
     pub prompt: Vec<String>,
 
+    /// Bind an opt-in HTTP/WebSocket control plane sharing the live application.
+    #[arg(long, value_name = "SOCKET_ADDR")]
+    pub listen: Option<std::net::SocketAddr>,
+
+    /// Bearer token file required for non-loopback --listen (optional on loopback).
+    #[arg(long, value_name = "PATH", requires = "listen")]
+    pub listen_token_file: Option<PathBuf>,
 }
 
 /// Headless application adapters.
@@ -187,6 +198,23 @@ pub enum Mode {
     Text,
     Json,
     Rpc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalModeArg {
+    Yolo,
+    Write,
+    Ask,
+}
+
+impl From<ApprovalModeArg> for pi_agent::ApprovalMode {
+    fn from(value: ApprovalModeArg) -> Self {
+        match value {
+            ApprovalModeArg::Yolo => Self::Yolo,
+            ApprovalModeArg::Write => Self::Write,
+            ApprovalModeArg::Ask => Self::Ask,
+        }
+    }
 }
 
 /// First-class subcommands.
@@ -424,6 +452,30 @@ impl Cli {
                 return Err("--force only applies to rpi self-update targets".to_owned());
             }
         }
+        if self.listen.is_some() && self.command.is_some() {
+            return Err("--listen cannot be combined with subcommands".to_owned());
+        }
+        if self.listen.is_some()
+            && matches!(self.mode, Some(Mode::Json) | Some(Mode::Rpc))
+        {
+            return Err("--listen is only supported on the text/TUI/REPL path".to_owned());
+        }
+        if self.listen.is_some() && self.is_print_mode() {
+            return Err("--listen is only supported on the text/TUI/REPL path (not print mode)".to_owned());
+        }
+        if self.listen.is_some() && self.list_models.is_some() {
+            return Err("--listen cannot be combined with --list-models".to_owned());
+        }
+        if let Some(path) = self.listen_token_file.as_deref()
+            && self.listen.is_none()
+        {
+            return Err("--listen-token-file requires --listen".to_owned());
+        }
+        if let Some(path) = self.listen_token_file.as_deref()
+            && path.as_os_str().is_empty()
+        {
+            return Err("--listen-token-file requires a non-empty path".to_owned());
+        }
         for (flag, names) in [
             ("--tools", self.tools.as_deref()),
             ("--exclude-tools", Some(self.exclude_tools.as_slice())),
@@ -510,6 +562,7 @@ mod tests {
             "--extension", "two-ext", "--skill", "skill-a", "--skill", "skill-b",
             "--prompt-template", "prompt-a", "--prompt-template", "prompt-b",
             "--theme", "theme-a", "--theme", "theme-b", "--add-dir", "workspace-a",
+
             "--add-dir", "workspace-b",
         ])
         .expect("parse parity flags");
@@ -530,6 +583,19 @@ mod tests {
         assert_eq!(cli.themes.len(), 2);
         assert_eq!(cli.add_dirs, [PathBuf::from("workspace-a"), PathBuf::from("workspace-b")]);
         assert!(cli.offline && cli.verbose);
+    }
+    #[test]
+    fn parses_approval_mode_and_rejects_invalid_values() {
+        for (wire, expected) in [
+            ("yolo", ApprovalModeArg::Yolo),
+            ("write", ApprovalModeArg::Write),
+            ("ask", ApprovalModeArg::Ask),
+        ] {
+            let cli = Cli::try_parse_from(["rpi", "--approval-mode", wire]).expect("approval mode");
+            assert_eq!(cli.approval_mode, Some(expected));
+        }
+        assert!(Cli::try_parse_from(["rpi", "--approval-mode", "WRITE"]).is_err());
+        assert!(Cli::try_parse_from(["rpi", "--approval-mode", "always"]).is_err());
     }
 
     #[test]
@@ -554,6 +620,16 @@ mod tests {
             .expect("unified resume");
         assert_eq!(unified.resume.as_deref(), Some("grok-prefix"));
         assert!(Cli::try_parse_from(["rpi", "--resume-codex", "codex-id"]).is_err());
+    }
+    #[test]
+    fn resume_short_alias_sets_resume_and_retains_conflicts() {
+        let cli = Cli::try_parse_from(["rpi", "-r", "session-id"])
+            .expect("short resume alias");
+        assert_eq!(cli.resume.as_deref(), Some("session-id"));
+        // The short alias participates in the same selector conflicts as --resume.
+        assert!(Cli::try_parse_from(["rpi", "-r", "id", "--session", "other"]).is_err());
+        assert!(Cli::try_parse_from(["rpi", "-r", "id", "--continue"]).is_err());
+        assert!(Cli::try_parse_from(["rpi", "-r", "id", "--no-session"]).is_err());
     }
 
     #[test]
@@ -641,6 +717,63 @@ mod tests {
             after.cwd.as_deref(),
             Some(PathBuf::from("workspace-b").as_path())
         );
-        assert!(matches!(after.command, Some(Command::Sessions)));
+    }
+
+    #[test]
+    fn listen_flags_parse_and_require_socket_addr() {
+        let cli = Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0"])
+            .expect("parse listen loopback");
+        assert_eq!(
+            cli.listen.as_ref().map(std::net::SocketAddr::to_string),
+            Some("127.0.0.1:0".to_owned())
+        );
+        assert!(cli.listen_token_file.is_none());
+        let with_token = Cli::try_parse_from([
+            "rpi",
+            "--listen",
+            "127.0.0.1:0",
+            "--listen-token-file",
+            "token",
+        ])
+        .expect("parse listen token");
+        assert_eq!(
+            with_token.listen_token_file.as_deref(),
+            Some(PathBuf::from("token").as_path())
+        );
+        assert!(
+            Cli::try_parse_from(["rpi", "--listen-token-file", "token"]).is_err(),
+            "token file without --listen parses"
+        );
+    }
+
+    #[test]
+    fn listen_rejects_structured_modes_and_subcommands() {
+        let rpc = Cli::try_parse_from(["rpi", "--mode", "rpc", "--listen", "127.0.0.1:0"])
+            .expect("parse rpc listen");
+        assert!(rpc.validate().is_err());
+        let json = Cli::try_parse_from(["rpi", "--mode", "json", "--listen", "127.0.0.1:0"])
+            .expect("parse json listen");
+        assert!(json.validate().is_err());
+        let sessions = Cli::try_parse_from(["rpi", "sessions", "--listen", "127.0.0.1:0"]);
+        assert!(sessions.is_err(), "subcommand plus listen parses");
+        let print_mode = Cli::try_parse_from(["rpi", "--print", "--listen", "127.0.0.1:0"])
+            .expect("parse print listen");
+        assert!(print_mode.validate().is_err());
+    }
+
+    #[test]
+    fn listen_token_file_requires_non_empty_path() {
+        // Contract: clap's `PathBuf` value parser rejects empty values with
+        // `ErrorKind::InvalidValue`, so `--listen-token-file ''` fails at parse
+        // time before `validate()` runs (the empty-path guard there is defensive).
+        let error = Cli::try_parse_from([
+            "rpi",
+            "--listen",
+            "127.0.0.1:0",
+            "--listen-token-file",
+            "",
+        ])
+        .expect_err("empty token path should be rejected at parse time");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
     }
 }

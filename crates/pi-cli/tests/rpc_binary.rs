@@ -687,10 +687,7 @@ fn concurrent_ids_correlate_independently() {
         .collect::<Vec<_>>();
     assert_eq!(
         command_names,
-        [
-            "settings", "model", "branch", "resume", "fork", "export", "agents",
-            "compact", "ps", "loop", "goal", "workflow",
-        ],
+        pi_cli::interactive_commands::PRIMARY_COMMAND_NAMES,
         "RPC command discovery must match TUI and REPL primary slash surface"
     );
 
@@ -858,16 +855,13 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
     session.write_line(&format!(
         r#"{{"type":"loop_delete","id":"loop-delete","taskId":"{task_id}"}}"#
     ));
-    session.write_line(r#"{"type":"loop_list","id":"after-loop-delete"}"#);
     let mut malformed = None;
     let mut deleted = None;
-    let mut empty = None;
-    while malformed.is_none() || deleted.is_none() || empty.is_none() {
+    while malformed.is_none() || deleted.is_none() {
         let line = session.read_json_deadline(deadline);
         match line.get("id").and_then(Value::as_str) {
             Some("bad-loop-update") => malformed = Some(line),
             Some("loop-delete") => deleted = Some(line),
-            Some("after-loop-delete") => empty = Some(line),
             _ => {}
         }
     }
@@ -880,7 +874,11 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
         Some("bad-loop-update"),
         "Invalid command",
     );
-    let empty = empty.expect("loop list after delete");
+
+    session.write_line(r#"{"type":"loop_list","id":"after-loop-delete"}"#);
+    let (_events, empty) = session.read_until(deadline, |line| {
+        is_response(line) && line.get("id").and_then(Value::as_str) == Some("after-loop-delete")
+    });
     assert_success(&empty, "loop_list", "after-loop-delete");
     assert!(empty["data"].as_array().expect("empty loop list").is_empty());
 

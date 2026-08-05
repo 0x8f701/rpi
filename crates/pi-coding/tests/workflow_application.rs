@@ -29,8 +29,25 @@ impl Fixture {
     }
 }
 fn git(cwd: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").args(["-c", "color.ui=false", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
-        .args(args).current_dir(cwd).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0").env("LC_ALL", "C").output().expect("git");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let output = Command::new("git")
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", cwd)
+        .env("USERPROFILE", cwd)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", cwd.join("absent-global-git-config"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "Pi Test")
+        .env("GIT_AUTHOR_EMAIL", "pi@example.test")
+        .env("GIT_COMMITTER_NAME", "Pi Test")
+        .env("GIT_COMMITTER_EMAIL", "pi@example.test")
+        .env("LC_ALL", "C")
+        .args(["-c", "color.ui=false", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git");
     assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
     String::from_utf8(output.stdout).expect("utf8").trim().to_owned()
 }
@@ -121,7 +138,9 @@ async fn plain_text_planning_survives_and_later_todo_mutation_runs() {
         })
         .await
         .expect("plain-text planning must create the workflow");
-    assert_eq!(created.status, WorkflowStatus::Planning);
+    // With async supervisor start, the workflow is created as Queued.
+    // Wait for the supervisor to reach Planning before mutating Todo.
+    let created = wait_status(&application, &created.workflow_id, WorkflowStatus::Planning).await;
     assert!(created.todo.phases.is_empty());
 
     let result = application
@@ -140,7 +159,24 @@ async fn plain_text_planning_survives_and_later_todo_mutation_runs() {
     assert_eq!(result.phases[0].tasks[0].id, "later-root");
     assert!(application.todo_state().phases.is_empty(), "parent Todo must remain unchanged");
     let child = factory.child_application(&created.workflow_id, created.generation).expect("exact workflow child application");
-    let jobs = child.orchestration_runtime().expect("child orchestration").jobs(None);
+    let jobs = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let jobs = child
+                .orchestration_runtime()
+                .expect("child orchestration")
+                .jobs(None);
+            if jobs.iter().any(|job| {
+                job.todo_task_id.as_deref() == Some("later-root")
+                    && job.workflow_id.as_deref() == Some(created.workflow_id.as_str())
+                    && job.workflow_generation == Some(created.generation)
+            }) {
+                break jobs;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("workflow Todo job projection timed out");
     assert!(jobs.iter().any(|job| job.todo_task_id.as_deref() == Some("later-root") && job.workflow_id.as_deref() == Some(created.workflow_id.as_str()) && job.workflow_generation == Some(created.generation)), "workflow Todo jobs must preserve exact ownership: {jobs:?}");
     let running = wait_status(&application, &created.workflow_id, WorkflowStatus::Running).await;
     assert_eq!(running.todo.phases[0].tasks[0].id, "later-root");
@@ -160,20 +196,22 @@ async fn workflow_todo_mutation_fails_safely_for_missing_workflow() {
 }
 
 #[tokio::test]
-async fn provider_planning_error_still_rolls_back_create_safely() {
+async fn provider_planning_error_surfaces_failed_status() {
     let f = Fixture::new();
     let secret = "upstream api_key=workflow-secret";
     let (application, _factory, _registration) = app(&f, vec![FauxResponse::error(secret)]).await;
-    let error = application
+    // With async supervisor start, workflow creation succeeds immediately
+    // (Queued). The provider error surfaces later through the projection
+    // sink as a Failed status update.
+    let created = application
         .workflow_create(WorkflowCreateRequest {
             name: "provider-error".into(),
             objective: "must not survive provider failure".into(),
         })
         .await
-        .expect_err("provider failure must fail workflow creation");
-    assert_eq!(error.to_string(), "workflow runtime creation failed");
-    assert!(!error.to_string().contains(secret));
-    assert!(application.workflow_list().is_empty());
+        .expect("workflow creation should succeed with async start");
+    let snapshot = wait_status(&application, &created.workflow_id, WorkflowStatus::Failed).await;
+    assert!(!format!("{snapshot:?}").contains(secret));
     application.cleanup().await;
 }
 
@@ -217,27 +255,41 @@ async fn integrate_remove_and_conflict_retention() {
 #[tokio::test]
 async fn cleanup_preserves_paused_workflow_for_restore() {
     let f = Fixture::new();
-    let (first, _factory, registration) = app(
-        &f,
-        vec![FauxResponse::text("planning acknowledged")],
+    let (first, _factory, registration) = tokio::time::timeout(
+        Duration::from_secs(10),
+        app(&f, vec![FauxResponse::text("planning acknowledged")]),
     )
-    .await;
-    let created = first
-        .workflow_create(WorkflowCreateRequest {
+    .await
+    .expect("initial workflow application setup timed out");
+    let created = tokio::time::timeout(
+        Duration::from_secs(10),
+        first.workflow_create(WorkflowCreateRequest {
             name: "paused-restore".into(),
             objective: "resume after process exit".into(),
-        })
-        .await
-        .expect("create workflow");
-    let paused = first
-        .workflow_pause(&created.workflow_id, created.generation)
-        .await
-        .expect("pause workflow");
+        }),
+    )
+    .await
+    .expect("workflow create timed out")
+    .expect("create workflow");
+    let paused = tokio::time::timeout(
+        Duration::from_secs(10),
+        first.workflow_pause(&created.workflow_id, created.generation),
+    )
+    .await
+    .expect("workflow pause timed out")
+    .expect("pause workflow");
     assert_eq!(paused.status, WorkflowStatus::Paused);
-    first.cleanup().await;
+    tokio::time::timeout(Duration::from_secs(10), first.cleanup())
+        .await
+        .expect("initial workflow application cleanup timed out");
     drop(registration);
 
-    let (second, _factory, _registration) = app(&f, Vec::new()).await;
+    let (second, _factory, _registration) = tokio::time::timeout(
+        Duration::from_secs(10),
+        app(&f, Vec::new()),
+    )
+    .await
+    .expect("restored workflow application setup timed out");
     assert_eq!(
         second
             .workflow_get(&created.workflow_id)
@@ -245,7 +297,77 @@ async fn cleanup_preserves_paused_workflow_for_restore() {
             .status,
         WorkflowStatus::Paused
     );
-    second.cleanup().await;
+    tokio::time::timeout(Duration::from_secs(10), second.cleanup())
+        .await
+        .expect("restored workflow application cleanup timed out");
+}
+
+#[tokio::test]
+async fn real_runtime_resume_cancel_and_remove_lifecycle_is_bounded() {
+    let f = Fixture::new();
+    let (application, _factory, _registration) = tokio::time::timeout(
+        Duration::from_secs(10),
+        app(&f, vec![FauxResponse::text("planning acknowledged")]),
+    )
+    .await
+    .expect("workflow application setup timed out");
+    let created = tokio::time::timeout(
+        Duration::from_secs(10),
+        application.workflow_create(WorkflowCreateRequest {
+            name: "lifecycle".into(),
+            objective: "exercise real public lifecycle".into(),
+        }),
+    )
+    .await
+    .expect("workflow create timed out")
+    .expect("create workflow");
+    let created = wait_status(&application, &created.workflow_id, WorkflowStatus::Planning).await;
+    assert_eq!(application.workflow_list().len(), 1);
+    assert_eq!(application.workflow_get(&created.workflow_id).expect("show workflow").name, "lifecycle");
+    let path = worktree(&f, created.workflow_id.as_str());
+    assert!(path.exists());
+
+    let paused = tokio::time::timeout(
+        Duration::from_secs(10),
+        application.workflow_pause(&created.workflow_id, created.generation),
+    )
+    .await
+    .expect("workflow pause timed out")
+    .expect("pause workflow");
+    assert_eq!(paused.status, WorkflowStatus::Paused);
+
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(10),
+        application.workflow_resume(&created.workflow_id, created.generation),
+    )
+    .await
+    .expect("workflow resume timed out")
+    .expect("resume workflow");
+    assert_eq!(resumed.status, WorkflowStatus::Planning);
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(10),
+        application.workflow_cancel(&created.workflow_id, created.generation),
+    )
+    .await
+    .expect("workflow cancel timed out")
+    .expect("cancel workflow");
+    assert_eq!(cancelled.status, WorkflowStatus::Cancelled);
+    assert!(path.exists(), "cancel preserves the owned worktree until explicit remove");
+
+    let removed = tokio::time::timeout(
+        Duration::from_secs(10),
+        application.workflow_remove(&created.workflow_id, created.generation),
+    )
+    .await
+    .expect("workflow remove timed out")
+    .expect("remove workflow");
+    assert_eq!(removed.workflow_id, created.workflow_id);
+    assert!(application.workflow_list().is_empty());
+    assert!(!path.exists());
+    tokio::time::timeout(Duration::from_secs(10), application.cleanup())
+        .await
+        .expect("workflow application cleanup timed out");
 }
 
 #[test]
@@ -295,7 +417,7 @@ async fn shared_agent_root_keeps_repository_workflows_isolated() {
         name: "first-repo".into(),
         objective: "remain isolated".into(),
     }).await.expect("create first workflow");
-    assert_eq!(created.status, WorkflowStatus::Planning);
+    let _ = wait_status(&first_application, &created.workflow_id, WorkflowStatus::Planning).await;
     first_application.cleanup().await;
     drop(first_registration);
 

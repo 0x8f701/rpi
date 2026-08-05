@@ -494,6 +494,8 @@ mod tests {
             content: None,
             display: None,
             details: None,
+            usage: None,
+            from_hook: None,
             data: None,
             name: None,
             label: None,

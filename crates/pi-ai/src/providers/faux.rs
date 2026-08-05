@@ -78,7 +78,7 @@ impl FauxProviderRegistration {
 }
 pub fn register_faux_provider(options: FauxProviderOptions) -> FauxProviderRegistration {
     let queue = Arc::new(Mutex::new(VecDeque::new()));
-    let source_id = format!("faux:{}", now_millis());
+    let source_id = format!("faux:{}", uuid::Uuid::now_v7());
     let reg = FauxProviderRegistration {
         api: options.api.clone(),
         models: options.models.clone(),
@@ -308,7 +308,13 @@ mod tests {
             stop_reason: StopReason::ToolUse,
             error_message: None,
         }]);
-        let events = stream_simple(model, Context::default(), SimpleStreamOptions::default()).await;
+        let events = faux_stream(
+            model,
+            SimpleStreamOptions::default().stream,
+            registration.queue.clone(),
+            registration.chunk_size,
+        )
+        .await;
         let mut kinds = Vec::new();
         while let Some(event) = events.next().await {
             kinds.push(match event {
@@ -344,7 +350,7 @@ mod tests {
         token.cancel();
         let mut options = SimpleStreamOptions::default();
         options.stream.abort_signal = Some(token);
-        let events = stream_simple(model, Context::default(), options).await;
+        let events = faux_stream(model, options.stream, registration.queue.clone(), registration.chunk_size).await;
         assert!(matches!(
             events.next().await,
             Some(AssistantMessageEvent::Error {
@@ -358,4 +364,17 @@ mod tests {
         );
         registration.unregister();
     }
+    #[test]
+    fn concurrent_registrations_have_distinct_sources() {
+        let registrations = std::thread::scope(|scope| {
+            let first = scope.spawn(unique_registration);
+            let second = scope.spawn(unique_registration);
+            [first.join().expect("first registration"), second.join().expect("second registration")]
+        });
+        assert_ne!(registrations[0].source_id, registrations[1].source_id);
+        for registration in registrations {
+            registration.unregister();
+        }
+    }
+
 }

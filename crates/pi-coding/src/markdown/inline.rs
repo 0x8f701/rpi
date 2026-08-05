@@ -9,6 +9,7 @@ pub enum InlineStyle {
     Bold,
     Italic,
     Code,
+    TableBorder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -3,19 +3,24 @@ mod runtime;
 mod workflows;
 mod workflow_backend;
 mod workflow_events;
+mod side_chat;
+pub use side_chat::{
+    SideChatFork, SideChatMainPeek, create_peek_main_tool, filter_tools_by_capabilities,
+    tools_include_mutation,
+};
 pub use todo_execution::{TodoDagExecutionOutcome, TodoDagExecutionStatus};
 pub use runtime::ApplicationRuntimeCandidate;
 pub use workflows::ApplicationWorkflowRuntimeFactory;
 
-use std::{collections::HashSet, path::{Path, PathBuf}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicUsize, Ordering}}, time::{Duration, Instant}};
+use std::{path::{Path, PathBuf}, sync::{Arc, Weak, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
-use pi_agent::{AgentEvent, AgentTool, AgentToolResult, Subscription, ThinkingLevel};
+use pi_agent::{AgentEvent, AgentTool, AgentToolResult, ThinkingLevel, ToolCapability, compose_before_tool_call};
 use pi_ai::{ContentBlock, CustomMessage, Message, Model, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, broadcast}, task::JoinHandle};
+use tokio::{sync::{Mutex as AsyncMutex, OwnedMutexGuard, broadcast}, task::JoinHandle};
 
 use crate::{
     CompactionReason, ExtensionActionHost, ExtensionCancellation, ExtensionCommandDescriptor,
@@ -43,6 +48,43 @@ pub enum GoalActivationOutcome {
     AlreadyActive,
 }
 
+/// Outcome shared by lifecycle operations that either complete or are cancelled by an extension.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionChangeOutcome {
+    pub cancelled: bool,
+}
+
+impl SessionChangeOutcome {
+    const COMPLETED: Self = Self { cancelled: false };
+    const CANCELLED: Self = Self { cancelled: true };
+}
+
+/// Outcome of a fork operation, including the selected prompt text on success.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionForkOutcome {
+    pub text: String,
+    pub cancelled: bool,
+}
+
+impl SessionForkOutcome {
+    fn completed(text: String) -> Self {
+        Self { text, cancelled: false }
+    }
+
+    fn cancelled() -> Self {
+        Self { text: String::new(), cancelled: true }
+    }
+}
+
+
+struct PreparedSameCwdCutover {
+    session: crate::PreparedSessionReplacement,
+    orchestration: Option<(crate::OrchestrationRuntime, crate::PreparedDurableBinding)>,
+    loop_handle: crate::LoopSchedulerHandle,
+    loops: crate::PreparedLoopActivation,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -326,6 +368,7 @@ impl GoalToolBinding {
                 }
             },
         )
+        .with_capability(ToolCapability::Write)
     }
 
     pub fn bind(&self, application: &Application) -> Result<()> {
@@ -405,38 +448,13 @@ impl Application {
 }
 
 struct ApplicationInner {
-    session: Session,
     events: broadcast::Sender<ApplicationEvent>,
     runtime_factory: Mutex<Option<Arc<dyn ApplicationRuntimeFactory>>>,
     runtime: runtime::ApplicationRuntimeSlot,
-    session_subscription: Mutex<Option<Subscription>>,
-    active_run: Mutex<Option<JoinHandle<()>>>,
-    extension_runtime: Mutex<Option<(ExtensionRuntime, ExtensionPermissionSet)>>,
-    todo_transition_active: AtomicBool,
-    orchestration_runtime: Mutex<Option<crate::OrchestrationRuntime>>,
-    orchestration_events: Mutex<Option<JoinHandle<()>>>,
     workflow_manager: Mutex<Option<crate::WorkflowManager>>,
     workflow_runtime_factory: Mutex<Option<Weak<workflows::ApplicationWorkflowRuntimeFactory>>>,
     workflow_events: Mutex<Option<JoinHandle<()>>>,
-    todo_dag: Mutex<todo_execution::TodoDagCoordinator>,
-    todo_dag_changed: Notify,
-    todo_cycle_pending: AtomicBool,
-    todo_continuation_suppressed: AtomicBool,
-    todo_resume_requested: AtomicBool,
-    charged_goal_jobs: Mutex<HashSet<String>>,
-    goal_tool_binding: Mutex<Option<GoalToolBinding>>,
-    goal_work_activation: Mutex<Option<GoalWorkKey>>,
-    goal_work_pending: AtomicUsize,
-    goal_work_changed: Notify,
-    orchestration_explicit: AtomicBool,
-    runtime_settings: Mutex<Arc<crate::RuntimeSettingsSnapshot>>,
-    process_manager: ProcessManager,
-    process_owner_id: ProcessOwnerId,
-    process_events: Mutex<Option<JoinHandle<()>>>,
-    session_events: Mutex<Option<JoinHandle<()>>>,
     loop_scheduler: Mutex<Option<crate::LoopSchedulerRuntime>>,
-    turn_gate: Arc<AsyncMutex<()>>,
-    loop_turn_active: AtomicBool,
     operation_gate: AsyncMutex<()>,
     cleanup_lock: AsyncMutex<()>,
     cleaned: AtomicBool,
@@ -503,14 +521,12 @@ impl Application {
 
     pub async fn new_with_orchestration(
         session: Session,
-        runtime: crate::OrchestrationRuntime,
+        orchestration: crate::OrchestrationRuntime,
     ) -> Self {
         let application = Self::build(session, None).await;
-        application.attach_orchestration(runtime).expect("fresh application accepts orchestration");
         application
-            .inner
-            .orchestration_explicit
-            .store(true, Ordering::Release);
+            .attach_orchestration(orchestration)
+            .expect("fresh application accepts orchestration");
         application
     }
 
@@ -519,302 +535,50 @@ impl Application {
         extension_runtime: Option<(ExtensionRuntime, ExtensionPermissionSet)>,
     ) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER_CAPACITY);
-        let process_manager = session.process_manager();
-        let process_owner_id = session.process_owner_id();
-        let runtime_settings = session
-            .resource_manager()
-            .map(|resources| resources.snapshot().settings.runtime_settings())
-            .transpose()
-            .expect("attached resource settings were already validated")
-            .unwrap_or_else(|| crate::Settings::default().runtime_settings().expect("default settings"));
-        let shell_extensions = extension_runtime.clone();
         let initial_runtime = runtime::ApplicationRuntime::new(
             runtime::INITIAL_RUNTIME_EPOCH,
-            session.clone(),
+            session,
             extension_runtime,
             None,
             None,
         );
         let inner = Arc::new(ApplicationInner {
-            session: session.clone(),
             runtime: runtime::ApplicationRuntimeSlot::new(initial_runtime, events.clone()),
             runtime_factory: Mutex::new(None),
             events,
-            active_run: Mutex::new(None),
-            session_subscription: Mutex::new(None),
-            session_events: Mutex::new(None),
-            extension_runtime: Mutex::new(shell_extensions),
-            orchestration_runtime: Mutex::new(None),
-            orchestration_events: Mutex::new(None),
             workflow_manager: Mutex::new(None),
             workflow_runtime_factory: Mutex::new(None),
             workflow_events: Mutex::new(None),
-            todo_dag: Mutex::new(todo_execution::TodoDagCoordinator::default()),
-            todo_dag_changed: Notify::new(),
-            todo_cycle_pending: AtomicBool::new(false),
-            todo_continuation_suppressed: AtomicBool::new(false),
-            todo_transition_active: AtomicBool::new(false),
-            todo_resume_requested: AtomicBool::new(false),
-            charged_goal_jobs: Mutex::new(HashSet::new()),
-            goal_tool_binding: Mutex::new(None),
-            goal_work_activation: Mutex::new(None),
-            goal_work_pending: AtomicUsize::new(0),
-            goal_work_changed: Notify::new(),
-            orchestration_explicit: AtomicBool::new(false),
-            runtime_settings: Mutex::new(Arc::new(runtime_settings)),
-            process_manager: process_manager.clone(),
-            process_owner_id,
-            process_events: Mutex::new(None),
             loop_scheduler: Mutex::new(None),
-            turn_gate: Arc::new(AsyncMutex::new(())),
-            loop_turn_active: AtomicBool::new(false),
             operation_gate: AsyncMutex::new(()),
             cleanup_lock: AsyncMutex::new(()),
             cleaned: AtomicBool::new(false),
         });
-        let todo_gate = inner.todo_dag_transaction_gate();
-        let todo_check_inner = Arc::downgrade(&inner);
-        let todo_commit_inner = Arc::downgrade(&inner);
-        session.set_todo_mutation_transaction(crate::todo::TodoMutationTransaction {
-            gate: todo_gate,
-            check: Arc::new(move || {
-                let inner = todo_check_inner
-                    .upgrade()
-                    .ok_or_else(|| anyhow!("application stopped"))?;
-                if inner.todo_transition_active.load(Ordering::Acquire) {
-                    return Err(anyhow!("Todo mutation rejected during session transition"));
-                }
-                Ok(())
-            }),
-            commit: Arc::new(move || {
-                let Some(inner) = todo_commit_inner.upgrade() else {
-                    return;
-                };
-                if let Err(error) = inner.arm_todo_dag_after_mutation_locked() {
-                    inner.todo_dag_failed(&error);
-                }
-            }),
-        });
-        let extension = inner.extension_runtime.lock().clone();
-        if let Some((runtime, _)) = extension.as_ref() {
-            runtime
-                .set_action_host(Arc::new(ApplicationExtensionHost {
-                    application: Arc::downgrade(&inner),
-                }))
-                .expect("new extension runtime must not already have an action host");
-            let before_start_runtime = runtime.clone();
-            session.set_before_agent_start(Some(Arc::new(move |context| {
-                let runtime = before_start_runtime.clone();
-                Box::pin(async move {
-                    let event = serde_json::json!({
-                        "prompt": prompt_text(&context.messages),
-                        "images": prompt_images(&context.messages),
-                    });
-                    let reduction = runtime
-                        .reduce_before_agent_start(event, context.system_prompt)
-                        .await?;
-                    let mut messages = context.messages;
-                    messages.extend(reduction.messages.into_iter().map(extension_custom_message));
-                    Ok(pi_agent::BeforeAgentStartResult {
-                        system_prompt: reduction.system_prompt,
-                        messages,
-                    })
-                })
-            })));
-            let context_runtime = runtime.clone();
-            session.set_transform_context(Some(Arc::new(move |messages, _| {
-                let runtime = context_runtime.clone();
-                Box::pin(async move { runtime.reduce_context(messages).await })
-            })));
-            let message_runtime = runtime.clone();
-            session.set_transform_message(Some(Arc::new(move |message, _| {
-                let runtime = message_runtime.clone();
-                Box::pin(async move { runtime.reduce_message_end(message).await })
-            })));
-            let tool_call_runtime = runtime.clone();
-            session.set_before_tool_call(Some(Arc::new(move |context| {
-                let runtime = tool_call_runtime.clone();
-                Box::pin(async move {
-                    let reduction = runtime
-                        .reduce_tool_call(
-                            &context.tool_call.id,
-                            &context.tool_call.name,
-                            context.arguments,
-                        )
-                        .await?;
-                    Ok(pi_agent::BeforeToolCallResult {
-                        block: reduction.block,
-                        reason: reduction.reason,
-                        arguments: Some(reduction.input),
-                    })
-                })
-            })));
-            let tool_result_runtime = runtime.clone();
-            session.set_after_tool_call(Some(Arc::new(move |context| {
-                let runtime = tool_result_runtime.clone();
-                Box::pin(async move {
-                    let reduction = runtime
-                        .reduce_tool_result(
-                            &context.tool_call.id,
-                            &context.tool_call.name,
-                            context.arguments,
-                            context.result.content,
-                            Some(context.result.details),
-                            context.is_error,
-                        )
-                        .await?;
-                    Ok(pi_agent::AfterToolCallResult {
-                        content: Some(reduction.content),
-                        details: reduction.details,
-                        is_error: Some(reduction.is_error),
-                        usage: reduction.usage.map(extension_usage),
-                        terminate: None,
-                    })
-                })
-            })));
-            let mut stream_options = session.stream_options();
-            let request_runtime = runtime.clone();
-            stream_options.stream.before_provider_request = Some(Arc::new(move |payload, _| {
-                let runtime = request_runtime.clone();
-                Box::pin(async move { runtime.reduce_provider_request(payload).await })
-            }));
-            let headers_runtime = runtime.clone();
-            stream_options.stream.before_provider_headers = Some(Arc::new(move |headers, _| {
-                let runtime = headers_runtime.clone();
-                Box::pin(async move { runtime.reduce_provider_headers(headers).await })
-            }));
-            let response_runtime = runtime.clone();
-            stream_options.stream.after_provider_response = Some(Arc::new(move |response, _| {
-                let runtime = response_runtime.clone();
-                Box::pin(async move {
-                    runtime
-                        .emit_checked(ExtensionEvent::new(
-                            "after_provider_response",
-                            serde_json::json!({ "status": response.status, "headers": response.headers }),
-                        ))
-                        .await
-                })
-            }));
-            session.set_stream_options(stream_options).await;
-            let compact_runtime = runtime.clone();
-            session.set_before_compaction(Some(Arc::new(move |context| {
-                let runtime = compact_runtime.clone();
-                Box::pin(async move {
-                    let reduction = runtime
-                        .reduce_before_compact(serde_json::json!({
-                            "customInstructions": context.custom_instructions,
-                            "reason": context.reason,
-                            "willRetry": context.will_retry,
-                        }))
-                        .await?;
-                    Ok(crate::BeforeCompactionResult {
-                        cancel: reduction.cancel,
-                        compaction: reduction.compaction,
-                    })
-                })
-            })));
-        }
-        let event_inner = Arc::downgrade(&inner);
-        let subscription = session
-            .subscribe(move |event| {
-                let event_inner = event_inner.clone();
-                async move {
-                    let Some(inner) = event_inner.upgrade() else {
-                        return Ok(());
-                    };
-                    let extension = inner
-                        .extension_runtime
-                        .lock()
-                        .as_ref()
-                        .map(|(runtime, _)| runtime.clone());
-                    if let Some(runtime) = extension
-                        && let Some(extension_event) = agent_extension_event(&event)
-                    {
-                        let _ = runtime.emit(extension_event).await;
-                    }
-                    if let AgentEvent::ToolExecutionEnd {
-                        tool_name,
-                        is_error: false,
-                        result,
-                        ..
-                    } = &event
-                        && tool_name == "todo"
-                    {
-                        let state = inner.session.todo_state();
-                        let completed_tasks = serde_json::from_value::<crate::TodoToolDetails>(
-                            result.details.clone(),
-                        )
-                        .map(|details| details.completed_tasks)
-                        .unwrap_or_default();
-                        inner.publish(ApplicationEvent::TodoUpdated {
-                            phases: state.phases,
-                            completed_tasks,
-                        });
-                    }
-                    inner.publish(ApplicationEvent::Agent(event));
-                    Ok(())
-                }
-            })
-            .await;
-        *inner.session_subscription.lock() = Some(subscription);
-        let mut session_events = session.subscribe_session_events();
-        let session_event_inner = Arc::downgrade(&inner);
-        let session_event_task = tokio::spawn(async move {
-            while let Ok(event) = session_events.recv().await {
-                let Some(inner) = session_event_inner.upgrade() else {
-                    break;
-                };
-                let extension = session_extension_event(&event);
-                let runtime = inner
-                    .extension_runtime
-                    .lock()
-                    .as_ref()
-                    .map(|(runtime, _)| runtime.clone());
-                if let (Some(extension), Some(runtime)) = (extension, runtime) {
-                    let _ = runtime.emit(extension).await;
-                }
-                inner.publish(ApplicationEvent::Session(event));
-            }
-        });
-        *inner.session_events.lock() = Some(session_event_task);
-        let mut process_events = process_manager.subscribe();
-        let process_event_inner = Arc::downgrade(&inner);
-        let process_event_task = tokio::spawn(async move {
-            loop {
-                match process_events.recv().await {
-                    Ok(event) => {
-                        let Some(inner) = process_event_inner.upgrade() else {
-                            break;
-                        };
-                        if process_event_owner(&event) == &inner.process_owner_id {
-                            inner.publish(ApplicationEvent::Process(event));
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-        *inner.process_events.lock() = Some(process_event_task);
-        let loop_runner_inner = Arc::downgrade(&inner);
+        let application = Self { inner };
+        let generation = application.runtime();
+        application
+            .bind_runtime_generation(&generation)
+            .await
+            .expect("fresh runtime generation must bind");
+        let loop_runner_inner = Arc::downgrade(&application.inner);
         let loop_runner: crate::LoopTurnRunner = Arc::new(move |request, cancel| {
             let inner = loop_runner_inner.clone();
             Box::pin(async move { run_loop_turn(inner, request, cancel).await })
         });
-        let loop_event_inner = Arc::downgrade(&inner);
+        let loop_event_inner = Arc::downgrade(&application.inner);
         let loop_events: crate::LoopEventSink = Arc::new(move |event| {
             if let Some(inner) = loop_event_inner.upgrade() {
                 inner.publish(ApplicationEvent::Loop(event));
             }
         });
-        let session_file = session.recorder_info().map(|(_, path)| path);
+        let session_file = generation.session.recorder_info().map(|(_, path)| path);
         let loop_scheduler = crate::start_loop_scheduler(
             session_file.as_deref(),
             loop_runner,
             loop_events,
         );
-        *inner.loop_scheduler.lock() = Some(loop_scheduler);
-        Self { inner }
+        *application.inner.loop_scheduler.lock() = Some(loop_scheduler);
+        application
     }
 
     async fn bind_runtime_generation(
@@ -859,8 +623,9 @@ impl Application {
                 let runtime = message_runtime.clone();
                 Box::pin(async move { runtime.reduce_message_end(message).await })
             })));
+            let host_hook = session.before_tool_call();
             let tool_call_runtime = runtime.clone();
-            session.set_before_tool_call(Some(Arc::new(move |context| {
+            let extension_hook = Arc::new(move |context: pi_agent::BeforeToolCallContext| {
                 let runtime = tool_call_runtime.clone();
                 Box::pin(async move {
                     let reduction = runtime
@@ -875,8 +640,9 @@ impl Application {
                         reason: reduction.reason,
                         arguments: Some(reduction.input),
                     })
-                })
-            })));
+                }) as pi_agent::BoxFuture<Result<pi_agent::BeforeToolCallResult>>
+            });
+            session.set_before_tool_call(compose_before_tool_call(host_hook, Some(extension_hook)));
             let tool_result_runtime = runtime.clone();
             session.set_after_tool_call(Some(Arc::new(move |context| {
                 let runtime = tool_result_runtime.clone();
@@ -1005,6 +771,11 @@ impl Application {
         }));
 
         if let Some(orchestration) = generation.orchestration_runtime() {
+            orchestration
+                .bind_and_recover(&session)
+                .context("binding orchestration runtime generation")?;
+        }
+        if let Some(orchestration) = generation.orchestration_runtime() {
             let mut events = orchestration.subscribe();
             let orchestration_inner = Arc::downgrade(&self.inner);
             *generation.orchestration_events.lock() = Some(tokio::spawn(async move {
@@ -1098,8 +869,9 @@ impl Application {
                 .any(|write| write.behavior == crate::SettingApplyBehavior::Live);
             if has_live {
                 let settings = manager.settings().runtime_settings()?;
-                self.inner.session.apply_runtime_settings(settings.clone()).await;
-                *self.runtime().runtime_settings.lock() = Arc::new(settings);
+                let active = self.runtime();
+                active.session.apply_runtime_settings(settings.clone()).await;
+                *active.runtime_settings.lock() = Arc::new(settings);
             }
             return Ok(SettingApplyOutcome {
                 writes,
@@ -1111,8 +883,9 @@ impl Application {
         }
 
         let settings = manager.settings().runtime_settings()?;
-        self.inner.session.apply_runtime_settings(settings.clone()).await;
-        *self.runtime().runtime_settings.lock() = Arc::new(settings);
+        let active = self.runtime();
+        active.session.apply_runtime_settings(settings.clone()).await;
+        *active.runtime_settings.lock() = Arc::new(settings);
         Ok(SettingApplyOutcome {
             writes,
             applied_live: true,
@@ -1125,7 +898,8 @@ impl Application {
     #[must_use]
     pub fn attach_goal_tool(&self, binding: GoalToolBinding) -> Result<()> {
         binding.bind(self)?;
-        let mut current = self.inner.goal_tool_binding.lock();
+        let active = self.runtime();
+        let mut current = active.goal_tool_binding.lock();
         if current.is_some() {
             return Err(anyhow!("application goal tool is already configured"));
         }
@@ -1134,8 +908,9 @@ impl Application {
     }
 
     pub fn orchestration_runtime(&self) -> Option<crate::OrchestrationRuntime> {
-        self.inner.orchestration_runtime.lock().as_ref().cloned()
+        self.runtime().orchestration_runtime()
     }
+
 
     pub fn attach_orchestration(&self, runtime: crate::OrchestrationRuntime) -> Result<()> {
         self.attach_orchestration_with_override(runtime, true)
@@ -1146,43 +921,50 @@ impl Application {
         runtime: crate::OrchestrationRuntime,
         explicit: bool,
     ) -> Result<()> {
-        let mut current = self.inner.orchestration_runtime.lock();
+        let active = self.runtime();
+        if active.session.recorder_info().is_some() {
+            runtime
+                .bind_and_recover(&active.session)
+                .context("binding orchestration to application session")?;
+        }
+        let mut current = active.orchestration_runtime.lock();
         if current.is_some() {
             return Err(anyhow!("application orchestration is already configured"));
         }
         let mut events = runtime.subscribe();
         let event_runtime = runtime.clone();
         let event_inner = Arc::downgrade(&self.inner);
+        let epoch = active.epoch();
         let event_task = tokio::spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(event) => {
-                        let Some(inner) = event_inner.upgrade() else {
-                            break;
-                        };
+                        let Some(inner) = event_inner.upgrade() else { break; };
+                        let active = inner.runtime();
+                        if active.epoch() != epoch { break; }
                         if matches!(&event, crate::OrchestrationEvent::JobUpdated { job, .. } if !job.status.is_settled()) {
-                            inner.todo_cycle_pending.store(true, Ordering::Release);
+                            active.todo_cycle_pending.store(true, Ordering::Release);
                         }
-                        let allow_spawn = !inner.todo_continuation_suppressed.load(Ordering::Acquire);
+                        let allow_spawn = !active.todo_continuation_suppressed.load(Ordering::Acquire);
                         if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                             inner.todo_dag_failed(&error);
                         }
-                        inner.publish(ApplicationEvent::Orchestration(event));
+                        let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                         inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(inner) = event_inner.upgrade() else {
-                            break;
-                        };
+                        let Some(inner) = event_inner.upgrade() else { break; };
+                        let active = inner.runtime();
+                        if active.epoch() != epoch { break; }
                         for event in event_runtime.presentation_events() {
                             if matches!(&event, crate::OrchestrationEvent::JobUpdated { job, .. } if !job.status.is_settled()) {
-                                inner.todo_cycle_pending.store(true, Ordering::Release);
+                                active.todo_cycle_pending.store(true, Ordering::Release);
                             }
-                            let allow_spawn = !inner.todo_continuation_suppressed.load(Ordering::Acquire);
+                            let allow_spawn = !active.todo_continuation_suppressed.load(Ordering::Acquire);
                             if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                                 inner.todo_dag_failed(&error);
                             }
-                            inner.publish(ApplicationEvent::Orchestration(event));
+                            let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                             inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                         }
                     }
@@ -1191,8 +973,8 @@ impl Application {
             }
         });
         *current = Some(runtime);
-        *self.inner.orchestration_events.lock() = Some(event_task);
-        self.inner.orchestration_explicit.store(explicit, Ordering::Release);
+        *active.orchestration_events.lock() = Some(event_task);
+        active.orchestration_explicit.store(explicit, Ordering::Release);
         drop(current);
         self.inner.arm_todo_dag_after_mutation()?;
         Ok(())
@@ -1200,26 +982,26 @@ impl Application {
 
     #[must_use]
     pub fn session(&self) -> Session {
-        self.inner.session.clone()
+        self.runtime().session()
     }
 
     #[must_use]
     pub fn get_active_tool_names(&self) -> Vec<String> {
-        self.inner.session.get_active_tool_names()
+        self.runtime().session.get_active_tool_names()
     }
 
     #[must_use]
     pub fn get_all_tools(&self) -> Vec<pi_agent::AgentTool> {
-        self.inner.session.get_all_tools()
+        self.runtime().session.get_all_tools()
     }
 
     #[must_use]
     pub fn get_tool_definition(&self, name: &str) -> Option<pi_agent::AgentTool> {
-        self.inner.session.get_tool_definition(name)
+        self.runtime().session.get_tool_definition(name)
     }
 
     pub async fn set_active_tools_by_name(&self, names: &[String]) -> Result<()> {
-        self.inner.session.set_active_tools_by_name(names).await
+        self.runtime().session.set_active_tools_by_name(names).await
     }
 
     #[must_use]
@@ -1229,11 +1011,12 @@ impl Application {
 
     #[must_use]
     pub fn todo_state(&self) -> crate::TodoState {
-        self.inner.session.todo_state()
+        self.runtime().session.todo_state()
     }
 
     pub fn apply_todo(&self, op: crate::TodoOp) -> Result<crate::TodoApplyResult> {
-        match self.inner.session.apply_todo(op) {
+        let active = self.runtime();
+        match active.session.apply_todo(op) {
             Ok(result) => {
                 self.inner.publish(ApplicationEvent::TodoUpdated {
                     phases: result.phases.clone(),
@@ -1242,14 +1025,14 @@ impl Application {
                 Ok(result)
             }
             Err(error) => {
-                self.inner.session.schedule_todo_reminder();
+                active.session.schedule_todo_reminder();
                 Err(error)
             }
         }
     }
 
     pub fn set_todos(&self, phases: Vec<crate::TodoPhase>) -> Result<crate::TodoApplyResult> {
-        let result = self.inner.session.set_todos(phases)?;
+        let result = self.runtime().session.set_todos(phases)?;
         self.inner.publish(ApplicationEvent::TodoUpdated {
             phases: result.phases.clone(),
             completed_tasks: result.completed_tasks.clone(),
@@ -1258,7 +1041,7 @@ impl Application {
     }
     #[must_use]
     pub fn goal_state(&self) -> GoalState {
-        self.inner.session.goal_runtime().get()
+        self.runtime().session.goal_runtime().get()
     }
 
     pub fn goal_create(&self, objective: impl Into<String>, token_budget: Option<u64>) -> Result<Goal> {
@@ -1302,7 +1085,7 @@ impl Application {
 
     pub fn goal_update_usage(&self, delta: GoalUsageDelta) -> Result<Goal> {
         let goal = self
-            .inner
+            .runtime()
             .session
             .goal_runtime()
             .update_usage(delta)
@@ -1316,7 +1099,7 @@ impl Application {
 
     #[must_use]
     pub fn goal_continuation_decision(&self) -> GoalContinuationDecision {
-        let decision = self.inner.session.goal_runtime().continuation_decision();
+        let decision = self.runtime().session.goal_runtime().continuation_decision();
         self.inner.publish(ApplicationEvent::GoalContinuation {
             decision: decision.clone(),
         });
@@ -1327,7 +1110,7 @@ impl Application {
     where
         F: FnOnce(&crate::GoalRuntime) -> std::result::Result<Goal, GoalError>,
     {
-        let goal = mutation(&self.inner.session.goal_runtime())
+        let goal = mutation(&self.runtime().session.goal_runtime())
             .map_err(|error| anyhow!(error.to_string()))?;
         self.inner.publish(ApplicationEvent::GoalUpdated {
             operation,
@@ -1347,42 +1130,44 @@ impl Application {
             goal_id: goal.id.clone(),
             revision: state.revision,
         };
-        let turn_guard = self.inner.turn_gate.clone().try_lock_owned().ok();
+        let active = self.runtime();
+        let turn_guard = active.turn_gate.clone().try_lock_owned().ok();
         let outcome = if turn_guard.is_some() {
             GoalActivationOutcome::Started
         } else {
             GoalActivationOutcome::Queued
         };
         {
-            let mut activation = self.inner.goal_work_activation.lock();
+            let mut activation = active.goal_work_activation.lock();
             if activation.as_ref() == Some(&key) {
                 return Ok(GoalActivationOutcome::AlreadyActive);
             }
             *activation = Some(key.clone());
         }
-        self.inner.goal_work_pending.fetch_add(1, Ordering::AcqRel);
+        active.goal_work_pending.fetch_add(1, Ordering::AcqRel);
         let inner = Arc::downgrade(&self.inner);
         tokio::spawn(run_goal_work(inner, key, turn_guard));
         Ok(outcome)
     }
 
     pub fn prepare_resumed_goal(&self, forked: bool) -> Result<()> {
-        let runtime = self.inner.session.goal_runtime();
-        let Some(source) = runtime.get().current else {
+        let active = self.runtime();
+        let goal_runtime = active.session.goal_runtime();
+        let Some(source) = goal_runtime.get().current else {
             return Ok(());
         };
         if forked {
-            runtime
+            goal_runtime
                 .fork_clone(&source)
                 .map_err(|error| anyhow!(error.to_string()))?;
             self.inner.publish(ApplicationEvent::GoalUpdated {
                 operation: "fork_clone",
-                state: runtime.get(),
+                state: goal_runtime.get(),
             });
         } else {
             self.inner.pause_goal_after_resume()?;
         }
-        self.inner.charged_goal_jobs.lock().clear();
+        active.charged_goal_jobs.lock().clear();
         Ok(())
     }
 
@@ -1423,53 +1208,63 @@ impl Application {
 
     #[must_use]
     pub fn process_manager(&self) -> ProcessManager {
-        self.inner.process_manager.clone()
+        self.runtime().process_manager()
     }
 
     pub async fn process_spawn(&self, spec: ProcessSpawnSpec) -> Result<ProcessInfo> {
-        self.inner.process_manager.spawn(self.inner.process_owner_id.clone(), spec).await
+        let active = self.runtime();
+        active.process_manager.spawn(active.process_owner_id.clone(), spec).await
     }
 
     #[must_use]
     pub fn process_list(&self) -> Vec<ProcessInfo> {
-        self.inner.process_manager.list(&self.inner.process_owner_id)
+        let active = self.runtime();
+        active.process_manager.list(&active.process_owner_id)
     }
 
     pub fn process_describe(&self, id: &ProcessId) -> Result<ProcessInfo> {
-        self.inner.process_manager.describe(&self.inner.process_owner_id, id)
+        let active = self.runtime();
+        active.process_manager.describe(&active.process_owner_id, id)
     }
 
     pub async fn process_logs(&self, id: &ProcessId, cursor: u64, max_bytes: Option<usize>, follow: bool, timeout: Option<Duration>) -> Result<ProcessLogs> {
-        self.inner.process_manager.logs(&self.inner.process_owner_id, id, cursor, max_bytes, follow, timeout).await
+        let active = self.runtime();
+        active.process_manager.logs(&active.process_owner_id, id, cursor, max_bytes, follow, timeout).await
     }
 
     pub async fn process_write(&self, id: &ProcessId, bytes: Vec<u8>, close_stdin: bool) -> Result<()> {
-        self.inner.process_manager.write(&self.inner.process_owner_id, id, bytes, close_stdin).await
+        let active = self.runtime();
+        active.process_manager.write(&active.process_owner_id, id, bytes, close_stdin).await
     }
 
     pub async fn process_send_keys(&self, id: &ProcessId, keys: &[ProcessKey]) -> Result<()> {
-        self.inner.process_manager.send_keys(&self.inner.process_owner_id, id, keys).await
+        let active = self.runtime();
+        active.process_manager.send_keys(&active.process_owner_id, id, keys).await
     }
 
     pub fn process_resize(&self, id: &ProcessId, size: ProcessTerminalSize) -> Result<()> {
-        self.inner.process_manager.resize(&self.inner.process_owner_id, id, size)
+        let active = self.runtime();
+        active.process_manager.resize(&active.process_owner_id, id, size)
     }
 
     pub fn process_signal(&self, id: &ProcessId, signal: ProcessSignal) -> Result<()> {
-        self.inner.process_manager.signal(&self.inner.process_owner_id, id, signal)
+        let active = self.runtime();
+        active.process_manager.signal(&active.process_owner_id, id, signal)
     }
 
     pub async fn process_stop(&self, id: &ProcessId, grace: Option<Duration>) -> Result<ProcessInfo> {
-        self.inner.process_manager.stop(&self.inner.process_owner_id, id, grace).await
+        let active = self.runtime();
+        active.process_manager.stop(&active.process_owner_id, id, grace).await
     }
 
     pub async fn process_wait(&self, id: &ProcessId, timeout: Option<Duration>) -> Result<ProcessInfo> {
-        self.inner.process_manager.wait(&self.inner.process_owner_id, id, timeout).await
+        let active = self.runtime();
+        active.process_manager.wait(&active.process_owner_id, id, timeout).await
     }
 
     #[must_use]
     pub fn session_header(&self) -> Option<SessionStartedEvent> {
-        self.inner.session.session_header().map(|header| SessionStartedEvent {
+        self.runtime().session.session_header().map(|header| SessionStartedEvent {
             record_type: header.record_type,
             version: header.version,
             id: header.id,
@@ -1480,18 +1275,19 @@ impl Application {
 
     #[must_use]
     pub fn messages(&self) -> Vec<Message> {
-        self.inner.session.history()
+        self.runtime().session.history()
     }
 
     #[must_use]
     pub fn last_assistant_text(&self) -> Option<String> {
-        let text = self.inner.session.last_assistant_text();
+        let text = self.runtime().session.last_assistant_text();
         (!text.is_empty()).then_some(text)
     }
 
     #[must_use]
     pub async fn state(&self) -> ApplicationState {
-        let session = &self.inner.session;
+        let active = self.runtime();
+        let session = &active.session;
         let (session_id, session_file) = session
             .recorder_info()
             .map_or((None, None), |(id, path)| {
@@ -1518,15 +1314,11 @@ impl Application {
 
     #[must_use]
     pub fn is_streaming(&self) -> bool {
-        self.inner.loop_turn_active.load(Ordering::Acquire)
-            || self.inner.goal_work_pending.load(Ordering::Acquire) != 0
-            || self
-                .inner
-                .active_run
-                .lock()
-                .as_ref()
-                .is_some_and(|run| !run.is_finished())
-            || self.inner.todo_cycle_pending.load(Ordering::Acquire)
+        let active = self.runtime();
+        active.loop_turn_active.load(Ordering::Acquire)
+            || active.goal_work_pending.load(Ordering::Acquire) != 0
+            || active.active_run.lock().as_ref().is_some_and(|run| !run.is_finished())
+            || active.todo_cycle_pending.load(Ordering::Acquire)
     }
 
     pub async fn prompt(
@@ -1570,17 +1362,18 @@ impl Application {
         } else {
             (message, images)
         };
-        if self.inner.todo_continuation_suppressed.load(Ordering::Acquire) {
-            self.inner.todo_resume_requested.store(true, Ordering::Release);
+        let active = self.runtime();
+        if active.todo_continuation_suppressed.load(Ordering::Acquire) {
+            active.todo_resume_requested.store(true, Ordering::Release);
         }
-        if self.inner.loop_turn_active.load(Ordering::Acquire) {
+        if active.loop_turn_active.load(Ordering::Acquire) {
             return match streaming_behavior {
                 Some(StreamingBehavior::Steer) => {
-                    self.inner.session.steer(user_message(message, images)).await;
+                    active.session.steer(user_message(message, images)).await;
                     Ok(())
                 }
                 Some(StreamingBehavior::FollowUp) => {
-                    self.inner.session.follow_up(user_message(message, images)).await;
+                    active.session.follow_up(user_message(message, images)).await;
                     Ok(())
                 }
                 None => Err(anyhow!(
@@ -1588,14 +1381,14 @@ impl Application {
                 )),
             };
         }
-        let Ok(turn_guard) = self.inner.turn_gate.clone().try_lock_owned() else {
+        let Ok(turn_guard) = active.turn_gate.clone().try_lock_owned() else {
             return match streaming_behavior {
                 Some(StreamingBehavior::Steer) => {
-                    self.inner.session.steer(user_message(message, images)).await;
+                    active.session.steer(user_message(message, images)).await;
                     Ok(())
                 }
                 Some(StreamingBehavior::FollowUp) => {
-                    self.inner.session.follow_up(user_message(message, images)).await;
+                    active.session.follow_up(user_message(message, images)).await;
                     Ok(())
                 }
                 None => Err(anyhow!(
@@ -1603,19 +1396,19 @@ impl Application {
                 )),
             };
         };
-        let session = self.inner.session.clone();
+        let session = active.session.clone();
         let inner = self.inner.clone();
         let selection = session.select_for_request(&message).await;
         // Exact trusted agent mention + delegation verb spawns through the
         // normal orchestration path (AgentUpdated/JobUpdated). Generic skill
         // or semantic text stays a selection recommendation only.
         if allow_natural_language_spawn
-            && let Some(runtime) = self.orchestration_runtime()
+            && let Some(runtime) = self.runtime().orchestration_runtime()
             && runtime
                 .spawn_from_natural_language(runtime.main_agent_id(), 0, &message)?
                 .is_some()
         {
-            inner.todo_cycle_pending.store(true, Ordering::Release);
+            active.todo_cycle_pending.store(true, Ordering::Release);
         }
         inner.publish(ApplicationEvent::Selection(selection));
         if session.todo_reminder_pending() {
@@ -1624,9 +1417,7 @@ impl Application {
             });
         }
         let turn_guard = turn_guard;
-        let goal_was_active = self
-            .inner
-            .session
+        let goal_was_active = session
             .goal_runtime()
             .get()
             .current
@@ -1648,44 +1439,62 @@ impl Application {
             inner.finish_parent_turn();
             drop(turn_guard);
         });
-        *self.inner.active_run.lock() = Some(handle);
+        *active.active_run.lock() = Some(handle);
         Ok(())
     }
 
     pub async fn steer(&self, message: String, images: Vec<ContentBlock>) {
-        if self.inner.todo_continuation_suppressed.load(Ordering::Acquire) {
-            self.inner.todo_resume_requested.store(true, Ordering::Release);
+        let active = self.runtime();
+        if active.todo_continuation_suppressed.load(Ordering::Acquire) {
+            active.todo_resume_requested.store(true, Ordering::Release);
         }
-        self.inner.session.steer(user_message(message, images)).await;
+        active.session.steer(user_message(message, images)).await;
     }
 
     pub async fn follow_up(&self, message: String, images: Vec<ContentBlock>) {
-        if self.inner.todo_continuation_suppressed.load(Ordering::Acquire) {
-            self.inner.todo_resume_requested.store(true, Ordering::Release);
+        let active = self.runtime();
+        if active.todo_continuation_suppressed.load(Ordering::Acquire) {
+            active.todo_resume_requested.store(true, Ordering::Release);
         }
-        self.inner.session.follow_up(user_message(message, images)).await;
+        active.session.follow_up(user_message(message, images)).await;
     }
 
     pub async fn abort(&self) {
-        self.inner.todo_resume_requested.store(false, Ordering::Release);
-        self.inner.todo_continuation_suppressed.store(true, Ordering::Release);
-        if let Some(runtime) = self.orchestration_runtime() {
+        let active = self.runtime();
+        active.todo_resume_requested.store(false, Ordering::Release);
+        active.todo_continuation_suppressed.store(true, Ordering::Release);
+        if let Some(runtime) = active.orchestration_runtime() {
             runtime.cancel_active();
             self.inner.finish_todo_cycle_if_idle(Some(&runtime), false);
         }
-        self.inner.session.abort().await;
+        // Ownership boundary: cancel the loop iteration token BEFORE the
+        // session abort so the scheduler observes `runner_cancel.is_cancelled()`
+        // and classifies the turn as `Cancelled` (silent; the loop remains
+        // scheduled). If the session abort completed first, the runner could
+        // settle with a provider "Request was aborted" error before the loop
+        // token fired, and the scheduler would misclassify a user Esc as
+        // `LoopEvent::Failed`. Cancelling the token first is race-safe: the
+        // runner's `tokio::select!` either observes the token (returns via the
+        // cancel arm) or has already completed, but `runner_cancel.is_cancelled()`
+        // is now true in both cases → `RunResult::Cancelled`. Real provider/
+        // runtime failures are unaffected: they complete without the token
+        // cancelled and still surface as `LoopEvent::Failed`.
+        if let Ok(handle) = self.loop_handle() {
+            let _ = handle.cancel_active_iteration().await;
+        }
+        active.session.abort().await;
     }
 
     pub fn abort_compaction(&self) {
-        self.inner.session.abort_compaction();
+        self.runtime().session.abort_compaction();
     }
 
     pub fn set_auto_retry_enabled(&self, enabled: bool) {
-        self.inner.session.set_auto_retry_enabled(enabled);
+        self.runtime().session.set_auto_retry_enabled(enabled);
     }
 
     pub fn abort_retry(&self) {
-        self.inner.session.abort_retry();
+        self.runtime().session.abort_retry();
     }
 
     pub async fn execute_bash(
@@ -1703,86 +1512,90 @@ impl Application {
         exclude_from_context: bool,
         id: Option<String>,
     ) -> Result<crate::BashResult> {
-        if let Some(runtime) = self.extension_runtime() {
+        let active = self.runtime();
+        if let Some(runtime) = active.extension_runtime() {
             let reduction = runtime
+                .0
                 .reduce_user_bash(serde_json::json!({
                     "command": command,
                     "excludeFromContext": exclude_from_context,
-                    "cwd": self.inner.session.cwd(),
+                    "cwd": active.session.cwd(),
                 }))
                 .await?;
             if let Some(result) = reduction.result {
-                self.inner
+                active
                     .session
                     .record_bash_result(&command, exclude_from_context, &result)
                     .await?;
                 return Ok(result);
             }
         }
-        self.inner
+        active
             .session
             .execute_bash_with_id(&command, exclude_from_context, id)
             .await
     }
 
     pub fn abort_bash(&self) {
-        self.inner.session.abort_bash();
+        self.runtime().session.abort_bash();
     }
 
     #[must_use]
     pub fn is_bash_running(&self) -> bool {
-        self.inner.session.is_bash_running()
+        self.runtime().session.is_bash_running()
     }
 
     #[must_use]
     pub fn session_stats(&self) -> crate::SessionStats {
-        self.inner.session.session_stats()
+        self.runtime().session.session_stats()
     }
 
     pub async fn queued_messages(&self) -> (Vec<Message>, Vec<Message>) {
-        self.inner.session.queued_messages().await
+        self.runtime().session.queued_messages().await
     }
 
     pub async fn drain_queued_messages(&self) -> (Vec<Message>, Vec<Message>) {
-        self.inner.session.drain_queued_messages().await
+        self.runtime().session.drain_queued_messages().await
     }
 
     pub async fn wait_for_idle(&self) {
+        let active = self.runtime();
         loop {
-            self.inner.session.wait_for_idle().await;
-            let handle = self.inner.active_run.lock().take();
+            active.session.wait_for_idle().await;
+            let handle = active.active_run.lock().take();
             if let Some(handle) = handle {
                 let _ = handle.await;
             }
-            let changed = self.inner.goal_work_changed.notified();
-            if self.inner.goal_work_pending.load(Ordering::Acquire) == 0 {
+            let changed = active.goal_work_changed.notified();
+            if active.goal_work_pending.load(Ordering::Acquire) == 0 {
                 return;
             }
             changed.await;
         }
     }
     async fn begin_todo_session_transition(&self) -> Result<()> {
-        self.inner.todo_continuation_suppressed.store(true, Ordering::Release);
-        self.inner.todo_resume_requested.store(false, Ordering::Release);
-        self.inner.todo_cycle_pending.store(false, Ordering::Release);
-        let runtime = self.orchestration_runtime();
-        let gate = self.inner.todo_dag_transaction_gate();
+        let active = self.runtime();
+        active.todo_continuation_suppressed.store(true, Ordering::Release);
+        active.todo_resume_requested.store(false, Ordering::Release);
+        active.todo_cycle_pending.store(false, Ordering::Release);
+        let orchestration = active.orchestration_runtime();
+        let gate = active.todo_dag.lock().reconcile_gate.clone();
         let job_ids = {
             let _transaction = gate.lock();
-            self.inner.todo_transition_active.store(true, Ordering::Release);
-            runtime.as_ref().map_or_else(Vec::new, |runtime| {
+            active.todo_transition_active.store(true, Ordering::Release);
+            orchestration.as_ref().map_or_else(Vec::new, |runtime| {
                 self.inner.begin_todo_dag_transition_locked(runtime)
             })
         };
-        let Some(runtime) = runtime else {
+        let Some(orchestration) = orchestration else {
             return Ok(());
         };
-        runtime.cancel_jobs(&job_ids);
+        orchestration.cancel_jobs_result(&job_ids)?;
         let mut remaining = job_ids;
         while !remaining.is_empty() {
-            runtime.wait_jobs(&remaining, None, None).await?;
+            orchestration.wait_jobs(&remaining, None, None).await?;
             remaining.retain(|job_id| {
-                runtime
+                orchestration
                     .jobs(Some(std::slice::from_ref(job_id)))
                     .first()
                     .is_some_and(|job| {
@@ -1794,15 +1607,83 @@ impl Application {
     }
 
     fn finish_todo_session_transition(&self) {
-        let gate = self.inner.todo_dag_transaction_gate();
+        let active = self.runtime();
+        let gate = active.todo_dag.lock().reconcile_gate.clone();
         let _transaction = gate.lock();
-        self.inner.todo_transition_active.store(false, Ordering::Release);
+        active.todo_transition_active.store(false, Ordering::Release);
         if let Err(error) = self.inner.arm_todo_dag_after_mutation_locked() {
             self.inner.todo_dag_failed(&error);
         }
     }
 
-    pub async fn switch_session(&self, path: &Path) -> Result<()> {
+    fn prepare_orchestration_cutover(
+        &self,
+        active: &runtime::ApplicationRuntime,
+        session: &crate::PreparedSessionReplacement,
+    ) -> Result<Option<(crate::OrchestrationRuntime, crate::PreparedDurableBinding)>> {
+        let Some(orchestration) = active.orchestration_runtime() else {
+            return Ok(None);
+        };
+        let (session_id, session_path) = session.recorder_info();
+        let mut binding = orchestration.prepare_parent_identity(session_id, session_path)?;
+        orchestration.initialize_prepared_parent(&mut binding)?;
+        Ok(Some((orchestration, binding)))
+    }
+
+    async fn prepare_same_cwd_cutover(
+        &self,
+        active: &runtime::ApplicationRuntime,
+        session: crate::PreparedSessionReplacement,
+    ) -> Result<PreparedSameCwdCutover> {
+        let (_, session_file) = session.recorder_info();
+        let target_loops = crate::prepare_loop_activation(Some(&session_file)).await?;
+        let current_file = active.session.recorder_info().map(|(_, path)| path);
+        let current_loops = crate::prepare_loop_activation(current_file.as_deref()).await?;
+        let orchestration = self.prepare_orchestration_cutover(active, &session)?;
+        let handle = self.loop_handle()?;
+        let loops = match handle
+            .prepare_session_switch(
+                crate::prepare_loop_session_switch(target_loops),
+                crate::LoopRemovalReason::SessionChanged,
+            )
+            .await
+        {
+            Ok(loops) => loops,
+            Err(error) => {
+                drop(orchestration);
+                return Err(error.into());
+            }
+        };
+        if self.inner.cleaned.load(Ordering::Acquire) {
+            handle.restore_prepared_session(current_loops);
+            drop(orchestration);
+            return Err(anyhow!("application shut down during session cutover"));
+        }
+        Ok(PreparedSameCwdCutover {
+            session,
+            orchestration,
+            loop_handle: handle,
+            loops,
+        })
+    }
+
+    async fn commit_same_cwd_cutover(
+        &self,
+        active: &runtime::ApplicationRuntime,
+        prepared: PreparedSameCwdCutover,
+    ) {
+        active.session.commit_session_replacement(prepared.session).await;
+        if let Some((orchestration, binding)) = prepared.orchestration {
+            orchestration.commit_prepared_parent(binding);
+        }
+        prepared
+            .loop_handle
+            .commit_prepared_session_switch(prepared.loops);
+        active.charged_goal_jobs.lock().clear();
+        self.finish_todo_session_transition();
+    }
+
+    pub async fn switch_session(&self, path: &Path) -> Result<SessionChangeOutcome> {
         let prepared = crate::PreparedSessionResume::prepare_path(path)?;
         self.switch_prepared_session(prepared).await
     }
@@ -1810,7 +1691,7 @@ impl Application {
     pub async fn switch_prepared_session(
         &self,
         prepared: crate::PreparedSessionResume,
-    ) -> Result<()> {
+    ) -> Result<SessionChangeOutcome> {
         if let Some(runtime) = self.extension_runtime()
             && runtime
                 .reduce_before_switch(serde_json::json!({
@@ -1819,7 +1700,7 @@ impl Application {
                 }))
                 .await?
         {
-            return Err(anyhow!("session switch cancelled by extension"));
+            return Ok(SessionChangeOutcome::CANCELLED);
         }
 
         let target_session_file = prepared.path().to_path_buf();
@@ -1829,32 +1710,37 @@ impl Application {
             .with_context(|| format!("resolving resumed working directory {}", prepared.target_cwd().display()))?;
         let active = self.runtime();
         if target_cwd == active.session.cwd() {
-            let loops = self.loop_handle()?;
-            let previous = active.session.recorder_info().map(|(_, path)| path);
-            loops.suspend(crate::LoopRemovalReason::SessionChanged).await?;
+            let _operation = self.inner.operation_gate.lock().await;
             active.session.wait_for_idle().await;
             if let Err(error) = self.begin_todo_session_transition().await {
-                let _ = loops.activate(previous).await;
                 self.finish_todo_session_transition();
                 return Err(error);
             }
-            if let Err(error) = active.session.switch_prepared_session(prepared).await {
-                let _ = loops.activate(previous).await;
+            let session = match active.session.prepare_resume_replacement(prepared).await {
+                Ok(session) => session,
+                Err(error) => {
+                    self.finish_todo_session_transition();
+                    return Err(error);
+                }
+            };
+            let goal = session.goal_runtime();
+            if let Some(current) = goal.get().current
+                && current.lifecycle == crate::GoalLifecycle::Active
+                && let Err(error) = goal.pause_on_resume()
+            {
                 self.finish_todo_session_transition();
-                return Err(error);
+                return Err(anyhow!(error.to_string()));
             }
-            let current = active.session.recorder_info().map(|(_, path)| path);
-            if let Err(error) = loops.activate(current).await {
-                self.finish_todo_session_transition();
-                return Err(error.into());
-            }
-            active.charged_goal_jobs.lock().clear();
-            if let Err(error) = self.inner.pause_goal_after_resume() {
-                self.finish_todo_session_transition();
-                return Err(error);
-            }
-            self.finish_todo_session_transition();
-            return Ok(());
+            let prepared = match self.prepare_same_cwd_cutover(&active, session).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.finish_todo_session_transition();
+                    return Err(error);
+                }
+            };
+            active.process_manager.shutdown_owner(&active.process_owner_id).await;
+            self.commit_same_cwd_cutover(&active, prepared).await;
+            return Ok(SessionChangeOutcome::COMPLETED);
         }
 
         let factory = self
@@ -1883,6 +1769,7 @@ impl Application {
         let candidate = factory
             .build_runtime_candidate(target_cwd, session_options, Some(prepared))
             .await?;
+        candidate.session.set_session_dir(active.session.session_dir());
 
         let _operation = self.inner.operation_gate.lock().await;
         let loops = self.loop_handle()?;
@@ -1916,52 +1803,47 @@ impl Application {
         if let Some((runtime, _)) = extension {
             runtime.shutdown_with_reason("session_switch").await;
         }
-        Ok(())
+        Ok(SessionChangeOutcome::COMPLETED)
     }
-    pub async fn new_session(&self) -> Result<()> {
+    pub async fn new_session(&self) -> Result<SessionChangeOutcome> {
         self.new_session_with_parent(None).await
     }
 
-    pub async fn new_session_with_parent(&self, parent_session: Option<&Path>) -> Result<()> {
+    pub async fn new_session_with_parent(&self, parent_session: Option<&Path>) -> Result<SessionChangeOutcome> {
         if let Some(runtime) = self.extension_runtime()
             && runtime
                 .reduce_before_switch(serde_json::json!({ "reason": "new" }))
                 .await?
         {
-            return Err(anyhow!("session switch cancelled by extension"));
+            return Ok(SessionChangeOutcome::CANCELLED);
         }
-        let loops = self.loop_handle()?;
-        let previous = self.inner.session.recorder_info().map(|(_, path)| path);
-        loops.suspend(crate::LoopRemovalReason::SessionChanged).await?;
+        let _operation = self.inner.operation_gate.lock().await;
+        let active = self.runtime();
         self.wait_for_idle().await;
         if let Err(error) = self.begin_todo_session_transition().await {
-            let _ = loops.activate(previous).await;
             self.finish_todo_session_transition();
             return Err(error);
         }
-        self.inner
-            .process_manager
-            .shutdown_owner(&self.inner.process_owner_id)
-            .await;
-        let result = self
-            .inner
+        let session = match active
             .session
-            .reset()
-            .await
-            .and_then(|()| self.inner.session.start_new_recording_with_parent(parent_session));
-        if let Err(error) = result {
-            let _ = loops.activate(previous).await;
-            self.finish_todo_session_transition();
-            return Err(error);
-        }
-        let current = self.inner.session.recorder_info().map(|(_, path)| path);
-        if let Err(error) = loops.activate(current).await {
-            self.finish_todo_session_transition();
-            return Err(error.into());
-        }
-        self.inner.charged_goal_jobs.lock().clear();
-        self.finish_todo_session_transition();
-        Ok(())
+            .prepare_new_session_replacement(parent_session)
+        {
+            Ok(session) => session,
+            Err(error) => {
+                self.finish_todo_session_transition();
+                return Err(error);
+            }
+        };
+        let prepared = match self.prepare_same_cwd_cutover(&active, session).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.finish_todo_session_transition();
+                return Err(error);
+            }
+        };
+        active.process_manager.shutdown_owner(&active.process_owner_id).await;
+        self.commit_same_cwd_cutover(&active, prepared).await;
+        Ok(SessionChangeOutcome::COMPLETED)
     }
 
     pub async fn compact(
@@ -1969,12 +1851,14 @@ impl Application {
         custom_instructions: Option<&str>,
     ) -> Result<crate::CompactionResult> {
         self.wait_for_idle().await;
-        self.inner.session.compact(custom_instructions).await
+        self.runtime().session.compact(custom_instructions).await
     }
 
-    pub async fn fork_session(&self, entry_id: &str) -> Result<String> {
-        let source_goal = self.inner.session.goal_runtime().get().current;
-        let restore_conversation = if let Some(runtime) = self.extension_runtime() {
+    pub async fn fork_session(&self, entry_id: &str) -> Result<SessionForkOutcome> {
+        let _operation = self.inner.operation_gate.lock().await;
+        let active = self.runtime();
+        let source_goal = active.session.goal_runtime().get().current;
+        let restore_conversation = if let Some((runtime, _)) = active.extension_runtime() {
             let reduction = runtime
                 .reduce_before_fork(serde_json::json!({
                     "entryId": entry_id,
@@ -1982,65 +1866,53 @@ impl Application {
                 }))
                 .await?;
             if reduction.cancel {
-                return Err(anyhow!("session fork cancelled by extension"));
+                return Ok(SessionForkOutcome::cancelled());
             }
             !reduction.skip_conversation_restore
         } else {
             true
         };
-        let loops = self.loop_handle()?;
-        let previous = self.inner.session.recorder_info().map(|(_, path)| path);
-        loops.suspend(crate::LoopRemovalReason::SessionChanged).await?;
         self.wait_for_idle().await;
         if let Err(error) = self.begin_todo_session_transition().await {
-            let _ = loops.activate(previous).await;
             self.finish_todo_session_transition();
             return Err(error);
         }
-        self.inner
-            .process_manager
-            .shutdown_owner(&self.inner.process_owner_id)
-            .await;
         self.inner.publish(ApplicationEvent::SessionBeforeFork(SessionBeforeForkEvent { target_id: entry_id.to_owned() }));
-        let editor_text = match self.inner.session.fork_session(entry_id, restore_conversation).await {
-            Ok(editor_text) => editor_text,
+        let (session, editor_text) = match active
+            .session
+            .prepare_fork_replacement(entry_id, restore_conversation)
+        {
+            Ok(prepared) => prepared,
             Err(error) => {
-                let _ = loops.activate(previous).await;
                 self.finish_todo_session_transition();
                 return Err(error);
             }
         };
-        let (session_id, session_file) = match self.inner.session.recorder_info() {
-            Some(info) => info,
-            None => {
-                self.finish_todo_session_transition();
-                return Err(anyhow!("forked session recording is unavailable"));
-            }
-        };
-        if let Err(error) = loops.activate(Some(session_file.clone())).await {
+        let goal = session.goal_runtime();
+        if let Some(source_goal) = source_goal
+            && let Err(error) = goal.fork_clone(&source_goal)
+        {
             self.finish_todo_session_transition();
-            return Err(error.into());
+            return Err(anyhow!(error.to_string()));
         }
-        if let Some(source_goal) = source_goal {
-            if let Err(error) = self
-                .inner
-                .session
-                .goal_runtime()
-                .fork_clone(&source_goal)
-                .map_err(|error| anyhow!(error.to_string()))
-            {
+        let (session_id, session_file) = session.recorder_info();
+        let prepared = match self.prepare_same_cwd_cutover(&active, session).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
                 self.finish_todo_session_transition();
                 return Err(error);
             }
+        };
+        active.process_manager.shutdown_owner(&active.process_owner_id).await;
+        self.commit_same_cwd_cutover(&active, prepared).await;
+        if goal.get().current.is_some() {
             self.inner.publish(ApplicationEvent::GoalUpdated {
                 operation: "fork_clone",
-                state: self.goal_state(),
+                state: goal.get(),
             });
         }
-        self.inner.charged_goal_jobs.lock().clear();
-        self.finish_todo_session_transition();
         self.inner.publish(ApplicationEvent::SessionForked(SessionForkedEvent { target_id: entry_id.to_owned(), session_id, session_file: session_file.to_string_lossy().into_owned(), editor_text: editor_text.clone() }));
-        Ok(editor_text)
+        Ok(SessionForkOutcome::completed(editor_text))
     }
 
     pub async fn navigate_tree(&self, entry_id: &str, options: crate::NavigateTreeOptions) -> Result<crate::NavigateTreeResult> {
@@ -2058,7 +1930,7 @@ impl Application {
                 }))
                 .await?;
             if reduction.cancel {
-                let active_leaf_id = self.inner.session.session_tree()?.active_leaf_id;
+                let active_leaf_id = self.runtime().session.session_tree()?.active_leaf_id;
                 return Ok(crate::NavigateTreeResult {
                     editor_text: None,
                     active_leaf_id,
@@ -2087,7 +1959,7 @@ impl Application {
             return Err(error);
         }
         self.inner.publish(ApplicationEvent::SessionBeforeTree(SessionBeforeTreeEvent { target_id: entry_id.to_owned(), summarize: options.summarize }));
-        let result = match self.inner.session.navigate_tree(entry_id, options).await {
+        let result = match self.runtime().session.navigate_tree(entry_id, options).await {
             Ok(result) => result,
             Err(error) => {
                 self.finish_todo_session_transition();
@@ -2100,74 +1972,91 @@ impl Application {
     }
 
     pub fn set_session_label(&self, target_id: &str, label: Option<&str>) -> Result<()> {
-        self.inner.session.set_session_label(target_id, label)
+        self.runtime().session.set_session_label(target_id, label)
     }
 
-    pub async fn clone_session(&self) -> Result<()> {
-        let source_goal = self.inner.session.goal_runtime().get().current;
-        let loops = self.loop_handle()?;
-        let previous = self.inner.session.recorder_info().map(|(_, path)| path);
-        loops.suspend(crate::LoopRemovalReason::SessionChanged).await?;
+    pub async fn clone_session(&self) -> Result<SessionChangeOutcome> {
+        let _operation = self.inner.operation_gate.lock().await;
+        let active = self.runtime();
+        let source_goal = active.session.goal_runtime().get().current;
+        let target_id = active
+            .session
+            .session_tree()?
+            .active_leaf_id
+            .ok_or_else(|| anyhow!("Cannot clone session: no current entry selected"))?;
+        let restore_conversation = if let Some((runtime, _)) = active.extension_runtime() {
+            let reduction = runtime
+                .reduce_before_fork(serde_json::json!({
+                    "entryId": target_id,
+                    "position": "at",
+                }))
+                .await?;
+            if reduction.cancel {
+                return Ok(SessionChangeOutcome::CANCELLED);
+            }
+            !reduction.skip_conversation_restore
+        } else {
+            true
+        };
         self.wait_for_idle().await;
         if let Err(error) = self.begin_todo_session_transition().await {
-            let _ = loops.activate(previous).await;
             self.finish_todo_session_transition();
             return Err(error);
         }
-        self.inner
-            .process_manager
-            .shutdown_owner(&self.inner.process_owner_id)
-            .await;
-        if let Err(error) = self.inner.session.clone_session().await {
-            let _ = loops.activate(previous).await;
-            self.finish_todo_session_transition();
-            return Err(error);
-        }
-        let current = self.inner.session.recorder_info().map(|(_, path)| path);
-        if let Err(error) = loops.activate(current).await {
-            self.finish_todo_session_transition();
-            return Err(error.into());
-        }
-        if let Some(source_goal) = source_goal {
-            if let Err(error) = self
-                .inner
-                .session
-                .goal_runtime()
-                .fork_clone(&source_goal)
-                .map_err(|error| anyhow!(error.to_string()))
-            {
+        let session = match active
+            .session
+            .prepare_clone_replacement(&target_id, restore_conversation)
+        {
+            Ok(session) => session,
+            Err(error) => {
                 self.finish_todo_session_transition();
                 return Err(error);
             }
+        };
+        let goal = session.goal_runtime();
+        if let Some(source_goal) = source_goal
+            && let Err(error) = goal.fork_clone(&source_goal)
+        {
+            self.finish_todo_session_transition();
+            return Err(anyhow!(error.to_string()));
+        }
+        let prepared = match self.prepare_same_cwd_cutover(&active, session).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.finish_todo_session_transition();
+                return Err(error);
+            }
+        };
+        active.process_manager.shutdown_owner(&active.process_owner_id).await;
+        self.commit_same_cwd_cutover(&active, prepared).await;
+        if goal.get().current.is_some() {
             self.inner.publish(ApplicationEvent::GoalUpdated {
                 operation: "fork_clone",
-                state: self.goal_state(),
+                state: goal.get(),
             });
         }
-        self.inner.charged_goal_jobs.lock().clear();
-        self.finish_todo_session_transition();
-        Ok(())
+        Ok(SessionChangeOutcome::COMPLETED)
     }
 
     pub fn fork_messages(&self) -> Result<Vec<crate::ForkMessage>> {
-        self.inner.session.fork_messages()
+        self.runtime().session.fork_messages()
     }
 
     pub fn session_entries(&self, since: Option<&str>) -> Result<crate::SessionEntries> {
-        self.inner.session.session_entries(since)
+        self.runtime().session.session_entries(since)
     }
 
     pub fn session_tree(&self) -> Result<crate::SessionTreeResult> {
-        self.inner.session.session_tree()
+        self.runtime().session.session_tree()
     }
 
     pub fn export_html(&self, output: Option<&Path>) -> Result<PathBuf> {
-        crate::export_live_session(&self.inner.session, output, &crate::ExportOptions::default())
+        crate::export_live_session(&self.runtime().session, output, &crate::ExportOptions::default())
     }
 
     pub fn export_jsonl(&self, output: Option<&Path>) -> Result<PathBuf> {
         let (_, path) = self
-            .inner
+            .runtime()
             .session
             .recorder_info()
             .ok_or_else(|| anyhow!("session recording is unavailable"))?;
@@ -2299,8 +2188,9 @@ impl Application {
         snapshot: &crate::ResourceSnapshot,
         settings: &crate::RuntimeSettingsSnapshot,
     ) -> Result<Option<crate::OrchestrationRuntime>> {
+        let active = self.runtime();
         let enabled = settings.orchestration_enabled
-            || self.inner.orchestration_explicit.load(Ordering::Acquire);
+            || active.orchestration_explicit.load(Ordering::Acquire);
         if !enabled {
             return Ok(None);
         }
@@ -2315,11 +2205,11 @@ impl Application {
         config.max_tools_per_agent = settings.orchestration_max_tools_per_agent;
         config = config.with_selector_settings(snapshot.settings.selector.clone().unwrap_or_default());
         config.agent_settings = snapshot.settings.agents.clone();
-        if let Some(model) = self.inner.session.model() {
+        if let Some(model) = active.session.model() {
             config.parent_model = model;
         }
         // Live parent model so /model switches apply to child resolution without rebuild.
-        let session_for_parent = self.inner.session.clone();
+        let session_for_parent = active.session.clone();
         config = config.with_parent_model_provider(std::sync::Arc::new(move || {
             session_for_parent.model().unwrap_or_default()
         }));
@@ -2332,11 +2222,11 @@ impl Application {
                 .ok_or_else(|| anyhow!("orchestration URI resolver is not initialized"))?(uri)
         });
         let factory = crate::OrchestrationRuntime::child_factory_from_session_and_uri(
-            &self.inner.session,
+            &active.session,
             Some(resolver),
         );
         let runtime = crate::OrchestrationRuntime::new(config, factory)?;
-        if let Some(current) = self.orchestration_runtime()
+        if let Some(current) = self.runtime().orchestration_runtime()
             && current.runtime_equivalent(&runtime)
         {
             return Ok(Some(current));
@@ -2348,10 +2238,33 @@ impl Application {
     async fn commit_orchestration_candidate(
         &self,
         candidate: Option<crate::OrchestrationRuntime>,
-    ) {
+    ) -> Result<()> {
+        let active = self.runtime();
+        let same_runtime = active
+            .orchestration_runtime()
+            .zip(candidate.as_ref())
+            .is_some_and(|(current, candidate)| current.shares_runtime(candidate));
+        if !same_runtime
+            && let Some(runtime) = &candidate
+        {
+            // Replacing a live runtime is a deliberate reconfiguration, not a
+            // crash recovery: the previous runtime's jobs are cancelled by its
+            // own shutdown, so the replacement starts from a clean durable
+            // state. A first-time enable (no live previous) still recovers any
+            // existing sidecar so resumed sessions continue their jobs.
+            if active.orchestration_runtime().is_some() {
+                runtime
+                    .bind_and_reset(&active.session)
+                    .context("resetting replacement orchestration runtime")?;
+            } else {
+                runtime
+                    .bind_and_recover(&active.session)
+                    .context("binding replacement orchestration runtime")?;
+            }
+        }
         let next_runtime = candidate.as_ref().cloned();
         let (previous, runtime_changed) = {
-            let mut current = self.inner.orchestration_runtime.lock();
+            let mut current = active.orchestration_runtime.lock();
             if current
                 .as_ref()
                 .zip(candidate.as_ref())
@@ -2363,33 +2276,38 @@ impl Application {
             }
         };
         if runtime_changed {
-            if let Some(task) = self.inner.orchestration_events.lock().take() {
+            if let Some(task) = active.orchestration_events.lock().take() {
                 task.abort();
             }
-            if let Some(runtime) = next_runtime {
+            if let Some(runtime) = &next_runtime {
                 let mut events = runtime.subscribe();
                 let event_runtime = runtime.clone();
                 let event_inner = Arc::downgrade(&self.inner);
-                *self.inner.orchestration_events.lock() = Some(tokio::spawn(async move {
+                let epoch = active.epoch();
+                *active.orchestration_events.lock() = Some(tokio::spawn(async move {
                     loop {
                         match events.recv().await {
                             Ok(event) => {
                                 let Some(inner) = event_inner.upgrade() else { break; };
-                                let allow_spawn = !inner.todo_continuation_suppressed.load(Ordering::Acquire);
+                                let active = inner.runtime();
+                                if active.epoch() != epoch { break; }
+                                let allow_spawn = !active.todo_continuation_suppressed.load(Ordering::Acquire);
                                 if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                                     inner.todo_dag_failed(&error);
                                 }
-                                inner.publish(ApplicationEvent::Orchestration(event));
+                                let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                                 inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 let Some(inner) = event_inner.upgrade() else { break; };
+                                let active = inner.runtime();
+                                if active.epoch() != epoch { break; }
                                 for event in event_runtime.presentation_events() {
-                                    let allow_spawn = !inner.todo_continuation_suppressed.load(Ordering::Acquire);
+                                    let allow_spawn = !active.todo_continuation_suppressed.load(Ordering::Acquire);
                                     if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                                         inner.todo_dag_failed(&error);
                                     }
-                                    inner.publish(ApplicationEvent::Orchestration(event));
+                                    let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                                     inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                                 }
                             }
@@ -2401,15 +2319,30 @@ impl Application {
         }
         if let Some(previous) = previous {
             previous.shutdown().await;
+            // `previous.shutdown()` persists the prior runtime's final state
+            // to the shared per-parent-session sidecar (runtime.rs:3479),
+            // undoing the replacement's clean reset and letting a later
+            // restart recover pre-reload jobs. The replacement is now the sole
+            // durable owner: this post-shutdown sync closes the ownership race
+            // by re-writing the sidecar to the replacement's current (clean)
+            // state. The pre-swap bind/reset already validated the durable
+            // path, so a clean sidecar is part of the reload contract and a
+            // failure here must fail the reload rather than leave stale state.
+            if let Some(runtime) = &next_runtime {
+                runtime
+                    .persist_durable_state()
+                    .context("persisting replacement orchestration runtime")?;
+            }
         }
+        Ok(())
     }
 
     /// The resource snapshot, extension registry, and agent tool set are all staged
     /// before the active resource and extension generations are replaced.
     pub async fn reload(&self) -> Result<crate::ReloadResult> {
         self.wait_for_idle().await;
-        let resources = self
-            .inner
+        let active = self.runtime();
+        let resources = active
             .session
             .resource_manager()
             .ok_or_else(|| anyhow!("session has no resource manager"))?;
@@ -2417,23 +2350,22 @@ impl Application {
         let next_runtime_settings = Arc::new(resource_candidate.snapshot().settings.runtime_settings()?);
         let orchestration_candidate =
             self.orchestration_candidate(&resource_candidate.snapshot(), &next_runtime_settings)?;
-        let extension_runtime = self.inner.extension_runtime.lock().clone();
+        let extension_runtime = active.extension_runtime.lock().clone();
         let Some((runtime, permissions)) = extension_runtime else {
             let mut additional_tools = Vec::new();
             if let Some(orchestration) = &orchestration_candidate {
                 additional_tools.extend(orchestration.agent_tools("Main", 0));
             }
-            if let Some(binding) = self.inner.goal_tool_binding.lock().as_ref() {
+            if let Some(binding) = active.goal_tool_binding.lock().as_ref() {
                 additional_tools.push(binding.tool());
             }
-            let update = self
-                .inner
+            let update = active
                 .session
                 .prepare_resource_update(resource_candidate.snapshot(), additional_tools)?;
             let result = resources.commit_reload(resource_candidate)?;
-            self.inner.session.commit_resource_update(update).await;
-            *self.inner.runtime_settings.lock() = next_runtime_settings;
-            self.commit_orchestration_candidate(orchestration_candidate).await;
+            active.session.commit_resource_update(update).await;
+            *active.runtime_settings.lock() = next_runtime_settings;
+            self.commit_orchestration_candidate(orchestration_candidate).await?;
             return Ok(result);
         };
         let specs = resource_candidate.extension_specs(&permissions)?;
@@ -2447,10 +2379,10 @@ impl Application {
         if let Some(orchestration) = &orchestration_candidate {
             additional_tools.extend(orchestration.agent_tools("Main", 0));
         }
-        if let Some(binding) = self.inner.goal_tool_binding.lock().as_ref() {
+        if let Some(binding) = active.goal_tool_binding.lock().as_ref() {
             additional_tools.push(binding.tool());
         }
-        let update = match self.inner.session.prepare_resource_update(
+        let update = match active.session.prepare_resource_update(
             resource_candidate.snapshot(),
             additional_tools,
         ) {
@@ -2467,15 +2399,15 @@ impl Application {
         let result = resources.commit_reload(resource_candidate)?;
         runtime.commit_reload(extension_candidate)?;
         runtime.finish_reload("reload").await;
-        self.inner.session.commit_resource_update(update).await;
-        *self.inner.runtime_settings.lock() = next_runtime_settings;
-        self.commit_orchestration_candidate(orchestration_candidate).await;
+        active.session.commit_resource_update(update).await;
+        *active.runtime_settings.lock() = next_runtime_settings;
+        self.commit_orchestration_candidate(orchestration_candidate).await?;
         Ok(result)
     }
 
     #[must_use]
     pub fn resource_generation(&self) -> Option<u64> {
-        self.inner
+        self.runtime()
             .session
             .resource_manager()
             .map(|resources| resources.generation())
@@ -2483,56 +2415,56 @@ impl Application {
 
     #[must_use]
     pub fn resource_snapshot(&self) -> Option<Arc<crate::ResourceSnapshot>> {
-        self.inner
+        self.runtime()
             .session
             .resource_manager()
             .map(|resources| resources.snapshot())
     }
 
     pub async fn set_steering_mode(&self, mode: pi_agent::QueueMode) {
-        self.inner.session.set_steering_mode(mode).await;
+        self.runtime().session.set_steering_mode(mode).await;
     }
 
     pub async fn set_follow_up_mode(&self, mode: pi_agent::QueueMode) {
-        self.inner.session.set_follow_up_mode(mode).await;
+        self.runtime().session.set_follow_up_mode(mode).await;
     }
 
     pub fn set_auto_compaction_enabled(&self, enabled: bool) {
-        self.inner.session.set_auto_compaction_enabled(enabled);
+        self.runtime().session.set_auto_compaction_enabled(enabled);
     }
 
     pub fn set_session_name(&self, name: &str) -> Result<()> {
-        self.inner.session.set_session_name(name)
+        self.runtime().session.set_session_name(name)
     }
 
     pub async fn set_project_trust(
         &self,
         decision: crate::TrustDecision,
     ) -> Result<crate::ReloadResult> {
-        let resources = self
-            .inner
+        let active = self.runtime();
+        let resources = active
             .session
             .resource_manager()
             .ok_or_else(|| anyhow!("session has no resource manager"))?;
         resources
             .trust_store()
-            .set(self.inner.session.cwd(), decision)?;
+            .set(active.session.cwd(), decision)?;
         self.reload().await
     }
 
     pub fn set_model(&self, model: Model, api_key: String) -> crate::ThinkingLevelChange {
-        self.inner.session.set_model(model, api_key)
+        self.runtime().session.set_model(model, api_key)
     }
 
     pub async fn set_model_with_resolved_auth(
         &self,
         model: Model,
     ) -> Result<crate::ThinkingLevelChange> {
-        self.inner.session.set_model_with_resolved_auth(model).await
+        self.runtime().session.set_model_with_resolved_auth(model).await
     }
 
     pub fn set_thinking_level(&self, level: ThinkingLevel) -> crate::ThinkingLevelChange {
-        self.inner.session.set_thinking_level(level)
+        self.runtime().session.set_thinking_level(level)
     }
 
     /// Stops every runtime owned by this application. Safe to call repeatedly;
@@ -2544,7 +2476,8 @@ impl Application {
         }
 
         self.inner.cleaned.store(true, Ordering::Release);
-        self.inner.session.abort().await;
+        let active = self.runtime();
+        active.session.abort().await;
         self.wait_for_idle().await;
 
         if let Some(task) = self.inner.workflow_events.lock().take() {
@@ -2567,30 +2500,24 @@ impl Application {
         if let Some(runtime) = loop_scheduler {
             runtime.shutdown().await;
         }
-        if let Some(task) = self.inner.orchestration_events.lock().take() {
+        if let Some(task) = active.orchestration_events.lock().take() {
             task.abort();
         }
-        let orchestration_runtime = self.inner.orchestration_runtime.lock().take();
+        let orchestration_runtime = active.orchestration_runtime.lock().take();
         if let Some(runtime) = orchestration_runtime {
             runtime.shutdown().await;
         }
 
-        self.inner
-            .process_manager
-            .shutdown_owner(&self.inner.process_owner_id)
-            .await;
-        let process_events = self.inner.process_events.lock().take();
-        if let Some(task) = process_events {
+        active.process_manager.shutdown_owner(&active.process_owner_id).await;
+        if let Some(task) = active.process_events.lock().take() {
             task.abort();
         }
-        let session_events = self.inner.session_events.lock().take();
-        if let Some(task) = session_events {
+        if let Some(task) = active.session_events.lock().take() {
             task.abort();
         }
-        self.inner.session_subscription.lock().take();
+        active.session_subscription.lock().take();
 
-        let runtime = self
-            .inner
+        let runtime = active
             .extension_runtime
             .lock()
             .take()
@@ -2606,7 +2533,7 @@ impl Application {
     /// and falls back to in-memory history. Publishes an [`Exported`] event
     /// with the output path, or a [`ShareFailed`] event on error.
     pub fn export_session(&self, output: Option<PathBuf>) {
-        let session = self.inner.session.clone();
+        let session = self.runtime().session();
         let events = self.inner.events.clone();
         let options = crate::export::ExportOptions::default();
         tokio::spawn(async move {
@@ -2632,7 +2559,7 @@ impl Application {
     /// default secret visibility, and publishes a [`ShareSucceeded`] event with
     /// the viewer URL — or a [`ShareFailed`] event with an actionable error.
     pub fn share_session(&self) {
-        let session = self.inner.session.clone();
+        let session = self.runtime().session();
         let events = self.inner.events.clone();
         let options = crate::export::ExportOptions::default();
         tokio::spawn(async move {
@@ -2673,7 +2600,7 @@ impl ExtensionActionHost for ApplicationExtensionHost {
         Box::pin(async move {
             let application = self.application()?;
             let state = application.state().await;
-            let stats = application.inner.session.session_stats();
+            let stats = application.session_stats();
             let project_trusted = application
                 .resource_snapshot()
                 .is_none_or(|snapshot| snapshot.trust.is_trusted());
@@ -2707,7 +2634,7 @@ impl ExtensionActionHost for ApplicationExtensionHost {
                 all_tools,
                 commands,
                 flag_values: std::collections::BTreeMap::new(),
-                system_prompt: application.inner.session.current_system_prompt().await,
+                system_prompt: application.session().current_system_prompt().await,
                 model: state.model.map(public_extension_model),
                 thinking_level: state.thinking_level,
             })
@@ -2728,8 +2655,7 @@ impl ExtensionActionHost for ApplicationExtensionHost {
             match action {
                 ExtensionRuntimeAction::SendMessage { message, delivery, trigger_turn } => {
                     application
-                        .inner
-                        .session
+                        .session()
                         .send_custom_message(
                             CustomMessage {
                                 custom_type: message.custom_type,
@@ -2746,14 +2672,13 @@ impl ExtensionActionHost for ApplicationExtensionHost {
                 }
                 ExtensionRuntimeAction::SendUserMessage { content, delivery } => {
                     application
-                        .inner
-                        .session
+                        .session()
                         .send_user_message(content, message_delivery(delivery))
                         .await?;
                     Ok(Value::Null)
                 }
                 ExtensionRuntimeAction::AppendEntry { custom_type, data } => {
-                    serde_json::to_value(application.inner.session.append_custom_entry(&custom_type, data)?)
+                    serde_json::to_value(application.session().append_custom_entry(&custom_type, data)?)
                         .map_err(Into::into)
                 }
                 ExtensionRuntimeAction::SetSessionName { name } => {
@@ -2790,8 +2715,6 @@ impl ExtensionActionHost for ApplicationExtensionHost {
                             model.id
                         ))?;
                     let _ = application
-                        .inner
-                        .session
                         .set_model_with_resolved_auth(canonical)
                         .await?;
                     Ok(Value::Bool(true))
@@ -2846,18 +2769,20 @@ impl ApplicationInner {
         runtime: &crate::OrchestrationRuntime,
         reset_attempts: bool,
     ) -> Result<TodoDagExecutionOutcome> {
-        let gate = self.todo_dag_transaction_gate();
+        let active = self.runtime();
+        let gate = active.todo_dag.lock().reconcile_gate.clone();
         let _transaction = gate.lock();
-        if self.todo_transition_active.load(Ordering::Acquire) {
+        if active.todo_transition_active.load(Ordering::Acquire) {
             return Err(anyhow!("Todo mutation rejected during session transition"));
         }
-        self.todo_continuation_suppressed.store(false, Ordering::Release);
-        self.todo_resume_requested.store(false, Ordering::Release);
-        self.todo_cycle_pending.store(true, Ordering::Release);
+        active.todo_continuation_suppressed.store(false, Ordering::Release);
+        active.todo_resume_requested.store(false, Ordering::Release);
+        active.todo_cycle_pending.store(true, Ordering::Release);
         self.arm_todo_dag_locked(runtime, reset_attempts)
     }
     fn has_ready_open_todo(&self) -> bool {
-        self.session
+        self.runtime()
+            .session
             .todo_state()
             .phases
             .iter()
@@ -2869,58 +2794,61 @@ impl ApplicationInner {
     }
 
     fn arm_todo_dag_after_mutation(&self) -> Result<()> {
-        let gate = self.todo_dag_transaction_gate();
+        let active = self.runtime();
+        let gate = active.todo_dag.lock().reconcile_gate.clone();
         let _transaction = gate.lock();
         self.arm_todo_dag_after_mutation_locked()
     }
 
     fn arm_todo_dag_after_mutation_locked(&self) -> Result<()> {
-        if self.todo_transition_active.load(Ordering::Acquire) {
+        let active = self.runtime();
+        if active.todo_transition_active.load(Ordering::Acquire) {
             return Err(anyhow!("Todo mutation rejected during session transition"));
         }
-        self.todo_continuation_suppressed.store(false, Ordering::Release);
-        self.todo_resume_requested.store(false, Ordering::Release);
-        let runtime = self.orchestration_runtime.lock().as_ref().cloned();
+        active.todo_continuation_suppressed.store(false, Ordering::Release);
+        active.todo_resume_requested.store(false, Ordering::Release);
+        let runtime = active.orchestration_runtime();
         let Some(runtime) = runtime else {
             return Ok(());
         };
         if self.has_ready_open_todo() {
-            self.todo_cycle_pending.store(true, Ordering::Release);
+            active.todo_cycle_pending.store(true, Ordering::Release);
             self.arm_todo_dag_locked(&runtime, true)?;
-        } else if self.todo_dag.lock().status != TodoDagExecutionStatus::Dormant {
+        } else if active.todo_dag.lock().status != TodoDagExecutionStatus::Dormant {
             self.reconcile_todo_dag_locked(&runtime, true)?;
         }
         self.finish_todo_cycle_if_idle(Some(&runtime), false);
         Ok(())
     }
     fn finish_parent_turn(&self) {
-        if !self.todo_cycle_pending.load(Ordering::Acquire) {
+        let active = self.runtime();
+        if !active.todo_cycle_pending.load(Ordering::Acquire) {
             self.publish(ApplicationEvent::AgentSettled);
             return;
         }
-        if self.todo_resume_requested.swap(false, Ordering::AcqRel) {
-            self.todo_continuation_suppressed.store(false, Ordering::Release);
+        if active.todo_resume_requested.swap(false, Ordering::AcqRel) {
+            active.todo_continuation_suppressed.store(false, Ordering::Release);
         }
-        if !self.todo_continuation_suppressed.load(Ordering::Acquire)
-            && let Some(runtime) = self.orchestration_runtime.lock().as_ref().cloned()
+        let orchestration = active.orchestration_runtime();
+        if !active.todo_continuation_suppressed.load(Ordering::Acquire)
+            && let Some(runtime) = orchestration.as_ref()
         {
             let result = if self.has_ready_open_todo()
-                && self.todo_dag.lock().status.is_terminal()
+                && active.todo_dag.lock().status.is_terminal()
             {
-                self.arm_todo_dag(&runtime, true).map(|_| ())
-            } else if self.todo_dag.lock().status != TodoDagExecutionStatus::Dormant {
-                self.reconcile_todo_dag(&runtime, true).map(|_| ())
+                self.arm_todo_dag(runtime, true).map(|_| ())
+            } else if active.todo_dag.lock().status != TodoDagExecutionStatus::Dormant {
+                self.reconcile_todo_dag(runtime, true).map(|_| ())
             } else {
                 Ok(())
             };
             if let Err(error) = result {
                 self.todo_dag_failed(&error);
             }
-            self.finish_todo_cycle_if_idle(Some(&runtime), true);
+            self.finish_todo_cycle_if_idle(Some(runtime), true);
             return;
         }
-        let runtime = self.orchestration_runtime.lock().as_ref().cloned();
-        self.finish_todo_cycle_if_idle(runtime.as_ref(), true);
+        self.finish_todo_cycle_if_idle(orchestration.as_ref(), true);
     }
     fn has_active_jobs(runtime: &crate::OrchestrationRuntime) -> bool {
         runtime.jobs(None).iter().any(|job| {
@@ -2929,12 +2857,13 @@ impl ApplicationInner {
     }
 
     fn todo_dag_failed(&self, error: &anyhow::Error) {
-        self.todo_dag.lock().status = TodoDagExecutionStatus::Blocked;
-        self.todo_dag_changed.notify_waiters();
+        let active = self.runtime();
+        active.todo_dag.lock().status = TodoDagExecutionStatus::Blocked;
+        active.todo_dag_changed.notify_waiters();
         self.publish(ApplicationEvent::RunFailed {
             message: format!("failed to reconcile Todo DAG execution: {error}"),
         });
-        let runtime = self.orchestration_runtime.lock().as_ref().cloned();
+        let runtime = active.orchestration_runtime();
         self.finish_todo_cycle_if_idle(runtime.as_ref(), false);
     }
 
@@ -2943,27 +2872,28 @@ impl ApplicationInner {
         runtime: Option<&crate::OrchestrationRuntime>,
         parent_settled: bool,
     ) {
-        if !self.todo_cycle_pending.load(Ordering::Acquire) {
+        let active = self.runtime();
+        if !active.todo_cycle_pending.load(Ordering::Acquire) {
             return;
         }
         if !parent_settled
-            && self.active_run.lock().as_ref().is_some_and(|run| !run.is_finished())
+            && active.active_run.lock().as_ref().is_some_and(|run| !run.is_finished())
         {
             return;
         }
         if runtime.is_some_and(Self::has_active_jobs) {
             return;
         }
-        if self.todo_continuation_suppressed.load(Ordering::Acquire) {
-            let mut coordinator = self.todo_dag.lock();
+        if active.todo_continuation_suppressed.load(Ordering::Acquire) {
+            let mut coordinator = active.todo_dag.lock();
             if coordinator.status == TodoDagExecutionStatus::Active {
                 coordinator.status = TodoDagExecutionStatus::Blocked;
-                self.todo_dag_changed.notify_waiters();
+                active.todo_dag_changed.notify_waiters();
             }
-        } else if self.todo_dag.lock().status == TodoDagExecutionStatus::Active {
+        } else if active.todo_dag.lock().status == TodoDagExecutionStatus::Active {
             return;
         }
-        if self.todo_cycle_pending.swap(false, Ordering::AcqRel) {
+        if active.todo_cycle_pending.swap(false, Ordering::AcqRel) {
             self.publish(ApplicationEvent::AgentSettled);
         }
     }
@@ -2974,13 +2904,14 @@ impl ApplicationInner {
         started: Instant,
         goal_was_active: bool,
     ) {
-        if self.session.goal_runtime().get().current.is_none() {
+        let active = self.runtime();
+        if active.session.goal_runtime().get().current.is_none() {
             return;
         }
         let mut tokens = usage_tokens(&parent_usage);
         let mut settled_jobs = Vec::new();
-        if let Some(runtime) = self.orchestration_runtime.lock().as_ref() {
-            let charged = self.charged_goal_jobs.lock();
+        if let Some(runtime) = active.orchestration_runtime() {
+            let charged = active.charged_goal_jobs.lock();
             for job in runtime.jobs(None) {
                 if !job.status.is_settled() || charged.contains(&job.id) {
                     continue;
@@ -3000,12 +2931,12 @@ impl ApplicationInner {
         };
         if tokens != 0 || elapsed != 0 {
             let delta = GoalUsageDelta::new(tokens, elapsed);
-            match self.session.goal_runtime().update_usage(delta) {
+            match active.session.goal_runtime().update_usage(delta) {
                 Ok(_) => {
-                    self.charged_goal_jobs.lock().extend(settled_jobs);
+                    active.charged_goal_jobs.lock().extend(settled_jobs);
                     self.publish(ApplicationEvent::GoalUsageCharged {
                         delta,
-                        state: self.session.goal_runtime().get(),
+                        state: active.session.goal_runtime().get(),
                     });
                 }
                 Err(error) => self.publish(ApplicationEvent::RunFailed {
@@ -3013,15 +2944,15 @@ impl ApplicationInner {
                 }),
             }
         } else {
-            self.charged_goal_jobs.lock().extend(settled_jobs);
+            active.charged_goal_jobs.lock().extend(settled_jobs);
         }
         self.publish(ApplicationEvent::GoalContinuation {
-            decision: self.session.goal_runtime().continuation_decision(),
+            decision: active.session.goal_runtime().continuation_decision(),
         });
     }
 
     fn pause_goal_after_resume(&self) -> Result<()> {
-        let runtime = self.session.goal_runtime();
+        let runtime = self.runtime().session.goal_runtime();
         let Some(goal) = runtime.get().current else {
             return Ok(());
         };
@@ -3062,25 +2993,26 @@ fn goal_tool_schema() -> Schema {
 }
 impl Drop for ApplicationInner {
     fn drop(&mut self) {
-        self.process_manager.shutdown_owner_now(&self.process_owner_id);
-        if let Some(task) = self.orchestration_events.get_mut().take() {
+        let active = self.runtime.runtime();
+        active.process_manager.shutdown_owner_now(&active.process_owner_id);
+        if let Some(task) = active.orchestration_events.lock().take() {
             task.abort();
         }
-        if let Some(task) = self.process_events.get_mut().take() {
+        if let Some(task) = active.process_events.lock().take() {
             task.abort();
         }
-        if let Some(task) = self.session_events.get_mut().take() {
+        if let Some(task) = active.session_events.lock().take() {
             task.abort();
         }
-        self.session_subscription.get_mut().take();
+        active.session_subscription.lock().take();
 
-        let session = self.session.clone();
-        let active_run = self.active_run.get_mut().take();
+        let session = active.session.clone();
+        let active_run = active.active_run.lock().take();
         let loop_scheduler = self.loop_scheduler.get_mut().take();
-        let orchestration_runtime = self.orchestration_runtime.get_mut().take();
-        let extension_runtime = self
+        let orchestration_runtime = active.orchestration_runtime.lock().take();
+        let extension_runtime = active
             .extension_runtime
-            .get_mut()
+            .lock()
             .take()
             .map(|(runtime, _)| runtime);
         let cleanup = async move {
@@ -3124,8 +3056,9 @@ struct GoalWorkPendingGuard {
 impl Drop for GoalWorkPendingGuard {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.upgrade() {
-            inner.goal_work_pending.fetch_sub(1, Ordering::AcqRel);
-            inner.goal_work_changed.notify_waiters();
+            let active = inner.runtime();
+            active.goal_work_pending.fetch_sub(1, Ordering::AcqRel);
+            active.goal_work_changed.notify_waiters();
         }
     }
 }
@@ -3144,7 +3077,7 @@ async fn run_goal_work(
             let Some(application) = inner.upgrade() else {
                 return;
             };
-            application.turn_gate.clone().lock_owned().await
+            application.runtime().turn_gate.clone().lock_owned().await
         }
     };
     let Some(inner) = inner.upgrade() else {
@@ -3154,7 +3087,8 @@ async fn run_goal_work(
         clear_goal_work_activation(&inner, &key);
         return;
     }
-    let state = inner.session.goal_runtime().get();
+    let active = inner.runtime();
+    let state = active.session.goal_runtime().get();
     if state.revision != key.revision
         || !state.current.as_ref().is_some_and(|goal| {
             goal.id == key.goal_id && goal.lifecycle == crate::GoalLifecycle::Active
@@ -3165,7 +3099,7 @@ async fn run_goal_work(
     }
 
     inner.publish(ApplicationEvent::GoalContinuation {
-        decision: inner.session.goal_runtime().continuation_decision(),
+        decision: active.session.goal_runtime().continuation_decision(),
     });
     let message = Message::Custom(CustomMessage {
         custom_type: GOAL_CONTINUATION_CUSTOM_TYPE.to_owned(),
@@ -3178,7 +3112,7 @@ async fn run_goal_work(
         timestamp: pi_ai::now_millis(),
     });
     let started = Instant::now();
-    match inner.session.run_messages(vec![message]).await {
+    match active.session.run_messages(vec![message]).await {
         Ok(result) => inner.finish_goal_turn(result.usage, started, true),
         Err(error) => {
             clear_goal_work_activation(&inner, &key);
@@ -3193,7 +3127,8 @@ async fn run_goal_work(
 }
 
 fn clear_goal_work_activation(inner: &ApplicationInner, key: &GoalWorkKey) {
-    let mut activation = inner.goal_work_activation.lock();
+    let active = inner.runtime();
+    let mut activation = active.goal_work_activation.lock();
     if activation.as_ref() == Some(key) {
         *activation = None;
     }
@@ -3207,16 +3142,17 @@ async fn run_loop_turn(
     let Some(inner) = inner.upgrade() else {
         return Err("application stopped".to_owned());
     };
+    let active = inner.runtime();
     request.report(crate::LoopRunState::Queued);
     let turn_guard = tokio::select! {
         _ = cancel.cancelled() => return Err("loop cancelled".to_owned()),
-        guard = inner.turn_gate.clone().lock_owned() => guard,
+        guard = active.turn_gate.clone().lock_owned() => guard,
     };
     if cancel.is_cancelled() {
         return Err("loop cancelled".to_owned());
     }
     request.report(crate::LoopRunState::Started);
-    let session = inner.session.clone();
+    let session = active.session.clone();
     let loop_message = Message::Custom(pi_ai::CustomMessage {
         custom_type: crate::LOOP_SCHEDULED_MESSAGE_TYPE.to_owned(),
         content: request.model_prompt.into(),
@@ -3240,7 +3176,7 @@ async fn run_loop_turn(
             }
         }
     };
-    inner.loop_turn_active.store(false, Ordering::Release);
+    active.loop_turn_active.store(false, Ordering::Release);
     inner.finish_parent_turn();
     drop(turn_guard);
     result

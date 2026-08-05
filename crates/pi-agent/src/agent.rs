@@ -413,6 +413,12 @@ impl Agent {
         *self.inner.transform_context.write() = hook;
     }
 
+    /// Returns the hook currently installed for the next tool call.
+    #[must_use]
+    pub fn before_tool_call(&self) -> Option<BeforeToolCallFn> {
+        self.inner.before_tool_call.read().clone()
+    }
+
     pub fn set_before_tool_call(&self, hook: Option<BeforeToolCallFn>) {
         *self.inner.before_tool_call.write() = hook;
     }
@@ -984,6 +990,26 @@ impl Agent {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod before_tool_call_getter_tests {
+    use super::*;
+    use crate::BeforeToolCallResult;
+
+    #[test]
+    fn getter_returns_current_hook_and_tracks_replacement() {
+        let agent = Agent::new(AgentOptions::default());
+        assert!(agent.before_tool_call().is_none());
+        let hook: BeforeToolCallFn = Arc::new(|_| {
+            Box::pin(async { Ok(BeforeToolCallResult::default()) })
+        });
+        agent.set_before_tool_call(Some(hook.clone()));
+        let current = agent.before_tool_call().expect("current hook");
+        assert!(Arc::ptr_eq(&current, &hook));
+        agent.set_before_tool_call(None);
+        assert!(agent.before_tool_call().is_none());
     }
 }
 

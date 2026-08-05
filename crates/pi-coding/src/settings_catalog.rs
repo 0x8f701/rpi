@@ -10,7 +10,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::settings::{Settings, SettingsManager, SettingsScope, validate_settings};
+use crate::settings::{
+    SESSION_IMPORT_SOURCE_VALUES, Settings, SettingsManager, SettingsScope, validate_settings,
+};
 
 const REDACTED_VALUE: &str = "[redacted]";
 
@@ -236,6 +238,8 @@ pub const SETTINGS_CATALOG: &[SettingDef] = &[
     setting!("branchSummary.reserveTokens", Session, POSITIVE_I64, "16384", "Tokens reserved while generating branch summaries.", NONE, ALL, LIVE, false, false),
     setting!("branchSummary.skipPrompt", Session, BOOL, "false", "Skip the branch-summary prompt when possible.", NONE, ALL, LIVE, false, false),
     setting!("exposeSessionEnvironment", Session, BOOL, "true", "Expose the session environment to tools.", NONE, ALL, LIVE, false, true),
+    setting!("sessionDir", Session, NON_EMPTY_STRING, "null", "Directory used for session storage and lookup.", NONE, ALL, RESTART, false, false),
+    setting!("sessionImportSources", Session, STRING_LIST, "[]", "Foreign session sources eligible for automatic discovery and resume; native Pi sessions are always included.", SESSION_IMPORT_SOURCE_VALUES, ALL, RELOAD, false, false),
 
     setting!("compaction.enabled", Compaction, BOOL, "true", "Enable automatic context compaction.", NONE, ALL, LIVE, false, false),
     setting!("compaction.reserveTokens", Compaction, POSITIVE_I64, "16384", "Tokens reserved for the next response during compaction.", NONE, ALL, LIVE, false, false),
@@ -301,6 +305,7 @@ pub const SETTINGS_CATALOG: &[SettingDef] = &[
     setting!("enableSkillCommands", Resources, BOOL, "true", "Expose loaded skills as interactive commands.", NONE, ALL, RELOAD, false, true),
 
     setting!("defaultProjectTrust", TrustSecurity, SettingValueType::Enum, "\"ask\"", "Default trust for projects without a stored decision.", &["ask", "always", "never"], GLOBAL, RESTART, false, true),
+    setting!("approvalMode", TrustSecurity, SettingValueType::Enum, "\"yolo\"", "Host tool approval policy.", &["yolo", "write", "ask"], GLOBAL, RESTART, false, true),
     setting!("apiKey", TrustSecurity, SettingValueType::Secret, "null", "Misplaced API credentials are redacted; use auth.json or environment variables.", NONE, SettingScopeSupport::None, RESTART, true, true),
 ];
 
@@ -742,7 +747,7 @@ mod tests {
     #[test]
     fn catalog_covers_all_typed_setting_paths() {
         let expected = BTreeSet::from([
-            "defaultProvider", "defaultModel", "defaultThinkingLevel", "defaultProjectTrust", "theme",
+            "defaultProvider", "defaultModel", "defaultThinkingLevel", "defaultProjectTrust", "approvalMode", "sessionDir", "sessionImportSources", "theme",
             "compaction.enabled", "compaction.reserveTokens", "compaction.keepRecentTokens",
             "terminal.showImages", "terminal.imageWidthCells", "terminal.clearOnShrink", "terminal.showTerminalProgress",
             "images.autoResize", "images.blockImages", "retry.enabled", "retry.maxRetries", "retry.baseDelayMs",
@@ -798,6 +803,36 @@ mod tests {
     }
 
     #[test]
+    fn approval_mode_is_global_only_restart_with_yolo_default() {
+        let (_agent, _cwd, manager) = manager();
+        let definition = SettingsCatalog::definition("approvalMode").expect("approval mode");
+        assert_eq!(definition.scopes, SettingScopeSupport::GlobalOnly);
+        assert_eq!(definition.behavior, SettingApplyBehavior::Restart);
+        assert_eq!(definition.default_value(), json!("yolo"));
+
+        let view = manager.setting("approvalMode").expect("approval mode view");
+        assert_eq!(view.effective_value, json!("yolo"));
+        assert_eq!(view.source, SettingSource::Default);
+        assert!(view.editable_global);
+        assert!(!view.editable_project);
+
+        let paths = manager.paths();
+        let cwd = paths.project.parent().expect("project config").parent().expect("cwd");
+        fs::create_dir_all(cwd.join(".pi")).expect("project dir");
+        manager.load_project(true).expect("trust empty project");
+        let mut project = manager.settings_draft(SettingsScope::Project).expect("project draft");
+        let error = project.set("approvalMode", json!("yolo")).expect_err("global only");
+        assert!(error.to_string().contains("cannot be written"), "{error:#}");
+
+        let mut global = manager.settings_draft(SettingsScope::Global).expect("global draft");
+        global.set("approvalMode", json!("ask")).expect("set approval mode");
+        let writes = global.apply(&manager).expect("apply");
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].needs_restart);
+        assert!(!writes[0].needs_reload);
+    }
+
+    #[test]
     fn draft_rejects_wrong_types_ranges_and_enums() {
         let (_agent, _cwd, manager) = manager();
         let mut draft = manager.settings_draft(SettingsScope::Global).expect("draft");
@@ -805,6 +840,33 @@ mod tests {
         assert!(draft.set("temperature", json!(2.1)).is_err());
         assert!(draft.set("transport", json!("udp")).is_err());
         assert!(!draft.is_dirty());
+    }
+
+    #[test]
+    fn session_import_sources_catalog_exposes_allowed_values_and_full_validation() {
+        let definition = SettingsCatalog::definition("sessionImportSources")
+            .expect("session import sources definition");
+        assert_eq!(definition.category, SettingCategory::Session);
+        assert_eq!(definition.value_type, STRING_LIST);
+        assert_eq!(definition.default_value(), json!([]));
+        assert_eq!(definition.enum_values, SESSION_IMPORT_SOURCE_VALUES);
+        assert_eq!(definition.behavior, SettingApplyBehavior::Reload);
+
+        let (_agent, _cwd, manager) = manager();
+        let mut allowed = manager.settings_draft(SettingsScope::Global).expect("allowed draft");
+        allowed
+            .set("sessionImportSources", json!(["codex", "claude"]))
+            .expect("stage allowed sources");
+        allowed.validate().expect("allowed sources validate");
+
+        for value in [json!(["pi"]), json!(["codex", "codex"])] {
+            let mut invalid = manager.settings_draft(SettingsScope::Global)
+                .expect("invalid draft");
+            invalid
+                .set("sessionImportSources", value)
+                .expect("stage structurally valid list");
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]

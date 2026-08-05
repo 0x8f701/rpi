@@ -57,6 +57,64 @@ fn faux_factory(
     })
 }
 
+/// `faux_factory` variant that installs a test-only `before_tool_call` hook on
+/// each child session. The hook fires from *child tool execution* the instant a
+/// child's model emits a `hub` call with `op: "wait"`, notifying the per-child
+/// readiness signal so the parent test can deterministically wait until both
+/// children have begun their explicit waits before issuing any send. This
+/// removes the race where peer-roster visibility (which precedes the model
+/// emitting its wait) let Main's send arrive before wait registration and be
+/// consumed as steering. Routing still flows entirely through the owned
+/// `hub` AgentTool; no direct child `runtime` sends are used.
+fn faux_factory_with_wait_readiness(
+    registrations: Arc<Mutex<HashMap<String, pi_ai::providers::FauxProviderRegistration>>>,
+    wait_readiness: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+) -> ChildSessionFactory {
+    Arc::new(move |request| {
+        let registrations = registrations.clone();
+        let wait_readiness = wait_readiness.clone();
+        let child_id = request.child_id.clone();
+        Box::pin(async move {
+            let registration = registrations
+                .lock()
+                .get(&child_id)
+                .cloned()
+                .expect("registration for child");
+            let child_model = registration.model(None).expect("registered child model");
+            let before_tool_call: Option<pi_agent::BeforeToolCallFn> =
+                wait_readiness.lock().get(&child_id).cloned().map(|notify| {
+                    Arc::new(move |context: pi_agent::BeforeToolCallContext| {
+                        let notify = notify.clone();
+                        Box::pin(async move {
+                            if context.tool_call.name == "hub"
+                                && context.arguments.get("op").and_then(|value| value.as_str())
+                                    == Some("wait")
+                            {
+                                notify.notify_one();
+                            }
+                            Ok(pi_agent::BeforeToolCallResult::default())
+                        })
+                            as pi_agent::BoxFuture<anyhow::Result<pi_agent::BeforeToolCallResult>>
+                    }) as pi_agent::BeforeToolCallFn
+                });
+            Session::new(SessionOptions {
+                model: child_model,
+                cwd: std::env::current_dir().expect("cwd"),
+                system_prompt: request.system_prompt,
+                thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
+                api_key: "faux".to_owned(),
+                compaction: None,
+                stream_options: SimpleStreamOptions::default(),
+                tools: Some(request.orchestration_tools),
+                before_tool_call,
+                after_tool_call: None,
+                stream_fn: None,
+                auth_resolver: None,
+            })
+        })
+    })
+}
+
 fn runtime_with_responses(
     artifact_dir: &std::path::Path,
     responses: Vec<(&str, FauxResponse)>,
@@ -319,6 +377,150 @@ async fn user_task_spawns_child_that_invokes_configured_glob() {
 
     runtime.shutdown().await;
     registration.unregister();
+}
+
+fn hub_tool_call(id: &str, arguments: serde_json::Value) -> FauxResponse {
+    FauxResponse {
+        content: vec![ContentBlock::ToolCall(ToolCall {
+            id: id.to_owned(),
+            name: "hub".to_owned(),
+            arguments,
+            thought_signature: None,
+        })],
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+    }
+}
+
+#[tokio::test]
+async fn real_task_children_route_main_alpha_beta_main_through_owned_hub_tools() {
+    const MAIN_TO_ALPHA: &str = "main-to-alpha-authoritative";
+    const ALPHA_TO_BETA: &str = "alpha-to-beta-authoritative";
+    const BETA_TO_MAIN: &str = "beta-to-main-authoritative";
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let suffix = uuid::Uuid::now_v7().to_string();
+    let model = Model {
+        id: format!("owned-hub-model-{suffix}"),
+        name: "Owned Hub E2E".to_owned(),
+        api: format!("owned-hub-api-{suffix}"),
+        provider: format!("owned-hub-provider-{suffix}"),
+        ..Model::default()
+    };
+    let register = |child: &str, responses: Vec<FauxResponse>| {
+        let api = format!("{}-{child}", model.api);
+        let provider = format!("{}-{child}", model.provider);
+        let id = format!("{}-{child}", model.id);
+        let registration = register_faux_provider(FauxProviderOptions {
+            api: api.clone(),
+            provider: provider.clone(),
+            models: vec![Model { id, api, provider, ..model.clone() }],
+            chunk_size: 64,
+        });
+        registration.set_responses(responses);
+        registration
+    };
+    let alpha_registration = register("alpha", vec![
+        hub_tool_call("alpha-wait-main", serde_json::json!({"op":"wait","from":"Main","timeoutMs":2000})),
+        hub_tool_call("alpha-send-beta", serde_json::json!({"op":"send","to":"Beta","message":ALPHA_TO_BETA})),
+        FauxResponse::text("Alpha relayed through its owned hub tool"),
+    ]);
+    let beta_registration = register("beta", vec![
+        hub_tool_call("beta-wait-alpha", serde_json::json!({"op":"wait","from":"Alpha","timeoutMs":2000})),
+        hub_tool_call("beta-send-main", serde_json::json!({"op":"send","to":"Main","message":BETA_TO_MAIN})),
+        FauxResponse::text("Beta relayed through its owned hub tool"),
+    ]);
+    let mut alpha_definition = definition("alpha");
+    alpha_definition.model = Some(vec![format!("{}-alpha", model.id)]);
+    let mut beta_definition = definition("beta");
+    beta_definition.model = Some(vec![format!("{}-beta", model.id)]);
+    let alpha_wait_ready = Arc::new(tokio::sync::Notify::new());
+    let beta_wait_ready = Arc::new(tokio::sync::Notify::new());
+    let mut wait_readiness: HashMap<String, Arc<tokio::sync::Notify>> = HashMap::new();
+    wait_readiness.insert("Alpha".to_owned(), alpha_wait_ready.clone());
+    wait_readiness.insert("Beta".to_owned(), beta_wait_ready.clone());
+    let mut registrations = HashMap::new();
+    registrations.insert("Alpha".to_owned(), alpha_registration.clone());
+    registrations.insert("Beta".to_owned(), beta_registration.clone());
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![alpha_definition, beta_definition]),
+        artifacts.path(),
+    );
+    config.default_agent = "alpha".to_owned();
+    config.max_concurrency = 2;
+    config.mailbox_capacity = 8;
+    config.max_recursion_depth = 2;
+    config.parent_model = model;
+    let runtime = OrchestrationRuntime::new(config, faux_factory_with_wait_readiness(Arc::new(Mutex::new(registrations)), Arc::new(Mutex::new(wait_readiness)))).expect("runtime");
+    let tools = runtime.agent_tools("Main", 0);
+    let task = tools.iter().find(|tool| tool.name == "task").expect("task tool");
+    let hub = tools.iter().find(|tool| tool.name == "hub").expect("hub tool");
+    let context = |id: &str, arguments| {
+        let (_, abort) = AbortController::new();
+        ToolCallContext { tool_call_id: id.to_owned(), arguments, on_update: Arc::new(|_| {}), abort, model: None }
+    };
+    let spawned = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        (task.execute)(context("spawn-alpha-beta", serde_json::json!({"tasks":[
+            {"name":"Alpha","agent":"alpha","task":"Wait for Main, then relay to Beta."},
+            {"name":"Beta","agent":"beta","task":"Wait for Alpha, then relay to Main."}
+        ]}))),
+    ).await.expect("task returns before children settle").expect("spawn children");
+    let mut spawns: Vec<pi_coding::TaskSpawn> = serde_json::from_value(spawned.details).expect("spawn details");
+    spawns.sort_by_key(|spawn| spawn.index);
+    assert_eq!((spawns[0].agent_id.as_str(), spawns[1].agent_id.as_str()), ("Alpha", "Beta"));
+    assert_ne!(spawns[0].job_id, spawns[1].job_id);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(alpha_wait_ready.notified(), beta_wait_ready.notified());
+    })
+    .await
+    .expect("both children register hub wait before Main sends");
+    let main_send = (hub.execute)(context("main-send-alpha", serde_json::json!({"op":"send","to":"Alpha","message":MAIN_TO_ALPHA}))).await.expect("Main sends Alpha");
+    assert_eq!(main_send.details["receipts"][0]["to"], "Alpha");
+    assert_ne!(main_send.details["receipts"][0]["outcome"], "failed");
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        (hub.execute)(context("main-wait-beta", serde_json::json!({"op":"wait","from":"Beta","timeoutMs":2500}))),
+    ).await.expect("bounded Beta wait").expect("Main waits through hub");
+    assert_eq!(reply.details["message"]["from"], "Beta");
+    assert_eq!(reply.details["message"]["to"], "Main");
+    assert_eq!(reply.details["message"]["body"], BETA_TO_MAIN);
+    let job_ids = spawns.iter().map(|spawn| spawn.job_id.clone()).collect::<Vec<_>>();
+    let jobs = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let jobs = runtime.jobs(Some(&job_ids));
+            if jobs.len() == 2 && jobs.iter().all(|job| job.status.is_settled()) {
+                break jobs;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("both jobs settle");
+    assert!(jobs.iter().all(|job| job.status == pi_coding::JobStatus::Completed));
+    let history = |id: &str| -> Vec<Message> {
+        serde_json::from_slice(&std::fs::read(runtime.resolve_history_reference(id).expect("history path")).expect("read history")).expect("parse history")
+    };
+    let alpha_history = history("Alpha");
+    let beta_history = history("Beta");
+    fn hub_results(messages: &[Message]) -> Vec<&pi_ai::ToolResultMessage> {
+        messages.iter().filter_map(|message| match message {
+            Message::ToolResult(result) if result.tool_name == "hub" => Some(result),
+            _ => None,
+        }).collect()
+    }
+    let alpha_hub = hub_results(&alpha_history);
+    let beta_hub = hub_results(&beta_history);
+    assert_eq!(alpha_hub.len(), 2);
+    assert_eq!(alpha_hub[0].details.as_ref().expect("Alpha wait details")["message"]["from"], "Main");
+    assert_eq!(alpha_hub[0].details.as_ref().expect("Alpha wait details")["message"]["body"], MAIN_TO_ALPHA);
+    assert_eq!(alpha_hub[1].details.as_ref().expect("Alpha send details")["receipts"][0]["to"], "Beta");
+    assert_eq!(beta_hub[0].details.as_ref().expect("Beta wait details")["message"]["from"], "Alpha");
+    assert_eq!(beta_hub[0].details.as_ref().expect("Beta wait details")["message"]["body"], ALPHA_TO_BETA);
+    assert_eq!(beta_hub[1].details.as_ref().expect("Beta send details")["receipts"][0]["to"], "Main");
+    assert!(runtime.inbox("Alpha", true).is_empty());
+    assert!(runtime.inbox("Beta", true).is_empty());
+    assert!(runtime.inbox("Main", true).is_empty());
+    runtime.shutdown().await;
+    alpha_registration.unregister();
+    beta_registration.unregister();
 }
 
 #[tokio::test]
@@ -1293,7 +1495,6 @@ async fn running_child_observes_mid_run_steering_exactly_once() {
         None,
     );
     assert_eq!(receipt[0].outcome, pi_coding::DeliveryOutcome::Woken);
-    assert!(runtime.inbox("Steered", true).is_empty());
     release_first.cancel();
     let results = run.await.expect("run join").expect("run result");
     assert_eq!(results[0].output, "urgent instruction followed");

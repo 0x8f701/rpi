@@ -165,7 +165,7 @@ async fn pty_input_resize_and_signal() {
     let directory = tempfile::tempdir().expect("tempdir");
     let manager = ProcessManager::new();
     let owner = ProcessOwnerId::new("pty-owner");
-    let mut pty_spec = spec(directory.path(), "stty size; read line; printf '<%s>' \"$line\"; sleep 30");
+    let mut pty_spec = spec(directory.path(), "trap 'printf INTERRUPTED; exit 0' INT; stty size; read line; printf '<%s>' \"$line\"; while :; do sleep 1; done");
     pty_spec.tty = true;
     pty_spec.terminal_size = Some(ProcessTerminalSize { rows: 24, cols: 80 });
     let info = manager.spawn(owner.clone(), pty_spec).await.expect("spawn PTY");
@@ -194,9 +194,18 @@ async fn pty_input_resize_and_signal() {
         }
     }
     assert!(output.windows(b"<hello>".len()).any(|window| window == b"<hello>"));
-    manager.signal(&owner, &info.id, ProcessSignal::Sigint).expect("interrupt PTY");
+    manager
+        .send_keys(&owner, &info.id, &[ProcessKey::CtrlC])
+        .await
+        .expect("send Ctrl-C");
     let exited = manager.wait(&owner, &info.id, Some(Duration::from_secs(3))).await.expect("wait PTY");
     assert!(exited.state.is_terminal());
+    assert!(
+        all_output(&manager, &owner, &info.id)
+            .await
+            .windows(b"INTERRUPTED".len())
+            .any(|window| window == b"INTERRUPTED")
+    );
 }
 
 #[tokio::test]

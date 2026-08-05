@@ -190,6 +190,7 @@ enum ProcessPanelInput {
 pub(crate) enum ProcessPanelAction {
     Close,
     Open(ProcessId),
+    Attach(ProcessId),
     SendText { id: ProcessId, text: String },
     SendKeys { id: ProcessId, keys: Vec<ProcessKey> },
     Resize { id: ProcessId, size: ProcessTerminalSize },
@@ -281,6 +282,20 @@ impl ProcessPanel {
                 self.selected = self.processes.len().saturating_sub(1);
                 ProcessKeyResult::Handled
             }
+            KeyCode::Char('a') => {
+                let Some(process) = self.processes.get(self.selected) else {
+                    return ProcessKeyResult::Handled;
+                };
+                if !process.tty {
+                    self.notice = Some("Direct input requires a tty=true process".to_owned());
+                    return ProcessKeyResult::Handled;
+                }
+                if process.state != ProcessState::Running {
+                    self.notice = Some("Direct input requires a running process".to_owned());
+                    return ProcessKeyResult::Handled;
+                }
+                ProcessKeyResult::Action(ProcessPanelAction::Attach(process.id.clone()))
+            }
             KeyCode::Enter => {
                 let Some(id) = self.processes.get(self.selected).map(|process| process.id.clone()) else {
                     return ProcessKeyResult::Handled;
@@ -334,6 +349,20 @@ impl ProcessPanel {
                     ProcessPanelView::Detail
                 };
                 ProcessKeyResult::Handled
+            }
+            KeyCode::Char('a') => {
+                let Some(process) = self.active_process() else {
+                    return ProcessKeyResult::Handled;
+                };
+                if !process.tty {
+                    self.notice = Some("Direct input requires a tty=true process".to_owned());
+                    return ProcessKeyResult::Handled;
+                }
+                if process.state != ProcessState::Running {
+                    self.notice = Some("Direct input requires a running process".to_owned());
+                    return ProcessKeyResult::Handled;
+                }
+                ProcessKeyResult::Action(ProcessPanelAction::Attach(process.id.clone()))
             }
             KeyCode::Char('d') => {
                 self.view = ProcessPanelView::Detail;
@@ -487,12 +516,13 @@ fn render_process_list(frame: &mut ratatui::Frame<'_>, panel: &ProcessPanel, are
         Line::from(vec![Span::styled(format!(" {marker} "), style), Span::styled(format!("{:<9}", state_label(process.state)), style.patch(process_state_style(process.state, theme))), Span::styled(format!(" pid {:<7} {:<28} {}", pid, truncate(label, 28), short_id(&process.id)), style)])
     }).collect() };
     frame.render_widget(Paragraph::new(lines), sections[0]);
-    frame.render_widget(Paragraph::new(format!(" ↑/↓ select · Enter inspect · Esc close · {}/{} ", panel.selected.saturating_add(1).min(panel.processes.len()), panel.processes.len())).style(Style::default().fg(theme.dim)), sections[1]);
+    let notice = panel.notice.as_deref().map_or(String::new(), |notice| format!(" {}", sanitize(notice)));
+    frame.render_widget(Paragraph::new(vec![Line::from(format!(" ↑/↓ select · Enter inspect · a attach PTY · Esc close · {}/{} ", panel.selected.saturating_add(1).min(panel.processes.len()), panel.processes.len())), Line::from(Span::styled(notice, Style::default().fg(theme.warning)))]).style(Style::default().fg(theme.dim)), sections[1]);
 }
 
 fn render_process_detail(frame: &mut ratatui::Frame<'_>, panel: &ProcessPanel, area: Rect, theme: Theme) {
     let Some(process) = panel.active_process() else { return; };
-    let mut lines = vec![field_line("ID", process.id.as_str(), theme), field_line("Label", process.label.as_deref().unwrap_or("(unlabeled)"), theme), field_line("State", state_label(process.state), theme), field_line("PID", &process.pid.map_or_else(|| "—".to_owned(), |pid| pid.to_string()), theme), field_line("Terminal", if process.tty { "PTY" } else { "pipes" }, theme), field_line("Output", &format!("{}..{}", process.output_start_cursor, process.output_cursor), theme), field_line("Exit", &process.exit_code.map_or_else(|| "—".to_owned(), |code| code.to_string()), theme), Line::default(), Line::from(Span::styled(" Tab/l logs · i input · k key · r resize · g signal · Ctrl-C interrupt · x stop · Esc back ", Style::default().fg(theme.dim)))];
+    let mut lines = vec![field_line("ID", process.id.as_str(), theme), field_line("Label", process.label.as_deref().unwrap_or("(unlabeled)"), theme), field_line("State", state_label(process.state), theme), field_line("PID", &process.pid.map_or_else(|| "—".to_owned(), |pid| pid.to_string()), theme), field_line("Terminal", if process.tty { "PTY" } else { "pipes" }, theme), field_line("Output", &format!("{}..{}", process.output_start_cursor, process.output_cursor), theme), field_line("Exit", &process.exit_code.map_or_else(|| "—".to_owned(), |code| code.to_string()), theme), Line::default(), Line::from(Span::styled(" a attach PTY · Tab/l logs · i input · k key · r resize · g signal · Ctrl-C interrupt · x stop · Esc back ", Style::default().fg(theme.dim)))];
     if let Some(notice) = &panel.notice { lines.push(Line::from(Span::styled(sanitize(notice), Style::default().fg(theme.warning)))); }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -761,6 +791,43 @@ mod tests {
                 keys: vec![ProcessKey::CtrlC]
             })
         );
+    }
+
+    #[test]
+    fn attach_requires_running_pty() {
+        let running = process("00000000-0000-0000-0000-000000000010", ProcessState::Running, 3);
+        let running_id = running.id.clone();
+        let mut panel = ProcessPanel::new(vec![running]);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char('a'))),
+            ProcessKeyResult::Action(ProcessPanelAction::Attach(running_id))
+        );
+
+        let mut pipe = process("00000000-0000-0000-0000-000000000011", ProcessState::Running, 2);
+        pipe.tty = false;
+        let mut panel = ProcessPanel::new(vec![pipe]);
+        assert_eq!(panel.handle_key(key(KeyCode::Char('a'))), ProcessKeyResult::Handled);
+        assert!(panel.notice.as_deref().is_some_and(|notice| notice.contains("tty=true")));
+
+        let exited = process("00000000-0000-0000-0000-000000000012", ProcessState::Exited, 1);
+        let mut panel = ProcessPanel::new(vec![exited]);
+        assert_eq!(panel.handle_key(key(KeyCode::Char('a'))), ProcessKeyResult::Handled);
+        assert!(panel.notice.as_deref().is_some_and(|notice| notice.contains("running")));
+    }
+
+    #[test]
+    fn attach_rejection_is_visible_in_list_footer() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut pipe = process("00000000-0000-0000-0000-000000000013", ProcessState::Running, 1);
+        pipe.tty = false;
+        let mut panel = ProcessPanel::new(vec![pipe]);
+        assert_eq!(panel.handle_key(key(KeyCode::Char('a'))), ProcessKeyResult::Handled);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_process_panel(frame, &panel, crate::theme::DARK)).unwrap();
+        let rendered = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(rendered.contains("tty=true"), "{rendered}");
     }
 
     #[test]

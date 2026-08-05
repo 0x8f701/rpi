@@ -276,8 +276,8 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     assert!(running_jobs.iter().all(|job| job.status == JobStatus::Running));
     assert_eq!(controlled.peak.load(Ordering::SeqCst), 2);
 
-    // 3) Inter-agent IRC while both are running: the active child bridge accepts
-    // the message immediately, so it is not retained in Beta's mailbox.
+    // 3) Inter-agent IRC while both are running: Woken means the active child
+    // bridge accepted delivery; durable removal follows asynchronous steering.
     let alpha_to_beta = controlled.runtime.send("Alpha", "Beta", "alpha-to-beta", None);
     assert_eq!(alpha_to_beta.len(), 1);
     assert_eq!(alpha_to_beta[0].outcome, DeliveryOutcome::Woken);
@@ -289,8 +289,12 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     assert!(beta_to_main[0].error.is_none());
 
     // Mail to Main must remain queued and must not be drained by job wait.
+    // Beta may still show the accepted message until its active bridge acknowledges it.
     assert_eq!(controlled.runtime.inbox("Main", true).len(), 1);
-    assert!(controlled.runtime.inbox("Beta", true).is_empty());
+    let beta_pending = controlled.runtime.inbox("Beta", true);
+    assert!(beta_pending.is_empty() || (beta_pending.len() == 1
+        && beta_pending[0].from == "Alpha"
+        && beta_pending[0].body == "alpha-to-beta"));
 
     // 4) hub wait on Alpha must not return while Alpha is still running, and
     //    must not consume Main's unrelated mailbox message.
@@ -404,7 +408,7 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     assert!(controlled.runtime.inbox("Main", true).is_empty());
 
     // 7) Roster via hub list — Alpha idle, Beta aborted. The earlier IRC was
-    // delivered directly to Beta's active Session rather than retained.
+    // accepted by Beta's active Session and is acknowledged before settlement.
     let list = (hub.execute)(context("main-list", json!({ "op": "list" })))
         .await
         .expect("hub list");

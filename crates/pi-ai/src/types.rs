@@ -99,18 +99,29 @@ pub enum Role {
 pub enum ContentBlock {
     Text {
         text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "textSignature",
+            alias = "text_signature",
+            skip_serializing_if = "Option::is_none"
+        )]
         text_signature: Option<String>,
     },
     Thinking {
         thinking: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "thinkingSignature",
+            alias = "thinking_signature",
+            skip_serializing_if = "Option::is_none"
+        )]
         thinking_signature: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         redacted: bool,
     },
     Image {
         data: String,
+        #[serde(rename = "mimeType", alias = "mime_type")]
         mime_type: String,
     },
     #[serde(rename = "toolCall")]
@@ -140,6 +151,16 @@ impl ContentBlock {
 pub type Content = ContentBlock;
 pub type ContentList = Vec<ContentBlock>;
 
+/// Deserialize `UserMessage.content` from either the canonical content-block
+/// array or an upstream plain string (which becomes a single text block).
+/// Serialization always emits the canonical array form; this only loosens input.
+fn deserialize_user_content<'de, D>(deserializer: D) -> Result<ContentList, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CustomMessageContent::deserialize(deserializer).map(CustomMessageContent::into_blocks)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
@@ -153,6 +174,7 @@ pub struct ToolCall {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
+    #[serde(deserialize_with = "deserialize_user_content")]
     pub content: ContentList,
     pub timestamp: i64,
 }
@@ -329,6 +351,12 @@ pub struct CustomMessage {
 pub struct BranchSummaryMessage {
     pub summary: String,
     pub from_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_hook: Option<bool>,
     pub timestamp: i64,
 }
 
@@ -337,6 +365,12 @@ pub struct BranchSummaryMessage {
 pub struct CompactionSummaryMessage {
     pub summary: String,
     pub tokens_before: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_hook: Option<bool>,
     pub timestamp: i64,
 }
 
@@ -841,11 +875,27 @@ mod tests {
             Message::BranchSummary(BranchSummaryMessage {
                 summary: "alternate work".into(),
                 from_id: "entry-1".into(),
+                details: Some(serde_json::json!({"readFiles":["src/lib.rs"]})),
+                usage: Some(Usage {
+                    input: 10,
+                    output: 4,
+                    total_tokens: 14,
+                    ..Usage::default()
+                }),
+                from_hook: Some(true),
                 timestamp: 11,
             }),
             Message::CompactionSummary(CompactionSummaryMessage {
                 summary: "prior work".into(),
                 tokens_before: 12_345,
+                details: Some(serde_json::json!({"modifiedFiles":["src/main.rs"]})),
+                usage: Some(Usage {
+                    input: 20,
+                    output: 5,
+                    total_tokens: 25,
+                    ..Usage::default()
+                }),
+                from_hook: Some(false),
                 timestamp: 12,
             }),
         ];
@@ -855,10 +905,16 @@ mod tests {
                 "display":false, "details":{"nested":{"kept":true}}, "timestamp":10
             }),
             serde_json::json!({
-                "role":"branchSummary", "summary":"alternate work", "fromId":"entry-1", "timestamp":11
+                "role":"branchSummary", "summary":"alternate work", "fromId":"entry-1",
+                "details":{"readFiles":["src/lib.rs"]},
+                "usage":{"input":10,"output":4,"cacheRead":0,"cacheWrite":0,"cacheWrite1h":0,"reasoning":0,"totalTokens":14,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},
+                "fromHook":true, "timestamp":11
             }),
             serde_json::json!({
-                "role":"compactionSummary", "summary":"prior work", "tokensBefore":12345, "timestamp":12
+                "role":"compactionSummary", "summary":"prior work", "tokensBefore":12345,
+                "details":{"modifiedFiles":["src/main.rs"]},
+                "usage":{"input":20,"output":5,"cacheRead":0,"cacheWrite":0,"cacheWrite1h":0,"reasoning":0,"totalTokens":25,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},
+                "fromHook":false, "timestamp":12
             }),
         ];
         for (message, expected) in messages.into_iter().zip(expected) {
@@ -868,6 +924,21 @@ mod tests {
                 serde_json::from_value(encoded).expect("deserialize extensible message");
             assert_eq!(decoded, message);
         }
+
+        let legacy_branch: Message = serde_json::from_value(serde_json::json!({
+            "role":"branchSummary", "summary":"legacy", "fromId":"root", "timestamp":1
+        }))
+        .expect("deserialize legacy branch summary");
+        assert!(matches!(legacy_branch, Message::BranchSummary(BranchSummaryMessage {
+            details: None, usage: None, from_hook: None, ..
+        })));
+        let legacy_compaction: Message = serde_json::from_value(serde_json::json!({
+            "role":"compactionSummary", "summary":"legacy", "tokensBefore":7, "timestamp":2
+        }))
+        .expect("deserialize legacy compaction summary");
+        assert!(matches!(legacy_compaction, Message::CompactionSummary(CompactionSummaryMessage {
+            details: None, usage: None, from_hook: None, ..
+        })));
     }
 
     #[test]
@@ -923,5 +994,130 @@ mod tests {
             serde_json::from_value::<ConstrainedSampling>(serde_json::json!({"type":"bogus"}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn user_message_plain_string_becomes_single_text_block() {
+        let json = serde_json::json!({"content": "hello world", "timestamp": 7});
+        let msg: UserMessage = serde_json::from_value(json).expect("plain string content");
+        assert_eq!(msg.content, vec![ContentBlock::text("hello world")]);
+        assert_eq!(msg.timestamp, 7);
+    }
+
+    #[test]
+    fn user_message_array_content_parses_unchanged() {
+        let json = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}, {"type": "image", "data": "b348", "mimeType": "image/png"}],
+            "timestamp": 9
+        });
+        let msg: UserMessage = serde_json::from_value(json).expect("array content");
+        assert_eq!(
+            msg.content,
+            vec![
+                ContentBlock::text("hi"),
+                ContentBlock::Image {
+                    data: "b348".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(msg.timestamp, 9);
+    }
+
+    #[test]
+    fn content_block_fields_use_camel_case_and_accept_legacy_snake_case() {
+        let canonical = serde_json::to_value(ContentBlock::Image {
+            data: "b348".to_owned(),
+            mime_type: "image/png".to_owned(),
+        })
+        .expect("serialize image block");
+        assert_eq!(
+            canonical,
+            serde_json::json!({"type": "image", "data": "b348", "mimeType": "image/png"})
+        );
+
+        let legacy: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "image",
+            "data": "b348",
+            "mime_type": "image/png"
+        }))
+        .expect("deserialize legacy image block");
+        assert_eq!(
+            legacy,
+            ContentBlock::Image {
+                data: "b348".to_owned(),
+                mime_type: "image/png".to_owned(),
+            }
+        );
+
+        let signed_text: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "text",
+            "text": "hi",
+            "text_signature": "legacy"
+        }))
+        .expect("deserialize legacy text signature");
+        assert_eq!(
+            serde_json::to_value(signed_text).expect("serialize text signature"),
+            serde_json::json!({"type": "text", "text": "hi", "textSignature": "legacy"})
+        );
+
+        let signed_thinking: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "thinking",
+            "thinking": "private reasoning",
+            "thinking_signature": "legacy-thinking",
+            "redacted": true
+        }))
+        .expect("deserialize legacy thinking signature");
+        assert_eq!(
+            serde_json::to_value(signed_thinking).expect("serialize thinking signature"),
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "private reasoning",
+                "thinkingSignature": "legacy-thinking",
+                "redacted": true
+            })
+        );
+    }
+
+    #[test]
+    fn user_message_string_derived_serializes_canonical_array() {
+        let msg: UserMessage = serde_json::from_value(serde_json::json!({
+            "content": "plain",
+            "timestamp": 1
+        }))
+        .expect("plain string content");
+        let value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "content": [{"type": "text", "text": "plain"}],
+                "timestamp": 1
+            })
+        );
+    }
+
+    #[test]
+    fn user_message_empty_array_parses() {
+        let msg: UserMessage =
+            serde_json::from_value(serde_json::json!({"content": [], "timestamp": 0}))
+                .expect("empty array content");
+        assert!(msg.content.is_empty());
+    }
+
+    #[test]
+    fn user_message_rejects_non_string_or_invalid_block_content() {
+        for content in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(7),
+            serde_json::json!({"text": "not a content block"}),
+            serde_json::json!([{"type": "image", "data": "missing mime type"}]),
+        ] {
+            let value = serde_json::json!({"content": content, "timestamp": 1});
+            assert!(
+                serde_json::from_value::<UserMessage>(value).is_err(),
+                "accepted invalid user content"
+            );
+        }
     }
 }

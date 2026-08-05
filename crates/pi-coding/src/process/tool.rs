@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use base64::Engine as _;
-use pi_agent::{AbortSignal, AgentTool, AgentToolResult};
+use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCapability};
 use pi_ai::Schema;
 use serde_json::{Value, json};
 
@@ -30,6 +30,7 @@ pub fn process_tool(
             async move { execute_process_tool(&manager, &owner_id, &cwd, context.arguments, context.abort).await }
         },
     )
+    .with_capability(ToolCapability::Exec)
     .with_prompt_guidelines(vec![
         "Use process start for servers, watchers, long-running, or interactive commands; use bash only for finite foreground commands.".to_owned(),
         "Never launch long-lived work with nohup, setsid, disown, or shell '&'. A supervised process must have a stable id visible in /ps with logs, signal, stop, and wait controls.".to_owned(),
@@ -296,4 +297,22 @@ fn process_schema() -> Schema {
     let mut schema = Schema::object_ordered(fields);
     schema.additional_properties = Some(Value::Bool(false));
     schema
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_tool_carries_exec_capability() {
+        let tool = process_tool(
+            Path::new("."),
+            ProcessManager::with_config(super::super::ProcessManagerConfig {
+                idle_timeout: None,
+                ..super::super::ProcessManagerConfig::default()
+            }),
+            ProcessOwnerId::new("test-owner"),
+        );
+        assert_eq!(tool.capability, ToolCapability::Exec);
+    }
 }

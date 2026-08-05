@@ -12,7 +12,7 @@ use pi_coding::{
 
 /// Canonical usage advertised by the builtin registry and parse errors.
 pub const WORKFLOW_USAGE: &str =
-    "/workflow [list|show [id|name]|create <name> <objective>|pause|resume|cancel|integrate|remove]";
+    "/workflow [list|show [id|name]|create <objective>|create <name> <objective>|pause|resume|cancel|integrate|remove]";
 
 /// Selector accepted by show/lifecycle subcommands (`id` or `name`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,7 +267,7 @@ pub fn parse_workflow_status(value: &str) -> Result<WorkflowStatus> {
 /// - bare → [`InteractiveWorkflowCommand::OpenPage`]
 /// - `list`
 /// - `show [id|name]`
-/// - `create <name> <objective>` (quoted args via [`pi_coding::parse_command_args`])
+/// - `create <objective>` or `create <name> <objective>` (quoted args via [`pi_coding::parse_command_args`])
 /// - `pause|resume|cancel|integrate|remove [id|name]`
 pub fn parse_interactive_workflow_command(
     argument: Option<&str>,
@@ -330,20 +330,20 @@ fn no_trailing<'a>(
     Ok(command)
 }
 
-fn parse_create<'a>(
-    mut parts: impl Iterator<Item = &'a str>,
-) -> Result<InteractiveWorkflowCommand> {
-    let name = parts
-        .next()
-        .ok_or_else(|| anyhow!("workflow create requires <name> <objective>"))?
-        .trim();
+fn parse_create<'a>(parts: impl Iterator<Item = &'a str>) -> Result<InteractiveWorkflowCommand> {
+    let arguments = parts.collect::<Vec<_>>();
+    let (name, objective) = match arguments.as_slice() {
+        [] => bail!("workflow create requires <objective> or <name> <objective>"),
+        [objective] => ((*objective).to_owned(), (*objective).to_owned()),
+        [name, objectives @ ..] => ((*name).to_owned(), objectives.join(" ")),
+    };
+    let name = name.trim();
     if name.is_empty() {
         bail!("workflow name must not be empty");
     }
-    let objective = parts.collect::<Vec<_>>().join(" ");
     let objective = objective.trim();
     if objective.is_empty() {
-        bail!("workflow create requires <name> <objective>");
+        bail!("workflow objective must not be empty");
     }
     Ok(InteractiveWorkflowCommand::Create {
         name: name.to_owned(),

@@ -56,6 +56,47 @@ fn primary_parse_contract_covers_all_subcommands() {
             objective: "land the feature".into(),
         }
     );
+
+    assert_eq!(
+        parse_interactive_workflow_command(Some(
+            "create 调研并且撰写zig版本的pi-coding-agent"
+        ))
+        .unwrap(),
+        InteractiveWorkflowCommand::Create {
+            name: "调研并且撰写zig版本的pi-coding-agent".into(),
+            objective: "调研并且撰写zig版本的pi-coding-agent".into(),
+        }
+    );
+    assert_eq!(
+        parse_interactive_workflow_command(Some(
+            "create zig-agent 调研并且撰写zig版本的pi-coding-agent"
+        ))
+        .unwrap(),
+        InteractiveWorkflowCommand::Create {
+            name: "zig-agent".into(),
+            objective: "调研并且撰写zig版本的pi-coding-agent".into(),
+        }
+    );
+    assert_eq!(
+        parse_interactive_workflow_command(Some(
+            "create moonbit-agent 制作moonbit版本的pi-coding-agent"
+        ))
+        .unwrap(),
+        InteractiveWorkflowCommand::Create {
+            name: "moonbit-agent".into(),
+            objective: "制作moonbit版本的pi-coding-agent".into(),
+        }
+    );
+    assert_eq!(
+        parse_interactive_workflow_command(Some(
+            "create 制作moonbit版本的pi-coding-agent"
+        ))
+        .unwrap(),
+        InteractiveWorkflowCommand::Create {
+            name: "制作moonbit版本的pi-coding-agent".into(),
+            objective: "制作moonbit版本的pi-coding-agent".into(),
+        }
+    );
     assert_eq!(
         parse_interactive_workflow_command(Some("pause")).unwrap(),
         InteractiveWorkflowCommand::Pause { selector: None }
@@ -105,23 +146,27 @@ fn rejects_unknown_and_malformed_subcommands_with_usage() {
     let err = parse_interactive_workflow_command(Some("show a b")).unwrap_err();
     assert!(err.to_string().contains("unexpected argument"), "{err:#}");
 
-    let err = parse_interactive_workflow_command(Some("create only-name")).unwrap_err();
-    assert!(
-        err.to_string().contains("create requires <name> <objective>"),
-        "{err:#}"
+    assert_eq!(
+        parse_interactive_workflow_command(Some("create only-name")).unwrap(),
+        InteractiveWorkflowCommand::Create {
+            name: "only-name".into(),
+            objective: "only-name".into(),
+        }
     );
 
-    let err = parse_interactive_workflow_command(Some("create")).unwrap_err();
     assert!(
-        err.to_string().contains("create requires <name> <objective>"),
-        "{err:#}"
+        parse_interactive_workflow_command(Some("create"))
+            .unwrap_err()
+            .to_string()
+            .contains("create requires <objective> or <name> <objective>")
     );
 
-    let err = parse_interactive_workflow_command(Some("create \"\" objective")).unwrap_err();
-    assert!(
-        err.to_string().contains("name must not be empty")
-            || err.to_string().contains("create requires"),
-        "{err:#}"
+    assert_eq!(
+        parse_interactive_workflow_command(Some("create \"\" objective")).unwrap(),
+        InteractiveWorkflowCommand::Create {
+            name: "objective".into(),
+            objective: "objective".into(),
+        }
     );
 }
 

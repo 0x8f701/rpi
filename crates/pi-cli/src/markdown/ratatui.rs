@@ -178,11 +178,14 @@ fn styled_ranges(
             .iter()
             .filter(|styled| styled.range.start <= range.start && styled.range.end >= range.end)
         {
-            style = style.patch(match styled.style {
-                InlineStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
-                InlineStyle::Italic => Style::default().add_modifier(Modifier::ITALIC),
-                InlineStyle::Code => styles.inline_code,
-            });
+            match styled.style {
+                InlineStyle::Bold => style = style.add_modifier(Modifier::BOLD),
+                InlineStyle::Italic => style = style.add_modifier(Modifier::ITALIC),
+                InlineStyle::Code => style = style.patch(styles.inline_code),
+                // Separators are chrome, not header/body content. Their explicit
+                // range makes the border theme authoritative without reparsing.
+                InlineStyle::TableBorder => style = styles.table_border,
+            }
         }
         // Split on whitespace so repeated plain vs styled tokens remain
         // addressable as exact span contents (e.g. two plain `same` + two code `same`).
@@ -1281,6 +1284,39 @@ mod tests {
     }
 
     #[test]
+    fn table_borders_use_one_style_while_content_semantics_survive() {
+        let styles = MarkdownRatatuiStyles {
+            table_border: Style::default().fg(Color::DarkGray),
+            table_header: Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            table_body: Style::default().fg(Color::White),
+            inline_code: Style::default().fg(Color::LightRed),
+            ..MarkdownRatatuiStyles::default()
+        };
+        let source = "| **Document** | Role |\n| --- | --- |\n| Guide | Read `semantic ranges` before changing borders |";
+        let output = render_ratatui_markdown(source, 52, styles);
+        assert!(output.lines.iter().all(|line| line.width() <= 52));
+
+        for line in &output.lines {
+            for span in &line.spans {
+                if span.content.chars().any(|character| "┌┬┐├┼┤│└┴┘─".contains(character)) {
+                    assert_eq!(span.style.fg, Some(Color::DarkGray), "{span:?}");
+                }
+            }
+        }
+        assert!(output.lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content == "Document"
+                && span.style.fg == Some(Color::Yellow)
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(output.lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("semantic") && span.style.fg == Some(Color::LightRed)
+        }));
+        assert!(output.lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content == "Guide" && span.style.fg == Some(Color::White)
+        }));
+    }
+
+    #[test]
     fn zero_width_is_safely_clamped() {
         let output = render_ratatui_markdown("---", 0, MarkdownRatatuiStyles::default());
         assert_eq!(output.lines.len(), 1);
@@ -1340,5 +1376,82 @@ X[User] --> A\n\
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn table_border_uses_one_theme_token_and_wraps_within_budget() {
+        // Coherency contract: the live TUI maps every table chrome glyph to a
+        // single semantic theme token (theme.md_code_block_border), so all
+        // `─│┌┐└┘├┤┬┼┴` cells share one real-RGB color — never a mix of ANSI
+        // defaults, never Reset. Driven through the same public style map the
+        // transcript uses (table_border <- theme token), so a wiring regression
+        // (hardcoded color, Reset, or per-glyph divergence) fails at the
+        // rendered-span level rather than by grepping source.
+        let theme = crate::theme::DARK;
+        let border = theme.md_code_block_border;
+        assert_ne!(border, Color::Reset, "table border token must be a real RGB");
+        let styles = MarkdownRatatuiStyles {
+            text: Style::default().fg(theme.text),
+            heading_2: Style::default().fg(theme.md_heading),
+            table_border: Style::default().fg(border),
+            table_header: Style::default().fg(theme.md_heading).add_modifier(Modifier::BOLD),
+            table_body: Style::default().fg(theme.text),
+            ..MarkdownRatatuiStyles::default()
+        };
+
+        // A realistic 3-column comparison table plus a 2-column doc/role table
+        // at a constrained width. Balanced wrapping must keep every row within
+        // budget and preserve each column's content (no clipping/overflow, no
+        // collapsed column).
+        let source = "| Field | OMP dark | OMP light |\n\
+                      | --- | --- | --- |\n\
+                      | text | #d4d4d4 | default |\n\
+                      | toolTitle | #d4d4d4 | default |\n\n\
+                      | Document | Role |\n\
+                      | --- | --- |\n\
+                      | Guide | Read semantic ranges before changing borders |";
+        let width = 52u16;
+        let output = render_ratatui_markdown(source, width, styles);
+
+        // (1) Width bound — balanced wrapping, no row clips past the budget.
+        assert!(
+            output.lines.iter().all(|line| line.width() <= usize::from(width)),
+            "every table row must fit within {width}: {:?}",
+            output.lines.iter().map(line_text).collect::<Vec<_>>()
+        );
+
+        // (2) Single border color — every chrome glyph span carries the token.
+        let mut border_colors = BTreeSet::new();
+        let glyphs = "┌┬┐├┼┤│└┴┘─";
+        for line in &output.lines {
+            for span in &line.spans {
+                if span.content.chars().any(|c| glyphs.contains(c)) {
+                    assert_eq!(
+                        span.style.fg,
+                        Some(border),
+                        "border glyph must use the theme token: {span:?}"
+                    );
+                    border_colors.insert(color_key(span.style.fg.unwrap_or(Color::Reset)));
+                }
+            }
+        }
+        assert!(!border_colors.is_empty(), "source must render at least one border glyph");
+        assert_eq!(
+            border_colors.len(),
+            1,
+            "table border must be a single color, got {border_colors:?}"
+        );
+
+        // (3) Content survival — each column's distinctive token remains
+        // visible, so balanced wrapping kept columns materially usable.
+        let plain: String = output
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        for needle in ["Field", "toolTitle", "Document", "Role", "Guide", "semantic", "default"] {
+            assert!(plain.contains(needle), "column content {needle:?} must survive wrapping: {plain}");
+        }
     }
 }

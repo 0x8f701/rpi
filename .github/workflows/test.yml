@@ -17,6 +17,7 @@ jobs:
   test:
     name: workspace and product contracts
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -59,6 +60,14 @@ jobs:
       - name: Check workspace
         run: cargo +1.88.0 check --workspace --all-targets --locked
 
+      - name: Test core library units
+        shell: bash
+        run: |
+          cargo +1.88.0 test --locked -p pi-ai --lib
+          cargo +1.88.0 test --locked -p pi-agent --lib
+          cargo +1.88.0 test --locked -p pi-coding --lib -- --test-threads=1
+          cargo +1.88.0 test --locked -p pi-cli --lib -- --test-threads=1
+
       - name: Test workspace contracts
         shell: bash
         run: |
@@ -84,6 +93,29 @@ jobs:
           cargo +1.88.0 test --package pi-cli --test json_mode_binary --locked
           cargo +1.88.0 test --package pi-cli --test rpc_binary --locked
 
+      - name: Test CLI compatibility and approval E2E
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-cli --test session_rpc_cli_compat_e2e --locked -- --test-threads=1
+          cargo +1.88.0 test --package pi-cli --test approval_e2e --locked -- --test-threads=1
+
+      - name: Test live control-plane E2E
+        run: cargo +1.88.0 test --package pi-cli --test listen_control_plane --locked -- --test-threads=1
+
+      - name: Test TUI side-chat and code-review E2E
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-cli --test slash_command_dispatch --locked -- --test-threads=1
+          cargo +1.88.0 test --package pi-cli --test side_chat_e2e --locked -- --test-threads=1
+          cargo +1.88.0 test --package pi-cli --test core_tui_e2e --locked -- --test-threads=1
+          cargo +1.88.0 test --package pi-cli --test cross_tool_session_tui_e2e --locked -- --test-threads=1
+
+      - name: Test durable orchestration E2E
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-coding --test durable_child_sessions --locked -- --test-threads=1
+          cargo +1.88.0 test --package pi-coding --test durable_orchestration_e2e --locked -- --test-threads=1
+
       - name: Test extensions with real Bun
         env:
           BUN_REQUIRED: "1"
@@ -94,9 +126,6 @@ jobs:
           cargo +1.88.0 test --package pi-coding --test extension_api_conformance --locked
           cargo +1.88.0 test --package pi-cli --test extension_run_chain_tui --locked
           cargo +1.88.0 test --package pi-cli --test extension_ui_tui --locked
-
-      - name: Test self-update
-        run: cargo +1.88.0 test --package pi-cli --lib self_update::tests --locked
 
       - name: Check installers
         shell: bash

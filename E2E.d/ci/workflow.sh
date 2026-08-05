@@ -23,7 +23,8 @@ list_scenarios() {
     printf '%s\n' \
         'workflow.rpc - concurrent create, worktrees, ownership Todo roots, pause/resume/cancel, integrate/conflict' \
         'workflow.tmux - compact header, workflow list-to-detail, settings scrollback exclusion' \
-        'workflow.run - rpc + tmux umbrella release gate'
+        'workflow.goal-tmux - exact Chinese goal/workflow commands, real Todo calls/workers, multi-DAG Todo detail' \
+        'workflow.run - rpc + tmux + goal-tmux umbrella release gate'
 }
 
 require_workflow_apis_or_block() {
@@ -249,13 +250,65 @@ TERM=xterm-256color \
     printf 'workflow.tmux passed\nevidence=%s\n' "$evidence"
 }
 
+run_goal_workflow_tmux() {
+    local root evidence
+    require_rpi
+    require_cmd python3
+    require_cmd git
+    require_cmd tmux
+    root="$(scenario_workspace workflow-goal-tmux)"
+    evidence="$EVIDENCE_ROOT/workflow-goal-tmux"
+
+    run_with_timeout 180 python3 "$E2E_DIR/lib/run_goal_workflow_tui_campaign.py" \
+        --rpi "$RPI_BIN" \
+        --home "$root/home" \
+        --workspace "$root/workspace" \
+        --evidence "$evidence"
+
+    python3 - "$evidence/assertions.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if summary.get("status") != "passed":
+    raise SystemExit(f"workflow goal-tmux status not passed: {summary!r}")
+required = {
+    "exact-chinese-commands",
+    "objective-only-default-name",
+    "four-distinct-workflow-ids",
+    "zig-workflows-preserved-after-moonbit",
+    "real-goal-and-workflow-todo-tool-results",
+    "request-routed-real-worker-completions",
+    "todo-overview-main-plus-four-workflows",
+    "todo-details-phases-tasks-linked-jobs",
+    "workflow-owned-linked-jobs",
+    "loopback-openai-provider",
+    "bounded-waits",
+    "isolated-git-workspace",
+}
+missing = sorted(required - set(summary.get("checks") or []))
+if missing:
+    raise SystemExit(f"workflow goal-tmux missing checks: {missing}")
+ids = summary.get("workflowIds") or []
+if len(ids) != 4 or len(set(ids)) != 4:
+    raise SystemExit(f"workflow goal-tmux IDs are not four distinct values: {ids!r}")
+if summary.get("workflowTodoResults") != 4 or summary.get("goalTodoResult") is not True:
+    raise SystemExit(f"workflow goal-tmux lacks real todo results: {summary!r}")
+if int(summary.get("workerCompletions") or 0) < 8:
+    raise SystemExit(f"workflow goal-tmux lacks real worker completions: {summary!r}")
+print("workflow.goal-tmux assertions passed")
+PY
+    log "workflow.goal-tmux evidence=$evidence"
+}
+
 run_all() {
     prepare_roots
     run_workflow_rpc
     if command -v tmux >/dev/null 2>&1; then
         run_workflow_tmux
+        run_goal_workflow_tmux
     else
-        log "tmux not available; skipped workflow.tmux (rpc still ran)"
+        log "tmux not available; skipped workflow.tmux and workflow.goal-tmux (rpc still ran)"
     fi
     printf 'workflow campaigns passed\nevidence=%s\n' "$EVIDENCE_ROOT"
 }
@@ -264,6 +317,7 @@ case "${1:-list}" in
     list|--list|--dry-run) list_scenarios ;;
     rpc) prepare_roots; run_workflow_rpc; printf 'workflow.rpc passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
     tmux) prepare_roots; run_workflow_tmux ;;
+    goal-tmux) prepare_roots; run_goal_workflow_tmux ;;
     run) run_all ;;
-    *) fail "usage: $0 [list|--dry-run|run|rpc|tmux]" ;;
+    *) fail "usage: $0 [list|--dry-run|run|rpc|tmux|goal-tmux]" ;;
 esac

@@ -410,11 +410,17 @@ mod tests {
             Message::BranchSummary(BranchSummaryMessage {
                 summary: "branch".into(),
                 from_id: "old-leaf".into(),
+                details: None,
+                usage: None,
+                from_hook: None,
                 timestamp: 3,
             }),
             Message::CompactionSummary(CompactionSummaryMessage {
                 summary: "compact".into(),
                 tokens_before: 9000,
+                details: None,
+                usage: None,
+                from_hook: None,
                 timestamp: 4,
             }),
         ];

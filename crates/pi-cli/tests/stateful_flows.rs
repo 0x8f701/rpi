@@ -450,10 +450,11 @@ async fn loop_adapter_restores_durable_tasks_and_avoids_double_fire() {
     second.persist_now().expect("persist second session");
     drop(second);
 
-    application
+    let away = application
         .switch_session(&second_path)
         .await
         .expect("switch away");
+    assert!(!away.cancelled);
     assert!(
         application
             .loop_list()
@@ -463,10 +464,11 @@ async fn loop_adapter_restores_durable_tasks_and_avoids_double_fire() {
         "session switch must suspend all loops"
     );
 
-    application
+    let back = application
         .switch_session(&first_path)
         .await
         .expect("switch back");
+    assert!(!back.cancelled);
     let restored = application.loop_list().await.expect("restored loops");
     assert_eq!(restored.len(), 1, "only durable loops restore: {restored:?}");
     assert_eq!(restored[0].id, durable.id);
@@ -771,10 +773,11 @@ async fn goal_adapter_projects_active_goal_and_pauses_at_budget_boundary() {
         .record(pi_coding::resume_session(&active_path).expect("resume active"))
         .expect("attach safety");
     let safety = Application::new(safety_session).await;
-    safety
+    let resume = safety
         .switch_session(&active_path)
         .await
         .expect("switch resume");
+    assert!(!resume.cancelled);
     let paused = safety.goal_state().current.expect("paused on resume");
     assert_eq!(paused.id, original.id);
     assert_eq!(paused.lifecycle, GoalLifecycle::Paused);
@@ -878,8 +881,9 @@ async fn same_cwd_session_tree_branch_fork_clone_and_resume_lineage() {
     application.wait_for_idle().await;
     let fork_user = user_entry_id(&application);
 
-    let forked_text = application.fork_session(&fork_user).await.expect("fork");
-    assert_eq!(forked_text, "first question");
+    let forked = application.fork_session(&fork_user).await.expect("fork");
+    assert!(!forked.cancelled);
+    assert_eq!(forked.text, "first question");
     let forked_state = application.state().await;
     let fork_file = forked_state.session_file.clone().expect("fork file");
     let fork_id = forked_state.session_id.clone().expect("fork id");
@@ -915,7 +919,7 @@ async fn same_cwd_session_tree_branch_fork_clone_and_resume_lineage() {
     let pre_clone = application.state().await;
     let pre_clone_file = pre_clone.session_file.clone().expect("pre-clone file");
     let pre_clone_messages = application.messages();
-    application.clone_session().await.expect("clone");
+    assert!(!application.clone_session().await.expect("clone").cancelled);
     let cloned = application.state().await;
     let clone_file = cloned.session_file.clone().expect("clone file");
     assert_ne!(clone_file, pre_clone_file);
@@ -939,10 +943,11 @@ async fn same_cwd_session_tree_branch_fork_clone_and_resume_lineage() {
 
     // Resume the original source session in-process (same CWD) and prove the
     // live transcript rebuilds from that file, not the clone tip.
-    application
+    let resume = application
         .switch_session(Path::new(&source_file))
         .await
         .expect("resume source");
+    assert!(!resume.cancelled);
     let resumed = application.state().await;
     assert_eq!(resumed.session_file.as_deref(), Some(source_file.as_str()));
     assert_eq!(resumed.session_id.as_deref(), Some(source_id.as_str()));
@@ -964,7 +969,7 @@ async fn same_cwd_session_tree_branch_fork_clone_and_resume_lineage() {
     );
 
     // new_session resets the live transcript while remaining in the same CWD.
-    application.new_session().await.expect("new session");
+    assert!(!application.new_session().await.expect("new session").cancelled);
     let fresh = application.state().await;
     assert_eq!(fresh.message_count, 0);
     assert!(application.messages().is_empty());

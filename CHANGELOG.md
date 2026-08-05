@@ -2,6 +2,32 @@
 
 All notable changes to `rpi` are documented in this file.
 
+## [0.2.3] - 2026-08-05
+
+### Added
+
+- `/code-review [<from> <to>]` can compare any two commits, branches, or tags
+  while preserving the existing bare HEAD-to-working-tree view.
+- Added persistent `/btw` side conversations, interactive host-tool approval,
+  the authenticated `--listen` control plane, supervised PTY attachment, Todo
+  DAG navigation, and agent management in the TUI.
+- `/workflow create <objective>` now accepts a single objective and uses it as
+  the workflow name when no explicit name is provided.
+
+### Changed
+
+- Workflow creation starts supervision asynchronously, projects live status to
+  the TUI, and redacts nested worktree/runtime errors from user-visible output.
+- Session switches now wait for owned processes to terminate before committing
+  a same-directory session cutover.
+- Code review captures large tracked change sets without silently dropping late
+  paths, keeps Git execution isolated, and bounds oversized diff output.
+
+### Fixed
+
+- Resolved hub wait delivery and concurrent faux-provider registration races.
+
+
 ## [0.2.2] - 2026-08-02
 
 ### Changed
@@ -115,6 +141,7 @@ All notable changes to `rpi` are documented in this file.
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
 
+[0.2.3]: https://github.com/0x8f701/rpi/releases/tag/v0.2.3
 [0.2.2]: https://github.com/0x8f701/rpi/releases/tag/v0.2.2
 [0.2.1]: https://github.com/0x8f701/rpi/releases/tag/v0.2.1
 [0.2.0]: https://github.com/0x8f701/rpi/releases/tag/v0.2.0

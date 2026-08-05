@@ -26,14 +26,20 @@ when the limit is exceeded the oldest entries are dropped (`MAX_TRANSCRIPT_LINES
 Tool execution is shown as status lines (`· toolName(args)` / `  └ ok` /
 `  └ error`).
 
+When the transcript is empty, the welcome screen lists a few **Recent sessions**
+from the unified catalog, scoped to the current working directory. Each entry
+shows a `[source]` badge for native Pi, OMP, Codex, Claude, Grok/Hyper, or Droid
+sessions. Selecting a foreign session imports it once; subsequent resumes reuse
+the converted file under the effective native session root.
+
 ## Built-in themes
 
 Only two built-in palettes are always available:
 
-- `dark` — the cyan/green/dark palette (`DARK` in `crates/pi-cli/src/theme.rs:103`).
-- `light` — a high-contrast palette for light terminals (`LIGHT` in `theme.rs:165`).
+- `dark` — the exact installed OMP v17.2.6 default `titanium` palette: electric blue chrome, green success/readouts, gold highlights, and dark titanium surfaces (`DARK` in `crates/pi-cli/src/theme.rs`).
+- `light` — a high-contrast palette for light terminals (`LIGHT` in `theme.rs`).
 
-The initial theme is chosen from safe terminal background detection (`ThemeManager::load` in `theme.rs:281`). It can be pinned in `settings.json`:
+The initial theme follows safe terminal background detection; dark terminals therefore use the OMP-default Titanium palette. It can be pinned in `settings.json`:
 
 ```json
 {
@@ -262,9 +268,12 @@ filters the list, `Enter` confirms the selection, and `Esc` closes the overlay.
   automatic compaction (`open_settings_panel` in `tui.rs:2027`).
 - **Trust panel** (`/trust`): choose `Trusted`, `Untrusted`, or `Ask` for the
   current project (`open_trust_panel` in `tui.rs:2080`).
-- **Saved session selector** (`/sessions` or `/resume` with no argument):
-  filter by name/path, sort by newest or name, rename (`ctrl+r`), and delete
-  (`ctrl+d`) saved sessions (`handle_session_selector_key` in `tui.rs:2281`).
+**Saved session selector** (`/sessions`, `/resume` with no argument):
+unified catalog scoped to the current cwd, filter by name/path, sort by newest
+or name, rename (`ctrl+r`), and delete (`ctrl+d`) saved sessions. Rows show a
+`[source]` badge; foreign source files cannot be renamed or deleted, while
+native Pi sessions and already-imported conversions can be
+(`handle_session_selector_key` in `tui.rs:2281`).
 - **Scoped model selector** (`/scoped-models`): enable/disable models for
   `ctrl+p`/`ctrl+shift+p` cycling, save the scope, and reorder enabled models
   (`handle_scoped_model_selector_key` in `tui.rs:2387`).
@@ -328,7 +337,7 @@ on cleanup; iTerm images use the inline `1337` sequence with
 ## Slash commands
 
 The TUI and line REPL can execute the same built-ins, but `/help`, slash
-completion, and RPC discovery expose only the 12 commands in
+completion, and RPC discovery expose only the 14 commands in
 `PRIMARY_COMMAND_NAMES` (`interactive_commands.rs`). Prompt templates, dynamic
 skills, and extension commands remain executable through their namespaced paths.
 
@@ -346,10 +355,24 @@ skills, and extension commands remain executable through their namespaced paths.
 | `/loop [interval] <prompt>` | Run a recurring prompt |
 | `/goal` | Manage the durable session goal |
 | `/workflow` | Manage isolated concurrent workflows |
+| `/code-review [<from> <to>]` | Open a fullscreen Git diff browser: bare shows tracked HEAD→working-tree changes; two refs compare any two commits/branches/tags |
+| `/btw [prompt]` | Open a persistent detached side conversation forked from the active main branch |
 
 Other built-ins such as `/help`, `/new`, `/sessions`, `/tree`, `/todo`,
 `/share`, `/copy`, `/login`, `/logout`, `/process`, `/theme`, and `/quit`
 remain manually executable but are intentionally omitted from primary discovery.
+
+`/btw` is read-only by default. `Ctrl+T` toggles edit/exec tools while the side agent is idle; `Esc` aborts a streaming turn or closes an idle overlay; `Alt+R` reforks from the current main leaf; `Alt+N` clears the side transcript. The overlay has its own editor, transcript, events, stream, and abort lifecycle. Closing it preserves the side controller for reopening, while TUI shutdown aborts and joins active side work.
+
+`/code-review` displays staged and unstaged tracked changes against `HEAD`. `Tab` changes pane focus; `j`/`k`, arrows, and mouse clicks select hunks; `c` comments on the selected hunk; `Space` folds its inline review thread. Each thread appears after the complete hunk body with distinct comment/answer cards, and repeated agent progress messages collapse into one answer per exchange. Page keys and the mouse wheel scroll; tree clicks select or fold; `Esc`/`q` closes the page. Mouse capture is enabled only for this page and restored on every close or overlay transition.
+
+`/code-review` accepts zero or exactly two arguments. Bare `/code-review` shows
+tracked HEAD→working-tree changes. `/code-review <from> <to>` resolves each ref
+(commit hash, branch, or tag) to a commit and renders the commit-to-commit diff
+labeled `<from> → <to>` in the panel title; working-tree changes are ignored. One
+argument or more than two is invalid — the page does not open and the status line
+shows `Usage: /code-review [<from> <to>]`. Pressing `r` refreshes the snapshot and
+preserves the selected revision pair.
 
 Loop intervals accept positive bare seconds (`/loop 300 check status`) or compact `s`, `m`, `h`, and `d` units (`/loop 3s echo hello`, `/loop 30m check deploy`). Scheduled turns appear as `Loop <id> · <cadence>` system cards; the internal model instruction wrapper is not shown as a user message.
 
@@ -360,9 +383,10 @@ When stdout is not a TTY, `main_run` falls back to `repl::interactive`
 catalog but lacks the TUI's modal page overlays:
 
 - **No modal pages**: model, settings, trust, saved-session, scoped-model,
-  session-tree, and fork selectors are TUI-only. In the REPL, `/scoped-models`
-  and `/theme` report that they require the TUI, `/tree` prints JSON, `/fork`
-  with no argument prints candidate messages, and `/model` accepts a concrete spec.
+  session-tree, fork, `/btw`, and `/code-review` overlays are TUI-only. In the
+  REPL, `/scoped-models` and `/theme` report that they require the TUI, `/tree`
+  prints JSON, `/fork` with no argument prints candidate messages, and `/model`
+  accepts a concrete spec.
 - **No configurable keybindings or themes**: the REPL uses a fixed
   line-editing interface and ignores theme files.
 - **No terminal image rendering**: image attachments are processed and sent

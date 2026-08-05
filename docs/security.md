@@ -51,6 +51,15 @@ trusted and are included as plain-text instructions, not parsed as
 configuration. Sources: `crates/pi-coding/src/trust.rs`,
 `crates/pi-coding/src/resources.rs`, `crates/pi-coding/src/resource_manager.rs`.
 
+Tool execution policy is separate from project trust. Global
+`settings.json#approvalMode` and the one-run `--approval-mode` flag accept
+`yolo`, `write`, or `ask`: `yolo` allows all capabilities, `write` confirms
+Exec tools, and `ask` confirms every tool call. A project-local settings file
+cannot lower this global policy. When confirmation is required outside the TUI,
+the host fails closed instead of silently allowing the tool. Host approval runs
+before existing host hooks and extension reducers; a denial skips later hooks.
+Unknown or legacy tool metadata defaults to Exec capability.
+
 ## Credential storage and redaction
 
 API keys and subscriptions are resolved in the precedence order described in
@@ -144,6 +153,8 @@ controls.
   terminal guard. JSON, RPC, print mode, logs, and ratatui buffers never receive
   raw graphics protocol bytes. Source: `crates/pi-cli/src/terminal_images.rs` and
   `crates/pi-cli/src/tui.rs`.
+- `--listen` is available only on the live text TUI/REPL path and shares that exact `Application`; it is rejected with subcommands, print, JSON/RPC, or model-listing exits. HTTP and WebSocket messages are capped at 4 MiB, ordinary commands at 16 concurrent operations, pre-auth connections at 64 tasks, and outbound WebSocket delivery uses a bounded queue. Recovery commands such as abort and process stop can bypass saturated ordinary-work slots.
+- Non-loopback listeners require a bounded regular token file and exact `Authorization: Bearer <token>`. Tokenless loopback is reserved for native clients without an `Origin` header; browser-origin HTTP and WebSocket requests are rejected. Interactive extension dialogs remain exclusively owned by the local TUI: remote clients cannot observe or answer their ids. Listener task/stop failures remain observable after application cleanup. Source: `crates/pi-cli/src/modes/listen.rs`, `crates/pi-cli/src/modes/rpc.rs`, and `crates/pi-cli/src/lib.rs`.
 
 ## Extension manifest, environment, and process isolation
 

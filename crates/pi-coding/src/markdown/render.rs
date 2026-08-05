@@ -866,4 +866,38 @@ X[User] --> A\n\
             0
         );
     }
+
+    #[test]
+    fn realistic_prose_tables_are_bounded_and_keep_semantic_ranges() {
+        let source = "| **Document** | Role |\n\
+| --- | --- |\n\
+| Architecture decision record | Explains why committed conversation remains separate from transient composer frames |\n\
+| Contributor guide | Shows maintainers how to extend `table rendering` without losing semantic styles |\n\n\
+| Approach | Strengths | Trade-offs |\n\
+| --- | --- | --- |\n\
+| Shared renderer | One wrapping implementation serves print and live terminal views | Adapters consume explicit semantic ranges |\n\
+| TUI reparsing | Quick to prototype | Duplicates parsing and can recolor ordinary content |";
+        let output = render(source, 78);
+        assert!(output.lines.iter().all(|line| UnicodeWidthStr::width(line.text.as_str()) <= 78));
+        assert_eq!(output.lines.iter().filter(|line| line.role == LineRole::TableBorder).count(), 6);
+        assert!(output.lines.iter().any(|line| {
+            line.role == LineRole::TableHeader
+                && line.inline_styles.iter().any(|styled| styled.style == super::super::inline::InlineStyle::Bold)
+        }));
+        assert!(output.lines.iter().any(|line| {
+            line.role == LineRole::TableBody
+                && line.inline_styles.iter().any(|styled| styled.style == super::super::inline::InlineStyle::Code)
+        }));
+        for line in output.lines.iter().filter(|line| {
+            matches!(line.role, LineRole::TableBorder | LineRole::TableHeader | LineRole::TableBody)
+        }) {
+            for (offset, character) in line.text.char_indices().filter(|(_, character)| "┌┬┐├┼┤│└┴┘─".contains(*character)) {
+                assert!(line.inline_styles.iter().any(|styled| {
+                    styled.style == super::super::inline::InlineStyle::TableBorder
+                        && styled.range.start <= offset
+                        && styled.range.end >= offset + character.len_utf8()
+                }), "unmarked border {character:?} in {:?}", line.text);
+            }
+        }
+    }
 }

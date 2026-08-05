@@ -32,7 +32,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use pi_agent::{
-    AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolExecutionMode, ToolUpdateFn,
+    AbortSignal, AgentTool, AgentToolResult, ToolCallContext, ToolCapability, ToolExecutionMode,
+    ToolUpdateFn,
 };
 use pi_ai::{ConstrainedSampling, ConstrainedSamplingStrictness, ContentBlock, Schema};
 
@@ -578,6 +579,7 @@ fn todo_tool(runtime: TodoRuntime) -> AgentTool {
             }
         },
     )
+    .with_capability(ToolCapability::Write)
     .with_label("Todo")
     .with_execution_mode(ToolExecutionMode::Sequential)
     .with_prepare_arguments(fill_missing_with_null);
@@ -644,6 +646,7 @@ fn read_tool_for_workspace(
             )
         }
     })
+    .with_capability(ToolCapability::Read)
     .with_prompt_guidelines(vec!["Use read to examine files instead of cat or sed.".to_string()])
 }
 
@@ -844,6 +847,7 @@ fn write_tool_for_workspace(workspace: crate::WorkspaceRoots) -> AgentTool {
             async move { run_write(&workspace, ctx.arguments, ctx.abort).await }
         },
     )
+    .with_capability(ToolCapability::Write)
     .with_prompt_guidelines(vec!["Use write only for new files or complete rewrites.".to_string()])
 }
 
@@ -907,6 +911,7 @@ fn edit_tool_for_workspace(workspace: crate::WorkspaceRoots) -> AgentTool {
             async move { run_edit(&workspace, ctx.arguments, ctx.abort).await }
         },
     )
+    .with_capability(ToolCapability::Write)
     .with_prompt_guidelines(vec![
         "Use edit for precise changes (edits[].oldText must match exactly)".to_string(),
         "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls".to_string(),
@@ -1057,6 +1062,7 @@ fn bash_tool(cwd: &str, session_env: Option<SessionEnvFn>, process: Option<BashP
         let process = process.clone();
         async move { run_bash(&cwd, ctx.arguments, ctx.on_update, ctx.abort, session_env, process).await }
     })
+    .with_capability(ToolCapability::Exec)
     .with_prompt_guidelines(vec![
         "Inspect PI_* environment variables for current model and session details.".to_string(),
         "Use foreground bash only for finite commands. For servers, watchers, or commands intended to outlive the tool call, set background=true; never use nohup, setsid, disown, or shell '&'. Supervised commands are visible in /ps with logs, signal, stop, and wait controls.".to_string(),
@@ -2181,6 +2187,7 @@ fn ls_tool(cwd: &str) -> AgentTool {
         let workspace = workspace.clone();
         async move { run_ls(&workspace, ctx.arguments, ctx.abort) }
     })
+    .with_capability(ToolCapability::Read)
 }
 
 fn run_ls(workspace: &crate::WorkspaceRoots, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
@@ -2280,6 +2287,7 @@ fn find_tool(cwd: &str) -> AgentTool {
         let workspace = workspace.clone();
         async move { run_find(&workspace, ctx.arguments, ctx.abort) }
     })
+    .with_capability(ToolCapability::Read)
 }
 
 fn run_find(workspace: &crate::WorkspaceRoots, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
@@ -2401,6 +2409,7 @@ fn glob_tool_for_workspace(workspace: crate::WorkspaceRoots) -> AgentTool {
         let workspace = workspace.clone();
         async move { run_glob(&workspace, ctx.arguments, ctx.abort) }
     })
+    .with_capability(ToolCapability::Read)
 }
 
 fn run_glob(
@@ -2584,6 +2593,7 @@ fn grep_tool(cwd: &str) -> AgentTool {
         let workspace = workspace.clone();
         async move { run_grep(&workspace, ctx.arguments, ctx.abort) }
     })
+    .with_capability(ToolCapability::Read)
 }
 
 /// Scans one file for `re`, appending `path:line: text` / `path-line- text`
@@ -3220,6 +3230,26 @@ mod tests {
         assert_eq!(create_all_tools_map(&cwd).len(), TOOL_NAMES.len());
         assert_eq!(create_all_tool_definitions(&cwd).len(), TOOL_NAMES.len());
         assert_eq!(create_all_tool_definitions_map(&cwd).len(), TOOL_NAMES.len());
+    }
+
+    #[test]
+    fn builtin_tools_carry_explicit_capabilities() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        for (name, expected) in [
+            ("read", ToolCapability::Read),
+            ("grep", ToolCapability::Read),
+            ("find", ToolCapability::Read),
+            ("glob", ToolCapability::Read),
+            ("ls", ToolCapability::Read),
+            ("write", ToolCapability::Write),
+            ("edit", ToolCapability::Write),
+            ("todo", ToolCapability::Write),
+            ("bash", ToolCapability::Exec),
+        ] {
+            let tool = create_tool(name, &cwd).expect("built-in tool");
+            assert_eq!(tool.capability, expected, "{name}");
+        }
     }
 
     #[tokio::test]

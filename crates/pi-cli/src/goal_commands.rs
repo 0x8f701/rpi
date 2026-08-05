@@ -177,6 +177,17 @@ mod tests {
     }
 
     #[test]
+    fn exact_chinese_objective_is_create_shorthand() {
+        assert_eq!(
+            parse_interactive_goal_command(Some("制作zig版本的pi-coding-agent")).unwrap(),
+            InteractiveGoalCommand::Create {
+                objective: "制作zig版本的pi-coding-agent".to_owned(),
+                token_budget: None,
+            }
+        );
+    }
+
+    #[test]
     fn formats_empty_goal_details_for_overlay() {
         let details = format_goal_details(&GoalState::default());
         assert_eq!(details, "No goal is active. Choose Create goal to set an objective.");

@@ -12,7 +12,9 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use parking_lot::Mutex;
-use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ThinkingLevel, ToolExecutionMode};
+use pi_agent::{
+    AbortSignal, AgentTool, AgentToolResult, ThinkingLevel, ToolCapability, ToolExecutionMode,
+};
 use pi_ai::{ContentBlock, CustomMessageContent, Message, Model, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -718,6 +720,8 @@ pub struct ExtensionToolDescriptor {
     pub label: String,
     pub description: String,
     pub parameters: Schema,
+    #[serde(default)]
+    pub capability: ToolCapability,
     #[serde(default)]
     pub execution_mode: ToolExecutionMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3043,6 +3047,7 @@ fn agent_tools_from_registry(
                 },
             )
             .with_label(descriptor.label)
+            .with_capability(descriptor.capability)
             .with_execution_mode(descriptor.execution_mode);
             tool.prompt_guidelines = descriptor.prompt_guidelines;
             tool
@@ -3976,5 +3981,64 @@ fn with_diagnostics(error: anyhow::Error, transport: &dyn ExtensionTransport) ->
         error
     } else {
         anyhow!("{error}; child stderr: {diagnostics}")
+    }
+}
+
+
+#[cfg(test)]
+mod tool_capability_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_registration(capability: Option<&str>) -> Value {
+        let mut tool = json!({
+            "name": "custom_read",
+            "label": "Custom Read",
+            "description": "Reads custom data",
+            "parameters": { "type": "object", "properties": {} }
+        });
+        if let Some(capability) = capability {
+            tool["capability"] = json!(capability);
+        }
+        json!({ "kind": "tool", "tool": tool })
+    }
+
+    #[test]
+    fn extension_tool_capabilities_round_trip_lowercase() {
+        for capability in [
+            ToolCapability::Read,
+            ToolCapability::Write,
+            ToolCapability::Exec,
+        ] {
+            let wire = serde_json::to_value(ExtensionRegistration::Tool {
+                tool: ExtensionToolDescriptor {
+                    name: "custom".to_owned(),
+                    label: "Custom".to_owned(),
+                    description: "Custom extension tool".to_owned(),
+                    parameters: Schema::default(),
+                    capability,
+                    execution_mode: ToolExecutionMode::Default,
+                    prompt_guidelines: Vec::new(),
+                },
+            })
+            .unwrap();
+            assert_eq!(wire["tool"]["capability"], serde_json::to_value(capability).unwrap());
+            let decoded: ExtensionRegistration = serde_json::from_value(wire).unwrap();
+            let ExtensionRegistration::Tool { tool } = decoded else {
+                panic!("expected tool registration");
+            };
+            assert_eq!(tool.capability, capability);
+        }
+    }
+
+    #[test]
+    fn legacy_extension_tools_default_to_exec_and_invalid_values_fail() {
+        let decoded: ExtensionRegistration =
+            serde_json::from_value(tool_registration(None)).expect("legacy tool frame");
+        let ExtensionRegistration::Tool { tool } = decoded else {
+            panic!("expected tool registration");
+        };
+        assert_eq!(tool.capability, ToolCapability::Exec);
+        assert!(serde_json::from_value::<ExtensionRegistration>(tool_registration(Some("network"))).is_err());
     }
 }

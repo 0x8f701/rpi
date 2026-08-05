@@ -3,10 +3,13 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use pi_agent::{StreamFn, ThinkingLevel};
 use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
 use pi_ai::{
-    AssistantMessage, AssistantMessageEvent, ContentBlock, Message, Model, StopReason,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, Message, Model, StopReason, Usage,
     new_assistant_message_event_stream,
 };
-use pi_coding::{CompactionReason, CompactionSettings, RetrySettings, Session, SessionEvent, SessionOptions};
+use pi_coding::{
+    BeforeCompactionResult, CompactionDetails, CompactionReason, CompactionResult,
+    CompactionSettings, RetrySettings, Session, SessionEvent, SessionOptions,
+};
 
 static REGISTRY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -247,17 +250,97 @@ async fn manual_compaction_emits_paired_success_events() {
         stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None,
         stream_fn: None, auth_resolver: None,
     }).expect("build session");
-    session.load_history(vec![
+    let history = vec![
         Message::user_text("older request ".repeat(20), 1),
         Message::Assistant({ let mut message = AssistantMessage::pending(&session.model().expect("model")); message.content = vec![ContentBlock::text("older answer")]; message.stop_reason = StopReason::Stop; message }),
         Message::user_text("recent request", 3),
-    ]).await.expect("load history");
+    ];
+    let recorder = pi_coding::start_session_in(
+        cwd.path(), None, None, Some(cwd.path()), Some("manual-compaction-metadata"), None,
+    )
+    .expect("start recorder");
+    for message in &history {
+        recorder.record_message(message).expect("record history");
+    }
+    let session_path = recorder.path();
+    session.record(recorder).expect("attach recorder");
+    session.load_history(history).await.expect("load history");
     let mut events = session.subscribe_session_events();
     let result = session.compact(None).await.expect("manual compact");
     assert_eq!(result.summary, "manual checkpoint");
     assert!(matches!(events.recv().await.expect("start"), SessionEvent::CompactionStart { reason: CompactionReason::Manual }));
     assert!(matches!(events.recv().await.expect("end"), SessionEvent::CompactionEnd { reason: CompactionReason::Manual, aborted: false, result: Some(_), .. }));
+    let tree = pi_coding::load_session_tree(&session_path).expect("load recorded compaction");
+    let entry = tree.entries.iter().find(|entry| entry.entry_type == "compaction").expect("compaction entry");
+    assert_eq!(entry.details, serde_json::to_value(result.details.as_ref().expect("generated details")).ok());
+    assert_eq!(entry.usage, None);
+    assert_eq!(entry.from_hook, None);
     registration.unregister();
+}
+
+#[tokio::test]
+async fn hook_compaction_persists_details_usage_and_source() {
+    let cwd = tempfile::tempdir().expect("temporary working directory");
+    let session = Session::new(SessionOptions {
+        model: Model::default(),
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4 }),
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+    })
+    .expect("build session");
+    let recorder = pi_coding::start_session_in(
+        cwd.path(), None, None, Some(cwd.path()), Some("hook-compaction-metadata"), None,
+    )
+    .expect("start recorder");
+    let first = Message::user_text("older request", 1);
+    let first_id = recorder.record_message(&first).expect("record first");
+    let assistant = Message::Assistant({
+        let mut message = AssistantMessage::pending(&session.model().expect("model"));
+        message.content = vec![ContentBlock::text("older answer")];
+        message.stop_reason = StopReason::Stop;
+        message
+    });
+    recorder.record_message(&assistant).expect("record assistant");
+    let recent = Message::user_text("recent request", 3);
+    recorder.record_message(&recent).expect("record recent");
+    let session_path = recorder.path();
+    session.record(recorder).expect("attach recorder");
+    session.load_history(vec![first, assistant, recent]).await.expect("load history");
+
+    let details = CompactionDetails {
+        read_files: vec!["src/lib.rs".to_owned()],
+        modified_files: vec!["src/main.rs".to_owned()],
+    };
+    let usage = Usage { input: 17, output: 5, total_tokens: 22, ..Usage::default() };
+    let hook_result = CompactionResult {
+        summary: "hook checkpoint".to_owned(),
+        first_kept_entry_id: first_id,
+        tokens_before: 777,
+        estimated_tokens_after: Some(12),
+        usage: Some(usage.clone()),
+        details: Some(details.clone()),
+    };
+    session.set_before_compaction(Some(Arc::new(move |_| {
+        let hook_result = hook_result.clone();
+        Box::pin(async move {
+            Ok(BeforeCompactionResult { cancel: false, compaction: Some(hook_result) })
+        })
+    })));
+    session.compact(None).await.expect("hook compaction");
+
+    let tree = pi_coding::load_session_tree(&session_path).expect("load hook compaction");
+    let entry = tree.entries.iter().find(|entry| entry.entry_type == "compaction").expect("compaction entry");
+    assert_eq!(entry.details, serde_json::to_value(details).ok());
+    assert_eq!(entry.usage, Some(usage));
+    assert_eq!(entry.from_hook, Some(true));
 }
 
 #[tokio::test]

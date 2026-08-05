@@ -135,6 +135,10 @@ run_orchestration_rust() {
         # Runtime bidirectional IRC while supervised (Main↔child / peer).
         (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-coding --test orchestration_supervision main_supervises_two_children_with_irc --locked -- --nocapture)
 
+        # Authoritative real task + identity-bound child hub AgentTool chain.
+        (cd "$REPO_ROOT" && run_with_timeout 300 "${CARGO_E2E[@]}" test -p pi-coding --test orchestration \
+            real_task_children_route_main_alpha_beta_main_through_owned_hub_tools --locked -- --nocapture)
+
         # Image placeholder [Image #N, WIDTHxHEIGHT].
         (cd "$REPO_ROOT" && run_with_timeout 240 "${CARGO_E2E[@]}" test -p pi-cli clipboard_png_fixture_attaches_one_image --locked -- --nocapture)
 
@@ -155,6 +159,7 @@ run_orchestration_rust() {
     assert_file_contains "$logf" "failed_and_cancelled_owners_stay_open_and_terminal_reconciliation_is_idempotent"
     assert_file_contains "$logf" "nl_exact_agent_spawn"
     assert_file_contains "$logf" "main_supervises_two_children_with_irc"
+    assert_file_contains "$logf" "real_task_children_route_main_alpha_beta_main_through_owned_hub_tools"
     assert_file_contains "$logf" "message_delivered_event_renders_once"
     assert_file_contains "$logf" "replace_transcript_refreshes_todo_phases"
     printf 'orchestration.rust passed\nlog=%s\n' "$logf"
@@ -264,6 +269,20 @@ TERM=xterm-256color \
     if [ "${after_count:-0}" -gt $(( ${before_count:-0} + 1 )) ]; then
         fail "skill-only prompt appears to have spawned extra researcher jobs ($before_count -> $after_count)"
     fi
+
+    # --- Real rpi/tmux child-owned hub AgentTool chain ---
+    run_with_timeout 55 python3 "$E2E_DIR/lib/run_hub_tui_campaign.py" \
+        --rpi "$RPI_BIN" \
+        --home "$root/hub-home" \
+        --workspace "$root/hub-workspace" \
+        --evidence "$evidence/hub-tui" \
+        >"$evidence/hub-tui-result.json"
+    assert_file_contains "$evidence/hub-tui/tui.txt" \
+        'IRC · Beta → Main' 'beta-to-main-tmux' \
+        'Alpha (Alpha) · completed' 'Beta (Beta) · completed'
+    assert_file_lacks "$evidence/hub-tui/tui.txt" '<orchestration-message'
+    assert_file_contains "$evidence/hub-tui/assertions.json" \
+        'alpha-child-owned-hub-wait-send' 'beta-child-owned-hub-wait-send'
 
     # --- Dense Todo pressure at the reported 120x40 size ---
     run_with_timeout 45 python3 "$E2E_DIR/lib/run_todo_tui_campaign.py" \

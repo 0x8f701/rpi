@@ -1,5 +1,6 @@
 //! Shared path/search/metadata helpers for the session catalog.
 
+use std::cmp::Ordering;
 use std::env;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
@@ -11,15 +12,16 @@ use super::CatalogRow;
 
 const SUMMARY_MAX_CHARS: usize = 100;
 
+pub(super) fn compare_rows_newest(left: &CatalogRow, right: &CatalogRow) -> Ordering {
+    right
+        .modified_epoch
+        .total_cmp(&left.modified_epoch)
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| left.session_id.cmp(&right.session_id))
+}
+
 pub(super) fn sort_rows_newest(rows: &mut [CatalogRow]) {
-    rows.sort_by(|left, right| {
-        right
-            .modified_epoch
-            .partial_cmp(&left.modified_epoch)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.session_id.cmp(&right.session_id))
-    });
+    rows.sort_by(compare_rows_newest);
 }
 
 pub(super) fn display_name(row: &CatalogRow) -> String {

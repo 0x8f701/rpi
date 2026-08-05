@@ -220,7 +220,7 @@ mod tests {
     }
 
     fn agent(id: &str, name: &str, status: AgentStatus) -> AgentSnapshot {
-        AgentSnapshot { id: id.to_owned(), display_name: name.to_owned(), parent_id: None, status, created_at: 1, last_activity: 1, unread: 0, artifact_ref: None, history_ref: None }
+        AgentSnapshot { id: id.to_owned(), display_name: name.to_owned(), agent: name.to_owned(), parent_id: None, status, created_at: 1, last_activity: 1, unread: 0, artifact_ref: None, history_ref: None }
     }
 
     fn job(status: JobStatus) -> WorkflowJobSnapshot {

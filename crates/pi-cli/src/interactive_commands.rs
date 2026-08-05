@@ -111,6 +111,8 @@ pub const PRIMARY_COMMAND_NAMES: &[&str] = &[
     "loop",
     "goal",
     "workflow",
+    "code-review",
+    "btw",
 ];
 
 /// True when `name` is part of the visible primary slash surface.
@@ -373,10 +375,23 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         name: "workflow",
         description: "Create and manage concurrent isolated workflows",
         argument_hint: Some(
-            "[list|show [id|name]|create <name> <objective>|pause|resume|cancel|integrate|remove]",
+            "[list|show [id|name]|create <objective>|create <name> <objective>|pause|resume|cancel|integrate|remove]",
         ),
         requires_arguments: false,
     },
+    BuiltinCommand {
+        name: "code-review",
+        description: "Browse a working-tree or two-revision Git diff in a fullscreen panel",
+        argument_hint: Some("[<from> <to>]"),
+        requires_arguments: false,
+    },
+    BuiltinCommand {
+        name: "btw",
+        description: "Open side chat forked from the main conversation",
+        argument_hint: Some("[prompt]"),
+        requires_arguments: false,
+    },
+
     BuiltinCommand {
         name: "todo",
         description: "Show or edit the task list",
@@ -701,6 +716,10 @@ mod tests {
             "/loop-cancel <id>"
         );
         assert_eq!(usage(builtin("todo").expect("todo command")), "/todo [markdown]");
+        assert_eq!(
+            usage(builtin("code-review").expect("code review command")),
+            "/code-review [<from> <to>]"
+        );
         assert_eq!(usage(builtin("process").expect("process command")), "/process <start|describe|logs|send|resize|signal|stop|wait> ...");
         assert_eq!(usage(builtin("settings").expect("settings command")), "/settings [list|search|set|reset|validate|apply|cancel] ...");
         assert_eq!(
@@ -755,9 +774,11 @@ mod tests {
                 "loop",
                 "goal",
                 "workflow",
+                "code-review",
+                "btw",
             ]
         );
-        assert_eq!(PRIMARY_COMMAND_NAMES.len(), 12);
+        assert_eq!(PRIMARY_COMMAND_NAMES.len(), 14);
         let visible = visible_catalog()
             .into_iter()
             .map(|command| command.name)
@@ -772,7 +793,7 @@ mod tests {
         assert!(builtin("import").is_some(), "hidden commands remain executable");
         assert_eq!(
             usage(builtin("workflow").expect("workflow command")),
-            "/workflow [list|show [id|name]|create <name> <objective>|pause|resume|cancel|integrate|remove]"
+            "/workflow [list|show [id|name]|create <objective>|create <name> <objective>|pause|resume|cancel|integrate|remove]"
         );
         assert!(
             !requires_arguments(builtin("workflow").expect("workflow command")),

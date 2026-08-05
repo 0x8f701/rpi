@@ -26,6 +26,7 @@ clap.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 globset.workspace = true
+http.workspace = true
 image.workspace = true
 ignore.workspace = true
 nix.workspace = true
@@ -40,6 +41,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
@@ -47,7 +49,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-nix = { version = "0.29", default-features = false, features = ["term", "signal", "process"] }
 
 [lints]
 workspace = true

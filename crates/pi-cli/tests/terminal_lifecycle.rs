@@ -22,6 +22,7 @@ use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::termios::Termios;
 use nix::unistd::Pid;
+use unicode_width::UnicodeWidthChar;
 use tempfile::TempDir;
 
 const ENTER_ALT: &str = "\x1b[?1049h";
@@ -30,6 +31,8 @@ const SHOW_CURSOR: &str = "\x1b[?25h";
 const CLEAR_AFTER_CURSOR: &str = "\x1b[J";
 const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
 const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
+const BRACKETED_PASTE_START: &str = "\x1b[200~";
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const DISABLE_LINE_WRAP: &str = "\x1b[?7l";
 const ENABLE_LINE_WRAP: &str = "\x1b[?7h";
 const CLEAR_CURRENT_LINE: &str = "\x1b[2K";
@@ -134,6 +137,22 @@ impl PtyProbe {
         self.writer.flush().expect("pty flush");
     }
 
+    /// Send `payload` as a bracketed paste. The TUI keeps bracketed-paste mode
+    /// enabled while active, so crossterm delivers this as a single
+    /// `Event::Paste(payload)` and the composer paints the whole payload in one
+    /// render as a contiguous run. Per-key typing instead interleaves
+    /// cursor/separator cells between characters in the raw PTY stream, so
+    /// post-lifecycle composer-usability markers must be pasted, not typed.
+    fn bracketed_paste(&mut self, payload: &str) {
+        let mut bytes = Vec::with_capacity(
+            BRACKETED_PASTE_START.len() + payload.len() + BRACKETED_PASTE_END.len(),
+        );
+        bytes.extend_from_slice(BRACKETED_PASTE_START.as_bytes());
+        bytes.extend_from_slice(payload.as_bytes());
+        bytes.extend_from_slice(BRACKETED_PASTE_END.as_bytes());
+        self.send(&bytes);
+    }
+
     fn signal(&mut self, signal: Signal) {
         let pid = Pid::from_raw(self.child.id() as i32);
         kill(pid, signal).expect("send signal to child");
@@ -157,6 +176,29 @@ impl PtyProbe {
             }
             if Instant::now() >= deadline {
                 return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Wait for `needle` strictly after a captured stream byte offset and
+    /// return the offset immediately following the match. This lets lifecycle
+    /// tests prove event ordering without sleeps or ambiguous global counts.
+    fn wait_for_after(&self, needle: &str, start: usize, timeout: Duration) -> Option<usize> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let found = {
+                let buffer = self.buffer.lock().expect("buffer lock");
+                buffer
+                    .get(start..)
+                    .and_then(|tail| tail.find(needle))
+                    .map(|offset| start + offset + needle.len())
+            };
+            if found.is_some() {
+                return found;
+            }
+            if Instant::now() >= deadline {
+                return None;
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -405,6 +447,240 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
+/// Replay the subset of ANSI terminal control used by the inline TUI into a
+/// fixed-size screen plus unbounded normal-screen scrollback. This deliberately
+/// models newline-at-bottom promotion, cursor-addressed paints, and the erase
+/// sequences used by `clear_inline_viewport`; SGR and terminal modes do not
+/// affect retained text.
+fn replay_terminal_scrollback(input: &str, width: usize, height: usize) -> Vec<String> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut screen = vec![vec![' '; width]; height];
+    let mut scrollback = Vec::<String>::new();
+    let mut row = 0usize;
+    let mut column = 0usize;
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+
+    let scroll = |screen: &mut Vec<Vec<char>>, scrollback: &mut Vec<String>| {
+        scrollback.push(screen[0].iter().collect());
+        screen.rotate_left(1);
+        screen[height - 1].fill(' ');
+    };
+    while index < chars.len() {
+        match chars[index] {
+            '\u{1b}' if chars.get(index + 1) == Some(&'[') => {
+                index += 2;
+                let start = index;
+                while index < chars.len()
+                    && !(('@'..='~').contains(&chars[index]))
+                {
+                    index += 1;
+                }
+                if index == chars.len() {
+                    break;
+                }
+                let final_byte = chars[index];
+                let params = chars[start..index].iter().collect::<String>();
+                let values = params
+                    .trim_start_matches('?')
+                    .split(';')
+                    .map(|part| part.parse::<usize>().unwrap_or(0))
+                    .collect::<Vec<_>>();
+                match final_byte {
+                    'H' | 'f' => {
+                        row = values.first().copied().unwrap_or(1).max(1).saturating_sub(1).min(height - 1);
+                        column = values.get(1).copied().unwrap_or(1).max(1).saturating_sub(1).min(width - 1);
+                    }
+                    'A' => row = row.saturating_sub(values.first().copied().unwrap_or(1).max(1)),
+                    'B' => row = row.saturating_add(values.first().copied().unwrap_or(1).max(1)).min(height - 1),
+                    'C' => column = column.saturating_add(values.first().copied().unwrap_or(1).max(1)).min(width - 1),
+                    'D' => column = column.saturating_sub(values.first().copied().unwrap_or(1).max(1)),
+                    'G' => column = values.first().copied().unwrap_or(1).max(1).saturating_sub(1).min(width - 1),
+                    'J' => match values.first().copied().unwrap_or(0) {
+                        0 => {
+                            screen[row][column..].fill(' ');
+                            for line in &mut screen[row + 1..] {
+                                line.fill(' ');
+                            }
+                        }
+                        1 => {
+                            for line in &mut screen[..row] {
+                                line.fill(' ');
+                            }
+                            screen[row][..=column].fill(' ');
+                        }
+                        2 | 3 => screen.iter_mut().for_each(|line| line.fill(' ')),
+                        _ => {}
+                    },
+                    'K' => match values.first().copied().unwrap_or(0) {
+                        0 => screen[row][column..].fill(' '),
+                        1 => screen[row][..=column].fill(' '),
+                        2 => screen[row].fill(' '),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            '\u{1b}' if chars.get(index + 1) == Some(&']') => {
+                index += 2;
+                while index < chars.len() {
+                    if chars[index] == '\u{7}' {
+                        break;
+                    }
+                    if chars[index] == '\u{1b}' && chars.get(index + 1) == Some(&'\\') {
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            '\u{1b}' => {
+                index = index.saturating_add(1);
+            }
+            '\n' => {
+                if row + 1 == height {
+                    scroll(&mut screen, &mut scrollback);
+                } else {
+                    row += 1;
+                }
+            }
+            '\r' => column = 0,
+            ch if !ch.is_control() => {
+                let char_width = ch.width().unwrap_or(0);
+                if char_width > 0 {
+                    screen[row][column] = ch;
+                    column = column.saturating_add(char_width).min(width - 1);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    scrollback.extend(screen.into_iter().map(|line| line.into_iter().collect()));
+    scrollback
+}
+
+/// Wait until the inline composer is idle: the composer header line (the
+/// `╭── π … faux/faux-1 …╮` top border) is rendered AND its activity segment
+/// is absent. `composer_status_display` prepends the `⟲` activity separator
+/// only while busy (streaming/compacting/goal/non-default status); the idle
+/// `Ready` state omits `⟲` entirely (see `composer_header_line`). Unlike the
+/// `working` label — which `truncate_status_text` can shorten to `workin…`,
+/// `worki…`, `work…`, … depending on width — the `⟲` separator is dropped only
+/// as a whole, so its absence is a truncation-proof signal that the active
+/// `working` turn cleared and the composer is usable again.
+fn wait_for_idle_composer(probe: &PtyProbe, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let retained = replay_terminal_scrollback(&probe.snapshot(), 80, 24);
+        let live_start = retained.len().saturating_sub(24);
+        let idle = retained[live_start..].iter().any(|line| {
+            line.contains('╭') && line.contains("faux/faux-1") && !line.contains('⟲')
+        });
+        if idle {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn pty_committed_turns_never_promote_standalone_working_composer() {
+    let response = "assistant-scrollback-marker ".repeat(80);
+    let mut probe = PtyProbe::spawn(
+        &["--model", "faux/faux-1"],
+        &[("PI_FAUX_RESPONSE", response.as_str())],
+    );
+    assert!(
+        await_entered(&probe),
+        "TUI must acquire the inline viewport: {}",
+        probe.snapshot()
+    );
+    assert!(!probe.snapshot().contains(ENTER_ALT));
+
+    for turn in 1..=3 {
+        let prompt = format!("user-scrollback-marker-{turn} ").repeat(24);
+        let turn_start = probe.snapshot().len();
+        probe.bracketed_paste(&prompt);
+        probe.send(b"\r");
+        let response_end = probe
+            .wait_for_after(
+                "assistant-scrollback-marker",
+                turn_start,
+                Duration::from_secs(20),
+            )
+            .unwrap_or_else(|| {
+                panic!("turn {turn} must render its faux response: {}", probe.snapshot())
+            });
+        assert!(
+            wait_for_idle_composer(&probe, Duration::from_secs(20)),
+            "turn {turn} must settle, commit, and redraw an idle composer before the next submission: {}",
+            probe.snapshot()
+        );
+        assert!(
+            probe.wait_for_count(
+                &format!("user-scrollback-marker-{turn}"),
+                1,
+                Duration::from_secs(10),
+            ),
+            "turn {turn} user entry must be visible: {}",
+            probe.snapshot()
+        );
+    }
+
+    probe.send(&[CTRL_D]);
+    assert!(
+        probe.wait_for_count(SHOW_CURSOR, 1, Duration::from_secs(15)),
+        "clean exit after committed turns must restore the cursor: {}",
+        probe.snapshot()
+    );
+    let status = probe
+        .wait_exit(Duration::from_secs(15))
+        .expect("rpi must exit after committed turns");
+    assert!(status.success(), "committed-turn exit must succeed: {status:?}");
+
+    let retained = replay_terminal_scrollback(&probe.snapshot(), 80, 24);
+    let committed = retained
+        .iter()
+        .map(|line| line.trim_end())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    for turn in 1..=3 {
+        assert!(
+            committed.iter().any(|line| line.contains(&format!("user-scrollback-marker-{turn}"))),
+            "committed user turn {turn} must survive terminal replay: {committed:#?}"
+        );
+    }
+    assert!(
+        committed.iter().any(|line| line.contains("assistant-scrollback-marker")),
+        "committed assistant content must survive terminal replay: {committed:#?}"
+    );
+    let stale_composer = committed.windows(2).any(|rows| {
+        rows[0].contains("╭── π")
+            && rows[0].contains("working")
+            && rows[1].trim_start().starts_with("╰─")
+    });
+    assert!(
+        !stale_composer,
+        "standalone working composer frame leaked into scrollback: {committed:#?}"
+    );
+    assert!(
+        !committed.iter().any(|line| line.contains("╭── π") && line.contains("working")),
+        "working composer header leaked without its footer into scrollback: {committed:#?}"
+    );
+    assert!(
+        !committed.iter().any(|line| line.trim_start().starts_with("╰─")),
+        "empty composer footer leaked without its header into scrollback: {committed:#?}"
+    );
+    assert!(probe.snapshot().contains(DISABLE_BRACKETED_PASTE));
+    assert!(probe.snapshot().contains(ENABLE_LINE_WRAP));
+    assert!(probe.snapshot().contains(SHOW_CURSOR));
+}
+
 #[test]
 fn pty_initialization_error_leaves_terminal_clean() {
     // No --model and no auth (cleared env) => build_session fails before the
@@ -604,5 +880,95 @@ fn pty_single_ctrl_c_does_not_exit() {
     assert!(
         status.success(),
         "Ctrl+D exit after single Ctrl-C must succeed: {status:?}"
+    );
+}
+/// Esc byte (0x1b) in raw mode. The TUI keybindings map Esc to `Action::Abort`,
+/// which cancels a loop-owned active turn via `Application::abort`.
+const ESC: u8 = 0x1b;
+
+/// Contract: Esc during a `/loop`-owned active iteration cancels the active
+/// iteration, settles loop state without a failure toast ("Loop <id> failed:
+/// Request was aborted"), leaves the composer usable, and restores the
+/// terminal on exit. The loop remains scheduled (only the iteration is
+/// cancelled).
+///
+/// Plausible bug: the abort only cancelled the session, not the loop iteration
+/// token, so the scheduler misclassified the expected user Esc as a provider
+/// failure and raised the red error toast.
+#[test]
+fn pty_loop_iteration_esc_aborts_without_failure_toast() {
+    // A long faux response keeps the loop iteration streaming so Esc lands
+    // mid-flight instead of racing an instantaneous completion.
+    let long_response = "loopescstream-".repeat(1500);
+    let mut probe = PtyProbe::spawn(
+        &["--model", "faux/faux-1"],
+        &[("PI_FAUX_RESPONSE", long_response.as_str())],
+    );
+    assert!(
+        await_entered(&probe),
+        "TUI must acquire the inline viewport: {}",
+        probe.snapshot()
+    );
+    assert!(
+        !probe.snapshot().contains(ENTER_ALT),
+        "loop path must stay on the normal screen"
+    );
+
+    // Schedule a loop that fires immediately and streams the long faux reply.
+    probe.send(b"/loop 30m check status\r");
+    assert!(
+        probe.wait_for_count("loopescstream", 1, Duration::from_secs(20)),
+        "loop iteration must start streaming the faux reply: {}",
+        probe.snapshot()
+    );
+
+    probe.send(&[ESC]);
+    // The abort must clear the active `working` UI and restore the idle
+    // composer (status settles to `Ready`, which omits the `⟲` activity
+    // segment). Assert this directly — not via the transient "Aborting"
+    // status text, which is only rendered while NOT streaming and therefore
+    // never appears for an in-flight cancellation.
+    assert!(
+        wait_for_idle_composer(&probe, Duration::from_secs(10)),
+        "abort must clear the working UI and restore the idle composer: {}",
+        probe.snapshot()
+    );
+    // No failure toast for the expected user abort.
+    let after = probe.snapshot();
+    assert!(
+        !after.contains("failed: Request was aborted"),
+        "user Esc must not raise a Loop failed toast: {after}"
+    );
+
+    // Composer remains usable: pasted input renders after the abort. Bracketed
+    // paste → one Event::Paste → one contiguous render; per-key typing
+    // interleaves cursor/separator cells between chars in the raw stream.
+    probe.bracketed_paste("composerstillusable");
+    assert!(
+        probe.wait_for_count("composerstillusable", 1, Duration::from_secs(5)),
+        "composer must remain usable after loop iteration abort: {}",
+        probe.snapshot()
+    );
+    // Ctrl+D is the direct quit only with an empty editor; clear the pasted
+    probe.send(&[CTRL_C]);
+    thread::sleep(Duration::from_millis(150));
+
+    // Clean exit restores the terminal.
+    probe.send(&[CTRL_D]);
+    assert!(
+        probe.wait_for_count(SHOW_CURSOR, 1, Duration::from_secs(15)),
+        "clean exit after loop Esc must restore the cursor: {}",
+        probe.snapshot()
+    );
+    let status = probe
+        .wait_exit(Duration::from_secs(15))
+        .expect("rpi must exit after Ctrl+D");
+    assert!(
+        status.success(),
+        "loop Esc exit must report success: {status:?}"
+    );
+    assert!(
+        probe.snapshot().contains(CLEAR_AFTER_CURSOR),
+        "loop Esc exit must clear only the live inline viewport"
     );
 }

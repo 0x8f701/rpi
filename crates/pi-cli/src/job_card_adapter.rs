@@ -479,6 +479,7 @@ mod tests {
         AgentSnapshot {
             id: id.to_owned(),
             display_name: format!("task: work for {id}"),
+            agent: "task".to_owned(),
             parent_id: Some("Main".to_owned()),
             status,
             created_at: 1_000,

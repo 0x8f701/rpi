@@ -106,17 +106,66 @@ pub struct ThemeExport {
     pub info_bg: Option<Color>,
 }
 
-/// Built-in dark palette matching OMP's observed titanium interaction theme.
+/// Built-in dark palette resolved from the installed OMP v17.2.6 default
+/// `titanium` theme (`src/modes/theme/defaults/titanium.json`).
 pub const DARK: Theme = Theme {
-    accent: rgb(0x00, 0xb4, 0xff), border: rgb(0x2a, 0x30, 0x38), border_accent: rgb(0x00, 0xb4, 0xff), border_muted: rgb(0x1f, 0x25, 0x2d),
-    success: rgb(0x00, 0xff, 0x88), error: rgb(0xff, 0x47, 0x57), warning: rgb(0xff, 0xb3, 0x47), muted: rgb(0x9c, 0xa3, 0xb0), dim: rgb(0x6b, 0x72, 0x80), text: Color::Reset,
-    thinking_text: rgb(0x9c, 0xa3, 0xb0), user_message_text: Color::Reset, custom_message_text: Color::Reset, custom_message_label: rgb(0xd4, 0xc0, 0x90), tool_title: Color::Reset, tool_output: rgb(0x9c, 0xa3, 0xb0),
-    md_heading: rgb(0x00, 0xb4, 0xff), md_link: rgb(0x00, 0xff, 0x88), md_link_url: rgb(0x6b, 0x72, 0x80), md_code: rgb(0x00, 0xff, 0x88), md_code_block: rgb(0xe8, 0xec, 0xf4), md_code_block_border: rgb(0x2a, 0x30, 0x38), md_quote: rgb(0x9c, 0xa3, 0xb0), md_quote_border: rgb(0x2a, 0x30, 0x38), md_hr: rgb(0x2a, 0x30, 0x38), md_list_bullet: rgb(0x9c, 0xa3, 0xb0),
-    tool_diff_added: rgb(0x00, 0xff, 0x88), tool_diff_removed: rgb(0xff, 0x47, 0x57), tool_diff_context: rgb(0x9c, 0xa3, 0xb0),
-    syntax_comment: rgb(0x6b, 0x72, 0x80), syntax_keyword: rgb(0x00, 0xb4, 0xff), syntax_function: rgb(0x00, 0xff, 0x88), syntax_variable: rgb(0xe8, 0xec, 0xf4), syntax_string: rgb(0xd4, 0xc0, 0x90), syntax_number: rgb(0xff, 0xb3, 0x47), syntax_type: rgb(0xd4, 0xc0, 0x90), syntax_operator: rgb(0x9c, 0xa3, 0xb0), syntax_punctuation: rgb(0x6b, 0x72, 0x80),
-    thinking_off: rgb(0x4a, 0x50, 0x58), thinking_minimal: rgb(0x5a, 0x60, 0x68), thinking_low: rgb(0x6a, 0x70, 0x78), thinking_medium: rgb(0x9c, 0xa3, 0xb0), thinking_high: rgb(0x00, 0xb4, 0xff), thinking_xhigh: rgb(0xd4, 0xc0, 0x90), thinking_max: rgb(0xd4, 0xc0, 0x90), bash_mode: rgb(0x00, 0xff, 0x88),
-    selected_bg: rgb(0x00, 0x82, 0xb3), user_message_bg: rgb(0x0f, 0x12, 0x16), custom_message_bg: rgb(0x2a, 0x30, 0x38), tool_pending_bg: rgb(0x0f, 0x12, 0x16), tool_success_bg: rgb(0x0f, 0x12, 0x16), tool_error_bg: rgb(0x1a, 0x0f, 0x10),
-    export: ThemeExport { page_bg: Some(rgb(0x15, 0x18, 0x20)), card_bg: Some(rgb(0x0f, 0x12, 0x16)), info_bg: Some(rgb(0x2a, 0x30, 0x38)) },
+    accent: rgb(0x00, 0xb4, 0xff),
+    border: rgb(0x2a, 0x30, 0x38),
+    border_accent: rgb(0x00, 0xb4, 0xff),
+    border_muted: rgb(0x1f, 0x25, 0x2d),
+    success: rgb(0x00, 0xff, 0x88),
+    error: rgb(0xff, 0x47, 0x57),
+    warning: rgb(0xff, 0xb3, 0x47),
+    muted: rgb(0x9c, 0xa3, 0xb0),
+    dim: rgb(0x6b, 0x72, 0x80),
+    text: Color::Reset,
+    thinking_text: rgb(0x9c, 0xa3, 0xb0),
+    user_message_text: Color::Reset,
+    custom_message_text: Color::Reset,
+    custom_message_label: rgb(0xd4, 0xc0, 0x90),
+    tool_title: Color::Reset,
+    tool_output: rgb(0x9c, 0xa3, 0xb0),
+    md_heading: rgb(0x00, 0xb4, 0xff),
+    md_link: rgb(0x00, 0xb4, 0xff),
+    md_link_url: rgb(0x00, 0x82, 0xb3),
+    md_code: rgb(0x00, 0xff, 0x88),
+    md_code_block: rgb(0x9c, 0xa3, 0xb0),
+    md_code_block_border: rgb(0x2a, 0x30, 0x38),
+    md_quote: rgb(0x9c, 0xa3, 0xb0),
+    md_quote_border: rgb(0x2a, 0x30, 0x38),
+    md_hr: rgb(0x2a, 0x30, 0x38),
+    md_list_bullet: rgb(0x00, 0xb4, 0xff),
+    tool_diff_added: rgb(0x00, 0xff, 0x88),
+    tool_diff_removed: rgb(0xff, 0x47, 0x57),
+    tool_diff_context: rgb(0x9c, 0xa3, 0xb0),
+    syntax_comment: rgb(0x6b, 0x72, 0x80),
+    syntax_keyword: rgb(0x00, 0xb4, 0xff),
+    syntax_function: rgb(0x00, 0xff, 0x88),
+    syntax_variable: rgb(0xe8, 0xec, 0xf4),
+    syntax_string: rgb(0xd4, 0xc0, 0x90),
+    syntax_number: rgb(0xff, 0xb3, 0x47),
+    syntax_type: rgb(0x00, 0xb4, 0xff),
+    syntax_operator: rgb(0x00, 0xb4, 0xff),
+    syntax_punctuation: rgb(0x9c, 0xa3, 0xb0),
+    thinking_off: rgb(0x4a, 0x50, 0x58),
+    thinking_minimal: rgb(0x5a, 0x60, 0x68),
+    thinking_low: rgb(0x6a, 0x70, 0x78),
+    thinking_medium: rgb(0x9c, 0xa3, 0xb0),
+    thinking_high: rgb(0x00, 0xb4, 0xff),
+    thinking_xhigh: rgb(0xd4, 0xc0, 0x90),
+    thinking_max: rgb(0xd4, 0xc0, 0x90),
+    bash_mode: rgb(0x00, 0xff, 0x88),
+    selected_bg: rgb(0x00, 0x82, 0xb3),
+    user_message_bg: rgb(0x0f, 0x12, 0x16),
+    custom_message_bg: rgb(0x2a, 0x30, 0x38),
+    tool_pending_bg: rgb(0x0f, 0x12, 0x16),
+    tool_success_bg: rgb(0x0f, 0x12, 0x16),
+    tool_error_bg: rgb(0x1a, 0x0f, 0x10),
+    export: ThemeExport {
+        page_bg: Some(rgb(0x15, 0x18, 0x20)),
+        card_bg: Some(rgb(0x0f, 0x12, 0x16)),
+        info_bg: Some(rgb(0x2a, 0x30, 0x38)),
+    },
 };
 
 /// Built-in light palette, faithful to the installed Oh My Pi 17.1.8 `light`
@@ -924,38 +973,94 @@ mod tests {
     }
 
     #[test]
-    fn dark_palette_matches_observed_omp_titanium_values() {
-        assert_eq!(DARK.accent, Color::Rgb(0x00, 0xb4, 0xff));
-        assert_eq!(DARK.border, Color::Rgb(0x2a, 0x30, 0x38));
-        assert_eq!(DARK.border_accent, Color::Rgb(0x00, 0xb4, 0xff));
-        assert_eq!(DARK.muted, Color::Rgb(0x9c, 0xa3, 0xb0));
-        assert_eq!(DARK.syntax_variable, Color::Rgb(0xe8, 0xec, 0xf4));
-        assert_eq!(DARK.user_message_bg, Color::Rgb(0x0f, 0x12, 0x16));
-        assert_eq!(DARK.user_message_text, Color::Reset);
-        assert_eq!(DARK.custom_message_text, Color::Reset);
-        assert_eq!(DARK.tool_title, Color::Reset);
-        assert_eq!(DARK.custom_message_label, Color::Rgb(0xd4, 0xc0, 0x90));
-        assert_eq!(DARK.custom_message_bg, Color::Rgb(0x2a, 0x30, 0x38));
-        assert_eq!(DARK.md_heading, Color::Rgb(0x00, 0xb4, 0xff));
-        assert_eq!(DARK.md_link, Color::Rgb(0x00, 0xff, 0x88));
-        assert_eq!(DARK.md_link_url, Color::Rgb(0x6b, 0x72, 0x80));
-        assert_eq!(DARK.md_code, Color::Rgb(0x00, 0xff, 0x88));
-        assert_eq!(DARK.md_list_bullet, Color::Rgb(0x9c, 0xa3, 0xb0));
-        assert_eq!(DARK.tool_diff_added, Color::Rgb(0x00, 0xff, 0x88));
-        assert_eq!(DARK.tool_diff_removed, Color::Rgb(0xff, 0x47, 0x57));
-        assert_eq!(DARK.syntax_comment, Color::Rgb(0x6b, 0x72, 0x80));
-        assert_eq!(DARK.syntax_keyword, Color::Rgb(0x00, 0xb4, 0xff));
-        assert_eq!(DARK.syntax_function, Color::Rgb(0x00, 0xff, 0x88));
-        assert_eq!(DARK.syntax_type, Color::Rgb(0xd4, 0xc0, 0x90));
-        assert_eq!(DARK.syntax_operator, Color::Rgb(0x9c, 0xa3, 0xb0));
-        assert_eq!(DARK.thinking_off, Color::Rgb(0x4a, 0x50, 0x58));
-        assert_eq!(DARK.thinking_xhigh, Color::Rgb(0xd4, 0xc0, 0x90));
-        assert_eq!(DARK.thinking_max, DARK.thinking_xhigh);
-        assert_eq!(DARK.bash_mode, Color::Rgb(0x00, 0xff, 0x88));
+    fn dark_palette_matches_installed_omp_titanium_resolved_values() {
+        // Source: installed OMP v17.2.6 default titanium theme.
+        let expected = Theme {
+            accent: Color::Rgb(0x00, 0xb4, 0xff),
+            border: Color::Rgb(0x2a, 0x30, 0x38),
+            border_accent: Color::Rgb(0x00, 0xb4, 0xff),
+            border_muted: Color::Rgb(0x1f, 0x25, 0x2d),
+            success: Color::Rgb(0x00, 0xff, 0x88),
+            error: Color::Rgb(0xff, 0x47, 0x57),
+            warning: Color::Rgb(0xff, 0xb3, 0x47),
+            muted: Color::Rgb(0x9c, 0xa3, 0xb0),
+            dim: Color::Rgb(0x6b, 0x72, 0x80),
+            text: Color::Reset,
+            thinking_text: Color::Rgb(0x9c, 0xa3, 0xb0),
+            user_message_text: Color::Reset,
+            custom_message_text: Color::Reset,
+            custom_message_label: Color::Rgb(0xd4, 0xc0, 0x90),
+            tool_title: Color::Reset,
+            tool_output: Color::Rgb(0x9c, 0xa3, 0xb0),
+            md_heading: Color::Rgb(0x00, 0xb4, 0xff),
+            md_link: Color::Rgb(0x00, 0xb4, 0xff),
+            md_link_url: Color::Rgb(0x00, 0x82, 0xb3),
+            md_code: Color::Rgb(0x00, 0xff, 0x88),
+            md_code_block: Color::Rgb(0x9c, 0xa3, 0xb0),
+            md_code_block_border: Color::Rgb(0x2a, 0x30, 0x38),
+            md_quote: Color::Rgb(0x9c, 0xa3, 0xb0),
+            md_quote_border: Color::Rgb(0x2a, 0x30, 0x38),
+            md_hr: Color::Rgb(0x2a, 0x30, 0x38),
+            md_list_bullet: Color::Rgb(0x00, 0xb4, 0xff),
+            tool_diff_added: Color::Rgb(0x00, 0xff, 0x88),
+            tool_diff_removed: Color::Rgb(0xff, 0x47, 0x57),
+            tool_diff_context: Color::Rgb(0x9c, 0xa3, 0xb0),
+            syntax_comment: Color::Rgb(0x6b, 0x72, 0x80),
+            syntax_keyword: Color::Rgb(0x00, 0xb4, 0xff),
+            syntax_function: Color::Rgb(0x00, 0xff, 0x88),
+            syntax_variable: Color::Rgb(0xe8, 0xec, 0xf4),
+            syntax_string: Color::Rgb(0xd4, 0xc0, 0x90),
+            syntax_number: Color::Rgb(0xff, 0xb3, 0x47),
+            syntax_type: Color::Rgb(0x00, 0xb4, 0xff),
+            syntax_operator: Color::Rgb(0x00, 0xb4, 0xff),
+            syntax_punctuation: Color::Rgb(0x9c, 0xa3, 0xb0),
+            thinking_off: Color::Rgb(0x4a, 0x50, 0x58),
+            thinking_minimal: Color::Rgb(0x5a, 0x60, 0x68),
+            thinking_low: Color::Rgb(0x6a, 0x70, 0x78),
+            thinking_medium: Color::Rgb(0x9c, 0xa3, 0xb0),
+            thinking_high: Color::Rgb(0x00, 0xb4, 0xff),
+            thinking_xhigh: Color::Rgb(0xd4, 0xc0, 0x90),
+            thinking_max: Color::Rgb(0xd4, 0xc0, 0x90),
+            bash_mode: Color::Rgb(0x00, 0xff, 0x88),
+            selected_bg: Color::Rgb(0x00, 0x82, 0xb3),
+            user_message_bg: Color::Rgb(0x0f, 0x12, 0x16),
+            custom_message_bg: Color::Rgb(0x2a, 0x30, 0x38),
+            tool_pending_bg: Color::Rgb(0x0f, 0x12, 0x16),
+            tool_success_bg: Color::Rgb(0x0f, 0x12, 0x16),
+            tool_error_bg: Color::Rgb(0x1a, 0x0f, 0x10),
+            export: ThemeExport {
+                page_bg: Some(Color::Rgb(0x15, 0x18, 0x20)),
+                card_bg: Some(Color::Rgb(0x0f, 0x12, 0x16)),
+                info_bg: Some(Color::Rgb(0x2a, 0x30, 0x38)),
+            },
+        };
+
+        assert_eq!(DARK, expected);
+    }
+
+    #[test]
+    fn dark_palette_preserves_omp_semantic_distinctions() {
+        assert_eq!(DARK.tool_pending_bg, DARK.tool_success_bg);
+        assert_ne!(DARK.tool_pending_bg, DARK.tool_error_bg);
         assert_eq!(DARK.selected_bg, Color::Rgb(0x00, 0x82, 0xb3));
-        assert_eq!(DARK.tool_pending_bg, Color::Rgb(0x0f, 0x12, 0x16));
-        assert_eq!(DARK.tool_success_bg, Color::Rgb(0x0f, 0x12, 0x16));
-        assert_eq!(DARK.tool_error_bg, Color::Rgb(0x1a, 0x0f, 0x10));
+        assert_eq!(DARK.user_message_bg, Color::Rgb(0x0f, 0x12, 0x16));
+
+        assert_eq!(DARK.syntax_comment, Color::Rgb(0x6b, 0x72, 0x80));
+        assert_eq!(DARK.syntax_keyword, DARK.accent);
+        assert_eq!(DARK.syntax_function, DARK.success);
+        assert_eq!(DARK.syntax_variable, Color::Rgb(0xe8, 0xec, 0xf4));
+        assert_eq!(DARK.syntax_string, Color::Rgb(0xd4, 0xc0, 0x90));
+        assert_eq!(DARK.syntax_number, DARK.warning);
+        assert_eq!(DARK.syntax_type, DARK.accent);
+        assert_eq!(DARK.syntax_operator, DARK.accent);
+        assert_eq!(DARK.syntax_punctuation, DARK.muted);
+        assert_eq!(DARK.thinking_off, Color::Rgb(0x4a, 0x50, 0x58));
+        assert_eq!(DARK.thinking_minimal, Color::Rgb(0x5a, 0x60, 0x68));
+        assert_eq!(DARK.thinking_low, Color::Rgb(0x6a, 0x70, 0x78));
+        assert_eq!(DARK.thinking_medium, DARK.muted);
+        assert_eq!(DARK.thinking_high, DARK.accent);
+        assert_eq!(DARK.thinking_xhigh, DARK.custom_message_label);
+        assert_eq!(DARK.thinking_max, DARK.thinking_xhigh);
     }
 
     #[test]
@@ -1086,5 +1191,19 @@ mod tests {
             error.contains("unknown field") && error.contains("notAField"),
             "expected unknown top-level rejection, got: {error}"
         );
+    }
+
+    #[test]
+    fn dark_builtin_matches_omp_titanium_text_and_surface_roles() {
+        // OMP's default titanium theme deliberately leaves primary text roles
+        // empty so they inherit the terminal foreground.
+        assert_eq!(DARK.text, Color::Reset);
+        assert_eq!(DARK.user_message_text, Color::Reset);
+        assert_eq!(DARK.custom_message_text, Color::Reset);
+        assert_eq!(DARK.tool_title, Color::Reset);
+        assert_eq!(DARK.error, Color::Rgb(0xff, 0x47, 0x57));
+        assert_eq!(DARK.warning, Color::Rgb(0xff, 0xb3, 0x47));
+        assert_eq!(DARK.selected_bg, Color::Rgb(0x00, 0x82, 0xb3));
+        assert_eq!(DARK.md_code_block_border, Color::Rgb(0x2a, 0x30, 0x38));
     }
 }

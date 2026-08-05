@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use pi_agent::{AgentTool, AgentToolResult, ToolExecutionMode};
+use pi_agent::{AgentTool, AgentToolResult, ToolCapability, ToolExecutionMode};
 use pi_ai::Schema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{AgentStatus, DeliveryOutcome, JobSnapshot, JobStatus, OrchestrationRuntime, TaskItem};
+use super::{
+    AgentSnapshot, AgentStatus, DeliveryOutcome, JobSnapshot, JobStatus, OrchestrationRuntime,
+    TaskItem,
+};
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TASK_BATCH: usize = 64;
@@ -56,6 +59,7 @@ impl OrchestrationRuntime {
                 }
             },
         )
+        .with_capability(ToolCapability::Exec)
         .with_execution_mode(ToolExecutionMode::Sequential)
         .with_prepare_arguments(fill_task_nulls)
     }
@@ -77,6 +81,7 @@ impl OrchestrationRuntime {
                 }
             },
         )
+        .with_capability(ToolCapability::Read)
         .with_execution_mode(ToolExecutionMode::Sequential)
     }
 }
@@ -298,7 +303,7 @@ async fn execute_hub(
             Ok(result(text, json!({ "op": "wait", "message": message })))
         }
         "inbox" => {
-            let messages = runtime.inbox(&caller_id, parameters.peek);
+            let messages = runtime.inbox_result(&caller_id, parameters.peek)?;
             let text = if messages.is_empty() {
                 "Inbox empty.".to_owned()
             } else {
@@ -312,30 +317,7 @@ async fn execute_hub(
         }
         "list" => {
             let peers = runtime.list(&caller_id);
-            let text = if peers.is_empty() {
-                "No other agents.".to_owned()
-            } else {
-                peers
-                    .iter()
-                    .map(|peer| {
-                        let status = match peer.status {
-                            AgentStatus::Queued => "queued",
-                            AgentStatus::Running => "running",
-                            AgentStatus::Idle => "idle",
-                            AgentStatus::Parked => "parked",
-                            AgentStatus::Aborted => "aborted",
-                        };
-                        format!(
-                            "- {} [{}; unread {}; parent {}]",
-                            peer.id,
-                            status,
-                            peer.unread,
-                            peer.parent_id.as_deref().unwrap_or("none")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let text = agents_text(&peers);
             Ok(result(text, json!({ "op": "list", "peers": peers })))
         }
         "jobs" => {
@@ -350,7 +332,7 @@ async fn execute_hub(
                 .ids
                 .filter(|ids| !ids.is_empty())
                 .ok_or_else(|| anyhow!("ids is required for cancel"))?;
-            let cancelled = runtime.cancel_jobs(&ids);
+            let cancelled = runtime.cancel_jobs_result(&ids)?;
             Ok(result(
                 if cancelled.is_empty() {
                     "No running child tasks matched.".to_owned()
@@ -362,6 +344,34 @@ async fn execute_hub(
         }
         operation => bail!("unsupported hub operation {operation:?}"),
     }
+}
+
+fn agents_text(peers: &[AgentSnapshot]) -> String {
+    if peers.is_empty() {
+        return "No other agents.".to_owned();
+    }
+    peers
+        .iter()
+        .map(|peer| {
+            let status = match peer.status {
+                AgentStatus::Queued => "queued",
+                AgentStatus::Running => "running",
+                AgentStatus::Idle => "idle",
+                AgentStatus::Parked => "parked",
+                AgentStatus::Aborted => "aborted",
+            };
+            format!(
+                "- {} ({}; agent {}) [{}; unread {}; parent {}]",
+                peer.id,
+                peer.display_name,
+                peer.agent,
+                status,
+                peer.unread,
+                peer.parent_id.as_deref().unwrap_or("none")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn jobs_text(jobs: &[JobSnapshot], empty: &str) -> String {
@@ -597,8 +607,49 @@ mod advertisement_tests {
         assert!(task.description.contains("task —"));
         assert!(!task.description.contains("reviewer —"), "{}", task.description);
         assert_eq!(runtime.select_agent("anything", None), "task");
-
     }
+
+    #[test]
+    fn orchestration_tools_carry_explicit_capabilities() {
+        let dir = tempfile::tempdir().expect("artifacts");
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![def("task")]), dir.path()),
+            Arc::new(|_| Box::pin(async { panic!("unused") })),
+        )
+        .expect("runtime");
+        let tools = runtime.agent_tools("Main", 0);
+        assert_eq!(
+            tools.iter().find(|tool| tool.name == "task").unwrap().capability,
+            ToolCapability::Exec
+        );
+        assert_eq!(
+            tools.iter().find(|tool| tool.name == "hub").unwrap().capability,
+            ToolCapability::Read
+        );
+    }
+
+    #[test]
+    fn human_agent_list_distinguishes_id_display_name_and_type() {
+        let peers = vec![AgentSnapshot {
+            id: "review-job".to_owned(),
+            display_name: "Code Review".to_owned(),
+            agent: "reviewer".to_owned(),
+            parent_id: Some("Main".to_owned()),
+            status: AgentStatus::Running,
+            created_at: 1,
+            last_activity: 2,
+            unread: 3,
+            artifact_ref: None,
+            history_ref: None,
+        }];
+
+        assert_eq!(
+            agents_text(&peers),
+            "- review-job (Code Review; agent reviewer) [running; unread 3; parent Main]"
+        );
+        assert_eq!(agents_text(&[]), "No other agents.");
+    }
+
     #[test]
     fn task_schema_is_valid_for_openai_strict_tools() {
         let schema = serde_json::to_value(task_schema()).expect("task schema");

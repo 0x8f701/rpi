@@ -7,7 +7,10 @@ use std::time::Duration;
 use pi_agent::{AbortController, AgentTool, AgentToolResult, ToolCallContext, ToolUpdateFn};
 use pi_ai::{ContentBlock, Model};
 use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
-use pi_coding::{Application, ApplicationEvent, ProcessSpawnSpec, ProcessState, Session, SessionOptions};
+use pi_coding::{
+    Application, ApplicationEvent, ProcessKey, ProcessSpawnSpec, ProcessState, Session,
+    SessionOptions,
+};
 use serde_json::{Value, json};
 
 fn session(cwd: &Path) -> (Session, pi_ai::providers::FauxProviderRegistration) {
@@ -224,10 +227,117 @@ async fn new_session_stops_owned_process() {
         if let Ok(text) = std::fs::read_to_string(&pid_file) { break text.trim().parse::<i32>().expect("pid"); }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    application.new_session().await.expect("new session");
+    assert!(!application.new_session().await.expect("new session").cancelled);
     for _ in 0..100 {
         if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() { registration.unregister(); return; }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("process survived logical session change");
+}
+
+#[tokio::test]
+async fn direct_pty_input_stays_out_of_application_events_and_session_history() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (session, _registration) = session(directory.path());
+    let application = Application::new(session.clone()).await;
+    let mut events = application.subscribe();
+    let mut pty = spec(directory.path(), "read line; printf '<%s>' \"$line\"");
+    pty.tty = true;
+    let process = application.process_spawn(pty).await.expect("spawn PTY");
+
+    application
+        .process_write(&process.id, b"secret-input".to_vec(), false)
+        .await
+        .expect("write printable bytes");
+    application
+        .process_send_keys(&process.id, &[ProcessKey::Enter])
+        .await
+        .expect("write Enter");
+    let exited = application
+        .process_wait(&process.id, Some(Duration::from_secs(3)))
+        .await
+        .expect("wait PTY");
+    assert_eq!(exited.exit_code, Some(0));
+
+    while let Ok(event) = events.try_recv() {
+        let serialized = serde_json::to_string(&event).expect("serialize event");
+        assert!(!serialized.contains("secret-input"), "{serialized}");
+    }
+    assert!(
+        session.history().iter().all(|message| !format!("{message:?}").contains("secret-input")),
+        "direct PTY input must not enter session history",
+    );
+}
+
+#[tokio::test]
+async fn same_cwd_switch_session_stops_owned_process_and_drops_old_output() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let sessions = tempfile::tempdir().expect("session dir");
+    let (session, registration) = session(cwd.path());
+    session.set_session_dir(sessions.path().to_path_buf());
+    let application = Application::new(session).await;
+
+    let first = pi_coding::start_session_in(
+        cwd.path(),
+        None,
+        Some("off"),
+        Some(sessions.path()),
+        Some("same-cwd-first"),
+        None,
+    )
+    .expect("first recorder");
+    first.persist_now().expect("persist first");
+    let first_path = first.path();
+    first.close().expect("close first");
+    application
+        .switch_session(&first_path)
+        .await
+        .expect("attach first");
+
+    let pid_file = cwd.path().join("same-cwd-switch.pid");
+    let process = application
+        .process_spawn(spec(cwd.path(), &format!("echo $$ > '{}'; exec sleep 30", pid_file.display())))
+        .await
+        .expect("spawn");
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            break text.trim().parse::<i32>().expect("pid");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    let second = pi_coding::start_session_in(
+        cwd.path(),
+        None,
+        Some("off"),
+        Some(sessions.path()),
+        Some("same-cwd-second"),
+        None,
+    )
+    .expect("second recorder");
+    second.persist_now().expect("persist second");
+    let second_path = second.path();
+    second.close().expect("close second");
+
+    let outcome = application
+        .switch_session(&second_path)
+        .await
+        .expect("same cwd switch");
+    assert!(!outcome.cancelled);
+    assert!(
+        application
+            .process_list()
+            .iter()
+            .all(|info| info.state == ProcessState::Exited),
+        "same-cwd switch must stop the prior logical session's owned processes: {:?}",
+        application.process_list()
+    );
+    for _ in 0..100 {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            registration.unregister();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("process survived same-cwd logical session switch");
 }

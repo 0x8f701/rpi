@@ -12,8 +12,8 @@ mod lineage;
 #[cfg(test)]
 mod tests;
 
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
@@ -39,12 +39,49 @@ use self::discovery::{
 };
 use self::helpers::{
     canonical_fingerprint, content_fingerprint, display_name, expand_tilde, format_epoch,
-    fuzzy_match, make_absolute, metadata_epoch, normalize_cwd, normalize_summary, row_matches_query,
-    sort_rows_newest, truncate_summary,
+    compare_rows_newest, make_absolute, metadata_epoch, normalize_cwd, normalize_summary,
+    row_matches_query, sort_rows_newest, truncate_summary,
 };
 use self::lineage::{read_native_header_lite, read_native_lineage, read_native_list_info};
 
 pub(super) const LINEAGE_CUSTOM_TYPE: &str = "import_lineage";
+
+/// Maximum WalkDir entries visited per source, including roots, directories, and errors.
+pub const SESSION_CATALOG_WALK_ENTRY_LIMIT: usize = 4_096;
+/// Maximum regular-file candidates retained from any one session source.
+pub const SESSION_CATALOG_CANDIDATE_LIMIT: usize = 512;
+/// Maximum rows in the shared catalog universe returned by scan/list/search.
+pub const SESSION_CATALOG_ROW_LIMIT: usize = 512;
+
+#[derive(Debug)]
+struct DiscoveredCandidate {
+    modified_epoch: f64,
+    path: PathBuf,
+}
+
+impl PartialEq for DiscoveredCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.modified_epoch.total_cmp(&other.modified_epoch) == Ordering::Equal
+            && self.path == other.path
+    }
+}
+
+impl Eq for DiscoveredCandidate {}
+
+impl PartialOrd for DiscoveredCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DiscoveredCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.modified_epoch
+            .total_cmp(&other.modified_epoch)
+            // For equal mtimes, the lexically smaller stable path ranks newer.
+            .then_with(|| other.path.cmp(&self.path))
+    }
+}
 
 /// Machine identity for a session root / list row source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -328,6 +365,10 @@ pub struct SessionCatalog {
     /// Base used for foreign roots that live under the user home layout.
     sessions_home: PathBuf,
     native_agent_dir: PathBuf,
+    /// Exact native session directory selected by CLI/env/settings. When set,
+    /// native files and imports live directly in this directory rather than the
+    /// default agent-dir `sessions/<encoded-cwd>` tree.
+    native_session_root: Option<PathBuf>,
     codex_home: PathBuf,
     claude_config_dir: PathBuf,
 }
@@ -347,6 +388,7 @@ impl SessionCatalog {
         let sessions_home = make_absolute(expand_tilde(sessions_home.into(), &user_home));
         Self {
             native_agent_dir: sessions_home.join(".pi/agent"),
+            native_session_root: None,
             codex_home: sessions_home.join(".codex"),
             claude_config_dir: sessions_home.join(".claude"),
             sessions_home,
@@ -408,6 +450,14 @@ impl SessionCatalog {
     #[must_use]
     pub fn with_native_agent_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.native_agent_dir = make_absolute(path.into());
+        self.native_session_root = None;
+        self
+    }
+
+    /// Override the native catalog with an exact, already-resolved session root.
+    #[must_use]
+    pub fn with_native_session_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.native_session_root = Some(make_absolute(path.into()));
         self
     }
 
@@ -441,7 +491,12 @@ impl SessionCatalog {
     #[must_use]
     pub fn root_for(&self, kind: SessionSourceKind) -> SessionSourceRoot {
         let (path, pattern) = match kind {
-            SessionSourceKind::NativePi => (self.native_agent_dir.join("sessions"), "*.jsonl"),
+            SessionSourceKind::NativePi => (
+                self.native_session_root
+                    .clone()
+                    .unwrap_or_else(|| self.native_agent_dir.join("sessions")),
+                "*.jsonl",
+            ),
             SessionSourceKind::Omp => (self.sessions_home.join(".omp/agent/sessions"), "*.jsonl"),
             SessionSourceKind::Codex => (self.codex_home.join("sessions"), "rollout-*.jsonl"),
             SessionSourceKind::Claude => (self.claude_config_dir.join("projects"), "*.jsonl"),
@@ -459,15 +514,16 @@ impl SessionCatalog {
             .collect()
     }
 
-    /// Discover candidate session files for one source. Malformed paths are skipped.
+    /// Discover at most [`SESSION_CATALOG_CANDIDATE_LIMIT`] candidate files from
+    /// the source's bounded traversal window, retaining newest mtime then path.
     #[must_use]
     pub fn discover(&self, kind: SessionSourceKind) -> Vec<PathBuf> {
         let root = self.root_for(kind);
-        let mut paths = Vec::new();
+        let mut newest = BinaryHeap::with_capacity(SESSION_CATALOG_CANDIDATE_LIMIT);
         if !root.path.is_dir() {
-            return paths;
+            return Vec::new();
         }
-        for entry in WalkDir::new(&root.path).follow_links(false) {
+        for entry in self.walk_source_entries(kind) {
             let Ok(entry) = entry else {
                 continue;
             };
@@ -475,11 +531,30 @@ impl SessionCatalog {
                 continue;
             }
             let path = entry.path();
-            if !self.is_safe_session_path(kind, path) {
+            let Some(metadata) = self.safe_session_metadata(kind, path) else {
                 continue;
+            };
+            let candidate = DiscoveredCandidate {
+                modified_epoch: metadata_epoch(&metadata),
+                path: path.to_path_buf(),
+            };
+            if newest.len() < SESSION_CATALOG_CANDIDATE_LIMIT {
+                newest.push(Reverse(candidate));
+            } else if newest
+                .peek()
+                .is_some_and(|oldest| candidate > oldest.0)
+            {
+                newest.pop();
+                newest.push(Reverse(candidate));
             }
-            paths.push(path.to_path_buf());
         }
+        // Preserve the established discover API order for small stores. Within
+        // the hard traversal window, retained membership is independent of
+        // filesystem visitation order.
+        let mut paths = newest
+            .into_iter()
+            .map(|Reverse(candidate)| candidate.path)
+            .collect::<Vec<_>>();
         paths.sort();
         paths
     }
@@ -487,32 +562,56 @@ impl SessionCatalog {
     /// True when `path` is an acceptable regular session file under the source root.
     #[must_use]
     pub fn is_safe_session_path(&self, kind: SessionSourceKind, path: &Path) -> bool {
+        self.safe_session_metadata(kind, path).is_some()
+    }
+
+    fn safe_session_metadata(&self, kind: SessionSourceKind, path: &Path) -> Option<Metadata> {
         let root = self.root_for(kind).path;
-        if !matches_source_pattern(kind, path) {
-            return false;
-        }
-        if contains_component(path, &root, ".rsync-partial") {
-            return false;
-        }
-        if kind == SessionSourceKind::Codex && contains_component(path, &root, "archived_sessions")
+        if !matches_source_pattern(kind, path)
+            || contains_component(path, &root, ".rsync-partial")
+            || (kind == SessionSourceKind::Codex
+                && contains_component(path, &root, "archived_sessions"))
+            || !path_lexically_under_root(path, &root)
         {
-            return false;
+            return None;
         }
-        if !path_lexically_under_root(path, &root) {
-            return false;
-        }
-        let Ok(metadata) = fs::symlink_metadata(path) else {
-            return false;
-        };
+        let metadata = fs::symlink_metadata(path).ok()?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return false;
+            return None;
         }
-        match kind {
+        let valid_depth = match kind {
+            SessionSourceKind::NativePi if self.native_session_root.is_some() => {
+                path_under_depth(path, &root, 1, 1)
+            }
             SessionSourceKind::NativePi => is_native_tree_session(path, &root),
             SessionSourceKind::Grok => is_grok_summary_depth(path, &root),
-            SessionSourceKind::Omp => is_native_tree_session(path, &root) || path_under_depth(path, &root, 1, 8),
+            SessionSourceKind::Omp => {
+                is_native_tree_session(path, &root) || path_under_depth(path, &root, 1, 8)
+            }
             _ => true,
+        };
+        valid_depth.then_some(metadata)
+    }
+
+    fn walk_max_depth(&self, kind: SessionSourceKind) -> usize {
+        match kind {
+            SessionSourceKind::NativePi if self.native_session_root.is_some() => 1,
+            SessionSourceKind::NativePi | SessionSourceKind::Claude => 2,
+            SessionSourceKind::Omp => 8,
+            SessionSourceKind::Codex => 4,
+            SessionSourceKind::Grok => 3,
+            SessionSourceKind::Droid => 1,
         }
+    }
+    fn walk_source_entries(
+        &self,
+        kind: SessionSourceKind,
+    ) -> impl Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>> {
+        WalkDir::new(self.root_for(kind).path)
+            .follow_links(false)
+            .max_depth(self.walk_max_depth(kind))
+            .into_iter()
+            .take(SESSION_CATALOG_WALK_ENTRY_LIMIT)
     }
 
     /// Scan sources into newest-first rows. Parse failures are isolated per file.
@@ -520,17 +619,19 @@ impl SessionCatalog {
     pub fn scan(&self, sources: &[SessionSourceKind]) -> Vec<CatalogRow> {
         let selected = selected_sources(sources, true);
         let lineage_index = self.build_lineage_index();
-        let mut rows = Vec::new();
+        let mut source_rows = Vec::with_capacity(selected.len());
         for kind in selected {
+            let mut rows = Vec::with_capacity(SESSION_CATALOG_CANDIDATE_LIMIT);
             for path in self.discover(kind) {
                 match self.row_from_path(kind, &path, &lineage_index) {
                     Ok(Some(row)) => rows.push(row),
                     Ok(None) | Err(_) => continue,
                 }
             }
+            sort_rows_newest(&mut rows);
+            source_rows.push(rows);
         }
-        sort_rows_newest(&mut rows);
-        rows
+        merge_source_rows(source_rows)
     }
 
     /// Unified list used by future `/resume` pickers.
@@ -575,13 +676,16 @@ impl SessionCatalog {
                     .then_with(|| left.path.cmp(&right.path))
             }),
         }
+        rows.truncate(SESSION_CATALOG_ROW_LIMIT);
         rows
     }
 
     /// Keep newest row per source/cwd/summary (or source/id when summary empty).
     #[must_use]
     pub fn dedupe_rows(rows: &[CatalogRow]) -> Vec<CatalogRow> {
-        let mut best: HashMap<(SessionSourceKind, String, String), CatalogRow> = HashMap::new();
+        let mut best = Vec::<((SessionSourceKind, String, String), CatalogRow)>::with_capacity(
+            SESSION_CATALOG_ROW_LIMIT,
+        );
         for row in rows {
             let normalized_summary = normalize_summary(&row.summary);
             let cwd_empty = row.cwd.as_os_str().is_empty();
@@ -590,14 +694,27 @@ impl SessionCatalog {
             } else {
                 (row.kind, normalize_cwd(&row.cwd), normalized_summary)
             };
-            match best.get(&key) {
-                Some(existing) if existing.modified_epoch >= row.modified_epoch => {}
-                _ => {
-                    best.insert(key, row.clone());
+            if let Some((_, existing)) = best.iter_mut().find(|(existing, _)| *existing == key) {
+                if compare_rows_newest(row, existing).is_lt() {
+                    *existing = row.clone();
                 }
+                continue;
+            }
+            if best.len() < SESSION_CATALOG_ROW_LIMIT {
+                best.push((key, row.clone()));
+                continue;
+            }
+            let oldest = best
+                .iter()
+                .enumerate()
+                .max_by(|(_, (_, left)), (_, (_, right))| compare_rows_newest(left, right))
+                .map(|(index, _)| index)
+                .expect("non-empty bounded catalog");
+            if compare_rows_newest(row, &best[oldest].1).is_lt() {
+                best[oldest] = (key, row.clone());
             }
         }
-        let mut result = best.into_values().collect::<Vec<_>>();
+        let mut result = best.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
         sort_rows_newest(&mut result);
         result
     }
@@ -632,13 +749,14 @@ impl SessionCatalog {
             .to_str()
             .map(str::to_owned)
             .unwrap_or_else(|| input.to_string_lossy().into_owned());
-        let mut matches = Vec::new();
+        let mut matches = Vec::with_capacity(SESSION_CATALOG_ROW_LIMIT);
         for kind in SessionSourceKind::ALL {
-            matches.extend(
-                self.matching_paths(kind, &input_text)
-                    .into_iter()
-                    .map(|path| (kind, path)),
-            );
+            for path in self.matching_paths(kind, &input_text) {
+                if matches.len() == SESSION_CATALOG_ROW_LIMIT {
+                    break;
+                }
+                matches.push((kind, path));
+            }
         }
         match matches.as_slice() {
             [] => Err(CatalogError::SessionNotFound(input_text)),
@@ -766,7 +884,9 @@ impl SessionCatalog {
         } else {
             parsed.cwd.clone()
         };
-        let output_dir = if self.native_agent_dir.as_os_str().is_empty() {
+        let output_dir = if let Some(root) = &self.native_session_root {
+            root.clone()
+        } else if self.native_agent_dir.as_os_str().is_empty() {
             default_session_dir(&cwd)
         } else {
             // Honor hermetic native agent dir in tests / injected catalogs.
@@ -956,12 +1076,13 @@ impl SessionCatalog {
             rows = Self::dedupe_rows(&rows);
         } else {
             sort_rows_newest(&mut rows);
+            rows.truncate(SESSION_CATALOG_ROW_LIMIT);
         }
         rows
     }
 
     fn matching_paths(&self, kind: SessionSourceKind, input: &str) -> Vec<PathBuf> {
-        let mut matches = Vec::new();
+        let mut matches = Vec::with_capacity(SESSION_CATALOG_CANDIDATE_LIMIT);
         for path in self.discover(kind) {
             let file_stem = path.file_stem().and_then(OsStr::to_str).unwrap_or("");
             let stem_without_rollout = file_stem.strip_prefix("rollout-").unwrap_or(file_stem);
@@ -1157,6 +1278,43 @@ impl SessionCatalog {
             import_lineage: Some(lineage),
             search_text,
         }))
+    }
+}
+
+fn merge_source_rows(sources: Vec<Vec<CatalogRow>>) -> Vec<CatalogRow> {
+    let reserved_count = sources.iter().filter(|source| !source.is_empty()).count();
+    let remainder_limit = SESSION_CATALOG_ROW_LIMIT.saturating_sub(reserved_count);
+    let mut rows = Vec::with_capacity(SESSION_CATALOG_ROW_LIMIT);
+    let mut remainder = Vec::with_capacity(remainder_limit);
+    for source in sources {
+        let mut source = source.into_iter();
+        if let Some(row) = source.next() {
+            rows.push(row);
+        }
+        for row in source {
+            retain_newest_row(&mut remainder, row, remainder_limit);
+        }
+    }
+    rows.extend(remainder);
+    sort_rows_newest(&mut rows);
+    rows
+}
+
+fn retain_newest_row(rows: &mut Vec<CatalogRow>, row: CatalogRow, limit: usize) {
+    if rows.len() < limit {
+        rows.push(row);
+        return;
+    }
+    let Some(oldest) = rows
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| compare_rows_newest(left, right))
+        .map(|(index, _)| index)
+    else {
+        return;
+    };
+    if compare_rows_newest(&row, &rows[oldest]).is_lt() {
+        rows[oldest] = row;
     }
 }
 

@@ -7,6 +7,7 @@ export default function (pi: ExtensionApi): void {
     name: "bun_echo",
     label: "Bun Echo",
     description: "Echo text through the Bun extension host",
+    capability: "read",
     parameters: {
       type: "object",
       properties: { text: { type: "string" } },

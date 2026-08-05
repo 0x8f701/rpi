@@ -567,3 +567,101 @@ fn symlinked_source_component_is_rejected() {
         Err(WorktreeError::Symlink)
     ));
 }
+
+#[test]
+fn unborn_repository_create_fails_closed_without_partial_worktree() {
+    // `git init` with no HEAD commit (unborn). `discover` resolves the repo root
+    // and common git dir but `rev-parse --verify HEAD` fails, so `create` must
+    // fail closed with a typed command error and leave no managed worktree dir.
+    let sandbox = TempDir::new().expect("temporary sandbox");
+    let repo = sandbox.path().join("unborn");
+    let managed = sandbox.path().join("managed");
+    fs::create_dir_all(&repo).expect("unborn repo dir");
+    fixture_git(&repo, &["init"]);
+    fixture_git(&repo, &["config", "user.name", "Pi Test"]);
+    fixture_git(&repo, &["config", "user.email", "pi@example.test"]);
+    // Deliberately no commit: HEAD is unborn.
+    let manager = WorkflowWorktreeManager::new(&repo)
+        .with_catalog_path(sandbox.path().join("catalog.json"))
+        .with_timeout(TEST_TIMEOUT);
+    let options = CreateWorktreeOptions {
+        managed_root: managed.clone(),
+        base_commit: None,
+        timeout: Some(TEST_TIMEOUT),
+    };
+    assert!(
+        matches!(manager.create("unborn", options), Err(WorktreeError::CommandFailed { .. })),
+        "unborn repo must fail closed with a typed git command error"
+    );
+    // Fail-closed: no managed worktree directory was created.
+    assert!(
+        !managed.join(WORKTREE_ROOT_DIR_NAME).exists(),
+        "no partial worktree may be left after an unborn-repo failure"
+    );
+    assert!(
+        !sandbox.path().join("catalog.json").exists(),
+        "unborn failure must not persist a partial ownership catalog"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hostile_hooks_and_config_do_not_execute_during_worktree_creation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A cloned repo may carry a hostile `post-checkout` hook in `.git/hooks`
+    // (supply-chain attack) or redirect hooks via a `core.hooksPath` config to a
+    // malicious directory. Workflow worktree creation must never execute such
+    // hooks: they could write outside the managed worktree and escape isolation.
+    let fixture = Fixture::new("source", "managed");
+    let marker_default = fixture.sandbox.path().join("hostile-default.marker");
+    let marker_redirect = fixture.sandbox.path().join("hostile-redirect.marker");
+
+    // Hostile hook #1: default hooks dir.
+    fs::create_dir_all(fixture.repo.join(".git").join("hooks")).expect("hooks dir");
+    let default_hook = fixture.repo.join(".git").join("hooks").join("post-checkout");
+    fs::write(
+        &default_hook,
+        format!("#!/bin/sh\necho pwned > {}\n", marker_default.display()),
+    )
+    .expect("write default hook");
+    fs::set_permissions(&default_hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+
+    // Hostile hook #2: a redirected hooks dir selected via repo `core.hooksPath`.
+    let redirect_dir = fixture.sandbox.path().join("evil-hooks");
+    fs::create_dir_all(&redirect_dir).expect("redirect hooks dir");
+    let redirect_hook = redirect_dir.join("post-checkout");
+    fs::write(
+        &redirect_hook,
+        format!("#!/bin/sh\necho pwned > {}\n", marker_redirect.display()),
+    )
+    .expect("write redirect hook");
+    fs::set_permissions(&redirect_hook, fs::Permissions::from_mode(0o755)).expect("chmod redirect hook");
+    fixture_git(&fixture.repo, &["config", "core.hooksPath", redirect_dir.to_str().unwrap()]);
+
+    // Worktree creation must succeed without running either hostile hook.
+    let identity = fixture
+        .manager()
+        .create("hostile", fixture.create_options())
+        .expect("worktree created without executing hooks");
+    assert!(identity.worktree_path.exists());
+    assert!(
+        !marker_default.exists(),
+        "workflow worktree creation must not run the source repo post-checkout hook"
+    );
+    assert!(
+        !marker_redirect.exists(),
+        "workflow worktree creation must not honor a hostile core.hooksPath redirect"
+    );
+
+    // Integrate also runs git in the source repo; assert it too suppresses hooks
+    // by committing a clean change and integrating (merge) without triggering them.
+    commit_file(&identity.worktree_path, "feature.txt", "done\n", "feature");
+    let outcome = fixture
+        .manager()
+        .integrate("hostile", IntegrateOptions::default())
+        .expect("integrate");
+    assert!(matches!(outcome, IntegrateOutcome::Applied { .. }));
+    assert!(!marker_default.exists(), "integrate must not run post-merge/post-commit hooks");
+    assert!(!marker_redirect.exists(), "integrate must not honor hostile core.hooksPath");
+}

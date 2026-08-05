@@ -12,9 +12,10 @@ use tokio::io::AsyncBufReadExt;
 
 use pi_coding::{Application, ApplicationEvent, Session, TrustDecision};
 
-use crate::commands::{list_models, list_sessions, resolve_model_spec};
+use crate::commands::{list_models, list_sessions_in, resolve_model_spec};
 use crate::resume_catalog::{
-    ResumeCatalogRequest, ResumeSelectionRequest, load_resume_catalog, switch_resume_selection,
+    ResumeCatalogRequest, ResumeSelectionRequest, ResumeSelectionResult, effective_resume_sources,
+    load_resume_catalog, switch_resume_selection,
 };
 use crate::output::{error_line, parse_thinking_level, thinking_level_str};
 
@@ -86,17 +87,21 @@ fn print_header(session: &Session) {
     }
 }
 
-async fn resume_application(application: &Application, input: &str) -> Result<PathBuf> {
-    let catalog = pi_coding::SessionCatalog::from_env().map_err(anyhow::Error::new)?;
-    let cwd = application.session().cwd().to_path_buf();
-    let result = switch_resume_selection(
+async fn resume_application(application: &Application, input: &str) -> Result<ResumeSelectionResult> {
+    let session = application.session();
+    let catalog = pi_coding::SessionCatalog::from_env()
+        .map_err(anyhow::Error::new)?
+        .with_native_session_root(session.session_dir());
+    let cwd = session.cwd().to_path_buf();
+    let sources = effective_resume_sources(application);
+    switch_resume_selection(
         application,
         &catalog,
         &ResumeSelectionRequest::Input(input.to_owned()),
         Some(&cwd),
+        &sources,
     )
-    .await?;
-    Ok(result.path)
+    .await
 }
 
 /// Dispatch a slash command (without the leading `/`). Returns `true` to quit.
@@ -190,8 +195,8 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
             println!("{}", change.message);
         },
         "new" => {
-            application.new_session().await?;
-            println!("started a new transcript");
+            let outcome = application.new_session().await?;
+            println!("{}", if outcome.cancelled { "new session cancelled" } else { "started a new transcript" });
         },
         "name" if arg.is_empty() => println!(
             "{}",
@@ -214,44 +219,51 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
                 state.session_file.as_deref().unwrap_or("in memory")
             );
         }
-        "sessions" => list_sessions(session.cwd())?,
-        "resume" if arg.is_empty() => match pi_coding::SessionCatalog::from_env() {
-            Ok(catalog) => match load_resume_catalog(
-                &catalog,
-                &ResumeCatalogRequest {
-                    cwd_scope: Some(session.cwd().to_path_buf()),
-                    ..ResumeCatalogRequest::default()
-                },
-            ) {
-                Ok(result) if result.rows.is_empty() => println!("No sessions for this directory."),
-                Ok(result) => {
-                    for row in result.rows {
-                        let imported = if matches!(
-                            row.status,
-                            pi_coding::CatalogRowStatus::AlreadyImported { .. }
-                        ) {
-                            " imported"
-                        } else {
-                            ""
-                        };
-                        println!(
-                            "[{:<10}] {}  {}  {}{}  {}",
-                            row.source_badge,
-                            row.display_time,
-                            row.session_id,
-                            row.summary,
-                            imported,
-                            row.cwd.display()
-                        );
+        "sessions" => list_sessions_in(session.cwd(), &session.session_dir())?,
+        "resume" if arg.is_empty() => {
+            let catalog = pi_coding::SessionCatalog::from_env()
+                .map(|catalog| catalog.with_native_session_root(session.session_dir()));
+            let sources = effective_resume_sources(application);
+            match catalog {
+                Ok(catalog) => match load_resume_catalog(
+                    &catalog,
+                    &ResumeCatalogRequest {
+                        cwd_scope: Some(session.cwd().to_path_buf()),
+                        sources,
+                        ..ResumeCatalogRequest::default()
+                    },
+                ) {
+                    Ok(result) if result.rows.is_empty() => println!("No sessions for this directory."),
+                    Ok(result) => {
+                        for row in result.rows {
+                            let imported = if matches!(
+                                row.status,
+                                pi_coding::CatalogRowStatus::AlreadyImported { .. }
+                            ) {
+                                " imported"
+                            } else {
+                                ""
+                            };
+                            println!(
+                                "[{:<10}] {}  {}  {}{}  {}",
+                                row.source_badge,
+                                row.display_time,
+                                row.session_id,
+                                row.summary,
+                                imported,
+                                row.cwd.display()
+                            );
+                        }
                     }
-                }
-                Err(error) => error_line(&format!("failed to list resumable sessions: {error}")),
-            },
-            Err(error) => error_line(&format!("failed to open session catalog: {error}")),
-        },
+                    Err(error) => error_line(&format!("failed to list resumable sessions: {error}")),
+                },
+                Err(error) => error_line(&format!("failed to open session catalog: {error}")),
+            }
+        }
         "resume" => {
             match resume_application(application, arg).await {
-                Ok(path) => println!("resumed {}", path.display()),
+                Ok(result) if result.cancelled => println!("session resume cancelled"),
+                Ok(result) => println!("resumed {}", result.path.display()),
                 Err(error) => error_line(&format!("{error:#}")),
             }
         }
@@ -259,10 +271,15 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
             if arg.is_empty() {
                 error_line("usage: /import <path.jsonl>");
             } else {
-                let imported =
-                    pi_coding::import_session(pi_coding::SourceSessionFormat::Pi, Path::new(arg))?;
-                application.switch_session(&imported.path).await?;
-                println!("imported and resumed {}", imported.path.display());
+                let session_dir = session.session_dir();
+                std::fs::create_dir_all(&session_dir)?;
+                let imported = pi_coding::import_session_to(
+                    pi_coding::SourceSessionFormat::Pi,
+                    Path::new(arg),
+                    &session_dir,
+                )?;
+                let outcome = application.switch_session(&imported.path).await?;
+                println!("{}", if outcome.cancelled { "session resume cancelled".to_owned() } else { format!("imported and resumed {}", imported.path.display()) });
             }
         }
         "compact" => {
@@ -285,12 +302,16 @@ async fn handle_slash(application: &Application, line: &str) -> Result<bool> {
             }
         }
         "fork" => {
-            let text = application.fork_session(arg).await?;
-            println!("forked from {arg}\n{text}");
+            let outcome = application.fork_session(arg).await?;
+            if outcome.cancelled {
+                println!("session fork cancelled");
+            } else {
+                println!("forked from {arg}\n{}", outcome.text);
+            }
         }
         "clone" => {
-            application.clone_session().await?;
-            println!("cloned current session branch");
+            let outcome = application.clone_session().await?;
+            println!("{}", if outcome.cancelled { "session clone cancelled" } else { "cloned current session branch" });
         }
         "tree" => println!(
             "{}",

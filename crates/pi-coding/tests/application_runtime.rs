@@ -54,6 +54,7 @@ fn session_with_responses(responses: Vec<FauxResponse>) -> (Session, FauxProvide
         auth_resolver: None,
     })
     .expect("build session");
+    session.start_new_recording().expect("start application test recording");
     (session, registration)
 }
 fn session_with_recorded_contexts(
@@ -273,10 +274,11 @@ async fn cross_cwd_switch_replaces_generation_and_preserves_old_session_lease() 
     let mut events = application.subscribe();
     let source_epoch = application.runtime_epoch();
 
-    tokio::time::timeout(Duration::from_secs(5), application.switch_session(&target_file))
+    let switch = tokio::time::timeout(Duration::from_secs(5), application.switch_session(&target_file))
         .await
         .expect("cross cwd switch timeout")
         .expect("cross cwd switch");
+    assert!(!switch.cancelled);
 
     assert!(application.runtime_epoch() > source_epoch);
     assert_eq!(clone.session().cwd(), target.path());
@@ -574,7 +576,7 @@ async fn state_tracks_modes_pending_counts_and_new_session_reset() {
     assert!(queued.auto_compaction_enabled);
     assert_eq!(queued.pending_message_count, 2);
 
-    application.new_session().await.expect("new session");
+    assert!(!application.new_session().await.expect("new session").cancelled);
     let reset = application.state().await;
     assert!(!reset.is_streaming);
     assert!(!reset.is_compacting);
@@ -628,11 +630,12 @@ async fn navigation_and_fork_events_serialize_as_typed_application_events() {
         .await
         .session_file
         .expect("session file");
-    let prompt = application
+    let outcome = application
         .fork_session(&user_id)
         .await
         .expect("fork session");
-    assert_eq!(prompt, "question");
+    assert!(!outcome.cancelled);
+    assert_eq!(outcome.text, "question");
     assert_ne!(
         application.state().await.session_file.as_deref(),
         Some(previous.as_str())
@@ -1012,6 +1015,7 @@ fn controlled_reload_session(
         auth_resolver: None,
     })
     .expect("controlled reload session");
+    session.start_new_recording().expect("start reload test recording");
     (session, registration, started_count, started, release)
 }
 
@@ -1164,6 +1168,105 @@ async fn non_equivalent_reload_cleans_running_and_retained_job_state() {
     registration.unregister();
 }
 
+/// Contract: a non-equivalent reload must reset the durable sidecar, not only
+/// the live in-memory job state. `commit_orchestration_candidate` binds the
+/// replacement with a clean slate, then `previous.shutdown()` best-effort
+/// persists the prior runtime's final state back to the shared sidecar
+/// (runtime.rs:3479); without re-syncing the replacement's clean state, a
+/// later restart binding a fresh runtime to the same parent session would
+/// recover the cancelled pre-reload jobs. This test simulates that restart by
+/// tearing down the live application and binding a fresh
+/// `OrchestrationRuntime` to the same parent session, then asserting the
+/// durable sidecar yields no jobs.
+#[tokio::test]
+async fn non_equivalent_reload_resets_durable_sidecar_so_restart_recovers_no_jobs() {
+    let root = tempfile::tempdir().expect("root");
+    let resources = orchestration_resources(root.path(), root.path().join("agent-home"));
+    let (session, registration, started_count, started, _release) =
+        controlled_reload_session(root.path());
+    session
+        .attach_resources(resources.clone())
+        .await
+        .expect("attach resources");
+    let application = Application::new(session).await;
+    application.reload().await.expect("enable orchestration");
+    let prior = application.orchestration_runtime().expect("runtime");
+    let spawn = prior
+        .spawn_tasks(
+            "Main",
+            0,
+            vec![TaskItem {
+                index: 0,
+                id: "ResetSurvivor".to_owned(),
+                agent: "task".to_owned(),
+                assignment: "must not survive non-equivalent reload into a restart".to_owned(),
+                todo_task_id: None,
+            }],
+        )
+        .expect("spawn")
+        .remove(0);
+    wait_for_reload_child(&started_count, &started).await;
+
+    resources
+        .settings_manager()
+        .update_global(|settings| {
+            settings.orchestration = Some(OrchestrationSettings {
+                tasks: Some(true),
+                max_concurrency: Some(2),
+                ..OrchestrationSettings::default()
+            });
+        })
+        .expect("non-equivalent settings");
+    application.reload().await.expect("non-equivalent reload");
+    let replacement = application.orchestration_runtime().expect("replacement runtime");
+    assert!(replacement.jobs(None).is_empty());
+
+    // Simulate a restart immediately after the non-equivalent reload, while the
+    // replacement is still the live durable owner: bind a fresh
+    // `OrchestrationRuntime` to the same parent session (and therefore the same
+    // durable sidecar) and recover. Doing this before `application.cleanup()`
+    // is essential: cleanup's own shutdown persist would re-write an empty
+    // sidecar and mask a stale-sidecar regression. The fresh recovery must read
+    // exactly what `commit_orchestration_candidate`'s post-shutdown re-sync
+    // left on disk.
+    let session = application.session();
+    let snapshot = session
+        .resource_manager()
+        .expect("resources")
+        .snapshot();
+    let mut config = pi_coding::OrchestrationConfig::new(
+        pi_coding::AgentCatalog::from_agents(snapshot.agents.clone()),
+        snapshot.cwd.join(".pi").join("artifacts"),
+    );
+    if let Some(model) = session.model() {
+        config.parent_model = model;
+    }
+    let factory = pi_coding::OrchestrationRuntime::child_factory_from_session(&session);
+    let fresh = pi_coding::OrchestrationRuntime::new(config, factory)
+        .expect("fresh runtime");
+    fresh
+        .bind_and_recover(&session)
+        .expect("recover durable sidecar after restart");
+    assert!(
+        fresh.jobs(None).is_empty(),
+        "non-equivalent reload must not leave pre-reload jobs recoverable from the durable sidecar"
+    );
+    assert_eq!(fresh.active_child_count(), 0, "no recovered active children");
+    assert!(
+        fresh.list("Main").is_empty(),
+        "no recovered agents from the pre-reload runtime"
+    );
+    assert!(
+        fresh.resolve_read_uri("artifact://ResetSurvivor").is_err(),
+        "no recovered artifacts from the pre-reload runtime"
+    );
+
+    fresh.shutdown().await;
+    application.cleanup().await;
+    drop(spawn);
+    registration.unregister();
+}
+
 #[tokio::test]
 async fn extension_session_reducers_cancel_without_mutation_and_transform_tree() -> anyhow::Result<()> {
     let Some(bun) = bun_executable() else { return Ok(()); };
@@ -1185,9 +1288,12 @@ async fn extension_session_reducers_cancel_without_mutation_and_transform_tree()
     let resume_directory = tempfile::tempdir()?;
     let resume_file = resume_directory.path().join("resume.jsonl");
     write_session(&resume_file, resume_directory.path(), "resume", "resume message");
-    assert!(application.new_session().await.expect_err("cancel new").to_string().contains("cancelled"));
-    assert!(application.switch_session(&resume_file).await.expect_err("cancel resume").to_string().contains("cancelled"));
-    assert!(application.fork_session(&user_id).await.expect_err("cancel fork").to_string().contains("cancelled"));
+    assert!(application.new_session().await?.cancelled);
+    assert!(application.switch_session(&resume_file).await?.cancelled);
+    let fork = application.fork_session(&user_id).await?;
+    assert!(fork.cancelled);
+    assert!(fork.text.is_empty());
+    assert!(application.clone_session().await?.cancelled);
     let unchanged = application.state().await;
     assert_eq!(unchanged.session_id, before.session_id);
     assert_eq!(unchanged.session_file, before.session_file);
@@ -1227,9 +1333,36 @@ async fn extension_fork_skip_conversation_restore_creates_empty_live_context() -
     let (runtime, permissions, _temporary) = semantic_runtime_with_source(&bun, Some(source)).await?;
     let application = Application::new_with_extensions(session, runtime.clone(), permissions).await;
 
-    assert_eq!(application.fork_session(&user_id).await?, "question");
+    let fork = application.fork_session(&user_id).await?;
+    assert!(!fork.cancelled);
+    assert_eq!(fork.text, "question");
     assert!(application.messages().is_empty());
     assert!(application.session_entries(None)?.entries.iter().all(|entry| entry.message.is_none()));
+
+    application.cleanup().await;
+    runtime.shutdown().await;
+    registration.unregister();
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_clone_skip_conversation_restore_creates_empty_live_context() -> anyhow::Result<()> {
+    let Some(bun) = bun_executable() else { return Ok(()); };
+    let (session, registration) = session_with_responses(vec![FauxResponse::text("answer")]);
+    session.start_new_recording()?;
+    session.run("question", Vec::new()).await?;
+    let source = r#"export default function (pi) {
+        pi.on("session_before_fork", (event) => {
+            if (event.position !== "at") throw new Error(`unexpected position: ${event.position}`);
+            return { skipConversationRestore: true };
+        });
+    }"#;
+    let (runtime, permissions, _temporary) = semantic_runtime_with_source(&bun, Some(source)).await?;
+    let application = Application::new_with_extensions(session, runtime.clone(), permissions).await;
+
+    let clone = application.clone_session().await?;
+    assert!(!clone.cancelled);
+    assert!(application.messages().is_empty());
 
     application.cleanup().await;
     runtime.shutdown().await;
@@ -1420,10 +1553,11 @@ async fn loop_turns_project_events_use_session_path_and_suspend_on_switch() {
         })
         .await
         .expect("create durable loop");
-    application
+    let switched = application
         .switch_session(&second_path)
         .await
         .expect("switch session");
+    assert!(!switched.cancelled);
     assert!(application.loop_list().await.expect("second session loops").is_empty());
     let mut removed_for_switch = false;
     while let Ok(event) = events.try_recv() {
@@ -1439,10 +1573,11 @@ async fn loop_turns_project_events_use_session_path_and_suspend_on_switch() {
     }
     assert!(removed_for_switch, "session switch must project loop suspension");
 
-    application
+    let restored_switch = application
         .switch_session(&first_path)
         .await
         .expect("restore first session");
+    assert!(!restored_switch.cancelled);
     let restored = application.loop_list().await.expect("restored loops");
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].id, durable.id);
@@ -1580,5 +1715,139 @@ async fn compact_persists_checkpoint_and_keeps_application_transcript_usable() {
     assert!(user.content.iter().any(|block| matches!(block, ContentBlock::Text { text, .. } if text.contains("application checkpoint"))));
 
     application.cleanup().await;
+    registration.unregister();
+}
+/// Contract: a user abort (`Application::abort`) during a loop-owned active
+/// turn must cancel the loop iteration token BEFORE the session abort so the
+/// scheduler classifies the turn as `RunResult::Cancelled` (silent; the loop
+/// remains scheduled) instead of `LoopEvent::Failed` ("Loop <id> failed:
+/// Request was aborted").
+///
+/// Plausible bug (old ordering): `session.abort().await` ran first, letting the
+/// provider stream fail with "Request was aborted" and the runner settle
+/// before the loop iteration token fired — the scheduler then saw
+/// `runner_cancel.is_cancelled() == false` and emitted `LoopEvent::Failed` for
+/// an expected user cancellation. This test uses an abort-blocked faux stream
+/// (the exact provider behavior on Esc) and asserts no `LoopEvent::Failed` and
+/// that the loop task remains scheduled.
+#[tokio::test]
+async fn abort_during_loop_turn_settles_as_cancelled_not_failed() {
+    let suffix = uuid::Uuid::now_v7().to_string();
+    let api = format!("loop-abort-api-{suffix}");
+    let provider = format!("loop-abort-provider-{suffix}");
+    let model = Model {
+        id: "loop-abort-model".to_owned(),
+        name: "Loop Abort".to_owned(),
+        api: api.clone(),
+        provider: provider.clone(),
+        ..Model::default()
+    };
+    let registration = register_faux_provider(FauxProviderOptions {
+        api,
+        provider,
+        models: vec![model.clone()],
+        chunk_size: 1,
+    });
+    // No queued response: a custom stream blocks until the session is aborted,
+    // then fails with "Request was aborted" exactly like a real provider on Esc.
+    let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, options| {
+        Box::pin(async move {
+            let stream = pi_ai::new_assistant_message_event_stream();
+            let mut partial = pi_ai::AssistantMessage::pending(&model);
+            stream
+                .push(pi_ai::AssistantMessageEvent::Start { partial: partial.clone() })
+                .await;
+            if let Some(token) = options.stream.abort_signal.as_ref() {
+                token.cancelled().await;
+            }
+            partial.stop_reason = pi_ai::StopReason::Aborted;
+            partial.error_message = Some("Request was aborted".to_owned());
+            stream
+                .push(pi_ai::AssistantMessageEvent::Error {
+                    reason: pi_ai::StopReason::Aborted,
+                    error: partial,
+                })
+                .await;
+            stream
+        })
+    });
+    let session = Session::new(SessionOptions {
+        model,
+        cwd: std::env::current_dir().expect("cwd"),
+        system_prompt: String::new(),
+        thinking_level: pi_agent::ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: Some(stream_fn),
+        auth_resolver: None,
+    })
+    .expect("build session");
+
+    let application = Application::new(session).await;
+    let mut events = application.subscribe();
+    let task = application
+        .loop_create(pi_coding::LoopCreateRequest::immediate("30m", "loop abort turn"))
+        .await
+        .expect("create loop");
+
+    // Wait for the iteration to fire and the abort-blocked stream to be in-flight.
+    let mut saw_fired = false;
+    while !saw_fired {
+        let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("application event channel");
+        if let ApplicationEvent::Loop(pi_coding::LoopEvent::Fired { task_id, .. }) = &event {
+            if task_id == &task.id {
+                saw_fired = true;
+            }
+        }
+    }
+    assert!(saw_fired, "loop iteration must fire");
+
+    // User Esc: abort the loop-owned active turn.
+    application.abort().await;
+
+    // The turn must settle WITHOUT emitting LoopEvent::Failed/Finished for the
+    // task, and the agent must settle (AgentSettled clears the working UI).
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut saw_settled = false;
+    while std::time::Instant::now() < deadline {
+        let Ok(recv) = tokio::time::timeout(Duration::from_millis(100), events.recv()).await else {
+            continue;
+        };
+        let Ok(event) = recv else { break };
+        match event {
+            ApplicationEvent::Loop(pi_coding::LoopEvent::Failed { task_id, message, .. })
+                if task_id == task.id =>
+            {
+                panic!("user abort must not emit LoopEvent::Failed: {message}");
+            }
+            ApplicationEvent::Loop(pi_coding::LoopEvent::Finished { task_id, .. })
+                if task_id == task.id =>
+            {
+                panic!("cancelled iteration must not emit LoopEvent::Finished");
+            }
+            ApplicationEvent::AgentSettled => saw_settled = true,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_settled,
+        "abort must settle the agent (AgentSettled) to clear the working UI"
+    );
+
+    // The loop task remains scheduled; only the active iteration was cancelled.
+    let remaining = application.loop_list().await.expect("loop list");
+    assert!(
+        remaining.iter().any(|t| t.id == task.id),
+        "loop task must remain scheduled after iteration cancel: {remaining:?}"
+    );
+
+    application.wait_for_idle().await;
     registration.unregister();
 }

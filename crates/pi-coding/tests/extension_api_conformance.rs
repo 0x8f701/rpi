@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use pi_agent::AbortSignal;
+use pi_agent::{AbortSignal, ToolCapability};
 use pi_ai::ContentBlock;
 use pi_coding::{
     ExtensionActionHost, ExtensionCancellation, ExtensionCapability, ExtensionContextSnapshot,
@@ -505,6 +505,12 @@ async fn inexpressible_tool_and_dead_registration_categories_fail_closed() -> Re
             "registerTool.constrainedSampling",
         ),
         (
+            "invalid-tool-capability",
+            "invalid-tool-capability.ts",
+            vec![ExtensionCapability::Tools],
+            "registerTool capability must be read, write, or exec",
+        ),
+        (
             "provider-registration",
             "provider-registration.ts",
             vec![ExtensionCapability::ProviderMetadata],
@@ -911,6 +917,16 @@ async fn real_bun_tools_register_and_execute_across_the_process_boundary() -> Re
         .expect("bun_echo must be registered by the bun extension");
     assert_eq!(echo.label, "Bun Echo");
     assert_eq!(echo.description, "Echo text through the Bun extension host");
+    assert_eq!(echo.capability, ToolCapability::Read);
+    assert_eq!(
+        runtime
+            .agent_tools()
+            .into_iter()
+            .find(|tool| tool.name == "bun_echo")
+            .expect("bun_echo AgentTool")
+            .capability,
+        ToolCapability::Read
+    );
     let schema = serde_json::to_value(&echo.parameters).context("serializing tool schema")?;
     assert_eq!(schema["type"], json!("object"));
     assert_eq!(schema["properties"]["text"]["type"], json!("string"));

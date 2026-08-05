@@ -347,8 +347,12 @@ mod tests {
 
     #[test]
     fn wrapped_table_rows_keep_header_body_and_border_roles() {
-        // Contract: multi-line header/body cells must not steal TableBorder roles
-        // from separators (index-based role bugs break TUI styling).
+        // Contract: content-aware wrapping emits one top border, one separator
+        // border, and one bottom border. Every wrapped header row carries
+        // TableHeader and every wrapped body row carries TableBody, so
+        // index-based role bugs cannot steal TableBorder from separators. The
+        // exact wrapped row count varies with content, so the assertion is
+        // structural rather than a hardcoded count.
         let output = render(
             "| longheaderword | other |\n| --- | --- |\n| alphabeta gamma delta | x |",
             14,
@@ -358,26 +362,33 @@ mod tests {
             .iter()
             .map(|line| line.role)
             .collect::<Vec<_>>();
-        assert_eq!(
-            roles,
-            vec![
-                LineRole::TableBorder,
-                LineRole::TableHeader,
-                LineRole::TableHeader,
-                LineRole::TableHeader,
-                LineRole::TableHeader,
-                LineRole::TableHeader,
-                LineRole::TableBorder,
-                LineRole::TableBody,
-                LineRole::TableBody,
-                LineRole::TableBody,
-                LineRole::TableBody,
-                LineRole::TableBody,
-                LineRole::TableBody,
-                LineRole::TableBody,
-                LineRole::TableBorder,
-            ]
+
+        assert!(
+            roles.len() >= 4,
+            "table must render top/separator/bottom borders plus content: {roles:?}"
         );
+        assert_eq!(roles.first(), Some(&LineRole::TableBorder), "top border: {roles:?}");
+        assert_eq!(roles.last(), Some(&LineRole::TableBorder), "bottom border: {roles:?}");
+
+        // The single separator border is the only TableBorder between the ends.
+        let separator = roles[1..roles.len() - 1]
+            .iter()
+            .position(|role| *role == LineRole::TableBorder)
+            .map(|index| index + 1)
+            .expect("separator border between header and body");
+        let header_roles = &roles[1..separator];
+        let body_roles = &roles[separator + 1..roles.len() - 1];
+        assert!(!header_roles.is_empty(), "header section must wrap content: {roles:?}");
+        assert!(
+            header_roles.iter().all(|role| *role == LineRole::TableHeader),
+            "header section must be all TableHeader: {roles:?}"
+        );
+        assert!(!body_roles.is_empty(), "body section must wrap content: {roles:?}");
+        assert!(
+            body_roles.iter().all(|role| *role == LineRole::TableBody),
+            "body section must be all TableBody: {roles:?}"
+        );
+
         assert!(
             output
                 .plain_lines()

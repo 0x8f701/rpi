@@ -160,6 +160,7 @@ struct AdapterInner {
     state: Mutex<AdapterState>,
     pending: Mutex<HashMap<String, PendingInteraction>>,
     events: broadcast::Sender<ExtensionUiEvent>,
+    observer_events: broadcast::Sender<ExtensionUiEvent>,
 }
 
 #[derive(Default)]
@@ -185,10 +186,18 @@ struct PendingInteraction {
     response: oneshot::Sender<Result<ExtensionUiResponse, String>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostToolConfirmation {
+    Approved,
+    Denied,
+    Cancelled,
+}
+
 impl ExtensionUiAdapter {
     #[must_use]
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(UI_EVENT_BUFFER);
+        let (observer_events, _) = broadcast::channel(UI_EVENT_BUFFER);
         let state = AdapterState {
             canonical_queries_supported: true,
             ..AdapterState::default()
@@ -198,6 +207,7 @@ impl ExtensionUiAdapter {
                 state: Mutex::new(state),
                 pending: Mutex::new(HashMap::new()),
                 events,
+                observer_events,
             }),
         }
     }
@@ -205,6 +215,13 @@ impl ExtensionUiAdapter {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<ExtensionUiEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// Subscribes to extension UI state changes without claiming ownership of
+    /// interactive requests. This stream never emits `InteractionRequested`.
+    #[must_use]
+    pub fn subscribe_non_interactive(&self) -> broadcast::Receiver<ExtensionUiEvent> {
+        self.inner.observer_events.subscribe()
     }
 
     #[must_use]
@@ -284,6 +301,33 @@ impl ExtensionUiAdapter {
     /// extension-originated events.
     pub fn set_canonical_queries_supported(&self, supported: bool) {
         self.inner.state.lock().canonical_queries_supported = supported;
+    }
+
+    pub async fn confirm_host_tool(
+        &self,
+        mode: pi_coding::ExtensionMode,
+        tool_name: &str,
+        capability: pi_agent::ToolCapability,
+    ) -> Result<HostToolConfirmation> {
+        let response = self
+            .request(
+                ExtensionUiContext {
+                    instance: host_instance(),
+                    mode,
+                },
+                ExtensionUiRequest::Confirm {
+                    title: "Approve tool call?".to_owned(),
+                    message: format!("Tool: {tool_name}\nCapability: {}", capability_name(capability)),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await?;
+        match response {
+            ExtensionUiResponse::Confirmed { confirmed: true } => Ok(HostToolConfirmation::Approved),
+            ExtensionUiResponse::Confirmed { confirmed: false } => Ok(HostToolConfirmation::Denied),
+            ExtensionUiResponse::Cancelled => Ok(HostToolConfirmation::Cancelled),
+            _ => Err(anyhow!("host tool confirmation returned an invalid response")),
+        }
     }
 
     #[must_use]
@@ -508,12 +552,15 @@ impl ExtensionUiHost for ExtensionUiAdapter {
                 clear_if_owned(&mut state.active_theme, &instance);
                 clear_if_owned(&mut state.tools_expanded, &instance);
             }
-            let _ = inner
-                .events
-                .send(ExtensionUiEvent::ExtensionCleared { instance });
+            publish_event(&inner, ExtensionUiEvent::ExtensionCleared { instance });
             Ok(())
         })
     }
+}
+
+fn publish_event(inner: &AdapterInner, event: ExtensionUiEvent) {
+    let _ = inner.events.send(event.clone());
+    let _ = inner.observer_events.send(event);
 }
 
 fn clear_if_owned<T>(
@@ -532,6 +579,14 @@ fn host_instance() -> ExtensionInstanceId {
     ExtensionInstanceId {
         extension_id: "host".to_owned(),
         generation: 0,
+    }
+}
+
+fn capability_name(capability: pi_agent::ToolCapability) -> &'static str {
+    match capability {
+        pi_agent::ToolCapability::Read => "read",
+        pi_agent::ToolCapability::Write => "write",
+        pi_agent::ToolCapability::Exec => "exec",
     }
 }
 
@@ -554,9 +609,7 @@ fn apply_action(
                 }
                 state.notifications.push_back(notification.clone());
             }
-            let _ = inner
-                .events
-                .send(ExtensionUiEvent::Notification { notification });
+            publish_event(inner, ExtensionUiEvent::Notification { notification });
         }
         ExtensionUiRequest::Status { key, text } => {
             if let Some(text) = text {
@@ -570,17 +623,20 @@ fn apply_action(
                     .lock()
                     .statuses
                     .insert((context.instance, key), text);
-                let _ = inner.events.send(ExtensionUiEvent::StatusChanged { item });
+                publish_event(inner, ExtensionUiEvent::StatusChanged { item });
             } else {
                 inner
                     .state
                     .lock()
                     .statuses
                     .remove(&(context.instance.clone(), key.clone()));
-                let _ = inner.events.send(ExtensionUiEvent::StatusCleared {
-                    instance: context.instance,
-                    key,
-                });
+                publish_event(
+                    inner,
+                    ExtensionUiEvent::StatusCleared {
+                        instance: context.instance,
+                        key,
+                    },
+                );
             }
         }
         ExtensionUiRequest::Widget {
@@ -600,17 +656,20 @@ fn apply_action(
                     .lock()
                     .widgets
                     .insert((context.instance, key), item.clone());
-                let _ = inner.events.send(ExtensionUiEvent::WidgetChanged { item });
+                publish_event(inner, ExtensionUiEvent::WidgetChanged { item });
             } else {
                 inner
                     .state
                     .lock()
                     .widgets
                     .remove(&(context.instance.clone(), key.clone()));
-                let _ = inner.events.send(ExtensionUiEvent::WidgetCleared {
-                    instance: context.instance,
-                    key,
-                });
+                publish_event(
+                    inner,
+                    ExtensionUiEvent::WidgetCleared {
+                        instance: context.instance,
+                        key,
+                    },
+                );
             }
         }
         ExtensionUiRequest::SetEditorText { text } => {
@@ -618,10 +677,13 @@ fn apply_action(
                 .state
                 .lock()
                 .editor_text = Some((context.instance.clone(), text.clone()));
-            let _ = inner.events.send(ExtensionUiEvent::EditorTextChanged {
-                instance: context.instance,
-                text,
-            });
+            publish_event(
+                inner,
+                ExtensionUiEvent::EditorTextChanged {
+                    instance: context.instance,
+                    text,
+                },
+            );
         }
         ExtensionUiRequest::GetEditorText => {
             let text = inner
@@ -644,38 +706,53 @@ fn apply_action(
                 state.editor_text = Some((context.instance.clone(), updated.clone()));
                 updated
             };
-            let _ = inner.events.send(ExtensionUiEvent::EditorTextChanged {
-                instance: context.instance,
-                text: updated,
-            });
+            publish_event(
+                inner,
+                ExtensionUiEvent::EditorTextChanged {
+                    instance: context.instance,
+                    text: updated,
+                },
+            );
         }
         ExtensionUiRequest::SetWorkingMessage { message } => {
             inner.state.lock().working_message = Some((context.instance.clone(), message.clone()));
-            let _ = inner.events.send(ExtensionUiEvent::WorkingMessageChanged {
-                instance: context.instance,
-                message,
-            });
+            publish_event(
+                inner,
+                ExtensionUiEvent::WorkingMessageChanged {
+                    instance: context.instance,
+                    message,
+                },
+            );
         }
         ExtensionUiRequest::SetWorkingVisible { visible } => {
             inner.state.lock().working_visible = Some((context.instance.clone(), visible));
-            let _ = inner.events.send(ExtensionUiEvent::WorkingVisibilityChanged {
-                instance: context.instance,
-                visible,
-            });
+            publish_event(
+                inner,
+                ExtensionUiEvent::WorkingVisibilityChanged {
+                    instance: context.instance,
+                    visible,
+                },
+            );
         }
         ExtensionUiRequest::SetWorkingIndicator { options } => {
             inner.state.lock().working_indicator = Some((context.instance.clone(), options.clone()));
-            let _ = inner.events.send(ExtensionUiEvent::WorkingIndicatorChanged {
-                instance: context.instance,
-                options,
-            });
+            publish_event(
+                inner,
+                ExtensionUiEvent::WorkingIndicatorChanged {
+                    instance: context.instance,
+                    options,
+                },
+            );
         }
         ExtensionUiRequest::SetHiddenThinkingLabel { label } => {
             inner.state.lock().hidden_thinking_label = Some((context.instance.clone(), label.clone()));
-            let _ = inner.events.send(ExtensionUiEvent::HiddenThinkingLabelChanged {
-                instance: context.instance,
-                label,
-            });
+            publish_event(
+                inner,
+                ExtensionUiEvent::HiddenThinkingLabelChanged {
+                    instance: context.instance,
+                    label,
+                },
+            );
         }
         ExtensionUiRequest::GetAllThemes => {
             let themes = inner.state.lock().themes.clone();
@@ -705,10 +782,13 @@ fn apply_action(
                 });
             }
             inner.state.lock().active_theme = Some((context.instance.clone(), name.clone()));
-            let _ = inner.events.send(ExtensionUiEvent::ThemeChanged {
-                instance: context.instance,
-                name,
-            });
+            publish_event(
+                inner,
+                ExtensionUiEvent::ThemeChanged {
+                    instance: context.instance,
+                    name,
+                },
+            );
             return Ok(ExtensionUiResponse::ThemeSet {
                 success: true,
                 error: None,
@@ -725,17 +805,23 @@ fn apply_action(
         }
         ExtensionUiRequest::SetToolsExpanded { expanded } => {
             inner.state.lock().tools_expanded = Some((context.instance.clone(), expanded));
-            let _ = inner.events.send(ExtensionUiEvent::ToolsExpandedChanged {
-                instance: context.instance,
-                expanded,
-            });
+            publish_event(
+                inner,
+                ExtensionUiEvent::ToolsExpandedChanged {
+                    instance: context.instance,
+                    expanded,
+                },
+            );
         }
         ExtensionUiRequest::Title { title } => {
             inner.state.lock().title = Some((context.instance.clone(), title.clone()));
-            let _ = inner.events.send(ExtensionUiEvent::TitleChanged {
-                instance: context.instance,
-                title,
-            });
+            publish_event(
+                inner,
+                ExtensionUiEvent::TitleChanged {
+                    instance: context.instance,
+                    title,
+                },
+            );
         }
         ExtensionUiRequest::Select { .. }
         | ExtensionUiRequest::Confirm { .. }
@@ -798,6 +884,70 @@ mod tests {
             error
                 .to_string()
                 .contains("unavailable in noninteractive mode")
+        );
+    }
+
+    #[tokio::test]
+    async fn host_tool_confirmation_uses_synthetic_host_context_and_safe_prompt() {
+        for (confirmed, expected) in [
+            (true, HostToolConfirmation::Approved),
+            (false, HostToolConfirmation::Denied),
+        ] {
+            let adapter = ExtensionUiAdapter::new();
+            let mut events = adapter.subscribe();
+            let requester = adapter.clone();
+            let pending = tokio::spawn(async move {
+                requester
+                    .confirm_host_tool(
+                        ExtensionMode::Rpc,
+                        "dangerous_tool",
+                        pi_agent::ToolCapability::Exec,
+                    )
+                    .await
+            });
+            let ExtensionUiEvent::InteractionRequested { interaction } =
+                events.recv().await.expect("host confirmation")
+            else {
+                panic!("expected host confirmation")
+            };
+            assert_eq!(interaction.context.instance.extension_id, "host");
+            assert_eq!(interaction.context.instance.generation, 0);
+            assert_eq!(interaction.context.mode, ExtensionMode::Rpc);
+            let ExtensionUiRequest::Confirm { title, message } = &interaction.request else {
+                panic!("expected confirm request")
+            };
+            assert_eq!(title, "Approve tool call?");
+            assert!(message.contains("dangerous_tool"));
+            assert!(message.contains("exec"));
+            assert!(!message.contains('{'));
+            adapter.respond_confirmed(&interaction.id, confirmed).unwrap();
+            assert_eq!(pending.await.unwrap().unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn host_tool_confirmation_cancel_is_distinct() {
+        let adapter = ExtensionUiAdapter::new();
+        let mut events = adapter.subscribe();
+        let requester = adapter.clone();
+        let pending = tokio::spawn(async move {
+            requester
+                .confirm_host_tool(
+                    ExtensionMode::Tui,
+                    "write",
+                    pi_agent::ToolCapability::Write,
+                )
+                .await
+        });
+        let ExtensionUiEvent::InteractionRequested { interaction } =
+            events.recv().await.expect("host confirmation")
+        else {
+            panic!("expected host confirmation")
+        };
+        adapter.cancel(&interaction.id).unwrap();
+        assert_eq!(
+            pending.await.unwrap().unwrap(),
+            HostToolConfirmation::Cancelled
         );
     }
 

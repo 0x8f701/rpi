@@ -58,6 +58,42 @@ pub struct SettingsPanelRow {
     pub blocked_reason: Option<String>,
     pub redacted: bool,
 }
+impl SettingsPanelRow {
+    #[must_use]
+    pub fn section(&self) -> String {
+        if self.key.starts_with("thinkingBudgets.") {
+            return "Thinking token budgets".to_owned();
+        }
+        settings_key_section(&self.key)
+    }
+
+    #[must_use]
+    pub fn display_key(&self) -> &str {
+        if let Some(level) = self.key.strip_prefix("thinkingBudgets.") {
+            return match level {
+                "minimal" => "minimal token budget",
+                "low" => "low token budget",
+                "medium" => "medium token budget",
+                "high" => "high token budget",
+                _ => level,
+            };
+        }
+        self.key
+            .split_once('.')
+            .map_or(self.key.as_str(), |(_, child)| child)
+    }
+}
+
+fn settings_key_section(key: &str) -> String {
+    let Some((prefix, _)) = key.split_once('.') else {
+        return "General".to_owned();
+    };
+    let mut characters = prefix.chars();
+    characters.next().map_or_else(
+        || "General".to_owned(),
+        |first| first.to_uppercase().chain(characters).collect(),
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -205,7 +241,7 @@ impl SettingsPanel {
 
     pub fn rows(&self) -> Result<Vec<SettingsPanelRow>> {
         let query = self.search.trim().to_ascii_lowercase();
-        SettingsCatalog::definitions()
+        let mut rows = SettingsCatalog::definitions()
             .iter()
             .filter(|definition| self.category.is_none_or(|category| definition.category == category))
             .filter(|definition| {
@@ -261,7 +297,25 @@ impl SettingsPanel {
                     redacted: view.redacted,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if query.is_empty() {
+            rows.sort_by_cached_key(SettingsPanelRow::section);
+        } else {
+            rows.sort_by_cached_key(|row| {
+                let key = row.key.to_ascii_lowercase();
+                let rank = if key == query {
+                    0
+                } else if key.starts_with(&query) {
+                    1
+                } else if key.contains(&query) {
+                    2
+                } else {
+                    3
+                };
+                (rank, row.section(), key)
+            });
+        }
+        Ok(rows)
     }
 
     pub fn snapshot(&self) -> Result<SettingsPanelSnapshot> {
@@ -308,6 +362,124 @@ impl SettingsPanel {
 
     pub fn set_object(&mut self, key: &str, value: Map<String, Value>) -> Result<()> {
         self.set_value(key, Value::Object(value))
+    }
+
+    pub fn set_input(&mut self, key: &str, input: &str) -> Result<()> {
+        let definition = SettingsCatalog::definition(key)
+            .ok_or_else(|| anyhow::anyhow!("unknown setting key {key:?}"))?;
+        let value = match definition.value_type {
+            SettingValueType::Boolean => match input.trim() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => bail!("{key} must be true or false"),
+            },
+            SettingValueType::Enum | SettingValueType::String { .. } => {
+                Value::String(input.to_owned())
+            }
+            SettingValueType::Integer { .. } => {
+                let value = input
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| anyhow::anyhow!("{key} must be an integer"))?;
+                Value::Number(value.into())
+            }
+            SettingValueType::UnsignedInteger { .. } => {
+                let value = input
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("{key} must be a non-negative integer"))?;
+                Value::Number(value.into())
+            }
+            SettingValueType::Number { .. } => {
+                let value = input
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|_| anyhow::anyhow!("{key} must be a number"))?;
+                let number = serde_json::Number::from_f64(value)
+                    .ok_or_else(|| anyhow::anyhow!("{key} must be a finite number"))?;
+                Value::Number(number)
+            }
+            SettingValueType::StringList { .. } => {
+                let value: Value = serde_json::from_str(input).map_err(|error| {
+                    anyhow::anyhow!("{key} must be a valid JSON array of strings: {error}")
+                })?;
+                if value
+                    .as_array()
+                    .is_none_or(|values| values.iter().any(|value| !value.is_string()))
+                {
+                    bail!("{key} must be a JSON array of strings");
+                }
+                value
+            }
+            SettingValueType::Array | SettingValueType::Object => {
+                serde_json::from_str(input).map_err(|error| {
+                    anyhow::anyhow!("{key} must be valid JSON: {error}")
+                })?
+            }
+            SettingValueType::Secret => {
+                bail!("{key} is secret material and cannot be edited here")
+            }
+        };
+        self.set_value(key, value)
+    }
+
+    pub fn input_hint(&self, key: &str) -> Result<&'static str> {
+        let definition = SettingsCatalog::definition(key)
+            .ok_or_else(|| anyhow::anyhow!("unknown setting key {key:?}"))?;
+        if key.starts_with("thinkingBudgets.") {
+            return Ok("integer token override; inherited when unset");
+        }
+        Ok(match definition.value_type {
+            SettingValueType::Boolean => "true or false",
+            SettingValueType::Enum => "allowed value",
+            SettingValueType::String { .. } => "text",
+            SettingValueType::Integer { .. } => "integer",
+            SettingValueType::UnsignedInteger { .. } => "non-negative integer",
+            SettingValueType::Number { .. } => "number",
+            SettingValueType::StringList { .. } => "JSON array of strings",
+            SettingValueType::Array => "JSON array",
+            SettingValueType::Object => "JSON object",
+            SettingValueType::Secret => "managed through authentication storage",
+        })
+    }
+
+    pub fn input_value(&self, key: &str) -> Result<String> {
+        let definition = SettingsCatalog::definition(key)
+            .ok_or_else(|| anyhow::anyhow!("unknown setting key {key:?}"))?;
+        let view = self.draft.get(key)?;
+        let scope_value = match self.scope {
+            SettingsScope::Global => view.global_value.as_ref(),
+            SettingsScope::Project => view.project_value.as_ref(),
+        };
+        let value = scope_value.unwrap_or(&view.effective_value);
+        match definition.value_type {
+            SettingValueType::Boolean => Ok(value.as_bool().map(|value| value.to_string()).unwrap_or_default()),
+            SettingValueType::Enum | SettingValueType::String { .. } => {
+                Ok(value.as_str().unwrap_or_default().to_owned())
+            }
+            SettingValueType::Integer { .. }
+            | SettingValueType::UnsignedInteger { .. }
+            | SettingValueType::Number { .. } => {
+                Ok(value.is_number().then(|| value.to_string()).unwrap_or_default())
+            }
+            SettingValueType::StringList { .. } => Ok(if value
+                .as_array()
+                .is_some_and(|values| values.iter().all(Value::is_string))
+            {
+                value.to_string()
+            } else {
+                "[]".to_owned()
+            }),
+            SettingValueType::Array => {
+                Ok(if value.is_array() { value.to_string() } else { "[]".to_owned() })
+            }
+            SettingValueType::Object => {
+                Ok(if value.is_object() { value.to_string() } else { "{}".to_owned() })
+            }
+            SettingValueType::Secret => {
+                bail!("{key} is secret material and cannot be edited here")
+            }
+        }
     }
 
     pub fn reset(&mut self, key: &str) -> Result<()> {
@@ -424,6 +596,40 @@ mod tests {
     }
 
     #[test]
+    fn dotted_keys_keep_exact_identity_with_grouped_labels() {
+        let (_agent, _cwd, manager) = manager(true);
+        let mut panel = SettingsPanel::new(manager, SettingsScope::Global).expect("panel");
+        panel.set_category(Some(SettingCategory::RetryTransport));
+        panel.set_search("retry.enabled");
+        let rows = panel.rows().expect("rows");
+        let row = rows
+            .iter()
+            .find(|row| row.key == "retry.enabled")
+            .expect("retry.enabled row");
+        assert_eq!(row.section(), "Retry");
+        assert_eq!(row.display_key(), "enabled");
+        panel.cursor = rows
+            .iter()
+            .position(|row| row.key == "retry.enabled")
+            .expect("retry.enabled position");
+        assert_eq!(panel.selected().expect("selected").expect("row").key, "retry.enabled");
+    }
+
+    #[test]
+    fn thinking_budget_rows_are_labeled_as_numeric_overrides_without_mutation() {
+        let (_agent, _cwd, manager) = manager(true);
+        let mut panel = SettingsPanel::new(manager, SettingsScope::Global).expect("panel");
+        panel.set_search("thinkingBudgets.medium");
+        let row = panel.selected().expect("selected").expect("medium row");
+        assert_eq!(row.key, "thinkingBudgets.medium");
+        assert_eq!(row.section(), "Thinking token budgets");
+        assert_eq!(row.display_key(), "medium token budget");
+        assert_eq!(panel.input_hint(&row.key).expect("hint"), "integer token override; inherited when unset");
+        assert!(row.inherited);
+        assert!(!panel.is_dirty(), "selecting the override row must not stage a value");
+    }
+
+    #[test]
     fn category_search_navigation_and_scope_provenance_are_staged() {
         let (_agent, cwd, manager) = manager(true);
         manager
@@ -486,7 +692,62 @@ mod tests {
             &fs::read(agent.path().join("settings.json")).expect("settings file"),
         )
         .expect("settings json");
+
         assert_eq!(saved["future"]["nested"], 1);
+    }
+
+    #[test]
+    fn typed_input_preserves_strings_and_validates_numeric_and_collection_controls() {
+        let (_agent, _cwd, manager) = manager(true);
+        let mut panel = SettingsPanel::new(manager, SettingsScope::Global).expect("panel");
+
+        panel.set_input("theme", "true").expect("string input");
+        assert_eq!(
+            panel
+                .rows()
+                .expect("rows")
+                .into_iter()
+                .find(|row| row.key == "theme")
+                .expect("theme row")
+                .scope_value,
+            Some(json!("true"))
+        );
+
+        panel.set_input("maxTokens", "4096").expect("integer input");
+        panel
+            .set_input("terminal.imageWidthCells", "80")
+            .expect("unsigned input");
+        panel.set_input("temperature", "0.75").expect("number input");
+        panel
+            .set_input("enabledModels", r#"["first, model","  padded  "]"#)
+            .expect("string list input");
+        panel
+            .set_input("keybindings", r#"{"submit":"enter"}"#)
+            .expect("object input");
+        panel
+            .set_input("packages", r#"[{"source":"example"}]"#)
+            .expect("array input");
+
+        assert_eq!(panel.input_value("theme").expect("theme input"), "true");
+        assert_eq!(
+            panel.input_value("enabledModels").expect("list input"),
+            r#"["first, model","  padded  "]"#
+        );
+        assert_eq!(
+            panel.input_value("keybindings").expect("object input"),
+            r#"{"submit":"enter"}"#
+        );
+
+        assert!(panel.set_input("maxTokens", "4.5").is_err());
+        assert!(panel.set_input("terminal.imageWidthCells", "-1").is_err());
+        assert!(panel.set_input("temperature", "NaN").is_err());
+        assert!(panel.set_input("enabledModels", r#"["first",2]"#).is_err());
+        assert!(panel.set_input("keybindings", "[]").is_err());
+        assert!(panel.set_input("packages", "{}").is_err());
+        assert!(panel.set_input("apiKey", "secret").is_err());
+
+        assert_eq!(panel.input_hint("enabledModels").expect("list hint"), "JSON array of strings");
+        assert_eq!(panel.input_hint("keybindings").expect("object hint"), "JSON object");
     }
 
     #[test]

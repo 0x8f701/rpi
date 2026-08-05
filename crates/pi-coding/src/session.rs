@@ -188,6 +188,7 @@ impl Drop for CompactionActivityGuard {
 
 struct SessionInner {
     cwd: PathBuf,
+    session_dir: RwLock<PathBuf>,
     workspace: crate::WorkspaceRoots,
     system_prompt: String,
     base_tools: Vec<pi_agent::AgentTool>,
@@ -332,6 +333,29 @@ pub(crate) struct SessionResourceUpdate {
     agents: Vec<crate::AgentDefinition>,
     selector_settings: crate::SelectorSettings,
     runtime_settings: crate::RuntimeSettingsSnapshot,
+}
+
+pub struct PreparedSessionReplacement {
+    recorder: SessionRecorder,
+    messages: Vec<Message>,
+    model: Option<Model>,
+    api_key: Option<String>,
+    thinking_level: ThinkingLevel,
+    session_name: Option<String>,
+    todo_phases: Vec<TodoPhase>,
+    goal: GoalRuntime,
+}
+
+impl PreparedSessionReplacement {
+    #[must_use]
+    pub(crate) fn recorder_info(&self) -> (String, PathBuf) {
+        (self.recorder.id(), self.recorder.path())
+    }
+
+    #[must_use]
+    pub(crate) fn goal_runtime(&self) -> GoalRuntime {
+        self.goal.clone()
+    }
 }
 fn spawn_cleanup<F, Fut>(cleanup: F)
 where
@@ -1004,6 +1028,7 @@ impl Session {
         }))?;
         Ok(Self {
             inner: Arc::new(SessionInner {
+                session_dir: RwLock::new(crate::default_session_dir(&cwd)),
                 cwd,
                 workspace,
                 system_prompt,
@@ -1033,6 +1058,18 @@ impl Session {
     #[must_use]
     pub fn cwd(&self) -> &Path {
         &self.inner.cwd
+    }
+
+    /// Replace the directory used by all future session recordings and forks.
+    /// The CLI resolves precedence once and stores the result here so interactive
+    /// actions never re-read environment variables or settings.
+    pub fn set_session_dir(&self, session_dir: PathBuf) {
+        *self.inner.session_dir.write() = session_dir;
+    }
+
+    #[must_use]
+    pub fn session_dir(&self) -> PathBuf {
+        self.inner.session_dir.read().clone()
     }
 
     #[must_use]
@@ -1816,11 +1853,19 @@ impl Session {
             return Err(anyhow!("extension compaction firstKeptEntryId is outside the live context"));
         }
         let compacted = apply_checkpoint(&result.summary, &messages, first_kept_index);
-        recorder.record_compaction(
+        let details = result
+            .details
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        recorder.record_compaction_metadata(
             &result.summary,
             Some(&result.first_kept_entry_id),
             result.tokens_before,
             &messages[first_kept_index..],
+            details.as_ref(),
+            result.usage.as_ref(),
+            Some(true),
         )?;
         {
             let mut state = self.inner.shared.compaction_runtime.lock();
@@ -1881,7 +1926,19 @@ impl Session {
         let estimated_tokens_after = estimate_context_tokens_usage_aware(&compacted);
         if abort.is_aborted() { return Err(anyhow!("Compaction cancelled")); }
         if let Some(recorder) = recorder {
-            recorder.record_compaction(&summary, Some(&first_kept_entry_id), tokens_before, &messages[cut.first_kept_index..])?;
+            let details = serde_json::to_value(CompactionDetails {
+                read_files: all_read_files.clone(),
+                modified_files: all_modified_files.clone(),
+            })?;
+            recorder.record_compaction_metadata(
+                &summary,
+                Some(&first_kept_entry_id),
+                tokens_before,
+                &messages[cut.first_kept_index..],
+                Some(&details),
+                None,
+                None,
+            )?;
         }
         {
             let mut state = self.inner.shared.compaction_runtime.lock();
@@ -1939,12 +1996,222 @@ impl Session {
         Ok(())
     }
 
-    pub fn start_new_recording(&self) -> Result<()> {
+    fn prepare_recorder_replacement(
+        &self,
+        recorder: SessionRecorder,
+        messages: Vec<Message>,
+        model: Option<Model>,
+        api_key: Option<String>,
+        thinking_level: ThinkingLevel,
+    ) -> Result<PreparedSessionReplacement> {
+        let session_name = recorder.session_name();
+        let todo_phases = recorder
+            .latest_todo_state()?
+            .map_or_else(Vec::new, |state| state.phases);
+        let goal = GoalRuntime::from_session_recorder(recorder.clone())
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let validator = TodoRuntime::memory();
+        validator.restore_state(todo_phases.clone())?;
+        Ok(PreparedSessionReplacement {
+            recorder,
+            messages,
+            model,
+            api_key,
+            thinking_level,
+            session_name,
+            todo_phases,
+            goal,
+        })
+    }
+
+    pub(crate) fn prepare_new_session_replacement(
+        &self,
+        parent_session: Option<&Path>,
+    ) -> Result<PreparedSessionReplacement> {
         let state = self.inner.shared.state.read();
-        let recorder = crate::start_session(
+        let session_dir = self.inner.session_dir.read().clone();
+        let recorder = crate::start_session_in(
             &self.inner.cwd,
             Some(&state.model),
             Some(thinking_level_name(state.thinking_level)),
+            Some(&session_dir),
+            None,
+            parent_session,
+        )?;
+        let thinking_level = state.thinking_level;
+        drop(state);
+        recorder.persist_now()?;
+        self.prepare_recorder_replacement(recorder, Vec::new(), None, None, thinking_level)
+    }
+
+    pub(crate) async fn prepare_resume_replacement(
+        &self,
+        prepared: crate::PreparedSessionResume,
+    ) -> Result<PreparedSessionReplacement> {
+        if !prepared.target_cwd().as_os_str().is_empty()
+            && prepared.target_cwd() != self.inner.cwd
+        {
+            return Err(anyhow!(
+                "session working directory {} does not match {}",
+                prepared.target_cwd().display(),
+                self.inner.cwd.display()
+            ));
+        }
+        let context = prepared.build_context();
+        let model = context
+            .provider
+            .as_deref()
+            .zip(context.model_id.as_deref())
+            .and_then(|(provider, model_id)| pi_ai::get_model(provider, model_id));
+        let api_key = if let Some(model) = &model {
+            if let Some(resolver) = &self.inner.shared.auth_resolver {
+                Some(resolver(model.clone()).await?.api_key)
+            } else {
+                let current = self.inner.shared.state.read();
+                if current.model.provider != model.provider {
+                    return Err(anyhow!(
+                        "cannot switch extension model provider without an auth resolver"
+                    ));
+                }
+                Some(current.api_key.clone())
+            }
+        } else {
+            None
+        };
+        let requested_thinking = parse_recorded_thinking_level(&context.thinking_level);
+        let thinking_level = model
+            .as_ref()
+            .map_or(requested_thinking, |model| clamp_thinking_level(model, requested_thinking));
+        let recorder = prepared.into_recorder()?;
+        self.prepare_recorder_replacement(
+            recorder,
+            context.messages,
+            model,
+            api_key,
+            thinking_level,
+        )
+    }
+
+    pub(crate) fn prepare_fork_replacement(
+        &self,
+        entry_id: &str,
+        restore_conversation: bool,
+    ) -> Result<(PreparedSessionReplacement, String)> {
+        let recorder = self.current_recorder()?;
+        let tree = recorder.tree()?;
+        let selected = tree
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .ok_or_else(|| anyhow!("Invalid entry ID for forking"))?;
+        let Some(Message::User(user)) = selected.message.as_ref() else {
+            return Err(anyhow!("Invalid entry ID for forking"));
+        };
+        let text = content_text(&user.content);
+        let current_path = recorder.path();
+        let session_dir = self.inner.session_dir.read().clone();
+        let replacement = if let Some(parent_id) = selected.parent_id.as_deref() {
+            crate::create_branched_session_in(&current_path, parent_id, Some(&session_dir))?
+        } else {
+            let state = self.inner.shared.state.read();
+            crate::start_session_in(
+                &self.inner.cwd,
+                Some(&state.model),
+                Some(thinking_level_name(state.thinking_level)),
+                Some(&session_dir),
+                None,
+                Some(&current_path),
+            )?
+        };
+        replacement.persist_now()?;
+        let messages = if restore_conversation {
+            replacement.tree()?.build_context(None).messages
+        } else {
+            Vec::new()
+        };
+        let thinking_level = self.thinking_level();
+        Ok((
+            self.prepare_recorder_replacement(replacement, messages, None, None, thinking_level)?,
+            text,
+        ))
+    }
+
+    pub(crate) fn prepare_clone_replacement(
+        &self,
+        leaf_id: &str,
+        restore_conversation: bool,
+    ) -> Result<PreparedSessionReplacement> {
+        let recorder = self.current_recorder()?;
+        anyhow::ensure!(
+            recorder.tree()?.entries.iter().any(|entry| entry.id == leaf_id),
+            "Cannot clone session: current entry is unavailable"
+        );
+        let session_dir = self.inner.session_dir.read().clone();
+        let replacement =
+            crate::create_branched_session_in(recorder.path(), leaf_id, Some(&session_dir))?;
+        replacement.persist_now()?;
+        let messages = if restore_conversation {
+            replacement.tree()?.build_context(None).messages
+        } else {
+            Vec::new()
+        };
+        let thinking_level = self.thinking_level();
+        self.prepare_recorder_replacement(replacement, messages, None, None, thinking_level)
+    }
+
+    pub(crate) async fn commit_session_replacement(
+        &self,
+        replacement: PreparedSessionReplacement,
+    ) {
+        let PreparedSessionReplacement {
+            recorder,
+            messages,
+            model,
+            api_key,
+            thinking_level,
+            session_name,
+            todo_phases,
+            goal,
+        } = replacement;
+        self.cleanup_bash_spills();
+        self.inner.agent.set_messages(messages.clone()).await;
+        self.inner.agent.clear_all_queues().await;
+        if let Some(model) = model.clone() {
+            self.inner.agent.set_model(model).await;
+        }
+        self.inner.agent.set_thinking_level(thinking_level).await;
+        {
+            let mut state = self.inner.shared.state.write();
+            state.messages = messages;
+            if let Some(model) = model {
+                state.model = model;
+            }
+            if let Some(api_key) = api_key {
+                state.api_key = api_key;
+            }
+            state.thinking_level = thinking_level;
+        }
+        *self.inner.shared.compaction_runtime.lock() = CompactionRuntime::default();
+        self.inner.shared.compaction_active.store(false, Ordering::Release);
+        *self.inner.shared.session_name.write() = session_name;
+        *self.inner.shared.recorder.lock() = Some(Arc::new(recorder));
+        self.inner
+            .todo
+            .restore_state(todo_phases)
+            .expect("prepared todo state remains valid");
+        *self.inner.shared.goal.write() = goal;
+    }
+
+    pub fn start_new_recording(&self) -> Result<()> {
+        let state = self.inner.shared.state.read();
+        let session_dir = self.inner.session_dir.read().clone();
+        let recorder = crate::start_session_in(
+            &self.inner.cwd,
+            Some(&state.model),
+            Some(thinking_level_name(state.thinking_level)),
+            Some(&session_dir),
+            None,
+            None,
         )?;
         drop(state);
         self.record(recorder)
@@ -1952,14 +2219,74 @@ impl Session {
 
     pub fn start_new_recording_with_parent(&self, parent_session: Option<&Path>) -> Result<()> {
         let state = self.inner.shared.state.read();
-        let recorder = crate::start_session_with_parent(
+        let session_dir = self.inner.session_dir.read().clone();
+        let recorder = crate::start_session_in(
             &self.inner.cwd,
             Some(&state.model),
             Some(thinking_level_name(state.thinking_level)),
+            Some(&session_dir),
+            None,
+            parent_session,
+        )?;
+        drop(state);
+        // Persist the header (including the parent link) immediately so the
+        // child recording exists on disk before any external tree read, mirroring
+        // `prepare_new_session_replacement` and `fork_session`. Subsequent
+        // non-assistant entries still defer to the lazy flush lifecycle.
+        recorder.persist_now()?;
+        self.record(recorder)
+    }
+
+
+    /// Start a durable child recording: every entry from the header onward is
+    /// fsync'd so a crash mid-turn leaves a recoverable partial transcript.
+    /// `child_dir` is the child root (e.g. `<session-root>/children/<parent-id>/`).
+    pub fn start_durable_child_recording(
+        &self,
+        child_dir: &Path,
+        parent_session: &Path,
+    ) -> Result<()> {
+        let state = self.inner.shared.state.read();
+        let recorder = crate::start_durable_child_session_in(
+            &self.inner.cwd,
+            Some(&state.model),
+            Some(thinking_level_name(state.thinking_level)),
+            child_dir,
+            None,
             parent_session,
         )?;
         drop(state);
         self.record(recorder)
+    }
+
+    /// Resume a durable child recording from an existing child JSONL path,
+    /// continuing with durable (fsync) appends. Loads the existing history
+    /// into the agent so the next turn continues the transcript.
+    pub async fn resume_durable_child_recording(&self, path: &Path) -> Result<()> {
+        let prepared = crate::PreparedSessionResume::prepare_path(path)?;
+        if !prepared.target_cwd().as_os_str().is_empty()
+            && prepared.target_cwd() != self.inner.cwd
+        {
+            return Err(anyhow!(
+                "durable child session working directory {} does not match {}",
+                prepared.target_cwd().display(),
+                self.inner.cwd.display()
+            ));
+        }
+        let context = prepared.build_context();
+        let recorder = crate::resume_durable_child_session_from_prepared(prepared)?;
+        self.cleanup_bash_spills();
+        self.load_history(context.messages).await?;
+        if let Some(provider) = context.provider.as_deref()
+            && let Some(model_id) = context.model_id.as_deref()
+            && let Some(model) = pi_ai::get_model(provider, model_id)
+        {
+            let api_key = self.inner.shared.state.read().api_key.clone();
+            self.set_model(model, api_key);
+        }
+        self.set_thinking_level(parse_recorded_thinking_level(&context.thinking_level));
+        self.record(recorder)?;
+        Ok(())
     }
 
     pub async fn switch_session(&self, path: &Path) -> Result<()> {
@@ -2084,14 +2411,17 @@ impl Session {
         };
         let text = content_text(&user.content);
         let current_path = recorder.path();
+        let session_dir = self.inner.session_dir.read().clone();
         let replacement = if let Some(parent_id) = selected.parent_id.as_deref() {
-            crate::create_branched_session(&current_path, parent_id)?
+            crate::create_branched_session_in(&current_path, parent_id, Some(&session_dir))?
         } else {
             let state = self.inner.shared.state.read();
-            crate::start_session_with_parent(
+            crate::start_session_in(
                 &self.inner.cwd,
                 Some(&state.model),
                 Some(thinking_level_name(state.thinking_level)),
+                Some(&session_dir),
+                None,
                 Some(&current_path),
             )?
         };
@@ -2106,14 +2436,20 @@ impl Session {
         Ok(text)
     }
 
-    pub async fn clone_session(&self) -> Result<()> {
+    pub async fn clone_session(&self, leaf_id: &str, restore_conversation: bool) -> Result<()> {
         let recorder = self.current_recorder()?;
-        let leaf_id = recorder
-            .last_entry_id()
-            .ok_or_else(|| anyhow!("Cannot clone session: no current entry selected"))?;
-        let replacement = crate::create_branched_session(recorder.path(), &leaf_id)?;
-        let context = replacement.tree()?.build_context(None);
-        self.load_history(context.messages).await?;
+        anyhow::ensure!(
+            recorder.tree()?.entries.iter().any(|entry| entry.id == leaf_id),
+            "Cannot clone session: current entry is unavailable"
+        );
+        let session_dir = self.inner.session_dir.read().clone();
+        let replacement = crate::create_branched_session_in(recorder.path(), leaf_id, Some(&session_dir))?;
+        if restore_conversation {
+            let context = replacement.tree()?.build_context(None);
+            self.load_history(context.messages).await?;
+        } else {
+            self.load_history(Vec::new()).await?;
+        }
         self.record(replacement)
     }
 
@@ -2267,6 +2603,11 @@ impl Session {
 
     pub fn set_transform_context(&self, hook: Option<TransformContextFn>) {
         self.inner.agent.set_transform_context(hook);
+    }
+
+    #[must_use]
+    pub fn before_tool_call(&self) -> Option<BeforeToolCallFn> {
+        self.inner.agent.before_tool_call()
     }
 
     pub fn set_before_tool_call(&self, hook: Option<BeforeToolCallFn>) {
@@ -3781,7 +4122,104 @@ mod thinking_level_change_tests {
         assert!(change.clamped);
         assert_eq!(change.effective, ThinkingLevel::Off);
         assert_eq!(session.thinking_level(), ThinkingLevel::Off);
+
         assert!(change.message.contains("unsupported"), "{}", change.message);
+    }
+}
+
+#[cfg(test)]
+mod session_directory_tests {
+    use super::*;
+
+    fn test_session(cwd: &Path, session_dir: &Path) -> Session {
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.set_session_dir(session_dir.to_path_buf());
+        session
+    }
+
+    #[test]
+    fn interactive_new_recording_uses_stored_session_directory() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session = test_session(cwd.path(), sessions.path());
+        session.start_new_recording().expect("new recording");
+        let path = session.recorder_info().expect("recording path").1;
+        assert_eq!(path.parent(), Some(sessions.path()));
+    }
+
+    #[test]
+    fn interactive_new_with_parent_uses_stored_directory_and_keeps_parent() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let source_dir = tempfile::tempdir().expect("source sessions");
+        let source = crate::start_session_in(
+            cwd.path(),
+            None,
+            Some("off"),
+            Some(source_dir.path()),
+            Some("source"),
+            None,
+        )
+        .expect("source");
+        source.persist_now().expect("persist source");
+        let source_path = source.path();
+        let session = test_session(cwd.path(), sessions.path());
+        session
+            .start_new_recording_with_parent(Some(&source_path))
+            .expect("new with parent");
+        let path = session.recorder_info().expect("recording path").1;
+        assert_eq!(path.parent(), Some(sessions.path()));
+        assert_eq!(
+            crate::load_session_tree(&path)
+                .expect("tree")
+                .header
+                .parent_session
+                .as_deref(),
+            Some(source_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_fork_uses_stored_session_directory() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let source_dir = tempfile::tempdir().expect("source sessions");
+        let sessions = tempfile::tempdir().expect("selected sessions");
+        let source = crate::start_session_in(
+            cwd.path(),
+            None,
+            Some("off"),
+            Some(source_dir.path()),
+            Some("source-fork"),
+            None,
+        )
+        .expect("source");
+        let first = source
+            .record_message(&Message::user_text("first", 0))
+            .expect("first message");
+        source
+            .record_message(&Message::user_text("second", 1))
+            .expect("second message");
+        source.persist_now().expect("persist source");
+
+        let session = test_session(cwd.path(), sessions.path());
+        session.record(source).expect("attach source");
+        session.fork_session(&first, true).await.expect("fork");
+        let path = session.recorder_info().expect("fork path").1;
+        assert_eq!(path.parent(), Some(sessions.path()));
     }
 }
 
@@ -3921,5 +4359,165 @@ mod bash_spill_lifecycle_tests {
         );
         // Idempotent second cleanup.
         session.cleanup_bash_spills();
+    }
+}
+
+#[cfg(test)]
+mod session_label_tests {
+    use super::*;
+    use std::fs;
+
+    fn test_session(cwd: &Path) -> Session {
+        Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session")
+    }
+
+    fn label_in_tree(roots: &[crate::SessionTreeNode], entry_id: &str) -> Option<String> {
+        fn walk(roots: &[crate::SessionTreeNode], entry_id: &str) -> Option<String> {
+            for node in roots {
+                if node.entry.id == entry_id {
+                    return node.label.clone();
+                }
+                if let Some(found) = walk(&node.children, entry_id) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(roots, entry_id)
+    }
+
+    fn label_for(session: &Session, entry_id: &str) -> Option<String> {
+        label_in_tree(&session.session_tree().expect("session tree").tree, entry_id)
+    }
+
+    fn label_rows_for(path: &Path, target_id: &str) -> Vec<serde_json::Value> {
+        fs::read_to_string(path)
+            .expect("read session jsonl")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse jsonl row"))
+            .filter(|row| {
+                row.get("type").and_then(serde_json::Value::as_str) == Some("label")
+                    && row.get("targetId").and_then(serde_json::Value::as_str) == Some(target_id)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn set_session_label_trims_and_treats_whitespace_as_clear() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session = test_session(cwd.path());
+        session.set_session_dir(sessions.path().to_path_buf());
+
+        let recorder = crate::start_session_in(
+            cwd.path(),
+            None,
+            Some("off"),
+            Some(sessions.path()),
+            Some("label-whitespace"),
+            None,
+        )
+        .expect("start recorder");
+        let entry_id = recorder
+            .record_message(&Message::user_text("root", 0))
+            .expect("record entry");
+        recorder.persist_now().expect("persist");
+        let path = recorder.path();
+        session.record(recorder).expect("attach recorder");
+
+        session
+            .set_session_label(&entry_id, Some("  checkpoint  "))
+            .expect("set trimmed label");
+        assert_eq!(
+            label_for(&session, &entry_id).as_deref(),
+            Some("checkpoint"),
+            "non-empty labels must be trimmed before storage"
+        );
+
+        // Whitespace-only input must normalize to the same clear path as None.
+        for clear_input in [Some("   "), Some("\t\n  "), Some(""), None] {
+            session
+                .set_session_label(&entry_id, Some("keep-me"))
+                .expect("re-label before clear case");
+            assert_eq!(
+                label_for(&session, &entry_id).as_deref(),
+                Some("keep-me"),
+            );
+
+            session
+                .set_session_label(&entry_id, clear_input)
+                .expect("clear via whitespace/empty/none");
+            assert_eq!(
+                label_for(&session, &entry_id),
+                None,
+                "whitespace-only/empty/None must clear resolved label; input={clear_input:?}"
+            );
+        }
+
+        // The recorder is a user-only recording, so label appends stay pending in
+        // memory until an assistant message arrives. Force a durable flush of the
+        // final clear mutation via the in-module persistence API before any disk or
+        // resume read, so the assertions below observe a real persisted clear row
+        // rather than an empty (vacuously-cleared) transcript.
+        session
+            .current_recorder()
+            .expect("attached recorder")
+            .persist_now_durable()
+            .expect("durable-flush final label clear");
+
+        let rows = label_rows_for(&path, &entry_id);
+        let last_clear = rows
+            .iter()
+            .rev()
+            .find(|row| row.get("label").is_none())
+            .expect("canonical clear label row must omit optional label field");
+        assert_eq!(last_clear["type"], "label");
+        assert_eq!(last_clear["targetId"], entry_id);
+        assert!(
+            last_clear.get("label").is_none(),
+            "clear representation must omit label, got {last_clear}"
+        );
+        assert!(
+            !rows.iter().any(|row| {
+                row.get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|label| label.chars().all(char::is_whitespace) || label.is_empty())
+            }),
+            "whitespace/empty must never be persisted as a label value: {rows:?}"
+        );
+
+        // In-module read/replay path: reload through the attached recorder tree.
+        assert_eq!(
+            label_for(&session, &entry_id),
+            None,
+            "cleared label must remain absent on subsequent in-memory tree reads"
+        );
+
+        // Resume path available in-module must also resolve as cleared.
+        let resumed = crate::resume_session(&path).expect("resume session");
+        let resumed_label = label_in_tree(
+            &resumed.tree().expect("resumed tree").tree(),
+            &entry_id,
+        );
+        assert_eq!(
+            resumed_label, None,
+            "whitespace clear must survive resume/read resolution"
+        );
+        resumed.close().expect("close resumed");
     }
 }

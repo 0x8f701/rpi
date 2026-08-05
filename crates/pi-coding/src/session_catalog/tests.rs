@@ -54,6 +54,24 @@ fn set_modified(path: &Path, seconds: u64) {
         .expect("mtime");
 }
 
+fn synthetic_row(index: usize) -> CatalogRow {
+    CatalogRow {
+        kind: SessionSourceKind::Codex,
+        session_id: format!("synthetic-{index:04}"),
+        summary: String::new(),
+        cwd: PathBuf::new(),
+        modified_epoch: 777.0,
+        display_time: String::new(),
+        path: PathBuf::from(format!("/synthetic/{index:04}")),
+        size: 0,
+        message_count: None,
+        name: None,
+        status: CatalogRowStatus::Foreign,
+        import_lineage: None,
+        search_text: String::new(),
+    }
+}
+
 fn write_native(catalog: &SessionCatalog, project: &str, file: &str, id: &str, cwd: &str, user: &str) -> PathBuf {
     let path = catalog
         .root_for(SessionSourceKind::NativePi)
@@ -262,6 +280,33 @@ fn explicit_agent_dir_overrides_sessions_home_native_root() {
 }
 
 #[test]
+fn exact_native_session_root_lists_direct_children_and_rejects_nested_files() {
+    let fixture = Fixture::new();
+    let root = fixture.root.join("custom-sessions");
+    let catalog = SessionCatalog::new(fixture.root.join("home"))
+        .with_native_session_root(root.clone());
+    fs::create_dir_all(&root).expect("custom root");
+    let direct = root.join("direct.jsonl");
+    fs::write(
+        &direct,
+        "{\"type\":\"session\",\"version\":3,\"id\":\"direct\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp/work\"}\n",
+    )
+    .expect("direct session");
+    let nested = root.join("nested/nested.jsonl");
+    fs::create_dir_all(nested.parent().expect("nested parent")).expect("nested directory");
+    fs::write(
+        &nested,
+        "{\"type\":\"session\",\"version\":3,\"id\":\"nested\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp/work\"}\n",
+    )
+    .expect("nested session");
+
+    assert_eq!(catalog.root_for(SessionSourceKind::NativePi).path, root);
+    assert!(catalog.is_safe_session_path(SessionSourceKind::NativePi, &direct));
+    assert!(!catalog.is_safe_session_path(SessionSourceKind::NativePi, &nested));
+    assert_eq!(catalog.discover(SessionSourceKind::NativePi), vec![direct]);
+}
+
+#[test]
 fn scan_mixed_sources_newest_first() {
     let fixture = Fixture::new();
     let catalog = fixture.catalog();
@@ -337,6 +382,207 @@ fn dedupe_keeps_newest_same_cwd_summary() {
     assert_eq!(deduped[0].session_id, "new");
 }
 
+#[test]
+fn discover_keeps_bounded_newest_candidates_with_stable_ties() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let mut paths = Vec::with_capacity(SESSION_CATALOG_CANDIDATE_LIMIT + 2);
+    for index in 0..SESSION_CATALOG_CANDIDATE_LIMIT + 2 {
+        let path = write_codex(
+            &catalog,
+            &format!("rollout-{index:04}.jsonl"),
+            &format!("id-{index:04}"),
+            "/tmp/bounded",
+            "bounded candidate",
+        );
+        set_modified(&path, index as u64 + 1);
+        paths.push(path);
+    }
+
+    let discovered = catalog.discover(SessionSourceKind::Codex);
+    assert_eq!(discovered.len(), SESSION_CATALOG_CANDIDATE_LIMIT);
+    assert!(!discovered.contains(&paths[0]));
+    assert!(!discovered.contains(&paths[1]));
+    assert!(discovered.contains(paths.last().expect("newest")));
+
+    for path in &paths {
+        set_modified(path, 777);
+    }
+    let tied = catalog.discover(SessionSourceKind::Codex);
+    assert!(tied.contains(&paths[0]), "stable smaller paths win equal-mtime ties");
+    assert!(tied.contains(&paths[SESSION_CATALOG_CANDIDATE_LIMIT - 1]));
+    assert!(!tied.contains(&paths[SESSION_CATALOG_CANDIDATE_LIMIT]));
+    assert!(!tied.contains(&paths[SESSION_CATALOG_CANDIDATE_LIMIT + 1]));
+}
+
+#[test]
+fn source_candidate_caps_prevent_starvation_before_global_row_cap() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    for index in 0..SESSION_CATALOG_CANDIDATE_LIMIT + 4 {
+        let path = write_codex(
+            &catalog,
+            &format!("rollout-codex-{index:04}.jsonl"),
+            &format!("codex-{index:04}"),
+            "/tmp/codex",
+            "codex bounded",
+        );
+        set_modified(&path, 10_000 + index as u64);
+    }
+    let corrupt = catalog
+        .root_for(SessionSourceKind::Codex)
+        .path
+        .join("rollout-corrupt-newest.jsonl");
+    fs::write(&corrupt, b"{not json\n").expect("corrupt");
+    set_modified(&corrupt, 30_000);
+    #[cfg(unix)]
+    {
+        let target = catalog
+            .root_for(SessionSourceKind::Codex)
+            .path
+            .join("rollout-codex-0515.jsonl");
+        let link = catalog
+            .root_for(SessionSourceKind::Codex)
+            .path
+            .join("rollout-symlink-newest.jsonl");
+        std::os::unix::fs::symlink(target, &link).expect("symlink");
+    }
+    let claude = write_claude(
+        &catalog,
+        "claude-sentinel.jsonl",
+        "claude-sentinel",
+        "/tmp/claude",
+        "claude sentinel",
+    );
+    let claude_second = write_claude(
+        &catalog,
+        "claude-second.jsonl",
+        "claude-second",
+        "/tmp/claude",
+        "claude second",
+    );
+    set_modified(&claude, 1);
+    set_modified(&claude_second, 2);
+
+    let rows = catalog.scan(&[SessionSourceKind::Codex, SessionSourceKind::Claude]);
+    assert_eq!(rows.len(), SESSION_CATALOG_ROW_LIMIT);
+    assert!(rows.iter().any(|row| row.session_id == "claude-second"));
+    assert!(!rows.iter().any(|row| row.session_id == "claude-sentinel"));
+    assert!(rows.iter().any(|row| row.session_id == "codex-0515"));
+    assert_eq!(rows.iter().filter(|row| row.kind == SessionSourceKind::Claude).count(), 1);
+    assert!(!rows.iter().any(|row| row.path == corrupt));
+    #[cfg(unix)]
+    assert!(!rows.iter().any(|row| row.path.ends_with("rollout-symlink-newest.jsonl")));
+    assert!(!rows.iter().any(|row| row.session_id == "codex-0000"));
+}
+
+#[test]
+fn finished_row_adapters_cap_with_stable_path_ties() {
+    let rows = (0..SESSION_CATALOG_ROW_LIMIT + 2)
+        .map(synthetic_row)
+        .collect::<Vec<_>>();
+    let deduped = SessionCatalog::dedupe_rows(&rows);
+    assert_eq!(deduped.len(), SESSION_CATALOG_ROW_LIMIT);
+    assert_eq!(deduped.first().expect("first").session_id, "synthetic-0000");
+    assert_eq!(
+        deduped.last().expect("last").session_id,
+        format!("synthetic-{:04}", SESSION_CATALOG_ROW_LIMIT - 1)
+    );
+
+    let named = SessionCatalog::sort_rows(rows, CatalogSort::Name);
+    assert_eq!(named.len(), SESSION_CATALOG_ROW_LIMIT);
+    assert_eq!(named.first().expect("first").session_id, "synthetic-0000");
+}
+
+#[test]
+fn list_and_search_share_bounded_universe_before_cwd_filtering() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    for index in 0..SESSION_CATALOG_ROW_LIMIT + 1 {
+        let cwd = if index == SESSION_CATALOG_ROW_LIMIT {
+            "/tmp/other"
+        } else {
+            "/tmp/wanted"
+        };
+        let path = write_codex(
+            &catalog,
+            &format!("rollout-shared-{index:04}.jsonl"),
+            &format!("shared-{index:04}"),
+            cwd,
+            "bounded-universe-token",
+        );
+        set_modified(&path, index as u64 + 1);
+    }
+    let options = CatalogListOptions {
+        sources: vec![SessionSourceKind::Codex],
+        include_foreign: true,
+        cwd_scope: Some(PathBuf::from("/tmp/wanted")),
+        ..CatalogListOptions::default()
+    };
+    let listed = catalog.list(&options);
+    let searched = catalog
+        .search(
+            "bounded-universe-token",
+            &CatalogSearchOptions {
+                sources: options.sources.clone(),
+                include_foreign: true,
+                cwd_scope: options.cwd_scope.clone(),
+                ..CatalogSearchOptions::default()
+            },
+        )
+        .expect("search");
+    let unscoped_listed = catalog.list(&CatalogListOptions {
+        cwd_scope: None,
+        ..options.clone()
+    });
+    let unscoped_searched = catalog
+        .search(
+            "bounded-universe-token",
+            &CatalogSearchOptions {
+                sources: options.sources.clone(),
+                include_foreign: true,
+                cwd_scope: None,
+                ..CatalogSearchOptions::default()
+            },
+        )
+        .expect("unscoped search");
+    let listed_ids = listed.iter().map(|row| &row.session_id).collect::<Vec<_>>();
+    let searched_ids = searched.iter().map(|row| &row.session_id).collect::<Vec<_>>();
+    assert_eq!(listed_ids, searched_ids);
+    assert_eq!(listed.len(), SESSION_CATALOG_ROW_LIMIT - 1);
+    assert!(!listed.iter().any(|row| row.session_id == "shared-0000"));
+    assert!(!listed.iter().any(|row| row.session_id == "shared-0512"));
+    assert!(!searched.iter().any(|row| row.session_id == "shared-0512"));
+    assert!(unscoped_listed.iter().any(|row| row.session_id == "shared-0512"));
+    assert!(unscoped_searched.iter().any(|row| row.session_id == "shared-0512"));
+}
+
+#[test]
+fn walk_budget_counts_junk_entries_before_candidate_filtering() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let root = catalog.root_for(SessionSourceKind::Droid).path;
+    fs::create_dir_all(&root).expect("droid root");
+    for index in 0..SESSION_CATALOG_WALK_ENTRY_LIMIT {
+        let path = root.join(format!("junk-{index:05}"));
+        if index % 2 == 0 {
+            fs::create_dir(&path).expect("junk directory");
+        } else {
+            fs::write(path.with_extension("txt"), b"junk").expect("junk file");
+        }
+    }
+    let sentinel = write_droid(&catalog, "zzzzz-sentinel", "/tmp/droid");
+    set_modified(&sentinel, 100_000);
+    let walked = catalog
+        .walk_source_entries(SessionSourceKind::Droid)
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    assert_eq!(walked.len(), SESSION_CATALOG_WALK_ENTRY_LIMIT);
+    let discovered = catalog.discover(SessionSourceKind::Droid);
+    assert_eq!(discovered.contains(&sentinel), walked.contains(&sentinel));
+    assert!(discovered.len() <= 1, "junk must never become a candidate");
+}
 #[test]
 fn fuzzy_search_matches_summary_and_source() {
     let fixture = Fixture::new();

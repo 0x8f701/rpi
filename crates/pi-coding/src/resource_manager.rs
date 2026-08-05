@@ -13,8 +13,8 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::prompt_templates::{LoadPromptTemplatesOptions, PromptTemplate, load_prompt_templates};
 use crate::resources::{
-    CONFIG_DIR_NAME, Skill, agent_dir_path, load_context_files,
-    load_skills_trusted_from_agent_dir,
+    CONFIG_DIR_NAME, Skill, SkillDiagnostic, agent_dir_path, home_dir, load_context_files,
+    load_skills_from_dir,
 };
 use crate::settings::{DefaultProjectTrust, Settings, SettingsManager};
 use crate::system_prompt::ContextFile;
@@ -51,12 +51,19 @@ pub struct ResourcePaths {
 impl ResourcePaths {
     #[must_use]
     pub fn discover(cwd: impl AsRef<Path>, project_trusted: bool) -> Self {
-        let cwd = cwd.as_ref();
-        let agent_dir = agent_dir_path();
-        let project_dir = cwd.join(CONFIG_DIR_NAME);
+        Self::discover_from_agent_dir(cwd.as_ref(), &agent_dir_path(), project_trusted)
+    }
+
+    fn discover_from_agent_dir(cwd: &Path, agent_dir: &Path, project_trusted: bool) -> Self {
+        let skill_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let project_dir = skill_cwd.join(CONFIG_DIR_NAME);
+        let skill_paths = discover_skill_roots(cwd, agent_dir, project_trusted)
+            .into_iter()
+            .map(|root| root.path)
+            .collect();
         let mut paths = Self {
-            context_roots: vec![agent_dir.clone()],
-            skill_paths: vec![agent_dir.join("skills")],
+            context_roots: vec![agent_dir.to_path_buf()],
+            skill_paths,
             prompt_paths: vec![agent_dir.join("prompts")],
             theme_dirs: vec![agent_dir.join("themes")],
             keybinding_files: vec![agent_dir.join("keybindings.json")],
@@ -65,7 +72,6 @@ impl ResourcePaths {
         };
         if project_trusted {
             paths.context_roots.push(cwd.to_path_buf());
-            paths.skill_paths.push(project_dir.join("skills"));
             paths.prompt_paths.push(project_dir.join("prompts"));
             paths.theme_dirs.push(project_dir.join("themes"));
             paths.keybinding_files.push(project_dir.join("keybindings.json"));
@@ -73,6 +79,179 @@ impl ResourcePaths {
             paths.append_system_prompt_files.insert(0, project_dir.join("APPEND_SYSTEM.md"));
         }
         paths
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SkillRoot {
+    path: PathBuf,
+    source: crate::SkillSource,
+}
+
+fn discover_skill_roots(cwd: &Path, agent_dir: &Path, project_trusted: bool) -> Vec<SkillRoot> {
+    let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let project_boundary = canonical_cwd
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .unwrap_or(&canonical_cwd)
+        .to_path_buf();
+    let mut roots = vec![SkillRoot {
+        path: agent_dir.join("skills"),
+        source: crate::SkillSource::User,
+    }];
+    let configured_home = home_from_agent_dir(agent_dir).map(Path::to_path_buf);
+    let configured_candidate = configured_home
+        .as_ref()
+        .map(|home| home.join(".agents").join("skills"));
+    let configured_is_project = configured_candidate.as_ref().is_some_and(|path| {
+        fs::canonicalize(path)
+            .unwrap_or_else(|_| path.clone())
+            .starts_with(&project_boundary)
+    });
+    if !configured_is_project
+        && let Some(path) = configured_candidate
+    {
+        push_skill_root(
+            &mut roots,
+            path,
+            crate::SkillSource::User,
+            &project_boundary,
+            project_trusted,
+        );
+    } else if let Some(home) = platform_home_dir() {
+        push_skill_root(
+            &mut roots,
+            home.join(".agents").join("skills"),
+            crate::SkillSource::User,
+            &project_boundary,
+            project_trusted,
+        );
+    }
+    if project_trusted {
+        for ancestor in trusted_project_ancestors(&canonical_cwd) {
+            push_skill_root(
+                &mut roots,
+                ancestor.join(".agents").join("skills"),
+                crate::SkillSource::Project,
+                &project_boundary,
+                true,
+            );
+        }
+        push_skill_root(
+            &mut roots,
+            canonical_cwd.join(CONFIG_DIR_NAME).join("skills"),
+            crate::SkillSource::Project,
+            &project_boundary,
+            true,
+        );
+    }
+    roots
+}
+
+fn push_skill_root(
+    roots: &mut Vec<SkillRoot>,
+    path: PathBuf,
+    source: crate::SkillSource,
+    project_boundary: &Path,
+    project_trusted: bool,
+) -> bool {
+    let target = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let source = if target.starts_with(project_boundary) {
+        if !project_trusted {
+            return false;
+        }
+        crate::SkillSource::Project
+    } else {
+        source
+    };
+    if let Some(index) = roots.iter().position(|root| same_path(&root.path, &path)) {
+        let existing = roots.remove(index);
+        roots.push(SkillRoot {
+            path,
+            source: if source == crate::SkillSource::Project {
+                source
+            } else {
+                existing.source
+            },
+        });
+        return true;
+    }
+    roots.push(SkillRoot { path, source });
+    true
+}
+
+fn home_from_agent_dir(agent_dir: &Path) -> Option<&Path> {
+    let pi_dir = agent_dir.parent()?;
+    (agent_dir.file_name()? == "agent" && pi_dir.file_name()? == CONFIG_DIR_NAME)
+        .then(|| pi_dir.parent())
+        .flatten()
+}
+
+fn platform_home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = RESOURCE_HOME_OVERRIDE.with(|override_home| override_home.borrow().clone()) {
+        return Some(home);
+    }
+    home_dir().map(PathBuf::from)
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESOURCE_HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+fn trusted_project_ancestors(cwd: &Path) -> Vec<PathBuf> {
+    let Ok(cwd) = fs::canonicalize(cwd) else {
+        return vec![cwd.to_path_buf()];
+    };
+    let git_root = cwd
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists());
+    let Some(git_root) = git_root else {
+        return vec![cwd];
+    };
+    let mut ancestors = cwd
+        .ancestors()
+        .take_while(|ancestor| *ancestor != git_root)
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    ancestors.push(git_root.to_path_buf());
+    ancestors.reverse();
+    ancestors
+}
+
+fn load_default_skills(
+    roots: &[SkillRoot],
+) -> (Vec<Skill>, Vec<SkillDiagnostic>) {
+    let mut skills = Vec::new();
+    let mut skill_indexes = BTreeMap::<String, usize>::new();
+    let mut diagnostics = Vec::new();
+    for root in roots {
+        let (found, found_diagnostics) =
+            load_skills_from_dir(&root.path.to_string_lossy(), root.source, true);
+        diagnostics.extend(found_diagnostics);
+        let mut root_names = BTreeMap::new();
+        for skill in found {
+            if root_names.insert(skill.name.clone(), ()).is_some() {
+                continue;
+            }
+            if let Some(index) = skill_indexes.get(&skill.name).copied() {
+                skills[index] = skill;
+            } else {
+                skill_indexes.insert(skill.name.clone(), skills.len());
+                skills.push(skill);
+            }
+        }
+    }
+    (skills, diagnostics)
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
     }
 }
 
@@ -322,7 +501,11 @@ fn build_candidate(
     })?
     .agents()
     .to_vec();
-    let paths = ResourcePaths::discover(&options.cwd, project_trusted);
+    let paths = ResourcePaths::discover_from_agent_dir(
+        &options.cwd,
+        &options.agent_dir,
+        project_trusted,
+    );
     let packages = crate::PackageManager::with_agent_dir(
         &options.cwd,
         &options.agent_dir,
@@ -338,7 +521,12 @@ fn build_candidate(
     let (mut skills, skill_diagnostics) = if options.disable_skills {
         (Vec::new(), Vec::new())
     } else {
-        load_skills_trusted_from_agent_dir(&cwd_text, &options.agent_dir, project_trusted)
+        let skill_roots = discover_skill_roots(
+            &options.cwd,
+            &options.agent_dir,
+            project_trusted,
+        );
+        load_default_skills(&skill_roots)
     };
     let mut diagnostics = skill_diagnostics
         .into_iter()
@@ -809,4 +997,405 @@ fn load_first_existing(paths: &[PathBuf], description: &str) -> Result<Option<St
 
 fn resolve_explicit(cwd: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{RESOURCE_HOME_OVERRIDE, ResourceManager, ResourceManagerOptions, ResourcePaths};
+    use std::fs;
+
+    #[test]
+    fn resource_paths_order_global_ancestors_then_project() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let repository = root.path().join("work").join("repository");
+        let cwd = repository.join("crates").join("pi-coding");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        let agent_dir = home.join(".pi").join("agent");
+
+        let paths = ResourcePaths::discover_from_agent_dir(&cwd, &agent_dir, true);
+
+        assert_eq!(
+            paths.skill_paths,
+            vec![
+                agent_dir.join("skills"),
+                home.join(".agents").join("skills"),
+                repository.join(".agents").join("skills"),
+                repository.join("crates").join(".agents").join("skills"),
+                cwd.join(".agents").join("skills"),
+                cwd.join(".pi").join("skills"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_paths_exclude_all_project_roots_when_untrusted() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let cwd = root.path().join("repository").join("nested");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir(root.path().join("repository").join(".git")).expect("git directory");
+        let agent_dir = home.join(".pi").join("agent");
+
+        let paths = ResourcePaths::discover_from_agent_dir(&cwd, &agent_dir, false);
+
+        assert_eq!(
+            paths.skill_paths,
+            vec![agent_dir.join("skills"), home.join(".agents").join("skills")]
+        );
+    }
+
+    #[test]
+    fn resource_paths_stop_at_nearest_git_root_including_git_file() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let outer = root.path().join("outer");
+        let repository = outer.join("repository");
+        let cwd = repository.join("nested");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(outer.join(".git")).expect("outer git directory");
+        fs::write(repository.join(".git"), "gitdir: elsewhere").expect("git file");
+        let agent_dir = root.path().join("home").join(".pi").join("agent");
+
+        let paths = ResourcePaths::discover_from_agent_dir(&cwd, &agent_dir, true);
+
+        assert!(paths.skill_paths.contains(&repository.join(".agents").join("skills")));
+        assert!(paths.skill_paths.contains(&cwd.join(".agents").join("skills")));
+        assert!(!paths.skill_paths.contains(&outer.join(".agents").join("skills")));
+        assert!(!paths.skill_paths.contains(&root.path().join(".agents").join("skills")));
+    }
+
+    #[test]
+    fn resource_paths_without_git_root_use_only_cwd_and_deduplicate() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        fs::create_dir_all(&home).expect("home directory");
+        let agent_dir = home.join(".pi").join("agent");
+
+        let paths = RESOURCE_HOME_OVERRIDE.with(|override_home| {
+            let previous = override_home.replace(Some(home.clone()));
+            let paths = ResourcePaths::discover_from_agent_dir(&home, &agent_dir, true);
+            override_home.replace(previous);
+            paths
+        });
+
+        assert_eq!(
+            paths.skill_paths,
+            vec![
+                agent_dir.join("skills"),
+                home.join(".agents").join("skills"),
+                home.join(".pi").join("skills"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_paths_without_git_exclude_cwd_agents_when_untrusted() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let platform_home = root.path().join("platform-home");
+        let cwd = root.path().join("project");
+        let agent_dir = cwd.join(".pi").join("agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+
+        let paths = RESOURCE_HOME_OVERRIDE.with(|override_home| {
+            let previous = override_home.replace(Some(platform_home.clone()));
+            let paths = ResourcePaths::discover_from_agent_dir(&cwd, &agent_dir, false);
+            override_home.replace(previous);
+            paths
+        });
+
+        assert_eq!(
+            paths.skill_paths,
+            vec![
+                agent_dir.join("skills"),
+                platform_home.join(".agents").join("skills"),
+            ]
+        );
+        assert!(!paths.skill_paths.contains(&cwd.join(".agents").join("skills")));
+    }
+
+    fn write_skill(root: &std::path::Path, name: &str) {
+        write_skill_with_description(root, name, &format!("{name} skill"));
+    }
+
+    fn write_skill_with_description(root: &std::path::Path, name: &str, description: &str) {
+        fs::create_dir_all(root).expect("skill directory");
+        fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n"),
+        )
+        .expect("skill markdown");
+    }
+
+    #[test]
+    fn resource_manager_snapshot_loads_global_and_ancestor_agents_skills() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let repository = root.path().join("repository");
+        let cwd = repository.join("nested");
+        let agent_dir = home.join(".pi").join("agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        write_skill(&home.join(".agents").join("skills").join("global"), "global-agents");
+        write_skill(
+            &repository.join(".agents").join("skills").join("repository"),
+            "repository-agents",
+        );
+        write_skill(&cwd.join(".agents").join("skills").join("nested"), "nested-agents");
+        write_skill(&cwd.join(".pi").join("skills").join("project"), "project-pi");
+        let mut options = ResourceManagerOptions::new(&cwd);
+        options.agent_dir = agent_dir;
+        options.project_trust_override = Some(true);
+
+        let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+        let names = snapshot.skills.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>();
+
+        assert!(names.contains(&"global-agents"), "{names:?}");
+        assert!(names.contains(&"repository-agents"), "{names:?}");
+        assert!(names.contains(&"nested-agents"), "{names:?}");
+        assert!(names.contains(&"project-pi"), "{names:?}");
+    }
+    #[test]
+    fn resource_paths_do_not_treat_project_agent_dir_parent_as_global_home() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let repository = root.path().join("repository");
+        let cwd = repository.join("nested");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        let agent_dir = repository.join(".pi").join("agent");
+        let paths = ResourcePaths::discover_from_agent_dir(&cwd, &agent_dir, false);
+
+        assert_eq!(paths.skill_paths.first(), Some(&agent_dir.join("skills")));
+        assert!(!paths.skill_paths.contains(&repository.join(".agents").join("skills")));
+    }
+
+    #[test]
+    fn project_local_agent_dir_uses_platform_global_skills_when_untrusted() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let platform_home = root.path().join("real-home");
+        let repository = root.path().join("repository");
+        let cwd = repository.join("nested");
+        let agent_dir = repository.join(".pi").join("agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        write_skill(&platform_home.join(".agents/skills/global"), "global-agents");
+        write_skill(&repository.join(".agents/skills/project"), "project-agents");
+
+        RESOURCE_HOME_OVERRIDE.with(|override_home| {
+            let previous = override_home.replace(Some(platform_home.clone()));
+            let mut options = ResourceManagerOptions::new(&cwd);
+            options.agent_dir = agent_dir.clone();
+            options.project_trust_override = Some(false);
+            let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+            override_home.replace(previous);
+            let names = snapshot.skills.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>();
+
+            assert_eq!(snapshot.skills.first().map(|skill| skill.name.as_str()), Some("global-agents"));
+            assert!(names.contains(&"global-agents"), "{names:?}");
+            assert!(!names.contains(&"project-agents"), "{names:?}");
+        });
+    }
+    #[test]
+    fn resource_manager_snapshot_excludes_untrusted_ancestor_agents_skills() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let repository = root.path().join("repository");
+        let cwd = repository.join("nested");
+        let agent_dir = home.join(".pi").join("agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        write_skill(&home.join(".agents").join("skills").join("global"), "global-agents");
+        write_skill(
+            &repository.join(".agents").join("skills").join("repository"),
+            "repository-agents",
+        );
+        let mut options = ResourceManagerOptions::new(&cwd);
+        options.agent_dir = agent_dir;
+        options.project_trust_override = Some(false);
+
+        let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+        let names = snapshot.skills.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>();
+
+        assert!(names.contains(&"global-agents"), "{names:?}");
+        assert!(!names.contains(&"repository-agents"), "{names:?}");
+    }
+
+    #[test]
+    fn resource_manager_snapshot_prefers_project_pi_for_duplicate_skill_name() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let repository = root.path().join("repository");
+        let cwd = repository.join("nested");
+        let agent_dir = home.join(".pi").join("agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        write_skill_with_description(&home.join(".agents/skills/shared"), "shared", "global");
+        write_skill_with_description(&repository.join(".agents/skills/shared"), "shared", "ancestor");
+        write_skill_with_description(&cwd.join(".agents/skills/shared"), "shared", "deepest");
+        write_skill_with_description(&cwd.join(".pi/skills/shared"), "shared", "project pi");
+        let mut options = ResourceManagerOptions::new(&cwd);
+        options.agent_dir = agent_dir;
+        options.project_trust_override = Some(true);
+
+        let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+        let shared = snapshot.skills.iter().find(|skill| skill.name == "shared").expect("shared");
+
+        assert_eq!(shared.description, "project pi");
+        assert_eq!(shared.source, crate::SkillSource::Project);
+        assert_eq!(snapshot.skills.iter().filter(|skill| skill.name == "shared").count(), 1);
+    }
+
+    #[test]
+    fn resource_manager_snapshot_prefers_deepest_agents_skill() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let repository = root.path().join("repository");
+        let cwd = repository.join("nested");
+        let agent_dir = root.path().join("home/.pi/agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        write_skill_with_description(&repository.join(".agents/skills/shared"), "shared", "shallow");
+        write_skill_with_description(&cwd.join(".agents/skills/shared"), "shared", "deepest");
+        let mut options = ResourceManagerOptions::new(&cwd);
+        options.agent_dir = agent_dir;
+        options.project_trust_override = Some(true);
+
+        let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+        let shared = snapshot.skills.iter().find(|skill| skill.name == "shared").expect("shared");
+
+        assert_eq!(shared.description, "deepest");
+        assert_eq!(snapshot.skills.iter().filter(|skill| skill.name == "shared").count(), 1);
+    }
+
+    #[test]
+    fn overlapping_platform_home_agents_obeys_project_trust_and_source() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let cwd = root.path().join("project");
+        let agent_dir = cwd.join(".pi/agent");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        write_skill(&cwd.join(".agents/skills/overlap"), "overlap");
+
+        RESOURCE_HOME_OVERRIDE.with(|override_home| {
+            let previous = override_home.replace(Some(cwd.clone()));
+            let mut untrusted = ResourceManagerOptions::new(&cwd);
+            untrusted.agent_dir = agent_dir.clone();
+            untrusted.project_trust_override = Some(false);
+            let untrusted = ResourceManager::new(untrusted).expect("untrusted manager").snapshot();
+            assert!(!untrusted.skills.iter().any(|skill| skill.name == "overlap"));
+
+            let mut trusted = ResourceManagerOptions::new(&cwd);
+            trusted.agent_dir = agent_dir.clone();
+            trusted.project_trust_override = Some(true);
+            let trusted = ResourceManager::new(trusted).expect("trusted manager").snapshot();
+            override_home.replace(previous);
+            let overlap = trusted.skills.iter().find(|skill| skill.name == "overlap").expect("overlap");
+            assert_eq!(overlap.source, crate::SkillSource::Project);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn platform_global_agents_symlink_into_project_is_excluded_when_untrusted() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let platform_home = root.path().join("home");
+        let repository = root.path().join("repository");
+        let cwd = repository.join("nested");
+        let agent_dir = platform_home.join(".pi/agent");
+        let project_agents = repository.join(".agents/skills");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        write_skill(&project_agents.join("linked"), "linked-project");
+        fs::create_dir_all(platform_home.join(".agents")).expect("global agents parent");
+        symlink(&project_agents, platform_home.join(".agents/skills")).expect("skills symlink");
+
+        RESOURCE_HOME_OVERRIDE.with(|override_home| {
+            let previous = override_home.replace(Some(platform_home.clone()));
+            let mut options = ResourceManagerOptions::new(&cwd);
+            options.agent_dir = agent_dir.clone();
+            options.project_trust_override = Some(false);
+            let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+            override_home.replace(previous);
+            assert!(!snapshot.skills.iter().any(|skill| skill.name == "linked-project"));
+        });
+    }
+
+    #[test]
+    fn aliased_global_root_keeps_deepest_project_precedence() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let repository = root.path().join("repository");
+        let cwd = repository.join("nested");
+        let agent_dir = root.path().join("agent-home/.pi/agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        write_skill_with_description(
+            &repository.join(".agents/skills/shared"),
+            "shared",
+            "shallow",
+        );
+        write_skill_with_description(
+            &cwd.join(".agents/skills/shared"),
+            "shared",
+            "deepest",
+        );
+
+        RESOURCE_HOME_OVERRIDE.with(|override_home| {
+            let previous = override_home.replace(Some(cwd.clone()));
+            let mut options = ResourceManagerOptions::new(&cwd);
+            options.agent_dir = agent_dir.clone();
+            options.project_trust_override = Some(true);
+            let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+            override_home.replace(previous);
+            let shared = snapshot.skills.iter().find(|skill| skill.name == "shared").expect("shared");
+
+            assert_eq!(shared.description, "deepest");
+            assert_eq!(shared.source, crate::SkillSource::Project);
+        });
+    }
+
+    #[test]
+    fn trusted_project_local_agent_dir_keeps_platform_global_and_project_agents() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let platform_home = root.path().join("home");
+        let repository = root.path().join("repository");
+        let cwd = repository.join("nested");
+        let agent_dir = repository.join(".pi/agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(repository.join(".git")).expect("git directory");
+        write_skill_with_description(
+            &platform_home.join(".agents/skills/shared"),
+            "shared",
+            "platform user",
+        );
+        write_skill_with_description(
+            &repository.join(".agents/skills/shared"),
+            "shared",
+            "repository project",
+        );
+        write_skill(&platform_home.join(".agents/skills/global-only"), "global-only");
+
+        RESOURCE_HOME_OVERRIDE.with(|override_home| {
+            let previous = override_home.replace(Some(platform_home.clone()));
+            let mut options = ResourceManagerOptions::new(&cwd);
+            options.agent_dir = agent_dir.clone();
+            options.project_trust_override = Some(true);
+            let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+            override_home.replace(previous);
+            let shared = snapshot.skills.iter().find(|skill| skill.name == "shared").expect("shared");
+
+            assert!(snapshot.skills.iter().any(|skill| skill.name == "global-only"));
+            assert_eq!(shared.description, "repository project");
+            assert_eq!(shared.source, crate::SkillSource::Project);
+        });
+    }
 }

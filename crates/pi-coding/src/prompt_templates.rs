@@ -106,7 +106,7 @@ pub fn load_prompt_templates(options: &LoadPromptTemplatesOptions) -> Result<Vec
             bail!("prompt template path is not a markdown file or directory: {}", path.display());
         }
     }
-    dedupe_templates(templates)
+    Ok(dedupe_templates(templates))
 }
 
 fn load_templates_from_dir(
@@ -169,22 +169,27 @@ fn load_template_from_file(path: &Path, scope: ResourceScope) -> Result<PromptTe
     })
 }
 
-fn dedupe_templates(templates: Vec<PromptTemplate>) -> Result<Vec<PromptTemplate>> {
-    let mut by_name = BTreeMap::<String, PathBuf>::new();
-    let mut deduped = Vec::with_capacity(templates.len());
-    for template in templates {
-        if let Some(winner) = by_name.get(&template.name) {
-            bail!(
-                "prompt template /{} collision: {} conflicts with {}",
-                template.name,
-                template.file_path.display(),
-                winner.display()
-            );
-        }
-        by_name.insert(template.name.clone(), template.file_path.clone());
-        deduped.push(template);
+fn dedupe_templates(templates: Vec<PromptTemplate>) -> Vec<PromptTemplate> {
+    // Later-loaded templates shadow earlier ones with the same name, matching
+    // upstream behavior. The shadowing (later) template keeps its own position
+    // and the earlier duplicate is dropped, so only one command is emitted per
+    // name. Load order is global prompts, then project prompts, then explicit
+    // paths, so project/explicit templates override global ones of the same name.
+    let mut last_index = BTreeMap::<String, usize>::new();
+    for (index, template) in templates.iter().enumerate() {
+        last_index.insert(template.name.clone(), index);
     }
-    Ok(deduped)
+    templates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, template)| {
+            if last_index.get(&template.name) == Some(&index) {
+                Some(template)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Parse command arguments with the original prompt-template quoting rules.
@@ -385,4 +390,82 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 
 fn is_under(target: &Path, root: &Path) -> bool {
     target == root || target.starts_with(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn template(name: &str, content: &str, scope: ResourceScope, file_path: &str) -> PromptTemplate {
+        PromptTemplate {
+            name: name.to_owned(),
+            description: String::new(),
+            argument_hint: None,
+            content: content.to_owned(),
+            file_path: PathBuf::from(file_path),
+            scope,
+        }
+    }
+
+    #[test]
+    fn no_duplicates_preserves_order_and_content() {
+        let templates = vec![
+            template("alpha", "a", ResourceScope::Global, "/g/alpha.md"),
+            template("beta", "b", ResourceScope::Project, "/p/beta.md"),
+            template("gamma", "c", ResourceScope::Explicit, "/e/gamma.md"),
+        ];
+        let deduped = dedupe_templates(templates);
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(deduped[0].name, "alpha");
+        assert_eq!(deduped[1].name, "beta");
+        assert_eq!(deduped[2].name, "gamma");
+        assert_eq!(deduped[0].content, "a");
+        assert_eq!(deduped[1].content, "b");
+        assert_eq!(deduped[2].content, "c");
+    }
+
+    #[test]
+    fn later_duplicate_shadows_earlier_at_later_position() {
+        let templates = vec![
+            template("shared", "global-content", ResourceScope::Global, "/g/shared.md"),
+            template("other", "other-content", ResourceScope::Global, "/g/other.md"),
+            template("shared", "explicit-content", ResourceScope::Explicit, "/e/shared.md"),
+        ];
+        let deduped = dedupe_templates(templates);
+        assert_eq!(deduped.len(), 2);
+        // The later-loaded "shared" wins and occupies the later position; the
+        // earlier global "shared" is dropped, so only one command is emitted.
+        assert_eq!(deduped[0].name, "other");
+        assert_eq!(deduped[1].name, "shared");
+        assert_eq!(deduped[1].content, "explicit-content");
+        assert_eq!(deduped[1].scope, ResourceScope::Explicit);
+        assert_eq!(deduped[1].file_path, PathBuf::from("/e/shared.md"));
+    }
+
+    #[test]
+    fn same_scope_duplicate_uses_the_later_template() {
+        let templates = vec![
+            template("review", "first", ResourceScope::Explicit, "/a/review.md"),
+            template("review", "second", ResourceScope::Explicit, "/b/review.md"),
+        ];
+        let deduped = dedupe_templates(templates);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].content, "second");
+        assert_eq!(deduped[0].file_path, PathBuf::from("/b/review.md"));
+    }
+
+    #[test]
+    fn project_template_shadows_global_of_same_name() {
+        let templates = vec![
+            template("deploy", "global deploy", ResourceScope::Global, "/g/deploy.md"),
+            template("deploy", "project deploy", ResourceScope::Project, "/p/deploy.md"),
+        ];
+        let deduped = dedupe_templates(templates);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].name, "deploy");
+        assert_eq!(deduped[0].content, "project deploy");
+        assert_eq!(deduped[0].scope, ResourceScope::Project);
+        assert_eq!(deduped[0].file_path, PathBuf::from("/p/deploy.md"));
+    }
 }

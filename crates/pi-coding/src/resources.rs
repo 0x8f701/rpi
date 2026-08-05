@@ -92,7 +92,7 @@ pub fn agent_dir_path() -> PathBuf {
 
 /// Best-effort home directory (HOME on Unix, USERPROFILE on Windows), mirroring
 /// Go's `os.UserHomeDir`.
-fn home_dir() -> Option<String> {
+pub(crate) fn home_dir() -> Option<String> {
     // Test-only override (parallel-safe, no global env mutation).
     HOME_OVERRIDE.with(|o| o.borrow().clone())
         .or_else(|| env_home("HOME"))
@@ -488,7 +488,7 @@ pub struct SkillDiagnostic {
 /// - honor `.gitignore`/`.ignore`/`.fdignore`, skip `node_modules`, follow
 ///   symlinks but realpath-dedup so a symlink loop or duplicate target is visited
 ///   once.
-fn load_skills_from_dir(
+pub(crate) fn load_skills_from_dir(
     dir: &str,
     source: SkillSource,
     trusted: bool,

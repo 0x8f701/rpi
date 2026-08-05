@@ -156,15 +156,19 @@ pub enum LoopSchedulerError {
     #[error("failed to persist loop scheduler state: {0}")] Persistence(#[source] std::io::Error),
     #[error("failed to decode loop scheduler state: {0}")] Decode(#[source] serde_json::Error),
 }
-
 /// Validated target loop sidecar ready for an atomic session cutover.
 ///
 /// Built by [`prepare_loop_activation`] before any active-actor mutation so
 /// target decode failures cannot strand the current session mid-switch.
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedLoopActivation {
+pub struct PreparedLoopActivation {
     storage_path: Option<PathBuf>,
-    state: PersistedLoopState,
+    tasks: Vec<LoopTask>,
+    events: Vec<LoopEvent>,
+}
+
+pub struct PreparedLoopSessionSwitch {
+    activation: PreparedLoopActivation,
 }
 
 /// Read and decode the target session's loop sidecar without touching the actor.
@@ -174,6 +178,20 @@ pub(crate) struct PreparedLoopActivation {
 pub(crate) async fn prepare_loop_activation(
     session_file: Option<&Path>,
 ) -> Result<PreparedLoopActivation, LoopSchedulerError> {
+    prepare_loop_activation_at(session_file, Utc::now()).await
+}
+
+/// Clock-aware core of [`prepare_loop_activation`].
+///
+/// Expiry partitioning is driven by the supplied `now` so the result is
+/// consistent with whatever clock the loop actor will install under. Production
+/// callers pass `Utc::now()` via the wrapper; tests pinned to a [`ManualClock`]
+/// pass that clock's `now` so a target seeded with a fixed expiry is not
+/// classified as expired by the real wall clock.
+async fn prepare_loop_activation_at(
+    session_file: Option<&Path>,
+    now: DateTime<Utc>,
+) -> Result<PreparedLoopActivation, LoopSchedulerError> {
     let storage_path = session_file.map(loop_state_path);
     let state = match &storage_path {
         Some(path) => load_loop_state(path).await?,
@@ -182,11 +200,36 @@ pub(crate) async fn prepare_loop_activation(
             tasks: Vec::new(),
         },
     };
-    Ok(PreparedLoopActivation { storage_path, state })
+    let (expired_tasks, tasks): (Vec<_>, Vec<_>) =
+        state.tasks.into_iter().partition(|task| task.is_expired(now));
+    let mut events = expired_tasks
+        .into_iter()
+        .map(|task| LoopEvent::Removed {
+            task_id: task.id,
+            reason: LoopRemovalReason::Expired,
+        })
+        .collect::<Vec<_>>();
+    events.extend(tasks.iter().cloned().map(|task| LoopEvent::Created {
+        task,
+        restored: true,
+    }));
+    Ok(PreparedLoopActivation {
+        storage_path,
+        tasks,
+        events,
+    })
+}
+
+pub(crate) fn prepare_loop_session_switch(
+    activation: PreparedLoopActivation,
+) -> PreparedLoopSessionSwitch {
+    PreparedLoopSessionSwitch { activation }
 }
 
 #[derive(Clone)]
-pub struct LoopSchedulerHandle { commands: mpsc::UnboundedSender<LoopCommand> }
+pub struct LoopSchedulerHandle {
+    commands: mpsc::UnboundedSender<LoopCommand>,
+}
 impl LoopSchedulerHandle {
     pub async fn create(&self, request: LoopCreateRequest) -> Result<LoopTask, LoopSchedulerError> { let (reply, response) = oneshot::channel(); self.send(LoopCommand::Create { request, reply })?; receive(response).await }
     pub async fn update(&self, request: LoopUpdateRequest) -> Result<LoopTask, LoopSchedulerError> { let (reply, response) = oneshot::channel(); self.send(LoopCommand::Update { request, reply })?; receive(response).await }
@@ -194,6 +237,12 @@ impl LoopSchedulerHandle {
     pub async fn delete(&self, task_id: &str) -> Result<bool, LoopSchedulerError> { self.delete_inner(task_id, false).await }
     pub async fn cancel(&self, task_id: &str) -> Result<bool, LoopSchedulerError> { self.delete_inner(task_id, true).await }
     async fn delete_inner(&self, task_id: &str, cancel_active: bool) -> Result<bool, LoopSchedulerError> { let (reply, response) = oneshot::channel(); self.send(LoopCommand::Delete { task_id: task_id.to_owned(), cancel_active, reply })?; receive(response).await }
+    /// Cancel the active iteration in-flight without removing the loop task.
+    /// Returns `true` when an active run was cancelled, `false` when none was
+    /// running. Used by `Application::abort` so a user Esc during a loop-owned
+    /// turn settles as a cancellation (`RunResult::Cancelled`, silent — the loop
+    /// remains scheduled) instead of a failure (`LoopEvent::Failed` toast).
+    pub async fn cancel_active_iteration(&self) -> Result<bool, LoopSchedulerError> { let (reply, response) = oneshot::channel(); self.send(LoopCommand::CancelActive { reply })?; receive(response).await }
     pub(crate) async fn suspend(&self, reason: LoopRemovalReason) -> Result<(), LoopSchedulerError> { let (reply, response) = oneshot::channel(); self.send(LoopCommand::Suspend { reason, reply })?; receive(response).await }
     pub(crate) async fn activate(&self, session_file: Option<PathBuf>) -> Result<(), LoopSchedulerError> { let (reply, response) = oneshot::channel(); self.send(LoopCommand::Activate { storage_path: session_file.as_deref().map(loop_state_path), reply })?; receive(response).await }
     /// Atomically cut over to a previously prepared target session sidecar.
@@ -210,6 +259,26 @@ impl LoopSchedulerHandle {
         let (reply, response) = oneshot::channel();
         self.send(LoopCommand::SwitchSession { prepared, reason, reply })?;
         receive(response).await
+    }
+    /// Persist and quiesce the current session before any external live-state
+    /// mutation. The target is already decoded; after this succeeds, activation
+    /// is an infallible actor message and in-memory install.
+    pub(crate) async fn prepare_session_switch(
+        &self,
+        prepared: PreparedLoopSessionSwitch,
+        reason: LoopRemovalReason,
+    ) -> Result<PreparedLoopActivation, LoopSchedulerError> {
+        self.suspend(reason).await?;
+        Ok(prepared.activation)
+    }
+
+    pub(crate) fn restore_prepared_session(&self, prepared: PreparedLoopActivation) {
+        self.commit_prepared_session_switch(prepared);
+    }
+    pub(crate) fn commit_prepared_session_switch(&self, prepared: PreparedLoopActivation) {
+        self.commands
+            .send(LoopCommand::InstallPrepared { prepared })
+            .expect("prepared loop scheduler remains live through session cutover");
     }
     fn send(&self, command: LoopCommand) -> Result<(), LoopSchedulerError> { self.commands.send(command).map_err(|_| LoopSchedulerError::Stopped) }
 }
@@ -288,9 +357,8 @@ fn start_loop_scheduler_with_clock_and_persist_hook(
         join,
     }
 }
-
 enum LoopCommand {
-    Create { request: LoopCreateRequest, reply: oneshot::Sender<Result<LoopTask, LoopSchedulerError>> }, Update { request: LoopUpdateRequest, reply: oneshot::Sender<Result<LoopTask, LoopSchedulerError>> }, List { reply: oneshot::Sender<Result<Vec<LoopTask>, LoopSchedulerError>> }, Delete { task_id: String, cancel_active: bool, reply: oneshot::Sender<Result<bool, LoopSchedulerError>> }, Suspend { reason: LoopRemovalReason, reply: oneshot::Sender<Result<(), LoopSchedulerError>> }, Activate { storage_path: Option<PathBuf>, reply: oneshot::Sender<Result<(), LoopSchedulerError>> }, SwitchSession { prepared: PreparedLoopActivation, reason: LoopRemovalReason, reply: oneshot::Sender<Result<(), LoopSchedulerError>> },
+    Create { request: LoopCreateRequest, reply: oneshot::Sender<Result<LoopTask, LoopSchedulerError>> }, Update { request: LoopUpdateRequest, reply: oneshot::Sender<Result<LoopTask, LoopSchedulerError>> }, List { reply: oneshot::Sender<Result<Vec<LoopTask>, LoopSchedulerError>> }, Delete { task_id: String, cancel_active: bool, reply: oneshot::Sender<Result<bool, LoopSchedulerError>> }, CancelActive { reply: oneshot::Sender<Result<bool, LoopSchedulerError>> }, Suspend { reason: LoopRemovalReason, reply: oneshot::Sender<Result<(), LoopSchedulerError>> }, Activate { storage_path: Option<PathBuf>, reply: oneshot::Sender<Result<(), LoopSchedulerError>> }, SwitchSession { prepared: PreparedLoopActivation, reason: LoopRemovalReason, reply: oneshot::Sender<Result<(), LoopSchedulerError>> }, InstallPrepared { prepared: PreparedLoopActivation },
 }
 struct PendingRun { request: LoopRunRequest, next_fire_at: DateTime<Utc> }
 struct ActiveRun { task_id: String, cancel: CancellationToken, join: JoinHandle<()>, generation: u64, report_completion: bool }
@@ -333,44 +401,51 @@ impl LoopSchedulerActor {
             .flat_map(|task| [task.next_fire_at(), task.expires_at])
             .min()
     }
-    async fn handle_command(&mut self, command: LoopCommand) { match command {
-        LoopCommand::Create { request, reply } => {
-            let result = self.create(request).await;
-            let _ = reply.send(result);
+    async fn handle_command(&mut self, command: LoopCommand) {
+        match command {
+            LoopCommand::Create { request, reply } => {
+                let result = self.create(request).await;
+                let _ = reply.send(result);
+            }
+            LoopCommand::Update { request, reply } => {
+                let result = self.update(request).await;
+                let _ = reply.send(result);
+            }
+            LoopCommand::List { reply } => {
+                let result = if self.active_session {
+                    Ok(self.tasks.clone())
+                } else {
+                    Err(LoopSchedulerError::Inactive)
+                };
+                let _ = reply.send(result);
+            }
+            LoopCommand::Delete {
+                task_id,
+                cancel_active,
+                reply,
+            } => {
+                let result = self.delete(&task_id, cancel_active).await;
+                let _ = reply.send(result);
+            }
+            LoopCommand::CancelActive { reply } => {
+                let result = self.cancel_active_iteration();
+                let _ = reply.send(result);
+            }
+            LoopCommand::Suspend { reason, reply } => self.suspend(reason, reply).await,
+            LoopCommand::Activate { storage_path, reply } => {
+                let result = self.activate(storage_path).await;
+                let _ = reply.send(result);
+            }
+            LoopCommand::SwitchSession {
+                prepared,
+                reason,
+                reply,
+            } => {
+                self.switch_session(prepared, reason, reply).await;
+            }
+            LoopCommand::InstallPrepared { prepared } => self.install_prepared(prepared),
         }
-        LoopCommand::Update { request, reply } => {
-            let result = self.update(request).await;
-            let _ = reply.send(result);
-        }
-        LoopCommand::List { reply } => {
-            let result = if self.active_session {
-                Ok(self.tasks.clone())
-            } else {
-                Err(LoopSchedulerError::Inactive)
-            };
-            let _ = reply.send(result);
-        }
-        LoopCommand::Delete {
-            task_id,
-            cancel_active,
-            reply,
-        } => {
-            let result = self.delete(&task_id, cancel_active).await;
-            let _ = reply.send(result);
-        }
-        LoopCommand::Suspend { reason, reply } => self.suspend(reason, reply).await,
-        LoopCommand::Activate { storage_path, reply } => {
-            let result = self.activate(storage_path).await;
-            let _ = reply.send(result);
-        }
-        LoopCommand::SwitchSession {
-            prepared,
-            reason,
-            reply,
-        } => {
-            self.switch_session(prepared, reason, reply).await;
-        }
-    } }
+    }
     async fn create(&mut self, request: LoopCreateRequest) -> Result<LoopTask, LoopSchedulerError> {
         self.require_active()?; if self.tasks.len() >= MAX_LOOP_TASKS { return Err(LoopSchedulerError::TaskLimitReached(MAX_LOOP_TASKS)); } let prompt = request.prompt.trim(); if prompt.is_empty() { return Err(LoopSchedulerError::EmptyPrompt); } let interval_secs = parse_loop_interval(&request.interval)?; let now = self.clock.now();
         let id = uuid::Uuid::now_v7().simple().to_string();
@@ -382,6 +457,19 @@ impl LoopSchedulerActor {
     }
     async fn delete(&mut self, task_id: &str, cancel_active: bool) -> Result<bool, LoopSchedulerError> {
         self.require_active()?; let Some(index) = self.task_index(task_id) else { return Ok(false); }; let removed = self.tasks.remove(index); if let Err(error) = self.persist().await { self.tasks.insert(index, removed); return Err(error); } self.queue.retain(|pending| pending.request.task_id != task_id); if let Some(active) = self.active.as_mut().filter(|active| active.task_id == task_id) { active.report_completion = false; if cancel_active { active.cancel.cancel(); } } self.emit(LoopEvent::Removed { task_id: task_id.to_owned(), reason: if cancel_active { LoopRemovalReason::Cancelled } else { LoopRemovalReason::Deleted } }); Ok(true)
+    }
+    /// Cancel the active iteration's token without removing the task. The loop
+    /// remains scheduled and its next fire proceeds normally; the cancelled
+    /// iteration settles as `RunResult::Cancelled` (no `LoopEvent::Failed`).
+    /// This distinguishes an explicit user abort from a real provider/runtime
+    /// failure, which completes without the token cancelled.
+    fn cancel_active_iteration(&self) -> Result<bool, LoopSchedulerError> {
+        if let Some(active) = self.active.as_ref() {
+            active.cancel.cancel();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
     async fn fire_one_due(&mut self) {
         let now = self.clock.now();
@@ -625,27 +713,12 @@ impl LoopSchedulerActor {
             let _ = pending.reply.send(Ok(()));
         }
     }
-    /// Install a prepared target without any fallible I/O.
+    /// Install a prepared target without any fallible I/O or allocation.
     fn install_prepared(&mut self, prepared: PreparedLoopActivation) {
         self.storage_path = prepared.storage_path;
-        let now = self.clock.now();
-        let mut live = Vec::new();
-        for task in prepared.state.tasks {
-            if task.is_expired(now) {
-                self.emit(LoopEvent::Removed {
-                    task_id: task.id,
-                    reason: LoopRemovalReason::Expired,
-                });
-            } else {
-                live.push(task);
-            }
-        }
-        self.tasks = live;
-        for task in self.tasks.clone() {
-            self.emit(LoopEvent::Created {
-                task,
-                restored: true,
-            });
+        self.tasks = prepared.tasks;
+        for event in prepared.events {
+            self.emit(event);
         }
         self.active_session = true;
     }
@@ -1039,6 +1112,110 @@ mod tests {
                 if task_id == &shutdown_task.id
         )));
     }
+    /// Contract: `cancel_active_iteration` cancels the in-flight iteration
+    /// without removing the task or emitting a `Failed` event — the loop
+    /// remains scheduled. A real provider/runtime failure (runner returns `Err`
+    /// with the token uncancelled) still surfaces as `LoopEvent::Failed`.
+    ///
+    /// Plausible bug: Esc during a loop turn reports `Loop <id> failed: Request
+    /// was aborted` because the abort only cancelled the session, not the loop
+    /// iteration token, so the scheduler could not distinguish user abort from
+    /// a real failure.
+    #[tokio::test]
+    async fn cancel_active_iteration_settles_silently_but_real_failure_reports() {
+        let clock = Arc::new(ManualClock::new(fixed_time()));
+        let events: Arc<Mutex<Vec<LoopEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        // The runner blocks until the iteration token is cancelled, mirroring an
+        // in-flight turn that observes the user abort.
+        let runner: LoopTurnRunner = Arc::new(|request, cancel| {
+            request.report(LoopRunState::Started);
+            Box::pin(async move {
+                cancel.cancelled().await;
+                Err("loop cancelled".to_owned())
+            })
+        });
+        let event_log = events.clone();
+        let runtime = start_loop_scheduler_with_clock(
+            None,
+            runner,
+            Arc::new(move |event| event_log.lock().expect("events").push(event)),
+            clock.clone(),
+        );
+        let active = runtime
+            .handle
+            .create(LoopCreateRequest::immediate("1m", "active"))
+            .await
+            .expect("create active");
+        wait_for_event(&events, |event| {
+            matches!(event, LoopEvent::Fired { task_id, .. } if task_id == &active.id)
+        })
+        .await;
+
+        // Esc during the loop-owned turn cancels only the active iteration.
+        assert!(runtime
+            .handle
+            .cancel_active_iteration()
+            .await
+            .expect("cancel active"));
+        // No active run remains to cancel.
+        assert!(!runtime
+            .handle
+            .cancel_active_iteration()
+            .await
+            .expect("no active run"));
+
+        // The cancelled iteration emits no terminal event (Finished/Failed),
+        // and the task remains scheduled for its next cadence fire.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let logged = events.lock().expect("events").clone();
+        assert!(
+            !logged.iter().any(|event| matches!(
+                event,
+                LoopEvent::Failed { task_id, .. } if task_id == &active.id
+            )),
+            "user abort must not emit LoopEvent::Failed: {logged:?}"
+        );
+        assert!(
+            !logged.iter().any(|event| matches!(
+                event,
+                LoopEvent::Finished { task_id, .. } if task_id == &active.id
+            )),
+            "cancelled iteration must not emit LoopEvent::Finished: {logged:?}"
+        );
+        // The task remains scheduled (only the active iteration was cancelled);
+        // it has been mutated by the fire (last_fired_at/run_count) so compare
+        // by id rather than exact equality with the pre-fire snapshot.
+        let remaining = runtime.handle.list().await.expect("task remains");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, active.id);
+        assert_eq!(remaining[0].prompt, active.prompt);
+
+        // A real provider/runtime failure (runner returns Err with the token
+        // uncancelled) must still surface as LoopEvent::Failed.
+        let failure_events: Arc<Mutex<Vec<LoopEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let failure_log = failure_events.clone();
+        let failure_runtime = start_loop_scheduler_with_clock(
+            None,
+            Arc::new(|request, _cancel| {
+                request.report(LoopRunState::Started);
+                Box::pin(async { Err("provider unavailable".to_owned()) })
+            }),
+            Arc::new(move |event| failure_log.lock().expect("events").push(event)),
+            clock.clone(),
+        );
+        let failing = failure_runtime
+            .handle
+            .create(LoopCreateRequest::immediate("1m", "failing"))
+            .await
+            .expect("create failing");
+        wait_for_event(&failure_events, |event| {
+            matches!(event, LoopEvent::Failed { task_id, message, .. } if task_id == &failing.id && message == "provider unavailable")
+        })
+        .await;
+
+        runtime.shutdown().await;
+        failure_runtime.shutdown().await;
+    }
 
     #[tokio::test]
     async fn durable_tasks_persist_resume_and_ephemeral_tasks_do_not() {
@@ -1277,7 +1454,7 @@ mod tests {
             .await
             .expect("durable source");
 
-        let prepared = prepare_loop_activation(Some(&target))
+        let prepared = prepare_loop_activation_at(Some(&target), fixed_time())
             .await
             .expect("prepare target");
         let marker = events.lock().expect("events").len();

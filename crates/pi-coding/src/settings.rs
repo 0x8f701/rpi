@@ -8,13 +8,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::RwLock;
-use pi_agent::{QueueMode, ThinkingLevel};
+use pi_agent::{ApprovalMode, QueueMode, ThinkingLevel};
 use pi_ai::{CacheRetention, SimpleStreamOptions, ThinkingBudgets, Transport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::resources::{CONFIG_DIR_NAME, agent_dir_path};
+use crate::session_catalog::SessionSourceKind;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -362,6 +363,9 @@ pub struct SupportedSetting {
 }
 
 pub const SUPPORTED_SETTINGS_COVERAGE: &[SupportedSetting] = &[
+    SupportedSetting { key: "approvalMode", application: "session_run_blueprint host approval hook" },
+    SupportedSetting { key: "sessionDir", application: "effective_session_dir" },
+    SupportedSetting { key: "sessionImportSources", application: "effective_session_import_sources" },
     SupportedSetting { key: "steeringMode", application: "steering_mode" },
     SupportedSetting { key: "followUpMode", application: "follow_up_mode" },
     SupportedSetting { key: "retry", application: "retry_settings/apply_session_options" },
@@ -403,6 +407,12 @@ pub struct Settings {
     pub default_thinking_level: Option<ThinkingLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_project_trust: Option<DefaultProjectTrust>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_import_sources: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -485,6 +495,32 @@ pub struct Settings {
     pub enable_skill_commands: Option<bool>,
     #[serde(default, flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Settings {
+    #[must_use]
+    pub fn approval_mode(&self) -> ApprovalMode {
+        self.approval_mode.unwrap_or_default()
+    }
+
+    /// Session sources eligible for automatic discovery and resolution.
+    ///
+    /// Native Pi sessions are always included. Foreign sources are opt-in and
+    /// retain their configured order.
+    #[must_use]
+    pub fn effective_session_import_sources(&self) -> Vec<SessionSourceKind> {
+        let configured = self.session_import_sources.as_deref().unwrap_or_default();
+        let mut sources = Vec::with_capacity(configured.len() + 1);
+        sources.push(SessionSourceKind::NativePi);
+        for source in configured {
+            if let Some(kind) = session_import_source_kind(source)
+                && !sources.contains(&kind)
+            {
+                sources.push(kind);
+            }
+        }
+        sources
+    }
 }
 
 impl Settings {
@@ -1121,11 +1157,12 @@ fn parse_legacy_agent_override(name: &str, value: &Value) -> Result<AgentRuntime
 static SETTINGS_DIAGNOSTIC_WARNED_KEYS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-#[cfg(test)]
 thread_local! {
     /// When set, settings diagnostics from this thread are collected instead of
     /// printed. Thread-local so parallel settings tests cannot pollute each
     /// other's capture buffers or suppress foreign-thread diagnostics.
+    /// Armed by `arm_settings_diagnostic_capture()` for interactive TUI startup
+    /// so warnings surface in the UI instead of only on stderr.
     static SETTINGS_DIAGNOSTIC_WARN_CAPTURE: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1140,20 +1177,17 @@ fn emit_settings_diagnostic(dedupe_key: String, message: String) {
             return;
         }
     }
-    #[cfg(test)]
-    {
-        let captured = SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
-            let mut capture = capture.borrow_mut();
-            if let Some(log) = capture.as_mut() {
-                log.push(message.clone());
-                true
-            } else {
-                false
-            }
-        });
-        if captured {
-            return;
+    let captured = SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        if let Some(log) = capture.as_mut() {
+            log.push(message.clone());
+            true
+        } else {
+            false
         }
+    });
+    if captured {
+        return;
     }
     // Diagnostics go to stderr so structured stdout (JSON/RPC) stays clean.
     eprintln!("{message}");
@@ -1242,17 +1276,38 @@ fn warn_unsupported_subagents_fields(path: &Path, settings: &Settings) {
     }
 }
 
+
+/// Arm the process-wide settings diagnostic capture on the current thread.
+///
+/// When armed, subsequent calls to [`emit_settings_diagnostic`] on this thread
+/// collect messages into a thread-local buffer instead of printing to stderr.
+/// The capture is thread-local so production startup cannot accidentally
+/// suppress diagnostics emitted by concurrent background work on other threads.
+/// Drain with [`drain_settings_diagnostics`] to retrieve and clear the buffer.
+pub fn arm_settings_diagnostic_capture() {
+    SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
+        *capture.borrow_mut() = Some(Vec::new());
+    });
+}
+
+/// Drain captured settings diagnostics from the current thread.
+///
+/// Returns the messages collected since the last [`arm_settings_diagnostic_capture`]
+/// on this thread, or an empty `Vec` when the capture was never armed. Draining
+/// clears the buffer so a second drain without re-arming yields nothing.
+#[must_use]
+pub fn drain_settings_diagnostics() -> Vec<String> {
+    SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
+        capture.borrow_mut().take().unwrap_or_default()
+    })
+}
 #[cfg(test)]
 fn capture_settings_diagnostics<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     // Unique temp paths make process-wide path state safe without clearing:
     // each capture body only asserts on warnings for the paths it loads.
-    SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
-        *capture.borrow_mut() = Some(Vec::new());
-    });
+    arm_settings_diagnostic_capture();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    let messages = SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
-        capture.borrow_mut().take().unwrap_or_default()
-    });
+    let messages = drain_settings_diagnostics();
     match result {
         Ok(value) => (value, messages),
         Err(payload) => std::panic::resume_unwind(payload),
@@ -1263,6 +1318,31 @@ fn capture_settings_diagnostics<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
 fn capture_legacy_agent_migration_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     capture_settings_diagnostics(f)
 }
+#[cfg(test)]
+fn capture_is_explicitly_armed_and_drained_once() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("settings.json");
+    fs::write(
+        &path,
+        r#"{"subagents":{"agentOverrides":{"reviewer":{"enabled":true}}}}"#,
+    )
+    .expect("settings");
+
+    arm_settings_diagnostic_capture();
+    load_settings_file(&path, SettingsScope::Global).expect("load");
+    let warnings = drain_settings_diagnostics();
+
+    assert_eq!(warnings.len(), 1, "captured once: {warnings:?}");
+    assert!(
+        warnings[0].contains("deprecated subagents.agentOverrides"),
+        "{warnings:?}"
+    );
+    assert!(
+        drain_settings_diagnostics().is_empty(),
+        "drain must clear the capture"
+    );
+}
+
 
 
 
@@ -1318,7 +1398,27 @@ fn load_settings_file(path: &Path, scope: SettingsScope) -> Result<Settings> {
     Ok(settings)
 }
 
+pub(crate) const SESSION_IMPORT_SOURCE_VALUES: &[&str] =
+    &["omp", "codex", "claude", "grok", "droid"];
+
+fn session_import_source_kind(value: &str) -> Option<SessionSourceKind> {
+    match value {
+        "omp" => Some(SessionSourceKind::Omp),
+        "codex" => Some(SessionSourceKind::Codex),
+        "claude" => Some(SessionSourceKind::Claude),
+        "grok" => Some(SessionSourceKind::Grok),
+        "droid" => Some(SessionSourceKind::Droid),
+        _ => None,
+    }
+}
+
 pub(crate) fn validate_settings(settings: &Settings, scope: SettingsScope, path: &Path) -> Result<()> {
+    if scope == SettingsScope::Project && settings.approval_mode.is_some() {
+        bail!(
+            "invalid project settings {}: approvalMode is global-only",
+            path.display()
+        );
+    }
     for (field, entries) in [
         ("extensions", &settings.extensions),
         ("skills", &settings.skills),
@@ -1441,6 +1541,23 @@ fn validate_operational_settings(settings: &Settings) -> Result<()> {
     }
     if settings.theme.as_ref().is_some_and(|value| value.trim().is_empty()) {
         bail!("theme must not be empty");
+    }
+    if settings.session_dir.as_ref().is_some_and(|value| value.as_os_str().is_empty()) {
+        bail!("sessionDir must not be empty");
+    }
+    if let Some(sources) = &settings.session_import_sources {
+        let mut seen = HashSet::with_capacity(sources.len());
+        for source in sources {
+            if session_import_source_kind(source).is_none() {
+                bail!(
+                    "sessionImportSources contains unsupported source '{source}'; allowed sources: {}",
+                    SESSION_IMPORT_SOURCE_VALUES.join(", ")
+                );
+            }
+            if !seen.insert(source.as_str()) {
+                bail!("sessionImportSources contains duplicate source '{source}'");
+            }
+        }
     }
     if settings.scoped_models.as_ref().is_some_and(|patterns| patterns.iter().any(|pattern| pattern.trim().is_empty())) {
         bail!("scopedModels contains an empty pattern");
@@ -1584,6 +1701,191 @@ mod tests {
             .expect_err("zero max results must fail")
             .to_string()
             .contains("selector.maxResults"));
+    }
+    #[test]
+    fn approval_mode_has_documented_support_coverage() {
+        let entry = SUPPORTED_SETTINGS_COVERAGE
+            .iter()
+            .find(|entry| entry.key == "approvalMode")
+            .expect("approvalMode support coverage");
+        assert!(entry.application.contains("host approval hook"));
+    }
+
+    #[test]
+    fn approval_mode_defaults_to_yolo_and_round_trips_lowercase() {
+        assert_eq!(ApprovalMode::default(), ApprovalMode::Yolo);
+
+        let settings: Settings = serde_json::from_str(r#"{"approvalMode":"write"}"#)
+            .expect("deserialize approval mode");
+        assert_eq!(settings.approval_mode, Some(ApprovalMode::Write));
+        let encoded = serde_json::to_value(&settings).expect("serialize settings");
+        assert_eq!(encoded["approvalMode"], "write");
+        assert!(serde_json::from_str::<Settings>(r#"{"approvalMode":"WRITE"}"#).is_err());
+    }
+    #[test]
+    fn approval_mode_accessor_defaults_to_yolo() {
+        assert_eq!(Settings::default().approval_mode(), ApprovalMode::Yolo);
+        let settings = Settings {
+            approval_mode: Some(ApprovalMode::Ask),
+            ..Settings::default()
+        };
+        assert_eq!(settings.approval_mode(), ApprovalMode::Ask);
+    }
+
+    #[test]
+    fn project_approval_mode_cannot_weaken_global_policy() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(agent.path().join("settings.json"), r#"{"approvalMode":"ask"}"#)
+            .expect("global settings");
+        fs::create_dir_all(cwd.path().join(CONFIG_DIR_NAME)).expect("project settings dir");
+        fs::write(
+            cwd.path().join(CONFIG_DIR_NAME).join("settings.json"),
+            r#"{"approvalMode":"yolo"}"#,
+        )
+        .expect("project settings");
+
+        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("global");
+        assert_eq!(manager.settings().approval_mode, Some(ApprovalMode::Ask));
+        let error = manager.load_project(true).expect_err("project approval mode rejected");
+        assert!(error.to_string().contains("approvalMode"), "{error:#}");
+        assert_eq!(manager.settings().approval_mode, Some(ApprovalMode::Ask));
+    }
+
+    #[test]
+    fn approval_mode_merge_and_persistence_remain_typed() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings");
+        manager
+            .update_global(|settings| settings.approval_mode = Some(ApprovalMode::Write))
+            .expect("persist approval mode");
+        let reloaded = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload");
+        assert_eq!(reloaded.settings().approval_mode, Some(ApprovalMode::Write));
+
+        let mut override_settings = Settings::default();
+        override_settings.approval_mode = Some(ApprovalMode::Ask);
+        assert_eq!(
+            reloaded.settings().merged(&override_settings).approval_mode,
+            Some(ApprovalMode::Ask)
+        );
+    }
+
+    #[test]
+    fn session_dir_is_typed_and_project_scope_overrides_global() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"sessionDir":"global-sessions"}"#,
+        )
+        .expect("global settings");
+        fs::create_dir_all(cwd.path().join(CONFIG_DIR_NAME)).expect("project settings dir");
+        fs::write(
+            cwd.path().join(CONFIG_DIR_NAME).join("settings.json"),
+            r#"{"sessionDir":"project-sessions"}"#,
+        )
+        .expect("project settings");
+
+        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("settings");
+        assert_eq!(manager.settings().session_dir.as_deref(), Some(Path::new("global-sessions")));
+        manager.load_project(true).expect("trusted project settings");
+        assert_eq!(manager.settings().session_dir.as_deref(), Some(Path::new("project-sessions")));
+    }
+
+    #[test]
+    fn session_import_sources_absent_empty_and_empty_override_are_native_only() {
+        assert_eq!(
+            Settings::default().effective_session_import_sources(),
+            vec![SessionSourceKind::NativePi]
+        );
+        let absent = serde_json::to_value(Settings::default()).expect("serialize absent sources");
+        assert!(absent.get("sessionImportSources").is_none());
+
+        let empty: Settings = serde_json::from_str(r#"{"sessionImportSources":[]}"#)
+            .expect("deserialize empty session import sources");
+        assert_eq!(empty.session_import_sources, Some(Vec::new()));
+        assert_eq!(
+            empty.effective_session_import_sources(),
+            vec![SessionSourceKind::NativePi]
+        );
+        let encoded_empty = serde_json::to_value(&empty).expect("serialize empty sources");
+        assert_eq!(encoded_empty["sessionImportSources"], serde_json::json!([]));
+
+        let configured: Settings =
+            serde_json::from_str(r#"{"sessionImportSources":["codex"]}"#)
+                .expect("deserialize configured source");
+        let merged = configured.merged(&empty);
+        assert_eq!(merged.session_import_sources, Some(Vec::new()));
+        assert_eq!(
+            merged.effective_session_import_sources(),
+            vec![SessionSourceKind::NativePi]
+        );
+    }
+
+    #[test]
+    fn session_import_sources_allowed_union_round_trips_camel_case() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"sessionImportSources":["omp","codex","claude","grok","droid"]}"#,
+        )
+        .expect("deserialize allowed session import sources");
+        validate_settings(&settings, SettingsScope::Global, Path::new("settings.json"))
+            .expect("allowed sources validate");
+        assert_eq!(
+            settings.effective_session_import_sources(),
+            vec![
+                SessionSourceKind::NativePi,
+                SessionSourceKind::Omp,
+                SessionSourceKind::Codex,
+                SessionSourceKind::Claude,
+                SessionSourceKind::Grok,
+                SessionSourceKind::Droid,
+            ]
+        );
+
+        let encoded = serde_json::to_value(&settings).expect("serialize settings");
+        assert_eq!(
+            encoded["sessionImportSources"],
+            serde_json::json!(["omp", "codex", "claude", "grok", "droid"])
+        );
+        assert!(encoded.get("session_import_sources").is_none());
+    }
+
+    #[test]
+    fn session_import_sources_reject_invalid_alias_and_duplicate_values() {
+        assert!(
+            serde_json::from_str::<Settings>(r#"{"sessionImportSources":["codex",1]}"#)
+                .is_err(),
+            "sessionImportSources must deserialize as a string list"
+        );
+
+        for (sources, expected) in [
+            (vec![""], "unsupported source"),
+            (vec!["   "], "unsupported source"),
+            (vec!["pi"], "unsupported source"),
+            (vec!["native"], "unsupported source"),
+            (vec!["hyper"], "unsupported source"),
+            (vec!["grok/hyper"], "unsupported source"),
+            (vec!["OMP"], "unsupported source"),
+            (vec!["unknown"], "unsupported source"),
+            (vec!["omp", "omp"], "duplicate source"),
+        ] {
+            let settings = Settings {
+                session_import_sources: Some(
+                    sources.into_iter().map(str::to_owned).collect(),
+                ),
+                ..Settings::default()
+            };
+            let error = validate_settings(
+                &settings,
+                SettingsScope::Global,
+                Path::new("settings.json"),
+            )
+            .expect_err("invalid session import sources must fail");
+            let error = format!("{error:#}");
+            assert!(error.contains("sessionImportSources"), "{error}");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

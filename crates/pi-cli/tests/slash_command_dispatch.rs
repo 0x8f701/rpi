@@ -7,6 +7,10 @@
 //! model turn. Isolated temp HOME keeps CI free of credentials and network.
 
 use std::collections::BTreeSet;
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use pi_agent::ThinkingLevel;
 use pi_ai::Model;
@@ -32,6 +36,110 @@ use pi_cli::process_commands::{
 };
 use pi_cli::theme::ThemeManager;
 use tempfile::TempDir;
+use pi_cli::code_review_panel::CodeReviewPanel;
+use pi_cli::side_chat::{SideChatController, SideChatToolMode};
+
+/// Hard upper bound for one-shot git fixture setup in this file.
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Bytes retained from each pipe for diagnostics. Readers still drain to EOF
+/// so a chatty child cannot fill the OS pipe; only the prefix is kept.
+const PIPE_DIAG_CAP: usize = 64 * 1024;
+
+/// Drain `read` to EOF while retaining at most `cap` bytes (prefix).
+fn drain_capped(mut read: impl Read, cap: usize) -> Vec<u8> {
+    let mut retained = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match read.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if retained.len() < cap {
+                    let take = (cap - retained.len()).min(n);
+                    retained.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    retained
+}
+
+/// Run a spawned command with a hard local deadline.
+///
+/// Drains stdout/stderr on dedicated threads from spawn (retaining only a fixed
+/// diagnostic prefix while continuing to EOF), then polls `try_wait` until exit
+/// or [`SUBPROCESS_TIMEOUT`]. On expiry or `try_wait` error the child is killed
+/// and waited before readers are joined. Readers are never joined while the
+/// child may still hold pipe ends.
+fn run_command_bounded(mut command: Command) -> Output {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("spawn subprocess");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let stderr = child.stderr.take().expect("stderr pipe");
+
+    let stdout_reader = thread::spawn(move || drain_capped(stdout, PIPE_DIAG_CAP));
+    let stderr_reader = thread::spawn(move || drain_capped(stderr, PIPE_DIAG_CAP));
+
+    let deadline = Instant::now() + SUBPROCESS_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stdout = stdout_reader
+                        .join()
+                        .unwrap_or_else(|_| b"<stdout reader panicked>".to_vec());
+                    let stderr = stderr_reader
+                        .join()
+                        .unwrap_or_else(|_| b"<stderr reader panicked>".to_vec());
+                    panic!(
+                        "subprocess timed out after {}s\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                        SUBPROCESS_TIMEOUT.as_secs(),
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr),
+                    );
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = stdout_reader
+                    .join()
+                    .unwrap_or_else(|_| b"<stdout reader panicked>".to_vec());
+                let stderr = stderr_reader
+                    .join()
+                    .unwrap_or_else(|_| b"<stderr reader panicked>".to_vec());
+                panic!(
+                    "try_wait subprocess: {error}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr),
+                );
+            }
+        }
+    };
+
+    // Child is reaped: safe to join pipe readers (EOF follows close).
+    let stdout = stdout_reader
+        .join()
+        .unwrap_or_else(|_| b"<stdout reader panicked>".to_vec());
+    let stderr = stderr_reader
+        .join()
+        .unwrap_or_else(|_| b"<stderr reader panicked>".to_vec());
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
 struct Fixture {
     _home: TempDir,
     cwd: TempDir,
@@ -200,10 +308,10 @@ fn primary_command_surface_is_help_and_completion_only() {
         PRIMARY_COMMAND_NAMES,
         &[
             "settings", "model", "branch", "resume", "fork", "export", "agents", "compact", "ps",
-            "loop", "goal", "workflow",
+            "loop", "goal", "workflow", "code-review", "btw",
         ]
     );
-    assert_eq!(PRIMARY_COMMAND_NAMES.len(), 12);
+    assert_eq!(PRIMARY_COMMAND_NAMES.len(), 14);
     let visible = visible_catalog()
         .into_iter()
         .map(|command| command.name)
@@ -224,7 +332,7 @@ fn primary_command_surface_is_help_and_completion_only() {
     assert!(builtin("quit").is_some());
     assert_eq!(
         usage(builtin("workflow").expect("workflow")),
-        "/workflow [list|show [id|name]|create <name> <objective>|pause|resume|cancel|integrate|remove]"
+        "/workflow [list|show [id|name]|create <objective>|create <name> <objective>|pause|resume|cancel|integrate|remove]"
     );
 }
 
@@ -463,7 +571,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
     // clone — clone current branch without a model turn.
     {
         match app.clone_session().await {
-            Ok(()) => {}
+            Ok(outcome) => assert!(!outcome.cancelled),
             Err(error) => {
                 let message = format!("{error:#}");
                 assert!(
@@ -701,11 +809,13 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             err.to_string().contains("unknown workflow subcommand"),
             "workflow typo: {err:#}"
         );
-        let err = parse_interactive_workflow_command(Some("create only-name")).expect_err("usage");
-        assert!(
-            err.to_string().contains("create requires"),
-            "workflow create usage: {err:#}"
-        );
+        let created = parse_interactive_workflow_command(Some("create only-name"))
+            .expect("single objective create");
+        assert!(matches!(
+            created,
+            InteractiveWorkflowCommand::Create { name, objective }
+                if name == "only-name" && objective == "only-name"
+        ));
         assert!(
             !is_primary_command("workfloww"),
             "/workflow must not prefix-match /workfloww"
@@ -799,7 +909,7 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
 
     // new — start a fresh transcript without a model turn.
     {
-        app.new_session().await.expect("new session");
+        assert!(!app.new_session().await.expect("new session").cancelled);
         covered.insert("new");
     }
 
@@ -943,6 +1053,73 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         covered.insert("run");
         covered.insert("chain");
         covered.insert("run-chain");
+    }
+
+    // code-review — load a real tracked dirty tree into the fullscreen panel model.
+    {
+        let git = |args: &[&str]| {
+            let mut command = Command::new("git");
+            // Explicit minimal env: never inherit host GIT_* routing/config/signing/hooks.
+            command.env_clear();
+            command
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(fixture.cwd.path())
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", fixture._home.path())
+                .env("USERPROFILE", fixture._home.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    fixture.cwd.path().join("absent-global-git-config"),
+                )
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_AUTHOR_NAME", "Slash Dispatch")
+                .env("GIT_AUTHOR_EMAIL", "slash-dispatch@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Slash Dispatch")
+                .env("GIT_COMMITTER_EMAIL", "slash-dispatch@example.invalid");
+            let output = run_command_bounded(command);
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "slash-dispatch@example.invalid"]);
+        git(&["config", "user.name", "Slash Dispatch"]);
+        std::fs::write(fixture.cwd.path().join("review.txt"), "before\n")
+            .expect("write review fixture");
+        git(&["add", "review.txt"]);
+        git(&["commit", "--no-verify", "-qm", "seed review fixture"]);
+        std::fs::write(fixture.cwd.path().join("review.txt"), "after\n")
+            .expect("dirty review fixture");
+        let panel = CodeReviewPanel::load(fixture.cwd.path());
+        assert!(
+            panel
+                .snapshot()
+                .files
+                .iter()
+                .any(|file| file.path == "review.txt"),
+            "code-review panel must load the tracked working-tree change: {:?}",
+            panel.snapshot()
+        );
+        covered.insert("code-review");
+    }
+
+    // btw — create the detached read-only side controller and cleanly shut it down.
+    {
+        let mut side = SideChatController::fork_from(app)
+            .await
+            .expect("fork side chat");
+        assert_eq!(side.tool_mode(), SideChatToolMode::ReadOnly);
+        assert_eq!(side.cwd(), fixture.cwd.path());
+        assert!(
+            side.tool_names().await.iter().all(|name| name != "write"),
+            "default /btw controller must not expose write"
+        );
+        side.shutdown().await;
+        covered.insert("btw");
     }
 
     // quit — present in catalog; dispatch returns exit without side effects.

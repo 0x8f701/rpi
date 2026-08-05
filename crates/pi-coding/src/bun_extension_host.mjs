@@ -222,6 +222,10 @@ function createApi() {
       const unsupported = ["constrainedSampling", "renderShell", "prepareArguments", "renderCall", "renderResult"]
         .find(field => tool[field] !== undefined);
       if (unsupported) unavailable(`registerTool.${unsupported}`);
+      const capability = tool.capability === undefined ? "exec" : tool.capability;
+      if (!(["read", "write", "exec"].includes(capability))) {
+        throw new Error("registerTool capability must be read, write, or exec");
+      }
       if (tools.has(tool.name)) throw new Error(`duplicate tool ${tool.name}`);
       tools.set(tool.name, tool);
       send({
@@ -233,6 +237,7 @@ function createApi() {
             label: String(tool.label ?? tool.name),
             description: String(tool.description ?? "Extension tool"),
             parameters: jsonValue(tool.parameters, { type: "object", properties: {} }),
+            capability,
             executionMode: tool.executionMode ?? "default",
             promptGuidelines: Array.isArray(tool.promptGuidelines) ? tool.promptGuidelines.map(String) : [],
           },

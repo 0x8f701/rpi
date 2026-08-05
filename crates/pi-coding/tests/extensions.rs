@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use pi_agent::{AbortController, AgentToolResult};
+use pi_agent::{AbortController, AgentToolResult, ToolCapability};
 use pi_coding::{
     ExtensionCancellation, ExtensionCapability, ExtensionManifestRuntime, ExtensionMode,
     ExtensionOrigin, ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeOptions,
@@ -274,6 +274,11 @@ export default function (pi: any) {
         ])
     );
     assert_eq!(runtime.tools()[0].name, "echo_bun");
+    assert_eq!(
+        runtime.tools()[0].capability,
+        ToolCapability::Exec,
+        "omitted Bun tool capability must fail safe"
+    );
 
     runtime
         .invoke_command("hello", String::new(), None, None)

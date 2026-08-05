@@ -159,6 +159,7 @@ Source: `crates/pi-coding/src/settings.rs:666-669` and
 | `defaultModel` | Default model id used when no `--model` is given. |
 | `defaultThinkingLevel` | Default reasoning level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). |
 | `defaultProjectTrust` | `"ask"`, `"always"`, or `"never"`. |
+| `approvalMode` | Global host tool policy: `yolo` allows all tools, `write` confirms Exec, and `ask` confirms every tool call. Project settings cannot override it. |
 | `steeringMode` | Steering queue mode (`all` or `one-at-a-time`). |
 | `followUpMode` | Follow-up queue mode (`all` or `one-at-a-time`). |
 | `theme` | Initial TUI theme name. |
@@ -199,6 +200,7 @@ list, or module-specific configuration.
 
 | Setting | Applied by |
 |---------|------------|
+| `approvalMode` | `session_run_blueprint` host approval hook |
 | `steeringMode` | `steering_mode` |
 | `followUpMode` | `follow_up_mode` |
 | `retry` | `retry_settings` / `apply_session_options` |
@@ -271,6 +273,8 @@ Source: `crates/pi-cli/src/commands.rs:145-180`,
 
 - No project-local configuration is loaded unless the project is trusted. Use
   `-a`/`--approve` or set `defaultProjectTrust` explicitly.
+- `approvalMode` is a global safety policy and is rejected in project `.pi/settings.json`; `--approval-mode` is the explicit one-run override. It is independent of `--approve`/`--no-approve`, which control only project resource trust.
+- Interactive approval runs before the existing host hook and extension reducer. Headless modes fail closed whenever the selected policy requires confirmation.
 - Bash tool commands run in the configured working directory (`--cwd`).
 - API keys are never printed in error messages or logs.
 - `models.json` and `auth.json` values may contain `$VAR` / `${VAR}` templates,

@@ -97,6 +97,16 @@ fn command(home: &Path) -> Command {
         .env_remove("CLAUDE_CONFIG_DIR");
     command
 }
+fn set_session_import_sources(home: &Path, sources: &[&str]) {
+    let agent_dir = home.join(".pi/agent");
+    fs::create_dir_all(&agent_dir).expect("agent settings directory");
+    fs::write(
+        agent_dir.join("settings.json"),
+        serde_json::to_vec(&serde_json::json!({ "sessionImportSources": sources }))
+            .expect("session import settings"),
+    )
+    .expect("write session import settings");
+}
 
 fn run_stdin(home: &Path, cwd: &Path, args: &[&str], stdin: &str) -> (bool, String, String) {
     use std::io::Write as _;
@@ -500,6 +510,7 @@ fn unified_resume_honors_sessions_home_for_native_and_foreign() {
     let process_home = TempDir::new().expect("process home");
     let sessions_home = TempDir::new().expect("sessions home");
     let cwd = TempDir::new().expect("cwd");
+    set_session_import_sources(process_home.path(), &["droid"]);
     plant_full_session(
         sessions_home.path(),
         cwd.path(),
@@ -549,6 +560,7 @@ fn unified_resume_supports_every_source_by_id_or_prefix() {
     ] {
         let home = TempDir::new().expect("home");
         let cwd = TempDir::new().expect("cwd");
+        set_session_import_sources(home.path(), &[source]);
         let source_path = foreign_fixture(home.path(), cwd.path(), source, id);
         let inputs = [source_path.to_str().expect("source path"), input];
         for input in inputs {
@@ -597,6 +609,7 @@ fn unified_resume_supports_every_source_by_id_or_prefix() {
 fn unified_resume_accepts_foreign_path_and_reuses_idempotent_import() {
     let home = TempDir::new().expect("home");
     let cwd = TempDir::new().expect("cwd");
+    set_session_import_sources(home.path(), &["codex"]);
     let source = foreign_fixture(home.path(), cwd.path(), "codex", "idempotent-path");
 
     for input in [source.to_str().expect("source path"), "idempotent-path"] {
@@ -626,6 +639,7 @@ fn unified_resume_accepts_foreign_path_and_reuses_idempotent_import() {
 fn unified_resume_rejects_ambiguous_malformed_and_oversized_inputs() {
     let home = TempDir::new().expect("home");
     let cwd = TempDir::new().expect("cwd");
+    set_session_import_sources(home.path(), &["codex", "claude"]);
     foreign_fixture(home.path(), cwd.path(), "codex", "ambiguous-one");
     foreign_fixture(home.path(), cwd.path(), "claude", "ambiguous-two");
     let (ok, _, err) = run(
@@ -679,6 +693,7 @@ fn unified_resume_rejects_ambiguous_malformed_and_oversized_inputs() {
 fn repl_resume_lists_unified_catalog_and_switches_by_id() {
     let home = TempDir::new().expect("home");
     let cwd = TempDir::new().expect("cwd");
+    set_session_import_sources(home.path(), &["grok"]);
     foreign_fixture(home.path(), cwd.path(), "grok", "repl-grok");
     let (ok, out, err) = run_stdin(
         home.path(),
@@ -690,6 +705,52 @@ fn repl_resume_lists_unified_catalog_and_switches_by_id() {
     assert!(out.contains("[grok/hyper"), "unified row missing: {out}");
     assert!(out.contains("repl-grok"), "session id missing: {out}");
     assert!(out.contains("resumed "), "switch result missing: {out}");
+}
+
+#[test]
+fn automatic_resume_defaults_native_only_and_rejects_foreign_path_and_id() {
+    let home = TempDir::new().expect("home");
+    let cwd = TempDir::new().expect("cwd");
+    let source = foreign_fixture(home.path(), cwd.path(), "omp", "disabled-omp");
+
+    for input in [source.to_str().expect("source path"), "disabled-omp"] {
+        let (ok, _, err) = run(
+            home.path(),
+            &[
+                "-m",
+                "faux/faux-1",
+                "--cwd",
+                cwd.path().to_str().expect("cwd str"),
+                "--resume",
+                input,
+            ],
+        );
+        assert!(!ok, "default policy must reject foreign resume {input}");
+        assert!(err.contains("session not found"), "unexpected rejection: {err}");
+    }
+}
+
+#[test]
+fn manual_repl_import_remains_available_with_native_only_policy() {
+    let home = TempDir::new().expect("home");
+    let cwd = TempDir::new().expect("cwd");
+    let source_home = TempDir::new().expect("source home");
+    let source = plant_full_session(
+        source_home.path(),
+        cwd.path(),
+        "manual-import",
+        "2026-07-03T00:00:00.000Z",
+    );
+
+    let input = format!("/import {}\n/quit\n", source.display());
+    let (ok, out, err) = run_stdin(
+        home.path(),
+        cwd.path(),
+        &["-m", "faux/faux-1"],
+        &input,
+    );
+    assert!(ok, "manual /import failed under native-only policy: {err}");
+    assert!(out.contains("imported and resumed"), "manual import output: {out}");
 }
 
 fn walk_files(root: &Path) -> Vec<PathBuf> {

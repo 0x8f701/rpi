@@ -63,7 +63,7 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
 }
 
 /// pi's `VALID_THINKING_LEVELS` (cli/args.ts:57).
-const VALID_THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
+const VALID_THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 fn is_valid_thinking_level(s: &str) -> bool {
     VALID_THINKING_LEVELS.contains(&s)
@@ -89,7 +89,7 @@ pub fn resolve_model(spec: &str) -> Result<Model, String> {
 /// provider ONLY when it matches a known provider; otherwise the whole string is
 /// matched as a model id across providers (OpenRouter-style ids contain slashes).
 /// Matching is case-insensitive and a `:<thinkingLevel>` suffix
-/// (off|minimal|low|medium|high|xhigh) is parsed off and returned alongside. An
+/// (off|minimal|low|medium|high|xhigh|max) is parsed off and returned alongside. An
 /// unknown model under a known provider falls back to a synthetic custom-id model
 /// with a warning (pi `buildFallbackModel`); a thinking-level suffix is stripped
 /// from the custom id first.
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn resolve_custom_id_fallback_all_levels() {
-        for level in ["off", "minimal", "low", "medium", "high", "xhigh"] {
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let r = resolve_model_pattern(&format!("anthropic/my-custom-model-id:{level}")).unwrap();
             assert_eq!(r.model.id, "my-custom-model-id", "level {level}: suffix leaked");
             assert_eq!(r.thinking_level, level, "level {level}: wrong level");
@@ -496,6 +496,11 @@ mod tests {
         // Bare-id pattern with suffix.
         let r = resolve_model_pattern("claude-sonnet-4-5:xhigh").unwrap();
         assert_eq!(r.thinking_level, "xhigh");
+
+        // `:max` is parsed like the other valid thinking levels.
+        let r = resolve_model_pattern("anthropic/claude-sonnet-4-5:max").unwrap();
+        assert_eq!(r.model.id, "claude-sonnet-4-5", ":max must not leak into the model id");
+        assert_eq!(r.thinking_level, "max");
 
         // No suffix → empty level.
         let r = resolve_model_pattern("anthropic/claude-sonnet-4-5").unwrap();

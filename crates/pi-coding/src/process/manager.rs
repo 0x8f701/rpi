@@ -364,34 +364,40 @@ impl ProcessManager {
             .into_iter()
             .filter(|session| !session.runtime.lock().state.is_terminal())
             .collect::<Vec<_>>();
-        if sessions.is_empty() {
-            return;
-        }
-        for session in &sessions {
-            if let Ok(controller) = session.controller() {
-                let _ = controller.signal(ProcessSignal::Sigterm);
-            }
-        }
-        tokio::time::sleep(self.inner.config.terminate_grace).await;
-        for session in &sessions {
-            if !session.runtime.lock().state.is_terminal()
-                && let Ok(controller) = session.controller()
-            {
-                let _ = controller.signal(ProcessSignal::Sigkill);
-            }
-        }
-        for session in sessions {
-            let future = async {
-                loop {
-                    let notified = session.changed.notified();
-                    if session.runtime.lock().state.is_terminal() {
-                        break;
-                    }
-                    notified.await;
+        if !sessions.is_empty() {
+            for session in &sessions {
+                if let Ok(controller) = session.controller() {
+                    let _ = controller.signal(ProcessSignal::Sigterm);
                 }
-            };
-            let _ = tokio::time::timeout(Duration::from_secs(5), future).await;
+            }
+            tokio::time::sleep(self.inner.config.terminate_grace).await;
+            for session in &sessions {
+                if !session.runtime.lock().state.is_terminal()
+                    && let Ok(controller) = session.controller()
+                {
+                    let _ = controller.signal(ProcessSignal::Sigkill);
+                }
+            }
+            for session in sessions {
+                let future = async {
+                    loop {
+                        let notified = session.changed.notified();
+                        if session.runtime.lock().state.is_terminal() {
+                            break;
+                        }
+                        notified.await;
+                    }
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(5), future).await;
+            }
         }
+
+        // Shutdown transfers this owner's processes out of the live registry.
+        // Keep any process whose termination could not be confirmed visible so
+        // callers never mistake registry reclamation for successful teardown.
+        self.inner.sessions.lock().retain(|_, session| {
+            &session.owner_id != owner_id || !session.runtime.lock().state.is_terminal()
+        });
     }
 
     pub fn shutdown_owner_now(&self, owner_id: &ProcessOwnerId) {

@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, ensure};
-use pi_agent::{AbortController, AgentToolResult, ToolExecutionMode};
+use pi_agent::{AbortController, AgentToolResult, ToolCapability, ToolExecutionMode};
 use pi_ai::{ContentBlock, Schema};
 use pi_cli::extension_ui::{ExtensionUiAdapter, ExtensionUiEvent};
 use pi_coding::{
@@ -150,6 +150,14 @@ async fn run_host_sample() -> Result<()> {
     let report = runtime.load(vec![valid]).await;
     ensure!(report.loaded.len() == 1, "valid extension did not load");
     ensure!(report.failures.is_empty(), "valid extension reported a failure");
+    ensure!(
+        runtime
+            .agent_tools()
+            .into_iter()
+            .find(|tool| tool.name == "sample_echo")
+            .is_some_and(|tool| tool.capability == ToolCapability::Exec),
+        "sample tool capability was not preserved"
+    );
 
     let rejected = runtime.stage_reload(vec![malformed, untrusted]).await;
     let rejected_report = rejected.report();
@@ -439,6 +447,7 @@ fn register_capabilities(output: &mut impl Write) -> Result<()> {
                         Schema::string(),
                         true,
                     )]),
+                    capability: ToolCapability::Exec,
                     execution_mode: ToolExecutionMode::Default,
                     prompt_guidelines: Vec::new(),
                 },

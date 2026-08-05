@@ -1,14 +1,14 @@
 use std::{
     collections::HashSet,
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use parking_lot::{Mutex, RwLock};
 use tokio::{sync::Notify, task::JoinHandle};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
-use super::{ApplicationEvent, GoalToolBinding, todo_execution};
+use super::{ApplicationEvent, GoalToolBinding, GoalWorkKey, todo_execution};
 use crate::{
     ExtensionPermissionSet, ExtensionRuntime, OrchestrationRuntime, ProcessManager, ProcessOwnerId,
     Session,
@@ -39,6 +39,10 @@ pub(super) struct ApplicationRuntime {
     pub(super) todo_cycle_pending: AtomicBool,
     pub(super) todo_continuation_suppressed: AtomicBool,
     pub(super) todo_resume_requested: AtomicBool,
+    pub(super) todo_transition_active: AtomicBool,
+    pub(super) goal_work_activation: Mutex<Option<GoalWorkKey>>,
+    pub(super) goal_work_pending: AtomicUsize,
+    pub(super) goal_work_changed: Notify,
 }
 
 impl ApplicationRuntime {
@@ -80,6 +84,10 @@ impl ApplicationRuntime {
             todo_cycle_pending: AtomicBool::new(false),
             todo_continuation_suppressed: AtomicBool::new(false),
             todo_resume_requested: AtomicBool::new(false),
+            todo_transition_active: AtomicBool::new(false),
+            goal_work_activation: Mutex::new(None),
+            goal_work_pending: AtomicUsize::new(0),
+            goal_work_changed: Notify::new(),
         }
     }
 

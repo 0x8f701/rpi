@@ -1353,7 +1353,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pi-agent"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1370,7 +1370,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ai"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1393,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "pi-cli"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1402,6 +1402,7 @@ dependencies = [
  "crossterm 0.29.0",
  "futures-util",
  "globset",
+ "http",
  "ignore",
  "image",
  "nix 0.29.0",
@@ -1416,6 +1417,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "unicode-segmentation",
  "unicode-width 0.2.0",
@@ -1424,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "pi-coding"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",

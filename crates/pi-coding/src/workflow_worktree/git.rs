@@ -393,12 +393,26 @@ pub(super) fn run_git_allow_fail(
 ) -> Result<Output, WorktreeError> {
     let cwd = canonicalize_no_symlink(cwd)?;
     let mut command = Command::new("git");
+    // Workflow git operations are automated and isolated: never execute
+    // source-repo or configured hooks, and never read host/global config. A
+    // hostile `post-checkout` planted in a cloned repo (or a `core.hooksPath`
+    // redirect) could escape the managed worktree during `worktree add`, and
+    // `post-merge`/`post-commit` during integrate. A hostile `~/.gitconfig` (e.g.
+    // `core.fsmonitor` or a redirect) could change git behaviour. `-c
+    // core.hooksPath=<null device>` overrides every lower-precedence hooksPath
+    // (command-line beats repo/local/global/system) so no hook directory is
+    // consulted; `GIT_CONFIG_GLOBAL=<null device>` plus `GIT_CONFIG_NOSYSTEM`
+    // fully isolates config from the host environment.
+    let null_device = if cfg!(unix) { "/dev/null" } else { "NUL" };
+    let hooks_override = format!("core.hooksPath={null_device}");
     command
-        .args(["--no-pager", "-c", "color.ui=false", "-c", "advice.detachedHead=false"])
+        .args(["--no-pager", "-c", "color.ui=false", "-c", "advice.detachedHead=false", "-c"])
+        .arg(&hooks_override)
         .args(args)
         .current_dir(&cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
