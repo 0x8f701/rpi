@@ -293,9 +293,24 @@ impl OverlayfsIsolation {
 
     /// True when the merged path is currently a mount point (kernel overlay or
     /// fuse-overlayfs in effect). rcopy backends always report false.
+    ///
+    /// On non-Linux targets overlayfs isolation is unsupported — `start` and
+    /// `start_with` always fail, and `restore` only reconstructs a handle
+    /// without mounting — so no overlay mount can ever exist there; this
+    /// reports `false` rather than claim a mount that cannot be present.
     #[must_use]
     pub fn is_mounted(&self) -> bool {
-        is_mountpoint(&self.merged)
+        #[cfg(target_os = "linux")]
+        {
+            is_mountpoint(&self.merged)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Overlayfs isolation is unsupported off Linux: `start`/`start_with`
+            // always fail and `restore` does not mount, so no overlay mount can
+            // ever exist. Reporting `false` is the truthful lifecycle state.
+            false
+        }
     }
 }
 

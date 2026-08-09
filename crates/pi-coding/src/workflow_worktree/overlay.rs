@@ -860,6 +860,38 @@ impl WorkflowIsolation for NoopWorkflowIsolation {
     }
 }
 
+/// Creates a symlink at `link` pointing to `target`, using the platform's
+/// native API. Windows requires the link kind up front, so the target is
+/// resolved relative to the link's directory to choose between a directory
+/// and a file link; a dangling target defaults to a file link.
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+        let resolved = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            link.parent().unwrap_or_else(|| Path::new(".")).join(target)
+        };
+        if std::fs::metadata(&resolved).is_ok_and(|meta| meta.is_dir()) {
+            symlink_dir(target, link)
+        } else {
+            symlink_file(target, link)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            "symlinks are not supported on this platform",
+        ))
+    }
+}
+
 /// Sync `src` onto `dst` so `dst` becomes an exact copy of `src`: entries
 /// present only in `dst` are removed, entries in `src` overwrite `dst`, and
 /// top-level names listed in `excluded` are never touched (the source repo's
@@ -911,7 +943,7 @@ fn sync_tree_excluding(src: &Path, dst: &Path, excluded: &[&str]) -> Result<(), 
                     )));
                 }
             }
-            std::os::unix::fs::symlink(&target, &to).map_err(|error| {
+            create_symlink(&target, &to).map_err(|error| {
                 WorktreeError::Other(anyhow!("creating symlink {}: {error}", to.display()))
             })?;
         } else {

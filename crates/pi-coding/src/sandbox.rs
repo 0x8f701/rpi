@@ -417,8 +417,8 @@ pub async fn run_in_sandbox(
     #[cfg(not(unix))]
     let reader_task = {
         use tokio::io::AsyncReadExt;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
         let on_chunk_stdout = on_chunk.clone();
         let on_chunk_stderr = on_chunk.clone();
         let t1 = tokio::spawn(async move {
