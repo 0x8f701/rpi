@@ -146,7 +146,7 @@ grep -Fq 'chmod 0700 "$path" || err "could not secure $label permissions: $path"
 grep -Fq 'printf '\''%s\n'\'' "$$" > "$LOCKFILE" && chmod 0600 "$LOCKFILE"' "$INSTALLER"
 grep -Fq 'chmod 0600 "$STATE_FILE" || fail_after_rollback "could not secure rpi update state permissions"' "$INSTALLER"
 if command -v pwsh >/dev/null 2>&1; then
-  pwsh -NoProfile -Command '$errors = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $args[0]), [ref]$null, [ref]$errors) | Out-Null; if ($errors.Count -ne 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }' "$POWERSHELL_INSTALLER"
+  POWERSHELL_INSTALLER="$POWERSHELL_INSTALLER" pwsh -NoProfile -Command '$errors = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $env:POWERSHELL_INSTALLER), [ref]$null, [ref]$errors) | Out-Null; if ($errors.Count -ne 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }'
 fi
 grep -Fq 'function Get-CandidateIdentityFailure([string]$Path, [string]$ExpectedVersion)' "$POWERSHELL_INSTALLER"
 grep -Fq '$CandidateOutput.Count -ne 1 -or [string]$CandidateOutput[0] -cne "rpi $ExpectedVersion"' "$POWERSHELL_INSTALLER"
