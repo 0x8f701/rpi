@@ -231,10 +231,10 @@ does not force print mode.</p>
 <tr><td><code>--approve</code></td><td><code>-a</code></td><td></td><td>Trust project-local <code>.pi</code> settings/resources for this run only.</td></tr>
 <tr><td><code>--no-approve</code></td><td></td><td></td><td>Refuse project-local <code>.pi</code> settings/resources for this run only.</td></tr>
 <tr><td><code>--approval-mode &lt;MODE&gt;</code></td><td></td><td><code>yolo|write|ask</code></td><td>Host tool approval policy. <code>yolo</code> allows all capabilities, <code>write</code> confirms Exec, and <code>ask</code> confirms every tool call. Non-interactive confirmation fails closed. This is separate from project trust flags.</td></tr>
-<tr><td><code>--listen &lt;SOCKET_ADDR&gt;</code></td><td></td><td>e.g. <code>127.0.0.1:8765</code></td><td>Bind a plaintext HTTP/WebSocket control plane around the live TUI/REPL application. Loopback is the default; non-loopback addresses are rejected unless both the token file and explicit insecure-remote opt-in are present. Only valid on the text path.</td></tr>
-<tr><td><code>--listen-token-file &lt;PATH&gt;</code></td><td></td><td>token file</td><td>Exact Bearer authentication. Optional on loopback and mandatory for insecure remote listening. Enables browser access; tokenless loopback accepts only native clients without <code>Origin</code>.</td></tr>
-<tr><td><code>--listen-allow-insecure-remote</code></td><td></td><td></td><td>Permit a non-loopback <code>--listen</code> address only with <code>--listen-token-file</code>. Plaintext HTTP/WebSocket exposes the bearer token and control traffic to passive network observers.</td></tr>
-<tr><td><code>--listen-advertised-origin &lt;URL&gt;</code></td><td></td><td>http(s) origin</td><td>Advertised origin used for collaboration links (<code>/collab</code>, <code>collab_start</code> without an explicit <code>baseUrl</code>) when <code>--listen</code> binds a wildcard address (0.0.0.0 or <code>::</code>). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing <code>/</code> is normalized away). Loopback binds advertise their local address automatically; wildcard binds fail closed without this flag.</td></tr>
+<tr><td><code>--listen &lt;SOCKET_ADDR&gt;</code></td><td></td><td>e.g. <code>127.0.0.1:8765</code></td><td>Bind a plaintext HTTP/WebSocket control plane around the live TUI/REPL application. Loopback is the default. Authentication is optional: a tokenless loopback bind accepts same-origin browsers and native clients; non-loopback binds require <code>--listen-allow-insecure-remote</code> (token optional there too). Only valid on the text path.</td></tr>
+<tr><td><code>--listen-token-file &lt;PATH&gt;</code></td><td></td><td>token file</td><td>Optional Bearer token file. When set, the token is mandatory on every bind (browsers present <code>rpi-auth.&lt;token&gt;</code>; <code>/rpc</code> requires <code>Authorization: Bearer</code>). When unset, the listener is tokenless: loopback accepts same-origin browsers, and <code>--listen-allow-insecure-remote</code> accepts same-origin LAN browsers (browser <code>Origin</code> authority equals HTTP <code>Host</code>).</td></tr>
+<tr><td><code>--listen-allow-insecure-remote</code></td><td></td><td></td><td>Permit a non-loopback <code>--listen</code> address (token optional). Plaintext HTTP/WebSocket exposes any bearer token and control traffic to passive network observers.</td></tr>
+<tr><td><code>--listen-advertised-origin &lt;URL&gt;</code></td><td></td><td>http(s) origin</td><td>Advertised origin for collaboration links (<code>/collab</code>, <code>collab_start</code> without an explicit <code>baseUrl</code>) and the reachable <code>/web</code> URL printed at startup. Not required for ordinary <code>/web</code>, <code>/ws</code>, or <code>/rpc</code>: tokenless browser access uses ordinary same-origin (<code>Origin</code> authority equals HTTP <code>Host</code>). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing <code>/</code> is normalized away). Loopback and other specific binds advertise their bound address automatically; a wildcard bind (0.0.0.0 or <code>::</code>) without this flag prints no reachable URL and <code>/collab</code> fails closed instead of synthesizing links from an unreachable wildcard.</td></tr>
 <tr><td><code>--version</code></td><td><code>-v</code>, <code>-V</code></td><td></td><td>Print version and exit.</td></tr>
 <tr><td><code>--help</code></td><td><code>-h</code></td><td></td><td>Print help and exit.</td></tr>
 </tbody></table>
@@ -243,15 +243,24 @@ does not force print mode.</p>
 <p><code>--provider</code> requires <code>--model</code>; <code>--api-key</code> requires <code>--model</code> or <code>--models</code>.
 <code>--continue</code>, <code>--resume</code>, <code>--session</code>, <code>--session-id</code>, <code>--fork</code>, and <code>--no-session</code>
 are mutually exclusive.</p>
-<p>For explicit LAN access:</p>
+<p>For explicit LAN access — tokenless (no token, same-origin browser):</p>
+<pre><code class="language-console">$ rpi --listen 0.0.0.0:8765 --listen-allow-insecure-remote
+</code></pre>
+<p>Open <code>http://&lt;host-lan-ip&gt;:8765/web</code> — or any hostname that routes to the
+host — from another machine; the browser auto-connects with no token. No
+<code>--listen-advertised-origin</code> is needed for ordinary <code>/web</code>, <code>/ws</code>, or
+<code>/rpc</code>: the browser's <code>Origin</code> authority must equal the HTTP <code>Host</code>
+(ordinary same-origin, which rejects unrelated cross-origin pages but is
+not authentication and not DNS-rebinding protection). This is plaintext and
+unauthenticated; use only on a network where passive observers are an
+accepted risk. To make the token mandatory, add <code>--listen-token-file</code>:</p>
 <pre><code class="language-console">$ rpi --listen 0.0.0.0:8765 --listen-token-file &lt;workspace&gt;/rpi-token --listen-allow-insecure-remote
 </code></pre>
-<p>Open <code>http://&lt;host-lan-ip&gt;:8765/web</code> from another machine. The flag is an
-authenticated plaintext opt-in, not encryption; use only on a network where
-passive observers are an accepted risk. <code>rpi agent serve</code> remains
-loopback-only. Collaboration links need a reachable origin on wildcard binds:
-add <code>--listen-advertised-origin http://&lt;host-lan-ip&gt;:8765</code> (loopback binds
-advertise their local address automatically and never need it).</p>
+<p>The token authenticates clients but does not encrypt traffic. <code>rpi agent serve</code>
+remains loopback-only. <code>--listen-advertised-origin</code> is only for collaboration
+links and the reachable URL printed at startup; loopback and specific binds
+advertise their bound address automatically, and a wildcard bind without it
+prints no reachable URL (ordinary web access still works via same-origin).</p>
 <h2 id="subcommands"><a class="header" href="#subcommands">Subcommands</a></h2>
 <h3 id="rpi-models-filter"><a class="header" href="#rpi-models-filter"><code>rpi models [FILTER]</code></a></h3>
 <p>List available models. Provider headers are printed in bold. The filter is case-sensitive and matches against provider name or model id.</p>
