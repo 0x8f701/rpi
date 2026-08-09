@@ -2794,8 +2794,8 @@ observers can capture any bearer token and control traffic.</li>
 <h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
 <ul>
 <li>Frontend type-check + build: <code>cd crates/pi-cli/web &amp;&amp; npm run build</code>
-(<code>tsc --noEmit &amp;&amp; vite build</code>; the committed <code>dist/index.html</code> is what the
-binary embeds).</li>
+(type-check, focused transcript assertions, Vite bundle, and deterministic
+trim); the committed <code>dist/index.html</code> is what the binary embeds.</li>
 <li>Rust: <code>cargo test -p pi-cli --lib</code> (subprotocol unit tests) and
 <code>cargo test -p pi-cli --test listen_control_plane</code> (GET /web route, positive
 and negative subprotocol auth, existing routes unchanged).</li>
