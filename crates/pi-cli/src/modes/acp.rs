@@ -1499,14 +1499,15 @@ async fn handle_ws_connection(
                 return Err(error);
             }
             // Same transport auth policy as the control-plane listener
-            // (`ws_auth`): tokenless loopback accepts native clients and
-            // rejects browsers (they always send Origin); a configured token
-            // must be presented as `Authorization: Bearer <token>` or the
+            // (`ws_auth`), except ACP keeps the strict tokenless stance:
+            // tokenless loopback accepts native clients and rejects browsers
+            // (they always send Origin); a configured token must be
+            // presented as `Authorization: Bearer <token>` or the
             // `rpi-auth.<token>` subprotocol, which is echoed verbatim in
             // the upgrade response so the browser accepts the handshake.
             let headers = request.headers();
             let protocol = websocket_subprotocol(headers, token.as_deref());
-            if !authorized(headers, token.as_deref()) && protocol.is_none() {
+            if !authorized(headers, token.as_deref(), false) && protocol.is_none() {
                 let mut error = ErrorResponse::new(Some("unauthorized".into()));
                 *error.status_mut() = http::StatusCode::UNAUTHORIZED;
                 return Err(error);

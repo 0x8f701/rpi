@@ -7,11 +7,11 @@
 //   RPI_SLOW_TAIL  tail of the FIRST slow mock reply ("chunk-four-done")
 //   RPI_CHROME     executable path of the system Chrome (optional)
 //   RPI_EVIDENCE   evidence dir for screenshots
-//
-// Asserts the rpi-auth subprotocol contract:
+// Asserts the rpi-auth subprotocol contract against a TOKENED listener
+// (auth_tokenless_test.mjs covers the tokenless listener):
 //   1. NO token: the boot auto-connect probe fails SILENTLY (no error toast,
-//      by design — the empty-hint explains the requirement) and the pill
-//      never reaches `connected`; it settles into `reconnecting`
+//      by design — the empty-hint explains the optional-token policy) and the
+//      pill never reaches `connected`; it settles into `reconnecting`
 //   2. WRONG token: Connect surfaces the "wrong or missing token" ERROR toast
 //      and never reaches `connected`
 //   3. GOOD token: Connect reaches `connected` and a prompt round-trips

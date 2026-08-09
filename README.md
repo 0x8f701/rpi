@@ -163,27 +163,54 @@ Runnable examples are in [`examples/`](examples/).
 
 See [`docs/src/user-guide/cli-modes.md`](docs/src/user-guide/cli-modes.md) for details.
 
-## Web control plane on a LAN
+## Web control plane
 
-`rpi --listen` defaults to loopback. To expose the Web/control-plane service
-to other machines on a trusted LAN, all three flags are required:
+`rpi --listen` serves the web client at `/web` on the control-plane listener.
+The listener defaults to loopback and authentication is optional.
+
+**Local, no token** — the default, one command:
 
 ```console
-$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token --listen-allow-insecure-remote
+$ rpi --listen 127.0.0.1:8765
 ```
 
-Then open `http://<host-lan-ip>:8765/web` from the other machine and enter the
-token. This is an authenticated but **unencrypted** opt-in: plaintext HTTP and
-WebSocket expose the bearer token and all control traffic to passive LAN
-observers. Prefer loopback or a TLS-terminating proxy on untrusted networks.
-`rpi agent serve` remains loopback-only.
+Open <http://127.0.0.1:8765/web>; the browser auto-connects with no token.
+
+**LAN, no token** — bind a non-loopback address and explicitly opt into
+plaintext remote listening (still no token):
+
+```console
+$ rpi --listen 0.0.0.0:8765 --listen-allow-insecure-remote
+```
+
+Open `http://<host-lan-ip>:8765/web` (or any hostname that routes to the
+host) from another machine; the browser auto-connects with no token. No
+`--listen-advertised-origin` is needed for ordinary `/web`, `/ws`, or
+`/rpc`: the browser request is accepted when its `Origin` authority equals
+the HTTP `Host` — an ordinary same-origin check that rejects unrelated
+cross-origin pages, not authentication and not DNS-rebinding protection.
+This is **unauthenticated and unencrypted**: anyone reachable on the
+network can drive the agent and observe traffic. Prefer loopback or a
+TLS-terminating proxy on untrusted networks.
+
+**Authenticated** — add `--listen-token-file <path>` to any of the above to
+make the token mandatory; the browser then requires it:
+
+```console
+$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token \
+      --listen-allow-insecure-remote
+```
+
+The token authenticates clients but does not encrypt the bearer token or
+control traffic against passive LAN observers. `rpi agent serve` remains
+loopback-only and rejects tokenless browsers.
 
 Collaboration join links (`/collab`, `collab_start` without an explicit
 `baseUrl`) cannot be synthesized from a wildcard bind. For a wildcard
 `--listen` address (0.0.0.0 or `::`), pass
 `--listen-advertised-origin <URL>` — a strict http/https origin with no
 credentials, path, query, or fragment — so links point at a reachable host.
-Loopback binds advertise their local address automatically.
+Loopback and other specific binds advertise their bound address automatically.
 
 ## Changelog
 

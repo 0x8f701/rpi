@@ -324,20 +324,34 @@ async fn start_listen(
         session_factory: Some(std::sync::Arc::new(spawner)),
     };
     let handle = modes::listen::start(application.clone(), extension_ui, config).await?;
+    let addr = handle.local_addr();
+    // Directly openable Web UI URL: the effective advertised origin (or the
+    // bound address for concrete binds) plus the `/web` route. Wildcard
+    // binds without `--listen-advertised-origin` have no reachable URL.
+    let web_url = handle.base_url().map(|base| format!("{base}/web"));
+    let web_line = web_url.as_deref().map_or_else(String::new, |url| format!(" Web UI: {url}"));
     if cli.listen_allow_insecure_remote {
+        let mode = if cli.listen_token_file.is_some() {
+            "authentication enabled"
+        } else {
+            "tokenless, unauthenticated"
+        };
+        let token_warning = if cli.listen_token_file.is_some() {
+            " The bearer token travels in cleartext on every request."
+        } else {
+            ""
+        };
         eprintln!(
-            "WARNING: insecure remote control plane enabled on http://{}. Plaintext HTTP/WebSocket exposes the bearer token and control traffic to passive network observers.",
-            handle.local_addr()
+            "WARNING: insecure remote control plane enabled on http://{addr} ({mode}).{web_line} Plaintext HTTP/WebSocket exposes control traffic to passive network observers.{token_warning}"
         );
     } else {
+        let auth = if cli.listen_token_file.is_some() {
+            "authentication enabled"
+        } else {
+            "tokenless"
+        };
         eprintln!(
-            "Control plane listening on http://{} ({})",
-            handle.local_addr(),
-            if cli.listen_token_file.is_some() {
-                "loopback, authentication enabled"
-            } else {
-                "loopback only"
-            }
+            "Control plane listening on http://{addr} (loopback, {auth}).{web_line}"
         );
     }
     Ok(Some(handle))

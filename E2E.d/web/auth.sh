@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Web WebSocket-auth E2E lane (playwright-only hard gate).
 #
-# Spawns the real `rpi --listen` binary with a token file and the loopback
+# Spawns the real `rpi --listen` binary WITH a token file and the loopback
 # mock provider (--scenario steering), opens `/web` in a real browser, and
-# asserts the rpi-auth.<token> subprotocol contract:
+# asserts the rpi-auth.<token> subprotocol contract against a TOKENED
+# listener (the tokenless-listener contract is covered by auth_tokenless.sh):
 #   1. NO token: the boot auto-connect probe fails SILENTLY (no error toast;
-#      the empty-hint explains the requirement) and the pill never reaches
-#      `connected` — it settles into `reconnecting`
+#      the empty-hint explains the optional-token policy) and the pill never
+#      reaches `connected` — it settles into `reconnecting`
 #   2. WRONG token: an explicit Connect surfaces the "wrong or missing token"
 #      ERROR toast and never reaches `connected`
 #   3. GOOD token: Connect reaches `connected` and a prompt round-trips

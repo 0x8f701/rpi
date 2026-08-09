@@ -88,9 +88,10 @@ const DEFAULT_WS_TIMEOUTS: WebSocketTimeouts = WebSocketTimeouts {
 
 /// Web client assets (vite build output) embedded into the binary by
 /// build.rs from `crates/pi-cli/web/dist/`. The page carries no data itself:
-/// every command and event flows through the token-gated `/rpc` and `/ws`
-/// routes, so the page is served without authentication and everything else
-/// keeps the existing auth policy.
+/// every command and event flows through the `/rpc` and `/ws` routes, which
+/// are token-gated when a token is configured and tokenless otherwise, so
+/// the page is served without authentication and everything else keeps the
+/// existing auth policy.
 ///
 /// Development override: `RPI_WEB_DEV_DIR` points at a directory containing a
 /// built `index.html` (e.g. `crates/pi-cli/web/dist`) served instead of the
@@ -102,7 +103,8 @@ const RPI_WEB_DEV_DIR: &str = "RPI_WEB_DEV_DIR";
 pub struct ListenConfig {
     pub address: SocketAddr,
     pub token_file: Option<PathBuf>,
-    /// Permit a non-loopback plaintext bind only when `token_file` is valid.
+    /// Permit a non-loopback plaintext bind; a token file is optional
+    /// (strongly recommended).
     pub allow_insecure_remote: bool,
     /// Explicitly advertised HTTP(S) origin used to build collaboration
     /// links when `address` is a wildcard bind (0.0.0.0/::). Validated and
@@ -175,9 +177,12 @@ struct ServerState {
     manager: std::sync::Arc<SessionRuntimeManager>,
     collab: CollabService,
     token: Option<Arc<[u8]>>,
-    /// Resolved advertised origin for `collab_start` requests that omit an
-    /// explicit `baseUrl`. `None` for wildcard binds without an explicit
-    /// advertised origin: link generation then fails closed.
+    /// Resolved advertised origin used to build collaboration links and to
+    /// default `collab_start` requests that omit an explicit `baseUrl`.
+    /// `None` for wildcard binds without an explicit advertised origin:
+    /// link generation fails closed. Browser auth does not consult this —
+    /// tokenless browsers are accepted only when same-origin against the
+    /// request's own `Host` ([`authorized`]).
     base_url: Option<String>,
 }
 
@@ -187,7 +192,7 @@ pub async fn start(
     config: ListenConfig,
 ) -> Result<ListenHandle> {
     let policy = if config.allow_insecure_remote {
-        ListenAddressPolicy::AllowAuthenticatedPlaintextRemote
+        ListenAddressPolicy::AllowPlaintextRemote
     } else {
         ListenAddressPolicy::LoopbackOnly
     };
@@ -396,7 +401,12 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<
             return Ok(());
         }
         let protocol = websocket_subprotocol(&raw.headers, state.token.as_deref());
-        if !authorized(&raw.headers, state.token.as_deref()) && protocol.is_none() {
+        // Tokenless browsers are accepted only when the request is
+        // same-origin: a single `http://` `Origin` whose authority equals
+        // the request's `Host`. Tokened clients authenticate via bearer or
+        // subprotocol regardless of Origin.
+        if !authorized(&raw.headers, state.token.as_deref(), true) && protocol.is_none()
+        {
             write_plain_response(&mut stream, StatusCode::UNAUTHORIZED, "unauthorized").await?;
             return Ok(());
         }
@@ -427,7 +437,7 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<
         write_plain_response(&mut stream, StatusCode::NOT_FOUND, "not found").await?;
         return Ok(());
     }
-    if !authorized(&raw.headers, state.token.as_deref()) {
+    if !authorized(&raw.headers, state.token.as_deref(), true) {
         write_plain_response(&mut stream, StatusCode::UNAUTHORIZED, "unauthorized").await?;
         return Ok(());
     }
@@ -1562,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_policy_keeps_default_strict_and_allows_authenticated_remote_opt_in() {
+    fn auth_policy_keeps_default_strict_and_allows_plaintext_remote_opt_in() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("token-file");
         std::fs::write(&token, b"fixture-value").unwrap();
@@ -1595,21 +1605,24 @@ mod tests {
                 )
                 .is_err()
             );
-            assert!(
+            // The explicit plaintext opt-in permits non-loopback binds with a
+            // token (recommended) or without one (tokenless LAN access).
+            assert_eq!(
                 load_auth_token(
                     address,
                     None,
                     "--listen",
-                    ListenAddressPolicy::AllowAuthenticatedPlaintextRemote,
+                    ListenAddressPolicy::AllowPlaintextRemote,
                 )
-                .is_err()
+                .unwrap(),
+                None
             );
             assert_eq!(
                 load_auth_token(
                     address,
                     Some(&token),
                     "--listen",
-                    ListenAddressPolicy::AllowAuthenticatedPlaintextRemote,
+                    ListenAddressPolicy::AllowPlaintextRemote,
                 )
                 .unwrap(),
                 Some(b"fixture-value".to_vec())
@@ -1656,26 +1669,55 @@ mod tests {
             http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer secret"),
         );
-        assert!(authorized(&headers, Some(b"secret")));
-        assert!(!authorized(&headers, Some(b"wrong")));
+        assert!(authorized(&headers, Some(b"secret"), false));
+        assert!(!authorized(&headers, Some(b"wrong"), false));
         headers.insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_static("Basic secret"),
         );
-        assert!(!authorized(&headers, Some(b"secret")));
+        assert!(!authorized(&headers, Some(b"secret"), false));
     }
 
     #[test]
-    fn unauthenticated_loopback_rejects_browser_origin() {
+    fn tokenless_listener_accepts_same_origin_browser_matching_host() {
+        // Native clients (no Origin) are always allowed tokenless.
         let mut headers = HeaderMap::new();
-        assert!(authorized(&headers, None));
+        assert!(authorized(&headers, None, true));
         headers.insert(
             http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer ignored-without-token-policy"),
         );
-        assert!(authorized(&headers, None));
-        headers.insert(http::header::ORIGIN, HeaderValue::from_static("https://example.test"));
-        assert!(!authorized(&headers, None));
+        assert!(authorized(&headers, None, true));
+        // A browser whose `http://` Origin authority matches the request's
+        // Host connects; an unrelated cross-origin page does not.
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("127.0.0.1:8765"),
+        );
+        headers.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8765"),
+        );
+        assert!(authorized(&headers, None, true));
+        headers.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert!(!authorized(&headers, None, true));
+        // Strict transport (ACP): every tokenless browser is rejected even
+        // with a matching Host; natives still pass.
+        let mut native = HeaderMap::new();
+        assert!(authorized(&native, None, false));
+        let mut browser = HeaderMap::new();
+        browser.insert(
+            http::header::HOST,
+            HeaderValue::from_static("127.0.0.1:8765"),
+        );
+        browser.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8765"),
+        );
+        assert!(!authorized(&browser, None, false));
     }
 
     fn protocol_headers(value: &str) -> HeaderMap {

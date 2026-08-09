@@ -27,7 +27,7 @@ use pi_coding::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
     tungstenite::{Message as WsMessage, client::IntoClientRequest},
@@ -446,8 +446,9 @@ async fn ws_subprotocol_token_auth_accepts_and_echoes() {
     app.application.cleanup().await;
 }
 
-/// The subprotocol channel rejects wrong tokens, empty candidates, and — when
-/// no token is configured — every browser connection (Origin always present).
+/// The subprotocol channel rejects wrong tokens and empty candidates with a
+/// token configured. Tokenless, the channel grants nothing but also demands
+/// nothing: a browser connection is accepted with or without a subprotocol.
 #[tokio::test]
 async fn ws_subprotocol_wrong_token_and_missing_token_rejected() {
     let app = faux_application("listen-ws-subprotocol-bad").await;
@@ -492,36 +493,123 @@ async fn ws_subprotocol_wrong_token_and_missing_token_rejected() {
     handle.stop().await.expect("stop");
     app.application.cleanup().await;
 
-    // Tokenless loopback: even a correctly-shaped subprotocol cannot help,
-    // because there is no configured token to compare against and the browser
-    // Origin triggers the DNS-rebinding rejection.
+    // Tokenless loopback: there is no configured token to compare against, so
+    // the subprotocol channel grants nothing. A browser connection without a
+    // subprotocol is accepted and served; offering one gets no echo (the
+    // server never authenticates a protocol it could not match), which makes
+    // the client abort the handshake — the correct RFC 6455 outcome.
     let tokenless = faux_application("listen-ws-subprotocol-tokenless").await;
     let (handle, _extension_ui) = listen(tokenless.application.clone()).await;
     let addr = handle.local_addr();
+    let origin = format!("http://{addr}");
+
+    let (mut ws, response) = ws_connect_with_subprotocol(addr, None, Some(&origin))
+        .await
+        .expect("tokenless loopback must accept browser ws without a subprotocol");
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok()),
+        None,
+        "no configured token means no subprotocol may be echoed"
+    );
+    ws.send(WsMessage::Text(
+        json!({"type":"get_state","id":"tokenless-subproto-1"}).to_string().into(),
+    ))
+    .await
+    .expect("ws send");
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut ok = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("parse");
+                if value["id"] == "tokenless-subproto-1" {
+                    ok = value["success"].as_bool().unwrap_or(false);
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            _ => break,
+        }
+    }
+    assert!(ok, "tokenless browser ws must serve get_state");
+    ws.close(None).await.ok();
+
+    // A subprotocol offer on a tokenless listener is never echoed, so the
+    // client-side handshake aborts (nothing to authenticate against).
     let result = ws_connect_with_subprotocol(
         addr,
         Some("rpi-auth.web-token-secret"),
-        Some("https://app.example"),
+        Some(&origin),
     )
     .await;
     assert!(
         result.is_err(),
-        "tokenless loopback must reject browser origin even with a subprotocol: {result:?}"
+        "unmatched subprotocol must not be echoed on a tokenless listener"
     );
+
     handle.stop().await.expect("stop");
     tokenless.application.cleanup().await;
 }
 
 #[tokio::test]
-async fn tokenless_loopback_rejects_browser_origin_over_http_and_ws() {
+async fn tokenless_loopback_accepts_same_origin_browser_over_http_and_ws() {
     let app = faux_application("listen-origin").await;
     let (handle, _extension_ui) = listen(app.application.clone()).await;
     let addr = handle.local_addr();
+    let origin = format!("http://{addr}");
     let body = json!({"type":"get_state","id":"origin-1"}).to_string();
 
-    let (status, response) = http_post_rpc(addr, body.as_bytes(), None).await;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&response));
+    // A browser-origin /rpc POST whose Origin authority matches the
+    // request's Host (the page the user opened) carries no token and is
+    // accepted.
+    let (status, response) = http_post_rpc_with_headers(
+        addr,
+        body.as_bytes(),
+        None,
+        &[("origin", &origin)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        200,
+        "same-origin browser without token must be accepted: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let value: Value = serde_json::from_slice(&response).expect("parse rpc response");
+    assert_eq!(value["id"], "origin-1");
+    assert_eq!(value["success"], true);
 
+    let mut ws = try_ws_connect(addr, None, Some(&origin))
+        .await
+        .expect("ws same-origin browser without token must connect");
+    ws.send(WsMessage::Text(
+        json!({"type":"get_state","id":"origin-ws-1"}).to_string().into(),
+    ))
+    .await
+    .expect("ws send");
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut ok = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("parse");
+                if value["id"] == "origin-ws-1" {
+                    ok = value["success"].as_bool().unwrap_or(false);
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            _ => break,
+        }
+    }
+    assert!(ok, "tokenless browser ws must serve get_state");
+    ws.close(None).await.ok();
+
+    // Ordinary request same-origin: a page from an unrelated origin is
+    // rejected over both channels even though the listener is tokenless.
     let (status, _) = http_post_rpc_with_headers(
         addr,
         body.as_bytes(),
@@ -529,12 +617,12 @@ async fn tokenless_loopback_rejects_browser_origin_over_http_and_ws() {
         &[("origin", "https://evil.example")],
     )
     .await;
-    assert_eq!(status, 401, "browser origin without token must be 401");
+    assert_eq!(status, 401, "foreign browser origin without token must be 401");
     assert!(
         try_ws_connect(addr, None, Some("https://evil.example"))
             .await
             .is_err(),
-        "ws browser origin without token must fail"
+        "ws foreign browser origin without token must fail"
     );
 
     handle.stop().await.expect("stop");
@@ -594,7 +682,7 @@ async fn token_authenticated_browser_origin_is_accepted() {
 }
 
 #[tokio::test]
-async fn non_loopback_policy_requires_both_token_and_explicit_opt_in() {
+async fn non_loopback_policy_requires_explicit_opt_in() {
     let app = faux_application("listen-remote-policy").await;
     let extension_ui = ExtensionUiAdapter::new();
     let token_dir = tempfile::tempdir().expect("token dir");
@@ -602,25 +690,23 @@ async fn non_loopback_policy_requires_both_token_and_explicit_opt_in() {
     std::fs::write(&token_path, "fixture-value").expect("write token");
 
     let cases = [
-        ("0.0.0.0:0", None, false, "IPv4 wildcard without token or opt-in"),
-        ("0.0.0.0:0", Some(token_path.clone()), false, "IPv4 wildcard without opt-in"),
-        ("0.0.0.0:0", None, true, "IPv4 wildcard without token"),
-        ("[::]:0", None, false, "IPv6 wildcard without token or opt-in"),
-        ("[::]:0", Some(token_path.clone()), false, "IPv6 wildcard without opt-in"),
-        ("[::]:0", None, true, "IPv6 wildcard without token"),
-        ("198.51.100.7:0", Some(token_path.clone()), false, "distinct non-loopback IPv4 without opt-in"),
-        ("192.0.2.1:0", Some(token_path.clone()), false, "documentation IPv4 without opt-in"),
-        ("8.8.8.8:0", Some(token_path.clone()), false, "public IPv4 without opt-in"),
-        ("[2001:db8::1]:0", Some(token_path.clone()), false, "documentation IPv6 without opt-in"),
+        ("0.0.0.0:0", None, "IPv4 wildcard without token or opt-in"),
+        ("0.0.0.0:0", Some(token_path.clone()), "IPv4 wildcard without opt-in"),
+        ("[::]:0", None, "IPv6 wildcard without token or opt-in"),
+        ("[::]:0", Some(token_path.clone()), "IPv6 wildcard without opt-in"),
+        ("198.51.100.7:0", Some(token_path.clone()), "distinct non-loopback IPv4 without opt-in"),
+        ("192.0.2.1:0", Some(token_path.clone()), "documentation IPv4 without opt-in"),
+        ("8.8.8.8:0", Some(token_path.clone()), "public IPv4 without opt-in"),
+        ("[2001:db8::1]:0", Some(token_path.clone()), "documentation IPv6 without opt-in"),
     ];
-    for (address, token_file, allow_insecure_remote, label) in cases {
+    for (address, token_file, label) in cases {
         let error = match start(
             app.application.clone(),
             extension_ui.clone(),
             ListenConfig {
                 address: address.parse().unwrap(),
                 token_file,
-                allow_insecure_remote,
+                allow_insecure_remote: false,
                 advertised_origin: None,
                 session_factory: None,
             },
@@ -635,10 +721,149 @@ async fn non_loopback_policy_requires_both_token_and_explicit_opt_in() {
         };
         let message = format!("{error:#}");
         assert!(
-            message.contains("loopback") || message.contains("token file"),
-            "{label}: refusal must explain missing security precondition: {message}"
+            message.contains("loopback"),
+            "{label}: refusal must explain the loopback-only policy: {message}"
         );
     }
+    app.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertised_origin() {
+    let app = faux_application("listen-wildcard-tokenless").await;
+    let extension_ui = ExtensionUiAdapter::new();
+    let handle = start(
+        app.application.clone(),
+        extension_ui,
+        ListenConfig {
+            address: "0.0.0.0:0".parse().unwrap(),
+            token_file: None,
+            allow_insecure_remote: true,
+            advertised_origin: None,
+            session_factory: None,
+        },
+    )
+    .await
+    .expect("tokenless wildcard opt-in must bind");
+    let wildcard = handle.local_addr();
+    assert!(wildcard.ip().is_unspecified(), "expected wildcard bind: {wildcard}");
+    let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], wildcard.port()));
+    let port = wildcard.port();
+
+    // Native tokenless clients (no Origin) stay accepted.
+    let (status, body) = http_post_rpc(
+        loopback,
+        br#"{"type":"get_state","id":"native-tokenless"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        200,
+        "native tokenless wildcard RPC failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let value: Value = serde_json::from_slice(&body).expect("parse rpc response");
+    assert_eq!(value["id"], "native-tokenless");
+    assert_eq!(value["success"], true);
+
+    // A wildcard bind has no advertised origin, but the request's own Host
+    // is the comparison target: a browser whose `http://` Origin authority
+    // matches the Host it sent is accepted tokenless over RPC and WS — no
+    // --listen-advertised-origin is needed for browser auth.
+    let (status, body) = http_post_rpc_with_headers(
+        loopback,
+        br#"{"type":"get_state","id":"browser-tokenless"}"#,
+        None,
+        &[("origin", &format!("http://{loopback}"))],
+    )
+    .await;
+    assert_eq!(
+        status,
+        200,
+        "same-origin browser RPC failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let value: Value = serde_json::from_slice(&body).expect("parse rpc response");
+    assert_eq!(value["id"], "browser-tokenless");
+    assert_eq!(value["success"], true);
+
+    let mut ws = try_ws_connect(loopback, None, Some(&format!("http://{loopback}")))
+        .await
+        .expect("same-origin browser ws must connect");
+    ws.send(WsMessage::Text(
+        json!({"type":"get_state","id":"browser-ws-tokenless"}).to_string().into(),
+    ))
+    .await
+    .expect("ws send");
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut ok = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("parse");
+                if value["id"] == "browser-ws-tokenless" {
+                    ok = value["success"].as_bool().unwrap_or(false);
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            _ => break,
+        }
+    }
+    assert!(ok, "same-origin browser ws must serve get_state");
+    ws.close(None).await.ok();
+
+    // Any LAN address or hostname the user's browser actually used works:
+    // the connection arrives on loopback while Host/Origin model the LAN
+    // page address, so arbitrary LAN IPs, hostnames, and the `localhost`
+    // alias all pass the same Host-based check.
+    let post = |host: &str, origin: &str, id: &str| {
+        let body = format!(r#"{{"type":"get_state","id":"{id}"}}"#);
+        format!(
+            "POST /rpc HTTP/1.1\r\nhost: {host}\r\norigin: {origin}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    for (host, origin, id) in [
+        (format!("192.168.1.50:{port}"), format!("http://192.168.1.50:{port}"), "browser-lan-ip"),
+        (format!("mypi.lan:{port}"), format!("http://mypi.lan:{port}"), "browser-lan-hostname"),
+        (format!("localhost:{port}"), format!("http://localhost:{port}"), "browser-localhost"),
+    ] {
+        let response = http_raw_exchange(loopback, post(&host, &origin, &id).as_bytes()).await;
+        assert_eq!(
+            parse_status(&response).unwrap_or(0),
+            200,
+            "{id}: same-origin browser on {host} must be accepted tokenless"
+        );
+    }
+
+    // Ordinary request same-origin: an unrelated cross-origin page is
+    // rejected over both channels even on the tokenless wildcard listener.
+    let (status, _) = http_post_rpc_with_headers(
+        loopback,
+        br#"{"type":"get_state","id":"browser-mismatch"}"#,
+        None,
+        &[("origin", &format!("http://192.168.1.50:{port}"))],
+    )
+    .await;
+    assert_eq!(status, 401, "mismatched browser origin must be 401");
+    assert!(
+        try_ws_connect(loopback, None, Some("https://evil.example"))
+            .await
+            .is_err(),
+        "mismatched browser ws origin must fail"
+    );
+    // Duplicate Host headers are rejected like duplicate Origins.
+    let body = r#"{"type":"get_state","id":"dup-host"}"#;
+    let duplicate_host = format!(
+        "POST /rpc HTTP/1.1\r\nhost: {loopback}\r\nhost: {loopback}\r\norigin: http://{loopback}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let response = http_raw_exchange(loopback, duplicate_host.as_bytes()).await;
+    assert_eq!(parse_status(&response).unwrap_or(0), 401, "duplicate Host must be rejected");
+
+    handle.stop().await.expect("stop");
     app.application.cleanup().await;
 }
 

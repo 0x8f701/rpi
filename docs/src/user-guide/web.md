@@ -22,29 +22,60 @@ regenerates the committed `dist/index.html`; rebuilding the Rust binary
 embeds the new bundle. `RPI_WEB_DEV_DIR=<dir>` makes the listener serve a
 built page from disk instead, for iterating without recompiling Rust.
 
-## Why a token is required
+## Starting the listener
 
-Browsers always send an `Origin` header on WebSocket and fetch connections.
-The control plane deliberately treats "loopback without `Origin`" as its
-native-client trust boundary — a tokenless loopback listener *refuses* browser
-connections (DNS-rebinding defense). So the web client requires a token file:
+The web client connects to the control-plane listener that `rpi --listen`
+serves. Authentication is **optional**: a tokenless listener accepts browser
+connections directly, and a configured token makes authentication mandatory.
+
+**One-command local startup** (loopback, no token — the browser auto-connects):
+
+```console
+$ rpi --listen 127.0.0.1:8765
+Control plane listening on http://127.0.0.1:8765 (loopback only)
+```
+
+Open <http://127.0.0.1:8765/web> in a browser; the page auto-connects with no
+token and is ready to use. This is the default for local single-user work.
+
+**Tokenless LAN access** — bind a non-loopback address and opt into
+plaintext remote listening (still no token):
+
+```console
+$ rpi --listen 0.0.0.0:8765 --listen-allow-insecure-remote
+```
+
+Open `http://<host-lan-ip>:8765/web` — or any hostname that routes to the
+host — from another machine on the LAN; the page auto-connects with no
+token. No `--listen-advertised-origin` is needed for ordinary `/web`,
+`/ws`, or `/rpc`: the browser request is accepted when its `Origin`
+authority equals the HTTP `Host` — an ordinary same-origin check that
+rejects unrelated cross-origin pages, not authentication and not
+DNS-rebinding protection. This is plaintext HTTP and WebSocket with **no
+authentication and no encryption**: anyone reachable on the network can
+drive the agent and observe traffic. Use loopback, or a TLS-terminating
+proxy in front of the listener, unless that exposure is explicitly
+acceptable.
+
+**Optional authenticated form** — add `--listen-token-file` to make the token
+mandatory on either bind:
 
 ```console
 $ rpi --listen 127.0.0.1:8765 --listen-token-file <workspace>/rpi-token
 Control plane listening on http://127.0.0.1:8765 (loopback, authentication enabled)
 ```
 
-Then open <http://127.0.0.1:8765/web> in a browser, enter the token, and press
-**Connect**. To opt into access from another machine on the LAN:
+Open <http://127.0.0.1:8765/web>, enter the token, and press **Connect**. For
+an authenticated LAN listener, combine the token file with the insecure-remote
+opt-in:
 
 ```console
-$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token --listen-allow-insecure-remote
+$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token \
+      --listen-allow-insecure-remote
 ```
 
-Open `http://<host-lan-ip>:8765/web` from that machine. This is plaintext HTTP
-and WebSocket: authentication remains mandatory, but passive LAN observers can
-capture the bearer token and control traffic. Use loopback or a
-TLS-terminating proxy unless that risk is explicitly acceptable.
+The token authenticates clients but provides no encryption: passive LAN
+observers can still capture the bearer token and control traffic.
 
 Collaboration join links follow the same bind/advertise separation: wildcard
 binds (0.0.0.0 or `::`) require `--listen-advertised-origin <URL>` (a strict
@@ -52,8 +83,9 @@ http/https origin without credentials, path, query, or fragment) before
 `/collab` — or `collab_start` without an explicit `baseUrl` — can print
 reachable links; loopback binds advertise their local address automatically.
 
-The page itself is served without authentication: it carries no data, and
-every command and event flows through the token-gated `/rpc` and `/ws` routes.
+The page itself is always served without authentication: it carries no data,
+and every command and event flows through the `/rpc` and `/ws` routes, which
+are token-gated only when a token file is configured.
 
 ## Authentication: the `rpi-auth.<token>` subprotocol
 
@@ -70,10 +102,14 @@ Sec-WebSocket-Protocol: rpi-auth.<token>
 - On success the exact offered protocol is reflected in the upgrade response
   (RFC 6455 requires the server to select and echo one subprotocol), so the
   browser accepts the handshake.
-- The `Authorization` header path and tokenless-loopback policy are unchanged.
-  Non-loopback binds require both a valid token file and
-  `--listen-allow-insecure-remote`. Wrong, empty, or whitespace-containing
-  candidates are rejected. The opt-in authenticates clients but provides no
+- The `Authorization` header path is unchanged. A token file makes the token
+  mandatory on every bind; without one the listener is tokenless — browsers
+  are accepted on loopback, and on a non-loopback bind with
+  `--listen-allow-insecure-remote` when the request's `Origin` authority
+  equals the HTTP `Host` (an ordinary same-origin check that rejects
+  unrelated cross-origin pages, not authentication and not DNS-rebinding
+  protection). Wrong, empty, or whitespace-containing candidates are
+  rejected. A configured token authenticates clients but provides no
   encryption against passive network observers.
 
 The token never appears in a URL or cookie; it is held only in the WebSocket
@@ -124,7 +160,8 @@ handshake header and kept in `sessionStorage` by the page.
   paths; images only render from base64 `data:` URIs with whitelisted MIME
   types.
 - The token is never placed in a URL, and there is no cookie, so nothing to
-  CSRF. All commands still require the token; the page itself is static.
+  CSRF. Commands require the token only when one is configured; the page itself
+  is static.
 
 ## v1 limitations
 
@@ -132,8 +169,8 @@ handshake header and kept in `sessionStorage` by the page.
   (`extension_ui_response` is hard-rejected on the wire by design); the page
   shows tool results but cannot answer interactive extension prompts.
 - No TLS: the listener is plain HTTP/WebSocket. Non-loopback access is an
-  explicit authenticated plaintext opt-in, and passive network observers can
-  capture the bearer token and control traffic.
+  explicit plaintext opt-in (optionally authenticated), and passive network
+  observers can capture any bearer token and control traffic.
 
 ## Testing
 
@@ -144,10 +181,13 @@ handshake header and kept in `sessionStorage` by the page.
   `cargo test -p pi-cli --test listen_control_plane` (GET /web route, positive
   and negative subprotocol auth, existing routes unchanged).
 - Browser E2E (playwright-only hard gate): `bash E2E.d/web/run.sh` spawns the
-  real binary with a token file and the loopback mock provider, then runs 10
-  lanes: core (load/auth/stream/abort/todo/rich/workflow/settings/session/
-  subagents), goal, xss, abort, reconnect, mobile, auth, and extras/sessions.
-  Playwright is installed ephemerally via npm over a system Chrome/Chromium
-  binary or playwright's bundled chromium; a lane with no usable browser
-  driver FAILS — there is no skip and no fallback to the `agent-browser` CDP
-  tool.
+  real binary with the loopback mock provider and runs 11 lanes: core
+  (load/auth/stream/abort/todo/rich/workflow/settings/session/subagents),
+  goal, xss, abort, reconnect, mobile, auth (tokened listener: no-token
+  silent probe, wrong-token error toast, good-token connect), auth_tokenless
+  (tokenless listener: empty-token boot auto-connect reaches `connected` and a
+  prompt round-trips), and extras/sessions. Most lanes start the listener with a
+  token file; the `auth_tokenless` lane starts it without one. Playwright is
+  installed ephemerally via npm over a system Chrome/Chromium binary or
+  playwright's bundled chromium; a lane with no usable browser driver FAILS —
+  there is no skip and no fallback to the `agent-browser` CDP tool.

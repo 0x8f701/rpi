@@ -103,7 +103,17 @@ web_spawn_rpi() {
     local -a extra_args=()
     if [ -n "${WEB_SPAWN_EXTENSION:-}" ]; then extra_args+=(--extension "$WEB_SPAWN_EXTENSION"); fi
     if [ "${WEB_SPAWN_CONTINUE:-0}" = "1" ]; then extra_args+=(--continue); fi
-    mkfifo "$root/stdin$tag" 2>/dev/null || true
+    # WEB_SPAWN_TOKENLESS=1 omits --listen-token-file so the listener runs the
+    # tokenless policy (loopback accepts browsers; the page auto-connects with
+    # an empty token). Default (0) keeps the tokened fixture every other lane
+    # relies on.
+    local -a token_args=()
+    if [ "${WEB_SPAWN_TOKENLESS:-0}" != "1" ]; then
+        token_args+=(--listen-token-file "$root/token")
+    fi
+    local stdin_path="$root/stdin$tag"
+    rm -f "$stdin_path"
+    mkfifo "$stdin_path"
     # fd 9 holds the fifo open (read-write so the open never blocks) so the
     # REPL never sees stdin EOF and the listener stays up for the scenario.
     exec 9<>"$root/stdin$tag"
@@ -121,7 +131,7 @@ web_spawn_rpi() {
             RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
             "$RPI_BIN" --offline "${extra_args[@]}" \
             --listen "127.0.0.1:$listen_port" \
-            --listen-token-file "$root/token" \
+            "${token_args[@]}" \
             --model user-steering/mock --api-key user-mock-key \
             <"$root/stdin$tag" >"$evidence/rpi$tag.stdout" 2>"$evidence/rpi$tag.stderr"
     ) &
@@ -226,7 +236,7 @@ web_run_playwright() {
     if [ -n "${RPI_COVERAGE_DIR:-}" ] && [ -f "$SCRIPT_DIR/lib/coverage-hook.mjs" ]; then
         node_preload+=(--import "$SCRIPT_DIR/lib/coverage-hook.mjs")
     fi
-    (cd "$work" && RPI_URL="$url" RPI_TOKEN="$TOKEN" \
+    (cd "$work" && RPI_URL="$url" RPI_TOKEN="${TOKEN:-}" \
     RPI_CHROME="$chrome" RPI_EVIDENCE="$evidence" \
     RPI_COVERAGE_DIR="${RPI_COVERAGE_DIR:-}" RPI_COVERAGE_LANE="${RPI_COVERAGE_LANE:-${name%.mjs}}" \
         env "${envs[@]}" node "${node_preload[@]}" "$name")

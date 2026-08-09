@@ -210,15 +210,18 @@ pub struct Cli {
     #[arg(long, value_name = "SOCKET_ADDR")]
     pub listen: Option<std::net::SocketAddr>,
 
-    /// Optional bearer token file for --listen. Enables browser access and is
-    /// mandatory when insecure remote listening is explicitly enabled.
+    /// Optional bearer token file for --listen. When set, /ws and /rpc
+    /// require the token from this file (as `Authorization: Bearer <token>`
+    /// or the `rpi-auth.<token>` subprotocol); without it the listener is
+    /// tokenless and accepts browsers directly.
     #[arg(long, value_name = "PATH", requires = "listen")]
     pub listen_token_file: Option<PathBuf>,
 
-    /// Explicitly allow authenticated plaintext HTTP/WebSocket on a
-    /// non-loopback --listen address. Passive network observers can capture
-    /// the bearer token and control traffic.
-    #[arg(long, requires_all = ["listen", "listen_token_file"])]
+    /// Explicitly allow plaintext HTTP/WebSocket on a non-loopback --listen
+    /// address. A token file is optional (strongly recommended): passive
+    /// network observers can capture control traffic and, when configured,
+    /// the bearer token.
+    #[arg(long, requires = "listen")]
     pub listen_allow_insecure_remote: bool,
 
     /// Advertised HTTP(S) origin used to build collaboration links when
@@ -831,11 +834,6 @@ impl Cli {
         if self.listen_allow_insecure_remote && self.listen.is_none() {
             return Err("--listen-allow-insecure-remote requires --listen".to_owned());
         }
-        if self.listen_allow_insecure_remote && self.listen_token_file.is_none() {
-            return Err(
-                "--listen-allow-insecure-remote requires --listen-token-file".to_owned(),
-            );
-        }
         if let Some(origin) = self.listen_advertised_origin.as_deref()
             && let Err(error) = crate::modes::listen::parse_advertised_origin(origin)
         {
@@ -1417,16 +1415,24 @@ mod tests {
         );
         assert!(with_remote_opt_in.listen_allow_insecure_remote);
 
+        // The explicit remote opt-in no longer requires a token file:
+        // tokenless LAN listening is an allowed (if unauthenticated) mode.
+        let tokenless_remote = Cli::try_parse_from([
+            "rpi",
+            "--listen",
+            "0.0.0.0:0",
+            "--listen-allow-insecure-remote",
+        ])
+        .expect("parse tokenless remote listen opt-in");
+        assert!(tokenless_remote.listen_allow_insecure_remote);
+        assert!(tokenless_remote.listen_token_file.is_none());
+        tokenless_remote
+            .validate()
+            .expect("tokenless remote opt-in must validate");
+
         for args in [
             ["rpi", "--listen-token-file", "token-file"].as_slice(),
             ["rpi", "--listen-allow-insecure-remote"].as_slice(),
-            [
-                "rpi",
-                "--listen",
-                "0.0.0.0:0",
-                "--listen-allow-insecure-remote",
-            ]
-            .as_slice(),
         ] {
             assert!(
                 Cli::try_parse_from(args).is_err(),
@@ -1437,10 +1443,9 @@ mod tests {
         let mut direct = Cli::try_parse_from(["rpi", "--listen", "0.0.0.0:0"])
             .expect("parse direct validation fixture");
         direct.listen_allow_insecure_remote = true;
-        assert_eq!(
-            direct.validate().expect_err("validation must require token file"),
-            "--listen-allow-insecure-remote requires --listen-token-file"
-        );
+        direct
+            .validate()
+            .expect("validation must accept tokenless remote opt-in");
         direct.listen = None;
         assert_eq!(
             direct.validate().expect_err("validation must require listen"),

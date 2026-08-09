@@ -22,11 +22,12 @@
 #   switch    switch.sh                   model + thinking-level switch
 #                                         (set_model / set_thinking_level)
 #   mobile    mobile.sh                   375x667 viewport shell contract
-#   auth      auth.sh                     no-token silent probe, wrong-token
-#                                         error toast, good-token connect
-#   extras    extras.sh                   side chat multi-tab + maintenance
-#                                         (snapcompact A→B, rewind, handoff,
-#                                         queue view/cancel)
+#   auth      auth.sh                     TOKENED listener: no-token silent
+#                                         probe, wrong-token error toast,
+#                                         good-token connect + round-trip
+#   auth_tokenless auth_tokenless.sh      TOKENLESS listener: empty-token
+#                                         boot auto-connect reaches connected
+#                                         + prompt round-trip
 #   sessions  sessions.sh                 multi-session (PLAYWRIGHT-ONLY):
 #                                         concurrent streaming across
 #                                         sessions, source-session event
@@ -64,7 +65,7 @@ E2E_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
 export E2E_RUN_ID EVIDENCE_ROOT WORK_ROOT RPI_BIN
 
 # Every lane script in the suite (core.sh = the shared core lane).
-LANES="core goal xss abort reconnect switch mobile auth extras sessions"
+LANES="core goal xss abort reconnect switch mobile auth auth_tokenless extras sessions"
 
 list_lanes() {
     local lane

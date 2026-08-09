@@ -61,17 +61,24 @@ All notable changes to `rpi` are documented in this file.
   (plaintext WebSocket; TLS is tracked for a later release).
 - Web chat client: `rpi --listen` serves a self-contained React/TypeScript
   app at `/web`, inlined into the binary and driving the existing WebSocket
-  control plane through token-gated `/rpc` and `/ws` routes. Browser
-  connections require `--listen-token-file` (DNS-rebinding defense). The
-  listener defaults to loopback. Remote LAN access requires both
-  `--listen-allow-insecure-remote` and `--listen-token-file` together with an
-  explicit `--listen <lan-address>`; rpi prints a startup warning that
-  plaintext HTTP/WebSocket exposes the bearer token and control traffic to
-  passive network observers. Remote deployments should place the listener
-  behind a TLS reverse proxy; this release does not provide TLS on `--listen`.
-  Multi-session authoritative restore and dedicated panels for
-  todo, goal, workflow, session tree, settings, subagent jobs, side chat, and
-  maintenance are implemented.
+  control plane through the `/rpc` and `/ws` routes. Authentication is
+  optional: the tokenless loopback default (`rpi --listen 127.0.0.1:8765`)
+  accepts browsers directly, so the page auto-connects with no token. An
+  explicit tokenless LAN opt-in (`--listen 0.0.0.0:8765
+  --listen-allow-insecure-remote`) allows tokenless LAN browser/RPC from any
+  host/IP that routes to the listener; browsers are accepted when the request
+  `Origin` authority equals the HTTP `Host` (ordinary same-origin, not
+  authentication and not DNS-rebinding protection), with no
+  `--listen-advertised-origin` required for `/web`, `/ws`, or `/rpc`. Adding
+  `--listen-token-file <path>` makes the
+  token mandatory on either bind (browser presents `rpi-auth.<token>`); rpi
+  prints a startup warning that plaintext HTTP/WebSocket exposes any bearer
+  token and control traffic to passive network observers. `rpi agent serve`
+  remains loopback-only and still rejects tokenless browsers. Remote
+  deployments should place the listener behind a TLS reverse proxy; this
+  release does not provide TLS on `--listen`. Multi-session authoritative
+  restore and dedicated panels for todo, goal, workflow, session tree,
+  settings, subagent jobs, side chat, and maintenance are implemented.
 - Encrypted live collaboration under `rpi --listen`: AES-256-GCM framed
   WebSocket relay with HKDF epoch keys, capability-hash subprotocol auth,
   control/view role links, `collab_start/status/stop` RPC, interactive `/collab`

@@ -62,10 +62,10 @@ does not force print mode.
 | `--approve` | `-a` | | Trust project-local `.pi` settings/resources for this run only. |
 | `--no-approve` | | | Refuse project-local `.pi` settings/resources for this run only. |
 | `--approval-mode <MODE>` | | `yolo\|write\|ask` | Host tool approval policy. `yolo` allows all capabilities, `write` confirms Exec, and `ask` confirms every tool call. Non-interactive confirmation fails closed. This is separate from project trust flags. |
-| `--listen <SOCKET_ADDR>` | | e.g. `127.0.0.1:8765` | Bind a plaintext HTTP/WebSocket control plane around the live TUI/REPL application. Loopback is the default; non-loopback addresses are rejected unless both the token file and explicit insecure-remote opt-in are present. Only valid on the text path. |
-| `--listen-token-file <PATH>` | | token file | Exact Bearer authentication. Optional on loopback and mandatory for insecure remote listening. Enables browser access; tokenless loopback accepts only native clients without `Origin`. |
-| `--listen-allow-insecure-remote` | | | Permit a non-loopback `--listen` address only with `--listen-token-file`. Plaintext HTTP/WebSocket exposes the bearer token and control traffic to passive network observers. |
-| `--listen-advertised-origin <URL>` | | http(s) origin | Advertised origin used for collaboration links (`/collab`, `collab_start` without an explicit `baseUrl`) when `--listen` binds a wildcard address (0.0.0.0 or `::`). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing `/` is normalized away). Loopback binds advertise their local address automatically; wildcard binds fail closed without this flag. |
+| `--listen <SOCKET_ADDR>` | | e.g. `127.0.0.1:8765` | Bind a plaintext HTTP/WebSocket control plane around the live TUI/REPL application. Loopback is the default. Authentication is optional: a tokenless loopback bind accepts same-origin browsers and native clients; non-loopback binds require `--listen-allow-insecure-remote` (token optional there too). Only valid on the text path. |
+| `--listen-token-file <PATH>` | | token file | Optional Bearer token file. When set, the token is mandatory on every bind (browsers present `rpi-auth.<token>`; `/rpc` requires `Authorization: Bearer`). When unset, the listener is tokenless: loopback accepts same-origin browsers, and `--listen-allow-insecure-remote` accepts same-origin LAN browsers (browser `Origin` authority equals HTTP `Host`). |
+| `--listen-allow-insecure-remote` | | | Permit a non-loopback `--listen` address (token optional). Plaintext HTTP/WebSocket exposes any bearer token and control traffic to passive network observers. |
+| `--listen-advertised-origin <URL>` | | http(s) origin | Advertised origin for collaboration links (`/collab`, `collab_start` without an explicit `baseUrl`) and the reachable `/web` URL printed at startup. Not required for ordinary `/web`, `/ws`, or `/rpc`: tokenless browser access uses ordinary same-origin (`Origin` authority equals HTTP `Host`). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing `/` is normalized away). Loopback and other specific binds advertise their bound address automatically; a wildcard bind (0.0.0.0 or `::`) without this flag prints no reachable URL and `/collab` fails closed instead of synthesizing links from an unreachable wildcard. |
 | `--version` | `-v`, `-V` | | Print version and exit. |
 | `--help` | `-h` | | Print help and exit. |
 
@@ -75,18 +75,30 @@ Short aliases are normalized before clap parses: `-v` maps to `--version`, `-xt`
 `--continue`, `--resume`, `--session`, `--session-id`, `--fork`, and `--no-session`
 are mutually exclusive.
 
-For explicit LAN access:
+For explicit LAN access — tokenless (no token, same-origin browser):
+
+```console
+$ rpi --listen 0.0.0.0:8765 --listen-allow-insecure-remote
+```
+
+Open `http://<host-lan-ip>:8765/web` — or any hostname that routes to the
+host — from another machine; the browser auto-connects with no token. No
+`--listen-advertised-origin` is needed for ordinary `/web`, `/ws`, or
+`/rpc`: the browser's `Origin` authority must equal the HTTP `Host`
+(ordinary same-origin, which rejects unrelated cross-origin pages but is
+not authentication and not DNS-rebinding protection). This is plaintext and
+unauthenticated; use only on a network where passive observers are an
+accepted risk. To make the token mandatory, add `--listen-token-file`:
 
 ```console
 $ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token --listen-allow-insecure-remote
 ```
 
-Open `http://<host-lan-ip>:8765/web` from another machine. The flag is an
-authenticated plaintext opt-in, not encryption; use only on a network where
-passive observers are an accepted risk. `rpi agent serve` remains
-loopback-only. Collaboration links need a reachable origin on wildcard binds:
-add `--listen-advertised-origin http://<host-lan-ip>:8765` (loopback binds
-advertise their local address automatically and never need it).
+The token authenticates clients but does not encrypt traffic. `rpi agent serve`
+remains loopback-only. `--listen-advertised-origin` is only for collaboration
+links and the reachable URL printed at startup; loopback and specific binds
+advertise their bound address automatically, and a wildcard bind without it
+prints no reachable URL (ordinary web access still works via same-origin).
 
 ## Subcommands
 

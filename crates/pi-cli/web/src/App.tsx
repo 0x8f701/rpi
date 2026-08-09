@@ -895,8 +895,10 @@ export function App() {
       setConnState('off');
       if (event.code === 1006) {
         // The boot auto-connect with no token is an expected probe on a fresh
-        // page load (the user has not typed anything yet) — stay quiet and
-        // let the empty-hint explain the requirement.
+        // page load (the user has not typed anything yet). On a tokenless
+        // listener it succeeds and never reaches this branch; on a tokened
+        // listener it is the expected "no token yet" refusal — stay quiet and
+        // let the empty-hint explain the optional-token policy.
         if (!(bootProbeRef.current && !tokenValue)) {
           toast('connection failed (wrong or missing token?). Enter the token and press Connect.', true);
         }
@@ -1376,7 +1378,8 @@ export function App() {
         <input
           id="token-input"
           type="password"
-          placeholder="auth token (rpi-auth.<token>)"
+          placeholder="token (optional)"
+          title="Optional: leave blank when the listener runs without --listen-token-file; enter the token only when the listener was started with one (sent as the rpi-auth.<token> WebSocket subprotocol)"
           autoComplete="off"
           spellCheck={false}
           defaultValue={token}
@@ -1513,11 +1516,16 @@ export function App() {
       <main id="transcript" aria-live="polite" ref={transcriptRef} onScroll={onTranscriptScroll}>
         {activeItems.length === 0 && (
           <div className="empty-hint">
-            Connect to the control plane, then send a prompt.
-            <br />
-            Requires <code>rpi --listen &lt;addr&gt; --listen-token-file &lt;token&gt;</code> — browsers
-            always send an Origin header, so a tokenless loopback listener deliberately refuses browser
-            connections. Enter the token above to authenticate.
+            {connState === 'on' ? (
+              <>Send a prompt to start the session.</>
+            ) : (
+              <>
+                Connecting to the control plane… The token field is optional: leave it
+                blank when the listener runs without <code>--listen-token-file</code> (the
+                page auto-connects); if the listener was started with a token, enter it above
+                and press <b>Connect</b>.
+              </>
+            )}
           </div>
         )}
         {activeItems.map((item) => {

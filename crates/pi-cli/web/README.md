@@ -31,21 +31,29 @@ TypeScript errors.
 ## Development
 
 ```console
-$ rpi --listen 127.0.0.1:8765 --listen-token-file <workspace>/rpi-token
+$ rpi --listen 127.0.0.1:8765        # tokenless loopback — the browser auto-connects
 $ cd crates/pi-cli/web
 $ RPI_LISTEN=http://127.0.0.1:8765 npm run dev   # http://localhost:5173
 ```
 
 The vite dev server proxies `/ws` (WebSocket control plane) and `/rpc` to the
-listener, so the page behaves like the embedded build. **A token file is
-required for the browser**: the control plane deliberately rejects browser
-connections on tokenless loopback (browsers always send `Origin`). Enter the
-token in the auth field and press Connect.
+listener, so the page behaves like the embedded build. Authentication is
+**optional**: a tokenless listener (no `--listen-token-file`) accepts the
+browser directly, so the dev page auto-connects with an empty token. To iterate
+against the authenticated path instead, start the listener with
+`--listen-token-file <workspace>/rpi-token` and enter the token in the auth
+field before pressing Connect.
 
-For LAN testing, add `--listen-allow-insecure-remote` and bind
-`0.0.0.0:8765`, then open `http://<host-lan-ip>:8765/web` from another machine.
-This authenticated plaintext mode exposes the bearer token and control traffic
-to passive LAN observers; it is not a substitute for TLS.
+For LAN testing, bind `0.0.0.0:8765` and add `--listen-allow-insecure-remote`,
+then open `http://<host-lan-ip>:8765/web` (or any hostname that routes to the
+host) from another machine. No `--listen-advertised-origin` is needed for
+`/web`, `/ws`, or `/rpc`: the browser is accepted when its `Origin` authority
+equals the HTTP `Host` (ordinary same-origin, not authentication and not
+DNS-rebinding protection). Plaintext HTTP/WebSocket exposes traffic to passive
+LAN observers; it is not a substitute for TLS. Adding
+`--listen-token-file` makes the token mandatory on either bind.
+`--listen-advertised-origin` is only for collaboration links and the reachable
+URL printed at startup.
 
 Alternative for iterating on the *built* page without rebuilding the Rust
 binary: `RPI_WEB_DEV_DIR=$PWD/dist rpi --listen ...` serves `dist/index.html`
