@@ -24,14 +24,14 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
 ```
 
-Pin both the installer source and selected release to `v0.2.5`:
+Pin both the installer source and selected release to `v0.2.6`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.5/install.sh | bash -s -- --version v0.2.5
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.6/install.sh | bash -s -- --version v0.2.6
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.5/install.ps1))) -Version v0.2.5
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.6/install.ps1))) -Version v0.2.6
 ```
 
 The release archive contains the compiled `rpi` executable; users do not need

@@ -2,6 +2,14 @@
 
 All notable changes to `rpi` are documented in this file.
 
+## [0.2.6] - 2026-08-09
+
+### Fixed
+
+- Dense Todo HUDs retain the compact `more active todos` overflow row when
+  the live panel reaches its eight-row height cap instead of replacing that
+  row with an unnecessary second blank separator.
+
 ## [0.2.5] - 2026-08-09
 
 ### Changed
@@ -339,6 +347,7 @@ All notable changes to `rpi` are documented in this file.
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
 
+[0.2.6]: https://github.com/0x8f701/rpi/releases/tag/v0.2.6
 [0.2.5]: https://github.com/0x8f701/rpi/releases/tag/v0.2.5
 [0.2.4]: https://github.com/0x8f701/rpi/releases/tag/v0.2.4
 [0.2.3]: https://github.com/0x8f701/rpi/releases/tag/v0.2.3
