@@ -1,0 +1,503 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Settings, configuration, and trust - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="settings-configuration-and-trust"><a class="header" href="#settings-configuration-and-trust">Settings, configuration, and trust</a></h1>
+<h2 id="configuration-directory"><a class="header" href="#configuration-directory">Configuration directory</a></h2>
+<p>The runtime resolves the agent configuration directory (<code>&lt;agent-dir&gt;</code>) in this
+order:</p>
+<ol>
+<li><code>PI_CODING_AGENT_DIR</code> environment variable.</li>
+<li>The platform home directory (<code>HOME</code> on Unix, <code>USERPROFILE</code> on Windows) with
+<code>/.pi/agent</code> appended.</li>
+</ol>
+<p>Source: <code>crates/pi-coding/src/resources.rs:26-41</code>.</p>
+<p>Within <code>&lt;agent-dir&gt;</code> the CLI reads:</p>
+<ul>
+<li><code>settings.json</code> — global startup defaults and operational settings.</li>
+<li><code>models.json</code> — custom providers and model overrides.</li>
+<li><code>auth.json</code> — stored provider credentials.</li>
+<li><code>trust.json</code> — persisted project trust decisions.</li>
+<li><code>sessions/</code> — native Pi v3 JSONL session files.</li>
+<li><code>skills/</code>, <code>prompts/</code>, <code>themes/</code> — global resources.</li>
+</ul>
+<p>Project-local resources are loaded from <code>&lt;workspace&gt;/.pi/</code> only when that project
+is trusted. Source: <code>crates/pi-coding/src/resource_manager.rs:49-70</code>.</p>
+<h2 id="project-trust"><a class="header" href="#project-trust">Project trust</a></h2>
+<p>By default, <code>rpi</code> asks before loading project-local <code>.pi</code> resources (skills,
+prompts, themes, keybindings, extensions, agents, and package settings). Trust
+decisions are stored in <code>&lt;agent-dir&gt;/trust.json</code>, versioned as
+<code>TRUST_STORE_VERSION = 1</code>, and scoped to the canonical project path. The
+resolver walks parent directories, so a decision at <code>&lt;workspace&gt;</code> covers
+<code>&lt;workspace&gt;/sub-project</code>.</p>
+<p>Source: <code>crates/pi-coding/src/trust.rs:67-140</code> and
+<code>crates/pi-coding/src/trust.rs:180-216</code>.</p>
+<p>Default behavior is controlled by <code>settings.json</code>:</p>
+<pre><code class="language-json">{
+  "defaultProjectTrust": "ask"
+}
+</code></pre>
+<p>Allowed values:</p>
+<ul>
+<li><code>"ask"</code> — prompt for trust in interactive modes; treat as untrusted in
+headless modes (default).</li>
+<li><code>"always"</code> — trust every project with a <code>.pi</code> directory without asking.</li>
+<li><code>"never"</code> — never trust project-local resources.</li>
+</ul>
+<p>One-run overrides:</p>
+<pre><code class="language-sh">rpi -a "hello"           # --approve: trust this project's .pi for this run
+rpi --no-approve "hello" # refuse project .pi for this run
+</code></pre>
+<p>Headless modes (<code>--print</code>, <code>--mode json</code>, <code>--mode rpc</code>) never prompt. In
+headless mode an unset or <code>"ask"</code> decision is treated as untrusted, so use
+<code>--approve</code> when you need project resources. If the project has no <code>.pi</code>
+directory, it is implicitly trusted.</p>
+<p>Source: <code>crates/pi-coding/src/trust.rs:37-43</code> and
+<code>crates/pi-cli/src/args.rs:168-174</code>.</p>
+<h2 id="settingsjson"><a class="header" href="#settingsjson"><code>settings.json</code></a></h2>
+<p>Global settings live at <code>&lt;agent-dir&gt;/settings.json</code>. Project settings live at
+<code>&lt;workspace&gt;/.pi/settings.json</code> and are merged on top of global settings when
+trusted. Unknown fields are retained across merges so other product modules can
+use them.</p>
+<p>Source: <code>crates/pi-coding/src/settings.rs:666-669</code> and
+<code>crates/pi-coding/src/settings.rs:729-843</code>.</p>
+<pre><code class="language-json">{
+  "defaultProvider": "openai",
+  "defaultModel": "openai/gpt-5",
+  "defaultThinkingLevel": "medium",
+  "defaultProjectTrust": "ask",
+  "theme": "dark",
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 8192,
+    "keepRecentTokens": 4096
+  },
+  "terminal": {
+    "showImages": true,
+    "imageWidthCells": 80,
+    "clearOnShrink": false,
+    "showTerminalProgress": true
+  },
+  "images": {
+    "autoResize": true,
+    "blockImages": false
+  },
+  "retry": {
+    "enabled": true,
+    "maxRetries": 3,
+    "baseDelayMs": 2000,
+    "provider": {
+      "timeoutMs": 60000,
+      "maxRetries": 3,
+      "maxRetryDelayMs": 60000
+    }
+  },
+  "transport": "auto",
+  "timeoutMs": 60000,
+  "maxRetryDelayMs": 60000,
+  "temperature": 0.7,
+  "maxTokens": 4096,
+  "cacheRetention": "short",
+  "thinkingBudgets": {
+    "minimal": 1024,
+    "low": 2048,
+    "medium": 4096,
+    "high": 8192
+  },
+  "scopedModels": ["openai/*", "anthropic/*"],
+  "branchSummary": {
+    "reserveTokens": 16384,
+    "skipPrompt": false
+  },
+  "keybindings": {
+    "toggleTheme": "ctrl+t"
+  },
+  "quietStartup": false,
+  "showThinking": true,
+  "exposeSessionEnvironment": true,
+  "doubleEscapeAction": "tree",
+  "orchestration": {
+    "process": false,
+    "tasks": false,
+    "todo": false,
+    "maxConcurrency": 8,
+    "maxRecursionDepth": 8,
+    "mailboxCapacity": 1000,
+    "maxToolsPerAgent": 16
+  },
+  "packages": [
+    "git:github.com/owner/pi-my-tools",
+    { "source": "./my-pi-tools", "extensions": ["*"] }
+  ],
+  "extensions": ["ext-id"],
+  "skills": ["rust-review"],
+  "prompts": ["custom-prompt"],
+  "themes": ["solarized"]
+}
+</code></pre>
+<h3 id="known-fields"><a class="header" href="#known-fields">Known fields</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>defaultProvider</code></td><td>Default provider id used when no model flag is given.</td></tr>
+<tr><td><code>defaultModel</code></td><td>Default model id used when no <code>--model</code> is given.</td></tr>
+<tr><td><code>defaultThinkingLevel</code></td><td>Default reasoning level (<code>off</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>).</td></tr>
+<tr><td><code>defaultProjectTrust</code></td><td><code>"ask"</code>, <code>"always"</code>, or <code>"never"</code>.</td></tr>
+<tr><td><code>approvalMode</code></td><td>Global host tool policy: <code>yolo</code> allows all tools, <code>write</code> confirms Exec, and <code>ask</code> confirms every tool call. Project settings cannot override it.</td></tr>
+<tr><td><code>steeringMode</code></td><td>Steering queue mode (<code>all</code> or <code>one-at-a-time</code>).</td></tr>
+<tr><td><code>followUpMode</code></td><td>Follow-up queue mode (<code>all</code> or <code>one-at-a-time</code>).</td></tr>
+<tr><td><code>sessionDir</code></td><td>Override the session storage directory.</td></tr>
+<tr><td><code>sessionImportSources</code></td><td>Allowed session import sources (<code>omp</code>, <code>codex</code>, <code>claude</code>, <code>grok</code>, <code>droid</code>).</td></tr>
+<tr><td><code>sessionTtlDays</code></td><td>Startup session TTL pruning age in days (default 30; must be &gt; 0).</td></tr>
+<tr><td><code>authScope</code></td><td>Active credential scope label; <code>PI_AUTH_SCOPE</code> overrides it at runtime.</td></tr>
+<tr><td><code>theme</code></td><td>Initial TUI theme name.</td></tr>
+<tr><td><code>compaction</code></td><td>Context compaction limits (<code>enabled</code>, <code>reserveTokens</code>, <code>keepRecentTokens</code>).</td></tr>
+<tr><td><code>terminal</code></td><td>Legacy TUI rendering options (<code>showImages</code>, <code>imageWidthCells</code>, <code>clearOnShrink</code>, <code>showTerminalProgress</code>).</td></tr>
+<tr><td><code>images</code></td><td>Image display options (<code>autoResize</code>, <code>blockImages</code>) plus generation overrides (<code>genModel</code>, <code>genBaseUrl</code>, <code>genApiKey</code>).</td></tr>
+<tr><td><code>retry</code></td><td>Retry policy (<code>enabled</code>, <code>maxRetries</code>, <code>baseDelayMs</code>, plus optional <code>provider</code> overrides).</td></tr>
+<tr><td><code>autoRetry</code>, <code>maxRetries</code>, <code>baseDelayMs</code></td><td>Top-level legacy aliases for the same retry fields.</td></tr>
+<tr><td><code>transport</code></td><td>Stream transport (<code>auto</code>, <code>sse</code>, <code>web-socket</code>, <code>web-socket-cached</code>).</td></tr>
+<tr><td><code>timeoutMs</code></td><td>HTTP/stream timeout.</td></tr>
+<tr><td><code>httpIdleTimeoutMs</code></td><td>Idle HTTP connection timeout.</td></tr>
+<tr><td><code>websocketConnectTimeoutMs</code></td><td>WebSocket connect timeout.</td></tr>
+<tr><td><code>maxRetryDelayMs</code></td><td>Maximum delay between retries.</td></tr>
+<tr><td><code>temperature</code></td><td>Sampling temperature, finite and <code>0..=2</code>.</td></tr>
+<tr><td><code>maxTokens</code></td><td>Maximum tokens per model request.</td></tr>
+<tr><td><code>cacheRetention</code></td><td>Cache retention (<code>none</code>, <code>short</code>, <code>long</code>).</td></tr>
+<tr><td><code>responsesStatefulChain</code></td><td>Opt-in stateful turn chaining for OpenAI Responses API models (default <code>false</code>); see <a href="configuration-profiles.html"><code>configuration-profiles.md</code></a>.</td></tr>
+<tr><td><code>thinkingBudgets</code></td><td>Per-level token budgets (<code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>).</td></tr>
+<tr><td><code>scopedModels</code> / <code>enabledModels</code></td><td>Alias for the same model-pattern allowlist.</td></tr>
+<tr><td><code>branchSummary</code></td><td>Branch-summary token reserve and <code>skipPrompt</code>.</td></tr>
+<tr><td><code>keybindings</code></td><td>Action-to-chord map (value is a string or array of strings).</td></tr>
+<tr><td><code>quietStartup</code></td><td>Suppress non-essential startup messages.</td></tr>
+<tr><td><code>showThinking</code> / <code>hideThinkingBlock</code></td><td>Control whether thinking blocks are shown.</td></tr>
+<tr><td><code>showImages</code>, <code>imageWidthCells</code>, <code>autoResizeImages</code></td><td>Top-level legacy aliases for terminal/image options.</td></tr>
+<tr><td><code>exposeSessionEnvironment</code></td><td>Forward session environment to tools.</td></tr>
+<tr><td><code>doubleEscapeAction</code></td><td>TUI action on double-escape (<code>fork</code>, <code>tree</code>, <code>none</code>).</td></tr>
+<tr><td><code>orchestration</code></td><td>Orchestration tool gates, concurrency limits, workflow isolation, and soft budgets (see <a href="../user-guide/orchestration.html"><code>orchestration.md</code></a> and <a href="../user-guide/workflows.html"><code>workflows.md</code></a>).</td></tr>
+<tr><td><code>selector</code></td><td>Optional model-selector thresholds (advanced).</td></tr>
+<tr><td><code>agents</code></td><td>Per-agent runtime settings (<code>settings.agents.&lt;name&gt;.enabled/model/tools</code>); see <a href="../user-guide/orchestration.html"><code>orchestration.md</code></a>.</td></tr>
+<tr><td><code>packages</code></td><td>Local/git package sources to install/load.</td></tr>
+<tr><td><code>extensions</code>, <code>skills</code>, <code>prompts</code>, <code>themes</code></td><td>Resource names to load from configured packages and discovered paths.</td></tr>
+<tr><td><code>sandbox</code></td><td>Opt-in Linux filesystem sandbox for bash (<code>enabled</code>, <code>network</code>, <code>allowedPaths</code>, <code>deniedPaths</code>, <code>readOnly</code>); see <a href="sandbox-isolation.html"><code>sandbox-isolation.md</code></a>.</td></tr>
+<tr><td><code>live</code></td><td>Hold-to-talk voice configuration (<code>enabled</code>, <code>sttBaseUrl</code>, <code>sttApiKey</code>, <code>sttModel</code>, <code>language</code>, <code>allowInsecure</code>); see <a href="../user-guide/live.html"><code>live.md</code></a>.</td></tr>
+<tr><td><code>memory</code></td><td>Memory backend (<code>backend</code>: <code>local</code>/<code>hindsight</code>/<code>off</code>; Hindsight HTTP endpoint/token, plaintext opt-in, bank/scoping, recall policy, injection, and per-operation timeouts); see <a href="memory.html"><code>memory.md</code></a>.</td></tr>
+<tr><td><code>hooks</code></td><td>Host hooks: external commands observing/gating session events; see <a href="hooks.html"><code>hooks.md</code></a>.</td></tr>
+<tr><td><code>permissionRules</code></td><td>Path-level permission rules evaluated before the approval mode; see <a href="security.html"><code>security.md</code></a>.</td></tr>
+<tr><td><code>mcpServers</code></td><td>MCP servers for the <code>mcp</code> tool (<code>name</code>, <code>transport</code>, <code>command</code>/<code>args</code>/<code>env</code>, <code>url</code>, <code>disabled</code>); see <a href="mcp.html"><code>mcp.md</code></a>.</td></tr>
+</tbody></table>
+</div>
+<p>Source: <code>crates/pi-coding/src/settings.rs:342-416</code>,
+<code>crates/pi-coding/src/settings.rs:970-1096</code>, and
+<code>crates/pi-coding/src/settings.rs:1104-1129</code>.</p>
+<h3 id="supported-operational-settings-coverage"><a class="header" href="#supported-operational-settings-coverage">Supported operational settings coverage</a></h3>
+<p>The following keys are the supported operational settings coverage used by the
+runtime. Any other field may exist but is either a startup default, a resource
+list, or module-specific configuration.</p>
+<div class="table-wrapper"><table><thead><tr><th>Setting</th><th>Applied by</th></tr></thead><tbody>
+<tr><td><code>approvalMode</code></td><td><code>session_run_blueprint</code> host approval hook</td></tr>
+<tr><td><code>steeringMode</code></td><td><code>steering_mode</code></td></tr>
+<tr><td><code>followUpMode</code></td><td><code>follow_up_mode</code></td></tr>
+<tr><td><code>retry</code></td><td><code>retry_settings</code> / <code>apply_session_options</code></td></tr>
+<tr><td><code>compaction</code></td><td><code>apply_session_options</code></td></tr>
+<tr><td><code>transport</code></td><td><code>apply_session_options</code></td></tr>
+<tr><td><code>timeoutMs</code></td><td><code>apply_session_options</code></td></tr>
+<tr><td><code>maxRetryDelayMs</code></td><td><code>apply_session_options</code></td></tr>
+<tr><td><code>temperature</code></td><td><code>apply_session_options</code></td></tr>
+<tr><td><code>maxTokens</code></td><td><code>apply_session_options</code></td></tr>
+<tr><td><code>cacheRetention</code></td><td><code>apply_session_options</code></td></tr>
+<tr><td><code>thinkingBudgets</code></td><td><code>apply_session_options</code></td></tr>
+<tr><td><code>scopedModels</code></td><td><code>scoped_model_patterns</code></td></tr>
+<tr><td><code>enabledModels</code></td><td><code>scoped_model_patterns</code> (legacy alias)</td></tr>
+<tr><td><code>terminal</code></td><td><code>tui_runtime</code></td></tr>
+<tr><td><code>images</code></td><td><code>tui_runtime</code></td></tr>
+<tr><td><code>theme</code></td><td><code>tui_runtime</code> / resource validation</td></tr>
+<tr><td><code>keybindings</code></td><td><code>tui_runtime</code></td></tr>
+<tr><td><code>branchSummary</code></td><td><code>branch_summary_settings</code></td></tr>
+<tr><td><code>quietStartup</code></td><td><code>tui_runtime</code></td></tr>
+<tr><td><code>hideThinkingBlock</code></td><td><code>tui_runtime</code></td></tr>
+<tr><td><code>showThinking</code></td><td><code>tui_runtime</code></td></tr>
+<tr><td><code>exposeSessionEnvironment</code></td><td><code>expose_session_environment</code></td></tr>
+<tr><td><code>doubleEscapeAction</code></td><td><code>tui_runtime</code></td></tr>
+<tr><td><code>orchestration</code></td><td>orchestration tool gates</td></tr>
+</tbody></table>
+</div>
+<p>Source: <code>crates/pi-coding/src/settings.rs:302-330</code>.</p>
+<h2 id="model-and-thinking-level-precedence"><a class="header" href="#model-and-thinking-level-precedence">Model and thinking-level precedence</a></h2>
+<p>When the CLI starts without an explicit model:</p>
+<ol>
+<li><code>--model</code> / <code>-m</code> flag.</li>
+<li>Resumed session's saved model (when <code>--resume</code> or <code>--continue</code> is used).</li>
+<li><code>settings.json</code> <code>defaultModel</code>.</li>
+<li>First authenticated model in the catalog.</li>
+</ol>
+<p>Thinking level precedence:</p>
+<ol>
+<li><code>--think</code> flag.</li>
+<li>Thinking level parsed from a <code>:level</code> model suffix (<code>anthropic/claude-sonnet-4-5:high</code>).</li>
+<li>Resumed session's saved thinking level.</li>
+<li><code>settings.json</code> <code>defaultThinkingLevel</code>.</li>
+<li><code>medium</code>.</li>
+</ol>
+<p>The final level is clamped to the resolved model's supported levels.</p>
+<h2 id="live-reload-semantics"><a class="header" href="#live-reload-semantics">Live reload semantics</a></h2>
+<p>Configuration and resources are loaded into an atomic snapshot.</p>
+<ul>
+<li><code>rpi reload</code> validates the current settings/resource graph and prints a
+structured snapshot, including <code>generation</code>, <code>trust</code>, discovered resources, and
+diagnostics. It always runs headlessly and emits JSON.</li>
+<li><code>SettingsManager::reload()</code> re-reads global settings and, when the project is
+trusted, project settings, then recomputes the effective snapshot.</li>
+<li><code>ResourceManager::stage_reload()</code> builds a new candidate snapshot without
+replacing the active one. <code>commit_reload()</code> swaps the active snapshot only
+after validation succeeds; any error leaves the previous generation in place.</li>
+<li>Interactive TUI <code>/reload</code> and REPL <code>reload</code> call the same stage-and-commit
+path, so malformed files never silently replace a working configuration.</li>
+<li>Settings writes performed through <code>update_global</code> or <code>update_project</code> are
+atomic (temp file + <code>fs::rename</code> + directory sync). Session-only overrides
+via <code>apply_overrides</code> are never persisted.</li>
+</ul>
+<p>Source: <code>crates/pi-cli/src/commands.rs:145-180</code>,
+<code>crates/pi-coding/src/settings.rs:729-843</code>, and
+<code>crates/pi-coding/src/resource_manager.rs:139-253</code>.</p>
+<h2 id="trust-boundaries"><a class="header" href="#trust-boundaries">Trust boundaries</a></h2>
+<ul>
+<li>No project-local configuration is loaded unless the project is trusted. Use
+<code>-a</code>/<code>--approve</code> or set <code>defaultProjectTrust</code> explicitly.</li>
+<li><code>approvalMode</code> is a global safety policy and is rejected in project <code>.pi/settings.json</code>; <code>--approval-mode</code> is the explicit one-run override. It is independent of <code>--approve</code>/<code>--no-approve</code>, which control only project resource trust.</li>
+<li>Interactive approval runs before the existing host hook and extension reducer. Headless modes fail closed whenever the selected policy requires confirmation.</li>
+<li>Bash tool commands run in the configured working directory (<code>--cwd</code>).</li>
+<li>API keys are never printed in error messages or logs.</li>
+<li><code>models.json</code> and <code>auth.json</code> values may contain <code>$VAR</code> / <code>${VAR}</code> templates,
+which are expanded from the current process environment or an explicit <code>env</code>
+map. Command-valued values (<code>!command</code>) are rejected.</li>
+</ul>
+<h2 id="custom-config-path-for-tests-or-isolation"><a class="header" href="#custom-config-path-for-tests-or-isolation">Custom config path for tests or isolation</a></h2>
+<pre><code class="language-sh">export PI_CODING_AGENT_DIR="&lt;workspace&gt;/.my-pi-config"
+mkdir -p "$PI_CODING_AGENT_DIR"
+rpi --print "hello"
+</code></pre>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../user-guide/e2e-scenarios.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/architecture.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../user-guide/e2e-scenarios.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/architecture.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

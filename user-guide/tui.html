@@ -1,0 +1,584 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>TUI and keybindings - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="tui-and-keybindings"><a class="header" href="#tui-and-keybindings">TUI and keybindings</a></h1>
+<p>The TUI is a normal-screen inline terminal interface built with <code>crossterm</code> and
+<code>ratatui</code>. It preserves terminal and tmux scrollback instead of switching to the
+alternate screen. It is selected when both stdin and stdout are terminals;
+otherwise the CLI uses print mode for positional prompts or the line REPL for a
+text session. The dispatch lives in <code>crates/pi-cli/src/lib.rs:138-169</code>.</p>
+<h2 id="layout"><a class="header" href="#layout">Layout</a></h2>
+<pre><code class="language-text"> rpi (rs) · provider/model · /cwd
+┌─────────────────────────────────────┐
+│ Conversation                        │
+│ ...                                 │
+├─────────────────────────────────────┤
+│ Message                             │
+│ &gt; type here                         │
+├─────────────────────────────────────┤
+│ Status line                         │
+└─────────────────────────────────────┘
+</code></pre>
+<p>The conversation area keeps the most recent 4,000 <strong>transcript entries</strong>;
+when the limit is exceeded the oldest entries are dropped (<code>MAX_TRANSCRIPT_LINES = 4_000</code> in <code>crates/pi-cli/src/tui.rs:58</code>, trimmed in <code>tui.rs:1703</code>).
+Tool execution is shown as status lines (<code>· toolName(args)</code> / <code>  └ ok</code> /
+<code>  └ error</code>).</p>
+<p>When the transcript is empty, the welcome screen lists a few <strong>Recent sessions</strong>
+from the unified catalog, scoped to the current working directory. Each entry
+shows a <code>[source]</code> badge for native Pi, OMP, Codex, Claude, Grok/Hyper, or Droid
+sessions. Selecting a foreign session imports it once; subsequent resumes reuse
+the converted file under the effective native session root.</p>
+<h2 id="built-in-themes"><a class="header" href="#built-in-themes">Built-in themes</a></h2>
+<p>Only two built-in palettes are always available:</p>
+<ul>
+<li><code>dark</code> — the exact installed OMP v17.2.6 default <code>titanium</code> palette: electric blue chrome, green success/readouts, gold highlights, and dark titanium surfaces (<code>DARK</code> in <code>crates/pi-cli/src/theme.rs</code>).</li>
+<li><code>light</code> — a high-contrast palette for light terminals (<code>LIGHT</code> in <code>theme.rs</code>).</li>
+</ul>
+<p>The initial theme follows safe terminal background detection; dark terminals therefore use the OMP-default Titanium palette. It can be pinned in <code>settings.json</code>:</p>
+<pre><code class="language-json">{
+  "theme": "light"
+}
+</code></pre>
+<p>Switch themes in the TUI with <code>/theme</code>, <code>/theme next</code>, <code>/theme prev</code>, or
+<code>/theme &lt;name&gt;</code>. The theme manager also live-reloads custom theme files and
+leaves the active palette unchanged when a reload fails (<code>theme.rs:353</code>).</p>
+<h2 id="custom-themes"><a class="header" href="#custom-themes">Custom themes</a></h2>
+<p>Place JSON theme files in one of the theme directories:</p>
+<ul>
+<li>Global: <code>&lt;pi-dir&gt;/themes/</code> (the <code>.pi</code> directory under the user's home directory:
+<code>HOME</code> on Unix, <code>USERPROFILE</code> on Windows, resolved by <code>home_dir()</code> in
+<code>crates/pi-cli/src/tui.rs:4985</code>)</li>
+<li>Project: <code>&lt;workspace&gt;/.pi/themes/</code></li>
+</ul>
+<p>Directory order is global-first, project-last (<code>config_paths</code> in <code>crates/pi-cli/src/tui.rs:4971</code>).</p>
+<p>A theme file extends <code>dark</code> or <code>light</code> and overrides only the colors it
+specifies:</p>
+<pre><code class="language-json">{
+  "name": "solarized",
+  "extends": "dark",
+  "vars": {
+    "blue": "#268bd2",
+    "green": "#859900"
+  },
+  "colors": {
+    "accent": "blue",
+    "success": "green",
+    "selectedBg": "#073642",
+    "mdHeading": "#b58900",
+    "syntaxKeyword": "blue",
+    "toolDiffAdded": "green"
+  }
+}
+</code></pre>
+<p><code>extends</code> must be <code>"dark"</code> or <code>"light"</code> (<code>theme.rs:522</code>). Role names may be
+camelCase (upstream) or snake_case (Rust-native); underscores and hyphens are
+ignored (<code>theme.rs:567</code>).</p>
+<p>Semantic roles cover the complete transcript and editor surface (defined on
+<code>Theme</code> in <code>theme.rs:41</code>):</p>
+<ul>
+<li>Core: <code>accent</code>, <code>border</code>, <code>borderAccent</code>, <code>borderMuted</code>, <code>success</code>, <code>error</code>,
+<code>warning</code>, <code>muted</code>, <code>dim</code>, <code>text</code>, <code>thinkingText</code></li>
+<li>Messages and tools: <code>userMessageText</code>, <code>customMessageText</code>,
+<code>customMessageLabel</code>, <code>toolTitle</code>, <code>toolOutput</code></li>
+<li>Markdown: <code>mdHeading</code>, <code>mdLink</code>, <code>mdLinkUrl</code>, <code>mdCode</code>, <code>mdCodeBlock</code>,
+<code>mdCodeBlockBorder</code>, <code>mdQuote</code>, <code>mdQuoteBorder</code>, <code>mdHr</code>, <code>mdListBullet</code></li>
+<li>Diffs and syntax: <code>toolDiffAdded</code>, <code>toolDiffRemoved</code>, <code>toolDiffContext</code>,
+<code>syntaxComment</code>, <code>syntaxKeyword</code>, <code>syntaxFunction</code>, <code>syntaxVariable</code>,
+<code>syntaxString</code>, <code>syntaxNumber</code>, <code>syntaxType</code>, <code>syntaxOperator</code>,
+<code>syntaxPunctuation</code></li>
+<li>Thinking and modes: <code>thinkingOff</code>, <code>thinkingMinimal</code>, <code>thinkingLow</code>,
+<code>thinkingMedium</code>, <code>thinkingHigh</code>, <code>thinkingXhigh</code>, <code>thinkingMax</code>, <code>bashMode</code></li>
+<li>Backgrounds: <code>selectedBg</code>, <code>userMessageBg</code>, <code>customMessageBg</code>,
+<code>toolPendingBg</code>, <code>toolSuccessBg</code>, <code>toolErrorBg</code></li>
+</ul>
+<p>Color values may be ratatui named colors (<code>black</code>, <code>red</code>, <code>cyan</code>, <code>gray</code>,
+<code>darkgray</code>, <code>lightgreen</code>, <code>white</code>, <code>reset</code>, ...) or hex <code>#rrggbb</code> / <code>#rgb</code>.
+Empty-string values resolve to the terminal default color for <code>text</code>,
+<code>userMessageText</code>, <code>customMessageText</code>, and <code>toolTitle</code> (<code>theme.rs:100</code>).
+Theme files are validated before loading; a malformed file is skipped with a
+diagnostic and the active theme is left unchanged.</p>
+<h2 id="keybindings"><a class="header" href="#keybindings">Keybindings</a></h2>
+<p>The TUI maps incoming keys to stable actions through a <code>KeyBindingsManager</code>.
+Built-in defaults reproduce the original TUI behavior (<code>default_bindings</code> in
+<code>crates/pi-cli/src/keybindings.rs:354</code>). The dispatch layer never checks
+hard-coded chords; it resolves every key event to an <code>Action</code> (<code>keybindings.rs:298</code>).</p>
+<h3 id="global-editor-and-application-defaults"><a class="header" href="#global-editor-and-application-defaults">Global editor and application defaults</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Chord</th><th>Action</th><th>Stable ID (config name)</th></tr></thead><tbody>
+<tr><td><code>enter</code></td><td>Submit message</td><td><code>tui.input.submit</code></td></tr>
+<tr><td><code>shift+enter</code>, <code>ctrl+j</code></td><td>Insert newline</td><td><code>tui.input.newLine</code></td></tr>
+<tr><td><code>backspace</code></td><td>Delete character backward</td><td><code>tui.editor.deleteCharBackward</code></td></tr>
+<tr><td><code>delete</code></td><td>Delete character forward</td><td><code>tui.editor.deleteCharForward</code></td></tr>
+<tr><td><code>left</code>, <code>ctrl+b</code></td><td>Move cursor left</td><td><code>tui.editor.cursorLeft</code></td></tr>
+<tr><td><code>right</code>, <code>ctrl+f</code></td><td>Move cursor right</td><td><code>tui.editor.cursorRight</code></td></tr>
+<tr><td><code>up</code></td><td>Move cursor / previous history line</td><td><code>tui.editor.cursorUp</code></td></tr>
+<tr><td><code>down</code></td><td>Move cursor / next history line</td><td><code>tui.editor.cursorDown</code></td></tr>
+<tr><td><code>alt+left</code>, <code>ctrl+left</code>, <code>alt+b</code></td><td>Word left</td><td><code>tui.editor.cursorWordLeft</code></td></tr>
+<tr><td><code>alt+right</code>, <code>ctrl+right</code>, <code>alt+f</code></td><td>Word right</td><td><code>tui.editor.cursorWordRight</code></td></tr>
+<tr><td><code>home</code>, <code>ctrl+a</code></td><td>Start of line</td><td><code>tui.editor.cursorLineStart</code></td></tr>
+<tr><td><code>end</code>, <code>ctrl+e</code></td><td>End of line</td><td><code>tui.editor.cursorLineEnd</code></td></tr>
+<tr><td><code>ctrl+]</code></td><td>Jump forward</td><td><code>tui.editor.jumpForward</code></td></tr>
+<tr><td><code>ctrl+alt+]</code></td><td>Jump backward</td><td><code>tui.editor.jumpBackward</code></td></tr>
+<tr><td><code>pageup</code></td><td>Scroll transcript up one page</td><td><code>tui.editor.pageUp</code></td></tr>
+<tr><td><code>pagedown</code></td><td>Scroll transcript down one page</td><td><code>tui.editor.pageDown</code></td></tr>
+<tr><td><code>ctrl+w</code>, <code>alt+backspace</code></td><td>Delete word backward</td><td><code>tui.editor.deleteWordBackward</code></td></tr>
+<tr><td><code>alt+d</code>, <code>alt+delete</code></td><td>Delete word forward</td><td><code>tui.editor.deleteWordForward</code></td></tr>
+<tr><td><code>ctrl+u</code></td><td>Clear the entire composer</td><td><code>tui.editor.clear</code></td></tr>
+<tr><td><code>ctrl+k</code></td><td>Delete to line end</td><td><code>tui.editor.deleteToLineEnd</code></td></tr>
+<tr><td><code>ctrl+y</code></td><td>Yank</td><td><code>tui.editor.yank</code></td></tr>
+<tr><td><code>alt+y</code></td><td>Yank pop</td><td><code>tui.editor.yankPop</code></td></tr>
+<tr><td><code>ctrl+-</code></td><td>Undo</td><td><code>tui.editor.undo</code></td></tr>
+<tr><td><code>esc</code></td><td>Abort in-flight run, or clear input when idle</td><td><code>app.interrupt</code></td></tr>
+<tr><td><code>ctrl+c</code></td><td>Clear input</td><td><code>app.clear</code></td></tr>
+<tr><td><code>ctrl+d</code></td><td>Quit (when input is empty)</td><td><code>app.exit</code></td></tr>
+<tr><td><code>tab</code></td><td>Accept slash-command completion</td><td><code>tui.input.tab</code></td></tr>
+<tr><td><code>ctrl+v</code>, <code>alt+v</code></td><td>Paste from clipboard</td><td><code>app.clipboard.pasteImage</code></td></tr>
+<tr><td><code>ctrl+x</code>, <code>ctrl+shift+c</code></td><td>Copy last assistant message</td><td><code>app.message.copy</code></td></tr>
+<tr><td><code>ctrl+g</code></td><td>Open external editor</td><td><code>app.editor.external</code></td></tr>
+<tr><td><code>ctrl+z</code></td><td>Suspend (yield terminal)</td><td><code>app.suspend</code></td></tr>
+<tr><td><code>shift+tab</code></td><td>Cycle thinking level</td><td><code>app.thinking.cycle</code></td></tr>
+<tr><td><code>ctrl+t</code></td><td>Toggle thinking block visibility</td><td><code>app.thinking.toggle</code></td></tr>
+<tr><td><code>ctrl+p</code></td><td>Cycle model forward</td><td><code>app.model.cycleForward</code></td></tr>
+<tr><td><code>ctrl+shift+p</code></td><td>Cycle model backward</td><td><code>app.model.cycleBackward</code></td></tr>
+<tr><td><code>ctrl+l</code></td><td>Open model selector</td><td><code>app.model.select</code></td></tr>
+<tr><td><code>ctrl+o</code></td><td>Expand/collapse tool details</td><td><code>app.tools.expand</code></td></tr>
+<tr><td><code>alt+enter</code></td><td>Queue follow-up</td><td><code>app.message.followUp</code></td></tr>
+<tr><td><code>alt+up</code></td><td>Dequeue last prompt</td><td><code>app.message.dequeue</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="contextual-selector-defaults"><a class="header" href="#contextual-selector-defaults">Contextual selector defaults</a></h3>
+<p>Some chords are intentionally reused across mutually exclusive panels; they
+only dispatch when the matching panel is open (<code>resolve_in</code> in
+<code>keybindings.rs:303</code>, selector actions in <code>keybindings.rs:323</code>).</p>
+<p><strong>Saved session selector</strong> (<code>/sessions</code>, <code>/resume</code> with no argument):</p>
+<div class="table-wrapper"><table><thead><tr><th>Chord</th><th>Action</th></tr></thead><tbody>
+<tr><td><code>ctrl+n</code></td><td>Toggle named-only filter (<code>app.session.toggleNamedFilter</code>)</td></tr>
+<tr><td><code>ctrl+p</code></td><td>Toggle path display (<code>app.session.togglePath</code>)</td></tr>
+<tr><td><code>ctrl+s</code></td><td>Toggle sort (<code>app.session.toggleSort</code>)</td></tr>
+<tr><td><code>ctrl+r</code></td><td>Rename selected session (<code>app.session.rename</code>)</td></tr>
+<tr><td><code>ctrl+d</code></td><td>Delete selected session (<code>app.session.delete</code>)</td></tr>
+<tr><td><code>ctrl+backspace</code></td><td>Delete without exiting selector (<code>app.session.deleteNoninvasive</code>)</td></tr>
+</tbody></table>
+</div>
+<p><strong>Scoped model selector</strong> (<code>/scoped-models</code>):</p>
+<div class="table-wrapper"><table><thead><tr><th>Chord</th><th>Action</th></tr></thead><tbody>
+<tr><td><code>ctrl+s</code></td><td>Save scoped patterns (<code>app.models.save</code>)</td></tr>
+<tr><td><code>ctrl+a</code></td><td>Enable all (<code>app.models.enableAll</code>)</td></tr>
+<tr><td><code>ctrl+x</code></td><td>Clear all (<code>app.models.clearAll</code>)</td></tr>
+<tr><td><code>ctrl+p</code></td><td>Toggle provider (<code>app.models.toggleProvider</code>)</td></tr>
+<tr><td><code>alt+up</code></td><td>Move selected up (<code>app.models.reorderUp</code>)</td></tr>
+<tr><td><code>alt+down</code></td><td>Move selected down (<code>app.models.reorderDown</code>)</td></tr>
+</tbody></table>
+</div>
+<p><strong>Session tree / fork panel</strong> (<code>/tree</code>, <code>/fork</code>):</p>
+<div class="table-wrapper"><table><thead><tr><th>Chord</th><th>Action</th></tr></thead><tbody>
+<tr><td><code>left</code></td><td>Fold the current node, or move up (<code>app.tree.foldOrUp</code>)</td></tr>
+<tr><td><code>right</code></td><td>Unfold the current node, or move down (<code>app.tree.unfoldOrDown</code>)</td></tr>
+<tr><td><code>alt+shift+l</code></td><td>Edit node label (<code>app.tree.editLabel</code>)</td></tr>
+<tr><td><code>alt+shift+t</code></td><td>Toggle label timestamps (<code>app.tree.toggleLabelTimestamp</code>)</td></tr>
+<tr><td><code>ctrl+d</code></td><td>Default filter (<code>app.tree.filter.default</code>)</td></tr>
+<tr><td><code>ctrl+t</code></td><td>No-tools filter (<code>app.tree.filter.noTools</code>)</td></tr>
+<tr><td><code>ctrl+u</code></td><td>User-only filter (<code>app.tree.filter.userOnly</code>)</td></tr>
+<tr><td><code>ctrl+l</code></td><td>Labeled-only filter (<code>app.tree.filter.labeledOnly</code>)</td></tr>
+<tr><td><code>ctrl+a</code></td><td>All entries filter (<code>app.tree.filter.all</code>)</td></tr>
+<tr><td><code>ctrl+o</code></td><td>Cycle filter forward (<code>app.tree.filter.cycleForward</code>)</td></tr>
+<tr><td><code>ctrl+shift+o</code></td><td>Cycle filter backward (<code>app.tree.filter.cycleBackward</code>)</td></tr>
+</tbody></table>
+</div>
+<p>Up/Down/PageUp/PageDown move the selection in all selector and tree panels.</p>
+<h2 id="custom-keybindings"><a class="header" href="#custom-keybindings">Custom keybindings</a></h2>
+<p>Place keybinding files in one of the keybinding paths:</p>
+<ul>
+<li>Global: <code>&lt;pi-dir&gt;/keybindings.json</code> (the <code>.pi</code> directory under the user's
+home directory)</li>
+<li>Project: <code>&lt;workspace&gt;/.pi/keybindings.json</code></li>
+</ul>
+<p>Project files overlay global files, which overlay built-in defaults (<code>KeyBindingsManager::load</code> in <code>keybindings.rs:267</code>). A file with any malformed chord, unknown action, or duplicate canonical chord is rejected in full with a diagnostic.</p>
+<p>Two file formats are accepted:</p>
+<p><strong>Upstream action-to-chord object</strong> (preferred):</p>
+<pre><code class="language-json">{
+  "tui.input.submit": ["ctrl+enter"],
+  "tui.input.newLine": ["shift+enter", "ctrl+j"],
+  "app.exit": "ctrl+q"
+}
+</code></pre>
+<p><strong>Legacy pi-rs <code>bindings</code> array</strong>:</p>
+<pre><code class="language-json">{
+  "bindings": [
+    { "chord": "ctrl+enter", "action": "editor_submit" },
+    { "chord": "enter", "action": "editor_newline" },
+    { "chord": "ctrl+q", "action": "quit" }
+  ]
+}
+</code></pre>
+<p>Overriding an action replaces all of its earlier chords, matching upstream
+behavior.</p>
+<p>Valid actions are the stable IDs listed above. The canonical registry is
+<code>VALID_ACTION_NAMES</code> in <code>keybindings.rs:177</code>. Chords use <code>+</code>-separated
+modifiers and a key token. Modifiers are <code>ctrl</code> (alias <code>control</code>), <code>alt</code>
+(alias <code>option</code>), and <code>shift</code>. Key tokens include special names (<code>enter</code>,
+<code>tab</code>, <code>esc</code>, <code>left</code>, <code>right</code>, <code>up</code>, <code>down</code>, <code>home</code>, <code>end</code>, <code>backspace</code>,
+<code>delete</code>, <code>space</code>, <code>pageup</code>, <code>pagedown</code>, <code>f1</code>–<code>f12</code>) or a single Unicode
+scalar (<code>a</code>, <code>/</code>, <code>1</code>).</p>
+<h2 id="selectors-tree-fork-and-dialogs"><a class="header" href="#selectors-tree-fork-and-dialogs">Selectors, tree, fork, and dialogs</a></h2>
+<p>The TUI uses several modal page overlays inside the inline viewport. Typing
+filters the list, <code>Enter</code> confirms the selection, and <code>Esc</code> closes the overlay.</p>
+<ul>
+<li><strong>Model selector</strong> (<code>ctrl+l</code> or <code>/model</code> with no argument): searchable list
+of configured providers and models (<code>open_model_panel</code> in <code>tui.rs:1963</code>).</li>
+<li><strong>Thinking level selector</strong> (<code>/settings</code> → "Thinking level" or <code>/theme</code> not
+used): one entry per level (<code>open_thinking_panel</code> in <code>tui.rs:1984</code>).</li>
+<li><strong>Settings panel</strong> (<code>/settings</code>): toggles thinking level, theme, and
+automatic compaction (<code>open_settings_panel</code> in <code>tui.rs:2027</code>).</li>
+<li><strong>Trust panel</strong> (<code>/trust</code>): choose <code>Trusted</code>, <code>Untrusted</code>, or <code>Ask</code> for the
+current project (<code>open_trust_panel</code> in <code>tui.rs:2080</code>).
+<strong>Saved session selector</strong> (<code>/sessions</code>, <code>/resume</code> with no argument):
+unified catalog scoped to the current cwd, filter by name/path, sort by newest
+or name, rename (<code>ctrl+r</code>), and delete (<code>ctrl+d</code>) saved sessions. Rows show a
+<code>[source]</code> badge; foreign source files cannot be renamed or deleted, while
+native Pi sessions and already-imported conversions can be
+(<code>handle_session_selector_key</code> in <code>tui.rs:2281</code>).</li>
+<li><strong>Scoped model selector</strong> (<code>/scoped-models</code>): enable/disable models for
+<code>ctrl+p</code>/<code>ctrl+shift+p</code> cycling, save the scope, and reorder enabled models
+(<code>handle_scoped_model_selector_key</code> in <code>tui.rs:2387</code>).</li>
+<li><strong>Session tree</strong> (<code>/tree</code>): browse the branching message tree, fold/unfold,
+apply filters, and edit node labels (<code>handle_tree_panel_key</code> in
+<code>tui.rs:2143</code>).</li>
+<li><strong>Fork panel</strong> (<code>/fork</code>): a tree filtered to user messages; selecting one
+and pressing <code>Enter</code> copies the active path up to that message into a new
+session (<code>TreePanelMode::Fork</code> in <code>tree_panel.rs:9</code>, <code>open_fork_panel</code> in
+<code>tui.rs:2066</code>).</li>
+</ul>
+<p><strong>Extension dialogs</strong> are raised when an extension requests interactive UI
+(<code>ExtensionDialog</code> in <code>tui.rs:127</code>). They include:</p>
+<ul>
+<li><strong>Select</strong>: <code>Up</code>/<code>Down</code> to choose, <code>Enter</code> to accept, <code>Esc</code> to cancel.</li>
+<li><strong>Confirm</strong>: arrow keys or <code>Tab</code> to swap the default; <code>y</code>/<code>Y</code> or <code>n</code>/<code>N</code> or
+<code>Enter</code> to accept; <code>Esc</code> to cancel.</li>
+<li><strong>Input / Editor</strong>: full editor keys from the keybinding table, <code>Enter</code>
+(<code>tui.input.submit</code>) to accept, <code>Esc</code> to cancel.</li>
+</ul>
+<p>(<code>handle_extension_dialog_key</code> in <code>tui.rs:2576</code>)</p>
+<h2 id="terminal-image-behavior"><a class="header" href="#terminal-image-behavior">Terminal image behavior</a></h2>
+<p>Images are rendered only in the inline TUI. The line REPL and structured modes
+never receive image protocol bytes.</p>
+<p><strong>Protocol detection</strong> uses explicit environment evidence
+(<code>detect_protocol</code> in <code>terminal_images.rs</code>):</p>
+<ul>
+<li><strong>Kitty</strong>: <code>KITTY_WINDOW_ID</code>, <code>TERM=xterm-kitty</code>, or <code>TERM_PROGRAM</code> equal to
+<code>wezterm</code>/<code>ghostty</code>. Under tmux, Kitty output is enabled only for tmux 3.3 or
+newer and every graphics APC is DCS-wrapped for passthrough. GNU Screen and
+older/unknown tmux versions fall back to metadata text.</li>
+<li><strong>iTerm2</strong>: <code>TERM_PROGRAM=iTerm.app</code> <strong>and</strong> <code>ITERM_SESSION_ID</code> present.</li>
+<li><strong>Sixel</strong>: <code>TERM</code> contains <code>sixel</code>. Sixel is detected for truthful
+diagnostics but is <strong>not emitted</strong> because the project does not yet include
+a bounded safe encoder; the TUI falls back to metadata text
+(<code>supports_images</code> in <code>terminal_images.rs</code>).</li>
+</ul>
+<p>The TUI does not read stdin for an active graphics probe during startup, so
+terminal capability detection cannot consume user keystrokes. The implemented
+query contract uses Kitty's valid 1x1 RGB form and its response splitter
+preserves unrelated bytes, but the interactive startup path does not invoke it.</p>
+<p><strong>Image display settings</strong> come from <code>terminal.showImages</code> and
+<code>terminal.imageWidthCells</code> in <code>settings.json</code> (<code>TerminalSettings</code> in
+<code>settings.rs</code>; the default width is <code>60</code>). Images are suppressed whenever an
+overlay such as a selector, tree, or dialog is open.</p>
+<p><strong>Layout and safety</strong>: the renderer decodes and validates the image, refuses
+empty data and payloads larger than the configured <code>MAX_IMAGE_BYTES</code> limit,
+clamps the layout to the viewport and
+<code>imageWidthCells</code>, preserves aspect ratio, and falls back to ordinary metadata
+when display is disabled or the protocol is unsupported.</p>
+<p><strong>Presentation</strong>: validated PNG payloads are transmitted in chunks of at most
+4,096 base64 bytes with Kitty's transmit-only action (<code>a=t</code>) and separate
+pixel width/height controls (<code>s=</code>, <code>v=</code>). Image and placement IDs are explicit,
+non-zero, and randomized per renderer. Frame reconciliation deletes only the
+renderer-owned placement that moved or disappeared; cleanup deletes only its
+owned image IDs, never another application's placements. iTerm images retain
+the inline <code>1337</code> fallback with <code>preserveAspectRatio=1</code>.</p>
+<h2 id="slash-commands"><a class="header" href="#slash-commands">Slash commands</a></h2>
+<p>The TUI and line REPL can execute the same built-ins, but <code>/help</code>, slash
+completion, and RPC discovery expose only the 22 commands in
+<code>PRIMARY_COMMAND_NAMES</code> (<code>interactive_commands.rs</code>). Prompt templates, dynamic
+skills, and extension commands remain executable through their namespaced paths.</p>
+<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>/settings</code></td><td>Inspect settings or open the settings page</td></tr>
+<tr><td><code>/model [provider/model]</code></td><td>Select or switch model</td></tr>
+<tr><td><code>/branch</code></td><td>Create a branch from a previous message</td></tr>
+<tr><td><code>/resume [path, id, or prefix]</code></td><td>Resume native or discovered foreign sessions</td></tr>
+<tr><td><code>/fork</code></td><td>Fork from a previous user message</td></tr>
+<tr><td><code>/export [path]</code></td><td>Export session to HTML or JSONL</td></tr>
+<tr><td><code>/dump [--jsonl] [path]</code></td><td>Export with an explicit format flag</td></tr>
+<tr><td><code>/handoff [--prose]</code></td><td>Generate a handoff summary (copied to clipboard)</td></tr>
+<tr><td><code>/agents</code></td><td>Manage agent definitions and model overrides</td></tr>
+<tr><td><code>/role</code></td><td>Manage the current agent role</td></tr>
+<tr><td><code>/compact [--snap] [instructions]</code></td><td>Manually compact session context (<code>--snap</code> is deterministic)</td></tr>
+<tr><td><code>/rewind [entry-index|checkpoint-name]</code></td><td>Roll the session back, archiving the dropped tail</td></tr>
+<tr><td><code>/checkpoint &lt;name&gt;</code></td><td>Mark the current position as a named rewind target</td></tr>
+<tr><td><code>/ps</code></td><td>List supervised processes</td></tr>
+<tr><td><code>/loop [interval] &lt;prompt&gt;</code></td><td>Run a recurring prompt</td></tr>
+<tr><td><code>/goal</code></td><td>Manage the durable session goal</td></tr>
+<tr><td><code>/workflow</code></td><td>Manage isolated concurrent workflows</td></tr>
+<tr><td><code>/code-review [&lt;from&gt; &lt;to&gt;]</code></td><td>Open a fullscreen Git diff browser: bare shows tracked HEAD→working-tree changes; two refs compare any two commits/branches/tags</td></tr>
+<tr><td><code>/btw [prompt]</code></td><td>Open a persistent detached side conversation forked from the active main branch</td></tr>
+<tr><td><code>/queue [cancel]</code></td><td>Show pending steering/follow-up prompts (cancel clears them)</td></tr>
+<tr><td><code>/live</code></td><td>Hold-to-talk voice input</td></tr>
+</tbody></table>
+</div>
+<p>Other built-ins such as <code>/help</code>, <code>/new</code>, <code>/sessions</code>, <code>/tree</code>, <code>/todo</code>,
+<code>/snapcompact</code>, <code>/share</code>, <code>/copy</code>, <code>/login</code>, <code>/logout</code>, <code>/process</code>, <code>/theme</code>,
+and <code>/quit</code> remain manually executable but are intentionally omitted from
+primary discovery.</p>
+<p><code>/btw</code> is read-only by default. <code>Ctrl+T</code> toggles edit/exec tools while the side agent is idle; <code>Esc</code> aborts a streaming turn or closes an idle overlay; <code>Alt+R</code> reforks from the current main leaf; <code>Alt+N</code> clears the side transcript. The overlay has its own editor, transcript, events, stream, and abort lifecycle. Closing it preserves the side controller for reopening, while TUI shutdown aborts and joins active side work.</p>
+<p><code>/code-review</code> displays staged and unstaged tracked changes against <code>HEAD</code>. <code>Tab</code> changes pane focus; <code>j</code>/<code>k</code>, arrows, and mouse clicks select hunks; <code>c</code> comments on the selected hunk; <code>Space</code> folds its inline review thread. Each thread appears after the complete hunk body with distinct comment/answer cards, and repeated agent progress messages collapse into one answer per exchange. Page keys and the mouse wheel scroll; tree clicks select or fold; <code>Esc</code>/<code>q</code> closes the page. Mouse capture is enabled only for this page and restored on every close or overlay transition.</p>
+<p><code>/code-review</code> accepts zero or exactly two arguments. Bare <code>/code-review</code> shows
+tracked HEAD→working-tree changes. <code>/code-review &lt;from&gt; &lt;to&gt;</code> resolves each ref
+(commit hash, branch, or tag) to a commit and renders the commit-to-commit diff
+labeled <code>&lt;from&gt; → &lt;to&gt;</code> in the panel title; working-tree changes are ignored. One
+argument or more than two is invalid — the page does not open and the status line
+shows <code>Usage: /code-review [&lt;from&gt; &lt;to&gt;]</code>. Pressing <code>r</code> refreshes the snapshot and
+preserves the selected revision pair.</p>
+<p>Loop intervals accept positive bare seconds (<code>/loop 300 check status</code>) or compact <code>s</code>, <code>m</code>, <code>h</code>, and <code>d</code> units (<code>/loop 3s echo hello</code>, <code>/loop 30m check deploy</code>). Scheduled turns appear as <code>Loop &lt;id&gt; · &lt;cadence&gt;</code> system cards; the internal model instruction wrapper is not shown as a user message.</p>
+<h2 id="tui-vs-repl-only-limitations"><a class="header" href="#tui-vs-repl-only-limitations">TUI vs REPL-only limitations</a></h2>
+<p>When stdout is not a TTY, <code>main_run</code> falls back to <code>repl::interactive</code>
+(<code>lib.rs:142</code>). The REPL shares the same slash-command
+catalog but lacks the TUI's modal page overlays:</p>
+<ul>
+<li><strong>No modal pages</strong>: model, settings, trust, saved-session, scoped-model,
+session-tree, fork, <code>/btw</code>, and <code>/code-review</code> overlays are TUI-only. In the
+REPL, <code>/scoped-models</code> and <code>/theme</code> report that they require the TUI, <code>/tree</code>
+prints JSON, <code>/fork</code> with no argument prints candidate messages, and <code>/model</code>
+accepts a concrete spec.</li>
+<li><strong>No configurable keybindings or themes</strong>: the REPL uses a fixed
+line-editing interface and ignores theme files.</li>
+<li><strong>No terminal image rendering</strong>: image attachments are processed and sent
+to the model, but the REPL displays only text metadata.</li>
+<li><strong>No interactive extension UI</strong>: the REPL is composed without the TUI's
+<code>ExtensionUiAdapter</code> (<code>session_run.rs:491</code>), so extension select/confirm/input
+dialogs cannot be answered interactively.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../introduction/install.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../user-guide/cli-modes.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../introduction/install.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../user-guide/cli-modes.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

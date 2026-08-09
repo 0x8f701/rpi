@@ -1,0 +1,446 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Authentication - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="authentication"><a class="header" href="#authentication">Authentication</a></h1>
+<p><code>rpi</code> resolves credentials in a strict, documented order and never logs them.
+Credentials can be managed interactively with <code>rpi login</code> / <code>rpi logout</code> or
+configured manually in <code>auth.json</code> or <code>models.json</code>.</p>
+<h2 id="quick-credential-management"><a class="header" href="#quick-credential-management">Quick credential management</a></h2>
+<pre><code class="language-sh"># Interactive login (choose provider and method)
+rpi login
+
+# Login to a specific provider
+rpi login anthropic
+
+# Remove stored credentials
+rpi logout openai
+</code></pre>
+<p><code>login</code> and <code>logout</code> operate on the agent's <code>auth.json</code>. Outside an
+interactive terminal they require an explicit provider argument. <code>auth.json</code> is
+written atomically with <code>0o600</code> file permissions and <code>0o700</code> directory
+permissions on Unix.</p>
+<h2 id="credential-precedence-per-provider"><a class="header" href="#credential-precedence-per-provider">Credential precedence (per provider)</a></h2>
+<p>When a request is built, <code>rpi</code> looks for a usable credential in this order
+(source: <code>crates/pi-cli/src/models_config.rs::resolve_model_request_auth</code> and
+<code>resolve_model_request_auth_async</code>):</p>
+<ol>
+<li>An explicit API key passed at call time, e.g. <code>--api-key</code> on the CLI
+(<code>--api-key</code> requires <code>--model</code> or <code>--models</code>).</li>
+<li>A runtime key set for the provider (the CLI stores <code>--api-key</code> as a runtime
+key for the resolved provider for the duration of the run).</li>
+<li>A stored <code>auth.json</code> credential for the provider:
+<ul>
+<li><code>api_key</code> entries are expanded and used as the key.</li>
+<li>OAuth entries require async resolution; <code>rpi</code> refreshes expired OAuth
+tokens automatically before use.</li>
+</ul>
+</li>
+<li>The <code>apiKey</code> field from <code>models.json</code> for that provider.</li>
+<li>A recognized provider environment variable (see table below).</li>
+<li>Anthropic-specific bearer handling: when the API-key slot is still empty,
+<code>ANTHROPIC_AUTH_TOKEN</code> is sent as <code>Authorization: Bearer &lt;token&gt;</code> and is
+never treated as an <code>x-api-key</code> value.</li>
+<li>Provider-specific header-only auth configured in <code>models.json</code> or model
+headers, e.g. <code>authorization</code>, <code>x-goog-api-key</code>, or <code>cf-aig-authorization</code>.</li>
+</ol>
+<p>If none of the above produce a key or recognized auth header, the request
+fails closed with an error naming the provider.</p>
+<p>All header-name lookups are case-insensitive. Header and credential values
+support <code>$VAR</code> / <code>${VAR}</code> template expansion (see
+<a href="#template-expansion">Template expansion</a>).</p>
+<h2 id="supported-oauth-providers"><a class="header" href="#supported-oauth-providers">Supported OAuth providers</a></h2>
+<p><code>rpi login</code> can store OAuth credentials for:</p>
+<ul>
+<li><code>anthropic</code></li>
+<li><code>openai-codex</code></li>
+<li><code>google-gemini-cli</code></li>
+<li><code>xai</code></li>
+<li><code>openrouter</code></li>
+<li><code>kimi-coding</code></li>
+</ul>
+<p>Other providers default to API-key authentication. OAuth tokens are refreshed
+automatically when expired (with a 5-minute skew). OAuth credentials may carry
+model entitlements (<code>available_model_ids</code>); models outside those entitlements
+are hidden for that credential.</p>
+<h2 id="environment-variables-by-provider"><a class="header" href="#environment-variables-by-provider">Environment variables by provider</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Provider(s)</th><th>Variable(s)</th></tr></thead><tbody>
+<tr><td><code>anthropic</code></td><td><code>ANTHROPIC_API_KEY</code>, <code>ANTHROPIC_OAUTH_TOKEN</code>, <code>ANTHROPIC_AUTH_TOKEN</code></td></tr>
+<tr><td><code>github-copilot</code></td><td><code>COPILOT_GITHUB_TOKEN</code></td></tr>
+<tr><td><code>openai</code>, <code>openai-codex</code></td><td><code>OPENAI_API_KEY</code></td></tr>
+<tr><td><code>azure-openai-responses</code></td><td><code>AZURE_OPENAI_API_KEY</code></td></tr>
+<tr><td><code>google</code></td><td><code>GEMINI_API_KEY</code></td></tr>
+<tr><td><code>google-vertex</code></td><td><code>GOOGLE_CLOUD_API_KEY</code> (or access-token/authorization header)</td></tr>
+<tr><td><code>groq</code></td><td><code>GROQ_API_KEY</code></td></tr>
+<tr><td><code>cerebras</code></td><td><code>CEREBRAS_API_KEY</code></td></tr>
+<tr><td><code>xai</code></td><td><code>XAI_API_KEY</code></td></tr>
+<tr><td><code>deepseek</code></td><td><code>DEEPSEEK_API_KEY</code></td></tr>
+<tr><td><code>openrouter</code></td><td><code>OPENROUTER_API_KEY</code></td></tr>
+<tr><td><code>nvidia</code></td><td><code>NVIDIA_API_KEY</code></td></tr>
+<tr><td><code>mistral</code></td><td><code>MISTRAL_API_KEY</code></td></tr>
+<tr><td><code>minimax</code>, <code>minimax-cn</code></td><td><code>MINIMAX_API_KEY</code>, <code>MINIMAX_CN_API_KEY</code></td></tr>
+<tr><td><code>moonshotai</code>, <code>moonshotai-cn</code></td><td><code>MOONSHOT_API_KEY</code></td></tr>
+<tr><td><code>huggingface</code></td><td><code>HF_TOKEN</code></td></tr>
+<tr><td><code>fireworks</code></td><td><code>FIREWORKS_API_KEY</code></td></tr>
+<tr><td><code>together</code></td><td><code>TOGETHER_API_KEY</code></td></tr>
+<tr><td><code>opencode</code>, <code>opencode-go</code></td><td><code>OPENCODE_API_KEY</code></td></tr>
+<tr><td><code>kimi-coding</code></td><td><code>KIMI_API_KEY</code></td></tr>
+<tr><td><code>cloudflare-workers-ai</code>, <code>cloudflare-ai-gateway</code></td><td><code>CLOUDFLARE_API_KEY</code></td></tr>
+<tr><td><code>amazon-bedrock</code></td><td><code>AWS_PROFILE</code>, <code>AWS_ACCESS_KEY_ID</code> + <code>AWS_SECRET_ACCESS_KEY</code>, <code>AWS_BEARER_TOKEN_BEDROCK</code>, <code>AWS_CONTAINER_CREDENTIALS_RELATIVE_URI</code>, <code>AWS_CONTAINER_CREDENTIALS_FULL_URI</code>, <code>AWS_WEB_IDENTITY_TOKEN_FILE</code></td></tr>
+<tr><td><code>ant-ling</code></td><td><code>ANT_LING_API_KEY</code></td></tr>
+<tr><td><code>qwen-token-plan</code>, <code>qwen-token-plan-cn</code></td><td><code>QWEN_TOKEN_PLAN_API_KEY</code>, <code>QWEN_TOKEN_PLAN_CN_API_KEY</code></td></tr>
+<tr><td><code>zai</code>, <code>zai-coding-cn</code></td><td><code>ZAI_API_KEY</code>, <code>ZAI_CODING_CN_API_KEY</code></td></tr>
+<tr><td><code>xiaomi</code>, <code>xiaomi-token-plan-cn</code>, <code>xiaomi-token-plan-ams</code>, <code>xiaomi-token-plan-sgp</code></td><td><code>XIAOMI_API_KEY</code>, <code>XIAOMI_TOKEN_PLAN_CN_API_KEY</code>, <code>XIAOMI_TOKEN_PLAN_AMS_API_KEY</code>, <code>XIAOMI_TOKEN_PLAN_SGP_API_KEY</code></td></tr>
+<tr><td><code>radius</code></td><td><code>RADIUS_API_KEY</code></td></tr>
+<tr><td><code>vercel-ai-gateway</code></td><td><code>AI_GATEWAY_API_KEY</code></td></tr>
+</tbody></table>
+</div>
+<p>Provider-specific notes:</p>
+<ul>
+<li><strong>Anthropic</strong>: <code>ANTHROPIC_OAUTH_TOKEN</code> wins over <code>ANTHROPIC_API_KEY</code> when an
+API key is requested. <code>ANTHROPIC_AUTH_TOKEN</code> is used as a bearer token in
+the <code>Authorization</code> header only when the API-key slot is empty, and is
+never used as an <code>x-api-key</code> value.</li>
+<li><strong>GitHub Copilot</strong>: <code>COPILOT_GITHUB_TOKEN</code> is required. The provider adds
+dynamic per-request headers (<code>X-Initiator</code>, <code>Openai-Intent</code>, and
+<code>Copilot-Vision-Request</code> when images are present).</li>
+<li><strong>Amazon Bedrock</strong>: ambient AWS credentials are intentionally not read.
+When one of the listed AWS credential sources is present, the resolved key
+is the sentinel <code>&lt;authenticated&gt;</code> and the AWS SDK signs the request.</li>
+<li><strong>Google Vertex</strong>: <code>GOOGLE_CLOUD_API_KEY</code> supplies an API key, or
+<code>GOOGLE_CLOUD_ACCESS_TOKEN</code> / an <code>authorization</code> header can supply an access
+token. The provider never reads Application Default Credential files or
+credential helpers. Vertex requests also require <code>GOOGLE_CLOUD_PROJECT</code>
+(alias <code>GCLOUD_PROJECT</code>) and <code>GOOGLE_CLOUD_LOCATION</code>.</li>
+</ul>
+<h2 id="authjson"><a class="header" href="#authjson"><code>auth.json</code></a></h2>
+<p><code>auth.json</code> lives next to <code>models.json</code> in the agent directory
+(<code>$PI_CODING_AGENT_DIR</code>, or the default agent directory under your home).
+Example:</p>
+<pre><code class="language-json">{
+  "openai": {
+    "type": "api_key",
+    "key": "$OPENAI_API_KEY",
+    "env": {
+      "OPENAI_API_KEY": "&lt;your-openai-key&gt;"
+    }
+  }
+}
+</code></pre>
+<p>Rules:</p>
+<ul>
+<li><code>type</code> is <code>"api_key"</code> for manually edited entries. <code>rpi login</code> may write
+<code>"oauth"</code> entries; those should not be hand-edited.</li>
+<li><code>key</code> is the credential value or a <code>$VAR</code> / <code>${VAR}</code> template.</li>
+<li><code>env</code> is an optional map of variables available only while resolving this
+credential.</li>
+<li><code>$$</code> becomes a literal <code>$</code>; <code>$!</code> becomes a literal <code>!</code>.</li>
+<li>Command-valued keys (<code>"key": "!some-command"</code>) are rejected.</li>
+</ul>
+<h2 id="modelsjson-authentication"><a class="header" href="#modelsjson-authentication"><code>models.json</code> authentication</a></h2>
+<p>Custom and overridden providers in <code>models.json</code> can carry authentication
+independently of <code>auth.json</code>:</p>
+<pre><code class="language-json">{
+  "providers": {
+    "my-proxy": {
+      "baseUrl": "https://api.example.com/v1",
+      "api": "openai-completions",
+      "apiKey": "$MY_PROXY_KEY",
+      "authHeader": true,
+      "headers": {
+        "x-custom": "$CUSTOM_HEADER"
+      },
+      "models": [
+        {
+          "id": "my-model",
+          "maxTokens": 4096
+        }
+      ]
+    }
+  }
+}
+</code></pre>
+<p>Rules:</p>
+<ul>
+<li><code>authHeader: true</code> sends <code>Authorization: Bearer &lt;apiKey&gt;</code>. It requires a
+resolved API key; if none exists the request fails closed.</li>
+<li>Provider-level <code>headers</code> apply to every model of that provider; per-model
+<code>headers</code> override them. Merging is case-insensitive last-wins.</li>
+<li><code>apiKey</code>, <code>baseUrl</code>, and <code>header</code> values support <code>$VAR</code> / <code>${VAR}</code> expansion
+from the process environment. <code>models.json</code> does <strong>not</strong> support a per-entry
+<code>env</code> map (only <code>auth.json</code> credentials do). <code>$$</code> is a literal <code>$</code> and <code>$!</code>
+is a literal <code>!</code>. Unset variables produce an error.</li>
+<li>Command-valued <code>apiKey</code> or header values (<code>"!command"</code>) are rejected.</li>
+</ul>
+<h2 id="template-expansion"><a class="header" href="#template-expansion">Template expansion</a></h2>
+<p>Both <code>auth.json</code> and <code>models.json</code> values use the same expander
+(source: <code>crates/pi-coding/src/auth.rs::expand_credential_value</code> and
+<code>crates/pi-cli/src/models_config.rs::resolve_config_value_with_fallback</code>):</p>
+<div class="table-wrapper"><table><thead><tr><th>Form</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>$VAR</code></td><td>Expand a single variable.</td></tr>
+<tr><td><code>${VAR}</code></td><td>Explicit boundary.</td></tr>
+<tr><td><code>$$</code></td><td>Literal <code>$</code>.</td></tr>
+<tr><td><code>$!</code></td><td>Literal <code>!</code>.</td></tr>
+</tbody></table>
+</div>
+<p>For <code>auth.json</code>, variables are resolved from the request environment, then the
+credential's own <code>env</code> map, then the process environment. Empty values are
+treated as unset. Invalid braced names such as <code>${1bad}</code> are left unchanged.
+If a referenced variable is not set, <code>rpi</code> exits with an error that names the
+variable and source file but never exposes the original template text.</p>
+<h2 id="redaction-and-sensitive-headers"><a class="header" href="#redaction-and-sensitive-headers">Redaction and sensitive headers</a></h2>
+<p>The following headers are treated as sensitive and are marked with
+<code>set_sensitive(true)</code> so they are hidden from request traces and logs:</p>
+<ul>
+<li><code>authorization</code></li>
+<li><code>x-api-key</code></li>
+<li><code>cf-aig-authorization</code></li>
+<li><code>x-goog-api-key</code></li>
+</ul>
+<p>When an error message is produced by <code>pi_messages</code>, <code>radius</code>, <code>mistral</code>, or
+similar providers, the raw API key and any bearer-token values found in the
+above headers are stripped from the message before it is surfaced. Error
+messages name the missing variable or provider, never the key value.</p>
+<h2 id="fail-closed-behavior"><a class="header" href="#fail-closed-behavior">Fail-closed behavior</a></h2>
+<p><code>rpi</code> fails loudly rather than silently when authentication cannot be resolved:</p>
+<ul>
+<li>No API key, no OAuth credential, no recognized auth header, and no
+<code>authHeader</code> fallback → request fails with:
+<code>no API key found for provider ...</code>.</li>
+<li><code>authHeader: true</code> without a resolved API key → request fails.</li>
+<li>A <code>$VAR</code> reference in <code>auth.json</code> or <code>models.json</code> resolves to an unset
+variable → request fails.</li>
+<li>Azure OpenAI requests with zero or more than one of <code>authorization</code> / <code>api-key</code>
+→ request fails.</li>
+<li>Google Vertex requests with both <code>authorization</code> and <code>x-goog-api-key</code> in the
+same scope → request fails.</li>
+<li>Amazon Bedrock requests with only one of <code>AWS_ACCESS_KEY_ID</code> or
+<code>AWS_SECRET_ACCESS_KEY</code> → request fails.</li>
+</ul>
+<p>Do not commit <code>auth.json</code> or <code>models.json</code> containing real keys.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../user-guide/models.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../user-guide/rpc-json.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../user-guide/models.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../user-guide/rpc-json.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

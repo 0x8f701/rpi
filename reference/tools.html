@@ -1,0 +1,404 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Extended tool catalog - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="extended-tool-catalog"><a class="header" href="#extended-tool-catalog">Extended tool catalog</a></h1>
+<p>Beyond the core coding tools (<code>read</code>, <code>bash</code>, <code>edit</code>, <code>write</code>, <code>grep</code>,
+<code>find</code>, <code>glob</code>, <code>ls</code>), <code>rpi</code> ships a catalog of extended tools
+(<code>TOOL_NAMES</code> in <code>crates/pi-coding/src/tools.rs:153</code>). Each tool below is a
+built-in; some are session-scoped (one live child process per session), and
+all bound their output and redact secrets.</p>
+<h2 id="lsp"><a class="header" href="#lsp"><code>lsp</code></a></h2>
+<p>Query a language server over the Language Server Protocol (JSON-RPC 2.0 with
+Content-Length framing, <code>lsp-types</code> message shapes). Actions: hover,
+definition, references, diagnostics, symbols, rename, code actions; one
+server is spawned per invocation (<code>crates/pi-coding/src/tools/lsp_client.rs</code>).
+<code>initialize</code> runs against the workspace root; a dedicated
+<code>wait_for_diagnostics</code> waits for the push targeted at a specific document
+URI. <code>ContentModified</code> errors are retried. Server stderr is captured
+(bounded) and redacted in error messages. Timeouts: 30 s per request, 15 s
+diagnostics wait.</p>
+<h2 id="browser"><a class="header" href="#browser"><code>browser</code></a></h2>
+<p>Headless Chromium/Chrome automation over the Chrome DevTools Protocol
+(<code>crates/pi-coding/src/tools/browser.rs</code>). Actions: <code>navigate</code>, <code>click</code>,
+<code>fill</code>, <code>screenshot</code>, <code>extract</code>, <code>list_tabs</code>, <code>close</code>. Each call spawns a
+fresh headless browser with a temporary profile, performs exactly one action,
+then tears it down — state does not persist between calls; non-navigate
+actions accept an optional <code>url</code> to navigate first. Chrome is discovered via
+<code>CHROME_PATH</code>, PATH, or standard install locations; missing binaries are
+rejected actionably. Output is bounded (16 KiB extract cap). Timeout/abort
+kills the whole browser process group, so a compromised page can only act
+within one action's window.</p>
+<h2 id="github"><a class="header" href="#github"><code>github</code></a></h2>
+<p>GitHub API access via the <code>gh</code> CLI (preferred — uses the user's own gh auth;
+rpi never touches or prints a token) with a <code>GH_TOKEN</code>/reqwest fallback
+(<code>crates/pi-coding/src/tools/github.rs</code>). Actions: <code>search_issues</code>,
+<code>get_issue</code>, <code>list_issues</code>, <code>create_issue</code>, <code>comment_issue</code>, <code>list_prs</code>,
+<code>get_pr</code>, <code>list_commits</code>, <code>view_file</code>, <code>search_code</code>. Requests are
+argv-built (<code>gh api --method … -f key=value</code>, no shell interpolation);
+GitHub JSON is parsed into bounded plain text (32 KiB cap; code search
+renders <code>file:line:snippet</code>). All surfaced error text is redacted.</p>
+<h2 id="ask"><a class="header" href="#ask"><code>ask</code></a></h2>
+<p>Ask the user a question mid-task and receive the typed answer as the tool
+result (<code>crates/pi-coding/src/ask.rs</code>). One pending question at a time;
+publishes <code>SessionEvent::AskUser</code> so the frontend renders the prompt, and
+resolves the awaiting call when the answer arrives. <strong>Interactive sessions
+only</strong>: print/JSON/RPC/REPL never arm the interactive flag, so the tool
+rejects up front instead of hanging. Answer-wait bound: 60 s default; abort
+or cancel resolves the slot.</p>
+<h2 id="eval"><a class="header" href="#eval"><code>eval</code></a></h2>
+<p>Evaluate code in a persistent, session-scoped language kernel
+(<code>crates/pi-coding/src/tools/eval.rs</code>): <code>python</code> (a real <code>python3</code>
+subprocess with the full standard library — an execution tool, not a
+sandbox) or <code>js</code> (the embedded QuickJS engine with no <code>require</code>/<code>import</code>, no
+network, and no filesystem access). Globals persist between calls
+(cross-cell state); a cell timeout (default 30 s, max 300 s) kills the
+kernel and the next call respawns it. Output is bounded (64 KiB per stream),
+errors are classified (syntax/runtime/timeout), and results are redacted.</p>
+<h2 id="notebook"><a class="header" href="#notebook"><code>notebook</code></a></h2>
+<p>Read, execute, and edit Jupyter notebooks (<code>.ipynb</code>)
+(<code>crates/pi-coding/src/tools/notebook.rs</code>): <code>read</code> lists cells (8 MiB file
+cap, 200-cell preview), <code>execute</code> runs code cells through the same
+session-scoped Python kernel as <code>eval</code> (outputs written back only with
+<code>write=true</code>; unknown fields preserved), <code>edit</code> appends a markdown/code/raw
+cell. Per-action capability gating: <code>read</code>→Read, <code>execute</code>→Exec,
+<code>edit</code>→Write, enforced before any dispatch — a read-only role can read
+notebooks without gaining edit/execute.</p>
+<h2 id="debug"><a class="header" href="#debug"><code>debug</code></a></h2>
+<p>Session-scoped Debug Adapter Protocol (DAP) client over stdio
+(<code>crates/pi-coding/src/tools/debug.rs</code>). Adapters: <code>gdb</code>, <code>lldb-dap</code>,
+<code>debugpy</code>. Actions: <code>launch</code>, <code>set_breakpoint</code> (1-based <code>file:line</code>),
+<code>continue_</code>, <code>pause</code>, <code>step_over</code>/<code>step_in</code>/<code>step_out</code>, <code>stack_trace</code>,
+<code>variables</code>, <code>evaluate</code>, <code>threads</code>, <code>terminate</code>. The program stays paused
+before start until the first <code>continue_</code> sends <code>configurationDone</code>; one
+adapter per session; <code>terminate</code> (or drop) kills the whole process group,
+debuggee included. Bounded: 30 s request timeout, 50 frames, 200 variables,
+32 KiB rendered output; adapter stderr is redacted in launch failures.</p>
+<h2 id="generate_image-and-inspect_image"><a class="header" href="#generate_image-and-inspect_image"><code>generate_image</code> and <code>inspect_image</code></a></h2>
+<ul>
+<li><code>generate_image</code> — bounded image generation through the provider subsystem
+(<code>pi_ai::generate_image</code>, OpenAI-compatible <code>images/generations</code>). The
+model must declare image capability (active model, an explicit <code>model</code>
+argument, or <code>settings.images.genModel</code>); <code>images.genBaseUrl</code>/<code>genApiKey</code>
+override the endpoint/credential for self-hosted services. Prompts capped
+at 4096 characters, <code>n</code> at 4, sizes whitelisted to 256/512/1024 square,
+decoded output capped at 128 MiB per image with a 16 MP header pre-check,
+save path workspace-contained. Returns file paths plus a bounded prompt
+echo — image bytes never enter the transcript.</li>
+<li><code>inspect_image</code> — deterministic metadata + statistics for an image file
+without rendering it: format, dimensions, decoded color type, file size,
+EXIF orientation (JPEG/WebP), mean/stddev 8-bit luma brightness, and a
+coarse 8-bin RGB dominant-color histogram. Refuses files over 32 MiB from
+metadata before reading; decoded allocation capped at 128 MiB; output
+bounded to a few KiB. No OCR, no ML, no vision-model call.</li>
+</ul>
+<h2 id="web_search-ast_grep-ast_edit"><a class="header" href="#web_search-ast_grep-ast_edit"><code>web_search</code>, <code>ast_grep</code>, <code>ast_edit</code></a></h2>
+<ul>
+<li><code>web_search</code> — DuckDuckGo Instant Answer API search (disabled while
+<code>PI_OFFLINE</code> is set).</li>
+<li><code>ast_grep</code> — structural code search with ast-grep patterns
+(<code>$-metavariables</code>, tree-sitter).</li>
+<li><code>ast_edit</code> — single-file structural rewrite with ast-grep
+pattern→rewrite.</li>
+</ul>
+<h2 id="memory-tools"><a class="header" href="#memory-tools">Memory tools</a></h2>
+<p><code>memory</code> (local JSONL store) and <code>recall</code>/<code>retain</code>/<code>reflect</code> (Hindsight
+backend) are documented in <a href="memory.html"><code>memory.md</code></a>. <code>mcp</code>, <code>debug</code>, <code>eval</code>,
+<code>notebook</code>, <code>lsp</code>, <code>browser</code>, and <code>github</code> above plus the orchestration
+tools (<code>task</code>, <code>hub</code>, <code>yield</code>, <code>goal</code> — see
+<a href="../user-guide/orchestration.html"><code>orchestration.md</code></a>) and the <code>todo</code> tool
+(see <a href="../user-guide/todos.html"><code>todos.md</code></a>) make up the full built-in set.</p>
+<h2 id="tool-schemas-and-example-calls"><a class="header" href="#tool-schemas-and-example-calls">Tool schemas and example calls</a></h2>
+<p>Every tool validates its arguments against a JSON-schema-style <code>parameters</code>
+object before execution; unknown keys and invalid values fail with actionable
+messages. Schemas below are verbatim from the tool factories; <code>required</code>
+lists the parameters the schema marks as required (all others are optional).
+Nullable-but-required parameters (the <code>todo</code> tool, orchestration tools) must
+still be present in the call object, but may be <code>null</code> when unused.</p>
+<div class="table-wrapper"><table><thead><tr><th>Tool</th><th>Required</th><th>Optional</th><th>Example call</th></tr></thead><tbody>
+<tr><td><code>read</code></td><td><code>path</code></td><td>—</td><td><code>read path=src/main.rs</code></td></tr>
+<tr><td><code>bash</code></td><td><code>command</code></td><td><code>timeout</code>, <code>excludeFromContext</code>, <code>cwd</code>, <code>env</code></td><td><code>bash command="cargo test" timeout=120</code></td></tr>
+<tr><td><code>browser</code></td><td><code>action</code></td><td><code>url</code>, <code>selector</code>, <code>text</code>, <code>path</code></td><td><code>browser action=fill url=https://example.com selector=#name text=world</code> (<code>tools/browser.rs:96-115</code>)</td></tr>
+<tr><td><code>github</code></td><td><code>action</code></td><td><code>repo</code>, <code>query</code>, <code>number</code>, <code>title</code>, <code>body</code>, <code>path</code>, <code>state</code>, <code>ref</code></td><td><code>github action=view_file repo=octocat/Hello-World path=README</code> (<code>tools/github.rs:97-131</code>)</td></tr>
+<tr><td><code>lsp</code></td><td><code>action</code></td><td><code>path</code>, <code>query</code>/<code>symbol</code>, <code>line</code>, <code>character</code>, <code>end_line</code>, <code>end_character</code>, <code>new_name</code>, <code>lang</code></td><td><code>lsp action=definition path=src/main.rs line=10 character=4</code> (<code>tools/lsp.rs:221-275</code>)</td></tr>
+<tr><td><code>eval</code></td><td><code>language</code>, <code>code</code></td><td><code>timeout</code></td><td><code>eval language=python code="x = 1"</code> (<code>tools/eval.rs:1049-1065</code>)</td></tr>
+<tr><td><code>notebook</code></td><td><code>action</code>, <code>path</code></td><td><code>cell</code>, <code>write</code>, <code>cell_type</code>, <code>source</code>, <code>timeout</code></td><td><code>notebook action=execute path=demo.ipynb write=true</code> (<code>tools/notebook.rs:128-157</code>)</td></tr>
+<tr><td><code>debug</code></td><td><code>action</code></td><td><code>adapter</code>, <code>program</code>, <code>args</code>, <code>cwd</code>, <code>launch_args</code>, <code>adapter_args</code>, <code>file</code>, <code>line</code>, <code>thread</code>, <code>variables_reference</code>, <code>expression</code>, <code>frame_id</code>, <code>wait_ms</code>, <code>levels</code></td><td><code>debug launch adapter=gdb program=./bin</code> → <code>debug set_breakpoint file=src/main.rs line=42</code> → <code>debug continue_</code> (<code>tools/debug.rs:759-823</code>)</td></tr>
+<tr><td><code>mcp</code></td><td><code>action</code></td><td><code>server</code>, <code>tool</code>, <code>args</code></td><td><code>mcp call server=my-tools tool=weather args={"city":"London"}</code> (<code>mcp.rs:667-690</code>)</td></tr>
+<tr><td><code>ask</code></td><td><code>question</code></td><td>—</td><td><code>ask question="Should I proceed?"</code> (schema <code>{question: string}</code> in <code>pi_agent::create_ask_tool</code>)</td></tr>
+<tr><td><code>web_search</code></td><td><code>query</code></td><td>—</td><td><code>web_search query="Rust async cancellation safety"</code> (<code>tools/web_search.rs:39-50</code>)</td></tr>
+<tr><td><code>ast_grep</code></td><td><code>pattern</code></td><td><code>path</code>, <code>lang</code></td><td><code>ast_grep pattern='fn $FNAME() {}' path=src lang=rust</code> (<code>tools/ast_grep.rs:63-84</code>)</td></tr>
+<tr><td><code>ast_edit</code></td><td><code>pattern</code>, <code>rewrite</code>, <code>path</code></td><td><code>lang</code></td><td><code>ast_edit pattern='Some($A)' rewrite='Option::Some($A)' path=src/lib.rs</code> (<code>tools/ast_edit.rs:66-93</code>)</td></tr>
+<tr><td><code>memory</code></td><td><code>op</code></td><td><code>content</code>, <code>tags</code>, <code>query</code>, <code>limit</code>, <code>tag</code>, <code>id</code></td><td><code>memory learn content="…" tags=["rust"]</code>; <code>memory recall query="async" limit=5</code>; <code>memory forget id=&lt;id&gt;</code> (<code>memory.rs:451-468</code>)</td></tr>
+<tr><td><code>generate_image</code></td><td><code>prompt</code></td><td><code>model</code>, <code>size</code>, <code>n</code>, <code>path</code></td><td><code>generate_image prompt="a cat" size=1024 n=1 path=out.png</code> (<code>tools/image_gen.rs:81-121</code>)</td></tr>
+<tr><td><code>inspect_image</code></td><td><code>path</code></td><td>—</td><td><code>inspect_image path=screenshot.png</code> (<code>tools/image.rs:82-90</code>)</td></tr>
+<tr><td><code>todo</code></td><td><code>op</code>, <code>list</code>, <code>task</code>, <code>phase</code>, <code>items</code>, <code>dependsOn</code>, <code>cascade</code></td><td>(all nullable)</td><td><code>todo op=init list=[{phase:"Plan",items:["A","B"]}]</code>; <code>todo op=start task=task-abc</code>; <code>todo op=view</code> (<code>tools.rs:671-708</code>)</td></tr>
+<tr><td><code>task</code></td><td><code>agent</code>/<code>task</code>, or <code>tasks[]</code> (each item needs <code>task</code>; <code>name</code>/<code>agent</code>/<code>todoTaskId</code> nullable)</td><td><code>name</code>, <code>todoTaskId</code>, <code>context</code></td><td><code>task agent=researcher task="Study the persistence layer" todoTaskId=task-abc</code> (<code>orchestration/tools.rs:497-513</code>)</td></tr>
+<tr><td><code>hub</code></td><td><code>op</code></td><td><code>to</code>, <code>message</code>, <code>replyTo</code>, <code>await</code>, <code>from</code>, <code>timeoutMs</code>, <code>peek</code>, <code>ids</code>, <code>agentId</code>, <code>lines</code></td><td><code>hub send to=w1 message="…"</code>; <code>hub wait from=w1 timeoutMs=30000</code>; <code>hub read_history agentId=w1 lines=50</code> (<code>orchestration/tools.rs:536-606</code>)</td></tr>
+<tr><td><code>yield</code></td><td><code>text</code></td><td>—</td><td><code>yield text="&lt;full final deliverable&gt;"</code> (<code>orchestration/tools.rs:136-140</code>)</td></tr>
+<tr><td><code>goal</code></td><td><code>op</code></td><td>—</td><td><code>goal op=get</code> / <code>goal op=pause</code> / <code>goal op=complete</code> (<code>application.rs:3491-3508</code>)</td></tr>
+</tbody></table>
+</div>
+<p>Action enums are enforced by the schema: <code>browser</code> = <code>navigate, click, fill, screenshot, extract, list_tabs, close</code> (<code>tools/browser.rs:91</code>); <code>github</code> =
+<code>search_issues, get_issue, list_issues, create_issue, comment_issue, list_prs, get_pr, list_commits, view_file, search_code</code> (<code>tools/github.rs:40-50</code>); <code>lsp</code>
+= <code>hover, definition, references, diagnostics, symbols, rename, code_actions, capabilities, status, reload</code> (<code>tools/lsp.rs:64</code>); <code>notebook</code> = <code>read, execute, edit</code> (<code>tools/notebook.rs:62</code>); <code>debug</code> = <code>launch, set_breakpoint, continue_, pause, step_over, step_in, step_out, stack_trace, variables, evaluate, threads, terminate</code> (<code>tools/debug.rs:70</code>); <code>mcp</code> = <code>list_servers, list_tools, call</code>; <code>memory</code> = <code>learn, recall, list, forget</code>
+(<code>memory.rs:447-450</code>); <code>todo</code> = <code>init, start, done, drop, rm, append, add_dependency, remove_dependency, update_dependencies, view</code>
+(<code>tools.rs:674-684</code>); <code>hub</code> = <code>send, wait, inbox, list, jobs, cancel, read_history</code> (<code>orchestration/tools.rs:544</code>); <code>goal</code> = <code>get, pause, complete</code> (<code>application.rs:3493-3498</code>).</p>
+<p>All extended tools share the same validation contract: arguments are
+validated against the schema (<code>additionalProperties: false</code> on the
+orchestration/todo schemas), capabilities gate execution, and results are
+bounded and redacted.</p>
+<h2 id="capabilities"><a class="header" href="#capabilities">Capabilities</a></h2>
+<p>Each tool declares a <code>ToolCapability</code> used by role ceilings and approval
+modes: <code>read</code> tools (<code>read</code>, <code>grep</code>, <code>find</code>, <code>glob</code>, <code>ls</code>, <code>web_search</code>,
+<code>ast_grep</code>, <code>lsp</code>, <code>inspect_image</code>, <code>hub</code>, <code>recall</code>, <code>reflect</code>), <code>write</code>
+tools (<code>write</code>, <code>edit</code>, <code>github</code>, <code>memory</code>, <code>retain</code>, <code>mcp</code>, <code>debug</code>,
+<code>notebook</code>'s edit action), and <code>exec</code> tools (<code>bash</code>, <code>browser</code>, <code>eval</code>,
+<code>notebook</code>'s execute action, <code>task</code>). Unknown or legacy tool metadata
+defaults to Exec capability.</p>
+<h2 id="invariants"><a class="header" href="#invariants">Invariants</a></h2>
+<ul>
+<li>Every tool result is bounded (per-tool byte caps) and passes through the
+secret redactor.</li>
+<li>Session-scoped tools (eval kernels, debug adapter, MCP servers, browser
+processes) are killed on drop — no leaked children, no orphaned
+processes.</li>
+<li>Workspace-relative tools resolve paths through the same containment as
+<code>read</code>/<code>bash</code> (<code>resolve_scoped_path</code>); see
+<a href="security.html"><code>security.md</code></a>.</li>
+<li>Tool arguments are validated against their schemas before execution, and
+unknown actions/arguments fail with actionable messages.</li>
+</ul>
+<h2 id="related-documentation"><a class="header" href="#related-documentation">Related documentation</a></h2>
+<ul>
+<li><a href="memory.html"><code>memory.md</code></a> — memory backends</li>
+<li><a href="mcp.html"><code>mcp.md</code></a> — MCP client</li>
+<li><a href="../user-guide/orchestration.html"><code>orchestration.md</code></a> — <code>task</code>/<code>hub</code>/<code>yield</code>/<code>goal</code></li>
+<li><a href="../user-guide/todos.html"><code>todos.md</code></a> — the <code>todo</code> tool</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/memory.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/mcp.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/memory.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/mcp.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

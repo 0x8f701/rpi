@@ -1,0 +1,414 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Orchestration: subagents, jobs, and IRC - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="orchestration-subagents-jobs-and-irc"><a class="header" href="#orchestration-subagents-jobs-and-irc">Orchestration: subagents, jobs, and IRC</a></h1>
+<p>The orchestration runtime (<code>crates/pi-coding/src/orchestration/</code>) lets the
+main session delegate work to child coding sessions ("subagents"), supervise
+them as <strong>jobs</strong>, and coordinate between them with <strong>IRC-style mailbox
+messages</strong>. It powers the <code>task</code>, <code>hub</code>, <code>yield</code>, and <code>goal</code> tools, the
+workflow executor (see <a href="workflows.html"><code>workflows.md</code></a>), and the TUI's agents
+panel and Todo DAG view.</p>
+<h2 id="enabling"><a class="header" href="#enabling">Enabling</a></h2>
+<p>Orchestration is opt-in. Set <code>settings.orchestration.tasks = true</code> (the
+<code>task</code> tool gate; <code>orchestration_enabled</code> in
+<code>crates/pi-coding/src/settings.rs:1403-1409</code>). The <code>todo</code> tool is on by
+default and the <code>process</code> tool is gated by <code>orchestration.process</code>.</p>
+<pre><code class="language-json">{
+  "orchestration": { "tasks": true }
+}
+</code></pre>
+<p>The workflow runtime requires orchestration and gates it separately; see
+<a href="workflows.html"><code>workflows.md</code></a> for the full <code>orchestration</code> settings block.</p>
+<h2 id="agent-catalog"><a class="header" href="#agent-catalog">Agent catalog</a></h2>
+<p>Agents are Markdown definitions with YAML frontmatter, discovered from
+<code>&lt;agent-dir&gt;/agents/*.md</code> and (when the project is trusted)
+<code>&lt;workspace&gt;/.pi/agents/*.md</code> (<code>AgentCatalog::discover</code> in
+<code>orchestration/definitions.rs:138</code>). The bundled <code>task</code> and <code>researcher</code>
+agents are always available; user definitions win over bundled ones.</p>
+<p>Frontmatter fields (<code>AgentDefinition</code> in <code>orchestration/definitions.rs:66-88</code>):</p>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>name</code></td><td>Identifier used by <code>task</code>/<code>hub</code> and by delegation.</td></tr>
+<tr><td><code>description</code></td><td>Shown in the <code>task</code> tool's available-agent list.</td></tr>
+<tr><td><code>tools</code></td><td>Child tool allowlist; <code>settings.agents.&lt;name&gt;.tools</code> overrides it.</td></tr>
+<tr><td><code>autoloadSkills</code></td><td>Skills autoloaded into the child's prompt.</td></tr>
+<tr><td><code>model</code></td><td>Model pattern list; <code>settings.agents.&lt;name&gt;.model</code> overrides it.</td></tr>
+<tr><td><code>thinkingLevel</code></td><td>Child reasoning level.</td></tr>
+<tr><td><code>maxTurns</code> / <code>maxToolCalls</code> / <code>timeoutSecs</code></td><td>Contract bounds: the child stops cleanly after the cap with a clear reason.</td></tr>
+<tr><td><code>disallowedTools</code></td><td>Tools the child must never receive.</td></tr>
+<tr><td><code>capabilityCeiling</code></td><td>Per-capability ceiling (<code>read</code>/<code>write</code>/<code>exec</code>); a role that sets only <code>read: true</code> gets a strictly read-only tool set. Orchestration plumbing (<code>todo</code>/<code>process</code>/<code>task</code>/<code>hub</code>/<code>goal</code>) is always kept so a read-only role can still delegate and be supervised.</td></tr>
+</tbody></table>
+</div>
+<p>Model resolution precedence: settings override → first matching definition
+pattern → parent session model (<code>resolve_agent_model</code>,
+<code>orchestration/definitions.rs:318-375</code>). Settings entries can disable an
+agent (<code>settings.agents.&lt;name&gt;.enabled = false</code>; <code>/agents</code> manages these),
+and a child that declares tools outside the supported set is not blocked:
+unknown declared tools are silently ignored (OMP-compatible) with a single
+deduped warning, and an invalid model makes the agent unavailable with an
+actionable error.</p>
+<h2 id="the-task-tool"><a class="header" href="#the-task-tool">The <code>task</code> tool</a></h2>
+<p><code>task</code> starts one or more independent child coding-session jobs and returns
+immediately with stable job and agent ids; supervision happens through <code>hub</code>
+(<code>orchestration/tools.rs:39-67</code>). A child that owns a canonical Todo DAG item
+receives that item's stable id as <code>todoTaskId</code>.</p>
+<pre><code class="language-text">task agent=researcher task="Study the persistence layer" todoTaskId=task-abc
+task tasks=[{name: "w1", task: "Draft API"}, {name: "w2", task: "Write tests"}]
+</code></pre>
+<p>Delegation intent is also recognized from the main prompt: an English
+delegation verb ("Have researcher study this") or a conservative CJK
+construction ("你让researcher仔细调研…") escalates to an exact trusted agent
+name; informational mentions do not. Ambiguous mentions with explicit
+delegation intent are errors (actionable, naming the candidates).</p>
+<p>The matcher is exact-token based (<code>runtime.rs:4936-4977</code>): the English
+token set is <code>have, ask, tell, get, let, make, please, delegate, assign, spawn, run, send, kick, dispatch</code> (<code>ENGLISH_DELEGATION_VERBS</code>,
+<code>runtime.rs:4939-4941</code>), matched as whole NFKC-lowercased tokens — so
+<code>researchers</code> never matches <code>researcher</code>. The CJK token set is <code>让, 请, 叫, 派, 安排, 委托, 交给</code> (<code>CJK_DELEGATION_TOKENS</code>, <code>runtime.rs:4948</code>), matched
+conservatively: the token must directly precede the agent name with no
+intervening tokenizer boundary (a CJK script run like <code>你让researcher</code>), using
+the same word-boundary logic the selector applies (<code>selector.rs:1107-1111</code>).
+A recognized verb or CJK construction plus an unambiguous agent-name mention
+selects that agent; multiple distinct agent names with delegation intent is
+an error listing the candidates.</p>
+<h2 id="jobs-and-supervision"><a class="header" href="#jobs-and-supervision">Jobs and supervision</a></h2>
+<p>Every delegated child runs as a <strong>job</strong> (<code>JobSnapshot</code> in
+<code>orchestration/runtime.rs</code>): <code>queued → running → completed | failed | cancelled | aborted</code>, with <code>created_at</code>/<code>started_at</code>/<code>finished_at</code>, a
+description, an optional <code>todoTaskId</code>, a redacted <code>result</code>/<code>error</code>, and a
+<code>softBudgetExhausted</code> marker.</p>
+<ul>
+<li><strong>Concurrency</strong>: at most <code>orchestration.maxConcurrency</code> children run at
+once (default 8, semaphore-bounded); recursion depth is bounded by
+<code>maxRecursionDepth</code> (default 8).</li>
+<li><strong>Job retention</strong>: settled jobs and their artifact files
+(<code>&lt;agent-id&gt;-&lt;job-id&gt;.md</code> outputs, <code>&lt;agent-id&gt;-&lt;job-id&gt;.history.json</code>
+transcripts) are retained up to <code>DEFAULT_MAX_RETAINED_JOBS = 256</code> for
+<code>DEFAULT_RETAINED_JOB_TTL_SECS = 24h</code>, then pruned
+(<code>JobRetention</code> in <code>orchestration/runtime.rs:32-33</code>).</li>
+<li><strong>Idle parking</strong>: idle non-main agents park after <code>DEFAULT_IDLE_TTL_SECS = 300s</code> and are revived on demand (<code>schedule_idle_park</code>).</li>
+<li><strong>Soft budgets</strong> (<code>JobSoftBudget</code> in <code>orchestration/runtime.rs:154-166</code>,
+settings <code>orchestration.softBudget</code>): <code>maxRequests</code>, <code>maxTokens</code>, and
+<code>yieldAfter</code> are all optional and default to unlimited (run-to-completion
+behavior). When a configured limit is reached the child is <strong>not</strong> failed:
+its run stops cleanly after the current turn, the job settles <code>Completed</code>
+with the partial result, and both <code>TaskResult</code> and <code>JobSnapshot</code> carry
+<code>softBudgetExhausted: true</code> so the parent can decide whether to continue
+the child.</li>
+<li><strong>Contract bounds</strong>: <code>maxTurns</code>, <code>maxToolCalls</code>, and <code>timeoutSecs</code> from
+the agent definition stop the child cleanly with a clear reason; a child
+that exceeds its timeout contract after an abort is reported.</li>
+<li><strong>Durable orchestration</strong>: child sessions are recorded to their own JSONL
+transcripts under the durable child root; the runtime persists agent
+snapshots, mailboxes, and job state to a sidecar so a restarted session
+revives queued children and re-delivers their mailboxes
+(<code>orchestration/persistence.rs</code>).</li>
+</ul>
+<p>The child's tool set is assembled per role: coding tools filtered by the
+capability ceiling and <code>disallowedTools</code>, plus orchestration plumbing. The
+child also receives the <code>yield</code> tool, the <code>hub</code> tool, and the <code>goal</code> tool.</p>
+<h2 id="the-hub-tool"><a class="header" href="#the-hub-tool">The <code>hub</code> tool</a></h2>
+<p><code>hub</code> coordinates with Main and child peers (<code>orchestration/tools.rs:70-103</code>):</p>
+<ul>
+<li><code>hub send &lt;to&gt; &lt;message&gt;</code> — deliver a mailbox message (subagent ⇄ subagent
+included). Delivery is durable: the message is committed to the recipient's
+mailbox before any revival claim, and the bounded delivered-message log
+(cap 200) keeps messages visible to the workflow page's Recent IRC even
+after consumption.</li>
+<li><code>hub wait [from] [timeoutMs]</code> — block until a message arrives; registered
+waiters make the delivery bridge defer matching sends so the waiter drains
+them durably (<code>MessageWaiter</code>, RAII-unregistered on every return path).</li>
+<li><code>hub inbox [peek]</code> — read queued messages without necessarily consuming.</li>
+<li><code>hub list</code> — refresh the peer roster (spawn-time snapshot with
+<code>&lt;peer_roster&gt;</code> + <code>&lt;truncated /&gt;</code> bounds).</li>
+<li><code>hub read_history &lt;agent&gt; [lines]</code> — rendered transcript of a peer
+(default 50 lines, hard max 200, 32 KiB byte cap).</li>
+<li><code>hub jobs</code> / <code>hub cancel</code> / <code>hub wait</code> — supervise child task jobs.</li>
+</ul>
+<p>The roster a child sees is a spawn-time snapshot: <code>hub list</code> refreshes state
+and <code>hub send</code> addresses exact ids.</p>
+<h2 id="the-yield-tool"><a class="header" href="#the-yield-tool">The <code>yield</code> tool</a></h2>
+<p><code>yield</code> is the explicit-delivery protocol for child sessions
+(<code>orchestration/tools.rs:104-119</code>, <code>YieldState</code> in
+<code>orchestration/runtime.rs:791-836</code>): a child calls it exactly once, passing
+the full final deliverable as <code>text</code>; that payload becomes the job's delivered
+output and the child's run terminates. It is wired to per-run delivery state
+the run loop reads when the child settles, so the payload lands in
+<code>TaskResult.output</code>. A child that exits without calling <code>yield</code> settles with
+its natural final text plus the marker:</p>
+<pre><code class="language-text">SYSTEM WARNING: Subagent exited without calling yield
+</code></pre>
+<h2 id="the-goal-tool"><a class="header" href="#the-goal-tool">The <code>goal</code> tool</a></h2>
+<p>Children receive the <code>goal</code> tool so a delegated worker can create, show,
+pause, resume, complete, or drop a session goal — the same durable goal
+state machine documented in <a href="goals.html"><code>goals.md</code></a>. Orchestration plumbing
+means role filters never remove it.</p>
+<h2 id="live-progress-and-activity"><a class="header" href="#live-progress-and-activity">Live progress and activity</a></h2>
+<p>The runtime publishes <code>ApplicationEvent</code>s (<code>agent_start</code>, <code>agent_settled</code>,
+<code>job_*</code>, <code>todo_updated</code>, orchestration mailbox messages) that drive the TUI
+agents panel and the workflow page. Each agent has a live <code>AgentSnapshot</code>
+(display name, status, current task summary, todo ownership) and a bounded
+per-agent activity feed; the workflow detail merges delegated task lifecycle
+entries with IRC messages per agent (<code>workflow/detail.rs</code>). Everything shown
+to the UI is redacted.</p>
+<h2 id="concurrency-gates-and-settings"><a class="header" href="#concurrency-gates-and-settings">Concurrency gates and settings</a></h2>
+<ul>
+<li><code>orchestration.maxConcurrency</code> (default 8) — child semaphore; a global
+workflow-scoped gate can additionally limit workflow children.</li>
+<li><code>orchestration.maxRecursionDepth</code> (default 8) — the <code>task</code> tool is only
+offered to a child while <code>depth &lt; maxRecursionDepth</code>.</li>
+<li><code>orchestration.mailboxCapacity</code> (default 1000) — per-agent mailbox bound.</li>
+<li><code>orchestration.maxToolsPerAgent</code> (default 16) — tool-count ceiling for a
+child's coding tools.</li>
+<li><code>orchestration.sandboxed</code> (default false) — run child process spawns in the
+Linux filesystem sandbox.</li>
+<li><code>orchestration.softBudget</code> — per-child soft budget (see above).</li>
+</ul>
+<p>All bounds are validated in <code>OrchestrationConfig::validate</code>
+(<code>orchestration/runtime.rs:368-392</code>) and at settings load time
+(<code>settings.rs:2674-2697</code>).</p>
+<h2 id="invariants"><a class="header" href="#invariants">Invariants</a></h2>
+<ul>
+<li>A child job is never failed by a soft budget — it settles <code>Completed</code> with
+the partial result and the <code>softBudgetExhausted</code> marker.</li>
+<li><code>yield</code> delivers exactly once; a missing <code>yield</code> is observable to the
+parent via <code>MISSING_YIELD_WARNING</code>.</li>
+<li>Messages are durably committed to the mailbox before any revival claim, so
+a restart cannot lose a delivered IRC message.</li>
+<li>Mailbox waits are RAII: every return path (timeout, abort, shutdown, drop)
+unregisters the waiter so no stale claim strands a message.</li>
+<li>Role ceilings only ever remove tools; orchestration plumbing
+(<code>todo</code>/<code>process</code>/<code>task</code>/<code>hub</code>/<code>goal</code>) is preserved so restricted roles
+can still delegate and be supervised.</li>
+</ul>
+<h2 id="related-documentation"><a class="header" href="#related-documentation">Related documentation</a></h2>
+<ul>
+<li><a href="workflows.html"><code>workflows.md</code></a> — workflow lifecycle on top of this runtime</li>
+<li><a href="todos.html"><code>todos.md</code></a> — the Todo DAG and its execution</li>
+<li><a href="goals.html"><code>goals.md</code></a> — the durable goal state machine</li>
+<li><a href="../reference/skills.html"><code>skills.md</code></a> — agent definition format details</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../user-guide/todos.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../user-guide/workflows.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../user-guide/todos.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../user-guide/workflows.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

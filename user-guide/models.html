@@ -1,0 +1,448 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Models and custom providers - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="models-and-custom-providers"><a class="header" href="#models-and-custom-providers">Models and custom providers</a></h1>
+<h2 id="built-in-catalog"><a class="header" href="#built-in-catalog">Built-in catalog</a></h2>
+<p><code>rpi</code> ships with an embedded model catalog in
+<a href="../../../crates/pi-ai/src/models_catalog.json"><code>crates/pi-ai/src/models_catalog.json</code></a>.
+The catalog is loaded once on first use and restored for built-in provider ids
+when a custom <code>models.json</code> is reloaded.</p>
+<p>List available models with:</p>
+<pre><code class="language-sh">rpi models
+rpi models claude
+</code></pre>
+<p>The filter is case-sensitive and matches provider name or model id. The list
+also reflects model entitlements from the resolved credential (e.g., GitHub
+Copilot OAuth model lists).</p>
+<h2 id="supported-api-identifiers"><a class="header" href="#supported-api-identifiers">Supported API identifiers</a></h2>
+<p>A model's <code>api</code> field selects the wire protocol. The identifiers registered by
+the built-in provider set are (source:
+<code>crates/pi-ai/src/types.rs</code> / <code>crates/pi-ai/src/providers/mod.rs</code>):</p>
+<div class="table-wrapper"><table><thead><tr><th>Identifier</th><th>Protocol</th></tr></thead><tbody>
+<tr><td><code>openai-completions</code></td><td>OpenAI chat completions (<code>/chat/completions</code>)</td></tr>
+<tr><td><code>openai-responses</code></td><td>OpenAI Responses API (<code>/responses</code>)</td></tr>
+<tr><td><code>openai-codex-responses</code></td><td>OpenAI Codex Responses API</td></tr>
+<tr><td><code>azure-openai-responses</code></td><td>Azure OpenAI Responses API</td></tr>
+<tr><td><code>anthropic-messages</code></td><td>Anthropic Messages API</td></tr>
+<tr><td><code>bedrock-converse-stream</code></td><td>Amazon Bedrock Converse streaming API</td></tr>
+<tr><td><code>google-generative-ai</code></td><td>Google Gemini API</td></tr>
+<tr><td><code>google-vertex</code></td><td>Google Vertex AI API</td></tr>
+<tr><td><code>mistral-conversations</code></td><td>Mistral conversations API</td></tr>
+<tr><td><code>pi-messages</code></td><td>Dynamic Radius provider catalog</td></tr>
+<tr><td><code>faux</code></td><td>Deterministic test/example provider</td></tr>
+</tbody></table>
+</div>
+<h2 id="model-spec-resolution"><a class="header" href="#model-spec-resolution">Model spec resolution</a></h2>
+<p>When you write <code>rpi -m &lt;spec&gt;</code> or use <code>/model</code> in the REPL, <code>rpi</code> resolves it
+with the following algorithm (source: <code>crates/pi-coding/src/resolve.rs</code>):</p>
+<ol>
+<li>If the text before the first <code>/</code> matches a known provider id (exactly,
+case-insensitively), the rest is treated as the model id within that
+provider: <code>anthropic/claude-sonnet-4-5</code>.</li>
+<li>Otherwise the whole string is matched as a bare model id across all
+providers. This allows OpenRouter-style ids that contain their own slashes,
+e.g. <code>openrouter/ai21/jamba-large-1.7</code>.</li>
+<li>Case-insensitive substring matching on model <code>id</code> and <code>name</code>. Aliases (ids
+ending in <code>-latest</code> or without a <code>-YYYYMMDD</code> date suffix) are preferred over
+dated versions; otherwise the latest dated version by descending id is used.</li>
+<li>If the provider is known but the id is not, <code>rpi</code> synthesizes a custom-id
+model by cloning that provider's default template (<code>defaultModelPerProvider</code>),
+or the provider's first model if no default is defined. A warning is emitted.</li>
+</ol>
+<p>A thinking-level suffix <code>:off|minimal|low|medium|high|xhigh</code> is parsed off the
+end of the spec. On a custom-id fallback the suffix is stripped from the id
+first. The CLI <code>--thinking</code> flag accepts <code>off|minimal|low|medium|high|xhigh|max</code>
+(<code>max</code> is an alias for <code>xhigh</code>). If the resolved model does not have
+<code>reasoning: true</code>, only <code>off</code> is available; a non-off suffix on a custom
+fallback enables <code>reasoning: true</code> for that request.</p>
+<p>When no spec is given, the default is <code>anthropic/claude-sonnet-4-5</code>.</p>
+<p>Examples:</p>
+<pre><code class="language-sh">rpi -m anthropic/claude-sonnet-4-5
+rpi -m claude-sonnet-4-5:high
+rpi -m openrouter/ai21/jamba-large-1.7
+rpi -m my-provider/my-custom-model:low
+rpi -m llama.cpp/llama-3.1-8b
+</code></pre>
+<h2 id="custom-providers-via-modelsjson"><a class="header" href="#custom-providers-via-modelsjson">Custom providers via <code>models.json</code></a></h2>
+<p>Place <code>models.json</code> in the agent directory (<code>$PI_CODING_AGENT_DIR</code>, or the
+default agent directory under your home). If no explicit agent directory or
+home directory is available, custom configuration is disabled and the
+current working directory is never used as a fallback.</p>
+<h3 id="openai-compatible-proxy"><a class="header" href="#openai-compatible-proxy">OpenAI-compatible proxy</a></h3>
+<pre><code class="language-json">{
+  "providers": {
+    "cliproxy": {
+      "baseUrl": "https://api.example.com/v1",
+      "api": "openai-completions",
+      "models": [
+        { "id": "gpt-5.5", "maxTokens": 8192 }
+      ]
+    }
+  }
+}
+</code></pre>
+<h3 id="cloudflare-ai-gateway"><a class="header" href="#cloudflare-ai-gateway">Cloudflare AI Gateway</a></h3>
+<pre><code class="language-json">{
+  "providers": {
+    "cf-gateway": {
+      "baseUrl": "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/openai/",
+      "api": "openai-completions",
+      "apiKey": "$CLOUDFLARE_API_KEY",
+      "models": [
+        { "id": "@cf/moonshotai/kimi-k2.6" }
+      ]
+    }
+  }
+}
+</code></pre>
+<p>The placeholders <code>{CLOUDFLARE_ACCOUNT_ID}</code> and <code>{CLOUDFLARE_GATEWAY_ID}</code> are
+substituted from the environment at request time. See
+<a href="../reference/environment-variables.html"><code>environment-variables.md</code></a>.</p>
+<h3 id="anthropic-with-a-bearer-token"><a class="header" href="#anthropic-with-a-bearer-token">Anthropic with a bearer token</a></h3>
+<pre><code class="language-json">{
+  "providers": {
+    "anthropic": {
+      "apiKey": "$ANTHROPIC_AUTH_TOKEN",
+      "authHeader": true,
+      "models": []
+    }
+  }
+}
+</code></pre>
+<p>A provider-level override with an empty <code>models</code> array keeps the built-in
+Anthropic models unchanged but applies the provider-level <code>apiKey</code>,
+<code>authHeader</code>, <code>baseUrl</code>, <code>headers</code>, or <code>compat</code>.</p>
+<h3 id="override-a-built-in-model"><a class="header" href="#override-a-built-in-model">Override a built-in model</a></h3>
+<pre><code class="language-json">{
+  "providers": {
+    "openai": {
+      "models": [
+        { "id": "gpt-5.5", "maxTokens": 16384 }
+      ]
+    }
+  }
+}
+</code></pre>
+<p>The per-model entry is merged with the built-in entry; <code>maxTokens</code> and other
+fields override defaults.</p>
+<h2 id="modelsjson-schema"><a class="header" href="#modelsjson-schema"><code>models.json</code> schema</a></h2>
+<p>Top level:</p>
+<pre><code class="language-json">{
+  "providers": {
+    "&lt;provider-id&gt;": {
+      "name": "Display name",
+      "baseUrl": "https://...",
+      "api": "openai-completions",
+      "apiKey": "$VAR",
+      "authHeader": false,
+      "headers": { "x-foo": "$FOO" },
+      "compat": { "supportsStrictMode": true },
+      "models": [
+        {
+          "id": "model-id",
+          "name": "Display name",
+          "api": "openai-completions",
+          "baseUrl": "...",
+          "reasoning": true,
+          "thinkingLevelMap": { "off": null, "high": "high" },
+          "input": ["text", "image"],
+          "cost": { "input": 3.0, "output": 15.0, "cacheRead": 1.5, "cacheWrite": 0.5 },
+          "contextWindow": 200000,
+          "maxTokens": 8192,
+          "headers": { "x-model": "value" },
+          "compat": { "supportsReasoningEffort": false }
+        }
+      ]
+    }
+  }
+}
+</code></pre>
+<p>Rules:</p>
+<ul>
+<li>A provider must define at least one of <code>baseUrl</code>, <code>headers</code>, <code>compat</code>,
+<code>apiKey</code>, <code>authHeader</code>, or <code>models</code>.</li>
+<li><code>api</code> and <code>baseUrl</code> can be set at provider level and overridden per model.
+Custom models require an <code>api</code> and a <code>baseUrl</code> somewhere in the fallback
+chain; otherwise loading fails closed.</li>
+<li>Model-level fields override provider-level fields.</li>
+<li><code>reasoning: true</code> enables the <code>off|minimal|low|medium|high|xhigh</code> level ladder;
+without it only <code>off</code> is available.</li>
+<li><code>thinkingLevelMap</code> can disable a level (<code>{ "xhigh": null }</code>) or map a level
+name to a provider-specific value.</li>
+<li><code>compat</code> is merged. Nested <code>openRouterRouting</code>, <code>vercelGatewayRouting</code>, and
+<code>chatTemplateKwargs</code> objects are merged deeply; all other compat keys are
+replaced.</li>
+<li>For custom model entries, defaults are: <code>input</code> <code>["text"]</code>,
+<code>contextWindow</code> <code>128000</code>, <code>maxTokens</code> <code>16384</code>, empty <code>cost</code>, no <code>compat</code>.</li>
+</ul>
+<h2 id="the-llamacpp-provider"><a class="header" href="#the-llamacpp-provider">The <code>llama.cpp</code> provider</a></h2>
+<p>When a llama.cpp router is configured (<code>rpi llama configure URL</code> or
+<code>LLAMA_BASE_URL</code>), live router models are merged into the catalog under the
+provider id <code>llama.cpp</code>. Select them with:</p>
+<pre><code class="language-sh">rpi -m llama.cpp/llama-3.1-8b
+</code></pre>
+<p>At startup <code>rpi</code> refreshes the live router catalog unless <code>PI_OFFLINE=1|true|yes</code>
+is set. If the router is unavailable, <code>rpi</code> falls back to the cached catalog
+stored in the agent directory. Router configuration and the cache are written
+atomically; the settings file must not be readable by group or other users on
+Unix. See <a href="../reference/local-llama.html"><code>local-llama.md</code></a> for router setup and GGUF
+downloads.</p>
+<h2 id="github-copilot"><a class="header" href="#github-copilot">GitHub Copilot</a></h2>
+<p><code>github-copilot</code> is treated specially:</p>
+<ul>
+<li>It uses <code>COPILOT_GITHUB_TOKEN</code> for bearer authentication.</li>
+<li>Before each request it adds dynamic headers based on the context:
+<ul>
+<li><code>X-Initiator: user</code> when the last message is from the user, otherwise
+<code>agent</code>.</li>
+<li><code>Openai-Intent: conversation-edits</code>.</li>
+<li><code>Copilot-Vision-Request: true</code> when the context contains image content.</li>
+</ul>
+</li>
+<li>Models are filtered by the entitlements returned for the resolved credential.</li>
+</ul>
+<h2 id="capability-flags-in-compat"><a class="header" href="#capability-flags-in-compat">Capability flags in <code>compat</code></a></h2>
+<p>Common flags used by the built-in providers:</p>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>supportsStrictMode</code></td><td>Enable JSON-schema strict tool sampling</td></tr>
+<tr><td><code>supportsOpenAIGrammarTools</code></td><td>Enable grammar-style constrained sampling</td></tr>
+<tr><td><code>supportsReasoningEffort</code></td><td>Map reasoning level to <code>reasoning_effort</code></td></tr>
+<tr><td><code>supportsEagerToolInputStreaming</code></td><td>Anthropic eager tool-input streaming</td></tr>
+<tr><td><code>supportsLongCacheRetention</code></td><td>24h prompt cache retention</td></tr>
+<tr><td><code>supportsCacheControlOnTools</code></td><td>Cache control on Anthropic tools</td></tr>
+<tr><td><code>supportsDeveloperRole</code></td><td>OpenAI Responses developer role</td></tr>
+<tr><td><code>supportsStore</code></td><td>Allow storing OpenAI Responses sessions</td></tr>
+<tr><td><code>allowEmptySignature</code></td><td>Allow empty thinking signatures</td></tr>
+<tr><td><code>forceAdaptiveThinking</code></td><td>Force adaptive thinking on Anthropic</td></tr>
+<tr><td><code>maxTokensField</code></td><td>Rename the <code>max_tokens</code> request field</td></tr>
+</tbody></table>
+</div>
+<p>The full set of flags and defaults is defined in the provider source files
+(<code>crates/pi-ai/src/providers/*.rs</code>).</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../user-guide/live.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../user-guide/authentication.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../user-guide/live.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../user-guide/authentication.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

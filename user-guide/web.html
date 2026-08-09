@@ -1,0 +1,364 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Web client (/web) - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="web-client-web"><a class="header" href="#web-client-web">Web client (<code>/web</code>)</a></h1>
+<p><code>rpi --listen</code> serves a web chat client at <code>GET /web</code> on the control-plane
+listener. The frontend is a React + TypeScript app (<code>crates/pi-cli/web/</code>,
+built with Vite); <code>vite-plugin-singlefile</code> inlines it into one self-contained
+<code>dist/index.html</code> that <code>build.rs</code> embeds into the binary as an asset table
+(<code>path -&gt; MIME/bytes</code>). At runtime there is no framework, build step, or
+external asset — the listener serves the embedded page, and the page drives
+the existing <a href="rpc-json.html">WebSocket control plane</a> in a browser.</p>
+<p>Frontend development uses the Vite dev server:</p>
+<pre><code class="language-console">$ rpi --listen 127.0.0.1:8765 --listen-token-file &lt;workspace&gt;/rpi-token
+$ cd crates/pi-cli/web
+$ npm install
+$ RPI_LISTEN=http://127.0.0.1:8765 npm run dev   # http://localhost:5173
+</code></pre>
+<p>The dev server proxies <code>/ws</code> and <code>/rpc</code> to the listener. <code>npm run build</code>
+regenerates the committed <code>dist/index.html</code>; rebuilding the Rust binary
+embeds the new bundle. <code>RPI_WEB_DEV_DIR=&lt;dir&gt;</code> makes the listener serve a
+built page from disk instead, for iterating without recompiling Rust.</p>
+<h2 id="why-a-token-is-required"><a class="header" href="#why-a-token-is-required">Why a token is required</a></h2>
+<p>Browsers always send an <code>Origin</code> header on WebSocket and fetch connections.
+The control plane deliberately treats "loopback without <code>Origin</code>" as its
+native-client trust boundary — a tokenless loopback listener <em>refuses</em> browser
+connections (DNS-rebinding defense). So the web client requires a token file:</p>
+<pre><code class="language-console">$ rpi --listen 127.0.0.1:8765 --listen-token-file &lt;workspace&gt;/rpi-token
+Control plane listening on http://127.0.0.1:8765 (loopback, authentication enabled)
+</code></pre>
+<p>Then open <a href="http://127.0.0.1:8765/web">http://127.0.0.1:8765/web</a> in a browser, enter the token, and press
+<strong>Connect</strong>. To opt into access from another machine on the LAN:</p>
+<pre><code class="language-console">$ rpi --listen 0.0.0.0:8765 --listen-token-file &lt;workspace&gt;/rpi-token --listen-allow-insecure-remote
+</code></pre>
+<p>Open <code>http://&lt;host-lan-ip&gt;:8765/web</code> from that machine. This is plaintext HTTP
+and WebSocket: authentication remains mandatory, but passive LAN observers can
+capture the bearer token and control traffic. Use loopback or a
+TLS-terminating proxy unless that risk is explicitly acceptable.</p>
+<p>Collaboration join links follow the same bind/advertise separation: wildcard
+binds (0.0.0.0 or <code>::</code>) require <code>--listen-advertised-origin &lt;URL&gt;</code> (a strict
+http/https origin without credentials, path, query, or fragment) before
+<code>/collab</code> — or <code>collab_start</code> without an explicit <code>baseUrl</code> — can print
+reachable links; loopback binds advertise their local address automatically.</p>
+<p>The page itself is served without authentication: it carries no data, and
+every command and event flows through the token-gated <code>/rpc</code> and <code>/ws</code> routes.</p>
+<h2 id="authentication-the-rpi-authtoken-subprotocol"><a class="header" href="#authentication-the-rpi-authtoken-subprotocol">Authentication: the <code>rpi-auth.&lt;token&gt;</code> subprotocol</a></h2>
+<p>Browsers cannot set the <code>Authorization</code> header on <code>WebSocket</code> connections.
+The listener therefore accepts the token as a WebSocket subprotocol request:</p>
+<pre><code>Sec-WebSocket-Protocol: rpi-auth.&lt;token&gt;
+</code></pre>
+<ul>
+<li>The offered list is scanned for the first <code>rpi-auth.&lt;token&gt;</code> entry whose
+token matches the configured token file, compared in constant time (the
+same comparison used for <code>Authorization: Bearer &lt;token&gt;</code>).</li>
+<li>On success the exact offered protocol is reflected in the upgrade response
+(RFC 6455 requires the server to select and echo one subprotocol), so the
+browser accepts the handshake.</li>
+<li>The <code>Authorization</code> header path and tokenless-loopback policy are unchanged.
+Non-loopback binds require both a valid token file and
+<code>--listen-allow-insecure-remote</code>. Wrong, empty, or whitespace-containing
+candidates are rejected. The opt-in authenticates clients but provides no
+encryption against passive network observers.</li>
+</ul>
+<p>The token never appears in a URL or cookie; it is held only in the WebSocket
+handshake header and kept in <code>sessionStorage</code> by the page.</p>
+<h2 id="v1-features"><a class="header" href="#v1-features">v1 features</a></h2>
+<ul>
+<li><strong>Connection state + auto-reconnect</strong> — the status pill shows
+<code>connecting / connected / reconnecting / offline</code>; unexpected disconnects
+retry with exponential backoff (1s → 15s cap). A manual <strong>Connect</strong> button
+reconnects after changing the token.</li>
+<li><strong>Prompt box</strong> — while idle, Enter and the primary <strong>Send</strong> button send
+<code>prompt</code>; while a run is active, both switch to <strong>Steer</strong> and send <code>steer</code>,
+avoiding a rejected second prompt. Shift+Enter inserts a newline; Esc (or
+<strong>Abort</strong>) stops the active run. Dedicated <strong>Steer</strong> and <strong>Follow up</strong> buttons
+remain available for explicit queue control.</li>
+<li><strong>Streaming transcript</strong> — assistant turns render live from the event
+stream: text deltas, collapsible <code>thinking</code> blocks, tool-call cards with
+arguments and results, bash/tool-result blocks, and final text rendered as
+markdown (headings, lists, code fences, blockquotes, links, images with
+MIME-whitelisted <code>data:</code> URIs).</li>
+<li><strong>Model / thinking switch</strong> — model and thinking-level dropdowns populated
+from <code>get_available_models</code> / <code>get_available_thinking_levels</code>, applying
+<code>set_model</code> and <code>set_thinking_level</code>; the session name comes from
+<code>get_state</code>.</li>
+<li><strong>Status line</strong> — a pulsing "streaming" badge while a run is in flight and
+error toasts for failed commands, failed runs, and connection problems.</li>
+<li><strong>Multi-session authoritative restore</strong> — reloading <code>/web</code> restores the
+active session's transcript, goal, todo, and running jobs from the server
+(<code>get_entries</code>, <code>get_state</code>, <code>get_tree</code>) rather than starting empty.</li>
+<li><strong>Panels</strong> — dedicated views for todo, goal, workflow, session tree,
+settings, subagent jobs, side chat, and maintenance, each driven by the same
+JSONL RPC control plane.</li>
+<li><strong>Collaboration guest route</strong> — <code>/collab/ws/&lt;roomId&gt;</code> serves the same
+embedded client for encrypted live-collaboration guests, reading the
+capability key from the URL fragment locally before opening the encrypted
+WebSocket.</li>
+</ul>
+<h2 id="security"><a class="header" href="#security">Security</a></h2>
+<ul>
+<li>Every model-derived string passes through a JavaScript port of the export
+pipeline's <code>redact_secrets</code> (credential shapes such as <code>sk-…</code>, <code>ghp_…</code>,
+<code>Bearer …</code>, <code>token=…</code>, PEM private keys) before touching the DOM, and every
+string crossing into <code>innerHTML</code> is additionally HTML-escaped
+(<code>&amp; &lt; &gt; " '</code>). Streaming deltas use <code>textContent</code>; model text is never
+injected as raw HTML.</li>
+<li>Links are restricted to <code>http</code>/<code>https</code>/<code>mailto</code> and same-origin relative
+paths; images only render from base64 <code>data:</code> URIs with whitelisted MIME
+types.</li>
+<li>The token is never placed in a URL, and there is no cookie, so nothing to
+CSRF. All commands still require the token; the page itself is static.</li>
+</ul>
+<h2 id="v1-limitations"><a class="header" href="#v1-limitations">v1 limitations</a></h2>
+<ul>
+<li>Remote approvals and overlay confirmations are intentionally unavailable
+(<code>extension_ui_response</code> is hard-rejected on the wire by design); the page
+shows tool results but cannot answer interactive extension prompts.</li>
+<li>No TLS: the listener is plain HTTP/WebSocket. Non-loopback access is an
+explicit authenticated plaintext opt-in, and passive network observers can
+capture the bearer token and control traffic.</li>
+</ul>
+<h2 id="testing"><a class="header" href="#testing">Testing</a></h2>
+<ul>
+<li>Frontend type-check + build: <code>cd crates/pi-cli/web &amp;&amp; npm run build</code>
+(<code>tsc --noEmit &amp;&amp; vite build</code>; the committed <code>dist/index.html</code> is what the
+binary embeds).</li>
+<li>Rust: <code>cargo test -p pi-cli --lib</code> (subprotocol unit tests) and
+<code>cargo test -p pi-cli --test listen_control_plane</code> (GET /web route, positive
+and negative subprotocol auth, existing routes unchanged).</li>
+<li>Browser E2E (playwright-only hard gate): <code>bash E2E.d/web/run.sh</code> spawns the
+real binary with a token file and the loopback mock provider, then runs 10
+lanes: core (load/auth/stream/abort/todo/rich/workflow/settings/session/
+subagents), goal, xss, abort, reconnect, mobile, auth, and extras/sessions.
+Playwright is installed ephemerally via npm over a system Chrome/Chromium
+binary or playwright's bundled chromium; a lane with no usable browser
+driver FAILS — there is no skip and no fallback to the <code>agent-browser</code> CDP
+tool.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../user-guide/rpc-json.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../user-guide/e2e-scenarios.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../user-guide/rpc-json.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../user-guide/e2e-scenarios.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

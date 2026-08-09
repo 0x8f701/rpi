@@ -1,0 +1,507 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>CLI modes and commands - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="cli-modes-and-commands"><a class="header" href="#cli-modes-and-commands">CLI modes and commands</a></h1>
+<p><code>rpi</code> is a single binary that switches between non-interactive, headless, and interactive modes based on the flags you pass.</p>
+<h2 id="top-level-syntax"><a class="header" href="#top-level-syntax">Top-level syntax</a></h2>
+<pre><code class="language-text">rpi [OPTIONS] [PROMPT]...
+</code></pre>
+<p>When no subcommand is given, a top-level run is selected by the flags and terminal:</p>
+<ol>
+<li><code>--mode json</code> or <code>--mode rpc</code> → headless structured I/O.</li>
+<li><code>-p</code> / <code>--print</code> → print mode.</li>
+<li>A non-empty positional prompt with non-terminal stdin or stdout → print mode, unless <code>--listen</code> is active.</li>
+<li>Both stdin and stdout are terminals → TUI, with positional prompts submitted as initial turns.</li>
+<li>Otherwise → line REPL, with positional prompts submitted as initial turns. <code>--listen</code> keeps non-terminal prompt runs on this live REPL path so the listener shares the running <code>Application</code> until EOF.</li>
+</ol>
+<p>Multiple positional <code>[PROMPT]</code> arguments are separate initial turns in JSON,
+print, TUI, and REPL modes. An empty prompt is skipped by structured modes and
+does not force print mode.</p>
+<h2 id="top-level-flags"><a class="header" href="#top-level-flags">Top-level flags</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Short</th><th>Value</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>--model &lt;SPEC&gt;</code></td><td><code>-m</code></td><td>e.g. <code>anthropic/claude-sonnet-4-5</code></td><td>Model to use.</td></tr>
+<tr><td><code>--provider &lt;PROVIDER&gt;</code></td><td></td><td>provider id</td><td>Provider used with <code>--model</code>.</td></tr>
+<tr><td><code>--models &lt;PATTERNS&gt;</code></td><td></td><td>comma-separated patterns</td><td>Scope interactive model cycling.</td></tr>
+<tr><td><code>--print</code></td><td><code>-p</code></td><td></td><td>Force print mode.</td></tr>
+<tr><td><code>--mode &lt;text|json|rpc&gt;</code></td><td></td><td>protocol</td><td>Output protocol. <code>json</code> streams one-shot events; <code>rpc</code> reads LF-delimited JSON commands on stdin; <code>text</code> uses normal terminal selection.</td></tr>
+<tr><td><code>--continue</code></td><td><code>-c</code></td><td></td><td>Resume the newest native Pi session for this directory. Native-only; foreign sessions are never selected.</td></tr>
+<tr><td><code>--resume &lt;PATH_OR_ID&gt;</code></td><td><code>-r</code></td><td>path or id</td><td>Resume a native Pi session or import and resume a discovered OMP, Codex, Claude, Grok, or Droid session. Exact ids and unambiguous prefixes are accepted.</td></tr>
+<tr><td><code>--session &lt;PATH_OR_ID&gt;</code></td><td></td><td>path or id</td><td>Open a session by file path, exact id, or unambiguous prefix.</td></tr>
+<tr><td><code>--session-id &lt;ID&gt;</code></td><td></td><td>exact id</td><td>Open an exact project session id, creating it when absent.</td></tr>
+<tr><td><code>--fork &lt;PATH_OR_ID&gt;</code></td><td></td><td>path or id</td><td>Fork a session by file path, exact id, or unambiguous prefix.</td></tr>
+<tr><td><code>--session-dir &lt;DIR&gt;</code></td><td></td><td>directory</td><td>Override the directory used for session storage and id lookup.</td></tr>
+<tr><td><code>--no-session</code></td><td></td><td></td><td>Do not persist a session file for this run.</td></tr>
+<tr><td><code>--name &lt;NAME&gt;</code></td><td><code>-n</code></td><td>display name</td><td>Set the session display name.</td></tr>
+<tr><td><code>--system-prompt &lt;TEXT_OR_PATH&gt;</code></td><td><code>--system</code></td><td>text or file</td><td>Override the system prompt with text or an existing file.</td></tr>
+<tr><td><code>--append-system-prompt &lt;TEXT_OR_PATH&gt;</code></td><td></td><td>text or file</td><td>Append to the system prompt; repeatable.</td></tr>
+<tr><td><code>--cwd &lt;DIR&gt;</code></td><td><code>-C</code></td><td>directory</td><td>Working directory for this run and global subcommands.</td></tr>
+<tr><td><code>--add-dir &lt;DIR&gt;</code></td><td></td><td>directory</td><td>Add a directory to scoped tools and <code>@file</code> expansion; repeatable.</td></tr>
+<tr><td><code>--thinking &lt;LEVEL&gt;</code></td><td><code>--think</code></td><td><code>off|minimal|low|medium|high|xhigh|max</code></td><td>Initial reasoning level.</td></tr>
+<tr><td><code>--api-key &lt;KEY&gt;</code></td><td></td><td>secret</td><td>Override the API key for the resolved model's provider.</td></tr>
+<tr><td><code>--tools &lt;TOOLS&gt;</code></td><td><code>-t</code></td><td>comma-separated names</td><td>Allowlist applied after tool assembly.</td></tr>
+<tr><td><code>--exclude-tools &lt;TOOLS&gt;</code></td><td><code>-xt</code></td><td>comma-separated names</td><td>Denylist applied after the allowlist.</td></tr>
+<tr><td><code>--no-tools</code></td><td><code>-nt</code></td><td></td><td>Disable all built-in, extension, orchestration, and custom tools.</td></tr>
+<tr><td><code>--no-builtin-tools</code></td><td><code>-nbt</code></td><td></td><td>Disable built-in tools while preserving others.</td></tr>
+<tr><td><code>--extension &lt;PATH&gt;</code></td><td><code>-e</code></td><td>file or directory</td><td>Load an explicit extension manifest; repeatable. <code>--extensions</code> is an alias.</td></tr>
+<tr><td><code>--no-extensions</code></td><td><code>-ne</code></td><td></td><td>Disable discovered/configured extensions while retaining explicit <code>--extension</code> paths.</td></tr>
+<tr><td><code>--skill &lt;PATH&gt;</code></td><td></td><td>file or directory</td><td>Load an explicit skill; repeatable.</td></tr>
+<tr><td><code>--no-skills</code></td><td><code>-ns</code></td><td></td><td>Disable discovered/configured skills while retaining explicit <code>--skill</code> paths.</td></tr>
+<tr><td><code>--prompt-template &lt;PATH&gt;</code></td><td></td><td>file or directory</td><td>Load an explicit prompt template; repeatable.</td></tr>
+<tr><td><code>--no-prompt-templates</code></td><td><code>-np</code></td><td></td><td>Disable discovered/configured prompt templates while retaining explicit paths.</td></tr>
+<tr><td><code>--theme &lt;PATH&gt;</code></td><td></td><td>file or directory</td><td>Load an explicit theme; repeatable.</td></tr>
+<tr><td><code>--no-themes</code></td><td></td><td></td><td>Disable discovered/configured themes while retaining explicit paths.</td></tr>
+<tr><td><code>--no-context-files</code></td><td><code>-nc</code></td><td></td><td>Disable <code>AGENTS.md</code> and <code>CLAUDE.md</code> discovery.</td></tr>
+<tr><td><code>--list-models [SEARCH]</code></td><td></td><td>optional filter</td><td>List models and exit.</td></tr>
+<tr><td><code>--offline</code></td><td></td><td></td><td>Disable nonessential startup networking such as catalog refreshes and update checks.</td></tr>
+<tr><td><code>--verbose</code></td><td></td><td></td><td>Force verbose startup diagnostics.</td></tr>
+<tr><td><code>--approve</code></td><td><code>-a</code></td><td></td><td>Trust project-local <code>.pi</code> settings/resources for this run only.</td></tr>
+<tr><td><code>--no-approve</code></td><td></td><td></td><td>Refuse project-local <code>.pi</code> settings/resources for this run only.</td></tr>
+<tr><td><code>--approval-mode &lt;MODE&gt;</code></td><td></td><td><code>yolo|write|ask</code></td><td>Host tool approval policy. <code>yolo</code> allows all capabilities, <code>write</code> confirms Exec, and <code>ask</code> confirms every tool call. Non-interactive confirmation fails closed. This is separate from project trust flags.</td></tr>
+<tr><td><code>--listen &lt;SOCKET_ADDR&gt;</code></td><td></td><td>e.g. <code>127.0.0.1:8765</code></td><td>Bind a plaintext HTTP/WebSocket control plane around the live TUI/REPL application. Loopback is the default; non-loopback addresses are rejected unless both the token file and explicit insecure-remote opt-in are present. Only valid on the text path.</td></tr>
+<tr><td><code>--listen-token-file &lt;PATH&gt;</code></td><td></td><td>token file</td><td>Exact Bearer authentication. Optional on loopback and mandatory for insecure remote listening. Enables browser access; tokenless loopback accepts only native clients without <code>Origin</code>.</td></tr>
+<tr><td><code>--listen-allow-insecure-remote</code></td><td></td><td></td><td>Permit a non-loopback <code>--listen</code> address only with <code>--listen-token-file</code>. Plaintext HTTP/WebSocket exposes the bearer token and control traffic to passive network observers.</td></tr>
+<tr><td><code>--listen-advertised-origin &lt;URL&gt;</code></td><td></td><td>http(s) origin</td><td>Advertised origin used for collaboration links (<code>/collab</code>, <code>collab_start</code> without an explicit <code>baseUrl</code>) when <code>--listen</code> binds a wildcard address (0.0.0.0 or <code>::</code>). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing <code>/</code> is normalized away). Loopback binds advertise their local address automatically; wildcard binds fail closed without this flag.</td></tr>
+<tr><td><code>--version</code></td><td><code>-v</code>, <code>-V</code></td><td></td><td>Print version and exit.</td></tr>
+<tr><td><code>--help</code></td><td><code>-h</code></td><td></td><td>Print help and exit.</td></tr>
+</tbody></table>
+</div>
+<p>Short aliases are normalized before clap parses: <code>-v</code> maps to <code>--version</code>, <code>-xt</code> to <code>--exclude-tools</code>, <code>-nt</code> to <code>--no-tools</code>, <code>-nbt</code> to <code>--no-builtin-tools</code>, <code>-ne</code> to <code>--no-extensions</code>, <code>-ns</code> to <code>--no-skills</code>, <code>-np</code> to <code>--no-prompt-templates</code>, and <code>-nc</code> to <code>--no-context-files</code>.</p>
+<p><code>--provider</code> requires <code>--model</code>; <code>--api-key</code> requires <code>--model</code> or <code>--models</code>.
+<code>--continue</code>, <code>--resume</code>, <code>--session</code>, <code>--session-id</code>, <code>--fork</code>, and <code>--no-session</code>
+are mutually exclusive.</p>
+<p>For explicit LAN access:</p>
+<pre><code class="language-console">$ rpi --listen 0.0.0.0:8765 --listen-token-file &lt;workspace&gt;/rpi-token --listen-allow-insecure-remote
+</code></pre>
+<p>Open <code>http://&lt;host-lan-ip&gt;:8765/web</code> from another machine. The flag is an
+authenticated plaintext opt-in, not encryption; use only on a network where
+passive observers are an accepted risk. <code>rpi agent serve</code> remains
+loopback-only. Collaboration links need a reachable origin on wildcard binds:
+add <code>--listen-advertised-origin http://&lt;host-lan-ip&gt;:8765</code> (loopback binds
+advertise their local address automatically and never need it).</p>
+<h2 id="subcommands"><a class="header" href="#subcommands">Subcommands</a></h2>
+<h3 id="rpi-models-filter"><a class="header" href="#rpi-models-filter"><code>rpi models [FILTER]</code></a></h3>
+<p>List available models. Provider headers are printed in bold. The filter is case-sensitive and matches against provider name or model id.</p>
+<h3 id="rpi-sessions"><a class="header" href="#rpi-sessions"><code>rpi sessions</code></a></h3>
+<p>List native Pi v3 sessions for the configured working directory, newest first. Honors the global <code>-C</code> / <code>--cwd</code> flag in any position:</p>
+<pre><code class="language-sh">rpi --cwd /path sessions
+rpi sessions -C /path
+</code></pre>
+<h3 id="rpi-import-session-source-input---output-path"><a class="header" href="#rpi-import-session-source-input---output-path"><code>rpi import-session &lt;SOURCE&gt; &lt;INPUT&gt; [--output PATH]</code></a></h3>
+<p>Convert an external session to native Pi v3 JSONL.</p>
+<p>Supported <code>SOURCE</code> values:</p>
+<ul>
+<li><code>pi</code></li>
+<li><code>omp</code></li>
+<li><code>codex</code></li>
+<li><code>claude</code></li>
+<li><code>grok</code></li>
+<li><code>droid</code></li>
+</ul>
+<p>With <code>--output</code> the file is written to that path (or into the directory if the path is an existing directory). Without <code>--output</code> the file is placed under the per-cwd session directory and the command prints the emitted path and message count.</p>
+<h3 id="rpi-login-provider--rpi-logout-provider"><a class="header" href="#rpi-login-provider--rpi-logout-provider"><code>rpi login [PROVIDER]</code> / <code>rpi logout [PROVIDER]</code></a></h3>
+<p>Configure or remove stored credentials in <code>auth.json</code>. When run in an interactive terminal with no provider, a list of configured providers is shown. Outside a terminal the provider argument is required.</p>
+<h3 id="rpi-reload"><a class="header" href="#rpi-reload"><code>rpi reload</code></a></h3>
+<p>Validate the active settings/resource snapshot and print a JSON summary to stdout.</p>
+<h3 id="rpi-export-session_path---output-path---jsonl"><a class="header" href="#rpi-export-session_path---output-path---jsonl"><code>rpi export &lt;SESSION_PATH&gt; [--output PATH] [--jsonl]</code></a></h3>
+<p>Export a native Pi v3 session file to a self-contained HTML file (default) or to a current-branch JSONL file with <code>--jsonl</code>. No model, auth, or network access is required. Prints the output path to stdout.</p>
+<h3 id="rpi-install-source---local--rpi-remove-source---local--rpi-list"><a class="header" href="#rpi-install-source---local--rpi-remove-source---local--rpi-list"><code>rpi install &lt;SOURCE&gt; [--local]</code> / <code>rpi remove &lt;SOURCE&gt; [--local]</code> / <code>rpi list</code></a></h3>
+<p>Install, remove, or list local/git rpi packages. <code>--local</code> persists the package in the project's <code>.pi/settings.json</code> instead of the global agent settings. Project packages are only loaded when the project is trusted.</p>
+<h3 id="rpi-config--l--local"><a class="header" href="#rpi-config--l--local"><code>rpi config [-l|--local]</code></a></h3>
+<p>Configure enabled package resources (extensions, skills, prompts, themes) for global or project scope. In a terminal it opens an interactive selector; with non-TTY stdout it prints deterministic JSON. Project scope is refused unless the project is trusted.</p>
+<h3 id="rpi-update-options-package"><a class="header" href="#rpi-update-options-package"><code>rpi update [OPTIONS] [PACKAGE]</code></a></h3>
+<p>Update the managed installation, configured packages, or dynamic model catalogs.</p>
+<ul>
+<li>no arguments or <code>--self</code>: update the managed <code>rpi</code> installation.</li>
+<li><code>--extensions</code>: reconcile every configured package.</li>
+<li><code>--self --extensions</code> or <code>--all</code>: update packages, then update <code>rpi</code>.</li>
+<li><code>--models</code>: refresh dynamic model catalogs.</li>
+<li><code>--extension SOURCE</code> or positional <code>PACKAGE</code>: update one configured package.</li>
+<li>positional <code>self</code> or <code>rpi</code>: update the managed installation.</li>
+<li><code>--force</code>: reinstall the selected self-update even when version and checksum match.</li>
+</ul>
+<p>A package source cannot be combined with <code>--self</code>, <code>--extensions</code>, or <code>--force</code>.</p>
+<h3 id="rpi-llama-command"><a class="header" href="#rpi-llama-command"><code>rpi llama &lt;COMMAND&gt;</code></a></h3>
+<p>Manage a llama.cpp router and local GGUF downloads:</p>
+<div class="table-wrapper"><table><thead><tr><th>Subcommand</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>configure URL [--api-key KEY]</code></td><td>Configure and validate a router</td></tr>
+<tr><td><code>status [--reload]</code></td><td>Show router catalog</td></tr>
+<tr><td><code>refresh</code></td><td>Refresh live models, fall back to cached catalog</td></tr>
+<tr><td><code>load MODEL</code> / <code>unload MODEL</code></td><td>Load/unload a model</td></tr>
+<tr><td><code>search QUERY</code></td><td>Search Hugging Face for GGUF repos</td></tr>
+<tr><td><code>details OWNER/REPO</code></td><td>List quantizations and checksums</td></tr>
+<tr><td><code>download OWNER/REPO [-q QUANT]</code></td><td>Download one quantization atomically</td></tr>
+<tr><td><code>installed</code></td><td>List local downloads</td></tr>
+</tbody></table>
+</div>
+<h2 id="interactive-modes"><a class="header" href="#interactive-modes">Interactive modes</a></h2>
+<ol>
+<li><strong>Headless JSON/RPC</strong> — when <code>--mode json</code> or <code>--mode rpc</code> is passed.</li>
+<li><strong>Print mode</strong> — when <code>-p</code> / <code>--print</code> is set, or a positional prompt is
+supplied while stdin or stdout is not a terminal.</li>
+<li><strong>TUI</strong> — when both stdin and stdout are terminals.</li>
+<li><strong>Line REPL</strong> — fallback for non-terminal text sessions.</li>
+</ol>
+<p>All share the same session engine; only the input and rendering differ.</p>
+<h2 id="print-mode-output"><a class="header" href="#print-mode-output">Print mode output</a></h2>
+<p>Print mode streams assistant text and tool activity to stdout:</p>
+<pre><code class="language-text">· bash({command})
+  └ ok
+
+The result is...
+</code></pre>
+<p>A trailing newline is appended after the final assistant text.</p>
+<h2 id="primary-slash-commands"><a class="header" href="#primary-slash-commands">Primary slash commands</a></h2>
+<p><code>/help</code>, slash completion, and RPC command discovery expose exactly these 21
+primary commands. Other built-ins remain manually executable where documented.</p>
+<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>/settings</code></td><td>Inspect settings (REPL) or open the settings panel (TUI)</td></tr>
+<tr><td><code>/model [spec]</code></td><td>Switch model without clearing the transcript</td></tr>
+<tr><td><code>/branch</code></td><td>Create a new branch from a previous message</td></tr>
+<tr><td><code>/resume [path|id|prefix]</code></td><td>List or resume native and discovered foreign sessions</td></tr>
+<tr><td><code>/fork</code></td><td>Fork from a previous user message</td></tr>
+<tr><td><code>/export [path]</code></td><td>Export the session to HTML or JSONL</td></tr>
+<tr><td><code>/dump [--jsonl] [path]</code></td><td>Export with an explicit format flag</td></tr>
+<tr><td><code>/handoff [--prose]</code></td><td>Generate a handoff summary (copied to clipboard)</td></tr>
+<tr><td><code>/agents</code></td><td>Manage agent definitions and model overrides</td></tr>
+<tr><td><code>/role</code></td><td>Manage the current agent role</td></tr>
+<tr><td><code>/compact [--snap] [instructions]</code></td><td>Manually compact session context (<code>--snap</code> is deterministic, no LLM call)</td></tr>
+<tr><td><code>/rewind [entry-index|checkpoint-name]</code></td><td>Roll the session back, archiving the dropped tail</td></tr>
+<tr><td><code>/checkpoint &lt;name&gt;</code></td><td>Mark the current position as a named rewind target</td></tr>
+<tr><td><code>/ps</code></td><td>List supervised processes</td></tr>
+<tr><td><code>/loop [interval] &lt;prompt&gt;</code></td><td>Run a prompt on a recurring interval</td></tr>
+<tr><td><code>/goal</code></td><td>Create and manage the durable session goal</td></tr>
+<tr><td><code>/workflow</code></td><td>Create and manage isolated concurrent workflows</td></tr>
+<tr><td><code>/code-review [&lt;from&gt; &lt;to&gt;]</code></td><td>Browse a Git diff in a fullscreen tree/diff page: bare shows tracked HEAD→working-tree staged and unstaged changes; two refs compare any two commits/branches/tags</td></tr>
+<tr><td><code>/btw [prompt]</code></td><td>Open a persistent detached side conversation forked from the active main branch</td></tr>
+<tr><td><code>/queue [cancel]</code></td><td>Show pending steering/follow-up prompts (cancel clears them)</td></tr>
+<tr><td><code>/live</code></td><td>Hold-to-talk voice input (TUI)</td></tr>
+</tbody></table>
+</div>
+<p>Frequently used hidden built-ins include <code>/help</code>, <code>/new</code>, <code>/sessions</code>, <code>/tree</code>,
+<code>/todo</code>, <code>/login</code>, <code>/logout</code>, <code>/share</code>, <code>/copy</code>, <code>/process</code>, <code>/theme</code>,
+<code>/snapcompact</code> (alias of <code>/compact --snap</code>), and <code>/quit</code>. They remain
+executable but do not appear in primary discovery.</p>
+<p><code>/btw</code> starts read-only. <code>Ctrl+T</code> toggles fresh workspace-scoped edit/exec tools when idle, <code>Esc</code> aborts a streaming side turn or closes an idle overlay, <code>Alt+R</code> reforks from the current main branch, and <code>Alt+N</code> clears the side transcript. Closing the overlay keeps its controller for reopening; leaving the TUI aborts and joins active side work. <code>peek_main</code> reads the current active main branch without writing to the main session.</p>
+<p><code>/code-review</code> uses direct bounded Git argv with pager, external diff, text conversion, configured filters, and interactive prompts disabled. It never sends repository content to a server. The page supports keyboard and mouse tree/hunk navigation, inline per-hunk comment threads after each complete hunk, fold/unfold controls, and one consolidated answer card per review exchange. <code>Esc</code> or <code>q</code> closes it and restores normal terminal mouse selection.</p>
+<p><code>/code-review</code> accepts zero or exactly two arguments. Bare <code>/code-review</code> shows
+tracked HEAD→working-tree staged and unstaged changes. <code>/code-review &lt;from&gt; &lt;to&gt;</code>
+resolves each ref — a commit hash, branch, or tag — to a commit and renders a
+commit-to-commit diff labeled <code>&lt;from&gt; → &lt;to&gt;</code> in the panel title; working-tree
+changes are ignored on this path. One argument or more than two is invalid: the
+panel does not open and the status line shows <code>Usage: /code-review [&lt;from&gt; &lt;to&gt;]</code>.
+Pressing <code>r</code> refreshes the snapshot while preserving the selected revision pair.</p>
+<p>Loop intervals accept positive bare seconds (<code>/loop 300 check status</code>) or compact
+<code>s</code>, <code>m</code>, <code>h</code>, and <code>d</code> units (<code>/loop 3s echo hello</code>, <code>/loop 30m check deploy</code>).
+Values are honored exactly; zero and overflow are rejected.</p>
+<h2 id="repl-only-additions"><a class="header" href="#repl-only-additions">REPL-only additions</a></h2>
+<p>The line REPL also accepts:</p>
+<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>/think &lt;level&gt;</code></td><td>Set reasoning level (<code>off</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>)</td></tr>
+<tr><td><code>!command</code></td><td>Run a bash command recorded in context</td></tr>
+<tr><td><code>!!command</code></td><td>Run a bash command excluded from context</td></tr>
+</tbody></table>
+</div>
+<p>In the TUI, reasoning level and model cycling are controlled by keybindings instead. See <a href="tui.html"><code>tui.md</code></a>.</p>
+<h2 id="tui-only-slash-commands"><a class="header" href="#tui-only-slash-commands">TUI-only slash commands</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>/theme [name|next|prev]</code></td><td>Show or switch the active theme</td></tr>
+<tr><td><code>/scoped-models</code></td><td>Enable or disable models for cycling (opens TUI panel)</td></tr>
+</tbody></table>
+</div>
+<h2 id="tui-keybindings"><a class="header" href="#tui-keybindings">TUI keybindings</a></h2>
+<p>The TUI uses the terminal's normal screen with inline redraws, preserving terminal
+and tmux scrollback. The transcript is above a composer and status line.</p>
+<div class="table-wrapper"><table><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+<tr><td><code>Enter</code></td><td>Submit the current message</td></tr>
+<tr><td><code>Shift+Enter</code> or <code>Ctrl+J</code></td><td>Insert a newline</td></tr>
+<tr><td><code>Ctrl+D</code> (on empty input)</td><td>Quit</td></tr>
+<tr><td><code>Esc</code></td><td>Cancel the in-flight run, or clear input when idle</td></tr>
+<tr><td><code>Ctrl+C</code></td><td>Clear input</td></tr>
+<tr><td><code>Ctrl+U</code></td><td>Clear the entire composer</td></tr>
+<tr><td><code>Tab</code></td><td>Accept the selected slash-command completion</td></tr>
+<tr><td><code>Up</code> / <code>Down</code></td><td>Move the cursor, select a completion, or navigate submitted prompt history</td></tr>
+<tr><td><code>Left</code> / <code>Right</code></td><td>Move cursor</td></tr>
+<tr><td><code>Backspace</code> / <code>Delete</code></td><td>Edit text</td></tr>
+<tr><td><code>Home</code> / <code>End</code></td><td>Move to start/end of line</td></tr>
+<tr><td><code>Ctrl+V</code> / <code>Alt+V</code></td><td>Paste from clipboard</td></tr>
+<tr><td><code>Ctrl+X</code> / <code>Ctrl+Shift+C</code></td><td>Copy last assistant message</td></tr>
+<tr><td><code>Ctrl+G</code></td><td>Open external editor</td></tr>
+<tr><td><code>Ctrl+L</code></td><td>Open model selector</td></tr>
+<tr><td><code>Ctrl+P</code> / <code>Ctrl+Shift+P</code></td><td>Cycle model forward/backward</td></tr>
+<tr><td><code>Ctrl+T</code></td><td>Toggle thinking-block visibility</td></tr>
+<tr><td><code>Shift+Tab</code></td><td>Cycle thinking level</td></tr>
+<tr><td><code>Ctrl+O</code></td><td>Expand tools panel</td></tr>
+</tbody></table>
+</div>
+<p>Type <code>/hotkeys</code> in either interactive mode to see a shortcut summary. Default bindings can be overridden with custom keybinding JSON files. See <a href="tui.html"><code>tui.md</code></a>.</p>
+<h2 id="session-resume-and-import"><a class="header" href="#session-resume-and-import">Session resume and import</a></h2>
+<p>Native sessions are Pi v3 JSONL files. Each line is an object with a <code>type</code> field. The active branch is reconstructed from <code>parentId</code> chains, so sessions can contain forks and the latest branch is followed on resume.</p>
+<p>Session files live under:</p>
+<pre><code class="language-text">&lt;agent-dir&gt;/sessions/--&lt;workspace&gt;--/&lt;timestamp&gt;_&lt;id&gt;.jsonl
+</code></pre>
+<p><code>&lt;workspace&gt;</code> is the encoded cwd: the absolute path with leading separators removed and <code>/</code>, <code>\</code>, and <code>:</code> replaced by <code>-</code>.</p>
+<p>The full-screen TUI selectors opened by <code>/resume</code> and <code>/sessions</code>, the line REPL bare <code>/resume</code> command, and the TUI startup Recent sessions list all draw from the same supported unified catalog. Automatic lists are scoped to the current working directory and display a <code>[source]</code> badge next to each row. Supported sources are native Pi (<code>pi</code>), OMP (<code>omp</code>), Codex (<code>codex</code>), Claude (<code>claude</code>), Grok/Hyper (<code>grok/hyper</code>), and Droid (<code>droid</code>).</p>
+<p><code>--resume</code> and <code>/resume</code> share this catalog. Native selections open the existing file without copying. Foreign selections are converted to Pi v3 once into the effective native session root, retain source lineage, and reuse that converted file on later resumes. In selectors, foreign source files are read-only: they cannot be renamed or deleted. Native Pi sessions and already-imported conversions are regular JSONL files under the session root and can be renamed or deleted from the selector. Only convertible user/assistant text messages are preserved during import; tool calls, reasoning, attachments, and branches are dropped.</p>
+<p><code>--continue</code> remains native-only and resumes the newest native Pi session for the directory.</p>
+<h2 id="model-spec-syntax"><a class="header" href="#model-spec-syntax">Model spec syntax</a></h2>
+<ul>
+<li><code>provider/id</code> — explicit provider and model id.</li>
+<li><code>id</code> — bare id matched across all providers.</li>
+<li><code>provider/id:level</code> — explicit model plus thinking level suffix.</li>
+<li><code>id:level</code> — bare id plus thinking level.</li>
+</ul>
+<p>Resolution is case-insensitive. If the requested id is unknown but the provider is known, the CLI falls back to a synthetic custom-id model cloned from that provider's default template and prints a warning. This is useful with custom <code>models.json</code> entries.</p>
+<h2 id="cancellation"><a class="header" href="#cancellation">Cancellation</a></h2>
+<ul>
+<li>In print mode, <code>Ctrl-C</code> aborts the in-flight turn and the CLI exits.</li>
+<li>In the REPL, <code>Ctrl-C</code> aborts the current turn and returns to the prompt.</li>
+<li>In the TUI, <code>Esc</code> aborts the in-flight run.</li>
+</ul>
+<h2 id="exit-codes"><a class="header" href="#exit-codes">Exit codes</a></h2>
+<ul>
+<li><code>0</code> — success (<code>--help</code> and <code>--version</code> also exit <code>0</code>).</li>
+<li><code>1</code> — any runtime/dispatch error. Errors are printed to stderr without
+secret values (<code>crates/pi-cli/src/main.rs:24-27</code>). Subcommands that fail
+(e.g. <code>rpi export</code> on a missing session) surface through this same path.</li>
+<li><code>2</code> — argument/usage errors, reported by clap's parser
+(<code>error.exit()</code> in <code>crates/pi-cli/src/args.rs:615-616</code>).</li>
+</ul>
+<p>There is no finer-grained exit-code table; all failure modes collapse to <code>1</code>
+(or <code>2</code> for a usage error before dispatch).</p>
+<h2 id="related-documentation"><a class="header" href="#related-documentation">Related documentation</a></h2>
+<ul>
+<li><a href="authentication.html"><code>authentication.md</code></a> — env vars, <code>auth.json</code>, <code>models.json</code></li>
+<li><a href="models.html"><code>models.md</code></a> — model catalog, custom providers</li>
+<li><a href="../reference/settings-trust.html"><code>settings-trust.md</code></a> — <code>settings.json</code>, config directory, trust</li>
+<li><a href="tui.html"><code>tui.md</code></a> — TUI themes and keybindings</li>
+<li><a href="rpc-json.html"><code>rpc-json.md</code></a> — JSON/RPC event schema</li>
+<li><a href="../reference/local-llama.html"><code>local-llama.md</code></a> — local model setup</li>
+<li><a href="../reference/packages.html"><code>packages.md</code></a> — package manager details</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../user-guide/tui.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../user-guide/goals.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../user-guide/tui.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../user-guide/goals.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

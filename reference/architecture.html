@@ -1,0 +1,530 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Architecture - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="pi-coding-架构图mermaid"><a class="header" href="#pi-coding-架构图mermaid">pi-coding 架构图（Mermaid）</a></h1>
+<blockquote>
+<p>来源：对 <code>crates/pi-coding</code>（约 128K 行 Rust）的结构分析。所有引用以 <code>&lt;repo-root&gt;/crates/...</code> 相对路径 + 行号给出，可执行验证：<code>grep -n "&lt;symbol&gt;" crates/pi-coding/src/&lt;file&gt;.rs</code>。</p>
+</blockquote>
+<h2 id="图-0--四层-crate-依赖"><a class="header" href="#图-0--四层-crate-依赖">图 0 — 四层 crate 依赖</a></h2>
+<pre><code class="language-mermaid">flowchart TB
+    subgraph L0["pi-cli — crates/pi-cli"]
+        TUI["TUI 面板 / REPL&lt;br/&gt;tui.rs · repl.rs"]
+        RPC["JSON-RPC / ACP 模式&lt;br/&gt;rpc.rs · acp.rs"]
+        CMD["子命令 · 会话编排&lt;br/&gt;interactive_commands.rs · session_run.rs"]
+    end
+    subgraph L1["pi-coding — crates/pi-coding（本图主体）"]
+        APP["Application 状态机&lt;br/&gt;application.rs"]
+        SESS["Session 回合执行&lt;br/&gt;session.rs"]
+        SUB["工具 · 编排 · 工作流&lt;br/&gt;扩展 · 配置 · 持久化"]
+    end
+    subgraph L2["pi-agent — crates/pi-agent"]
+        AGENT["Agent 循环&lt;br/&gt;agent.rs · loop_runtime.rs"]
+    end
+    subgraph L3["pi-ai — crates/pi-ai"]
+        PROV["providers/&lt;br/&gt;anthropic · openai · responses · codex · gemini..."]
+        CAT["模型目录 · 流式 · 重试 · 超时&lt;br/&gt;catalog.rs · stream.rs"]
+    end
+    TUI --&gt; APP
+    RPC --&gt; APP
+    CMD --&gt; APP
+    APP --&gt; SESS
+    SESS --&gt; AGENT
+    AGENT --&gt; PROV
+    PROV --&gt; CAT
+    classDef lay fill:#eef7ff,stroke:#1565c0
+    class L0,L1,L2,L3 lay
+</code></pre>
+<p>依赖方向（AGENTS.md 约束）：<code>pi-cli → pi-coding → pi-agent → pi-ai</code>，禁止跨层直取内部实现。</p>
+<h2 id="图-1--pi-coding-内部模块全景"><a class="header" href="#图-1--pi-coding-内部模块全景">图 1 — pi-coding 内部模块全景</a></h2>
+<pre><code class="language-mermaid">flowchart LR
+    subgraph CORE["回合核心"]
+        APP1["Application 状态机&lt;br/&gt;application.rs:335&lt;br/&gt;+ application/runtime.rs"]
+        SESS1["Session&lt;br/&gt;session.rs:717&lt;br/&gt;turn loop · retry · compaction"]
+        STORE["session_store.rs&lt;br/&gt;SessionRecorder:607 · start_session:1177&lt;br/&gt;resume:1551 · fork:1473"]
+    end
+    subgraph TOOLS["工具子系统 tools.rs + tools/*"]
+        CAT["工具目录&lt;br/&gt;tools.rs:537 create_all_tools"]
+        BASH["bash/brush · process/&lt;br/&gt;ProcessManager:23"]
+        EDIT["edit · write · ast_edit&lt;br/&gt;editdiff · editmatch"]
+        LSP1["lsp · lsp_client"]
+        BROWSER["browser · web_search"]
+        EVAL["eval · notebook · debug"]
+        IMG["image · image_gen · imageresize"]
+        MEMTOOL["memory · recall · retain · reflect"]
+        MCPTOOL["mcp_tool（McpRegistry）&lt;br/&gt;mcp.rs:554"]
+    end
+    subgraph AGENT2["子代理编排 orchestration/"]
+        ORCH["OrchestrationRuntime&lt;br/&gt;orchestration/runtime.rs:730"]
+        CHILD["ChildSession&lt;br/&gt;orchestration/runtime.rs:57"]
+        JOBS["jobs · persistence&lt;br/&gt;工具绑定"]
+    end
+    subgraph WF["工作流 workflow/ + workflow_worktree/"]
+        WFM["WorkflowManager&lt;br/&gt;workflow/manager.rs:196"]
+        WFS["WorkflowSupervisor&lt;br/&gt;workflow/supervisor.rs:283"]
+        WFT["worktree overlay&lt;br/&gt;workflow_worktree/mod.rs:280"]
+    end
+    subgraph EXT["扩展与集成"]
+        EXT1["extensions.rs&lt;br/&gt;ExtensionSpec:564 · 进程/QuickJS"]
+        QJS["quickjs_host.rs&lt;br/&gt;QuickJsExtensionHost:630"]
+        PLUGIN["plugin.rs 市场"]
+        PKG["packages.rs 包资源"]
+        HOOKS["hooks.rs HostHooks:71"]
+    end
+    subgraph CFG["配置 · 安全 · 隔离"]
+        SET["settings.rs · settings_catalog.rs&lt;br/&gt;RuntimeSettingsSnapshot:517"]
+        AUTH["auth.rs AuthManager:921"]
+        TRUST["trust.rs TrustStore:172&lt;br/&gt;resolve_project_trust:362"]
+        SANDBOX["sandbox.rs SandboxConfig:48"]
+        ENC["encrypt.rs · oauth.rs"]
+    end
+    subgraph CTX["上下文与选择"]
+        SEL["selector.rs SelectionPlan:321"]
+        RES["resources.rs · resource_manager.rs&lt;br/&gt;ResourceManager:317"]
+        MEM["memory.rs MemoryConfig:588"]
+        SYS["system_prompt.rs · prompt_templates.rs"]
+    end
+    subgraph DUR["持久化 · 生命周期"]
+        COMP["compaction.rs 压缩/回退"]
+        SCAT["session_catalog/ 会话树"]
+        LOOP1["loop_scheduler.rs LoopTask:97"]
+        GOAL["goal.rs · handoff.rs · todo.rs"]
+    end
+    APP1 --&gt; SESS1
+    SESS1 --&gt; STORE
+    SESS1 --&gt; TOOLS
+    SESS1 --&gt; CTX
+    SESS1 --&gt; AGENT2
+    AGENT2 --&gt; WF
+    APP1 --&gt; EXT
+    EXT --&gt; QJS
+    EXT --&gt; PLUGIN
+    EXT --&gt; PKG
+    APP1 --&gt; CFG
+    CFG --&gt; AUTH
+    CFG --&gt; TRUST
+    CFG --&gt; SANDBOX
+    SESS1 --&gt; DUR
+    DUR --&gt; COMP
+    DUR --&gt; SCAT
+</code></pre>
+<h2 id="图-2--单回合运行时流水线sequence"><a class="header" href="#图-2--单回合运行时流水线sequence">图 2 — 单回合运行时流水线（Sequence）</a></h2>
+<pre><code class="language-mermaid">sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant AP as "Application&lt;br/&gt;application.rs:1402"
+    participant SE as "Session&lt;br/&gt;session.rs:3685 run()"
+    participant AG as "pi-agent Agent&lt;br/&gt;agent.rs / loop_runtime.rs"
+    participant PR as "pi-ai provider&lt;br/&gt;stream"
+    participant TL as "Tool 目录&lt;br/&gt;tools.rs"
+
+    U-&gt;&gt;AP: prompt(text)
+    AP-&gt;&gt;SE: run(prompt)
+    SE-&gt;&gt;SE: run_messages(messages)
+    SE-&gt;&gt;SE: inject_selection_messages()&lt;br/&gt;selector 选择 + memory 注入
+    SE-&gt;&gt;SE: begin_run() → ClaimedRun
+    SE-&gt;&gt;SE: execute_with_retries()&lt;br/&gt;session.rs:3853
+    SE-&gt;&gt;AG: agent.prompt_messages()
+    AG-&gt;&gt;AG: run_agent_loop → run_loop
+    loop 每个模型回合
+        AG-&gt;&gt;PR: 流式请求（含工具定义）
+        PR--&gt;&gt;AG: assistant 消息 / tool_call
+        alt 有工具调用
+            AG-&gt;&gt;TL: 执行 AgentTool.execute()
+            TL--&gt;&gt;AG: ToolResult
+            AG-&gt;&gt;AG: 工具结果回合继续
+        else 无工具调用
+            AG--&gt;&gt;SE: 回合结束（stop_reason）
+        end
+    end
+    SE-&gt;&gt;SE: finish_run() → 记录/事件
+    SE--&gt;&gt;AP: RunResult
+    AP--&gt;&gt;U: 渲染结果
+</code></pre>
+<h2 id="图-3--回合失败恢复决策重试--回退--压缩"><a class="header" href="#图-3--回合失败恢复决策重试--回退--压缩">图 3 — 回合失败恢复决策（重试 / 回退 / 压缩）</a></h2>
+<pre><code class="language-mermaid">flowchart TD
+    A["execute_with_retries&lt;br/&gt;session.rs:3853"] --&gt; B{"最后消息是&lt;br/&gt;Assistant 成功?"}
+    B --&gt;|是| Z["返回成功&lt;br/&gt;finish_retry_success"]
+    B --&gt;|否| C{"stop_reason == Error?"}
+    C --&gt;|否| Z
+    C --&gt;|是| D{"context overflow?"}
+    D --&gt;|是| E{"已尝试过&lt;br/&gt;overflow 恢复?"}
+    E --&gt;|是| F["报错终止&lt;br/&gt;Context overflow persisted"]
+    E --&gt;|否| G["自动压缩&lt;br/&gt;perform_compaction(Overflow)"] --&gt; H["继续 agent.continue_run()"] --&gt; B
+    D --&gt;|否| I{"retryable 错误&lt;br/&gt;且未超限?"}
+    I --&gt;|是| J["重试（RetrySettings）&lt;br/&gt;session.rs RetrySettings:467"]
+    J --&gt; B
+    I --&gt;|否| K{"有回退链候选?&lt;br/&gt;retry_fallback.rs find_candidates:409"}
+    K --&gt;|是| L["切换到回退模型&lt;br/&gt;format_retry_fallback_selector:112"]
+    L --&gt; M["continue_run"] --&gt; B
+    K --&gt;|否| N["DoomLoopTracker 触发&lt;br/&gt;session.rs:228 → 终止"]
+    N --&gt; F
+</code></pre>
+<h2 id="图-4--pi-agent-循环内部"><a class="header" href="#图-4--pi-agent-循环内部">图 4 — pi-agent 循环内部</a></h2>
+<pre><code class="language-mermaid">flowchart TB
+    E["run_agent_loop&lt;br/&gt;loop_runtime.rs:45"] --&gt; F["run_loop&lt;br/&gt;loop_runtime.rs:103"]
+    F --&gt; G["取 steering / follow-up 消息&lt;br/&gt;PendingQueue"]
+    G --&gt; H["组装 AgentContext&lt;br/&gt;types.rs:546"]
+    H --&gt; I["调用 stream_fn（pi-ai 流式）"]
+    I --&gt; J{"解析回复"}
+    J --&gt;|tool_call| K["before_tool_call 钩子"]
+    K --&gt; L["执行 AgentTool（AgentTool::execute&lt;br/&gt;types.rs:265）"]
+    L --&gt; M["after_tool_call 钩子"]
+    M --&gt; N["写入消息历史"] --&gt; I
+    J --&gt;|纯文本| O["AgentSettled 事件"]
+    J --&gt;|Aborted/Error| O
+    O --&gt; P["AgentEvent 广播&lt;br/&gt;types.rs:645"]
+    P --&gt; Q["Session 订阅 → ApplicationEvent → TUI"]
+</code></pre>
+<h2 id="图-5--工具子系统"><a class="header" href="#图-5--工具子系统">图 5 — 工具子系统</a></h2>
+<pre><code class="language-mermaid">flowchart LR
+    S["Session.get_active_tools&lt;br/&gt;session.rs:1942"] --&gt; CAT["create_all_tools&lt;br/&gt;tools.rs:537"]
+    CAT --&gt; T1["read / grep / find / glob / ls"]
+    CAT --&gt; T2["bash（brush 引擎 + ProcessManager）&lt;br/&gt;tools/bash · process/"]
+    CAT --&gt; T3["edit / write / ast_edit&lt;br/&gt;tools/ast_grep · editdiff · editmatch"]
+    CAT --&gt; T4["lsp / browser / web_search"]
+    CAT --&gt; T5["eval / notebook / debug"]
+    CAT --&gt; T6["image / image_gen / imageresize"]
+    CAT --&gt; T7["memory / recall / retain / reflect&lt;br/&gt;memory.rs"]
+    CAT --&gt; T8["mcp_tool → McpRegistry&lt;br/&gt;mcp.rs:656"]
+    CAT --&gt; T9["ask / todo / goal"]
+    subgraph INFRA["执行基础设施"]
+        I1["tool_presentation.rs&lt;br/&gt;结果渲染与卡片"]
+        I2["truncate.rs · redact.rs&lt;br/&gt;截断与脱敏"]
+        I3["tools/mutation_queue.rs&lt;br/&gt;写操作队列"]
+        I4["tools/framing.rs&lt;br/&gt;流式帧"]
+    end
+    T2 --&gt; INFRA
+    T3 --&gt; INFRA
+    CAT --&gt; INFRA
+</code></pre>
+<h2 id="图-6--子代理编排orchestration"><a class="header" href="#图-6--子代理编排orchestration">图 6 — 子代理编排（Orchestration）</a></h2>
+<pre><code class="language-mermaid">flowchart TB
+    APP2["Application / Session"] --&gt; OR["OrchestrationRuntime&lt;br/&gt;orchestration/runtime.rs:730"]
+    OR --&gt; CS["ChildSession&lt;br/&gt;runtime.rs:57&lt;br/&gt;（独立 Session 快照）"]
+    OR --&gt; CHILDREQ["ChildSessionRequest&lt;br/&gt;runtime.rs:532&lt;br/&gt;（任务 + 预算 + 工具）"]
+    OR --&gt; MAIL["MailboxMessage&lt;br/&gt;runtime.rs:618&lt;br/&gt;子代理消息信箱"]
+    OR --&gt; DUR2["PreparedDurableBinding&lt;br/&gt;runtime.rs:920&lt;br/&gt;持久化绑定（fail-closed）"]
+    OR --&gt; TOOLS2["orchestration/tools.rs&lt;br/&gt;子代理控制工具"]
+    CS --&gt; SNAP["AgentSnapshot · AgentStatus&lt;br/&gt;runtime.rs:573"]
+    CS --&gt; RESULT["TaskResult&lt;br/&gt;runtime.rs:709"]
+    TOOLS2 --&gt; OR
+    DUR2 --&gt; STORE2["session_store 持久子会话&lt;br/&gt;start_durable_child_session_in&lt;br/&gt;session_store.rs:1560"]
+</code></pre>
+<h2 id="图-7--工作流yaml-dag--worktree"><a class="header" href="#图-7--工作流yaml-dag--worktree">图 7 — 工作流（YAML DAG + worktree）</a></h2>
+<pre><code class="language-mermaid">flowchart TB
+    WM["WorkflowManager&lt;br/&gt;workflow/manager.rs:196"] --&gt; PARSE["解析 YAML DAG&lt;br/&gt;workflow/detail.rs · store.rs"]
+    PARSE --&gt; TASKS["WorkflowTask DAG&lt;br/&gt;WorkflowStatus:54"]
+    TASKS --&gt; SUP["WorkflowSupervisor&lt;br/&gt;workflow/supervisor.rs:283"]
+    SUP --&gt; AGENTS3["按任务分配子代理&lt;br/&gt;（orchestration ChildSession）"]
+    SUP --&gt; TOB["WorkflowSupervisorTodoObservation&lt;br/&gt;supervisor.rs:73&lt;br/&gt;观察 todo 完成度"]
+    SUP --&gt; EV3["WorkflowEvent 广播"]
+    subgraph WT["worktree 隔离"]
+        WTM["WorkflowWorktreeManager&lt;br/&gt;workflow_worktree/mod.rs:280"]
+        OVER["overlay.rs 工作树叠加"]
+        GIT["git.rs 集成（IntegrateStrategy:209）"]
+    end
+    WM --&gt; WTM
+    WTM --&gt; OVER
+    OVER --&gt; GIT
+    GIT --&gt;|IntegrateOutcome| WM
+</code></pre>
+<h2 id="图-8--扩展--钩子--信任--沙箱--mcp"><a class="header" href="#图-8--扩展--钩子--信任--沙箱--mcp">图 8 — 扩展 / 钩子 / 信任 / 沙箱 / MCP</a></h2>
+<pre><code class="language-mermaid">flowchart TB
+    APPH["ApplicationExtensionHost&lt;br/&gt;application.rs:3067"] --&gt; EXTS["ExtensionSpec&lt;br/&gt;extensions.rs:564"]
+    EXTS --&gt; RUNTIME{"runtime 类型"}
+    RUNTIME --&gt;|process| PE["ProcessExtensionManifest&lt;br/&gt;extensions.rs:227&lt;br/&gt;子进程扩展"]
+    RUNTIME --&gt;|quickjs| QE["QuickJsExtensionHost&lt;br/&gt;quickjs_host.rs:630"]
+    PE --&gt; CAP["ExtensionCapabilityManifest&lt;br/&gt;extensions.rs:122"]
+    QE --&gt; CAP
+    CAP --&gt; PERM["ExtensionPermissionSet&lt;br/&gt;extensions.rs:154"]
+    PERM --&gt; TRUSTDEC{"pre_trust_decision&lt;br/&gt;（宿主钩子先行）"}
+    TRUSTDEC --&gt;|允许| LOAD["加载并执行扩展&lt;br/&gt;工具 · 事件钩子 · 渲染器"]
+    TRUSTDEC --&gt;|拒绝/询问| ASK["Ask 升级为 Trusted&lt;br/&gt;（trust 只能升不能降）"]
+    TRUSTDEC --&gt; SANDBOX2["sandbox.rs resolve:499&lt;br/&gt;沙箱配置（cap-std）"]
+    PERM --&gt; HOOKS2["HostHooks 事件&lt;br/&gt;hooks.rs:71&lt;br/&gt;before_tool_call 等"]
+    PERM --&gt; MCP2["McpRegistry 服务器&lt;br/&gt;mcp.rs:554&lt;br/&gt;stdio 子进程（可禁用）"]
+    LOAD --&gt; TOOLP["扩展工具注入 Session 工具目录"]
+</code></pre>
+<h2 id="图-9--会话持久化与生命周期"><a class="header" href="#图-9--会话持久化与生命周期">图 9 — 会话持久化与生命周期</a></h2>
+<pre><code class="language-mermaid">flowchart TB
+    START["start_session&lt;br/&gt;session_store.rs:1177"] --&gt; REC["SessionRecorder&lt;br/&gt;session_store.rs:607&lt;br/&gt;（消息 + 工具调用 + 事件）"]
+    REC --&gt; FILES["会话文件&lt;br/&gt;&lt;repo-digest&gt;/&lt;session-id&gt;/"]
+    FILES --&gt; RESUME["resume_session&lt;br/&gt;session_store.rs:1551"]
+    FILES --&gt; BRANCH["create_branched_session&lt;br/&gt;session_store.rs:1237"]
+    FILES --&gt; FORK["fork_session_in&lt;br/&gt;session_store.rs:1473"]
+    REC --&gt; COMP["compaction.rs&lt;br/&gt;（阈值/手动/溢出压缩）"]
+    COMP --&gt; REWIND["RewindTarget · RewindOutcome&lt;br/&gt;session.rs:589"]
+    COMP --&gt; SNAP["compact_snap 快照压缩&lt;br/&gt;（先落盘+fsync 再引用）"]
+    FILES --&gt; SCAT["session_catalog/&lt;br/&gt;会话树 · lineage"]
+    REC --&gt; EVENTS["SessionEvent 广播&lt;br/&gt;session.rs:503 → ApplicationEvent:209"]
+</code></pre>
+<h2 id="图-10--上下文装配管线选择器--资源--系统提示词"><a class="header" href="#图-10--上下文装配管线选择器--资源--系统提示词">图 10 — 上下文装配管线（选择器 + 资源 + 系统提示词）</a></h2>
+<pre><code class="language-mermaid">flowchart LR
+    REQ["用户请求"] --&gt; SEL["selector.rs&lt;br/&gt;SelectionPlan:321&lt;br/&gt;（autoMode / 分类 / 技能选择）"]
+    SEL --&gt; AUTO["PromptMode · AutoMode&lt;br/&gt;selector.rs:82"]
+    SEL --&gt; SKILL["加载 skill:// 技能正文&lt;br/&gt;session.rs inject_selection_messages"]
+    REQ --&gt; RES["resources.rs / resource_manager.rs&lt;br/&gt;ResourceSnapshot:259&lt;br/&gt;可信项目资源发现"]
+    RES --&gt; RELOAD["reload_resources&lt;br/&gt;session.rs:1744"]
+    REQ --&gt; MEM["memory.rs&lt;br/&gt;（hindsight 记忆注入）"]
+    MEM --&gt; INJ["inject_hindsight_memory"]
+    REQ --&gt; SYS["system_prompt.rs&lt;br/&gt;当前系统提示词 session.rs:1991"]
+    SYS --&gt; TEMPLATES["prompt_templates.rs"]
+    AUTO --&gt; SESS3["Session 回合开始"]
+    SKILL --&gt; SESS3
+    INJ --&gt; SESS3
+    SYS --&gt; SESS3
+</code></pre>
+<h2 id="关键事实索引可执行验证"><a class="header" href="#关键事实索引可执行验证">关键事实索引（可执行验证）</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>符号</th><th>位置</th></tr></thead><tbody>
+<tr><td><code>Session::new</code></td><td><code>crates/pi-coding/src/session.rs:723</code></td></tr>
+<tr><td><code>Session::run</code></td><td><code>crates/pi-coding/src/session.rs:3685</code></td></tr>
+<tr><td><code>execute_with_retries</code></td><td><code>crates/pi-coding/src/session.rs:3853</code></td></tr>
+<tr><td><code>Application::new</code> / <code>Application::prompt</code></td><td><code>crates/pi-coding/src/application.rs:486</code> / <code>:1402</code></td></tr>
+<tr><td><code>Agent</code>（pi-agent）</td><td><code>crates/pi-agent/src/agent.rs:229</code></td></tr>
+<tr><td><code>run_agent_loop</code> / <code>run_loop</code></td><td><code>crates/pi-agent/src/loop_runtime.rs:45</code> / <code>:103</code></td></tr>
+<tr><td><code>create_all_tools</code></td><td><code>crates/pi-coding/src/tools.rs:537</code></td></tr>
+<tr><td><code>OrchestrationRuntime</code> / <code>ChildSession</code></td><td><code>crates/pi-coding/src/orchestration/runtime.rs:730</code> / <code>:57</code></td></tr>
+<tr><td><code>WorkflowManager</code> / <code>WorkflowSupervisor</code></td><td><code>crates/pi-coding/src/workflow/manager.rs:196</code> / <code>supervisor.rs:283</code></td></tr>
+<tr><td><code>WorkflowWorktreeManager</code></td><td><code>crates/pi-coding/src/workflow_worktree/mod.rs:280</code></td></tr>
+<tr><td><code>ExtensionSpec</code> / <code>QuickJsExtensionHost</code></td><td><code>crates/pi-coding/src/extensions.rs:564</code> / <code>quickjs_host.rs:630</code></td></tr>
+<tr><td><code>McpRegistry</code> / <code>mcp_tool</code></td><td><code>crates/pi-coding/src/mcp.rs:554</code> / <code>:656</code></td></tr>
+<tr><td><code>SessionRecorder</code> / <code>start_session</code></td><td><code>crates/pi-coding/src/session_store.rs:607</code> / <code>:1177</code></td></tr>
+<tr><td><code>AuthManager</code> / <code>TrustStore</code> / <code>SandboxConfig</code></td><td><code>auth.rs:921</code> / <code>trust.rs:172</code> / <code>sandbox.rs:48</code></td></tr>
+<tr><td><code>SelectionPlan</code> / <code>ResourceManager</code> / <code>MemoryConfig</code></td><td><code>selector.rs:321</code> / <code>resource_manager.rs:317</code> / <code>memory.rs:588</code></td></tr>
+<tr><td><code>ProcessManager</code></td><td><code>crates/pi-coding/src/process/manager.rs:23</code></td></tr>
+<tr><td><code>RuntimeSettingsSnapshot</code></td><td><code>crates/pi-coding/src/settings.rs:517</code></td></tr>
+</tbody></table>
+</div>
+<h2 id="覆盖说明"><a class="header" href="#覆盖说明">覆盖说明</a></h2>
+<ul>
+<li>全量阅读：<code>lib.rs</code> 模块导出、<code>session.rs</code>（回合/重试/压缩主路径）、<code>application.rs</code>（状态机与事件）、<code>tools.rs</code> 目录、<code>pi-agent</code> 循环、<code>session_store.rs</code> 持久化、<code>orchestration/runtime.rs</code>、<code>workflow/*</code>、<code>extensions.rs</code>、<code>auth/trust/sandbox</code> 核心类型。</li>
+<li>摘要阅读（仅结构）：<code>settings.rs</code>、<code>mcp.rs</code>、<code>selector.rs</code>、<code>resource_manager.rs</code>、<code>compaction.rs</code>、<code>plugin.rs</code>、<code>packages.rs</code>、<code>markdown/*</code>。</li>
+<li>未逐行展开：各 <code>tools/*</code> 内部实现、<code>tests.rs</code>、<code>session_catalog/tests.rs</code>。</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/settings-trust.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/configuration-profiles.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/settings-trust.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/configuration-profiles.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

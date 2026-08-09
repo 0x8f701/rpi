@@ -1,0 +1,514 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>E2E scenarios (user-perspective tmux tests) - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="e2e-scenarios-user-perspective-tmux-tests"><a class="header" href="#e2e-scenarios-user-perspective-tmux-tests">E2E scenarios (user-perspective tmux tests)</a></h1>
+<p>This page is the <strong>scenario catalog</strong> for user-perspective, goal-driven E2E
+testing of the rpi TUI. Every entry is written the way a user would experience
+the product: a <strong>user goal</strong>, the <strong>concrete tmux interaction</strong> that pursues
+it, the <strong>observable outcome</strong> on the real TUI, and the <strong>pass criteria</strong> that
+prove the goal was achieved. The catalog covers every core feature; the
+highest-value scenarios are implemented as runnable, deterministic tmux
+scripts under <code>E2E.d/</code> (see <a href="#implementation-status">Implementation status</a>).</p>
+<h2 id="how-scenarios-are-executed"><a class="header" href="#how-scenarios-are-executed">How scenarios are executed</a></h2>
+<ul>
+<li>The binary under test is <code>target/release-dist/rpi</code> (<code>RPI_BIN</code>).</li>
+<li>Scenarios that need no model tool calls use the built-in faux provider
+(<code>--model faux/faux-1</code> + <code>PI_FAUX_RESPONSE</code>): fully offline and
+deterministic.</li>
+<li>Scenarios that must exercise tool calls (bash cards, todo DAG creation,
+workflow planning/workers) use a <strong>loopback mock provider</strong> (an
+OpenAI-compatible SSE server on <code>localhost</code>), never a real model — still
+offline and deterministic.</li>
+<li>Every script: starts tmux → launches rpi with the scenario's flags/model →
+drives keystrokes → asserts on pane text (status line, panel rows, output)
+and/or file side effects → captures evidence under
+<code>EVIDENCE_ROOT</code> → kills the session.</li>
+<li>Scripts are self-contained, skip-guarded (<code>tmux</code> present, <code>RPI_BIN</code>
+executable, faux model available), and use bounded
+wait-for-pattern polling instead of sleeps wherever possible.</li>
+<li>Run a single scenario or the whole lane:</li>
+</ul>
+<pre><code class="language-sh"># whole lane
+bash E2E.d/ci/user_scenarios.sh run
+# one scenario
+bash E2E.d/ci/user_scenarios.sh goal
+# list
+bash E2E.d/ci/user_scenarios.sh list
+</code></pre>
+<p>Evidence lands in <code>${TMPDIR:-/tmp}/rpi-e2e-evidence/&lt;run-id&gt;/user-&lt;scenario&gt;/</code>.</p>
+<h2 id="scenario-catalog"><a class="header" href="#scenario-catalog">Scenario catalog</a></h2>
+<p>Legend — <strong>script</strong>: implemented in this repo and runnable now; <strong>lane</strong>:
+covered by an existing E2E lane (<code>E2E.d/ci/*.sh</code> or Rust <code>tests/</code>); <strong>manual</strong>:
+needs hardware/credentials/network, runs by hand only.</p>
+<h3 id="1-goal-lifecycle-create--pin--pause--complete--budget--journal"><a class="header" href="#1-goal-lifecycle-create--pin--pause--complete--budget--journal">1. Goal lifecycle (create / pin / pause / complete + budget + journal)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Keep a long-running session focused on one objective with a token budget, and journal important constraints.</td></tr>
+<tr><td>Interaction</td><td><code>/goal create --tokens 100 ship the widget</code> → <code>/goal</code> → <code>/goal pin keep the release checklist in scope</code> → <code>/goal pins</code> → <code>/goal pause</code> → <code>/goal resume</code> → <code>/goal complete</code> → <code>/goal</code>.</td></tr>
+<tr><td>Observable outcome</td><td>Status line reports <code>Goal work started · active · 0/100 tokens · ship the widget</code>; a <code>Goal</code> details block lands in the transcript (<code>Objective: …</code>, <code>Status: active</code>, <code>Tokens: 0 / 100</code>, <code>Time spent: …</code>); the composer header shows the <code>🎯 Goal 0/100</code> chip; pause flips the chip to <code>⏸</code> and the summary to <code>paused · …</code>; pins list as <code>1. …</code>; complete flips to <code>completed · …</code>; <code>show</code> after <code>drop</code> reports <code>no goal</code>.</td></tr>
+<tr><td>Pass criteria</td><td>Every lifecycle summary contains the exact lifecycle word (<code>active</code>/<code>paused</code>/<code>completed</code>) and budget fraction; the <code>🎯</code>/<code>⏸</code>/<code>✓</code> chip appears and changes; pin text survives <code>pins</code>; the goal persists to the agent-dir goal state file.</td></tr>
+<tr><td>Status</td><td><strong>script</strong> <code>E2E.d/user/goal_lifecycle.sh</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="2-loop-create--cancel--delete--continue"><a class="header" href="#2-loop-create--cancel--delete--continue">2. Loop (create / cancel / delete / continue)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Run a recurring prompt on an interval and own its lifecycle.</td></tr>
+<tr><td>Interaction</td><td><code>/loop 1h slash keep-alive</code> → <code>/loops</code> → <code>/loop-update &lt;id&gt; 2h …</code> → <code>/loop-delete &lt;id&gt;</code> / <code>/loop-cancel &lt;id&gt;</code>; bare <code>/loop</code> shows usage.</td></tr>
+<tr><td>Observable outcome</td><td><code>/loop</code> reports <code>scheduled &lt;task-id&gt;</code> and the loop fires immediately (faux reply appears); <code>/loops</code> lists the loop with its id and prompt; missing-argument forms print <code>usage</code>.</td></tr>
+<tr><td>Pass criteria</td><td>A parseable loop id is printed and echoed by <code>/loops</code>; delete/cancel succeed without error text.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>ic.tui-loop</code> (<code>E2E.d/ci/interactive_commands.sh</code>) + Rust <code>goal_loop_e2e.rs</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="3-workflow-plan--todo--execute--integrate-isolation-restart"><a class="header" href="#3-workflow-plan--todo--execute--integrate-isolation-restart">3. Workflow (plan → todo → execute → integrate; isolation; restart)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Delegate a complex objective to an isolated, supervised workflow that plans, executes, and integrates its own changes back.</td></tr>
+<tr><td>Interaction</td><td><code>/workflow create ship-flow ship the widget</code> → watch the planning feed → <code>/todo</code> (workflow-owned DAG rows) → <code>/workflow integrate ship-flow</code> → <code>/workflow show ship-flow</code>; concurrently create a second workflow and verify isolation; restart rpi and verify the workflow resumes.</td></tr>
+<tr><td>Observable outcome</td><td>Creation prints the workflow detail block (<code>Status: queued</code> → live events move it through <code>planning</code> → <code>running</code>); the compact header counts <code>Workflows · N active · M total</code>; the supervisor's planning turns create real todo phases/tasks visible on the Todo DAG page; integration applies the workflow branch (<code>Integration: applied · &lt;commit&gt;</code>), status becomes <code>completed</code>; each workflow lives in its own git worktree; a restarted session restores non-terminal workflows.</td></tr>
+<tr><td>Pass criteria</td><td>Two concurrent workflows never share a worktree or collide on task ids; integration produces a real merge commit on the source branch; pause/resume/cancel/remove transitions are reflected in <code>show</code>.</td></tr>
+<tr><td>Status</td><td><strong>script</strong> <code>E2E.d/user/workflow_full_run.sh</code> (create → plan → todo → execute → integrate → completed); <strong>lane</strong> <code>workflow.goal-tmux</code>, <code>workflow.tmux</code>, <code>workflow.rpc</code>, <code>D11RestartRecovery</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="4-orchestration-subagents-spawndelegate-irc-soft-budgets-yield"><a class="header" href="#4-orchestration-subagents-spawndelegate-irc-soft-budgets-yield">4. Orchestration (subagents spawn/delegate, IRC, soft budgets, yield)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Have the main session delegate work to named subagents, receive their progress over IRC, and park them on a soft budget.</td></tr>
+<tr><td>Interaction</td><td>Natural-language delegation ("Have researcher study this") → observe the agent card and <code>👥</code> footer count → supervisor <code>yield</code> releases the turn; subagent completion lands in the transcript; IRC directives route to the owning workflow.</td></tr>
+<tr><td>Observable outcome</td><td>The subagent card renders agent name/status; the footer shows <code>👥 N</code> while agents run; <code>⟦N bg⟧</code> appears on the status line; yield tool parks the agent and returns control; a soft-budget-exhausted job surfaces in its card.</td></tr>
+<tr><td>Pass criteria</td><td>Delegation selects the trusted agent by name; cards appear and resolve; <code>yield</code> observably ends the subagent turn without error.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>orchestration.rpc</code> / <code>orchestration.rust</code> / <code>orchestration.tmux</code> (<code>E2E.d/ci/orchestration.sh</code>), <code>D47YieldTool</code>, <code>T50SoftBudgets</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="5-todo-dag-list--detail--execute"><a class="header" href="#5-todo-dag-list--detail--execute">5. Todo DAG (list / detail / execute)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Maintain a phased task list and inspect the dependency DAG before letting the model execute it.</td></tr>
+<tr><td>Interaction</td><td>Seed markdown: <code>/todo # Survey\n- [ ] map parser surface\n# Construct\n- [/] repair composer repaint</code> → <code>/todo</code> opens the DAG page → Enter opens detail → Esc back → Esc closes.</td></tr>
+<tr><td>Observable outcome</td><td>Overview shows <code>Todo DAGs</code> with a <code>[main]</code> row projecting <code>open N active M blocked K</code>; detail renders phases, tasks, <code>◌</code>/<code>●</code> markers, <code>in progress</code> labels and counts; Esc steps detail → overview → closed; composer focus restored.</td></tr>
+<tr><td>Pass criteria</td><td>Exact overview/detail chrome strings appear; the seeded task names and phase names render; panel closes without leaving overlay state.</td></tr>
+<tr><td>Status</td><td><strong>script</strong> <code>E2E.d/user/todo_dag.sh</code>; <strong>lane</strong> Rust <code>core_tui_e2e.rs::pty_todo_overview_detail_navigation</code>, <code>orchestration.rpc</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="6-btw-side-chat"><a class="header" href="#6-btw-side-chat">6. <code>/btw</code> side chat</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Run a parallel side conversation without disturbing the main session.</td></tr>
+<tr><td>Interaction</td><td><code>/btw</code> opens the overlay → type a prompt, Esc closes (session kept) → reopen and confirm persistence → <code>/btw new alpha</code> → <code>/btw list</code> → <code>/btw alpha</code> → <code>/btw close alpha</code>.</td></tr>
+<tr><td>Observable outcome</td><td>Status reports <code>Side chat open · tab … · Esc closes overlay (session kept)</code>; tab create reports <code>Side chat · tab alpha created · N of M tabs open</code>; <code>/btw list</code> shows tabs with the active marked <code>▸</code>; the side conversation persists across close/reopen.</td></tr>
+<tr><td>Pass criteria</td><td>Overlay opens/closes with status transitions; tab list contains created names; the main composer still accepts input after close.</td></tr>
+<tr><td>Status</td><td><strong>script</strong> <code>E2E.d/user/btw_side_chat.sh</code>; <strong>lane</strong> Rust <code>core_tui_e2e.rs::pty_btw_side_chat_open_paste_esc_reopen_persist</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="7-live-voice-hold-to-talk"><a class="header" href="#7-live-voice-hold-to-talk">7. <code>/live</code> voice (hold-to-talk)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Dictate a prompt by holding a key.</td></tr>
+<tr><td>Interaction</td><td><code>/live</code> arms hold-to-talk; Ctrl+Space records; transcript lands in the composer for review before Enter.</td></tr>
+<tr><td>Observable outcome</td><td>Status line shows <code>⟦live⟧</code> while armed; recorded text appears in the composer, not the transcript.</td></tr>
+<tr><td>Pass criteria</td><td>Manual: requires a working microphone; the TUI never blocks without one.</td></tr>
+<tr><td>Status</td><td><strong>manual</strong> (no mic on CI); <strong>lane</strong> <code>L1LiveVoice</code>, <code>docs/src/user-guide/live.md</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="8-mcp-stdio-server-connect--tool-call"><a class="header" href="#8-mcp-stdio-server-connect--tool-call">8. MCP (stdio server connect + tool call)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Attach an external MCP stdio server and use its tools.</td></tr>
+<tr><td>Interaction</td><td>Register an MCP server (config/<code>--mcp</code>), prompt the model to call its tool, verify the tool result card.</td></tr>
+<tr><td>Observable outcome</td><td>Server connects (<code>/mcp</code> status), tool call appears as a card with the server-provided result.</td></tr>
+<tr><td>Pass criteria</td><td>Tool result text from the MCP server lands in the transcript; disconnect cleans up.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>M1McpGateway</code>, <code>D44McpAcpTests</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="9-acp-agent-stdio-session"><a class="header" href="#9-acp-agent-stdio-session">9. ACP (agent stdio session)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Drive rpi from an external agent over the ACP stdio protocol.</td></tr>
+<tr><td>Interaction</td><td>Launch rpi under ACP (<code>--mode acp</code>), exchange <code>initialize</code>/<code>session/…</code> messages, approve a tool call via <code>session/request_permission</code>.</td></tr>
+<tr><td>Observable outcome</td><td>Protocol handshake succeeds; tool approval round-trips; completion returns the model text.</td></tr>
+<tr><td>Pass criteria</td><td>Deterministic envelope + tool approval exchange without host credentials.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>A1AcpProtocol</code>, <code>D44McpAcpTests</code>, Rust <code>acp_stdio_e2e.rs</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="10-extensions-overlay-open-plugin-install-from-dirgit-trust"><a class="header" href="#10-extensions-overlay-open-plugin-install-from-dirgit-trust">10. Extensions (overlay open, plugin install from dir/git, trust)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Load a third-party extension, open its overlay, and install a plugin from a directory or git source.</td></tr>
+<tr><td>Interaction</td><td>Launch with <code>--extension &lt;dir&gt;</code>; <code>/run alpha hello</code> and `/chain alpha one</td></tr>
+<tr><td>Observable outcome</td><td><code>/run</code> prints <code>alpha:hello</code>; <code>/chain</code> pipes outputs; the overlay opens over the TUI; installing an extension from a git URL lands in the extension dir.</td></tr>
+<tr><td>Pass criteria</td><td>Command/chain outputs appear in the pane; untrusted installs fail closed without <code>--approve</code>.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>campaign.extension</code>, <code>ic</code> overlay/plugin lanes, <code>D45OverlayP0</code>, <code>D50GitPluginSource</code>, <code>G10ExtensionDesign</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="11-rewind--snapcompact--compact"><a class="header" href="#11-rewind--snapcompact--compact">11. <code>/rewind</code> + <code>/snapcompact</code> + <code>/compact</code></a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Roll a session back to a checkpoint and shrink its context without losing the archive.</td></tr>
+<tr><td>Interaction</td><td>Run a few prompts → <code>/checkpoint mid</code> → <code>/rewind</code> (picker lists indices and <code>[checkpoint mid -&gt; …]</code>) → <code>/rewind &lt;entry&gt;</code> → <code>/snapcompact</code> → <code>/compact</code>.</td></tr>
+<tr><td>Observable outcome</td><td>The picker shows entry indices, types and checkpoint annotations; a rewind reports <code>rewound to entry N (kept …, dropped … record(s)); archived tail to &lt;path&gt;</code> and writes a <code>.rewind-*.jsonl</code> sidecar; <code>/snapcompact</code> reports <code>Compacted X → Y estimated tokens</code> on the status line (A→B) and writes a <code>.snapcompact-*.jsonl</code> archive; <code>/compact</code> (LLM summarizer) reports <code>Compaction complete</code>.</td></tr>
+<tr><td>Pass criteria</td><td>Transcript before the rewind target disappears from the live view; the archived tail file exists and contains the dropped records; the A→B token status shows a strict decrease.</td></tr>
+<tr><td>Status</td><td><strong>script</strong> <code>E2E.d/user/rewind_compact.sh</code> (checkpoint, picker, rewind + sidecar, <code>/snapcompact</code> A→B status + sidecar); <code>/compact</code> LLM summarizer completion covered by unit + Rust REPL lanes (<code>rewind_checkpoint_snapcompact_e2e.rs</code>); <code>T102RewindCheckpoint</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="12-handoff"><a class="header" href="#12-handoff">12. <code>/handoff</code></a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Produce a handoff summary another agent can act on.</td></tr>
+<tr><td>Interaction</td><td><code>/handoff</code> → <code>/handoff --prose</code>.</td></tr>
+<tr><td>Observable outcome</td><td>A <code>Handoff</code> transcript block renders the deterministic envelope (<code># Handoff</code>); the clipboard copy runs in the background; <code>--prose</code> in the TUI stays envelope-only with a hint that prose is a REPL/CLI surface.</td></tr>
+<tr><td>Pass criteria</td><td>Envelope text appears in the pane; the summarizer is never invoked on the TUI event loop.</td></tr>
+<tr><td>Status</td><td><strong>script</strong> <code>E2E.d/user/steering_queue_handoff.sh</code>; <strong>lane</strong> Rust <code>handoff_prose.rs</code>, <code>T99HandoffProse</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="13-fresh-dump-share---encrypt"><a class="header" href="#13-fresh-dump-share---encrypt">13. <code>/fresh</code>, <code>/dump</code>, <code>/share --encrypt</code></a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Start over cleanly, export the session, and share it privately.</td></tr>
+<tr><td>Interaction</td><td><code>/fresh</code> (alias <code>/new</code>) starts a new session; <code>/dump [--jsonl] [path]</code> writes an HTML/JSONL export; <code>/share --encrypt [passphrase]</code> writes an AES-256-GCM <code>.jsonl.enc</code> (never touches the network without a gist seam).</td></tr>
+<tr><td>Observable outcome</td><td><code>/fresh</code> prints <code>Started a new session</code> and <code>/name</code> reads <code>(unnamed)</code>; the dump file exists on disk with the session content; the encrypted share file exists and its header identifies the cipher.</td></tr>
+<tr><td>Pass criteria</td><td>File side effects verified on disk; <code>/share</code> honors a fake <code>gh</code> seam and never requires host credentials.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>ic.tui-name-new</code> (<code>/new</code>), <code>ic.tui-export</code> (<code>/export</code>), <code>ic.tui-share</code> (<code>/share</code> + fake gh), <code>T82FreshDumpShare</code>, <code>T38ExportFlagHardening</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="14-hooks--trust"><a class="header" href="#14-hooks--trust">14. Hooks / trust</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Run a trust hook that upgrades an untrusted project decision.</td></tr>
+<tr><td>Interaction</td><td>Install a hooks config with a <code>trust_decision</code> handler; launch in an untrusted project; verify the hook's <code>approve</code> recommendation is applied and its veto is never (a hook cannot weaken a stored denial).</td></tr>
+<tr><td>Observable outcome</td><td>The hook's approval lets the project resource load; a <code>deny</code>-only payload stays inert.</td></tr>
+<tr><td>Pass criteria</td><td>Hook event fires and the decision changes exactly as the fail-open contract allows.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>T27HooksSystem</code>, <code>T91TrustHook</code>, <code>T98TrustWiring</code>, <code>docs/src/reference/settings-trust.md</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="15-sandbox-bash-denied-path"><a class="header" href="#15-sandbox-bash-denied-path">15. Sandbox (bash denied path)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Ensure a denied filesystem path stays out of reach of the model's bash.</td></tr>
+<tr><td>Interaction</td><td>Configure sandbox denials; prompt a bash call against the denied path; observe the tool error.</td></tr>
+<tr><td>Observable outcome</td><td>The bash tool card renders the denial error; no file is created/read on the denied path.</td></tr>
+<tr><td>Pass criteria</td><td>The tool result contains the denial reason; the denied path is untouched on disk.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>O1OsIsolation</code>, <code>D10SandboxOverlay</code>, <code>D15SandboxToolsE2e</code>, Rust <code>sandbox</code> tests, <code>docs/src/reference/sandbox-isolation.md</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="16-image-generation-faux"><a class="header" href="#16-image-generation-faux">16. Image generation (faux)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Generate an image from a prompt.</td></tr>
+<tr><td>Interaction</td><td><code>/image &lt;prompt&gt;</code> with a faux-capable provider.</td></tr>
+<tr><td>Observable outcome</td><td>The image placeholder card renders <code>[Image #N, WxH]</code> (or the real image under kitty graphics).</td></tr>
+<tr><td>Pass criteria</td><td>API surface exercised against a faux generator (no real model); real-image rendering marked manual.</td></tr>
+<tr><td>Status</td><td><strong>manual</strong> (real generation); <strong>lane</strong> <code>G1ImageGen</code>, <code>T109ImageInspect</code>, Rust <code>write_orchestration_png_fixture</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="17-eval--notebook-python-cell"><a class="header" href="#17-eval--notebook-python-cell">17. Eval / notebook (python cell)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Run an inline python cell in the session.</td></tr>
+<tr><td>Interaction</td><td><code>/run python3 -c …</code> or the notebook overlay; verify cell output in the tool card.</td></tr>
+<tr><td>Observable outcome</td><td>Cell stdout appears in the card; errors surface as tool errors, not TUI hangs.</td></tr>
+<tr><td>Pass criteria</td><td>Output text lands in the pane; the composer stays responsive.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>E1EvalNotebook</code>, <code>T48OfficeNotebook</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="18-memory-tool"><a class="header" href="#18-memory-tool">18. Memory tool</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Persist a fact across sessions with the memory tool.</td></tr>
+<tr><td>Interaction</td><td>Prompt the model to store a fact (mock tool call) → verify the memory file → new session reads it back.</td></tr>
+<tr><td>Observable outcome</td><td>Memory file updated; a follow-up turn's context includes the stored fact.</td></tr>
+<tr><td>Pass criteria</td><td>File side effect + cross-session retrieval.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>T74MemorySystem</code>, <code>T87SkillGoalPins</code>, <code>docs/src/reference/skills.md</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="19-ask-tool"><a class="header" href="#19-ask-tool">19. Ask tool</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Answer a mid-task question the model asks.</td></tr>
+<tr><td>Interaction</td><td>Mock provider calls <code>ask</code>; the status line shows <code>⟦ask⟧ &lt;question&gt; ⟦esc⟧</code>; the next submitted line is routed back as the answer.</td></tr>
+<tr><td>Observable outcome</td><td>The pending question is visible above the composer and the answer arrives in the next model request.</td></tr>
+<tr><td>Pass criteria</td><td>Status-line ask glyph appears; the answer text reaches the provider request.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>T51AskTool</code>, Rust steering/ask unit tests</td></tr>
+</tbody></table>
+</div>
+<h3 id="20-auto-mode"><a class="header" href="#20-auto-mode">20. Auto-mode</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Let the model classify the task and route it automatically.</td></tr>
+<tr><td>Interaction</td><td>Submit a prompt in auto mode; observe the classification hint (<code>Detected: code task — /todo …</code>) and the routed workflow/todo behavior.</td></tr>
+<tr><td>Observable outcome</td><td>The classifier hint renders on the status line; execution follows the routed path.</td></tr>
+<tr><td>Pass criteria</td><td>Hint text appears; routing matches the fixture's classification.</td></tr>
+<tr><td>Status</td><td><strong>lane</strong> <code>T76AutoMode</code>, <code>T53AutoIntegrate</code>, <code>U7WorkflowFixes</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="21-queue--doom-loop"><a class="header" href="#21-queue--doom-loop">21. <code>/queue</code> + doom-loop</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Keep steering the agent while it works, then clear the backlog.</td></tr>
+<tr><td>Interaction</td><td>Submit a prompt (mock streams slowly) → type a second prompt while the turn is in flight (follow-up queued) → observe <code>⚙ N</code> header count and <code>Next: /queue · /goal</code> suggestion → <code>/queue</code> lists <code>Pending prompts: … steering, … follow-up — /queue cancel clears them</code> → turn completes and the follow-up drains automatically → <code>/queue</code> → <code>Queue is empty</code>; repeat with <code>/queue cancel</code>.</td></tr>
+<tr><td>Observable outcome</td><td>The pending count appears in the composer header (<code>⚙ 1</code>), the suggestion line advertises <code>/queue</code>, the queue view lists previews, and consumption clears the indicators without a restart.</td></tr>
+<tr><td>Pass criteria</td><td>Counts appear while queued, drain after processing, and <code>cancel</code> empties the queue with <code>Cancelled N queued prompts</code>.</td></tr>
+<tr><td>Status</td><td><strong>script</strong> <code>E2E.d/user/steering_queue_handoff.sh</code>; <strong>lane</strong> Rust <code>steering_rpc_binary_e2e.rs</code> + TUI queue unit tests</td></tr>
+</tbody></table>
+</div>
+<h3 id="22-tui-chrome-theme-status-line-bash-cards-code-frames-list-colors-steering-queue"><a class="header" href="#22-tui-chrome-theme-status-line-bash-cards-code-frames-list-colors-steering-queue">22. TUI chrome (theme, status line, bash cards, code frames, list colors, steering queue)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th></th><th></th></tr></thead><tbody>
+<tr><td>User goal</td><td>Recognize and control the interface itself: visual theme, live status line, tool cards, and code frames.</td></tr>
+<tr><td>Interaction</td><td><code>/theme</code> / <code>/theme next</code>; drive a bash tool call (multi-line command with leading <code>#</code> comments) → card renders <code>╭── # comment ──╮</code> frame, <code>$</code> command rows, <code>Output</code> separator; prompt a code fence that never closes → bottom border carries <code>… (unclosed fence)</code>; queue a steering message → <code>⟦steering⟧ &lt;preview&gt;</code> status line; check list/status colors under the active theme.</td></tr>
+<tr><td>Observable outcome</td><td>Theme switch changes the rendered palette; the bash card keeps its 20-row budget with comment frame and <code>$</code> rows; the open fence renders <code>╰── … (unclosed fence) ──╯</code> instead of a borderless tail; the steering preview sits above the input until the queue drains.</td></tr>
+<tr><td>Pass criteria</td><td>Exact chrome strings (<code>╭── #</code>, <code>$ </code>, <code>Output</code>, <code>… (unclosed fence)</code>) appear in captures; theme cycles; steering glyph and preview appear/clear with queue lifecycle.</td></tr>
+<tr><td>Status</td><td><strong>script</strong> <code>E2E.d/user/bash_card_fence.sh</code> (bash card + unclosed fence) and <code>E2E.d/user/steering_queue_handoff.sh</code> (steering line); <strong>lane</strong> <code>ic.tui-theme</code>, <code>K1ThemeAudit</code>, <code>F7ThemeListColors</code>, <code>T32NoColorFix</code></td></tr>
+</tbody></table>
+</div>
+<h2 id="implementation-status"><a class="header" href="#implementation-status">Implementation status</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Scenario</th><th>Script</th><th>Model</th><th>Coverage</th></tr></thead><tbody>
+<tr><td>Goal lifecycle</td><td><code>E2E.d/user/goal_lifecycle.sh</code></td><td>faux</td><td>full lifecycle + budget chip + pins</td></tr>
+<tr><td>Rewind / snapcompact / compact</td><td><code>E2E.d/user/rewind_compact.sh</code></td><td>faux</td><td>picker, checkpoint, sidecar, A→B status</td></tr>
+<tr><td><code>/btw</code> side chat</td><td><code>E2E.d/user/btw_side_chat.sh</code></td><td>faux</td><td>open/type/esc/reopen, tabs, list, close</td></tr>
+<tr><td>Steering queue + <code>/handoff</code></td><td><code>E2E.d/user/steering_queue_handoff.sh</code></td><td>mock (slow stream)</td><td>follow-up queue, <code>⚙</code>/suggestion, drain, cancel, handoff envelope</td></tr>
+<tr><td>Bash card + code fence</td><td><code>E2E.d/user/bash_card_fence.sh</code></td><td>mock (tool calls)</td><td>multi-line bash card, comment frame, unclosed fence marker</td></tr>
+<tr><td>Todo DAG page</td><td><code>E2E.d/user/todo_dag.sh</code></td><td>faux</td><td>markdown seed, overview/detail chrome, Esc navigation</td></tr>
+<tr><td>Workflow full run</td><td><code>E2E.d/user/workflow_full_run.sh</code></td><td>mock (planning)</td><td>create → plan → todo rows → integrate → completed, worktree</td></tr>
+</tbody></table>
+</div>
+<p>All other features are covered by the lanes listed in the catalog; <code>/live</code>
+voice and real image generation are manual.</p>
+<h2 id="verification"><a class="header" href="#verification">Verification</a></h2>
+<p>First full green run (2026-08-08): <code>bash E2E.d/ci/user_scenarios.sh run</code> → exit 0.
+Re-verified on the post-web-wave tree (2026-08-09, freshly rebuilt <code>target/release-dist/rpi</code>,
+rust-toolchain 1.88.0): <code>bash E2E.d/ci/user_scenarios.sh run</code> → exit 0.</p>
+<div class="table-wrapper"><table><thead><tr><th>Scenario</th><th>Result</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>goal-lifecycle</td><td>pass</td><td>status/detail/chip captures in <code>$EVIDENCE_ROOT/&lt;run-id&gt;/goal-lifecycle/</code></td></tr>
+<tr><td>rewind-compact</td><td>pass</td><td>rewind + snapcompact sidecars asserted on disk</td></tr>
+<tr><td>btw-side-chat</td><td>pass</td><td>overlay chrome + tab lifecycle captures</td></tr>
+<tr><td>steering-queue-handoff</td><td>pass</td><td>⚙ counts, auto-drain, <code>/queue cancel</code>, handoff envelope in transcript + fake-xclip capture</td></tr>
+<tr><td>bash-card-fence</td><td>pass</td><td>comment frame, <code>$</code> rows, <code>Output</code> separator, <code>… (unclosed fence)</code></td></tr>
+<tr><td>todo-dag</td><td>pass</td><td>overview/detail chrome + Esc navigation</td></tr>
+<tr><td>workflow-full-run</td><td>pass</td><td>create → plan → Todo DAG → workers → auto-integrate → completed; <code>e2e plan</code> commit + <code>PLAN.e2e</code> verified in git</td></tr>
+<tr><td>project-authoring</td><td>pending</td><td>empty git workspace → multi-module Rust CLI written, planted marker-parse defect caught by failing <code>cargo test</code>, read+edit repair, passing tests (12/12), valid/invalid CLI runs, Todo DAG completed; driven by <code>E2E.d/lib/project_authoring_mock.py</code></td></tr>
+</tbody></table>
+</div>
+<p>Notes from verification:</p>
+<ul>
+<li>Scenario scripts must run against a <strong>current</strong> release-dist binary; the
+previously shipped one (Aug 5) predated <code>/goal pin</code> and reported
+<code>a current goal already exists</code> on pin.</li>
+<li>The status text set by a command that starts a model turn
+(<code>Goal work started …</code>) is immediately superseded by the turn's busy label,
+so the scripts assert the details block, the header chip, and the
+post-turn statuses instead.</li>
+<li><code>/snapcompact</code>'s <code>Compacted A → B estimated tokens</code> status can be
+overwritten by the session's <code>Compaction complete</code> event (event ordering);
+the scripts accept either and assert the sidecar archive durably.</li>
+<li>The non-snap <code>/compact</code> LLM summarizer requires <code>&gt; keepRecentTokens</code> of
+context before it has anything to compact, which a short faux session cannot
+reach; that surface stays covered by unit tests and the Rust REPL lanes.</li>
+<li>The workflow supervisor prompt reads <code>You plan workflow …</code>; loopback mocks
+must classify on that wording, and multi-tool-call responses must stream one
+<code>tool_calls</code> index per SSE delta.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../user-guide/web.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/settings-trust.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../user-guide/web.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/settings-trust.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

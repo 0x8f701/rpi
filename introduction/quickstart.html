@@ -1,0 +1,372 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Quick start - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="quick-start"><a class="header" href="#quick-start">Quick start</a></h1>
+<h2 id="first-run-workflow"><a class="header" href="#first-run-workflow">First-run workflow</a></h2>
+<ol>
+<li>
+<p><strong>Install</strong> <code>rpi</code>:</p>
+<pre><code class="language-sh">curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
+</code></pre>
+<p>See <a href="install.html"><code>install.md</code></a> for Windows, pinned binary releases, manual
+archive verification, and rollback behavior.</p>
+</li>
+<li>
+<p><strong>Verify</strong> the binary:</p>
+<pre><code class="language-sh">rpi --version
+</code></pre>
+</li>
+<li>
+<p><strong>Configure one provider credential</strong>. For example:</p>
+<pre><code class="language-sh">rpi login anthropic
+</code></pre>
+<p>For non-interactive or CI use, set the provider-specific environment variable
+to a redacted credential value. Do not export placeholder values. For other
+providers, <code>auth.json</code>, <code>models.json</code>, and precedence rules, see
+<a href="../user-guide/authentication.html"><code>authentication.md</code></a>.</p>
+</li>
+<li>
+<p><strong>Run a non-interactive task</strong> to confirm the end-to-end path:</p>
+<pre><code class="language-sh">rpi --print -m anthropic/claude-sonnet-4-5 "List the Rust files in this directory"
+</code></pre>
+</li>
+<li>
+<p><strong>Start an interactive session</strong>:</p>
+<pre><code class="language-sh">rpi -m anthropic/claude-sonnet-4-5
+</code></pre>
+<p>The CLI opens the normal-screen inline TUI when both stdin and stdout are
+terminals; otherwise it uses the line REPL. See <a href="../user-guide/cli-modes.html"><code>cli-modes.md</code></a>
+for every flag, subcommand, and slash command.</p>
+</li>
+</ol>
+<h2 id="non-interactive-print-mode"><a class="header" href="#non-interactive-print-mode">Non-interactive print mode</a></h2>
+<pre><code class="language-sh">rpi --print "Explain this crate" -m anthropic/claude-sonnet-4-5
+
+# Or stream events as JSON lines for tooling
+rpi --mode json -m openai/gpt-5.5 "List all unfinished task markers in src/"
+</code></pre>
+<p>Positional prompts initialize the interactive session on a terminal. They select
+print mode only when stdin or stdout is not a terminal and <code>--listen</code> is absent;
+with <code>--listen</code>, a non-terminal run stays on the live line REPL path. Use
+<code>--print</code> when a script must be non-interactive:</p>
+<pre><code class="language-sh">rpi -m openai/gpt-5.5 "Review this repository"
+</code></pre>
+<h2 id="interactive-session"><a class="header" href="#interactive-session">Interactive session</a></h2>
+<pre><code class="language-sh">rpi -m anthropic/claude-sonnet-4-5
+</code></pre>
+<ul>
+<li>If both <code>stdin</code> and <code>stdout</code> are terminals, you get the normal-screen inline TUI.</li>
+<li>Otherwise you get the line REPL (<code>&gt; </code> prompt).</li>
+</ul>
+<p>In both modes you can type a message or use slash commands. Type <code>/help</code> for the
+22 primary commands, including <code>/workflow</code>, the TUI-only <code>/code-review</code> and
+<code>/btw</code> overlays, and <code>/live</code>.
+Model and thinking-level switches work as slash commands in the line REPL; the
+TUI uses <code>/model</code> plus keybindings such as <code>Ctrl+L</code> and <code>Ctrl+T</code>.</p>
+<h2 id="switch-models-and-reasoning-level"><a class="header" href="#switch-models-and-reasoning-level">Switch models and reasoning level</a></h2>
+<p>In the line REPL:</p>
+<pre><code>/model openai/gpt-5.5
+/think high
+</code></pre>
+<p>From the shell you can set the initial model and thinking level:</p>
+<pre><code class="language-sh">rpi -m openai/gpt-5.5 --think high --print "Refactor this function"
+</code></pre>
+<p>See <a href="../user-guide/models.html"><code>models.md</code></a> for model-spec syntax and custom providers.</p>
+<h2 id="manage-sessions"><a class="header" href="#manage-sessions">Manage sessions</a></h2>
+<pre><code class="language-sh"># List native Pi sessions for the current directory
+rpi sessions
+
+# Resume the newest native Pi session for this directory
+rpi --continue
+
+# Resume a native or foreign session by path, exact id, or prefix
+rpi --resume rollout-abc123.jsonl
+rpi --resume abc123
+</code></pre>
+<p>In the interactive TUI and line REPL, <code>/resume</code> and <code>/sessions</code> open a
+current-cwd-scoped unified catalog with <code>[source]</code> badges for native Pi, OMP,
+Codex, Claude, Grok/Hyper, and Droid sessions. Selecting a foreign session
+imports it once into the effective native session root; later resumes reuse
+the converted file. Foreign source files cannot be renamed or deleted from the
+selector, but native and imported JSONL files can be. <code>--continue</code> stays
+native-only and resumes the newest native Pi session for the directory.</p>
+<p>Sessions are stored as append-only JSONL files under <code>&lt;agent-dir&gt;/sessions/</code>.
+See <a href="../user-guide/cli-modes.html#session-resume-and-import"><code>cli-modes.md</code></a> for path encoding,
+import details, and selector management rules.</p>
+<h2 id="discover-models"><a class="header" href="#discover-models">Discover models</a></h2>
+<pre><code class="language-sh">rpi models
+rpi models claude
+rpi models openai
+</code></pre>
+<p>The filter is case-sensitive and matches against provider name or model id.</p>
+<h2 id="log-in"><a class="header" href="#log-in">Log in</a></h2>
+<pre><code class="language-sh">rpi login
+rpi login anthropic
+</code></pre>
+<p><code>login</code> stores credentials in <code>auth.json</code>. <code>logout</code> removes them. For
+non-interactive configuration, use <code>auth.json</code> or environment variables (see
+<a href="../user-guide/authentication.html"><code>authentication.md</code></a>).</p>
+<h2 id="export-or-share-a-session"><a class="header" href="#export-or-share-a-session">Export or share a session</a></h2>
+<pre><code class="language-sh"># Export a session file to a self-contained HTML file
+rpi export &lt;agent-dir&gt;/sessions/--&lt;workspace&gt;--/timestamp_id.jsonl
+
+# Export the current branch as JSONL for later resume
+rpi export session.jsonl --jsonl --output backup.jsonl
+</code></pre>
+<p>In the TUI or REPL, <code>/share</code> creates a secret GitHub gist via the <code>gh</code> CLI.
+See <a href="../reference/export-share.html"><code>export-share.md</code></a> for formats and sharing.</p>
+<h2 id="use-a-local-model"><a class="header" href="#use-a-local-model">Use a local model</a></h2>
+<pre><code class="language-sh">rpi llama configure http://127.0.0.1:8080
+rpi -m llama.cpp/&lt;model-id&gt; --print "Hello"
+</code></pre>
+<p>See <a href="../reference/local-llama.html"><code>local-llama.md</code></a> for router setup and GGUF downloads.</p>
+<h2 id="manage-packages"><a class="header" href="#manage-packages">Manage packages</a></h2>
+<pre><code class="language-sh">rpi install git:github.com/owner/pi-my-tools
+rpi list
+rpi update --extensions
+</code></pre>
+<p>Project packages need a trusted project. See <a href="../reference/settings-trust.html"><code>settings-trust.md</code></a>
+and <a href="../reference/packages.html"><code>packages.md</code></a>.</p>
+<h2 id="configure-loaded-resources"><a class="header" href="#configure-loaded-resources">Configure loaded resources</a></h2>
+<pre><code class="language-sh"># Open an interactive selector for enabled extensions/skills/prompts/themes
+rpi config
+
+# Scope the selector to project-local settings
+rpi config --local
+</code></pre>
+<p>Project scope is refused unless the project is trusted. See <a href="../reference/packages.html"><code>packages.md</code></a>
+for the package/resource model.</p>
+<h2 id="next-steps"><a class="header" href="#next-steps">Next steps</a></h2>
+<ul>
+<li>Read <a href="../user-guide/cli-modes.html"><code>cli-modes.md</code></a> for the full command surface.</li>
+<li>Read <a href="../reference/settings-trust.html"><code>settings-trust.md</code></a> to configure defaults in
+<code>settings.json</code>.</li>
+<li>Read <a href="../user-guide/models.html"><code>models.md</code></a> to add custom providers or local models.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../introduction/install.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../introduction/install.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

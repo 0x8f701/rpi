@@ -1,0 +1,579 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Security - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="security"><a class="header" href="#security">Security</a></h1>
+<p>This page describes the trust boundaries and hardening that are implemented in
+the current <code>rpi</code> source. Every protection below is source-grounded; unsupported
+surfaces are called out explicitly rather than with vague limitations.</p>
+<ul>
+<li><a href="#trust-boundary-and-project-local-resources">Trust boundary and project-local resources</a></li>
+<li><a href="#credential-storage-and-redaction">Credential storage and redaction</a></li>
+<li><a href="#path-and-symlink-containment">Path and symlink containment</a></li>
+<li><a href="#structured-stdout-and-protocol-isolation">Structured stdout and protocol isolation</a></li>
+<li><a href="#extension-manifest-environment-and-process-isolation">Extension manifest, environment, and process isolation</a></li>
+<li><a href="#process-ownership-capability-gating-and-log-bounds">Process ownership, capability gating, and log bounds</a></li>
+<li><a href="#image-decode-and-display-limits">Image decode and display limits</a></li>
+<li><a href="#parent-process-hardening">Parent-process hardening</a></li>
+<li><a href="#installer-and-update-checksums--atomicity">Installer and update checksums / atomicity</a></li>
+<li><a href="#reporting-issues">Reporting issues</a></li>
+</ul>
+<h2 id="trust-boundary-and-project-local-resources"><a class="header" href="#trust-boundary-and-project-local-resources">Trust boundary and project-local resources</a></h2>
+<p>The runtime keeps global configuration in the agent directory
+(<code>&lt;agent-dir&gt;</code>, resolved from <code>$PI_CODING_AGENT_DIR</code> or the platform default).
+Project-local resources live under <code>$CWD/.pi/</code> and are only loaded when that
+project is trusted. See <a href="settings-trust.html"><code>settings-trust.md</code></a> for the full
+configuration model.</p>
+<p>Trust decisions are stored in <code>$PI_CODING_AGENT_DIR/trust.json</code>, versioned as
+<code>TRUST_STORE_VERSION = 1</code>, and keyed by canonical project path. The resolver
+walks parents so a decision at <code>&lt;workspace&gt;</code> covers <code>&lt;workspace&gt;/project</code>.
+Source: <code>crates/pi-coding/src/trust.rs</code>.</p>
+<p>Effective trust is resolved by <code>resolve_project_trust</code> in this order:</p>
+<ol>
+<li>One-run <code>--approve</code> / <code>--no-approve</code> override.</li>
+<li>If the project has no <code>.pi</code> directory at all, treat it as trusted for that
+run (there is nothing local to load).</li>
+<li>A persisted decision from <code>trust.json</code>.</li>
+<li><code>settings.json#defaultProjectTrust</code> (<code>ask</code>, <code>always</code>, <code>never</code>).</li>
+</ol>
+<p>Headless modes (<code>--print</code>, <code>--mode json</code>, <code>--mode rpc</code>) never prompt. In
+headless mode an unset <code>"ask"</code> decision is treated as <strong>untrusted</strong>, so pass
+<code>-a</code> / <code>--approve</code> when you need project-local resources:</p>
+<pre><code class="language-sh">rpi --mode json --approve "what does this project do?"
+</code></pre>
+<p>Trust-gated project-local resources include skills, prompts, themes,
+keybindings, extensions, packages, and <code>.pi/settings.json</code>. Global resources
+and the built-in model catalog are always loaded. <code>AGENTS.md</code> / <code>CLAUDE.md</code>
+files discovered in ancestors of the cwd are loaded only when the project is
+trusted and are included as plain-text instructions, not parsed as
+configuration. Sources: <code>crates/pi-coding/src/trust.rs</code>,
+<code>crates/pi-coding/src/resources.rs</code>, <code>crates/pi-coding/src/resource_manager.rs</code>.</p>
+<p>Tool execution policy is separate from project trust. Global
+<code>settings.json#approvalMode</code> and the one-run <code>--approval-mode</code> flag accept
+<code>yolo</code>, <code>write</code>, or <code>ask</code>: <code>yolo</code> allows all capabilities, <code>write</code> confirms
+Exec tools, and <code>ask</code> confirms every tool call. A project-local settings file
+cannot lower this global policy. When confirmation is required outside the TUI,
+the host fails closed instead of silently allowing the tool. Host approval runs
+before existing host hooks and extension reducers; a denial skips later hooks.
+Host hooks and the <code>pre_trust_decision</code>/extension <code>trust_decision</code> surfaces
+are documented in <a href="hooks.html"><code>hooks.md</code></a>. Unknown or legacy tool metadata
+defaults to Exec capability.</p>
+<h2 id="credential-storage-and-redaction"><a class="header" href="#credential-storage-and-redaction">Credential storage and redaction</a></h2>
+<p>API keys and subscriptions are resolved in the precedence order described in
+<a href="../user-guide/authentication.html"><code>authentication.md</code></a>. The final value may come from an
+environment variable, <code>auth.json</code>, <code>models.json</code>, or the <code>--api-key</code> flag.</p>
+<h3 id="storage"><a class="header" href="#storage">Storage</a></h3>
+<p><code>auth.json</code> stores credentials as a <code>Credential</code> enum (<code>ApiKey</code> or <code>OAuth</code>).
+Writes go through <code>write_credentials_atomic</code>:</p>
+<ul>
+<li>The parent directory is created and set to <code>0o700</code> on Unix.</li>
+<li>A temporary file is created with <code>0o600</code> permissions.</li>
+<li>The JSON is serialized, synced, and moved into place with <code>fs::rename</code>.</li>
+<li>The final file is set to <code>0o600</code> and the parent directory is synced.</li>
+</ul>
+<p>Command-valued stored values (<code>!command</code>) are rejected during parsing.
+<code>$VAR</code> / <code>${VAR}</code> templates are expanded from the request env map, the
+credential's own env map, and then the process environment; empty values are
+treated as unset. Expansion errors name the missing variable and source only
+and never include the resolved secret. Source: <code>crates/pi-coding/src/auth.rs</code>.</p>
+<h3 id="redaction"><a class="header" href="#redaction">Redaction</a></h3>
+<ul>
+<li><code>Credential</code> and <code>RequestAuth</code> <code>Debug</code> impls only expose the credential type,
+whether a key is present, and counts of headers/env entries.</li>
+<li><code>--api-key</code> is documented as "never logged". Source: <code>crates/pi-cli/src/args.rs</code>.</li>
+<li>The HTTP headers <code>authorization</code>, <code>x-api-key</code>, <code>x-goog-api-key</code>, and
+<code>cf-aig-authorization</code> are marked sensitive with <code>reqwest</code>'s
+<code>HeaderValue::set_sensitive(true)</code>. Source: <code>crates/pi-ai/src/providers/common.rs</code>.</li>
+<li>Provider implementations redact those values from error bodies before they
+are returned or logged, replacing secrets with <code>[REDACTED]</code>.</li>
+<li>Custom model headers are merged case-insensitively and kept single-valued so
+duplicate <code>authorization</code> lines cannot leak a stale value.</li>
+</ul>
+<p>Do not commit <code>auth.json</code> or <code>models.json</code> containing real keys.</p>
+<h2 id="path-and-symlink-containment"><a class="header" href="#path-and-symlink-containment">Path and symlink containment</a></h2>
+<p>All built-in file tools operate relative to the configured <code>--cwd</code>.</p>
+<ul>
+<li><code>crates/pi-coding/src/tools/paths.rs::resolve_scoped_path</code> resolves the path,
+rejects traversal outside the lexical working directory, canonicalizes the
+nearest existing ancestor, and checks that the canonical path still starts
+with the canonical cwd. This prevents symlink escapes.</li>
+<li><code>crates/pi-cli/src/file_args.rs::resolve_contained_file</code> applies the same
+containment to <code>@file</code> arguments in the prompt: absolute paths, <code>..</code>, root
+components, and prefix components are rejected; the joined path is
+canonicalized and verified to stay inside the cwd. Text <code>@file</code> inputs are
+capped at 8 MiB and image <code>@file</code> inputs at 20 MiB.</li>
+<li>System-prompt file paths (<code>--system-prompt</code>, <code>--append-system-prompt</code>) use
+the same symlink-escape check. Source: <code>crates/pi-cli/src/session_run.rs</code>.</li>
+</ul>
+<p>Extension manifest executable and QuickJS entry paths are resolved relative to
+the manifest directory and must remain inside it. Source:
+<code>crates/pi-coding/src/extensions.rs::resolve_manifest_path</code>.</p>
+<p>Package sources are validated before any git command runs:</p>
+<ul>
+<li><code>npm:</code> sources are rejected at every parse/install/remove entry point with
+the exact error below. Configured <code>npm:</code> entries are also skipped during
+discovery so they can never reach installed state.</li>
+<li>Git refs are validated in <code>validate_git_reference</code>: leading <code>-</code>, <code>/</code>,
+trailing <code>/</code> or <code>.</code>, <code>..</code>, <code>//</code>, <code>@{</code>, backslash, colon, <code>?</code>, <code>*</code>, <code>[</code>, <code>^</code>,
+<code>~</code>, spaces, control characters, and <code>.lock</code> suffixes are all rejected.</li>
+<li>Git hosts and repository paths are normalized and percent-decoded before the
+check. Source: <code>crates/pi-coding/src/packages.rs</code>.</li>
+</ul>
+<p>The self-updater rejects symlinks for the install root, update state, versioned
+binary, and active executable, and verifies that the running binary matches the
+managed update state. Source: <code>crates/pi-cli/src/self_update.rs</code>.</p>
+<h2 id="structured-stdout-and-protocol-isolation"><a class="header" href="#structured-stdout-and-protocol-isolation">Structured stdout and protocol isolation</a></h2>
+<p><code>rpi</code> keeps structured output channels separate from interactive terminal
+controls.</p>
+<ul>
+<li><code>--mode json</code> emits one JSON line per application event and flushes after each
+record. Source: <code>crates/pi-cli/src/modes/json.rs</code>.</li>
+<li><code>--mode rpc</code> reads LF-terminated JSONL commands from stdin and writes
+LF-terminated JSONL responses/events to stdout. Malformed frames produce a
+JSON error response, not raw panic text. Source: <code>crates/pi-cli/src/modes/rpc.rs</code>.</li>
+<li>Process extensions speak a strict LF JSONL protocol over stdin/stdout. The
+host rejects CRLF, blank lines, and frames larger than the configured maximum
+(default 1 MiB, minimum 1,024 bytes). Source: <code>crates/pi-coding/src/extensions.rs</code>.</li>
+<li>QuickJS extensions run in-process with no stdout channel: the runtime has no
+<code>console</code>, <code>process</code>, <code>require</code>, or <code>fetch</code> globals, so extension code cannot
+emit protocol noise or escape the sandbox. Source:
+<code>crates/pi-coding/src/quickjs_host.rs</code>.</li>
+<li>Terminal image escape sequences are only emitted by the interactive TUI's
+terminal guard. JSON, RPC, print mode, logs, and ratatui buffers never receive
+raw graphics protocol bytes. Source: <code>crates/pi-cli/src/terminal_images.rs</code> and
+<code>crates/pi-cli/src/tui.rs</code>.</li>
+<li><code>--listen</code> is available only on the live text TUI/REPL path and shares that exact <code>Application</code>; it is rejected with subcommands, print, JSON/RPC, or model-listing exits. HTTP and WebSocket messages are capped at 4 MiB, ordinary commands at 16 concurrent operations, pre-auth connections at 64 tasks, and outbound WebSocket delivery uses a bounded queue. Recovery commands such as abort and process stop can bypass saturated ordinary-work slots.</li>
+<li><code>--listen</code> is loopback-only (127.0.0.0/8 or ::1) by default. A non-loopback or wildcard bind is permitted only when <code>--listen-allow-insecure-remote</code> and a valid <code>--listen-token-file</code> are both present; tokenless remote binds are always rejected before the socket is opened. This opt-in authenticates browser and native clients but does not encrypt plaintext HTTP/WebSocket: passive LAN observers can capture the bearer token and all control traffic. <code>agent serve</code> remains strictly loopback-only with no remote opt-in. On loopback, the bounded regular token file is optional; a token enables browser access with exact <code>Authorization: Bearer &lt;token&gt;</code> or the constant-time <code>rpi-auth.&lt;token&gt;</code> WebSocket subprotocol, while tokenless loopback accepts only native clients without <code>Origin</code>. Origin, subprotocol, and authentication checks remain mandatory. Wildcard binds (0.0.0.0 or <code>::</code>) cannot synthesize reachable collaboration links: <code>/collab</code> and <code>collab_start</code> without an explicit <code>baseUrl</code> fail closed unless <code>--listen-advertised-origin &lt;URL&gt;</code> supplies a strict http/https origin (no credentials, path, query, or fragment), while loopback binds keep advertising their local address automatically. Interactive extension dialogs remain exclusively owned by the local TUI: remote clients cannot observe or answer them.</li>
+</ul>
+<h2 id="extension-manifest-environment-and-process-isolation"><a class="header" href="#extension-manifest-environment-and-process-isolation">Extension manifest, environment, and process isolation</a></h2>
+<p>Every extension needs an explicit <code>pi-extension.json</code> manifest. See
+<a href="extensions.html"><code>extensions.md</code></a> for the full format.</p>
+<ul>
+<li>The manifest must declare <code>schemaVersion: 1</code> and uses <code>deny_unknown_fields</code>,
+so extra fields fail closed. The <code>id</code> is validated as an identifier up to
+128 bytes. Source: <code>crates/pi-coding/src/extensions.rs</code>.</li>
+<li><code>runtime</code> is discriminated: <code>process</code> uses <code>executable</code> + optional
+<code>arguments</code>; <code>quickjs</code> uses <code>entry</code> and rejects <code>arguments</code>. QuickJS entries
+must end in <code>.js</code> or <code>.mjs</code>.</li>
+<li>UI capabilities require the <code>ui</code> capability; QuickJS extensions reject
+<code>message_renderers</code> and <code>provider_metadata</code> because those factories cannot
+cross the protocol boundary.</li>
+<li>Package extensions are only loaded when the project is trusted. Untrusted
+project manifests are refused. Source:
+<code>crates/pi-coding/src/extensions.rs::extension_spec_from_package_resource</code>.</li>
+</ul>
+<p>When an extension process is spawned:</p>
+<ul>
+<li>The command starts with <code>env_clear()</code>; only the extension's configured
+environment and a small set of host variables are passed through.</li>
+<li>Process extensions may additionally run inside the opt-in Linux filesystem
+sandbox (<code>spawn_piped</code> with a <code>SandboxConfig</code>); see
+<a href="sandbox-isolation.html"><code>sandbox-isolation.md</code></a>.</li>
+<li>Every process extension receives <code>PI_EXTENSION_PROTOCOL_VERSION=1</code>,
+<code>PI_EXTENSION_ID</code>, and <code>PI_EXTENSION_PACKAGE_ID</code>.</li>
+<li>QuickJS extensions additionally receive <code>PI_EXTENSION_ENTRY</code>,
+<code>PI_EXTENSION_CAPABILITIES</code>, <code>PI_EXTENSION_UI_CAPABILITIES</code>, and
+<code>PI_EXTENSION_MAX_FRAME_BYTES</code>.</li>
+<li>The child is placed in its own process group (<code>process_group(0)</code>) and has
+<code>kill_on_drop(true)</code>, so it is terminated when the host drops it.</li>
+<li>stdin/stdout/stderr are piped; stdout is protocol-only. Up to 16 KiB of
+stderr is retained for crash diagnostics. Source:
+<code>crates/pi-coding/src/extensions.rs</code>.</li>
+</ul>
+<p>In-process QuickJS extensions never spawn: each runs on its own dedicated
+thread with a 64 MiB <code>set_memory_limit</code>, a <code>set_interrupt_handler</code> deadline,
+and no <code>process</code>/<code>require</code>/<code>fetch</code>/<code>console</code> globals. Source:
+<code>crates/pi-coding/src/quickjs_host.rs</code>.</p>
+<p>Extension instances are invalidated when the runtime reloads, the session ends,
+or the protocol breaks. The host does not keep orphaned extension children
+alive. Source: <code>crates/pi-coding/src/extensions.rs::spawn_discarded_instances</code>.</p>
+<h2 id="process-ownership-capability-gating-and-log-bounds"><a class="header" href="#process-ownership-capability-gating-and-log-bounds">Process ownership, capability gating, and log bounds</a></h2>
+<p>The <code>ProcessManager</code> owns long-lived subprocesses and enforces per-owner
+boundaries.</p>
+<ul>
+<li>Every spawned process is tagged with a <code>ProcessOwnerId</code>. <code>list</code>, <code>describe</code>,
+<code>logs</code>, <code>write</code>, <code>keys</code>, <code>resize</code>, <code>signal</code>, <code>stop</code>, and <code>wait</code> all require the
+caller's <code>owner_id</code> to match the session's owner. Source:
+<code>crates/pi-coding/src/process/manager.rs</code>.</li>
+<li>Default limits: at most 16 active processes, 1 MiB of retained output per
+process, 30-minute idle timeout with 30-second scans, 1-second termination
+grace, and 256 KiB per log read. Source: <code>crates/pi-coding/src/process/mod.rs</code>.</li>
+<li><code>validate_spawn_spec</code> rejects empty argv, NUL bytes in argv or env, non-
+absolute or non-directory cwd, env keys containing <code>=</code> or NUL, labels over 64
+bytes, and <code>output_bytes</code> above the manager maximum. Source:
+<code>crates/pi-coding/src/process/manager.rs</code>.</li>
+<li>Subprocesses are spawned with <code>env_clear()</code> plus explicit overrides, their
+own process group, and <code>kill_on_drop(true)</code>. On Unix, stdout and stderr are
+merged into a single combined stream so the host sees all output. Source:
+<code>crates/pi-coding/src/process/backend.rs</code>.</li>
+<li><code>ProcessLog</code> keeps a bounded ring buffer: when the retained bytes exceed the
+configured capacity, old bytes are dropped and the read response reports how
+much was lost. Source: <code>crates/pi-coding/src/process/log.rs</code>.</li>
+<li>The bash tool's <code>OutputAccumulator</code> bounds memory with default limits of
+2,000 lines / 50 KiB, keeps a rolling tail of at most 2× the byte limit, and
+streams overflow to a temp file. Source: <code>crates/pi-coding/src/tools/bash.rs</code>
+and <code>crates/pi-coding/src/truncate.rs</code>.</li>
+</ul>
+<p>Extension capabilities are enforced at registration time: the runtime builds
+an <code>ExtensionPermissionSet</code> from the manifest and rejects any registration that
+requests a capability or UI capability not in that set. Source:
+<code>crates/pi-coding/src/extensions.rs::ExtensionPermissionSet::validate_manifest</code>.</p>
+<h2 id="image-decode-and-display-limits"><a class="header" href="#image-decode-and-display-limits">Image decode and display limits</a></h2>
+<p>Image data is bounded before decoding and before being sent to the model or the
+terminal.</p>
+<ul>
+<li><code>crates/pi-cli/src/image_pipeline.rs</code> enforces:
+<ul>
+<li>20 MiB compressed input (<code>MAX_IMAGE_BYTES</code>).</li>
+<li>128 MiB decoded allocation budget (<code>MAX_DECODED_IMAGE_BYTES</code>).</li>
+<li>Maximum decoded dimensions capped by that budget at 8 bytes per pixel.</li>
+<li>Maximum display width/height of 2,000 pixels.</li>
+<li>Inline base64 cap of ~4.5 MiB.</li>
+</ul>
+</li>
+<li>Supported formats are PNG, JPEG, GIF, and WebP. The coding-side image tool
+additionally converts BMP to PNG before sending. Source:
+<code>crates/pi-coding/src/tools/imageresize.rs</code>.</li>
+<li>Terminal display reuses the same validation. The TUI caches at most 256
+decoded metadata entries, clamps the cell reservation to the viewport, and only
+emits Kitty or iTerm2 graphics protocol bytes. Sixel is detected but not
+emitted because there is no bounded safe encoder yet. Source:
+<code>crates/pi-cli/src/terminal_images.rs</code>.</li>
+</ul>
+<h2 id="parent-process-hardening"><a class="header" href="#parent-process-hardening">Parent-process hardening</a></h2>
+<p>Before any dispatch, <code>rpi</code> runs best-effort parent-process hardening
+(<code>harden_process</code> in <code>crates/pi-cli/src/lib.rs:64-84</code>, invoked from
+<code>crates/pi-cli/src/main.rs:12-17</code>):</p>
+<ul>
+<li>On Linux, the process is made non-dumpable and ptrace attach (plus
+<code>/proc/&lt;pid&gt;/mem</code> access) is denied even to same-user debuggers.</li>
+<li>The call is cfg-guarded and failure-ignored: hardening must never break
+startup on unsupported platforms.</li>
+</ul>
+<p>Loader variables (<code>LD_PRELOAD</code>, <code>LD_LIBRARY_PATH</code>) are consumed by the
+dynamic loader before <code>main</code> runs and cannot be sanitized after the fact;
+child processes already rebuild their environments (tools and extensions),
+so no child inherits the hardened parent's load state.</p>
+<h2 id="installer-and-update-checksums--atomicity"><a class="header" href="#installer-and-update-checksums--atomicity">Installer and update checksums / atomicity</a></h2>
+<p><code>install.sh</code>, <code>install.ps1</code>, and <code>rpi update --self</code> all follow the same
+pattern. The full update mechanics are documented in <a href="update.html"><code>update.md</code></a>;
+the security-relevant parts are:</p>
+<ul>
+<li>Every release archive is paired with a <code>SHA256SUMS</code> file. The installer
+downloads both, enforces a 1 MiB limit on the manifest and a 1 GiB limit on
+the archive, requires exactly one valid 64-character hex digest for the
+platform asset, recomputes the digest locally, and aborts on mismatch.</li>
+<li>A smoke test runs the staged binary with <code>--version</code> and requires the output
+to be exactly <code>rpi &lt;version&gt;</code> before activation — exit status alone is not
+proof of identity.</li>
+<li>Unix: the versioned binary is placed with a single <code>rename(2)</code>, then the
+active <code>bin/rpi</code> symlink is swapped with another <code>rename(2)</code>. The active path
+is never missing. The prior symlink target is captured so rollback restores
+exactly what was live. Source: <code>install.sh</code> and
+<code>crates/pi-cli/src/self_update.rs</code>.</li>
+<li>Windows: <code>MoveFileEx</code> with <code>MOVEFILE_REPLACE_EXISTING</code> performs an atomic
+same-volume replace. If the running <code>rpi.exe</code> is locked, the installer fails
+with a clear message instead of leaving a window where the executable is
+absent. A preemptive backup allows rollback to restore the previous binary.
+Source: <code>install.ps1</code> and <code>crates/pi-cli/src/self_update.rs</code>.</li>
+<li><code>update-state.json</code> is written atomically (temp file + rename) and is rolled
+back if activation or smoke testing fails. On Windows, activation is deferred
+to a short-lived PowerShell process that runs after the current <code>rpi</code> process
+exits; the deferred activation re-verifies that the moved binary prints
+exactly <code>rpi &lt;version&gt;</code> and restores the previous binary on any mismatch.
+Source: <code>crates/pi-cli/src/self_update.rs</code>.</li>
+<li>Concurrent installs are serialized: <code>install.sh</code> uses a PID-based lockfile;
+<code>install.ps1</code> uses a named mutex; <code>self_update.rs</code> acquires an install lock.</li>
+<li>Package updates use the same staging/rollback model: git checkouts are
+prepared next to the live checkout and activated with an atomic directory
+swap, and package state/settings files are written with temp-file + rename
+and rolled back on failure. Source: <code>crates/pi-coding/src/packages.rs</code>.</li>
+</ul>
+<p>The stable <code>/releases/latest</code> endpoint is never used for prereleases: the
+installer defaults to <code>/releases/latest</code>, and <code>self_update.rs</code> rejects draft or
+prerelease releases from that endpoint. Prerelease-aware users must explicitly
+request a prerelease tag. Source: <code>install.sh</code> and
+<code>crates/pi-cli/src/self_update.rs::select_release</code>.</p>
+<h3 id="npm-packages"><a class="header" href="#npm-packages">npm packages</a></h3>
+<p><code>npm:</code> package sources are deliberately not supported. Every entry point that
+accepts a package source rejects <code>npm:</code> with the exact error:</p>
+<pre><code class="language-text">npm package sources are not supported yet; use a local path or git source
+</code></pre>
+<p>There is no partial npm backend, npm package cache, or registry integration.
+Supported package sources are <code>local:</code> directories below the project and <code>git:</code>
+repositories. Source: <code>crates/pi-coding/src/packages.rs::npm_deferred_error</code>
+and <a href="packages.html"><code>packages.md</code></a>.</p>
+<h2 id="bash-filesystem-sandbox-opt-in-linux"><a class="header" href="#bash-filesystem-sandbox-opt-in-linux">Bash filesystem sandbox (opt-in, Linux)</a></h2>
+<p>The <code>bash</code> tool can run inside an opt-in filesystem sandbox (<code>settings.sandbox</code>
+or the per-call <code>sandboxed</code> parameter; default off). It is <strong>confinement, not
+isolation</strong>: the command still runs as the same user with the same host
+privileges — nothing is escalated — but inside fresh Linux namespaces created
+with <code>unshare</code> (<code>--mount --pid --fork --mount-proc</code>, plus <code>--net</code> unless
+<code>sandbox.network</code> is true). Source: <code>crates/pi-coding/src/sandbox.rs</code>.</p>
+<p>What the sandbox does:</p>
+<ul>
+<li>Builds a tmpfs root, bind-mounts the configured <code>sandbox.allowedPaths</code>
+(default: the session working directory plus the agent directory), and
+<code>pivot_root</code>s so the host root is detached. Filesystem reads and writes are
+confined to the allowed paths (read-write).</li>
+<li>System binaries and libraries under <code>/usr</code>, <code>/bin</code>, <code>/sbin</code>, <code>/lib</code>,
+<code>/lib64</code> are bind-mounted read-only so commands can execute; user data under
+those roots is not readable.</li>
+<li><code>sandbox.deniedPaths</code> entries are hidden with an empty overlay even when
+nested inside an allowed path.</li>
+<li>Network is loopback-only by default (fresh net namespace); <code>curl</code>, DNS, and
+other non-loopback traffic fail with "Network is unreachable".</li>
+<li><code>/proc</code> reflects only the sandbox's own PID namespace.</li>
+</ul>
+<p>Limitations to be aware of:</p>
+<ul>
+<li>Confinement, not isolation: the command keeps the caller's uid and can write
+to the bind-mounted allowed paths (the same inodes the host sees). A
+malicious command can still consume CPU/memory or abuse host binaries.</li>
+<li>Requires Linux, the util-linux <code>unshare</code> binary, and (for unprivileged
+users) permission to create user namespaces (<code>kernel.unprivileged_userns_clone</code>
+or an equivalent AppArmor profile). Missing prerequisites produce actionable
+errors; on non-Linux platforms the sandbox is rejected with an explicit
+"unsupported on this platform" error.</li>
+<li>The sandbox root is minimal: no <code>/etc</code> (so <code>/etc/passwd</code> is not visible, and
+DNS/NSS lookups fail), a private <code>/tmp</code>, and only the essential device nodes
+(<code>/dev/null</code>, <code>/dev/zero</code>, <code>/dev/full</code>, <code>/dev/random</code>, <code>/dev/urandom</code>,
+<code>/dev/tty</code>). No <code>/dev/pts</code>, <code>/run</code>, or <code>$HOME</code> unless explicitly allowed.</li>
+<li><code>deniedPaths</code> hides existing content but cannot prevent a command from
+creating a new entry at a denied path inside a read-write allowed path.</li>
+<li><code>sandboxed</code> and <code>background</code> are mutually exclusive; the supervised process
+manager runs outside the sandbox.</li>
+<li>Only paths are passed to the wrapper command line / environment — never
+secrets. Wrapper construction is deterministic and unit-tested
+(<code>sandbox.rs</code>), and the real namespace behavior is smoke-tested when the
+host supports it (<code>crates/pi-coding/tests/sandbox_smoke.rs</code>).</li>
+</ul>
+<h2 id="reporting-issues"><a class="header" href="#reporting-issues">Reporting issues</a></h2>
+<p>If you find a security issue in <code>rpi</code>, please open a private issue or contact
+the maintainers before disclosing publicly.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/local-llama.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/export-share.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/local-llama.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/export-share.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,350 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Memory - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="memory"><a class="header" href="#memory">Memory</a></h1>
+<p><code>rpi</code> has a memory subsystem with three backends, selected by
+<code>settings.memory.backend</code> (<code>crates/pi-coding/src/memory.rs</code>):</p>
+<div class="table-wrapper"><table><thead><tr><th>Backend</th><th>Tools</th><th>Behavior</th></tr></thead><tbody>
+<tr><td><code>local</code> (default)</td><td><code>memory</code></td><td>Built-in JSONL note store: <code>learn</code>, <code>recall</code>, <code>list</code>, <code>forget</code> entries that survive across sessions. Ordinary sessions use a repository namespace; personas use their durable persona-local store.</td></tr>
+<tr><td><code>hindsight</code></td><td><code>recall</code>, <code>retain</code>, <code>reflect</code></td><td>Calls an explicitly configured Hindsight HTTP API.</td></tr>
+<tr><td><code>off</code></td><td>(none)</td><td>Every memory tool is hidden.</td></tr>
+</tbody></table>
+</div>
+<p>A missing config falls back to <code>local</code>. Backend selection is inherited by future
+ordinary and persona child sessions; local persona memory remains rooted at the
+persona directory.</p>
+<h2 id="settings"><a class="header" href="#settings">Settings</a></h2>
+<pre><code class="language-json">{
+  "memory": {
+    "backend": "hindsight",
+    "hindsightApiUrl": "https://memory.example.test",
+    "hindsightApiToken": "$HINDSIGHT_API_TOKEN",
+    "hindsightBankId": "rpi",
+    "hindsightScoping": "per-project-tagged",
+    "hindsightInjection": false
+  }
+}
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>memory.backend</code></td><td><code>local</code></td><td><code>local</code>, <code>hindsight</code>, or <code>off</code>.</td></tr>
+<tr><td><code>memory.hindsightApiUrl</code></td><td>unset</td><td>Explicit Hindsight HTTP API base URL. Required for <code>hindsight</code>.</td></tr>
+<tr><td><code>memory.hindsightApiToken</code></td><td>unset</td><td>Optional bearer token. Secret settings views always redact it.</td></tr>
+<tr><td><code>memory.hindsightAllowInsecure</code></td><td><code>false</code></td><td>Explicitly permit plaintext HTTP endpoints and redirect hops for a trusted self-hosted service. Secure mode is HTTPS-only for the initial URL and every redirect.</td></tr>
+<tr><td><code>memory.hindsightBankId</code></td><td><code>rpi</code></td><td>Base bank id.</td></tr>
+<tr><td><code>memory.hindsightBankIdPrefix</code></td><td>unset</td><td>Optional bank-id prefix.</td></tr>
+<tr><td><code>memory.hindsightScoping</code></td><td><code>per-project-tagged</code></td><td><code>global</code>, <code>per-project</code>, or <code>per-project-tagged</code>.</td></tr>
+<tr><td><code>memory.hindsightBankMission</code></td><td>unset</td><td>Optional reflect mission applied while ensuring the bank exists.</td></tr>
+<tr><td><code>memory.hindsightRetainMission</code></td><td>unset</td><td>Optional retain mission applied while ensuring the bank exists.</td></tr>
+<tr><td><code>memory.hindsightInjection</code></td><td><code>false</code></td><td>Inject bounded recall for the latest ask as hidden context.</td></tr>
+<tr><td><code>memory.hindsightRecallBudget</code></td><td><code>mid</code></td><td>Hindsight recall/reflect budget: <code>low</code>, <code>mid</code>, or <code>high</code>.</td></tr>
+<tr><td><code>memory.hindsightRecallMaxTokens</code></td><td><code>1024</code></td><td>Maximum tokens requested from recall.</td></tr>
+<tr><td><code>memory.hindsightRecallTypes</code></td><td><code>world</code>, <code>experience</code></td><td>Memory types included in recall.</td></tr>
+<tr><td><code>memory.hindsightRequestTimeoutMs</code></td><td><code>30000</code></td><td>Default HTTP request deadline.</td></tr>
+<tr><td><code>memory.hindsightRecallTimeoutMs</code></td><td><code>30000</code></td><td>Recall deadline.</td></tr>
+<tr><td><code>memory.hindsightRetainTimeoutMs</code></td><td><code>60000</code></td><td>Retain deadline.</td></tr>
+<tr><td><code>memory.hindsightReflectTimeoutMs</code></td><td><code>120000</code></td><td>Reflect deadline.</td></tr>
+</tbody></table>
+</div>
+<h2 id="local-backend"><a class="header" href="#local-backend">Local backend</a></h2>
+<p>Ordinary sessions store entries at:</p>
+<pre><code class="language-text">&lt;agent-dir&gt;/memory/&lt;repo-digest&gt;/entries.jsonl
+</code></pre>
+<p>Persona sessions store entries at:</p>
+<pre><code class="language-text">&lt;persona-root&gt;/memory/entries.jsonl
+</code></pre>
+<p>The public local behavior remains unchanged:</p>
+<ul>
+<li>Entries are capped at 1 MiB.</li>
+<li>At most 100 entries are retained per namespace; <code>learn</code> evicts the oldest.</li>
+<li><code>recall</code> defaults to 10 entries and clamps at 50.</li>
+<li>At most 20 tags are stored per entry.</li>
+<li>Output is bounded and secrets are redacted.</li>
+<li>Switching away from local never migrates, mirrors, deletes, or rewrites JSONL.</li>
+</ul>
+<h2 id="hindsight-backend"><a class="header" href="#hindsight-backend">Hindsight backend</a></h2>
+<p>Hindsight uses the source-verified HTTP wire contract:</p>
+<ul>
+<li><code>POST /v1/default/banks/{bank}/memories/recall</code></li>
+<li><code>POST /v1/default/banks/{bank}/memories</code></li>
+<li><code>POST /v1/default/banks/{bank}/reflect</code></li>
+<li><code>PUT /v1/default/banks/{bank}</code> before retain/reflect to idempotently create
+or update the bank and apply optional missions. Any non-success, timeout, or
+authentication failure stops retain/reflect instead of being ignored.</li>
+</ul>
+<p>Recall and reflect requests include the selected budget, recall types, token
+limit, and namespace tags; retain requests include the item content and tags.
+The client methods themselves reject empty required query/content fields and
+bound every query, content, and optional context to 1 MiB, including direct
+turn-start injection calls that bypass tool argument validation.</p>
+<p>Responses are capped at 256 KiB before JSON decoding; rendered tool and
+injection output remains capped at 32 KiB. Every operation has an explicit
+timeout. HTTP errors include the operation and status while redacting credential
+shapes in the error path. The bearer token is sent only in the Authorization
+header. <code>MemoryConfig</code> debug output renders a redaction marker instead of the
+token.</p>
+<p>Plaintext HTTP endpoints are rejected unless <code>hindsightAllowInsecure</code> is
+explicitly true. In secure mode, the HTTP client is HTTPS-only and a redirect
+policy checks each hop before following it: HTTPS-to-HTTP and every other
+plaintext redirect fail before a request reaches the plaintext target, so the
+Authorization header cannot be forwarded there. The explicit insecure opt-in
+permits both an HTTP base URL and HTTP redirect hops for trusted self-hosted
+deployments; the normal redirect limit still applies.</p>
+<p>Turn-start injection is advisory and fail-open: an unavailable Hindsight service
+never prevents an ordinary agent turn from running. Explicit tool calls return
+contextual errors and never silently fall back to local.</p>
+<h2 id="namespaces"><a class="header" href="#namespaces">Namespaces</a></h2>
+<ul>
+<li><code>global</code>: one bank, no project tag filter.</li>
+<li><code>per-project</code>: bank id is <code>&lt;base&gt;-&lt;sanitized-label&gt;-&lt;digest-prefix&gt;</code>.</li>
+<li><code>per-project-tagged</code>: one bank; retains carry
+<code>project:&lt;sanitized-label&gt;-&lt;digest-prefix&gt;</code> and recalls use that tag with
+<code>tags_match: any</code>, which also permits untagged global memory.</li>
+<li>The project identity hashes the canonical repository anchor when present,
+otherwise the canonical working directory. The readable basename is retained,
+but same-named repositories remain isolated by the digest prefix.</li>
+<li>Future child sessions resolve the parent's live backend configuration. Local
+persona children still use <code>&lt;persona-root&gt;/memory/entries.jsonl</code>; Hindsight
+persona children use the explicitly configured bank/scoping contract.</li>
+</ul>
+<h2 id="invariants"><a class="header" href="#invariants">Invariants</a></h2>
+<ul>
+<li>Exactly one backend is active; no dual writes or automatic fallback.</li>
+<li><code>off</code> removes the complete reserved memory tool family in parent and child
+sessions.</li>
+<li>Local JSONL paths and model-visible local tool behavior are unchanged.</li>
+<li>External endpoints, auth, HTTPS-only redirect enforcement, timeouts, request/
+response bounds, and plaintext opt-in are explicit.</li>
+<li>Turn-start context is hidden (<code>display: false</code>) and never auto-submitted.</li>
+</ul>
+<h2 id="related-documentation"><a class="header" href="#related-documentation">Related documentation</a></h2>
+<ul>
+<li><a href="tools.html"><code>tools.md</code></a> — the full tool catalog including memory</li>
+<li><a href="settings-trust.html"><code>settings-trust.md</code></a> — settings precedence and trust</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/packages.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/tools.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/packages.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/tools.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

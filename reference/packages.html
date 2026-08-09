@@ -1,0 +1,426 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Packages - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="packages"><a class="header" href="#packages">Packages</a></h1>
+<p><code>rpi</code> supports local-directory and git-based packages. The npm backend is
+deliberately deferred and cannot be installed.</p>
+<p>Source: <code>crates/pi-coding/src/packages.rs:1-5</code> and
+<code>crates/pi-coding/src/packages.rs:842-845</code>.</p>
+<h2 id="package-sources"><a class="header" href="#package-sources">Package sources</a></h2>
+<p>Valid package sources:</p>
+<ul>
+<li>A plain filesystem path, relative to the current working directory or
+absolute. The stored identity becomes <code>local:&lt;canonical path&gt;</code>.
+<ul>
+<li>Example: <code>./my-pi-tools</code></li>
+</ul>
+</li>
+<li>A git URL using <code>https</code>, <code>http</code>, <code>ssh</code>, or <code>git</code> as the scheme.
+<ul>
+<li>Examples: <code>https://github.com/owner/repo</code>,
+<code>git@github.com:owner/repo</code>, <code>ssh://git@github.com/owner/repo</code>,
+<code>git:https://github.com/owner/repo</code></li>
+</ul>
+</li>
+<li>A <code>git:</code> shorthand using a host with a domain or <code>localhost</code>:
+<code>git:github.com/owner/repo</code>. The shorthand must include host, owner, and
+repository.</li>
+<li>A git ref pinned with <code>@ref</code>: <code>git:github.com/owner/repo@v1.2</code>.</li>
+<li><code>npm:package[@version]</code> — <strong>not implemented</strong>; rejected with a clear error.</li>
+</ul>
+<p>Source: <code>crates/pi-coding/src/packages.rs:810-903</code>.</p>
+<h2 id="install-remove-list-config-update"><a class="header" href="#install-remove-list-config-update">Install, remove, list, config, update</a></h2>
+<pre><code class="language-sh"># Install globally (stored in agent settings)
+rpi install git:github.com/owner/pi-my-tools
+
+# Install into project settings (requires project trust)
+rpi install ./my-pi-tools --local
+
+# Remove a configured package
+rpi remove git:github.com/owner/pi-my-tools
+
+# List configured packages and their install status
+rpi list
+
+# Toggle enabled package resources for global or project scope
+rpi config
+rpi config -l            # project scope; requires project trust
+
+# Update rpi itself (default when no package flags are given)
+rpi update
+rpi update --self
+
+# Update every configured package (also accepts --all)
+rpi update --extensions
+rpi update --all
+
+# Update one configured package by source identity
+rpi update git:github.com/owner/pi-my-tools
+rpi update github.com/owner/pi-my-tools
+
+# Update packages and rpi itself
+rpi update --self --extensions
+
+# Reinstall self-update even when version and checksum match
+rpi update --self --force
+</code></pre>
+<p>Source: <code>crates/pi-cli/src/args.rs:244-285</code> and
+<code>crates/pi-cli/src/lib.rs:62-120</code>.</p>
+<p><code>rpi list</code> shows the scope (<code>global</code> or <code>project</code>), source, status
+(<code>installed</code>, <code>missing</code>, or <code>unsupported</code>), whether a git source is pinned to
+a ref, and the on-disk path for installed packages.</p>
+<p>Source: <code>crates/pi-cli/src/package_commands.rs:34-66</code> and
+<code>crates/pi-coding/src/packages.rs:777-800</code>.</p>
+<p><code>rpi config</code> discovers resources declared by each package's
+<code>package.json#pi</code> manifest and lets you enable or disable individual extensions,
+skills, prompts, and themes. In a headless environment (stdout is not a TTY) it
+prints deterministic JSON and never blocks. Project scope is refused when the
+project is not trusted.</p>
+<p>Source: <code>crates/pi-cli/src/package_config.rs:1-16</code> and
+<code>crates/pi-cli/src/package_config.rs:542-550</code>.</p>
+<p><code>rpi update --extensions</code> reconciles every configured git/local package. Pinned
+git refs are fetched and reset to the configured ref; unpinned sources follow the
+remote default branch. <code>npm:</code> entries are skipped. <code>rpi update PACKAGE</code> reconciles
+one configured package by identity; matching <code>npm:</code> sources produce the deferred
+error.</p>
+<p>Source: <code>crates/pi-coding/src/packages.rs:495-545</code>.</p>
+<p>Git packages are cloned into a content-addressed directory under the scope root
+(<code>&lt;agent-dir&gt;/git/...</code> for global packages, <code>&lt;workspace&gt;/.pi/git/...</code> for
+project packages). Local packages are referenced by path. Atomic checkout
+swapping, serialized operations, and atomic settings/state writes prevent
+partial installs.</p>
+<p>Source: <code>crates/pi-coding/src/packages.rs:57-77</code>,
+<code>crates/pi-coding/src/packages.rs:408-530</code>,
+<code>crates/pi-coding/src/packages.rs:711-770</code>, and
+<code>crates/pi-coding/src/packages.rs:1867-1954</code>.</p>
+<h2 id="settingsjson-packages-field"><a class="header" href="#settingsjson-packages-field"><code>settings.json</code> packages field</a></h2>
+<p>The <code>packages</code> array holds either a source string or a filtered object:</p>
+<pre><code class="language-json">{
+  "packages": [
+    "git:github.com/owner/pi-my-tools",
+    {
+      "source": "git:github.com/owner/pi-skills",
+      "autoload": true,
+      "extensions": ["pi-my-ext"],
+      "skills": ["rust-review"],
+      "prompts": ["custom-prompt"],
+      "themes": ["solarized"]
+    }
+  ]
+}
+</code></pre>
+<p>Source: <code>crates/pi-coding/src/settings.rs:34-45</code>.</p>
+<ul>
+<li><code>autoload: true</code> enables all resources from the package by default.</li>
+<li><code>extensions</code>, <code>skills</code>, <code>prompts</code>, <code>themes</code> are resource-filter lists. They
+may contain exact resource names, glob patterns, <code>!</code> exclusions, and <code>+</code> / <code>-</code>
+force-include/exclude tokens used by <code>rpi config</code>.</li>
+<li>Project entries win over global entries with the same package identity.</li>
+</ul>
+<p>Source: <code>crates/pi-coding/src/packages.rs:524-550</code> and
+<code>crates/pi-cli/src/package_config.rs:1-16</code>.</p>
+<h2 id="package-manifest-packagejsonpi"><a class="header" href="#package-manifest-packagejsonpi">Package manifest (<code>package.json#pi</code>)</a></h2>
+<p>A package root may contain a <code>package.json</code> whose <code>pi</code> field declares its
+resources:</p>
+<pre><code class="language-json">{
+  "name": "pi-my-tools",
+  "pi": {
+    "schemaVersion": 1,
+    "extensions": ["extensions/*"],
+    "skills": ["skills/**/*.md"],
+    "prompts": ["prompts/**/*.md"],
+    "themes": ["themes/*.json"]
+  }
+}
+</code></pre>
+<p>Source: <code>crates/pi-coding/src/packages.rs:139-165</code>.</p>
+<p>Without a manifest, the package manager discovers resources under standard
+subdirectories:</p>
+<ul>
+<li><code>extensions/</code> — files named <code>pi-extension.json</code>.</li>
+<li><code>skills/</code> — <code>SKILL.md</code> or <code>.md</code> files.</li>
+<li><code>prompts/</code> — <code>.md</code> files.</li>
+<li><code>themes/</code> — <code>.json</code> files.</li>
+</ul>
+<p>Hidden entries, symlinks, and <code>node_modules</code> are ignored during discovery.</p>
+<p>Source: <code>crates/pi-coding/src/packages.rs:1303-1453</code>.</p>
+<h2 id="trust-and-scope"><a class="header" href="#trust-and-scope">Trust and scope</a></h2>
+<ul>
+<li>Global packages are always loaded.</li>
+<li>Project packages are loaded only when the project is trusted.</li>
+<li>Project resources win over global resources with the same name.</li>
+</ul>
+<p>Source: <code>crates/pi-coding/src/packages.rs:524-550</code>.</p>
+<h2 id="plugin-marketplace-rpi-plugin"><a class="header" href="#plugin-marketplace-rpi-plugin">Plugin marketplace (<code>rpi plugin</code>)</a></h2>
+<p>Separate from <code>rpi install</code> packages, the <strong>plugin marketplace</strong>
+(<code>crates/pi-coding/src/plugin.rs</code>) installs standalone extension packages —
+a directory whose root carries a validated <code>pi-extension.json</code> manifest (the
+same schema the extension runtime loads). Installed plugins land in
+<code>&lt;agent_dir&gt;/extensions/&lt;name&gt;/</code> and are picked up by the resource scan, so
+an installed plugin is loadable through the normal extension pipeline.</p>
+<pre><code class="language-sh">rpi plugin list                   # name, version, runtime, trust state
+rpi plugin list --updates         # check the marketplace index for updates
+rpi plugin install &lt;SOURCE&gt;       # install and record explicit Trusted consent
+rpi plugin remove &lt;NAME&gt;          # remove and clear the stored trust decision
+rpi plugin update &lt;NAME&gt;          # re-stage from the index entry, atomic swap
+</code></pre>
+<p><code>install</code>/<code>update</code> accept:</p>
+<ul>
+<li>a local directory,</li>
+<li>a local or remote <code>.tgz</code> / <code>.tar.gz</code> / <code>.tar</code> archive,</li>
+<li>an <code>owner/repo</code> GitHub reference,</li>
+<li>an <code>npm:&lt;name&gt;[@&lt;version&gt;]</code> reference — resolved through the npm registry
+to the package's <code>dist.tarball</code>, with the tarball's content authenticated
+against <code>dist.integrity</code> (<code>sha512-&lt;base64&gt;</code>; any other algorithm, a
+missing integrity field, or a digest mismatch fails closed),</li>
+<li>a git URL (<code>git+https://host/owner/repo</code>, <code>git+ssh://git@host/owner/repo.git</code>,
+<code>https://host/owner/repo.git</code>, <code>ssh://git@host/owner/repo.git</code>,
+<code>git@host:owner/repo.git</code>).</li>
+</ul>
+<p>Bounded everywhere: 256 MiB package cap, 1 MiB manifest cap, 2 MiB npm
+metadata cap, 60 s HTTP fetch timeout, 120 s git-clone timeout, and
+URL-credential redaction in every error.</p>
+<p>Trust model: <code>install</code> records the user's explicit consent as a <code>Trusted</code>
+decision for the plugin path; <code>remove</code> clears it. A plugin whose canonical
+path resolves to anything other than <code>Trusted</code> is listed but <strong>not</strong> loaded
+by <code>marketplace_extension_resources</code>, so untrusted plugins never execute.
+<code>update</code> preserves the stored trust decision.</p>
+<p>The marketplace index is a JSON list of <code>{name, repo, version, description?}</code>
+entries fetched from the <code>pluginMarketplace</code> setting (a URL or a local index
+file) or the embedded default. <code>npm:</code> sources are supported here even though
+the <code>rpi install</code> package manager defers them.</p>
+<h2 id="what-is-not-supported"><a class="header" href="#what-is-not-supported">What is not supported</a></h2>
+<ul>
+<li><code>npm:</code> sources (for the <code>rpi install</code> package manager; the plugin
+marketplace accepts them via <code>rpi plugin install</code>).</li>
+<li><code>package.json</code> lifecycle hooks or registry metadata.</li>
+<li>A <code>local:</code> scheme prefix. Local packages are written as plain filesystem
+paths.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/skills.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/memory.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/skills.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/memory.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

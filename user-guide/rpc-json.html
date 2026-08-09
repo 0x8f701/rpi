@@ -1,0 +1,420 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>RPC JSONL protocol - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="rpc-jsonl-protocol"><a class="header" href="#rpc-jsonl-protocol">RPC JSONL protocol</a></h1>
+<p><code>rpi --mode rpc</code> and the <code>rpi rpc</code> subcommand expose a long-lived,
+LF-delimited JSONL control protocol on stdin/stdout. The protocol is not
+JSON-RPC 2.0: every line is a single self-describing JSON object with a <code>type</code>
+discriminator, and every command can carry an optional <code>id</code> that the matching
+response echoes.</p>
+<h2 id="launching-the-rpc-mode"><a class="header" href="#launching-the-rpc-mode">Launching the RPC mode</a></h2>
+<ul>
+<li><code>rpi --mode rpc [&lt;other rpi flags&gt;]</code> starts the RPC server on stdin/stdout.</li>
+<li><code>rpi rpc [&lt;other rpi flags&gt;]</code> is equivalent: the subcommand forces
+<code>--mode rpc</code>, so the server always enters RPC mode. A conflicting explicit
+<code>--mode</code> is rejected. On fatal initialization error the server writes a
+failure response line to stdout.</li>
+</ul>
+<p>Both forms are headless and never prompt for project trust; pass <code>--approve</code>
+when you need project-local <code>.pi</code> resources.</p>
+<h2 id="framing"><a class="header" href="#framing">Framing</a></h2>
+<ul>
+<li>Every record is exactly one JSON object followed by a single line feed (<code>\n</code>,
+byte <code>0x0A</code>). There is no batching, length prefix, or JSON-RPC envelope.</li>
+<li>The writer serializes each record with <code>serde_json::to_writer</code>, appends <code>\n</code>,
+and flushes, so clients can read line-by-line.</li>
+<li>The reader splits incoming bytes on <code>\n</code>. A trailing carriage return (<code>\r</code>) is
+stripped before parsing, so <code>\r\n</code> sources are tolerated.</li>
+<li>If stdin reaches EOF while the last partial line is non-empty, that partial
+line is delivered as the final frame.</li>
+</ul>
+<h2 id="request-envelope"><a class="header" href="#request-envelope">Request envelope</a></h2>
+<p>Every command line is a JSON object containing at minimum:</p>
+<pre><code class="language-json">{"type": "&lt;command&gt;", "id": "optional-correlation-id", ...}
+</code></pre>
+<ul>
+<li><code>type</code> — required string, snake-cased command name (see the table below).</li>
+<li><code>id</code> — optional string. If present it is echoed in the matching response.
+Commands that do not need correlation may omit it.</li>
+</ul>
+<h2 id="response-envelope"><a class="header" href="#response-envelope">Response envelope</a></h2>
+<p>A response line has the fixed shape:</p>
+<pre><code class="language-json">{
+  "id": "optional-correlation-id",
+  "type": "response",
+  "command": "&lt;command&gt;",
+  "success": true,
+  "data": { ... }
+}
+</code></pre>
+<p>On failure:</p>
+<pre><code class="language-json">{
+  "id": "optional-correlation-id",
+  "type": "response",
+  "command": "&lt;command&gt;",
+  "success": false,
+  "error": "human-readable message"
+}
+</code></pre>
+<ul>
+<li><code>id</code> matches the request <code>id</code> when one was provided; otherwise it is omitted.</li>
+<li><code>command</code> repeats the request's <code>type</code> value.</li>
+<li><code>data</code> is present on success and is <code>null</code> for commands that return no
+payload.</li>
+<li><code>error</code> is present on failure.</li>
+</ul>
+<h2 id="correlation-and-asynchronous-events"><a class="header" href="#correlation-and-asynchronous-events">Correlation and asynchronous events</a></h2>
+<p>Command/response pairs correlate by <code>id</code>. In addition to responses, the host
+emits asynchronous <code>ApplicationEvent</code> records on the same stdout stream. Events
+have their own <code>type</code> tag (e.g. <code>session_started</code>, <code>agent_start</code>, <code>agent_settled</code>,
+<code>todo_updated</code>, <code>process_started</code>) and no <code>id</code>. A client should therefore read
+all stdout lines, dispatch <code>"response"</code> records by <code>id</code>, and dispatch events by
+<code>type</code>.</p>
+<p>A minimal exchange looks like:</p>
+<pre><code class="language-jsonl">{"type":"session_started","data":{"version":3,"id":"...","timestamp":"...","cwd":"&lt;workspace&gt;"}}
+{"type":"prompt","id":"1","message":"List Rust files"}
+{"id":"1","type":"response","command":"prompt","success":true,"data":null}
+{"type":"agent_settled"}
+</code></pre>
+<h2 id="malformed-input-and-recovery"><a class="header" href="#malformed-input-and-recovery">Malformed input and recovery</a></h2>
+<p>The RPC loop never aborts because of a bad line; it emits a failure response and
+continues reading.</p>
+<ul>
+<li>Invalid JSON → <code>{"type":"response","command":"parse","success":false,"error":"Failed to parse command: ..."}</code>. Because <code>serde_json::from_slice</code> fails before the object is inspected, an invalid JSON line cannot preserve an <code>id</code>.</li>
+<li>Missing <code>type</code> field → failure response with the preserved <code>id</code>.</li>
+<li>Unknown <code>type</code> value → <code>{"id":"...","type":"response","command":"&lt;type&gt;","success":false,"error":"Unknown command: &lt;type&gt;"}</code>.</li>
+<li>Invalid fields for a known command → failure response with <code>command</code> set to the command name and <code>id</code> preserved.</li>
+<li>Invalid <code>extension_ui_response</code> → failure response with <code>"command": "extension_ui_response"</code>.</li>
+</ul>
+<p>Because lines are split before parsing, a malformed line never corrupts the
+following valid lines.</p>
+<h2 id="extension-ui-requests-and-responses"><a class="header" href="#extension-ui-requests-and-responses">Extension UI requests and responses</a></h2>
+<p>When an extension asks to show UI, the host emits an <code>extension_ui_request</code>
+record with a unique <code>id</code> and a flattened method object:</p>
+<pre><code class="language-jsonl">{
+  "type": "extension_ui_request",
+  "id": "ui-1",
+  "method": "confirm",
+  "title": "Approve destructive edit?",
+  "message": "This will overwrite src/main.rs"
+}
+</code></pre>
+<p>Supported methods include <code>select</code>, <code>confirm</code>, <code>input</code>, <code>editor</code>, <code>notify</code>,
+<code>setStatus</code>, <code>setWidget</code>, <code>setTitle</code>, and <code>set_editor_text</code>. The client replies
+with an <code>extension_ui_response</code> carrying the same <code>id</code> and one of:</p>
+<pre><code class="language-jsonl">{"type":"extension_ui_response","id":"ui-1","confirmed":true}
+{"type":"extension_ui_response","id":"ui-1","value":"typed answer"}
+{"type":"extension_ui_response","id":"ui-1","cancelled":true}
+</code></pre>
+<p>Notification/status/widget requests are generated with a host-assigned id and
+are one-way; the client does not need to reply to them.</p>
+<h2 id="stdout-isolation"><a class="header" href="#stdout-isolation">Stdout isolation</a></h2>
+<p>All protocol output goes through a single mutex-protected stdout writer; every
+record is produced by the same JSONL write path. No ordinary command handler,
+event path, or tool prints raw text to stdout. Runtime diagnostics and panics
+are routed to stderr, so stdout remains exclusively JSONL protocol records.</p>
+<h2 id="command-reference"><a class="header" href="#command-reference">Command reference</a></h2>
+<p>The following table lists every current <code>RpcCommand</code> variant exactly once. All
+commands accept an optional <code>id</code>. Required fields are shown without brackets;
+optional fields are shown with <code>[...]</code> and their JSON key.</p>
+<div class="table-wrapper"><table><thead><tr><th><code>type</code></th><th>Fields</th><th>Example request line</th></tr></thead><tbody>
+<tr><td><code>prompt</code></td><td><code>message</code>; <code>[images]</code> array of <code>ContentBlock</code>; <code>[streamingBehavior]</code> <code>"steer"</code> or <code>"followUp"</code></td><td><code>{"type":"prompt","message":"List Rust files"}</code></td></tr>
+<tr><td><code>steer</code></td><td><code>message</code>; <code>[images]</code></td><td><code>{"type":"steer","message":"Use async rust"}</code></td></tr>
+<tr><td><code>follow_up</code></td><td><code>message</code>; <code>[images]</code></td><td><code>{"type":"follow_up","message":"Any tests?"}</code></td></tr>
+<tr><td><code>abort</code></td><td>—</td><td><code>{"type":"abort"}</code></td></tr>
+<tr><td><code>new_session</code></td><td><code>[parentSession]</code> path string</td><td><code>{"type":"new_session","parentSession":"&lt;workspace&gt;/parent.jsonl"}</code></td></tr>
+<tr><td><code>get_state</code></td><td>—</td><td><code>{"type":"get_state"}</code></td></tr>
+<tr><td><code>set_model</code></td><td><code>provider</code>, <code>modelId</code></td><td><code>{"type":"set_model","provider":"anthropic","modelId":"claude-sonnet-4-5"}</code></td></tr>
+<tr><td><code>cycle_model</code></td><td>—</td><td><code>{"type":"cycle_model"}</code></td></tr>
+<tr><td><code>get_available_models</code></td><td>—</td><td><code>{"type":"get_available_models"}</code></td></tr>
+<tr><td><code>set_thinking_level</code></td><td><code>level</code> (<code>"off"</code>, <code>"minimal"</code>, <code>"low"</code>, <code>"medium"</code>, <code>"high"</code>, <code>"xhigh"</code>)</td><td><code>{"type":"set_thinking_level","level":"high"}</code></td></tr>
+<tr><td><code>cycle_thinking_level</code></td><td>—</td><td><code>{"type":"cycle_thinking_level"}</code></td></tr>
+<tr><td><code>get_available_thinking_levels</code></td><td>—</td><td><code>{"type":"get_available_thinking_levels"}</code></td></tr>
+<tr><td><code>set_steering_mode</code></td><td><code>mode</code> (<code>"all"</code>, <code>"one-at-a-time"</code>)</td><td><code>{"type":"set_steering_mode","mode":"all"}</code></td></tr>
+<tr><td><code>set_follow_up_mode</code></td><td><code>mode</code> (<code>"all"</code>, <code>"one-at-a-time"</code>)</td><td><code>{"type":"set_follow_up_mode","mode":"one-at-a-time"}</code></td></tr>
+<tr><td><code>compact</code></td><td><code>[customInstructions]</code></td><td><code>{"type":"compact","customInstructions":"Summarize recent context"}</code></td></tr>
+<tr><td><code>set_auto_compaction</code></td><td><code>enabled</code> boolean</td><td><code>{"type":"set_auto_compaction","enabled":true}</code></td></tr>
+<tr><td><code>set_auto_retry</code></td><td><code>enabled</code> boolean</td><td><code>{"type":"set_auto_retry","enabled":true}</code></td></tr>
+<tr><td><code>abort_retry</code></td><td>—</td><td><code>{"type":"abort_retry"}</code></td></tr>
+<tr><td><code>bash</code></td><td><code>command</code>; <code>[excludeFromContext]</code> boolean</td><td><code>{"type":"bash","command":"pwd","excludeFromContext":true}</code></td></tr>
+<tr><td><code>abort_bash</code></td><td>—</td><td><code>{"type":"abort_bash"}</code></td></tr>
+<tr><td><code>get_session_stats</code></td><td>—</td><td><code>{"type":"get_session_stats"}</code></td></tr>
+<tr><td><code>export_html</code></td><td><code>[outputPath]</code></td><td><code>{"type":"export_html","outputPath":"&lt;workspace&gt;/out.html"}</code></td></tr>
+<tr><td><code>switch_session</code></td><td><code>sessionPath</code></td><td><code>{"type":"switch_session","sessionPath":"&lt;workspace&gt;/session.jsonl"}</code></td></tr>
+<tr><td><code>fork</code></td><td><code>entryId</code></td><td><code>{"type":"fork","entryId":"entry-1"}</code></td></tr>
+<tr><td><code>clone</code></td><td>—</td><td><code>{"type":"clone"}</code></td></tr>
+<tr><td><code>get_fork_messages</code></td><td>—</td><td><code>{"type":"get_fork_messages"}</code></td></tr>
+<tr><td><code>get_entries</code></td><td><code>[since]</code> entry id</td><td><code>{"type":"get_entries","since":"entry-1"}</code></td></tr>
+<tr><td><code>get_tree</code></td><td>—</td><td><code>{"type":"get_tree"}</code></td></tr>
+<tr><td><code>get_last_assistant_text</code></td><td>—</td><td><code>{"type":"get_last_assistant_text"}</code></td></tr>
+<tr><td><code>set_session_name</code></td><td><code>name</code></td><td><code>{"type":"set_session_name","name":"demo"}</code></td></tr>
+<tr><td><code>get_messages</code></td><td>—</td><td><code>{"type":"get_messages"}</code></td></tr>
+<tr><td><code>get_commands</code></td><td>—</td><td><code>{"type":"get_commands"}</code></td></tr>
+<tr><td><code>set_todos</code></td><td><code>phases</code> array of <code>TodoPhase</code></td><td><code>{"type":"set_todos","phases":[]}</code></td></tr>
+<tr><td><code>todo_op</code></td><td><code>op</code> (<code>"init"</code>, <code>"start"</code>, <code>"done"</code>, <code>"drop"</code>, <code>"rm"</code>, <code>"append"</code>, <code>"add_dependency"</code>, <code>"remove_dependency"</code>, <code>"update_dependencies"</code>, <code>"view"</code>) plus the op's fields: <code>init</code>: <code>[list]</code> array of <code>{phase, items, [agents]}</code> or <code>[items]</code>+<code>[phase]</code>; <code>start</code>/<code>done</code>/<code>drop</code>: <code>[task]</code> id-or-content + <code>[phase]</code>; <code>rm</code>: <code>[task]</code>, <code>[phase]</code>, <code>[cascade]</code>; <code>append</code>: <code>phase</code>, <code>items</code>; dependency ops: <code>task</code>, <code>dependsOn</code></td><td><code>{"type":"todo_op","op":"append","phase":"Plan","items":["ship it"]}</code></td></tr>
+<tr><td><code>loop_create</code></td><td><code>interval</code>, <code>prompt</code>; <code>[fireImmediately]</code> default <code>true</code>; <code>[durable]</code> default <code>false</code></td><td><code>{"type":"loop_create","interval":"5m","prompt":"check","fireImmediately":true,"durable":false}</code></td></tr>
+<tr><td><code>loop_update</code></td><td><code>taskId</code>; <code>[interval]</code>; <code>[prompt]</code></td><td><code>{"type":"loop_update","taskId":"loop-1","interval":"10m","prompt":"check again"}</code></td></tr>
+<tr><td><code>loop_list</code></td><td>—</td><td><code>{"type":"loop_list"}</code></td></tr>
+<tr><td><code>loop_delete</code></td><td><code>taskId</code></td><td><code>{"type":"loop_delete","taskId":"loop-1"}</code></td></tr>
+<tr><td><code>loop_cancel</code></td><td><code>taskId</code></td><td><code>{"type":"loop_cancel","taskId":"loop-1"}</code></td></tr>
+<tr><td><code>process_spawn</code></td><td><code>spec</code> (<code>argv</code>, <code>cwd</code>, <code>[env]</code>, <code>[tty]</code>, <code>[terminalSize]</code>, <code>[label]</code>, <code>[timeoutMs]</code>, <code>[outputBytes]</code>)</td><td><code>{"type":"process_spawn","spec":{"argv":["printf","ok"],"cwd":"&lt;workspace&gt;","env":{},"tty":false}}</code></td></tr>
+<tr><td><code>process_list</code></td><td>—</td><td><code>{"type":"process_list"}</code></td></tr>
+<tr><td><code>process_describe</code></td><td><code>processId</code></td><td><code>{"type":"process_describe","processId":"00000000-0000-7000-8000-000000000000"}</code></td></tr>
+<tr><td><code>process_logs</code></td><td><code>processId</code>; <code>[cursor]</code> default <code>0</code>; <code>[limitBytes]</code></td><td><code>{"type":"process_logs","processId":"00000000-0000-7000-8000-000000000000","cursor":0,"limitBytes":1024}</code></td></tr>
+<tr><td><code>process_write</code></td><td><code>processId</code>, <code>dataBase64</code></td><td><code>{"type":"process_write","processId":"00000000-0000-7000-8000-000000000000","dataBase64":"b2s="}</code></td></tr>
+<tr><td><code>process_keys</code></td><td><code>processId</code>, <code>keys</code> (<code>"ENTER"</code>, <code>"TAB"</code>, <code>"ESCAPE"</code>, <code>"CTRL_C"</code>, <code>"CTRL_D"</code>, <code>"UP"</code>, <code>"DOWN"</code>, <code>"LEFT"</code>, <code>"RIGHT"</code>)</td><td><code>{"type":"process_keys","processId":"00000000-0000-7000-8000-000000000000","keys":["ENTER","CTRL_C"]}</code></td></tr>
+<tr><td><code>process_resize</code></td><td><code>processId</code>, <code>cols</code>, <code>rows</code></td><td><code>{"type":"process_resize","processId":"00000000-0000-7000-8000-000000000000","cols":80,"rows":24}</code></td></tr>
+<tr><td><code>process_signal</code></td><td><code>processId</code>, <code>signal</code> (<code>"SIGINT"</code>, <code>"SIGTERM"</code>, <code>"SIGHUP"</code>, <code>"SIGQUIT"</code>, <code>"SIGKILL"</code>)</td><td><code>{"type":"process_signal","processId":"00000000-0000-7000-8000-000000000000","signal":"SIGTERM"}</code></td></tr>
+<tr><td><code>process_stop</code></td><td><code>processId</code></td><td><code>{"type":"process_stop","processId":"00000000-0000-7000-8000-000000000000"}</code></td></tr>
+<tr><td><code>process_wait</code></td><td><code>processId</code>; <code>[timeoutMs]</code></td><td><code>{"type":"process_wait","processId":"00000000-0000-7000-8000-000000000000","timeoutMs":500}</code></td></tr>
+</tbody></table>
+</div>
+<h3 id="common-payload-notes"><a class="header" href="#common-payload-notes">Common payload notes</a></h3>
+<ul>
+<li><code>images</code> items are <code>ContentBlock</code> objects; an inline image looks like
+<code>{"type":"image","data":"&lt;base64&gt;","mimeType":"image/png"}</code>.</li>
+<li><code>QueueMode</code> values serialize as kebab-case: <code>"all"</code> and <code>"one-at-a-time"</code>.</li>
+<li><code>ThinkingLevel</code> values are lowercase: <code>"off"</code>, <code>"minimal"</code>, <code>"low"</code>,
+<code>"medium"</code>, <code>"high"</code>, <code>"xhigh"</code>.</li>
+<li><code>ProcessSignal</code> values serialize as <code>SCREAMING_SNAKE_CASE</code>.</li>
+<li><code>ProcessKey</code> values serialize as the variant names shown above.</li>
+<li><code>ProcessId</code> is a string (UUID v7 in generated ids), not a number.</li>
+</ul>
+<h2 id="example-rpc-session"><a class="header" href="#example-rpc-session">Example RPC session</a></h2>
+<pre><code class="language-jsonl">{"type":"prompt","id":"1","message":"List Rust files"}
+{"type":"get_state","id":"2"}
+{"id":"1","type":"response","command":"prompt","success":true,"data":null}
+{"id":"2","type":"response","command":"get_state","success":true,"data":{"thinkingLevel":"medium","isStreaming":false,"sessionName":"demo"}}
+{"type":"agent_settled"}
+{"type":"bash","id":"3","command":"ls *.rs"}
+{"id":"3","type":"response","command":"bash","success":true,"data":{"exitCode":0,"stdout":"main.rs\nlib.rs\n"}}
+</code></pre>
+<p>For a complete Rust client example, see
+<a href="../../../examples/src/bin/rpc_client.rs"><code>examples/src/bin/rpc_client.rs</code></a>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../user-guide/authentication.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../user-guide/web.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../user-guide/authentication.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../user-guide/web.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

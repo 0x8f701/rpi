@@ -1,0 +1,335 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Local / self-hosted models with llama.cpp - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="local--self-hosted-models-with-llamacpp"><a class="header" href="#local--self-hosted-models-with-llamacpp">Local / self-hosted models with llama.cpp</a></h1>
+<p><code>rpi</code> has first-class support for a local <a href="https://github.com/ggerganov/llama.cpp">llama.cpp</a>
+router. When a router is configured, its live models are merged into the
+catalog under the <code>llama.cpp</code> provider and can be selected like any other
+model.</p>
+<h2 id="configure-a-router"><a class="header" href="#configure-a-router">Configure a router</a></h2>
+<pre><code class="language-sh">rpi llama configure http://localhost:8080 [--api-key TOKEN]
+</code></pre>
+<p>Source: <code>crates/pi-cli/src/args.rs:307-314</code>,
+<code>crates/pi-cli/src/llama_commands.rs:14-27</code>.</p>
+<p><code>rpi llama configure</code> validates the router by calling its <code>/v1/models</code> endpoint
+before persisting the settings. The base URL is normalized: a trailing <code>/v1</code> is
+stripped, query strings and fragments are removed, embedded credentials are
+rejected, and only <code>http</code>/<code>https</code> schemes are allowed. The configuration is
+persisted in the agent directory under the llama data directory.
+Source: <code>crates/pi-ai/src/llama.rs:38-50</code>,
+<code>crates/pi-ai/src/llama.rs:359-377</code>,
+<code>crates/pi-coding/src/llama.rs:173-194</code>.</p>
+<p>You can also set <code>LLAMA_BASE_URL</code> and optionally <code>LLAMA_API_KEY</code> to skip
+explicit configuration. On Unix, the persisted settings file must not be
+readable by group or other users.
+Source: <code>crates/pi-coding/src/llama.rs:130-159</code>.</p>
+<h2 id="use-local-models"><a class="header" href="#use-local-models">Use local models</a></h2>
+<p>Once configured, local models appear as <code>llama.cpp/&lt;MODEL_ID&gt;</code>:</p>
+<pre><code class="language-sh">rpi -m llama.cpp/&lt;model-id&gt; --print "Hello"
+</code></pre>
+<p>Router models are refreshed automatically at startup unless <code>PI_OFFLINE</code> is
+set. If the router is unreachable, <code>rpi</code> falls back to the cached catalog with a
+warning and continues using the last successfully observed snapshot.
+Source: <code>crates/pi-cli/src/session_run.rs:284-299</code>.</p>
+<h2 id="manage-the-router"><a class="header" href="#manage-the-router">Manage the router</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Subcommand</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>rpi llama status</code></td><td>Show configured router and live models</td></tr>
+<tr><td><code>rpi llama status --reload</code></td><td>Ask the router to rescan its model directory</td></tr>
+<tr><td><code>rpi llama refresh</code></td><td>Refresh live models; fall back to cache</td></tr>
+<tr><td><code>rpi llama load MODEL</code></td><td>Load a model through the router</td></tr>
+<tr><td><code>rpi llama unload MODEL</code></td><td>Unload a model through the router</td></tr>
+</tbody></table>
+</div>
+<p>Source: <code>crates/pi-cli/src/args.rs:316-332</code>,
+<code>crates/pi-cli/src/llama_commands.rs:24-69</code>.</p>
+<p><code>status</code> prints each router model on its own line with a status flag such as
+<code>loaded</code>, <code>loading</code>, <code>unloaded</code>, or <code>sleeping</code>.
+Source: <code>crates/pi-cli/src/llama_commands.rs:24-37</code>.</p>
+<p><code>load</code> and <code>unload</code> request the router to change its active model, then refresh
+the live catalog and persist the new snapshot atomically.
+Source: <code>crates/pi-coding/src/llama.rs:247-290</code>.</p>
+<p>In the TUI or REPL, <code>/llama</code> accepts the same operations:</p>
+<pre><code class="language-text">/llama status
+/llama refresh
+/llama load llama-3.1-8b
+/llama unload llama-3.1-8b
+/llama configure http://localhost:8080 [TOKEN]
+</code></pre>
+<p>Source: <code>crates/pi-cli/src/interactive_commands.rs:260-264</code>,
+<code>crates/pi-cli/src/llama_commands.rs:156-222</code>.</p>
+<h2 id="download-gguf-models-from-hugging-face"><a class="header" href="#download-gguf-models-from-hugging-face">Download GGUF models from Hugging Face</a></h2>
+<pre><code class="language-sh"># Search
+rpi llama search "meta-llama/Llama-3.1-8B"
+
+# List quantizations and file checksums
+rpi llama details meta-llama/Llama-3.1-8B-GGUF
+
+# Download a quantization (or the first available one if -q is omitted)
+rpi llama download meta-llama/Llama-3.1-8B-GGUF -q Q4_K_M
+
+# List local downloads
+rpi llama installed
+</code></pre>
+<p>Source: <code>crates/pi-cli/src/args.rs:333-353</code>,
+<code>crates/pi-cli/src/llama_commands.rs:66-107</code>.</p>
+<p><code>search</code> returns repository ids and download counts. <code>details</code> lists each
+quantization, the files it contains, their sizes, and SHA-256 checksums when
+available. <code>download</code> installs the selected quantization into the agent's llama
+models directory.
+Source: <code>crates/pi-ai/src/llama.rs:494-525</code>,
+<code>crates/pi-ai/src/llama.rs:526-633</code>,
+<code>crates/pi-coding/src/llama.rs:294-413</code>.</p>
+<p>Downloads are:</p>
+<ul>
+<li>Atomic: written to a <code>.part</code> file and renamed into place only after the
+checksum succeeds.</li>
+<li>Resumable: a partial <code>.part</code> file is reused with an HTTP <code>Range</code> request.</li>
+<li>Verifiable: each file is checked against the SHA-256 from Hugging Face when
+a checksum is provided.</li>
+<li>Cancellable: pressing Ctrl-C cancels the in-progress download cleanly.</li>
+</ul>
+<p>Source: <code>crates/pi-coding/src/llama.rs:439-638</code>.</p>
+<p>Authentication uses the <code>HF_TOKEN</code> environment variable or an already-configured
+Hugging Face token. A custom Hugging Face endpoint can be set with <code>HF_ENDPOINT</code>.</p>
+<h2 id="authentication"><a class="header" href="#authentication">Authentication</a></h2>
+<p>If your router requires a bearer token, pass it with <code>--api-key</code> during
+configuration or set <code>LLAMA_API_KEY</code>. The key is sent as an
+<code>Authorization: Bearer</code> header on router management and inference requests.
+Source: <code>crates/pi-coding/src/llama.rs:130-159</code>,
+<code>crates/pi-cli/src/models_config.rs:295-308</code>.</p>
+<h2 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>LLAMA_BASE_URL</code></td><td>Router base URL (skips <code>rpi llama configure</code>)</td></tr>
+<tr><td><code>LLAMA_API_KEY</code></td><td>Router bearer token</td></tr>
+<tr><td><code>HF_TOKEN</code></td><td>Hugging Face token for GGUF search/download</td></tr>
+<tr><td><code>HF_ENDPOINT</code></td><td>Custom Hugging Face API endpoint</td></tr>
+<tr><td><code>PI_OFFLINE</code></td><td>Skip router refresh at startup</td></tr>
+<tr><td><code>PI_CODING_AGENT_DIR</code></td><td>Override the agent directory that stores llama settings and downloads</td></tr>
+</tbody></table>
+</div>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/prompt-templates.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/security.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/prompt-templates.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/security.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

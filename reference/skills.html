@@ -1,0 +1,401 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Skills - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="skills"><a class="header" href="#skills">Skills</a></h1>
+<p>Skills are Markdown files with YAML frontmatter that provide specialized instructions for specific tasks. They are listed in the system prompt and loaded on demand by the model through the <code>read</code> tool using <code>skill://</code> URIs.</p>
+<p>For how skills differ from prompt templates, agents, and context files, see <a href="prompt-templates.html#how-templates-differ-from-skills-agents-and-context-files"><code>prompt-templates.md</code></a>.</p>
+<p>In this document <code>&lt;agent-dir&gt;</code> means the resolved agent configuration directory (<code>PI_CODING_AGENT_DIR</code> or the platform default), and <code>&lt;workspace&gt;</code> means the current working directory passed to the session.</p>
+<h2 id="file-format-and-frontmatter"><a class="header" href="#file-format-and-frontmatter">File format and frontmatter</a></h2>
+<p>A skill is usually a directory containing <code>SKILL.md</code>:</p>
+<pre><code class="language-text">&lt;agent-dir&gt;/skills/rust-review/
+  └── SKILL.md
+</code></pre>
+<pre><code class="language-markdown">---
+name: rust-review
+description: Review Rust code for idioms and safety.
+globs:
+  - "*.rs"
+  - "src/**/*.rs"
+alwaysApply: false
+hidden: false
+disable-model-invocation: false
+---
+
+# Rust review
+
+Check for unnecessary clones, panic paths, and async cancellation safety.
+</code></pre>
+<p>Fields:</p>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Required</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>name</code></td><td>No</td><td>Skill identifier. Defaults to the directory name. Must be lowercase <code>a-z</code>, <code>0-9</code>, and hyphens; ≤ 64 UTF-16 code units; must not start/end with a hyphen or contain <code>--</code>.</td></tr>
+<tr><td><code>description</code></td><td><strong>Yes</strong></td><td>Used in the system prompt and selector. Must be non-empty and ≤ 1,024 UTF-16 code units. A skill with no description is dropped.</td></tr>
+<tr><td><code>globs</code></td><td>No</td><td>Path patterns that trigger the selector when the user's request mentions matching files. YAML list or comma-separated string.</td></tr>
+<tr><td><code>alwaysApply</code> / <code>always-apply</code></td><td>No</td><td>When the YAML boolean <code>true</code>, the skill is autoloaded into the context.</td></tr>
+<tr><td><code>hide</code> / <code>hidden</code></td><td>No</td><td>When the YAML boolean <code>true</code>, the skill is excluded from the <code>&lt;available_skills&gt;</code> block and selector.</td></tr>
+<tr><td><code>disable-model-invocation</code></td><td>No</td><td>When the YAML boolean <code>true</code>, the skill is hidden from the system prompt. Quoted <code>"true"</code> is treated as the string <code>true</code> and does <strong>not</strong> hide the skill.</td></tr>
+</tbody></table>
+</div>
+<p>Only the plain YAML boolean <code>true</code> counts for the boolean fields; quoted values are strings.</p>
+<h2 id="discovery"><a class="header" href="#discovery">Discovery</a></h2>
+<p>Skills are discovered in these locations, in precedence order:</p>
+<ol>
+<li><code>&lt;agent-dir&gt;/skills/</code> — global user skills, always scanned.</li>
+<li><code>&lt;workspace&gt;/.pi/skills/</code> — project-local skills, scanned only when the project is trusted.</li>
+<li>Settings <code>skills</code> and package <code>skills</code> resources.</li>
+<li>Explicit <code>--skill PATH</code> arguments.</li>
+</ol>
+<p>Discovery rules from <code>load_skills_from_dir</code> in <a href="../../../crates/pi-coding/src/resources.rs"><code>crates/pi-coding/src/resources.rs</code></a>:</p>
+<ul>
+<li>A directory containing <code>SKILL.md</code> is a <strong>skill root</strong>; its children are not scanned further.</li>
+<li>At a root without <code>SKILL.md</code>, direct <code>.md</code> children are loaded and subdirectories are scanned recursively for <code>SKILL.md</code>.</li>
+<li><code>node_modules</code>, hidden directories, and entries matched by <code>.gitignore</code>, <code>.ignore</code>, or <code>.fdignore</code> are skipped.</li>
+<li>Symlinks are followed, but real paths are de-duplicated to avoid loops.</li>
+</ul>
+<p>Global skills are marked <code>source: User</code> and trusted. Project skills are <code>source: Project</code> and trusted only when the project is trusted. Explicit skills are <code>source: Explicit</code> and trusted. Package skills use <code>PackageGlobal</code> or <code>PackageProject</code> source and follow the package trust rules from <a href="packages.html"><code>packages.md</code></a>.</p>
+<p>During default directory scanning, the first skill with a given name wins: global skills are loaded before project skills, so a global skill shadows a project skill of the same name. After configured, package, and explicit skills are merged in, any remaining duplicate name is a hard error.</p>
+<h2 id="trust-gates-and-cli-flags"><a class="header" href="#trust-gates-and-cli-flags">Trust gates and CLI flags</a></h2>
+<p>Project-local <code>.pi/skills/</code> are loaded only when the resolved project trust decision allows project resources. Trust is resolved by <a href="../../../crates/pi-coding/src/trust.rs"><code>crates/pi-coding/src/trust.rs</code></a>:</p>
+<ol>
+<li>One-run <code>--approve</code> / <code>--no-approve</code>.</li>
+<li>Persisted decision in <code>&lt;agent-dir&gt;/trust.json</code>.</li>
+<li><code>defaultProjectTrust</code> in settings (<code>ask</code>, <code>always</code>, <code>never</code>).</li>
+<li>In headless modes, an unset decision is treated as untrusted.</li>
+</ol>
+<p>If a project has no <code>.pi</code> directory, it is trusted by default.</p>
+<pre><code class="language-sh">rpi --skill ./my-skills/rust-review.md --print "review src/main.rs"
+rpi --no-skills --print "hello"     # disables discovered/configured skills, explicit paths still load
+rpi --no-context-files --print "hello" # also skip AGENTS.md / CLAUDE.md
+</code></pre>
+<h2 id="safe-path-containment"><a class="header" href="#safe-path-containment">Safe path containment</a></h2>
+<p>Explicit skill paths are canonicalized and validated before loading:</p>
+<ul>
+<li>Relative paths are resolved against <code>--cwd</code> and must not escape it through symlinks.</li>
+<li>Paths inside a project <code>.pi/</code> directory require project trust.</li>
+<li>Missing paths are a hard error.</li>
+</ul>
+<p>When a skill is loaded, <code>base_dir</code> is set to the directory containing <code>SKILL.md</code>. The skill resolver in <a href="../../../crates/pi-coding/src/selector.rs"><code>crates/pi-coding/src/selector.rs</code></a> (<code>resolve_skill_uri</code>) restricts <code>skill://&lt;name&gt;/&lt;relative-path&gt;</code> reads to that base directory:</p>
+<ul>
+<li><code>..</code>, absolute paths, <code>?</code>, <code>#</code>, and backslashes are rejected.</li>
+<li>The resolved path is canonicalized and must be inside <code>base_dir</code>.</li>
+<li>The declared <code>file_path</code> itself must also be inside <code>base_dir</code>.</li>
+<li>Only trusted skills can be resolved.</li>
+</ul>
+<h2 id="selection-and-resolver"><a class="header" href="#selection-and-resolver">Selection and resolver</a></h2>
+<p>The deterministic selector in <a href="../../../crates/pi-coding/src/selector.rs"><code>crates/pi-coding/src/selector.rs</code></a> ranks skills for each request. Hidden skills and skills with <code>disable-model-invocation: true</code> are excluded from ranking. The score is built from:</p>
+<div class="table-wrapper"><table><thead><tr><th>Signal</th><th>Points</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Exact name match</td><td>1,600</td><td>Request tokens equal skill name phrase.</td></tr>
+<tr><td>Name phrase contained in request</td><td>1,000</td><td>e.g. request contains <code>"rust review"</code>.</td></tr>
+<tr><td>Name token overlap</td><td>220 each</td><td>Stopwords are ignored.</td></tr>
+<tr><td>Description token overlap</td><td>60 each</td><td>Stopwords are ignored.</td></tr>
+<tr><td>Description phrase (≥ 2 tokens)</td><td>90 per token</td><td>Longest shared phrase.</td></tr>
+<tr><td><code>alwaysApply: true</code></td><td>+2,000</td><td>Also makes the skill autoload.</td></tr>
+<tr><td>Matching <code>globs</code> path</td><td>+800 per matched pattern</td><td>Patterns are <code>globset</code> globs matched against request paths.</td></tr>
+<tr><td>Source precedence</td><td>+precedence</td><td><code>User</code> 50, <code>Project</code> 40, <code>PackageGlobal</code> 30, <code>PackageProject</code> 20, <code>Explicit</code> 10.</td></tr>
+</tbody></table>
+</div>
+<p>Only skills scoring at least <code>min_score</code> (default 60) are returned, up to <code>max_results</code> (default 5).</p>
+<p>An optional classifier can re-rank the deterministic candidates when <code>selector.classifier.enabled: true</code> in settings. The classifier is never allowed to invent new skill names; it only reorders candidates already produced by the deterministic pass.</p>
+<p>Selection recommendations are rendered into the system prompt as <code>&lt;selection_recommendations&gt;</code>. They augment model judgment; they do not replace it. The system prompt explicitly tells the model:</p>
+<blockquote>
+<p>Use the <code>read</code> tool with <code>skill://&lt;name&gt;</code> to load a skill when the task matches its description. When a skill file references a relative path, read it as <code>skill://&lt;name&gt;/&lt;relative-path&gt;</code>; the resolver confines access to that skill's base directory.</p>
+</blockquote>
+<h3 id="autoload-skills"><a class="header" href="#autoload-skills">Autoload skills</a></h3>
+<p>Some skills are loaded automatically:</p>
+<ul>
+<li>Skills with <code>alwaysApply: true</code> (if trusted and not disabled).</li>
+<li>High-scoring skills that also have <code>alwaysApply: true</code>.</li>
+<li>Skills named in a selected agent's <code>autoloadSkills</code> frontmatter.</li>
+</ul>
+<p>Autoloaded skill bodies are read from disk and inserted into the prompt context.</p>
+<h2 id="usage-in-the-prompt"><a class="header" href="#usage-in-the-prompt">Usage in the prompt</a></h2>
+<p>The <code>&lt;available_skills&gt;</code> block is appended to the system prompt <strong>only when the <code>read</code> tool is selected</strong>. It contains every visible, trusted skill:</p>
+<pre><code class="language-xml">&lt;available_skills&gt;
+  &lt;skill&gt;
+    &lt;name&gt;rust-review&lt;/name&gt;
+    &lt;description&gt;Review Rust code for idioms and safety.&lt;/description&gt;
+    &lt;location&gt;skill://rust-review&lt;/location&gt;
+  &lt;/skill&gt;
+&lt;/available_skills&gt;
+</code></pre>
+<p>Untrusted, hidden, and disabled skills are excluded. The model decides when to load a skill; deterministic recommendations are advisory.</p>
+<h2 id="interactive-skill-commands"><a class="header" href="#interactive-skill-commands">Interactive skill commands</a></h2>
+<p>When <code>enable_skill_commands</code> is <code>true</code> (the default), the REPL and TUI register a <code>/skill:&lt;name&gt;</code> command for each visible skill. Typing:</p>
+<pre><code>/skill:rust-review review src/lib.rs
+</code></pre>
+<p>expands the skill body into the user prompt. This is a convenience for manually loading a skill; the model can still load any skill via <code>read</code> on its own.</p>
+<h2 id="agents"><a class="header" href="#agents">Agents</a></h2>
+<p>Agents are defined in <code>&lt;agent-dir&gt;/agents/*.md</code> and, when trusted, <code>&lt;workspace&gt;/.pi/agents/*.md</code>. They look similar to skills but are used for a different purpose:</p>
+<div class="table-wrapper"><table><thead><tr><th></th><th>Skill</th><th>Agent</th></tr></thead><tbody>
+<tr><td>Location</td><td><code>skills/</code></td><td><code>agents/</code></td></tr>
+<tr><td>Frontmatter</td><td><code>name</code>, <code>description</code>, <code>globs</code>, <code>alwaysApply</code>, <code>disable-model-invocation</code></td><td><code>name</code>, <code>description</code>, <code>tools</code>, <code>autoloadSkills</code>, <code>model</code>, <code>thinkingLevel</code></td></tr>
+<tr><td>Use</td><td>Loaded by the current session via <code>skill://</code></td><td>Spawned as a subagent by the orchestration runtime</td></tr>
+<tr><td>System prompt</td><td>Listed in <code>&lt;available_skills&gt;</code></td><td>Becomes the child agent's full system prompt</td></tr>
+</tbody></table>
+</div>
+<p>The bundled <code>task</code> agent is always available. See <a href="../../../crates/pi-coding/src/orchestration/definitions.rs"><code>crates/pi-coding/src/orchestration/definitions.rs</code></a> for the agent definition format.</p>
+<h2 id="sdk-behavior"><a class="header" href="#sdk-behavior">SDK behavior</a></h2>
+<p>The <code>AgentSessionBuilder</code> in <a href="../../../crates/pi-coding/src/sdk.rs"><code>crates/pi-coding/src/sdk.rs</code></a> defaults to <code>ResourceDiscovery::Disabled</code>, so programmatic sessions do <strong>not</strong> auto-discover skills. To opt in, call <code>discover_resources(ResourceManagerOptions)</code>; project-local skills still require trust.</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use pi_ai::Model;
+use pi_coding::{AgentSessionBuilder, AgentSession, ResourceManagerOptions};
+
+async fn discovery_session(model: Model) -&gt; Result&lt;AgentSession, Box&lt;dyn std::error::Error&gt;&gt; {
+    let session = AgentSessionBuilder::new(model, "&lt;workspace&gt;")
+        .discover_resources(ResourceManagerOptions::new("&lt;workspace&gt;", "&lt;agent-dir&gt;"))?
+        .build()
+        .await?;
+    Ok(session)
+}
+<span class="boring">}</span></code></pre></pre>
+<p>This makes skill discovery explicit and fail-closed: no project skills are loaded unless the caller opts in and the project is trusted.</p>
+<h2 id="example-create-and-use-a-skill"><a class="header" href="#example-create-and-use-a-skill">Example: create and use a skill</a></h2>
+<p>Create a project skill:</p>
+<pre><code class="language-sh">mkdir -p .pi/skills/rust-review
+cat &gt; .pi/skills/rust-review/SKILL.md &lt;&lt;'EOF'
+---
+name: rust-review
+description: Review Rust code for safety, idioms, and clarity.
+globs:
+  - "*.rs"
+---
+
+# Rust review
+
+Check for unnecessary clones, panic paths, and async cancellation safety.
+EOF
+</code></pre>
+<p>Run with project trust:</p>
+<pre><code class="language-sh">rpi --approve --print "Review src/lib.rs using the rust-review skill"
+</code></pre>
+<p>Or in an interactive session type:</p>
+<pre><code>/skill:rust-review review src/lib.rs
+</code></pre>
+<p>The resolver ensures that any relative path inside the skill (for example a referenced checklist file) is read from <code>.pi/skills/rust-review/</code>, never from outside the project.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/extensions.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/packages.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/extensions.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/packages.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

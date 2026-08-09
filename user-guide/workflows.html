@@ -1,0 +1,494 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Isolated concurrent workflows - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="isolated-concurrent-workflows"><a class="header" href="#isolated-concurrent-workflows">Isolated concurrent workflows</a></h1>
+<p>A <strong>workflow</strong> is a durable, isolated, self-contained run of the agent that
+plans an objective into a canonical Todo DAG and then executes that DAG with
+delegated subagents. Workflows are managed with <code>/workflow</code> and rendered live
+in a dedicated TUI page (subagents, tasks, and IRC). The durable lifecycle
+lives in <code>crates/pi-coding/src/workflow/</code> (manager, store, supervisor) and the
+isolation backends in <code>crates/pi-coding/src/workflow_worktree/</code> (git worktrees)
+and <code>crates/pi-coding/src/workflow_worktree/overlay.rs</code> (overlayfs).</p>
+<h2 id="lifecycle"><a class="header" href="#lifecycle">Lifecycle</a></h2>
+<p>A workflow moves through a strict status machine
+(<code>WorkflowStatus</code> in <code>crates/pi-coding/src/workflow/mod.rs:53-64</code>):</p>
+<div class="table-wrapper"><table><thead><tr><th>Status</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>queued</code></td><td>Created, waiting for a runtime slot.</td></tr>
+<tr><td><code>planning</code></td><td>A bounded planning turn builds the canonical Todo DAG.</td></tr>
+<tr><td><code>running</code></td><td>The Todo DAG is being executed by delegated subagents.</td></tr>
+<tr><td><code>paused</code></td><td>Execution is suspended; <code>resume</code> continues it.</td></tr>
+<tr><td><code>integrating</code></td><td>Committed workflow changes are being merged back.</td></tr>
+<tr><td><code>completed</code></td><td>All tasks done; integration applied (or nothing to integrate).</td></tr>
+<tr><td><code>failed</code></td><td>Planning/execution/integration hit a hard error (<code>WorkflowFailure</code>).</td></tr>
+<tr><td><code>cancelled</code></td><td>Explicitly cancelled.</td></tr>
+<tr><td><code>conflicted</code></td><td>Integration produced merge conflicts.</td></tr>
+</tbody></table>
+</div>
+<p>Lifecycle transitions are validated in two places: the manager rejects
+actions that are not allowed for the current status (<code>ensure_allowed</code> in
+<code>workflow/manager.rs</code>), and the supervisor projects only legal transitions
+back (<code>validate_status</code>). Pause is legal from <code>queued</code>/<code>planning</code>/<code>running</code>;
+resume is legal from <code>paused</code>/<code>planning</code>/<code>running</code>; cancel is legal from any
+non-terminal status; integrate is legal from <code>completed</code>/<code>paused</code>/<code>conflicted</code>
+(manager) and completes from <code>completed</code>/<code>conflicted</code>/<code>failed</code> (supervisor).</p>
+<h3 id="transition-table-with-reasons"><a class="header" href="#transition-table-with-reasons">Transition table with reasons</a></h3>
+<p>Every transition below is enforced at <code>workflow/manager.rs:517-531</code> (action
+gates and runtime projection) and <code>workflow/supervisor.rs:652-716</code>
+(supervisor-side handling); the reasons are the conditions that make each
+transition legal.</p>
+<div class="table-wrapper"><table><thead><tr><th>From</th><th>Action / event</th><th>To</th><th>Reason / condition</th></tr></thead><tbody>
+<tr><td><code>queued</code></td><td><code>Start</code> (runtime)</td><td><code>planning</code></td><td>The workflow leaves the queue and runs its bounded planning turn.</td></tr>
+<tr><td><code>queued</code></td><td><code>Pause</code></td><td><code>paused</code></td><td>User <code>pause</code> before planning starts.</td></tr>
+<tr><td><code>queued</code></td><td><code>Cancel</code></td><td><code>cancelled</code></td><td>User cancel; allowed from any non-terminal status.</td></tr>
+<tr><td><code>planning</code></td><td><code>Pause</code></td><td><code>paused</code></td><td>User <code>pause</code> mid-planning; the planning turn is aborted and later <code>resume</code> restarts the bounded flow.</td></tr>
+<tr><td><code>planning</code></td><td>plan committed / budget reached / timed out</td><td><code>running</code></td><td>A committed canonical Todo DAG is armed for execution (<code>arm_plan_and_run</code> / <code>preserve_plan_and_run</code>).</td></tr>
+<tr><td><code>planning</code></td><td><code>Cancel</code></td><td><code>cancelled</code></td><td>User cancel.</td></tr>
+<tr><td><code>planning</code></td><td>hard error</td><td><code>failed</code></td><td>Planning hit a <code>WorkflowFailure</code>.</td></tr>
+<tr><td><code>running</code></td><td><code>Pause</code></td><td><code>paused</code></td><td>User <code>pause</code>; backend parks the worktree and child jobs settle.</td></tr>
+<tr><td><code>running</code></td><td><code>Cancel</code></td><td><code>cancelled</code></td><td>User cancel; active workflow job ids are cancelled first (<code>supervisor.rs:702-716</code>).</td></tr>
+<tr><td><code>running</code></td><td>DAG settles completed</td><td><code>completed</code></td><td>All tasks done or abandoned (<code>todo_dag_status</code> = <code>Settled</code> + exactly complete, <code>supervisor.rs:1228-1237</code>).</td></tr>
+<tr><td><code>running</code></td><td>DAG settles failed / blocked</td><td><code>failed</code></td><td>Settled-but-incomplete, or the DAG is permanently blocked.</td></tr>
+<tr><td><code>paused</code></td><td><code>Resume</code></td><td><code>running</code> / <code>completed</code></td><td>Backend resumes execution; a DAG that finished while paused settles into <code>completed</code> and auto-integrates (<code>manager.rs:438-444</code>).</td></tr>
+<tr><td><code>paused</code></td><td><code>Integrate</code></td><td><code>integrating</code></td><td>Manual integration of a paused workflow is allowed.</td></tr>
+<tr><td><code>paused</code></td><td><code>Cancel</code></td><td><code>cancelled</code></td><td>User cancel.</td></tr>
+<tr><td><code>completed</code></td><td><code>Integrate</code> (manual or auto)</td><td><code>integrating</code></td><td>Auto-integrates whenever the DAG settles into <code>completed</code> with no recorded integration (<code>manager.rs:372-377</code>); <code>Conflicted</code> outcomes land here for manual retry.</td></tr>
+<tr><td><code>integrating</code></td><td>merge applied</td><td><code>completed</code></td><td>Integration outcome <code>Applied { strategy, result_commit }</code>.</td></tr>
+<tr><td><code>integrating</code></td><td>merge conflicts</td><td><code>conflicted</code></td><td>Integration outcome <code>Conflicted { conflicts }</code> — manual <code>/workflow integrate</code> is required.</td></tr>
+<tr><td><code>integrating</code></td><td>merge error</td><td><code>failed</code></td><td>Hard integration error (e.g. <code>DirtyBase</code> refused).</td></tr>
+</tbody></table>
+</div>
+<p>The supervisor may also project <code>queued → completed</code>/<code>failed</code> (restored
+terminal outcomes) and <code>planning → completed</code>/<code>failed</code>; terminal statuses
+(<code>completed</code>/<code>failed</code>/<code>cancelled</code>/<code>conflicted</code>) and <code>paused</code>/<code>integrating</code>
+can never be re-entered from a runtime projection — a stale or regressing
+projection is rejected (<code>validate_runtime_projection</code>).</p>
+<h2 id="workflow-command"><a class="header" href="#workflow-command"><code>/workflow</code> command</a></h2>
+<p>Canonical usage (<code>WORKFLOW_USAGE</code> in <code>crates/pi-cli/src/workflow_commands/mod.rs:14-15</code>):</p>
+<pre><code class="language-text">/workflow [list|show [id|name]|create &lt;objective&gt;|create &lt;name&gt; &lt;objective&gt;|pause|resume|cancel|integrate|remove]
+</code></pre>
+<ul>
+<li>Bare <code>/workflow</code> opens the dedicated workflows page in the TUI.</li>
+<li><code>/workflow list</code> lists workflows (<code>status · name · id · objective</code>).</li>
+<li><code>/workflow show [id|name]</code> shows one workflow's detail.</li>
+<li><code>/workflow create &lt;name&gt; &lt;objective&gt;</code> (or a single argument used as both)
+creates a workflow; the newly created workflow becomes the selection.</li>
+<li><code>/workflow pause|resume|cancel|integrate|remove [id|name]</code> operate on the
+selected workflow, or on the named one. Selectors accept the workflow id or
+an exact name.</li>
+</ul>
+<p>Source: <code>crates/pi-cli/src/workflow_commands/mod.rs</code> (parse contract and
+executor), <code>crates/pi-cli/src/workflow_rpc.rs</code> (RPC surface).</p>
+<p>The RPC surface (<code>WorkflowRpcCommand</code> in <code>workflow_rpc.rs:87-130</code>) mirrors
+the slash command on the JSONL control plane (see
+<a href="rpc-json.html"><code>rpc-json.md</code></a>):</p>
+<div class="table-wrapper"><table><thead><tr><th><code>type</code></th><th>Fields</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>workflow_create</code></td><td><code>name</code>, <code>objective</code>; optional <code>id</code></td><td>Name and objective must be non-empty.</td></tr>
+<tr><td><code>workflow_list</code></td><td>—</td><td>Returns <code>{ "workflows": [...] }</code>.</td></tr>
+<tr><td><code>workflow_get</code></td><td>optional <code>workflowId</code> or <code>name</code></td><td>One of the two is required.</td></tr>
+<tr><td><code>workflow_pause</code> / <code>workflow_resume</code> / <code>workflow_cancel</code> / <code>workflow_integrate</code> / <code>workflow_remove</code></td><td><code>workflowId</code></td><td>Selector ids resolve exactly; unknown or ambiguous names fail actionably.</td></tr>
+</tbody></table>
+</div>
+<p>Wire snapshots project the durable <code>WorkflowSnapshot</code> (status, integration
+<code>none</code>/<code>applied:&lt;commit&gt;</code>/<code>conflicted:&lt;paths&gt;</code>, failure message) and
+<code>workflow_updated</code> / <code>workflow_status_changed</code> / <code>workflow_removed</code> events
+stream status changes (<code>workflow_rpc.rs:219-257</code>).</p>
+<h2 id="isolation-backends"><a class="header" href="#isolation-backends">Isolation backends</a></h2>
+<p>Each workflow runs in its own checkout of the source tree. The backend is
+selected by <code>settings.orchestration.isolation</code>
+(<code>WorkflowIsolationSetting</code> in <code>crates/pi-coding/src/settings.rs:283-298</code>):</p>
+<div class="table-wrapper"><table><thead><tr><th>Setting</th><th>Backend</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>worktree</code> (default)</td><td>git worktree</td><td>Branch namespace <code>rpi/workflow/&lt;id&gt;</code>, managed root outside the source worktree, ownership catalog at <code>&lt;managed-root&gt;/pi-workflow/worktrees.json</code>. Integration fast-forwards or creates a merge commit. Source: <code>workflow_worktree/git.rs</code>, <code>catalog.rs</code>.</td></tr>
+<tr><td><code>overlayfs</code></td><td>overlayfs</td><td>The source repo is the read-only lower layer; each workflow gets a private writable upper layer. Integration commits the upper state as a single commit on the source branch — last-writer-wins, so <code>Conflicted</code> is never produced by this backend. Source: <code>workflow_worktree/overlay.rs</code>.</td></tr>
+<tr><td><code>none</code></td><td>none</td><td>No isolation: workflows operate directly on the source working tree (<code>NoopWorkflowIsolation</code>).</td></tr>
+</tbody></table>
+</div>
+<p>The overlayfs backend tries, in order, <strong>kernel overlay</strong> (<code>mount -t overlay</code>),
+<strong>fuse-overlayfs</strong> (unprivileged FUSE daemon), then <strong>recursive copy</strong> — the
+first candidate that succeeds wins, and the chosen backend is persisted per
+workflow so a restored workflow re-mounts exactly what it had
+(<code>default_backend_candidates</code> in <code>workflow_worktree/overlay.rs:68-75</code>,
+<code>crates/pi-coding/src/isolate.rs</code>).</p>
+<p>Ownership is strict: every operation verifies that the live checkout exactly
+matches the recorded identity (source root, common git dir, branch, HEAD
+commit) before touching anything, and removal/prune only ever touch
+manager-owned identities (<code>WorktreeError::OwnershipMismatch</code>). The managed
+root must not be inside the source worktree, and the source base must be
+clean before integration (<code>DirtyBase</code> is refused).</p>
+<p>Integration strategies (<code>IntegrateStrategy</code> in
+<code>workflow_worktree/mod.rs:197-206</code>): <code>merge</code> fast-forwards when possible and
+otherwise creates a merge commit; <code>rebase</code> replays workflow commits onto the
+current source HEAD. The outcome is <code>Applied { strategy, result_commit }</code> or
+<code>Conflicted { conflicts }</code> — recorded on the durable snapshot as
+<code>WorkflowIntegration::None | Applied | Conflicted</code>
+(<code>workflow/manager.rs:23-28</code>).</p>
+<h2 id="planning-phase"><a class="header" href="#planning-phase">Planning phase</a></h2>
+<p>A workflow starts in <code>queued</code>, then moves to <code>planning</code>: the supervisor agent
+(running in the workflow's own <code>Application</code> context) receives a bounded
+planning prompt (<code>WorkflowSupervisorContract</code> in <code>workflow/supervisor.rs</code>).
+The planning contract requires the model to create the complete canonical
+Todo DAG exactly once with the <code>todo</code> tool and then stop — no delegation, no
+file edits, no waiting on jobs during planning. Explicit agent references in
+the objective are validated against the workflow agent catalog before any
+planning prompt runs (<code>validate_delegation_agents</code>).</p>
+<p>Planning is bounded so a correcting model can never hold the workflow in
+Planning forever:</p>
+<ul>
+<li><code>PLANNING_MAX_TURNS = 8</code> assistant turns (<code>workflow/supervisor.rs:35</code>).</li>
+<li><code>PLANNING_MAX_TOOL_CALLS = 16</code> — cap on Todo/tool calls in one planning
+prompt (<code>workflow/supervisor.rs:37</code>).</li>
+<li><code>PLANNING_DEFAULT_DEADLINE = 90 s</code> — one wall-clock budget for the whole
+planning turn, measured from a single pinned sleep (a provider streaming
+keepalives can never stretch it into a deadline-of-silence)
+(<code>workflow/supervisor.rs:41</code>, <code>1051-1061</code>).</li>
+<li><code>PLANNING_IDENTICAL_FAILED_OP_LIMIT = 3</code> — identical failed Todo
+operations with no Todo-state change terminate planning
+(<code>workflow/supervisor.rs:44</code>).</li>
+<li><code>PLANNING_CORRECTIONS_WITHOUT_PROGRESS_LIMIT = 6</code> — semantic
+non-progress detection on the canonical Todo state
+(<code>workflow/supervisor.rs:46-48</code>).</li>
+<li>A replan prompt gives a model that answered the first turn with plain text
+one chance to build the plan.</li>
+</ul>
+<p>The outcome is one of <code>Completed</code>, <code>PlanCommitted</code> (plan accepted on the
+first successful <code>todo init</code>, even while the model still has turns to emit),
+<code>PlanBudgetReached { reason }</code>, or <code>TimedOut</code>. A committed plan (or a budget
+stop with tasks present) preserves the plan and transitions to <code>running</code>
+immediately (<code>arm_plan_and_run</code> / <code>preserve_plan_and_run</code>).</p>
+<p>The supervisor's own planning turn is projected live into the workflow page as
+a bounded activity feed (thinking chunks, tool calls, IRC progress) so
+planning never reads as a static spinner (<code>WorkflowSupervisorActivity</code>,
+<code>workflow/supervisor.rs:85-110</code>; <code>planning_started_at_ms</code> tracks the phase).</p>
+<h2 id="execution-phase"><a class="header" href="#execution-phase">Execution phase</a></h2>
+<p><code>running</code> re-arms <strong>Todo DAG execution</strong> over the committed plan: each task
+in the canonical Todo state is executed by a delegated subagent (see
+<a href="orchestration.html"><code>orchestration.md</code></a>), with <code>todoTaskId</code> linking each job to
+its task. The workflow's Todo mutations never auto-arm execution
+(<code>workflow/supervisor.rs:966-984</code>); arming is explicit on the Planning →
+Running transition and on resume of a restored <code>running</code> workflow, so a
+parked DAG with open tasks is an actively worked workflow, not a Planning
+one. Restored workflows never come back frozen: restored <code>Queued</code>/<code>Planning</code>
+resume the planning flow, restored <code>Running</code> re-arms execution, restored
+<code>Paused</code> stays paused until an explicit <code>resume</code>
+(<code>WorkflowSupervisor::continue</code>).</p>
+<p>When the DAG settles (all tasks completed or abandoned), the supervisor
+projection moves the workflow to <code>completed</code> and the manager auto-integrates
+when the status ends <code>completed</code> with no prior integration
+(<code>workflow/manager.rs:372-377</code>, <code>439-444</code>). Integration is also available
+manually with <code>/workflow integrate</code>.</p>
+<h2 id="live-detail-and-workflow-panel"><a class="header" href="#live-detail-and-workflow-panel">Live detail and workflow panel</a></h2>
+<p>The workflow page (<code>crates/pi-cli/src/workflow_panel.rs</code>) renders a live,
+redacted projection of each workflow (<code>WorkflowRuntimeDetail</code> in
+<code>workflow/detail.rs:17-36</code>):</p>
+<ul>
+<li><code>todo</code> — the canonical Todo DAG.</li>
+<li><code>supervisor</code> — the planning/running supervisor row with its own activity
+feed; during <code>planning</code> the (idle at the orchestration layer) supervisor
+reads as actively planning.</li>
+<li><code>subagents</code> — one row per delegated worker: display name, agent type,
+status, current task summary, owning <code>todoTaskId</code>, and a bounded per-agent
+activity feed (task lifecycle entries + IRC messages the agent sent or
+received, newest-last).</li>
+<li><code>jobs</code> — delegated orchestration jobs with their todo ownership.</li>
+<li><code>irc</code> — the workflow's recent IRC (subagent ⇄ subagent included), deduped
+by message id and capped at 50 (<code>RECENT_IRC_LIMIT</code>).</li>
+</ul>
+<p>Everything in the live view is redacted (paths, ids, tokens), and a terminal
+durable status always wins over a stale live projection — a <code>Conflicted</code>
+integration that lands after the supervisor projected <code>Completed</code> is shown
+as <code>Conflicted</code> (<code>workflow/detail.rs:251-268</code>). The durable workflow record
+never persists activity; the activity feed is live-only.</p>
+<p>The supervisor settles from the canonical Todo state and publishes
+<code>WorkflowEvent</code>s (<code>StatusChanged</code>, <code>Updated</code>, <code>Removed</code>) through the
+<code>WorkflowManager</code>, which persists durable snapshots to the workflow store
+(<code>workflow/store.rs</code>) and restores them on restart (<code>WorkflowManager::reload</code>).</p>
+<h2 id="settings"><a class="header" href="#settings">Settings</a></h2>
+<pre><code class="language-json">{
+  "orchestration": {
+    "tasks": false,
+    "todo": true,
+    "maxConcurrency": 8,
+    "maxRecursionDepth": 8,
+    "mailboxCapacity": 1000,
+    "maxToolsPerAgent": 16,
+    "isolation": "worktree",
+    "sandboxed": false,
+    "softBudget": { "maxRequests": null, "maxTokens": null, "yieldAfter": null }
+  }
+}
+</code></pre>
+<ul>
+<li><code>tasks</code> — enables the orchestration <code>task</code> tool (default <code>false</code>).</li>
+<li><code>todo</code> — the <code>todo</code> tool is on by default; <code>false</code> opts out
+(<code>settings.rs:1411-1420</code>).</li>
+<li><code>maxConcurrency</code> — max parallel child jobs (default 8, bounds 1..=64).</li>
+<li><code>maxRecursionDepth</code> — max nested delegation depth (default 8, max 16).</li>
+<li><code>mailboxCapacity</code> — per-agent message mailbox (default 1000, max 10000).</li>
+<li><code>maxToolsPerAgent</code> — tool ceiling per child (default 16, max 64).</li>
+<li><code>isolation</code> — <code>worktree</code> (default), <code>overlayfs</code>, or <code>none</code>; unknown values
+fail deserialization (fail-closed).</li>
+<li><code>sandboxed</code> — when <code>true</code>, orchestration subagent children run their
+process spawns (the <code>bash</code> tool) inside the Linux filesystem sandbox
+(workspace + agent dir + <code>sandbox.allowedPaths</code> visible; deny-by-default
+otherwise). See <a href="../reference/sandbox-isolation.html"><code>sandbox-isolation.md</code></a>.</li>
+<li><code>softBudget</code> — per-child job soft budget: <code>maxRequests</code> (LLM turns),
+<code>maxTokens</code> (cumulative usage), <code>yieldAfter</code> (return control to the parent
+after N requests regardless of remaining budget). A reached limit settles
+the child <code>Completed</code> with <code>softBudgetExhausted: true</code>, never failed. See
+<a href="orchestration.html"><code>orchestration.md</code></a>.</li>
+</ul>
+<p>Validation: <code>maxConcurrency</code> must be 1..=64, <code>maxRecursionDepth</code> at most 16,
+<code>mailboxCapacity</code> 1..=10000, <code>maxToolsPerAgent</code> 1..=64, and soft-budget knobs
+must be positive when set (<code>settings.rs:2674-2697</code>).</p>
+<h2 id="invariants"><a class="header" href="#invariants">Invariants</a></h2>
+<ul>
+<li>Workflows never execute without a committed plan: <code>running</code> implies the
+Todo DAG was armed by the supervisor.</li>
+<li>Planning is always bounded: 8 turns, 6 non-progress corrections, and a
+wall-clock deadline; a stuck provider cannot hold a workflow in Planning
+forever.</li>
+<li>Isolation is ownership-checked: every backend operation verifies the exact
+recorded identity before mutating; foreign checkouts fail closed.</li>
+<li>Integration refuses dirty sources and dirty workflows (<code>DirtyBase</code> /
+<code>DirtyWorktree</code>), and overlayfs integration is last-writer-wins by design.</li>
+<li>The durable snapshot is authoritative for terminal outcomes; the live
+projection may never mask a <code>Conflicted</code> or <code>Failed</code> state.</li>
+<li><code>rewind</code> is refused while any workflow is active (see
+<a href="session-recovery.html"><code>session-recovery.md</code></a>).</li>
+</ul>
+<h2 id="related-documentation"><a class="header" href="#related-documentation">Related documentation</a></h2>
+<ul>
+<li><a href="orchestration.html"><code>orchestration.md</code></a> — the subagent/job runtime that
+executes the DAG</li>
+<li><a href="todos.html"><code>todos.md</code></a> — the canonical Todo DAG the workflow plans and
+executes</li>
+<li><a href="../reference/sandbox-isolation.html"><code>sandbox-isolation.md</code></a> — filesystem
+sandbox and overlayfs backends</li>
+<li><a href="cli-modes.html"><code>cli-modes.md</code></a> — <code>/workflow</code> in the slash-command surface</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../user-guide/orchestration.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../user-guide/session-recovery.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../user-guide/orchestration.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../user-guide/session-recovery.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

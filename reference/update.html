@@ -1,0 +1,370 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Update safety - rpi — reference manual</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">rpi — reference manual</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="update-safety"><a class="header" href="#update-safety">Update safety</a></h1>
+<p><code>rpi</code> can update itself from GitHub releases and reconcile configured rpi packages.
+Both paths are designed so a failed update never leaves the installation in an
+unusable state.</p>
+<h2 id="update-notifications"><a class="header" href="#update-notifications">Update notifications</a></h2>
+<p>When you start an interactive session (TUI or REPL), <code>rpi</code> checks GitHub
+releases in the background. If a newer release exists, a non-fatal status
+message is shown:</p>
+<pre><code class="language-text">Update available: current v0.2.4, latest v0.2.5 — summary — URL (run `rpi update --self`)
+</code></pre>
+<p>Source: <code>crates/pi-cli/src/self_update.rs:187-213</code>.</p>
+<p>Two environment variables control this check:</p>
+<ul>
+<li><code>PI_OFFLINE=1|true|yes</code> disables all updater networking.</li>
+<li><code>PI_SKIP_VERSION_CHECK</code> disables only the interactive startup version check.</li>
+</ul>
+<h2 id="self-update"><a class="header" href="#self-update">Self-update</a></h2>
+<pre><code class="language-sh">rpi update          # update rpi itself (default when no package flags are given)
+rpi update --self   # explicit
+rpi update --self --force   # reinstall even when version and checksum match
+</code></pre>
+<p>Source: <code>crates/pi-cli/src/args.rs:270-288</code>, <code>crates/pi-cli/src/lib.rs:85-94</code>.</p>
+<p><code>rpi update --self</code> downloads the latest GitHub release for the current platform,
+verifies it, smoke-tests it, and activates it atomically. It fails early if
+<code>PI_OFFLINE</code> is enabled. The updater expects a managed install layout rooted at
+<code>$PI_HOME</code> (default <code>~/.rpi</code> on Unix, <code>%USERPROFILE%\.rpi</code> on Windows; the
+self-updater otherwise derives the root from the running executable's location)
+with an <code>update-state.json</code> file.
+Source: <code>crates/pi-cli/src/self_update.rs:211-223</code>, <code>crates/pi-cli/src/self_update.rs:480-524</code>.</p>
+<h3 id="what-the-self-update-does"><a class="header" href="#what-the-self-update-does">What the self-update does</a></h3>
+<ol>
+<li>Selects the release. Stable versions query <code>/releases/latest</code>. Prerelease
+versions pick the newest published prerelease. Drafts and unpublished
+releases are rejected.</li>
+<li>Locates the platform archive (<code>rpi-&lt;version&gt;-&lt;triple&gt;.tar.gz</code> or <code>.zip</code>) and
+the release's <code>SHA256SUMS</code> file.</li>
+<li>Enforces size limits: archives are capped at 1 GiB and <code>SHA256SUMS</code> at 1 MiB.</li>
+<li>Downloads <code>SHA256SUMS</code>, looks up the expected digest, and skips the download
+when the installed digest already matches (unless <code>--force</code> is used).</li>
+<li>Downloads the archive, verifies its SHA-256 digest against <code>SHA256SUMS</code>, and
+extracts the binary to a staged path.</li>
+<li>Runs a smoke test: the staged binary must print exactly <code>rpi &lt;version&gt;</code> from
+<code>--version</code>.</li>
+<li>Atomically installs the versioned binary and swaps the active symlink, then
+writes <code>update-state.json</code> atomically.</li>
+</ol>
+<p>Sources: <code>crates/pi-cli/src/self_update.rs:223-304</code>,
+<code>crates/pi-cli/src/self_update.rs:705-723</code>,
+<code>crates/pi-cli/src/self_update.rs:725-770</code>,
+<code>crates/pi-cli/src/self_update.rs:795-875</code>,
+<code>crates/pi-cli/src/self_update.rs:874-889</code>.</p>
+<h3 id="safety-guarantees"><a class="header" href="#safety-guarantees">Safety guarantees</a></h3>
+<ul>
+<li><strong>Checksum verification</strong> — every archive is checked against the release's
+<code>SHA256SUMS</code> manifest.</li>
+<li><strong>Size limits</strong> — archives and extracted binaries are capped at 1 GiB;
+<code>SHA256SUMS</code> is capped at 1 MiB.</li>
+<li><strong>Smoke test</strong> — the downloaded binary must print exactly <code>rpi &lt;version&gt;</code>
+from <code>--version</code> before activation; exit status alone is not proof of
+identity.</li>
+<li><strong>Atomic activation</strong> — the active symlink is swapped with <code>rename(2)</code> on Unix
+and <code>MoveFileEx</code> on Windows, so the active <code>rpi</code> path is never missing during
+an update.</li>
+<li><strong>Rollback</strong> — if smoke testing, activation, or state writing fails, the
+previous active symlink and <code>update-state.json</code> are restored.</li>
+<li><strong>Serialized installs</strong> — a lockfile prevents concurrent installers from
+racing on the same <code>PI_HOME</code>.</li>
+<li><strong>No partial install</strong> — a failed transaction removes staged files and leaves
+the previous binary active.</li>
+</ul>
+<p>Source: <code>crates/pi-cli/src/self_update.rs:250-253</code>,
+<code>crates/pi-cli/src/self_update.rs:280-284</code>,
+<code>crates/pi-cli/src/self_update.rs:601-728</code>,
+<code>crates/pi-cli/src/self_update.rs:705-770</code>,
+<code>crates/pi-cli/src/self_update.rs:795-875</code>,
+<code>crates/pi-cli/src/self_update.rs:897-929</code>,
+<code>crates/pi-cli/src/self_update.rs:1081-1147</code>.</p>
+<h3 id="windows-deferred-activation"><a class="header" href="#windows-deferred-activation">Windows deferred activation</a></h3>
+<p>On Windows the running executable cannot be replaced while it is executing, so
+the self-updater writes a deferred activation script and a
+<code>last-update-result.json</code> status file. The new binary is moved into place by a
+short-lived PowerShell process after the current <code>rpi</code> process exits. The
+deferred activation then re-verifies that the moved binary prints exactly
+<code>rpi &lt;version&gt;</code> and restores the previous binary on any mismatch or rollback
+failure.
+Source: <code>crates/pi-cli/src/self_update.rs:798-875</code>,
+<code>crates/pi-cli/src/self_update.rs:987-1025</code>.</p>
+<h3 id="update-state"><a class="header" href="#update-state">Update state</a></h3>
+<p>After a successful install the updater writes <code>$PI_HOME/update-state.json</code>. It
+records the installed version, asset name, archive digest, versioned binary
+path, and install timestamp. On the next update the digest is used to detect
+republished tags that point to a different archive.
+Source: <code>crates/pi-cli/src/self_update.rs:62-73</code>,
+<code>crates/pi-cli/src/self_update.rs:285-295</code>.</p>
+<h2 id="update-packages"><a class="header" href="#update-packages">Update packages</a></h2>
+<pre><code class="language-sh">rpi update --extensions         # reconcile every configured package (--all is an alias)
+rpi update OWNER/REPO           # update one configured git or local package
+rpi update local:./my-tools     # update a configured local package
+rpi update --self --extensions  # update packages, then update rpi itself
+</code></pre>
+<p>Source: <code>crates/pi-cli/src/args.rs:270-288</code>,
+<code>crates/pi-cli/src/package_commands.rs:69-94</code>.</p>
+<p><code>rpi update --extensions</code> re-clones or checks out every configured git package
+and re-discovers every configured local package. Git packages are checked out
+into a content-addressed directory under the agent directory. Pinned git refs
+are honored; unpinned sources follow the remote's default branch. Local
+packages are validated from their configured paths.
+Source: <code>crates/pi-coding/src/packages.rs:470-708</code>,
+<code>crates/pi-coding/src/packages.rs:1118-1253</code>.</p>
+<p>Package updates use the same safety patterns as install:</p>
+<ul>
+<li>Operations are serialized with a per-scope lock.</li>
+<li>Git is invoked directly with an argv vector, never through a shell.</li>
+<li>New checkouts are staged next to the existing one and activated with an
+atomic directory swap. If validation fails, the swap is rolled back.</li>
+<li>Settings and package state files are written atomically (temp file + rename)
+and rolled back if either write fails.</li>
+</ul>
+<p>Source: <code>crates/pi-coding/src/packages.rs:656-708</code>,
+<code>crates/pi-coding/src/packages.rs:1874-1955</code>,
+<code>crates/pi-coding/src/packages.rs:2033-2133</code>.</p>
+<p><code>npm:</code> package sources are deliberately not supported. They are rejected with a
+clear error (<code>npm package sources are not supported yet; use a local path or git source</code>). See <a href="packages.html"><code>packages.md</code></a> for the supported package sources and
+manifest format.
+Source: <code>crates/pi-coding/src/packages.rs:948-954</code>.</p>
+<h2 id="update-environment-variables"><a class="header" href="#update-environment-variables">Update environment variables</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>PI_HOME</code></td><td><code>~/.rpi</code> (Unix) / <code>%USERPROFILE%\.rpi</code> (Windows)</td><td>Install root for the binary and update state</td></tr>
+<tr><td><code>PI_UPDATE_BASE_URL</code></td><td><code>https://api.github.com/repos/0x8f701/rpi/releases</code></td><td>Release API base (must match the installer scripts)</td></tr>
+<tr><td><code>GITHUB_TOKEN</code></td><td>(none)</td><td>Authenticate GitHub API calls for release metadata</td></tr>
+<tr><td><code>PI_OFFLINE</code></td><td>(none)</td><td>Disables all updater networking</td></tr>
+<tr><td><code>PI_SKIP_VERSION_CHECK</code></td><td>(none)</td><td>Disables only the nonfatal interactive startup version check</td></tr>
+</tbody></table>
+</div>
+<p>Source: <code>crates/pi-cli/src/self_update.rs:1-13</code>,
+<code>crates/pi-cli/src/self_update.rs:95-103</code>.</p>
+<h2 id="release-policy"><a class="header" href="#release-policy">Release policy</a></h2>
+<ul>
+<li>Tags must be semantic versions of the form <code>vX.Y.Z</code> (optionally with <code>+build</code>
+metadata).</li>
+<li>Prerelease tags (<code>vX.Y.Z-alpha.N</code>) are published as prereleases and are not
+made "latest", so the default <code>/releases/latest</code> endpoint never points to
+them.</li>
+<li>The release workflow refuses to overwrite an already-published release and
+verifies the asset inventory before publishing.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/export-share.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/export-share.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>
