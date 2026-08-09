@@ -426,15 +426,45 @@ def wait_for_all(session: str, needles: list[str], timeout: float = 20.0) -> str
         time.sleep(0.15)
     raise AssertionError(f"TUI omitted {needles!r}; final pane:\n{latest}")
 
+def wait_for_todo_overview(session: str, timeout: float = 5.0) -> str:
+    deadline = time.monotonic() + timeout
+    latest = ""
+    while time.monotonic() < deadline:
+        latest = capture(session)
+        if "Todo DAGs" in latest and "Enter details" in latest:
+            selected_todo_overview_line(latest)
+            return latest
+        if STATE.error is not None:
+            raise STATE.error
+        time.sleep(0.05)
+    raise AssertionError(f"TUI did not return to Todo DAG overview; final pane:\n{latest}")
+
+
+def selected_todo_overview_line(pane: str) -> str:
+    selected = [line for line in pane.splitlines() if "›" in line]
+    if len(selected) != 1:
+        raise AssertionError(f"Todo DAG overview has {len(selected)} selected rows:\n{pane}")
+    return selected[0]
+
+
 def select_todo_overview_row(session: str, identity: str, max_moves: int = 64) -> str:
     needle = identity[:17]
-    latest = ""
+    latest = capture(session)
     for _ in range(max_moves):
-        latest = capture(session)
-        if any("›" in line and needle in line for line in latest.splitlines()):
+        selected = selected_todo_overview_line(latest)
+        if needle in selected and "•" not in selected:
             return latest
         tmux("send-keys", "-t", f"{session}:0", "Down")
-        time.sleep(0.05)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            latest = capture(session)
+            if selected_todo_overview_line(latest) != selected:
+                break
+            if STATE.error is not None:
+                raise STATE.error
+            time.sleep(0.02)
+        else:
+            raise AssertionError(f"Todo DAG overview selection did not move from {selected!r}")
     raise AssertionError(f"Todo DAG overview never selected {needle!r}; final pane:\n{latest}")
 
 
@@ -665,7 +695,7 @@ def main() -> None:
         )
         (evidence / "todo-detail-main.txt").write_text(main_detail, encoding="utf-8")
         tmux("send-keys", "-t", f"{session}:0", "Escape")
-        time.sleep(0.15)
+        wait_for_todo_overview(session)
 
         details: list[str] = []
         sorted_workflows = sorted(
@@ -700,7 +730,7 @@ def main() -> None:
             details.append(detail)
             (evidence / f"todo-detail-{index}.txt").write_text(detail, encoding="utf-8")
             tmux("send-keys", "-t", f"{session}:0", "Escape")
-            time.sleep(0.15)
+            wait_for_todo_overview(session)
 
         tmux("send-keys", "-t", f"{session}:0", "Escape")
         time.sleep(0.2)
