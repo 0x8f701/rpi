@@ -12,6 +12,8 @@
 #   PI_HOME                install root (default: %USERPROFILE%\.rpi)
 #   PI_UPDATE_BASE_URL     GitHub-Releases-shaped API base (default:
 #                          https://api.github.com/repos/0x8f701/rpi/releases)
+#   GITHUB_TOKEN           authenticate the fixed GitHub API endpoint (default:
+#                          none; never sent to release-asset hosts)
 
 [CmdletBinding()]
 param(
@@ -184,13 +186,24 @@ if ($Version -and $Version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Z
 
 $Headers = @{ "User-Agent" = "rpi-install"; "Accept" = "application/vnd.github+json" }
 
+# Optional GITHUB_TOKEN support, mirroring install.sh and the built-in updater:
+# the token authenticates only the fixed GitHub API endpoint (avoiding the
+# unauthenticated rate limit) and is never sent to release-asset hosts or a
+# custom PI_UPDATE_BASE_URL endpoint.
+$GitHubApiBase = "https://api.github.com/repos/$Repo/releases"
+$ApiHeaders = $Headers
+if ($env:GITHUB_TOKEN -and $ApiBase -eq $GitHubApiBase) {
+    $ApiHeaders = @{} + $Headers
+    $ApiHeaders["Authorization"] = "Bearer $env:GITHUB_TOKEN"
+}
+
 # ── Resolve the release ──────────────────────────────────────────────────────
 $ReleaseUrl = if ($Version) { "$ApiBase/tags/v$Version" } else { "$ApiBase/latest" }
 Write-Host "Resolving release from $ReleaseUrl"
 try {
-    $Release = Invoke-RestMethod -Uri $ReleaseUrl -Headers $Headers
+    $Release = Invoke-RestMethod -Uri $ReleaseUrl -Headers $ApiHeaders
 } catch {
-    Fail "could not fetch release metadata from ${ReleaseUrl}: $($_.Exception.Message)"
+    Fail "could not fetch release metadata from ${ReleaseUrl}: $($_.Exception.Message) (GitHub may be rate-limiting this IP; set GITHUB_TOKEN to authenticate)"
 }
 
 $Tag = [string]$Release.tag_name

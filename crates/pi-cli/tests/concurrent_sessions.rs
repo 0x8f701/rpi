@@ -326,6 +326,7 @@ async fn harness(label: &str) -> Harness {
             address: "127.0.0.1:0".parse().unwrap(),
             token_file: None,
             allow_insecure_remote: false,
+            advertised_origin: None,
             session_factory: Some(Arc::new(spawner.clone())),
         },
     )

@@ -392,14 +392,29 @@ fn score_entry(entry: &MemoryEntry, terms: &[String], full_query: &str) -> usize
 /// sessions in the same checkout share one store. Always 32 hex chars — no
 /// separators, no traversal, stable across sessions.
 pub(crate) fn repo_namespace(cwd: &Path) -> String {
+    repo_digest_hex(&repo_anchor(cwd))
+}
+
+/// Canonical repository anchor: the cwd resolved to an absolute path and
+/// anchored at the first ancestor holding a `.git` entry so nested paths in
+/// one checkout share an identity. Falls back to the canonical cwd when no
+/// repository is present, which stays deterministic for a given directory.
+fn repo_anchor(cwd: &Path) -> PathBuf {
     let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let anchor = git_anchor(&canonical).unwrap_or(canonical);
+    git_anchor(&canonical).unwrap_or(canonical)
+}
+
+/// Hex SHA-256 (first 16 bytes, 32 chars) of a canonical repository anchor.
+/// This single digest is the repository identity shared by the local JSONL
+/// namespace and the Hindsight per-project scopes, so both resolve nested
+/// paths in one checkout identically and same-named repos apart.
+fn repo_digest_hex(anchor: &Path) -> String {
     let digest = Sha256::digest(anchor.as_os_str().as_encoded_bytes());
-    let mut namespace = String::with_capacity(32);
+    let mut hex = String::with_capacity(32);
     for byte in digest.iter().take(16) {
-        namespace.push_str(&format!("{byte:02x}"));
+        hex.push_str(&format!("{byte:02x}"));
     }
-    namespace
+    hex
 }
 
 fn git_anchor(start: &Path) -> Option<PathBuf> {
@@ -669,6 +684,10 @@ pub const DEFAULT_HINDSIGHT_REFLECT_TIMEOUT_MS: u64 = 120_000;
 const HINDSIGHT_RESPONSE_MAX_BYTES: usize = 256 * 1024;
 const HINDSIGHT_ERROR_MAX_BYTES: usize = 8 * 1024;
 const HINDSIGHT_INPUT_MAX_BYTES: usize = 1024 * 1024;
+/// Hex chars of the repository identity digest embedded in Hindsight
+/// per-project scope labels. 48 bits separates same-named checkouts with
+/// negligible collision odds while keeping bank ids and tags readable.
+const HINDSIGHT_SCOPE_DIGEST_PREFIX: usize = 12;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct MemoryConfig {
@@ -743,6 +762,11 @@ impl Default for MemoryConfig {
     }
 }
 
+/// Which Hindsight bank (and, for tagged scoping, which tags) a session's
+/// memory operations target. Per-project scopes key off the canonical
+/// repository identity digest shared with the local store, so nested paths in
+/// one checkout resolve identically while same-named repos under different
+/// parents stay apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HindsightBankScope {
     pub bank_id: String,
@@ -755,18 +779,59 @@ pub(crate) fn hindsight_bank_scope(config: &MemoryConfig, cwd: &Path) -> Hindsig
     let base = config.hindsight_bank_id_prefix.as_deref()
         .map(|prefix| format!("{prefix}-{}", config.hindsight_bank_id))
         .unwrap_or_else(|| config.hindsight_bank_id.clone());
-    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let label = git_anchor(&canonical).unwrap_or(canonical).file_name()
-        .and_then(|name| name.to_str()).filter(|name| !name.is_empty())
-        .unwrap_or("unknown").to_owned();
     match config.hindsight_scoping {
         crate::settings::HindsightScoping::Global => HindsightBankScope { bank_id: base, retain_tags: Vec::new(), recall_tags: Vec::new(), recall_tags_match: None },
-        crate::settings::HindsightScoping::PerProject => HindsightBankScope { bank_id: format!("{base}-{label}"), retain_tags: Vec::new(), recall_tags: Vec::new(), recall_tags_match: None },
+        crate::settings::HindsightScoping::PerProject => HindsightBankScope { bank_id: format!("{base}-{}", hindsight_project_label(cwd)), retain_tags: Vec::new(), recall_tags: Vec::new(), recall_tags_match: None },
         crate::settings::HindsightScoping::PerProjectTagged => {
-            let tag = format!("project:{label}");
+            let tag = format!("project:{}", hindsight_project_label(cwd));
             HindsightBankScope { bank_id: base, retain_tags: vec![tag.clone()], recall_tags: vec![tag], recall_tags_match: Some("any") }
         }
     }
+}
+
+/// Sanitized, collision-resistant project scope label: the repository basename
+/// sanitized to characters safe in bank ids and tags, plus a prefix of the
+/// same canonical identity digest local memory digests. Nested paths inside
+/// one checkout anchor at the same `.git` ancestor (so they share a label);
+/// same-named repos under different parents differ in the digest prefix.
+fn hindsight_project_label(cwd: &Path) -> String {
+    let anchor = repo_anchor(cwd);
+    let basename = anchor
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown");
+    let digest = repo_digest_hex(&anchor);
+    format!(
+        "{}-{}",
+        sanitize_scope_label(basename),
+        &digest[..HINDSIGHT_SCOPE_DIGEST_PREFIX]
+    )
+}
+
+/// Basenames are user-controlled; keep only characters that are safe in
+/// Hindsight bank ids and tags (ASCII alphanumerics plus `-`, `_`, `.`),
+/// mapping everything else to `-`, then collapsing separator runs and trimming
+/// edges. Falls back to `unknown` when nothing readable remains.
+fn sanitize_scope_label(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        out.push(if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            ch
+        } else {
+            '-'
+        });
+    }
+    let mut parts = out.split('-').filter(|part| !part.is_empty());
+    let mut label = String::with_capacity(out.len());
+    if let Some(first) = parts.next() {
+        label.push_str(first);
+        for part in parts {
+            label.push('-');
+            label.push_str(part);
+        }
+    }
+    if label.is_empty() { "unknown".to_owned() } else { label }
 }
 
 #[derive(Clone)]
@@ -1673,6 +1738,98 @@ mod tests {
             ..Default::default()
         }, Path::new(".")).err().expect("plaintext errors");
         assert!(error.to_string().contains("hindsightAllowInsecure"));
+    }
+
+    #[test]
+    fn hindsight_project_scopes_share_repo_identity_digest() {
+        use crate::settings::HindsightScoping;
+
+        let config = |scoping: HindsightScoping| MemoryConfig {
+            backend: crate::settings::MemoryBackend::Hindsight,
+            hindsight_scoping: scoping,
+            ..Default::default()
+        };
+        // Two repositories with the same basename under different parents.
+        let root_a = tempfile::tempdir().expect("root a");
+        let root_b = tempfile::tempdir().expect("root b");
+        let repo_a = root_a.path().join("same-name");
+        let repo_b = root_b.path().join("same-name");
+        std::fs::create_dir_all(repo_a.join(".git")).expect("git a");
+        std::fs::create_dir_all(repo_b.join(".git")).expect("git b");
+        // A nested path inside repo a: must scope exactly like the repo root.
+        let nested = repo_a.join("crates").join("pi-coding");
+        std::fs::create_dir_all(&nested).expect("nested");
+
+        for scoping in [HindsightScoping::PerProject, HindsightScoping::PerProjectTagged] {
+            let scope_at = |path: &std::path::Path| hindsight_bank_scope(&config(scoping), path);
+            let a = scope_at(&repo_a);
+            let b = scope_at(&repo_b);
+            assert_ne!(a, b, "{scoping:?}: same-basename repos under different parents must differ");
+            let rendered_a = format!("{a:?}");
+            let rendered_b = format!("{b:?}");
+            assert!(rendered_a.contains("same-name") && rendered_b.contains("same-name"),
+                "{scoping:?}: the human-readable basename must be retained: {rendered_a} / {rendered_b}");
+            // The distinguishing component is the same identity digest local
+            // memory digests (its prefix), not the basename.
+            let namespace_a = repo_namespace(&repo_a);
+            let namespace_b = repo_namespace(&repo_b);
+            assert_ne!(namespace_a, namespace_b, "sanity: digests differ");
+            let prefix_a = &namespace_a[..HINDSIGHT_SCOPE_DIGEST_PREFIX];
+            let prefix_b = &namespace_b[..HINDSIGHT_SCOPE_DIGEST_PREFIX];
+            assert_ne!(prefix_a, prefix_b, "sanity: digest prefixes differ");
+            assert!(rendered_a.contains(prefix_a), "{scoping:?}: scope must embed the local-memory digest prefix {prefix_a}: {rendered_a}");
+            assert!(rendered_b.contains(prefix_b), "{scoping:?}: scope must embed the local-memory digest prefix {prefix_b}: {rendered_b}");
+            // Nested paths inside one checkout share the repo-root scope.
+            assert_eq!(scope_at(&nested), a, "{scoping:?}: nested paths must resolve identically to the repo root");
+        }
+
+        // Per-project keys the bank id by the label; per-project-tagged keeps
+        // the shared bank id and tags each item by the label.
+        let per_project = hindsight_bank_scope(&config(HindsightScoping::PerProject), &repo_a);
+        let label = format!("same-name-{}", &repo_namespace(&repo_a)[..HINDSIGHT_SCOPE_DIGEST_PREFIX]);
+        assert_eq!(per_project.bank_id, format!("{DEFAULT_HINDSIGHT_BANK_ID}-{label}"));
+        assert!(per_project.retain_tags.is_empty() && per_project.recall_tags.is_empty());
+        assert_eq!(per_project.recall_tags_match, None);
+        let tagged = hindsight_bank_scope(&config(HindsightScoping::PerProjectTagged), &repo_a);
+        assert_eq!(tagged.bank_id, DEFAULT_HINDSIGHT_BANK_ID);
+        assert_eq!(tagged.retain_tags, vec![format!("project:{label}")]);
+        assert_eq!(tagged.recall_tags, tagged.retain_tags);
+        assert_eq!(tagged.recall_tags_match, Some("any"));
+
+        // Global scoping is untouched: plain bank id, no tags, no cwd variance.
+        let global_a = hindsight_bank_scope(&config(HindsightScoping::Global), &repo_a);
+        let global_b = hindsight_bank_scope(&config(HindsightScoping::Global), &repo_b);
+        assert_eq!(global_a.bank_id, DEFAULT_HINDSIGHT_BANK_ID);
+        assert_eq!(global_a, global_b, "Global must not vary by repository");
+        assert!(global_a.retain_tags.is_empty() && global_a.recall_tags.is_empty());
+        assert_eq!(global_a.recall_tags_match, None);
+    }
+
+    #[test]
+    fn hindsight_project_scope_label_is_sanitized() {
+        use crate::settings::HindsightScoping;
+
+        let scoped_config = || MemoryConfig {
+            backend: crate::settings::MemoryBackend::Hindsight,
+            hindsight_scoping: HindsightScoping::PerProject,
+            ..Default::default()
+        };
+        // A hostile basename must not leak separators or control characters
+        // into the bank id.
+        let dir = tempfile::tempdir().expect("dir");
+        let hostile = dir.path().join("weird name!@#\u{7f}");
+        std::fs::create_dir_all(hostile.join(".git")).expect("git");
+        let scope = hindsight_bank_scope(&scoped_config(), &hostile);
+        assert!(scope.bank_id.starts_with(&format!("{DEFAULT_HINDSIGHT_BANK_ID}-weird-name-")), "{}", scope.bank_id);
+        assert!(scope.bank_id.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')),
+            "bank id must stay token-safe: {}", scope.bank_id);
+        // A basename with no readable characters falls back to `unknown` but
+        // stays unique via the digest prefix.
+        let bare = dir.path().join("!!!");
+        std::fs::create_dir_all(bare.join(".git")).expect("git");
+        let bare_scope = hindsight_bank_scope(&scoped_config(), &bare);
+        assert!(bare_scope.bank_id.starts_with(&format!("{DEFAULT_HINDSIGHT_BANK_ID}-unknown-")), "{}", bare_scope.bank_id);
+        assert_ne!(bare_scope.bank_id, scope.bank_id);
     }
 
     #[test]

@@ -574,10 +574,13 @@ where
     F: FnMut(Option<&str>, &str) -> Result<()>,
 {
     loop {
-        let separator = pending
-            .find("\r\n\r\n")
-            .map(|position| (position, 4))
-            .or_else(|| pending.find("\n\n").map(|position| (position, 2)));
+        let separator = [
+            pending.find("\r\n\r\n").map(|position| (position, 4)),
+            pending.find("\n\n").map(|position| (position, 2)),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(position, _)| *position);
         let Some((position, len)) = separator else {
             return Ok(());
         };
@@ -731,6 +734,24 @@ mod tests {
             received,
             vec![(Some("delta".into()), "one".into()), (None, "two".into())]
         );
+    }
+
+    #[test]
+    fn drains_the_earliest_mixed_line_ending_separator() {
+        let mut pending = "data: first\n\ndata: second\r\n\r\n".to_owned();
+        let mut received = Vec::new();
+
+        drain_sse_events(&mut pending, &mut |event, data| {
+            received.push((event.map(str::to_owned), data.to_owned()));
+            Ok(())
+        })
+        .expect("drain mixed line endings");
+
+        assert_eq!(
+            received,
+            vec![(None, "first".into()), (None, "second".into())]
+        );
+        assert!(pending.is_empty());
     }
 
     // Accepts one HTTP/1.1 connection, reads the request headers, then either

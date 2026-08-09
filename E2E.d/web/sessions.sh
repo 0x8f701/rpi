@@ -56,6 +56,13 @@ main() {
 
     local root evidence port url pw_status=0
     root="$(scenario_workspace "$SCENARIO")"
+    git -C "$root/workspace" init -q
+    git -C "$root/workspace" config user.email "web-sessions@example.com"
+    git -C "$root/workspace" config user.name "Web Sessions"
+    git -C "$root/workspace" config commit.gpgsign false
+    printf 'web sessions seed\n' >"$root/workspace/seed.txt"
+    git -C "$root/workspace" add -- seed.txt
+    git -C "$root/workspace" commit -q -m "web sessions seed"
     evidence="$EVIDENCE_ROOT/$SCENARIO"
     printf '%s\n' "$TOKEN" >"$root/token"
 

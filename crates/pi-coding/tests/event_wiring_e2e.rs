@@ -14,7 +14,7 @@
 //! `tests/extensions.rs` (`removed_event_names_fail_registration`,
 //! `quickjs_overlay_lifecycle_events_are_rejected_at_registration`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::future::Future;
 use std::path::Path;
@@ -247,6 +247,85 @@ async fn model_select_reaches_extension_on_model_change() -> Result<()> {
     .await?;
     assert_eq!(payload["model"]["id"], json!(model.id));
     assert_eq!(payload["model"]["provider"], json!(model.provider));
+
+    application.cleanup().await;
+    runtime.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn model_select_extension_event_strips_credential_headers() -> Result<()> {
+    let dir = TempDir::new()?;
+    let (runtime, permissions) = load_runtime(
+        dir.path(),
+        "model-select-sanitized",
+        r#"export default function (pi) {
+  pi.on("model_select", (event) => {
+    const { signal, ...data } = event;
+    throw new Error("received:" + JSON.stringify(data));
+  });
+}
+"#,
+    )
+    .await?;
+    // Headers are assembled at runtime so no credential-shaped literal ever
+    // appears in source; they must never cross the EventHooks boundary.
+    let auth = format!("Bearer {}", uuid::Uuid::now_v7());
+    let api_key = format!("api-key-{}", uuid::Uuid::now_v7());
+    let suffix = uuid::Uuid::now_v7().to_string();
+    let model = Model {
+        id: format!("sanitized-model-{suffix}"),
+        name: "Sanitized Model".to_owned(),
+        api: format!("sanitized-api-{suffix}"),
+        provider: format!("sanitized-provider-{suffix}"),
+        headers: Some(HashMap::from([
+            ("Authorization".to_owned(), auth.clone()),
+            ("X-Api-Key".to_owned(), api_key.clone()),
+        ])),
+        ..Model::default()
+    };
+    let mut runtime_events = runtime.subscribe();
+    let application = application_with_runtime(session_with(model.clone()), runtime.clone(), permissions).await;
+
+    // Ordinary in-process model selection is unchanged: the ApplicationEvent
+    // still carries the credential-bearing model.
+    let payload = assert_forwarded_session_event(
+        &application,
+        &mut runtime_events,
+        "model_select",
+        async {
+            application.set_model(model.clone(), String::new());
+        },
+        |event| matches!(event, SessionEvent::ModelSelect { model: selected } if selected.id == model.id && selected.headers == model.headers),
+    )
+    .await?;
+
+    // The extension receives the public projection only: id/provider are
+    // present, and neither the header names, the header values, nor a
+    // headers object appear anywhere in the emitted JSON.
+    assert_eq!(payload["model"]["id"], json!(model.id));
+    assert_eq!(payload["model"]["provider"], json!(model.provider));
+    assert!(
+        payload["model"]["headers"].is_null(),
+        "no headers object may reach the extension: {payload}"
+    );
+    let encoded = payload.to_string();
+    assert!(
+        !encoded.contains(auth.as_str()),
+        "authorization value must not reach the extension"
+    );
+    assert!(
+        !encoded.contains(api_key.as_str()),
+        "api key value must not reach the extension"
+    );
+    assert!(
+        !encoded.contains("Authorization"),
+        "authorization header name must not reach the extension"
+    );
+    assert!(
+        !encoded.contains("X-Api-Key"),
+        "api key header name must not reach the extension"
+    );
 
     application.cleanup().await;
     runtime.shutdown().await;

@@ -41,8 +41,15 @@ wait_for_log() { # needle [timeout]
     fail "user.$SCENARIO: mock log never showed ${needle@Q} (see $evidence/mock-server.log)"
 }
 
-mock_request_line() { # n -> last matching log line
-    grep -F "request#$1 " "$evidence/mock-server.log" | tail -n 1 || true
+mock_request_line() { # n -> last user-summary log line for request n
+    # The user_mock_server logs one `... request#N user_len=... user_digest=...`
+    # line per request (plus a later `kind=` line); the summary line is the
+    # one that carries the queue-order digest markers.
+    grep -F "request#$1 user_len=" "$evidence/mock-server.log" | tail -n 1 || true
+}
+
+digest_of() { # text -> 12-hex sha256 prefix (user_mock_server.py logs user_digest=...)
+    printf '%s' "$1" | sha256sum | cut -c1-12
 }
 
 assert_mock_request_contains() { # n needle
@@ -151,14 +158,15 @@ TERM=xterm-256color \
 
     # Stream finishes -> follow-up drains automatically -> mock request 2.
     # Durable ordering proof (independent of any transient frame): request 1's
-    # body was fixed when the turn started, so it must NOT carry the follow-up;
-    # request 2 is the drained follow-up and MUST carry it as its last user
-    # message. The transcript-order check below pins the same contract.
+    # body was fixed when the turn started, so it must NOT carry the follow-up
+    # digest; request 2 is the drained follow-up and MUST carry its digest as
+    # its last user message. The transcript-order check below pins the same
+    # contract.
     wait_for 'chunk-four-done' 25
     wait_for 'steering-followup-reply' 25
     wait_for_log 'request#2 ' 15
-    assert_mock_request_lacks 1 'steering-followup-one'
-    assert_mock_request_contains 2 'steering-followup-one'
+    assert_mock_request_lacks 1 "user_digest=$(digest_of 'steering-followup-one')"
+    assert_mock_request_contains 2 "user_digest=$(digest_of 'steering-followup-one')"
     # The queue drained with the turn; /queue reports empty.
     send_cmd '/queue'
     wait_for 'Queue is empty' 15
@@ -176,10 +184,10 @@ TERM=xterm-256color \
         log "user.$SCENARIO: 'Queued follow-up' status already replaced; ⚙ count asserted"
     fi
     # Drain: request 4 is the follow-up; request 3 (round 2's in-flight turn)
-    # must never have carried it.
+    # must never have carried it (its digest is absent).
     wait_for_log 'request#4 ' 25
-    assert_mock_request_lacks 3 'steering-followup-two'
-    assert_mock_request_contains 4 'steering-followup-two'
+    assert_mock_request_lacks 3 "user_digest=$(digest_of 'steering-followup-two')"
+    assert_mock_request_contains 4 "user_digest=$(digest_of 'steering-followup-two')"
     send_cmd '/queue cancel'
     wait_for 'Queue is empty' 15
     send_cmd '/queue'

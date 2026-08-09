@@ -69,6 +69,15 @@ from disk.
 - Rust: `cargo test -p pi-cli --lib` and
   `cargo test -p pi-cli --test listen_control_plane` (route + subprotocol
   auth contracts).
-- Browser E2E (skip-guarded): `bash E2E.d/web/run.sh` — playwright (ephemeral
-  npm install) or `agent-browser` (CDP), against the real binary + loopback
-  mock provider.
+- Browser E2E: `bash E2E.d/web/run.sh` — the web release lanes are
+  **playwright-only hard gates** (no skip, no fallback driver). Each lane
+  requires `node`, an ephemeral `npm install` of playwright, and a usable
+  Chromium (system Chrome/Chromium on `PATH` or playwright's bundled
+  chromium); a missing `node`/`npm`, a failed playwright install, or no
+  usable Chromium FAILS the lane (exit 1 = setup failure, exit 2+ =
+  assertion failure) and the runner exits non-zero when any lane fails.
+  Lanes run against the real binary + loopback mock provider.
+- Measured coverage: `bash E2E.d/web/coverage.sh` builds a TEMPORARY
+  conditionally-instrumented bundle (`vite.coverage.config.ts`) into the
+  evidence root, serves it via `RPI_WEB_DEV_DIR`, and drives it with the
+  real Playwright lanes — the tracked `dist/` is never modified.

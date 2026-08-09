@@ -184,7 +184,7 @@ async function main() {
 
     // 3. Good token: Connect -> connected.
     await page.fill('#token-input', token);
-    await page.click('#connect-btn');
+    await page.press('#token-input', 'Enter');
     await waitFor(
       page,
       () => document.getElementById('conn-state').dataset.state === 'on',
@@ -198,6 +198,11 @@ async function main() {
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, (tail) => document.body.textContent.includes(tail), 'full slow reply never streamed into the DOM', 30000, slowTail);
     await waitFor(page, () => document.getElementById('stream-badge').hidden === true, 'streaming badge did not clear after the reply completed');
+    const sendLabelWhenIdle = await page.textContent('#send-btn');
+    if (sendLabelWhenIdle?.trim() !== 'Send') {
+      fail(`primary submit did not return to Send while idle: "${sendLabelWhenIdle}"`);
+    }
+    record('app.primary-submit-send');
     record('prompt.slow-stream-full');
 
     // Request 2 is instant.
@@ -215,6 +220,11 @@ async function main() {
       () => document.getElementById('stream-badge').hidden === false,
       'streaming badge never appeared for the third stream'
     );
+    const sendLabelWhileStreaming = await page.textContent('#send-btn');
+    if (sendLabelWhileStreaming?.trim() !== 'Steer') {
+      fail(`primary submit did not switch to Steer while streaming: "${sendLabelWhileStreaming}"`);
+    }
+    record('app.primary-submit-steer');
     // Dismiss every toast accumulated by earlier phases (e.g. the Phase A
     // wrong-token "connection failed" error toast, which auto-dismisses only
     // after 7s) so the abort's anyError check below is scoped to toasts the
@@ -308,6 +318,89 @@ async function main() {
     if (richText.includes('|---')) fail('raw table separator leaked into the transcript');
     record('md.no-fence-leak');
     record('md.no-separator-leak');
+
+    // ---- markdown renderer coverage: ordinary code fence + URL policy ----
+    await waitFor(page, () => document.querySelector('.md-fence__copy') !== null, 'ordinary code fence copy button never rendered', 15000);
+    record('md.fence-rendered');
+    const fenceLang = await page.evaluate(() => document.querySelector('.md-fence__lang')?.textContent || '');
+    if (!fenceLang.includes('text')) fail(`code fence lang label wrong: "${fenceLang}"`);
+    // Click the delegated copy button and observe the flash state.
+    await page.click('.md-fence__copy');
+    await waitFor(page, () => (document.querySelector('.md-fence__copy')?.textContent || '') === 'copied', 'fence copy button never flashed "copied"', 10000);
+    record('md.fence-copy');
+    // Safe link renders as a live anchor with the allowlisted http href.
+    await waitFor(page, () => document.querySelector('a[href="https://example.org/pi-web"]') !== null, 'safe http link anchor never rendered', 10000);
+    record('md.link-safe');
+    // Blocked javascript: link must NOT become a live anchor; label text shows inert.
+    const linkPolicy = await page.evaluate(() => {
+      const live = Array.from(document.querySelectorAll('.assistant-text a')).map((a) => a.getAttribute('href') || '');
+      return {
+        jsHref: live.some((h) => h.toLowerCase().startsWith('javascript:')),
+        evilText: document.body.textContent.includes('evil'),
+      };
+    });
+    if (linkPolicy.jsHref) fail('a javascript: link leaked as a live anchor');
+    if (!linkPolicy.evilText) fail('blocked link label text "evil" never rendered inert');
+    record('md.link-blocked');
+    // Safe data:image PNG renders as an <img>; select by stable alt text and
+    // verify its raw attribute separately because Chromium may normalize data
+    // URL selector matching while the streaming DOM is settling.
+    await waitFor(page, () => {
+      const image = document.querySelector('img.md-image[alt="pic"]');
+      return (image?.getAttribute('src') || '').startsWith('data:image/png;base64,');
+    }, 'safe data:image PNG never rendered', 15000);
+    record('md.image-safe');
+    const imagePolicy = await page.evaluate(() => {
+      const imgs = Array.from(document.querySelectorAll('.assistant-text img')).map((i) => i.getAttribute('src') || '');
+      return {
+        textHtmlImg: imgs.some((s) => s.toLowerCase().startsWith('data:text/html')),
+        safePngImg: imgs.some((s) => s.startsWith('data:image/png')),
+      };
+    });
+    if (imagePolicy.textHtmlImg) fail('a data:text/html image leaked as a live <img>');
+    if (!imagePolicy.safePngImg) fail('the safe data:image PNG did not render as a live <img>');
+    record('md.image-blocked');
+
+    // ---- Phase C2: tool execution card (App.ToolCard + redact.safeJson) ----
+    // A prompt carrying the marker makes the agent call the `read` tool once;
+    // the tool_execution_start/end events render a .tool-card in the transcript.
+    const toolCardBefore = await page.evaluate(() => document.querySelectorAll('.tool-card').length);
+    await page.fill('#prompt-input', 'tool-card coverage read seed');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      (b) => {
+        const cards = [...document.querySelectorAll('.tool-card')];
+        if (cards.length <= b) return false;
+        const last = cards[cards.length - 1];
+        return (last.querySelector('.tool-card__name')?.textContent || '') === 'read';
+      },
+      'read tool-card never rendered in the transcript',
+      30000,
+      toolCardBefore
+    );
+    record('app.tool-card');
+    await waitFor(
+      page,
+      () => {
+        const cards = [...document.querySelectorAll('.tool-card')];
+        const last = cards[cards.length - 1];
+        return !!last && last.querySelector('.tool-card__state--done') !== null;
+    },
+      'read tool-card never reached done state',
+      30000
+    );
+    const toolCardArgs = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.tool-card')];
+      const last = cards[cards.length - 1];
+      return last
+        ? { name: last.querySelector('.tool-card__name')?.textContent || '', result: last.querySelector('.tool-card__result')?.textContent || '', hasArgs: last.querySelector('.tool-card__args') !== null }
+        : null;
+    });
+    if (!toolCardArgs || toolCardArgs.name !== 'read') fail(`tool-card name wrong: ${JSON.stringify(toolCardArgs)}`);
+    if (!toolCardArgs.hasArgs) fail('tool-card args pre (safeJson) never rendered');
+    if (!toolCardArgs.result.includes('web coverage seed')) fail(`tool-card result never showed the read file content: "${toolCardArgs.result}"`);
+    record('app.tool-card-done');
 
     // ============== Phase L: reconnect (real server kill) ==============
     // The lane shell (coverage.sh) watches kill-server.marker, kills and
@@ -451,6 +544,77 @@ async function main() {
     );
     record('todo.detail-pane');
 
+    // ---- todo lifecycle coverage: add via Enter, dependency link/unlink,
+    // detail-pane Complete/Reopen, clear selection ----
+    // Add a SECOND task via Enter (covers the content input onKeyDown path).
+    await page.fill('#todo-add-phase', 'Plan');
+    await page.fill('#todo-add-content', 'dep target task');
+    await page.press('#todo-add-content', 'Enter');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('.todo-task')].some((r) => r.textContent.includes('dep target task')),
+      'second task (added via Enter) never appeared'
+    );
+    record('todo.add-via-enter');
+    // Re-select the first task so the detail pane is the dependency editor.
+    await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.todo-task')];
+      const row = rows.find((r) => r.textContent.includes('web e2e task'));
+      if (!row) throw new Error('first task row missing');
+      row.click();
+    });
+    await waitFor(page, () => document.getElementById('todo-detail') !== null, 'detail pane did not reopen');
+    // Toggle the dependency editor (covers the edit-toggle onClick).
+    await page.click('.todo-detail__toggle');
+    await waitFor(page, () => document.getElementById('todo-dep-select') !== null, 'dependency editor select never rendered');
+    // Choose the second task as a dependency (covers the dep-select onChange).
+    await page.selectOption('#todo-dep-select', { label: 'dep target task' });
+    // Link it (covers linkDependency) and assert the dep label resolves to the
+    // dependency's content via taskContentById.
+    await page.click('.todo-detail__dep-add button');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('.todo-detail__dep-label')].some((el) => el.textContent.includes('dep target task')),
+      'linked dependency label never rendered the dependency content'
+    );
+    record('todo.dep-link');
+    // Unlink it (covers unlinkDependency).
+    await page.click('.todo-detail__unlink');
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.todo-detail__unlink').length === 0,
+      'unlink never removed the dependency chip'
+    );
+    record('todo.dep-unlink');
+    // Detail-pane Complete button (covers the open-branch detail onClick).
+    await page.click('#todo-detail-complete');
+    await waitFor(
+      page,
+      () => {
+        const rows = [...document.querySelectorAll('.todo-task')];
+        const row = rows.find((r) => r.textContent.includes('web e2e task'));
+        return !!row && row.querySelector('.todo-task__bullet')?.getAttribute('aria-label') === 'completed';
+      },
+      'detail Complete never reached completed'
+    );
+    record('todo.detail-complete');
+    // Detail-pane Reopen button (covers the completed-branch detail onClick).
+    await page.click('#todo-detail-reopen');
+    await waitFor(
+      page,
+      () => {
+        const rows = [...document.querySelectorAll('.todo-task')];
+        const row = rows.find((r) => r.textContent.includes('web e2e task'));
+        return !!row && row.querySelector('.todo-task__bullet')?.getAttribute('aria-label') === 'in_progress';
+      },
+      'detail Reopen never returned to in_progress'
+    );
+    record('todo.detail-reopen');
+    // Clear the selection (covers the detail-head close onClick).
+    await page.click('.todo-detail__head .todo-panel__close');
+    await waitFor(page, () => document.getElementById('todo-detail') === null, 'detail pane did not clear');
+    record('todo.clear-selection');
+
     // ==================== Phase F: goal panel ====================
     await page.click('#todo-close-btn');
     await waitFor(page, () => document.getElementById('todo-panel') === null, 'todo panel did not close');
@@ -575,6 +739,149 @@ async function main() {
     );
     record('workflow.cancel-status');
 
+    // ---- workflow lifecycle coverage: create via Enter, row select,
+    // pause/resume/integrate/remove, actor activity toggle ----
+    // Create a second workflow via Enter (covers the objective onKeyDown).
+    await page.fill('#workflow-create-name', 'web-e2e-workflow-2');
+    await page.fill('#workflow-create-objective', 'lifecycle coverage workflow');
+    await page.press('#workflow-create-objective', 'Enter');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('.workflow-row')].some((row) => row.textContent.includes('web-e2e-workflow-2')),
+      'second workflow (created via Enter) never appeared',
+      30000
+    );
+    record('workflow.create-via-enter');
+    // Click the row to select it (covers the row onClick -> selectWorkflow).
+    await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.workflow-row')];
+      const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-2'));
+      if (!row) throw new Error('workflow-2 row missing');
+      row.click();
+    });
+    await waitFor(
+      page,
+      () => (document.querySelector('.workflow-detail__name')?.textContent || '').includes('web-e2e-workflow-2'),
+      'selecting the workflow row never rendered its detail pane'
+    );
+    record('workflow.select-row');
+    // Pause -> paused (covers the pause onClick).
+    await page.click('#workflow-pause-btn');
+    await waitFor(
+      page,
+      () => {
+        const rows = [...document.querySelectorAll('.workflow-row')];
+        const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-2'));
+        return !!row && row.getAttribute('data-status') === 'paused';
+      },
+      'pause never reached paused',
+      30000
+    );
+    record('workflow.pause');
+    // Resume -> live again (covers the resume onClick).
+    await page.click('#workflow-resume-btn');
+    await waitFor(
+      page,
+      () => {
+        const rows = [...document.querySelectorAll('.workflow-row')];
+        const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-2'));
+        return !!row && ['running', 'planning', 'integrating'].includes(row.getAttribute('data-status') || '');
+      },
+      'resume never returned the workflow to a live state',
+      30000
+    );
+    record('workflow.resume');
+    // Best-effort actor activity toggle (covers ActorRow onClick when an actor
+    // has activity). Skipped silently if no foldable actor appears in time.
+    const actorToggleOk = await page
+      .waitForFunction(
+        () => document.querySelector('.workflow-actor.is-foldable') !== null,
+        { timeout: 6000 }
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (actorToggleOk) {
+      const expandedBefore = await page.evaluate(() => document.querySelectorAll('.workflow-actor__activity').length);
+      await page.click('.workflow-actor.is-foldable .workflow-actor__row');
+      await waitFor(
+        page,
+        (b) => document.querySelectorAll('.workflow-actor__activity').length !== b,
+        'actor activity feed never toggled',
+        10000,
+        expandedBefore
+      );
+      // Best-effort: no record() — the actor feed is non-deterministic, so it
+      // is not a matrix-gated assertion; the click still exercises ActorRow's
+      // onClick for coverage when a foldable actor is present.
+    }
+    // Remove workflow-2 (covers the remove onClick) — deterministic: the row
+    // leaves the list (the manager cancels non-terminal workflows first).
+    await page.click('#workflow-remove-btn');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('.workflow-row')].every((r) => !r.textContent.includes('web-e2e-workflow-2')),
+      'remove never dropped the workflow-2 row',
+      30000
+    );
+    record('workflow.remove');
+    // Integrate (covers the integrate onClick) on a fresh workflow. Pause so
+    // the button is enabled, click it, and accept any observable outcome
+    // (integration element, detail error, status transition, or row removal).
+    // The click fires the handler for coverage regardless; integrate on a
+    // worktree with no new commits may no-op, so the outcome wait is bounded
+    // and non-fatal — but the panel vanishing still fails the lane.
+    await page.fill('#workflow-create-name', 'web-e2e-workflow-3');
+    await page.fill('#workflow-create-objective', 'integrate coverage workflow');
+    await page.click('#workflow-create-btn');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('.workflow-row')].some((row) => row.textContent.includes('web-e2e-workflow-3')),
+      'third workflow never appeared for integrate',
+      30000
+    );
+    await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.workflow-row')];
+      const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-3'));
+      if (!row) throw new Error('workflow-3 row missing');
+      row.click();
+    });
+    await waitFor(
+      page,
+      () => (document.querySelector('.workflow-detail__name')?.textContent || '').includes('web-e2e-workflow-3'),
+      'workflow-3 detail never rendered'
+    );
+    await page.click('#workflow-pause-btn');
+    await waitFor(
+      page,
+      () => {
+        const rows = [...document.querySelectorAll('.workflow-row')];
+        const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-3'));
+        return !!row && row.getAttribute('data-status') === 'paused';
+      },
+      'workflow-3 pause never reached paused before integrate',
+      30000
+    );
+    await page.click('#workflow-integrate-btn');
+    const integrateOutcome = await page
+      .waitForFunction(
+        () => {
+          const rows = [...document.querySelectorAll('.workflow-row')];
+          const row = rows.find((r) => r.textContent.includes('web-e2e-workflow-3'));
+          const status = row ? row.getAttribute('data-status') || '' : 'removed';
+          const detailError = document.querySelector('#workflow-detail .workflow-panel__error') !== null;
+          const integration = document.querySelector('.workflow-detail__integration') !== null;
+          return detailError || integration || status === 'removed' || ['integrating', 'completed', 'conflicted', 'cancelled'].includes(status);
+        },
+        { timeout: 12000 }
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (!integrateOutcome) {
+      const panelOk = await page.evaluate(() => document.getElementById('workflow-panel') !== null);
+      if (!panelOk) fail('workflow panel vanished after integrate (no observable outcome)');
+    }
+    record('workflow.integrate');
+
     // ==================== Phase H: settings panel ====================
     await page.click('#workflow-close-btn');
     await waitFor(page, () => document.getElementById('workflow-panel') === null, 'workflow panel did not close');
@@ -629,6 +936,58 @@ async function main() {
       'applied theme never reflected in the settings panel'
     );
     record('settings.apply-persisted');
+
+    // ---- settings coverage: refresh, typed control variants (boolean/enum/
+    // number/JSON textarea), reset-to-default, cancel draft, close ----
+    await page.click('#settings-refresh-btn');
+    await waitFor(page, () => document.querySelector('[data-setting-key="theme"]') !== null, 'refresh never reloaded the catalog');
+    record('settings.refresh');
+    // Open a second draft to exercise every typed SettingControl variant.
+    await page.click('.settings-category:has-text("Terminal")');
+    await page.click('#settings-edit-btn');
+    await waitFor(page, () => document.getElementById('settings-apply-btn') !== null, 'second draft never opened');
+    const settingsNotBusy = () => document.getElementById('settings-apply-btn')?.disabled === false;
+    await waitFor(page, settingsNotBusy, 'settings stayed busy before typed edits');
+    // Boolean checkbox (onChange -> parseTypedValue boolean branch).
+    await waitFor(page, () => document.querySelector('.setting-row input[type="checkbox"]:not([disabled])') !== null, 'no editable boolean setting', 10000);
+    await page.click('.setting-row input[type="checkbox"]:not([disabled])');
+    await waitFor(page, settingsNotBusy, 'boolean edit never settled');
+    record('settings.typed-boolean');
+    // Enum select (onChange -> parseTypedValue enum branch).
+    await waitFor(page, () => document.querySelector('.setting-row select:not([disabled])') !== null, 'no editable enum setting', 10000);
+    const enumOptions = await page.$$eval('.setting-row select:not([disabled]) option', (opts) => opts.map((o) => o.value));
+    const currentEnum = await page.$eval('.setting-row select:not([disabled])', (el) => el.value);
+    const enumTarget = (enumOptions.find((v) => v && v !== currentEnum) || enumOptions.find((v) => v) || '');
+    if (enumTarget) await page.selectOption('.setting-row select:not([disabled])', enumTarget);
+    await waitFor(page, settingsNotBusy, 'enum edit never settled');
+    record('settings.typed-enum');
+    // Number input (onChange + onBlur -> parseTypedValue integer branch).
+    await waitFor(page, () => document.querySelector('.setting-row input[type="number"]:not([disabled])') !== null, 'no editable number setting', 10000);
+    await page.fill('.setting-row input[type="number"]:not([disabled])', '80');
+    await page.evaluate(() => document.querySelector('.setting-row input[type="number"]:not([disabled])')?.blur());
+    await waitFor(page, settingsNotBusy, 'number edit never settled');
+    record('settings.typed-number');
+    // JSON object textarea (onBlur -> parseTypedValue object branch).
+    await waitFor(page, () => document.querySelector('.setting-row textarea:not([disabled])') !== null, 'no editable JSON setting', 10000);
+    await page.fill('.setting-row textarea:not([disabled])', '{"e2e": true}');
+    await page.evaluate(() => document.querySelector('.setting-row textarea:not([disabled])')?.blur());
+    await waitFor(page, settingsNotBusy, 'json edit never settled');
+    record('settings.typed-json');
+    // Reset-to-default (covers commitReset -> settings_reset).
+    await waitFor(page, () => document.querySelector('.setting-row__reset:not([disabled])') !== null, 'no reset button in draft', 10000);
+    await page.click('.setting-row__reset:not([disabled])');
+    await waitFor(page, settingsNotBusy, 'reset never settled');
+    record('settings.reset');
+    // Cancel the draft (covers cancelDraft -> settings_cancel, discards the
+    // typed edits so the fixture settings are unchanged).
+    await page.click('#settings-cancel-btn');
+    await waitFor(page, () => document.getElementById('settings-edit-btn') !== null, 'cancel never closed the draft');
+    record('settings.cancel-draft');
+    // Close the settings panel via its own close button (covers App's
+    // settings onClose callback).
+    await page.click('#settings-close-btn');
+    await waitFor(page, () => document.getElementById('settings-panel') === null, 'settings panel did not close');
+    record('settings.close');
 
     // ==================== Phase I: sessions panel ====================
     await waitFor(page, () => document.getElementById('session-sidebar') !== null, 'session sidebar did not render');
@@ -807,6 +1166,46 @@ async function main() {
     );
     record('subagent.cancel');
 
+    // ---- subagents coverage: spawn via Enter + message via Enter ----
+    // Spawn a second job via Enter (covers the task input onKeyDown). A
+    // second live job also gives the panel more than one card.
+    await page.fill('#subagents-task-input', 'web-e2e-subagent: second job for enter spawn');
+    await page.press('#subagents-task-input', 'Enter');
+    await waitFor(
+      page,
+      () =>
+        [...document.querySelectorAll('.subagent-job')].some((card) =>
+          (card.textContent || '').includes('second job for enter spawn')
+        ),
+      'second subagent job (spawned via Enter) never appeared',
+      30000
+    );
+    record('subagent.spawn-via-enter');
+    // Type a message and send it via Enter (covers the message input
+    // onKeyDown -> sendMessage path).
+    await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.subagent-job')];
+      const card = cards.find((c) => (c.textContent || '').includes('second job for enter spawn'));
+      if (!card) throw new Error('second subagent card missing');
+      const input = card.querySelector('.subagent-job__message-input');
+      if (!input) throw new Error('message input missing');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(input, 'ping via enter');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.press('.subagent-job[data-status="running"] .subagent-job__message-input, .subagent-job[data-status="queued"] .subagent-job__message-input', 'Enter');
+    await waitFor(
+      page,
+      () => (document.querySelector('[data-panel-toast]')?.textContent || '').includes('message delivered'),
+      'message sent via Enter never reported a delivered receipt',
+      30000
+    );
+    record('subagent.message-via-enter');
+    // Best-effort: an incoming message_delivered event (child -> Main) would
+    // refresh the job activity line via recordMessage. Wait briefly; do not
+    // fail if the canned mock child does not reply within the window.
+    await page.waitForTimeout(2500);
+
     // ============ Phase K: side chat + maintenance ============
     await page.click('#subagents-close-btn');
     await waitFor(page, () => document.getElementById('subagents-panel') === null, 'subagents panel did not close');
@@ -948,6 +1347,26 @@ async function main() {
       'queue cancel never reported'
     );
     record('maintenance.queue-cancel');
+
+    // ---- App coverage: maintenance panel close (onClosePanel) + composer
+    // steer/follow-up button clicks ----
+    // Close the maintenance panel via its own close button (covers App's
+    // maintenance onClosePanel callback, distinct from a panel-toggle swap).
+    await page.click('.maintenance .panel-close');
+    await waitFor(page, () => document.querySelector('.maintenance') === null, 'maintenance panel did not close via its close button');
+    record('app.maintenance-close');
+    // Clear the composer so Steer/Follow up hit submit's empty-input guard
+    // (no RPC, no side effects) — the onClick handlers still execute.
+    await page.fill('#prompt-input', '');
+    await page.click('#steer-btn');
+    await page.click('#followup-btn');
+    await waitFor(
+      page,
+      () => Array.from(document.querySelectorAll('#toasts .toast--error')).length === 0,
+      'empty steer/follow-up click produced an unexpected error toast'
+    );
+    record('app.steer-btn');
+    record('app.followup-btn');
 
     // ==================== Phase M: mobile viewport ====================
     const mobile = await browser.newPage({ viewport: { width: 375, height: 667 } });

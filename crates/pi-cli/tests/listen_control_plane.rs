@@ -621,6 +621,7 @@ async fn non_loopback_policy_requires_both_token_and_explicit_opt_in() {
                 address: address.parse().unwrap(),
                 token_file,
                 allow_insecure_remote,
+                advertised_origin: None,
                 session_factory: None,
             },
         )
@@ -655,6 +656,7 @@ async fn wildcard_listener_with_opt_in_enforces_token_over_loopback_connection()
             address: "0.0.0.0:0".parse().unwrap(),
             token_file: Some(token_path),
             allow_insecure_remote: true,
+            advertised_origin: None,
             session_factory: None,
         },
     )
@@ -707,6 +709,7 @@ async fn loopback_listen_accepts_v4_and_v6_with_and_without_token() {
                     address: addr.parse().unwrap(),
                     token_file: token_file.as_deref().map(std::path::PathBuf::from),
                     allow_insecure_remote: false,
+                    advertised_origin: None,
                     session_factory: None,
                 },
             )

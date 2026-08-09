@@ -110,11 +110,13 @@ contextual errors and never silently fall back to local.
 ## Namespaces
 
 - `global`: one bank, no project tag filter.
-- `per-project`: bank id is `<base>-<project-label>`.
-- `per-project-tagged`: one bank; retains carry `project:<label>` and recalls
-  use that tag with `tags_match: any`, which also permits untagged global memory.
-- The project label derives from the canonical repository anchor when present,
-  otherwise the working-directory name.
+- `per-project`: bank id is `<base>-<sanitized-label>-<digest-prefix>`.
+- `per-project-tagged`: one bank; retains carry
+  `project:<sanitized-label>-<digest-prefix>` and recalls use that tag with
+  `tags_match: any`, which also permits untagged global memory.
+- The project identity hashes the canonical repository anchor when present,
+  otherwise the canonical working directory. The readable basename is retained,
+  but same-named repositories remain isolated by the digest prefix.
 - Future child sessions resolve the parent's live backend configuration. Local
   persona children still use `<persona-root>/memory/entries.jsonl`; Hindsight
   persona children use the explicitly configured bank/scoping contract.

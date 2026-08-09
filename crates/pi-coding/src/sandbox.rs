@@ -23,6 +23,18 @@
 //! equivalent); the wrapper maps the caller to root *inside* the namespaces
 //! only — there is no privilege escalation on the host.
 //!
+//! Launcher trust: `unshare` is resolved **only** from fixed system paths
+//! (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) — the inherited `PATH` is
+//! never consulted, so a PATH-prepended `unshare` (for example in a writable
+//! workspace directory) is not a candidate at all. A candidate is accepted
+//! only when its canonical (symlink-resolved) path is one of those fixed
+//! identities, the file is a regular executable owned by root, and every
+//! ancestor in the complete canonical parent chain is a real directory that
+//! is neither group- nor world-writable; candidates inside the working
+//! directory (the workspace) are rejected. The file's device/inode identity
+//! is recorded at discovery and revalidated immediately before process
+//! creation, so a swap between discovery and spawn fails closed.
+//!
 //! Platform note: on non-Linux targets every sandbox entry point returns the
 //! explicit "sandbox unsupported on this platform" error.
 //!
@@ -75,8 +87,8 @@ impl SandboxConfig {
     }
 
     /// Rejects configurations that cannot be honored, with actionable errors:
-    /// non-Linux platforms, a missing `unshare`, and a working directory that
-    /// is not visible inside the sandbox.
+    /// non-Linux platforms, an untrustworthy or missing `unshare` launcher,
+    /// and a working directory that is not visible inside the sandbox.
     pub fn validate(&self, cwd: &Path) -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -88,10 +100,24 @@ impl SandboxConfig {
         }
         #[cfg(target_os = "linux")]
         {
-            if look_path("unshare").is_none() {
-                bail!(
-                    "sandbox requires the `unshare` command (util-linux). Install util-linux or disable the sandbox (sandbox.enabled=false)."
-                );
+            if let Err(reason) = discover_unshare_launcher(cwd) {
+                bail!("sandbox launcher is not trustworthy: {reason}");
+            }
+            // Fail closed at the config boundary: every allowed/denied path
+            // must be a clean absolute target (no `..`/`.`/prefix, not `/`).
+            // The setup script builds staging targets as `$ROOT$path`, so any
+            // surviving `..` would let a nonexistent path escape the private
+            // root during `mkdir`/`mount`. `resolve` normalizes already; this
+            // guards directly-constructed configs that bypass it.
+            for path in &self.allowed_paths {
+                if let Err(reason) = path_is_clean(path) {
+                    bail!("{reason}. Remove it from sandbox.allowedPaths or disable the sandbox.");
+                }
+            }
+            for path in &self.denied_paths {
+                if let Err(reason) = path_is_clean(path) {
+                    bail!("{reason}. Remove it from sandbox.deniedPaths or disable the sandbox.");
+                }
             }
             let cwd = canonicalize_or(cwd.to_path_buf());
             let visible = self
@@ -127,6 +153,11 @@ impl SandboxConfig {
     /// `tokio::process::Command` machinery as a plain spawn, so timeouts,
     /// aborts, and process-group kills keep working unchanged.
     ///
+    /// The launcher is resolved from fixed system paths only — the inherited
+    /// `PATH` is never consulted — and the resolved canonical path is the
+    /// wrapper program. `cwd` is the spawn working directory, used to reject
+    /// workspace-contained candidates.
+    ///
     /// The allowed/denied path lists travel as positional arguments between
     /// the script name and the confined command (`allowed_count`,
     /// `denied_count`, allowed paths, denied paths, `--` marker, then
@@ -138,13 +169,20 @@ impl SandboxConfig {
     /// shell code. Only paths and the command are passed on the command
     /// line — never secrets.
     #[cfg(target_os = "linux")]
-    pub fn wrapper_command(&self, argv: &[String]) -> Result<Vec<String>> {
-        let unshare = look_path("unshare").ok_or_else(|| {
-            anyhow!(
-                "sandbox requires the `unshare` command (util-linux). Install util-linux or disable the sandbox (sandbox.enabled=false)."
-            )
-        })?;
-        let mut wrapped = vec![unshare];
+    pub fn wrapper_command(&self, cwd: &Path, argv: &[String]) -> Result<Vec<String>> {
+        let launcher = discover_unshare_launcher(cwd)
+            .map_err(|reason| anyhow!("sandbox launcher is not trustworthy: {reason}"))?;
+        self.wrapper_argv(&launcher.path, argv)
+    }
+
+    /// Assembles the wrapper argv for a validated fixed-system `unshare`
+    /// path. `unshare` is a canonical, already-trusted path — this helper
+    /// never consults `PATH`. Kept separate from
+    /// [`SandboxConfig::wrapper_command`] so `build_command` can discover
+    /// the launcher once and revalidate the exact path that will spawn.
+    #[cfg(target_os = "linux")]
+    fn wrapper_argv(&self, unshare: &Path, argv: &[String]) -> Result<Vec<String>> {
+        let mut wrapped = vec![unshare.to_string_lossy().into_owned()];
         // Unprivileged mount/pid/net namespaces require a user namespace that
         // maps the caller to root inside the sandbox. Same uid on the host —
         // no privilege escalation. Real root skips the mapping so host-root
@@ -201,8 +239,18 @@ impl SandboxConfig {
 
     /// Non-Linux fallback: identical signature, explicit unsupported error.
     #[cfg(not(target_os = "linux"))]
-    pub fn wrapper_command(&self, argv: &[String]) -> Result<Vec<String>> {
+    pub fn wrapper_command(&self, _cwd: &Path, argv: &[String]) -> Result<Vec<String>> {
         let _ = (self, argv);
+        bail!(
+            "sandbox is only supported on Linux (this build targets {})",
+            std::env::consts::OS
+        );
+    }
+
+    /// Non-Linux fallback for the argv assembly (only reachable after
+    /// discovery already failed): explicit unsupported error.
+    #[cfg(not(target_os = "linux"))]
+    fn wrapper_argv(&self, _unshare: &Path, _argv: &[String]) -> Result<Vec<String>> {
         bail!(
             "sandbox is only supported on Linux (this build targets {})",
             std::env::consts::OS
@@ -240,21 +288,30 @@ enum SandboxStdio {
 /// read-only marker) are appended last so a host environment can never spoof
 /// them, and the allowed/denied path lists travel as wrapper argv, which
 /// environment variables cannot influence at all.
+///
+/// Returns the validated [`Launcher`] (when a sandbox wrapper was built)
+/// alongside the command so the caller can revalidate its device/inode
+/// identity immediately before process creation.
 fn build_command(
     config: Option<&SandboxConfig>,
     cwd: &Path,
     argv: &[String],
     env: &[(String, String)],
     stdio: SandboxStdio,
-) -> Result<tokio::process::Command> {
-    let (program, args) = if let Some(config) = config {
+) -> Result<(tokio::process::Command, Option<Launcher>)> {
+    let (program, args, launcher) = if let Some(config) = config {
         config.validate(cwd)?;
-        let wrapped = config.wrapper_command(argv)?;
-        (wrapped[0].clone(), wrapped[1..].to_vec())
+        // Discovered once so the spawn-time revalidation compares against
+        // the exact path/identity this wrapper will execute.
+        let launcher = discover_unshare_launcher(cwd)
+            .map_err(|reason| anyhow!("sandbox launcher is not trustworthy: {reason}"))?;
+        let wrapped = config.wrapper_argv(&launcher.path, argv)?;
+        (wrapped[0].clone(), wrapped[1..].to_vec(), Some(launcher))
     } else {
         (
             argv.first().cloned().ok_or_else(|| anyhow!("empty sandbox argv"))?,
             argv[1..].to_vec(),
+            None,
         )
     };
     let mut command = tokio::process::Command::new(program);
@@ -281,7 +338,7 @@ fn build_command(
             command.env(key, value);
         }
     }
-    Ok(command)
+    Ok((command, launcher))
 }
 
 /// Runs `argv` to completion — inside the sandbox when `config` is `Some`
@@ -303,7 +360,7 @@ pub async fn run_in_sandbox(
     abort: AbortSignal,
     on_chunk: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
 ) -> Result<SandboxRunOutcome> {
-    let mut command = build_command(config, cwd, argv, &env, SandboxStdio::Merged)?;
+    let (mut command, launcher) = build_command(config, cwd, argv, &env, SandboxStdio::Merged)?;
     // Merge stdout+stderr onto one stream so child write order is preserved
     // (pi/Go: same pipe on both fds, shared onData handler). UnixStream::pair
     // gives us ordered interleaving without a new dependency; a cloned end is
@@ -329,6 +386,13 @@ pub async fn run_in_sandbox(
     // process_send.
     command.stdin(Stdio::null());
 
+    // Revalidate the trusted launcher immediately before process creation:
+    // a file swapped since discovery, or replaced by a symlink, fails closed.
+    if let Some(launcher) = &launcher {
+        launcher
+            .revalidate()
+            .map_err(|reason| anyhow!("sandbox launcher is not trustworthy: {reason}"))?;
+    }
     let mut child = command.spawn().map_err(|e| anyhow!("{}", e))?;
 
     #[cfg(unix)]
@@ -496,7 +560,14 @@ pub fn spawn_piped(
     env: impl IntoIterator<Item = (String, String)>,
 ) -> Result<tokio::process::Child> {
     let env = env.into_iter().collect::<Vec<_>>();
-    let mut command = build_command(config, cwd, argv, &env, SandboxStdio::Piped)?;
+    let (mut command, launcher) = build_command(config, cwd, argv, &env, SandboxStdio::Piped)?;
+    // Revalidate the trusted launcher immediately before process creation
+    // (see [`Launcher::revalidate`]).
+    if let Some(launcher) = &launcher {
+        launcher
+            .revalidate()
+            .map_err(|reason| anyhow!("sandbox launcher is not trustworthy: {reason}"))?;
+    }
     command.spawn().map_err(|e| anyhow!("{}", e))
 }
 
@@ -513,10 +584,9 @@ pub fn resolve(settings: Option<&SandboxSettings>, cwd: &Path, agent_dir: &Path)
     let mut allowed_paths = Vec::new();
     if let Some(paths) = &settings.allowed_paths {
         for raw in paths {
-            if raw.trim().is_empty() {
-                continue;
+            if let Some(path) = normalize_sandbox_path(cwd, raw) {
+                allowed_paths.push(path);
             }
-            allowed_paths.push(canonicalize_or(absolutize(cwd, raw)));
         }
     }
     if allowed_paths.is_empty() {
@@ -526,10 +596,9 @@ pub fn resolve(settings: Option<&SandboxSettings>, cwd: &Path, agent_dir: &Path)
     let mut denied_paths = Vec::new();
     if let Some(paths) = &settings.denied_paths {
         for raw in paths {
-            if raw.trim().is_empty() {
-                continue;
+            if let Some(path) = normalize_sandbox_path(cwd, raw) {
+                denied_paths.push(path);
             }
-            denied_paths.push(canonicalize_or(absolutize(cwd, raw)));
         }
     }
     Some(SandboxConfig {
@@ -541,13 +610,86 @@ pub fn resolve(settings: Option<&SandboxSettings>, cwd: &Path, agent_dir: &Path)
     })
 }
 
-fn absolutize(cwd: &Path, raw: &str) -> PathBuf {
-    let path = PathBuf::from(raw);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
+/// Normalizes a sandbox path so it can never carry a `..` component into the
+/// shell transport, where the setup script builds staging targets as
+/// `$ROOT$path` and a surviving `..` would let a nonexistent path escape the
+/// private root during `mkdir`/`mount` (the 0.2.4 P1: denied paths that do
+/// not exist are never `canonicalize`d, so their lexical `..` reached the
+/// shell untouched).
+///
+/// Existing paths are `canonicalize`d FIRST so symlink/`..` semantics follow
+/// the real filesystem — a `..` after a symlink is NOT a lexical pop, so
+/// collapsing first (the original buggy shape) would mis-resolve
+/// `/a/link/../x` to `/a/x` instead of the real target. Lexical collapse
+/// runs only as the fallback for paths that do not exist on the host, which
+/// is exactly the P1 case, and the collapsed result is re-canonicalized in
+/// case the collapse made an existing path resolvable. Returns `None` for
+/// empty paths, prefix components (e.g. drive letters), and paths that
+/// normalize to the filesystem root — degenerate targets dropped exactly like
+/// the existing empty-string skip. The original (untrimmed) `raw` is parsed
+/// so valid path names that begin or end with spaces are preserved; only the
+/// emptiness check trims. [`SandboxConfig::validate`] independently enforces
+/// the same invariant on directly-constructed configs, so a `..` can never
+/// reach a spawn.
+fn normalize_sandbox_path(cwd: &Path, raw: &str) -> Option<PathBuf> {
+    if raw.trim().is_empty() {
+        return None;
     }
+    let path = PathBuf::from(raw);
+    let absolute = if path.is_absolute() { path } else { cwd.join(&path) };
+    // Existing path: canonicalize so symlink/`..` semantics follow the real
+    // filesystem. A canonical path is absolute with no `..`/`.`/prefix.
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        return canonical_root_rejected(canonical);
+    }
+    // Nonexistent (or an intermediate component is missing): lexically
+    // collapse `.`/`..` so no traversal component can reach the shell.
+    let normalized = lexically_normalize(&absolute)?;
+    // The collapse may have made an existing path resolvable (e.g.
+    // `/tmp/missing/../real`); canonicalize once more to keep symlink
+    // semantics correct when possible.
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        return canonical_root_rejected(canonical);
+    }
+    Some(normalized)
+}
+
+/// Rejects the filesystem root (`canonicalize("/")` is `/`, which would
+/// overlay the sandbox root itself if used as a staging target).
+fn canonical_root_rejected(canonical: PathBuf) -> Option<PathBuf> {
+    (canonical != Path::new("/")).then_some(canonical)
+}
+
+/// Lexically collapses `.`/`..` against preceding normal components with root
+/// clamping (a `..` above `/` stays `/`). Returns `None` for a prefix
+/// component (e.g. a Windows drive letter) or when the result is the
+/// filesystem root. Used only as the nonexistent-path fallback in
+/// [`normalize_sandbox_path`]; existing paths are canonicalized instead.
+fn lexically_normalize(absolute: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut stack: Vec<Component> = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) => return None,
+            Component::RootDir => {
+                stack.clear();
+                stack.push(Component::RootDir);
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => match stack.last() {
+                Some(Component::Normal(_)) => {
+                    stack.pop();
+                }
+                _ => {} // at the root: clamp, `..` above `/` stays `/`
+            },
+            Component::Normal(_) => stack.push(component),
+        }
+    }
+    let mut normalized = PathBuf::new();
+    for component in &stack {
+        normalized.push(component.as_os_str());
+    }
+    (normalized != Path::new("/")).then_some(normalized)
 }
 
 fn canonicalize_or(path: PathBuf) -> PathBuf {
@@ -560,6 +702,39 @@ fn canonicalize_or(path: PathBuf) -> PathBuf {
 fn path_is_within(path: &Path, allowed: &Path) -> bool {
     let allowed = canonicalize_or(allowed.to_path_buf());
     path.starts_with(&allowed)
+}
+
+/// True when `path` is a valid sandbox transport target: absolute, with no
+/// `..`/prefix components and not the filesystem root. The setup script builds
+/// staging paths as `$ROOT$path`, so any `..` component would let a
+/// (nonexistent) path escape the private root during `mkdir`/`mount`. This
+/// invariant is the fail-closed gate for directly-constructed configs that
+/// bypass [`resolve`]'s normalization.
+///
+/// Only `..` and prefix components are rejected — `.` components are
+/// harmless (they never let `$ROOT$path` escape) and `Path::components`
+/// skips mid-path `.` anyway, so they are not a traversal risk. The setup
+/// script adds its own shell-level `.`/`..` rejection as defense-in-depth.
+fn path_is_clean(path: &Path) -> Result<(), String> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(format!("sandbox path {} is not absolute", path.display()));
+    }
+    if path == Path::new("/") {
+        return Err("sandbox path '/' (filesystem root) cannot be a sandbox target".to_owned());
+    }
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => {
+                return Err(format!("sandbox path {} has a prefix component (e.g. drive letter)", path.display()));
+            }
+            Component::ParentDir => {
+                return Err(format!("sandbox path {} contains a '..' component", path.display()));
+            }
+            Component::RootDir | Component::Normal(_) | Component::CurDir => {}
+        }
+    }
+    Ok(())
 }
 
 /// True when the effective uid is root. Read from `/proc/self` ownership to
@@ -580,6 +755,11 @@ fn path_exists(path: &str) -> bool {
     std::fs::metadata(path).is_ok()
 }
 
+/// Resolves `name` from the inherited `PATH`. Used only for the `/bin/sh`
+/// fallback that runs the setup script *inside* the already-created fresh
+/// namespaces — the `unshare` launcher itself is NEVER resolved from `PATH`
+/// (see [`discover_unshare_launcher`]), so a PATH-prepended `unshare` is
+/// never a sandbox candidate.
 #[cfg(target_os = "linux")]
 fn look_path(name: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
@@ -590,6 +770,260 @@ fn look_path(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Fixed system locations util-linux installs `unshare` at. Discovery never
+/// consults the inherited `PATH`; only these absolute paths are candidates,
+/// so a PATH-prepended `unshare` (for example in a writable workspace
+/// directory) is not a candidate at all and can never be selected, let alone
+/// executed.
+#[cfg(target_os = "linux")]
+const TRUSTED_UNSHARE_CANDIDATES: [&str; 4] =
+    ["/usr/bin/unshare", "/bin/unshare", "/usr/sbin/unshare", "/sbin/unshare"];
+
+/// POSIX `st_mode` file-type bits (see `stat(2)`): the type mask and the
+/// regular-file/directory values. Kept as local literals so the trust seam
+/// has no dependency surface.
+#[cfg(target_os = "linux")]
+const S_IFMT: u32 = 0o170000;
+#[cfg(target_os = "linux")]
+const S_IFREG: u32 = 0o100000;
+#[cfg(target_os = "linux")]
+const S_IFDIR: u32 = 0o040000;
+
+/// The canonical (symlink-resolved) identities a launcher may have: each
+/// fixed candidate canonicalized. Merged-usr systems canonicalize
+/// `/bin/unshare` to `/usr/bin/unshare`, so membership is decided on the
+/// canonical path — a symlink that resolves outside the fixed set (for
+/// example into a workspace or user directory) is rejected.
+#[cfg(target_os = "linux")]
+fn trusted_launcher_canonicals() -> Vec<PathBuf> {
+    TRUSTED_UNSHARE_CANDIDATES
+        .iter()
+        .filter_map(|candidate| std::fs::canonicalize(candidate).ok())
+        .collect()
+}
+
+/// Facts about a discovered launcher candidate, gathered once at discovery.
+/// Kept separate from the trust decision so every rejection — non-root
+/// owner, missing execute bit, writable file or ancestor, workspace
+/// containment — is unit-testable without touching the real filesystem.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct LauncherProbe {
+    /// Canonical (symlink-resolved) path of the candidate file.
+    canonical: PathBuf,
+    /// `st_mode` of the file itself.
+    mode: u32,
+    /// `st_uid` of the file.
+    uid: u32,
+    /// Device id of the file (`st_dev`).
+    dev: u64,
+    /// Inode of the file (`st_ino`).
+    ino: u64,
+    /// `st_mode` of every ancestor directory of the canonical chain, from
+    /// the parent directory up to and including `/`.
+    ancestor_modes: Vec<u32>,
+}
+
+/// Gathers the facts [`probe_is_trusted`] needs for `canonical` (a
+/// symlink-resolved fixed-system path). Every ancestor is read with
+/// `symlink_metadata` and must be a real directory — a component swapped for
+/// a symlink after canonicalization fails closed. Returns `None` when the
+/// file or an ancestor cannot be stat'd.
+#[cfg(target_os = "linux")]
+fn probe_candidate(canonical: &Path) -> Option<LauncherProbe> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(canonical).ok()?;
+    let mut ancestor_modes = Vec::new();
+    let mut dir = canonical.parent()?;
+    loop {
+        let meta = std::fs::symlink_metadata(dir).ok()?;
+        if meta.mode() & S_IFMT != S_IFDIR {
+            return None;
+        }
+        ancestor_modes.push(meta.mode());
+        let Some(parent) = dir.parent() else {
+            break;
+        };
+        dir = parent;
+    }
+    Some(LauncherProbe {
+        canonical: canonical.to_path_buf(),
+        mode: meta.mode(),
+        uid: meta.uid(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        ancestor_modes,
+    })
+}
+
+/// Pure trust decision over a [`LauncherProbe`]. A launcher is accepted only
+/// when
+///
+/// - its canonical path is one of the fixed-system identities in `trusted`,
+/// - the file is a regular file, owned by root, executable, and not group-
+///   or world-writable (a group-writable launcher could be swapped by a
+///   same-group attacker),
+/// - every ancestor directory in the complete canonical chain is neither
+///   group- nor world-writable (a writable ancestor allows replacing the
+///   launcher),
+/// - the canonical path is not inside `cwd` (a "system" binary living inside
+///   the working directory/workspace is user-controlled by definition; the
+///   check is skipped when `cwd` is `/`, where it would be vacuous).
+///
+/// Returns `Ok(())` or a readable rejection reason.
+#[cfg(target_os = "linux")]
+fn probe_is_trusted(probe: &LauncherProbe, trusted: &[PathBuf], cwd: &Path) -> Result<(), String> {
+    if !trusted.iter().any(|candidate| candidate == &probe.canonical) {
+        return Err(format!(
+            "{} is not a trusted fixed-system unshare identity",
+            probe.canonical.display()
+        ));
+    }
+    if probe.mode & S_IFMT != S_IFREG {
+        return Err(format!(
+            "{} is not a regular file (mode {:o})",
+            probe.canonical.display(),
+            probe.mode
+        ));
+    }
+    if probe.uid != 0 {
+        return Err(format!(
+            "{} is not owned by root (uid {})",
+            probe.canonical.display(),
+            probe.uid
+        ));
+    }
+    if probe.mode & 0o111 == 0 {
+        return Err(format!(
+            "{} is not executable (mode {:o})",
+            probe.canonical.display(),
+            probe.mode
+        ));
+    }
+    if probe.mode & 0o022 != 0 {
+        return Err(format!(
+            "{} is group- or world-writable (mode {:o})",
+            probe.canonical.display(),
+            probe.mode
+        ));
+    }
+    if let Some(ancestor) = probe.ancestor_modes.iter().find(|mode| **mode & 0o022 != 0) {
+        return Err(format!(
+            "an ancestor of {} is group- or world-writable (mode {:o})",
+            probe.canonical.display(),
+            ancestor
+        ));
+    }
+    // The containment check keeps a user-controlled workspace tree from
+    // hosting the launcher; with a working directory of `/` it is vacuous
+    // (every system path is under `/`), so it is skipped there — the fixed
+    // canonical identity and ownership/mode/chain checks still apply.
+    if cwd != Path::new("/") && probe.canonical.starts_with(cwd) {
+        return Err(format!(
+            "{} is inside the working directory (workspace); refusing a workspace-contained launcher",
+            probe.canonical.display()
+        ));
+    }
+    Ok(())
+}
+
+/// A validated launcher: the canonical path plus the device/inode identity
+/// recorded at discovery. [`Launcher::revalidate`] is called immediately
+/// before process creation so a file swapped between discovery and spawn
+/// (different inode) or replaced by a symlink (no longer a regular file)
+/// fails closed.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct Launcher {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl Launcher {
+    /// Re-checks, immediately before spawn, that `path` is still the exact
+    /// file discovered: a regular file (never a symlink) with the same
+    /// device and inode. Any mismatch fails closed.
+    fn revalidate(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(&self.path).map_err(|error| {
+            format!("launcher {} vanished before spawn: {error}", self.path.display())
+        })?;
+        if meta.mode() & S_IFMT != S_IFREG {
+            return Err(format!(
+                "launcher {} is no longer a regular file (mode {:o}); refusing to spawn",
+                self.path.display(),
+                meta.mode()
+            ));
+        }
+        if meta.dev() != self.dev || meta.ino() != self.ino {
+            return Err(format!(
+                "launcher {} changed identity (device/inode mismatch); refusing to spawn",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Resolves the trusted `unshare` launcher for a sandboxed spawn, or a
+/// readable reason when no fixed-system candidate passes every check. The
+/// inherited `PATH` is never consulted: a PATH-prepended `unshare` is not a
+/// candidate at all.
+#[cfg(target_os = "linux")]
+fn discover_unshare_launcher(cwd: &Path) -> Result<Launcher, String> {
+    let cwd = canonicalize_or(cwd.to_path_buf());
+    let trusted = trusted_launcher_canonicals();
+    let mut rejections = Vec::new();
+    for candidate in TRUSTED_UNSHARE_CANDIDATES {
+        let Ok(canonical) = std::fs::canonicalize(candidate) else {
+            continue; // not installed at this fixed path
+        };
+        let Some(probe) = probe_candidate(&canonical) else {
+            continue;
+        };
+        match probe_is_trusted(&probe, &trusted, &cwd) {
+            Ok(()) => {
+                return Ok(Launcher {
+                    path: canonical,
+                    dev: probe.dev,
+                    ino: probe.ino,
+                });
+            }
+            Err(reason) => rejections.push(reason),
+        }
+    }
+    if rejections.is_empty() {
+        Err("no `unshare` found in the fixed system paths (/usr/bin, /bin, /usr/sbin, /sbin); install util-linux or disable the sandbox (sandbox.enabled=false)".to_owned())
+    } else {
+        Err(rejections.join("; "))
+    }
+}
+
+/// Non-Linux stub: the sandbox is unsupported there, so discovery always
+/// fails (only reachable after the platform error in
+/// [`SandboxConfig::validate`]).
+#[cfg(not(target_os = "linux"))]
+fn discover_unshare_launcher(_cwd: &Path) -> Result<Launcher, String> {
+    Err("sandbox is only supported on Linux".to_owned())
+}
+
+/// Placeholder for non-Linux builds: never constructed (discovery fails
+/// first), so revalidation is a no-op. Carries the same `path` field the
+/// Linux build has so `build_command` compiles unchanged.
+#[cfg(not(target_os = "linux"))]
+struct Launcher {
+    path: PathBuf,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Launcher {
+    fn revalidate(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Mount setup executed as PID 1 of the fresh mount/pid/net namespaces (root
@@ -608,9 +1042,15 @@ fn look_path(name: &str) -> Option<String> {
 ///
 /// Order matters: `/tmp` is mounted before allowed paths so an allowed path
 /// under `/tmp` (the common case for temp working directories) lands inside
-/// the final private tmpfs and its parent chain survives `pivot_root`; system
-/// dirs are bound read-only before allowed paths so an allowed path nested in
-/// a system dir still wins; denied overlays come last so they always win.
+/// the final private tmpfs and its parent chain survives `pivot_root`; allowed
+/// mountpoints are pre-created on the unbound tmpfs root BEFORE any host bind
+/// (system or allowed) so the staging `mkdir`/`: >` for a nested allowed path
+/// can never reach through an already-bound parent and truncate a host file;
+/// system dirs are then bound read-only before the allowed binds so an allowed
+/// path nested in a system dir still wins; denied overlays are constructed
+/// before any binds and re-applied after them so they always win, and an absent
+/// denied path covered by a bind fails closed (exit 95) rather than ever
+/// becoming visible or leaking a host path into existence.
 #[cfg(target_os = "linux")]
 const SANDBOX_SETUP_SCRIPT: &str = r#"#!/bin/sh
 set -eu
@@ -656,6 +1096,32 @@ esac
 # arg, so the counts plus 2 must fit; truncated transports fail here.
 [ $((ALLOWED_COUNT + DENIED_COUNT + 2)) -le "$#" ] || { echo "sandbox: path counts $ALLOWED_COUNT/$DENIED_COUNT exceed the $# remaining args (malformed transport)" >&2; exit 70; }
 
+# Defense-in-depth: every transported path must be lexically contained — no
+# `..` or `.` component — so `$ROOT$path` can never escape the private root
+# during staging `mkdir`/`mount`. The Rust side normalizes paths already; this
+# rejects any `..` that slipped through before a single mount runs. Absoluteness
+# is NOT checked here (the existing injection tests deliberately feed hostile
+# non-absolute values that must reach the mount step untouched), only traversal.
+# Runs in a subshell so the parent's positional arguments stay intact.
+(
+  i=0
+  total=$((ALLOWED_COUNT + DENIED_COUNT))
+  while [ "$i" -lt "$total" ]; do
+    p=$1
+    shift
+    i=$((i + 1))
+    [ -n "$p" ] || { echo "sandbox: empty path in transport (malformed transport)" >&2; exit 70; }
+    case "$p" in
+      /..|/../*|*/..|*/../*|..|../*)
+        echo "sandbox: path '$p' contains a '..' component (malformed transport)" >&2; exit 70;;
+    esac
+    case "$p" in
+      /.|/./*|*/.|*/./*|.|./*)
+        echo "sandbox: path '$p' contains a '.' component (malformed transport)" >&2; exit 70;;
+    esac
+  done
+) || exit 70
+
 # The process starts in the host working directory. Its absolute path is
 # preserved (allowed paths are bind-mounted at their host paths), so we can
 # `cd` back into it after pivot_root: a cwd inode from the detached old root
@@ -684,6 +1150,76 @@ done
 mkdir -p "$ROOT/tmp"
 mount -t tmpfs -o mode=1777 tmpfs "$ROOT/tmp" || { echo "sandbox: tmp mount failed" >&2; exit 96; }
 
+# Denied paths: empty overlay that wins over allowed and system binds.
+# Absent denied paths are constructed here, BEFORE any bind mounts exist at
+# their host paths, so mkdir/mount always happen on the tmpfs root and can
+# never create the denied path on the host. Runs in a subshell so the
+# parent's positional arguments stay intact for the re-application pass
+# after the binds (mounts are namespace state and survive the subshell).
+: > "$ROOT/.pi-deny-file" 2>/dev/null || true
+(
+  shift "$ALLOWED_COUNT" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt "$DENIED_COUNT" ]; do
+    p=$1
+    shift
+    i=$((i + 1))
+    [ -n "$p" ] || continue
+    if [ -d "$p" ] || [ ! -e "$p" ]; then
+      mkdir -p "$ROOT$p" 2>/dev/null || true
+      # Absent targets get a read-only overlay: mode-000 alone is bypassed
+      # by the userns-root command, so ro makes the empty dir inaccessible.
+      opts="mode=000"
+      [ -e "$p" ] || opts="mode=000,ro"
+      mount -t tmpfs -o "$opts" tmpfs "$ROOT$p" || { echo "sandbox: deny overlay $p failed" >&2; exit 95; }
+    else
+      mkdir -p "$(dirname "$ROOT$p")" 2>/dev/null || true
+      : > "$ROOT$p" 2>/dev/null || true
+      mount --bind "$ROOT/.pi-deny-file" "$ROOT$p" || { echo "sandbox: deny overlay $p failed" >&2; exit 95; }
+    fi
+  done
+) || exit 95
+
+# Allowed paths are mounted in TWO passes so staging can never reach through
+# an already-bound parent onto the host (the sandbox P1: a single-pass loop
+# that creates a mountpoint and binds it in the same iteration lets a bind
+# onto a parent — e.g. /foo — make `$ROOT$p` for a later nested allowed path
+# — e.g. /foo/bar/baz.txt — resolve through that bind onto the real host
+# file, so the `: >`/`mkdir` staging truncates/creates host content before
+# the confined command ever runs).
+#
+# Pass 1 (allowed staging) runs BEFORE any host bind — system or allowed —
+# so `$ROOT$p` always names a path on the unbound tmpfs root. The `mkdir`/
+# `: >` staging for a nested allowed path lands on the private tmpfs, never
+# on a host file a system or allowed parent bind would expose (a system
+# bind whose read-only remount silently failed would otherwise be a writable
+# parent). Pass 2 (allowed bind), after the system binds, attaches each host
+# path to its pre-created mountpoint in list order so a parent bind stacks
+# beneath a later child bind; it creates no target, so a parent bind cannot
+# funnel a later bind's staging into the host.
+#
+# Each `$1` is a literal path — no shell re-parsing. Pass 1 runs in a
+# subshell so the parent's positional arguments stay intact for the bind
+# pass; the created directories/files live on the tmpfs root and survive
+# the subshell.
+# >>> allowed-staging-begin
+(
+  i=0
+  while [ "$i" -lt "$ALLOWED_COUNT" ]; do
+    p=$1
+    shift
+    i=$((i + 1))
+    [ -n "$p" ] && [ -e "$p" ] || continue
+    if [ -d "$p" ]; then
+      mkdir -p "$ROOT$p"
+    else
+      mkdir -p "$(dirname "$ROOT$p")"
+      : > "$ROOT$p"
+    fi
+  done
+) || { echo "sandbox: allowed mountpoint staging failed" >&2; exit 93; }
+# >>> allowed-staging-end
+
 # System binaries/libs visible read-only so commands can execute; user data
 # under these roots stays hidden. Bound before allowed paths so an allowed
 # path nested in a system dir still wins.
@@ -693,42 +1229,36 @@ for d in /usr /bin /sbin /lib /lib64; do
   mount --bind "$d" "$ROOT$d" 2>/dev/null || { echo "sandbox: bind $d failed" >&2; exit 94; }
   mount -o remount,bind,ro "$ROOT$d" 2>/dev/null || true
 done
-
-# Allowed paths (read-write unless PI_SANDBOX_READ_ONLY=1): the agent's
-# working data. Each `$1` is a literal path — no shell re-parsing.
+# >>> allowed-bind-begin
 i=0
 while [ "$i" -lt "$ALLOWED_COUNT" ]; do
   p=$1
   shift
   i=$((i + 1))
   [ -n "$p" ] && [ -e "$p" ] || continue
-  if [ -d "$p" ]; then
-    mkdir -p "$ROOT$p"
-  else
-    mkdir -p "$(dirname "$ROOT$p")"
-    : > "$ROOT$p"
-  fi
   mount --bind "$p" "$ROOT$p" || { echo "sandbox: bind $p failed" >&2; exit 93; }
   if [ "${PI_SANDBOX_READ_ONLY:-0}" = "1" ]; then
     mount -o remount,bind,ro "$ROOT$p" || { echo "sandbox: remount $p read-only failed" >&2; exit 88; }
   fi
 done
+# >>> allowed-bind-end
 
-# Denied paths: empty overlay (wins over allowed and system binds). Directories
-# become empty tmpfs mounts; files are hidden behind an empty placeholder file.
+# Denied overlays re-applied after the binds: they always win. An absent
+# denied path covered by a bind has no mountpoint to attach to, and creating
+# one would leak the path onto the host — fail closed instead of running the
+# command with the denied path visible.
 i=0
 while [ "$i" -lt "$DENIED_COUNT" ]; do
   p=$1
   shift
   i=$((i + 1))
-  [ -n "$p" ] && [ -e "$p" ] || continue
-  if [ -d "$p" ]; then
-    mkdir -p "$ROOT$p"
-    mount -t tmpfs -o mode=000 tmpfs "$ROOT$p" || { echo "sandbox: deny overlay $p failed" >&2; exit 95; }
+  [ -n "$p" ] || continue
+  if [ -d "$p" ] || [ ! -e "$p" ]; then
+    opts="mode=000"
+    [ -e "$p" ] || opts="mode=000,ro"
+    mount -t tmpfs -o "$opts" tmpfs "$ROOT$p" || { echo "sandbox: denied path $p is absent on the host and cannot be hidden under a bind; refusing to run" >&2; exit 95; }
   else
-    mkdir -p "$(dirname "$ROOT$p")"
-    : > "$ROOT/.pi-deny-file" 2>/dev/null || true
-    mount --bind "$ROOT/.pi-deny-file" "$ROOT$p" || { echo "sandbox: deny overlay $p failed" >&2; exit 95; }
+    mount --bind "$ROOT/.pi-deny-file" "$ROOT$p" || { echo "sandbox: denied path $p is absent on the host and cannot be hidden under a bind; refusing to run" >&2; exit 95; }
   fi
 done
 
@@ -908,7 +1438,7 @@ mod tests {
             read_only: false,
         };
         let argv = config
-            .wrapper_command(&["/bin/echo".to_owned(), "hi".to_owned()])
+            .wrapper_command(Path::new("/tmp"), &["/bin/echo".to_owned(), "hi".to_owned()])
             .expect("wrapper argv");
         let i = argv
             .iter()
@@ -939,7 +1469,10 @@ mod tests {
             read_only: false,
         };
         let argv = config
-            .wrapper_command(&["/bin/bash".to_owned(), "-c".to_owned(), "echo hi".to_owned()])
+            .wrapper_command(
+                Path::new("/tmp"),
+                &["/bin/bash".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
+            )
             .expect("wrapper argv");
         let position = |flag: &str| argv.iter().position(|arg| arg == flag).expect(flag);
         // Namespace flags, in order, with --net present (network off by default).
@@ -981,7 +1514,10 @@ mod tests {
             read_only: false,
         };
         let argv = config
-            .wrapper_command(&["/bin/bash".to_owned(), "-c".to_owned(), "echo hi".to_owned()])
+            .wrapper_command(
+                Path::new("/tmp"),
+                &["/bin/bash".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
+            )
             .expect("wrapper argv");
         assert!(
             !argv.iter().any(|arg| arg == "--net"),
@@ -1004,11 +1540,14 @@ mod tests {
             read_only: false,
         };
         let argv = config
-            .wrapper_command(&[
-                "/bin/bash".to_owned(),
-                "-lc".to_owned(),
-                "echo 'a b'".to_owned(),
-            ])
+            .wrapper_command(
+                Path::new("/tmp"),
+                &[
+                    "/bin/bash".to_owned(),
+                    "-lc".to_owned(),
+                    "echo 'a b'".to_owned(),
+                ],
+            )
             .expect("wrapper argv");
         assert_eq!(argv[argv.len() - 3], "/bin/bash");
         assert_eq!(argv[argv.len() - 2], "-lc");
@@ -1031,7 +1570,7 @@ mod tests {
             read_only: false,
         };
         let argv = config
-            .wrapper_command(&["/bin/true".to_owned()])
+            .wrapper_command(Path::new("/tmp"), &["/bin/true".to_owned()])
             .expect("wrapper argv");
         let i = argv
             .iter()
@@ -1071,7 +1610,7 @@ mod tests {
             read_only: false,
         };
         let argv = config
-            .wrapper_command(&["/bin/echo".to_owned(), "lit".to_owned()])
+            .wrapper_command(Path::new("/tmp"), &["/bin/echo".to_owned(), "lit".to_owned()])
             .expect("wrapper argv");
         let i = argv
             .iter()
@@ -1271,6 +1810,78 @@ mod tests {
         );
     }
 
+    /// A configured denied path that does not exist on the host is still
+    /// denied inside the sandbox — including when it nests under an allowed
+    /// parent. The construct-before-binds / re-apply-after-binds dance must
+    /// never fall back to creating the denied path on the host: when the
+    /// absent path is covered by an allowed bind there is no mountpoint to
+    /// attach the overlay to, so the setup script refuses to run (exit 95)
+    /// and the host never sees the sentinel. On hosts where namespace setup
+    /// itself fails, the fail-closed path (exit 1 or 90-99) proves the same
+    /// no-leak property.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "live confinement test: requires Linux unprivileged user namespaces (run with --include-ignored on a supported kernel)"]
+    async fn denied_absent_under_allowed_parent_never_leaks_to_host() {
+        let dir = tempfile::TempDir::new().expect("allowed parent temp dir");
+        // Canonicalize the allowed parent so the sandbox bind matches the
+        // path the config names; the absent denied child is never resolved.
+        let allowed = dir.path().canonicalize().expect("canonicalize allowed parent");
+        let denied = allowed.join("secret");
+        // The allowed parent is real content; it must survive the run intact.
+        let allowed_file = allowed.join("allowed.txt");
+        std::fs::write(&allowed_file, "allowed content").expect("write allowed file");
+        let config = SandboxConfig {
+            enabled: true,
+            network: false,
+            allowed_paths: vec![allowed.clone()],
+            denied_paths: vec![denied.clone()],
+            read_only: false,
+        };
+        let argv = vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "mkdir -p secret/deep && touch secret/deep/pwned && echo RAN".to_owned(),
+        ];
+        let outcome = run_in_sandbox(
+            Some(&config),
+            &allowed,
+            &argv,
+            Vec::new(),
+            None,
+            AbortSignal::none(),
+            None,
+        )
+        .await
+        .expect("sandboxed run must not error at the runner level");
+        match outcome.exit_code {
+            Some(95) => {}
+            Some(code) if code == 1 || (90..=99).contains(&code) => {
+                // Host cannot create the namespaces (or the launcher is
+                // missing): the confined command never ran, which still
+                // proves the denied path never leaked.
+                eprintln!(
+                    "denied-absent live-run: sandbox namespace setup unavailable here (exit {code}); the fail-closed path still proved no leak"
+                );
+            }
+            other => panic!("unexpected sandbox outcome: {other:?}"),
+        }
+        assert!(
+            !denied.exists(),
+            "the absent denied path must never be created on the host: {}",
+            denied.display()
+        );
+        assert!(
+            !allowed.join("secret/deep/pwned").exists(),
+            "the sandboxed command must never be able to write under the denied path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&allowed_file).expect("read allowed file"),
+            "allowed content",
+            "allowed content must survive the run intact"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn validate_rejects_cwd_outside_allowed_paths() {
@@ -1384,8 +1995,8 @@ mod tests {
                 SandboxStdio::Merged,
             )
         };
-        let command = match build() {
-            Ok(command) => command,
+        let (command, launcher) = match build() {
+            Ok(pair) => pair,
             Err(error) => {
                 assert!(
                     error.to_string().contains("unshare"),
@@ -1394,6 +2005,10 @@ mod tests {
                 return;
             }
         };
+        assert!(
+            launcher.is_some(),
+            "a validated launcher identity is recorded for spawn-time revalidation"
+        );
         let program = command.as_std().get_program().to_string_lossy().into_owned();
         assert!(
             program.ends_with("/unshare") || program == "unshare",
@@ -1438,14 +2053,14 @@ mod tests {
             denied_paths: Vec::new(),
             read_only: false,
         };
-        let command = match build_command(
+        let (command, _launcher) = match build_command(
             Some(&config),
             &real,
             &["/bin/true".to_owned()],
             &[],
             SandboxStdio::Merged,
         ) {
-            Ok(command) => command,
+            Ok(pair) => pair,
             Err(error) => {
                 assert!(
                     error.to_string().contains("unshare"),
@@ -1563,5 +2178,745 @@ mod tests {
         let serialized = serde_json::to_string(&parsed).expect("serialize");
         let round: serde_json::Value = serde_json::from_str(&serialized).expect("json");
         assert_eq!(round["future"], 1);
+    }
+
+    /// Regression: a writable `unshare` prepended to `PATH` — the classic
+    /// workspace-escape vector, where the old lookup consulted the inherited
+    /// `PATH` — must never be selected, let alone executed, by a sandboxed
+    /// spawn.
+    ///
+    /// Edition 2024 forbids `unsafe`, which `std::env::set_var` requires, so
+    /// the hostile environment is built in a child process: the test
+    /// re-executes itself with the sentinel directory first on `PATH` and as
+    /// its working directory (mirroring the repo's fake-server re-exec test
+    /// pattern). The child asserts the wrapper program is the trusted
+    /// fixed-system `unshare` — never the sentinel — and runs a real
+    /// sandboxed command: the sentinel's marker file must stay absent, both
+    /// when the namespaces can be created (the sentinel would run and touch
+    /// it) and when the host fails closed on namespace setup (the setup
+    /// script's exit 90 or `unshare`'s own failure, still without touching
+    /// the marker).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn path_prepended_unshare_sentinel_is_never_selected_or_executed() {
+        const CHILD_ENV: &str = "PI_SANDBOX_SENTINEL_CHILD";
+        if std::env::var(CHILD_ENV).is_err() {
+            // Parent: build the hostile workspace, then run the real
+            // assertions in a child whose environment has the sentinel dir
+            // prepended to PATH and used as its working directory.
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::TempDir::new().expect("hostile workspace");
+            let sentinel = dir.path().join("unshare");
+            let marker = dir.path().join("pwned");
+            // The wrapper's environment is env_clear()ed, so the marker path
+            // is embedded literally (single-quoted; embedded quotes escaped).
+            let marker_quoted = marker.display().to_string().replace('\'', "'\\''");
+            std::fs::write(
+                &sentinel,
+                format!("#!/bin/sh\ntouch '{}'\n", marker_quoted),
+            )
+            .expect("write sentinel unshare");
+            std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o755))
+                .expect("sentinel executable");
+            let hostile_path = std::env::join_paths(
+                std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                )),
+            )
+            .expect("hostile PATH");
+            let exe = std::env::current_exe().expect("test binary path");
+            let status = tokio::process::Command::new(exe)
+                // Substring filter (no `--exact`, mirroring the repo's
+                // fake-server re-exec pattern) so only this test runs in the
+                // child regardless of the harness's module-path naming.
+                .arg("path_prepended_unshare_sentinel_is_never_selected_or_executed")
+                .env(CHILD_ENV, "1")
+                .env("PATH", hostile_path)
+                .current_dir(dir.path())
+                .status()
+                .await
+                .expect("run child test");
+            assert!(
+                status.success(),
+                "the child assertions must pass: a PATH-prepended unshare is never selected or executed"
+            );
+            assert!(
+                !marker.exists(),
+                "the sentinel unshare must never have been executed: {}",
+                marker.display()
+            );
+            return;
+        }
+        // Child: the sentinel dir is first on PATH and is the working
+        // directory; every assertion below runs in that hostile environment.
+        let cwd = std::env::current_dir().expect("hostile working directory");
+        let marker = cwd.join("pwned");
+        let _ = std::fs::remove_file(&marker);
+        let config = SandboxConfig {
+            enabled: true,
+            network: false,
+            allowed_paths: vec![cwd.clone()],
+            denied_paths: Vec::new(),
+            read_only: false,
+        };
+        // 1. Never selected: the wrapper program must be a trusted
+        // fixed-system unshare, never the PATH-prepended sentinel.
+        match config.wrapper_command(&cwd, &["/bin/true".to_owned()]) {
+            Ok(argv) => {
+                let program = PathBuf::from(argv[0].as_str());
+                assert!(
+                    trusted_launcher_canonicals()
+                        .iter()
+                        .any(|candidate| candidate == &program),
+                    "the wrapper program {program:?} must be a trusted fixed-system unshare, never the PATH-prepended sentinel: {argv:?}"
+                );
+                assert!(
+                    !program.starts_with(&cwd),
+                    "a workspace-contained launcher must never be selected: {program:?}"
+                );
+                // 2. Never executed: run a real sandboxed command and require
+                // the sentinel's marker to stay absent. When the host cannot
+                // create the namespaces, `unshare` fails (exit 1) or the
+                // setup script fails closed (exit 90-99) before the confined
+                // command runs — either way the sentinel never runs.
+                let outcome = run_in_sandbox(
+                    Some(&config),
+                    &cwd,
+                    &["/bin/true".to_owned()],
+                    Vec::new(),
+                    None,
+                    AbortSignal::none(),
+                    None,
+                )
+                .await
+                .expect("sandboxed run must not error at the runner level");
+                match outcome.exit_code {
+                    Some(0) => {}
+                    Some(code) => {
+                        // Any nonzero exit without a marker is the fail-closed
+                        // path (unshare could not create the namespaces, or
+                        // the setup script aborted before the confined command
+                        // ran). The sentinel never ran either way.
+                        eprintln!(
+                            "sentinel live-run: sandbox namespace setup unavailable here (exit {code}); the fail-closed path still proved the sentinel never ran"
+                        );
+                    }
+                    None => panic!("unexpected sandbox outcome (child killed by signal): {outcome:?}"),
+                }
+                assert!(
+                    !marker.exists(),
+                    "the sentinel unshare must never have been executed: {}",
+                    marker.display()
+                );
+            }
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("unshare"),
+                    "the only legitimate failure is the trusted-launcher fail-closed error, never sentinel selection: {error}"
+                );
+                assert!(
+                    !marker.exists(),
+                    "the sentinel unshare must never have been executed: {}",
+                    marker.display()
+                );
+            }
+        }
+    }
+
+    /// The trust seam rejects every insecure launcher candidate without
+    /// touching the real filesystem: canonical identity, ownership, mode,
+    /// writable ancestors, and workspace containment are decided purely from
+    /// gathered facts, so no privileged filesystem mutation is needed to
+    /// prove the rejections.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launcher_trust_rejects_insecure_candidates() {
+        // The workspace-contained canonical is deliberately a member of the
+        // trusted set: the containment check is defense-in-depth that must
+        // fire even when canonical identity would otherwise pass.
+        let trusted = vec![
+            PathBuf::from("/usr/bin/unshare"),
+            PathBuf::from("/home/user/workspace/bin/unshare"),
+        ];
+        let cwd = Path::new("/home/user/workspace");
+        let secure = || LauncherProbe {
+            canonical: PathBuf::from("/usr/bin/unshare"),
+            mode: 0o100755,
+            uid: 0,
+            dev: 1,
+            ino: 1,
+            ancestor_modes: vec![0o755, 0o755, 0o755], // /usr/bin, /usr, /
+        };
+        let cases: &[(&str, LauncherProbe, &str)] = &[
+            (
+                "canonical path outside the trusted set",
+                LauncherProbe {
+                    canonical: PathBuf::from("/usr/local/bin/unshare"),
+                    ..secure()
+                },
+                "trusted fixed-system",
+            ),
+            (
+                "symlink (not a regular file)",
+                LauncherProbe {
+                    mode: 0o120777,
+                    ..secure()
+                },
+                "regular file",
+            ),
+            (
+                "non-root owner",
+                LauncherProbe {
+                    uid: 1000,
+                    ..secure()
+                },
+                "root",
+            ),
+            (
+                "missing execute bit",
+                LauncherProbe {
+                    mode: 0o100644,
+                    ..secure()
+                },
+                "not executable",
+            ),
+            (
+                "world-writable file",
+                LauncherProbe {
+                    mode: 0o100777,
+                    ..secure()
+                },
+                "group- or world-writable",
+            ),
+            (
+                "group-writable ancestor",
+                LauncherProbe {
+                    ancestor_modes: vec![0o775, 0o755, 0o755],
+                    ..secure()
+                },
+                "group- or world-writable",
+            ),
+            (
+                "world-writable ancestor",
+                LauncherProbe {
+                    ancestor_modes: vec![0o755, 0o777, 0o755],
+                    ..secure()
+                },
+                "group- or world-writable",
+            ),
+            (
+                "workspace-contained candidate",
+                LauncherProbe {
+                    canonical: PathBuf::from("/home/user/workspace/bin/unshare"),
+                    ..secure()
+                },
+                "workspace",
+            ),
+        ];
+        for (name, probe, needle) in cases {
+            let error = probe_is_trusted(probe, &trusted, cwd).expect_err(name);
+            assert!(
+                error.contains(*needle),
+                "{name}: expected a rejection mentioning {needle:?}, got: {error}"
+            );
+        }
+        probe_is_trusted(&secure(), &trusted, cwd)
+            .expect("a trusted root-owned regular executable with a clean chain is accepted");
+    }
+
+    /// The spawn-time revalidation requires the exact same device/inode: a
+    /// different recorded identity, a symlink placed at the path, or a
+    /// vanished file all fail closed. Uses a scratch file, so no privileged
+    /// filesystem mutation is needed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launcher_revalidation_fails_closed_on_identity_change() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let file = dir.path().join("launcher");
+        std::fs::write(&file, "#!/bin/sh\nexit 0\n").expect("write scratch launcher");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let meta = std::fs::symlink_metadata(&file).expect("stat scratch launcher");
+        let launcher = Launcher {
+            path: file.clone(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        launcher
+            .revalidate()
+            .expect("the same device/inode revalidates");
+        // A different recorded identity for the same path must fail closed.
+        let swapped = Launcher {
+            path: file.clone(),
+            dev: meta.dev() ^ 1,
+            ino: meta.ino() ^ 1,
+        };
+        assert!(swapped.revalidate().is_err(), "an identity change must fail closed");
+        // A symlink placed at the path must fail closed (it is not the
+        // regular file that was discovered).
+        let link = dir.path().join("launcher-swapped");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink");
+        let symlink_launcher = Launcher {
+            path: link,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        assert!(symlink_launcher.revalidate().is_err(), "a symlink swap must fail closed");
+        // A vanished launcher must fail closed.
+        let gone = dir.path().join("never-written");
+        let gone_launcher = Launcher {
+            path: gone,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        assert!(gone_launcher.revalidate().is_err(), "a vanished launcher must fail closed");
+    }
+
+    /// `resolve` must lexically normalize `..`/`.` out of allowed and denied
+    /// paths so neither list can carry a traversal component into the shell
+    /// transport. Nonexistent paths are never `canonicalize`d, so without
+    /// normalization a `..` would reach the setup script verbatim and let
+    /// `$ROOT$path` escape the private root during staging (the 0.2.4 P1).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_normalizes_traversal_components_out_of_paths() {
+        let dir = tempfile::TempDir::new().expect("temp root");
+        let root = dir.path().canonicalize().expect("canonicalize temp root");
+        let cwd = root.join("work");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let config = resolve(
+            Some(&settings(
+                Some(true),
+                None,
+                Some(vec![
+                    "/tmp/allowed/./sub/../final", // -> /tmp/allowed/final
+                    "relative/../sibling",         // -> cwd/sibling
+                ]),
+                Some(vec![
+                    "/tmp/denied/with/../traversal",        // -> /tmp/denied/traversal
+                    "/tmp/denied/escape/../../target",      // -> /tmp/target
+                ]),
+            )),
+            &cwd,
+            &root.join("agent"),
+        )
+        .expect("config");
+        for path in config.allowed_paths.iter().chain(config.denied_paths.iter()) {
+            assert!(
+                path_is_clean(path).is_ok(),
+                "normalized sandbox path must be clean: {path:?}"
+            );
+        }
+        assert!(config.allowed_paths.iter().any(|p| p == Path::new("/tmp/allowed/final")));
+        assert!(config.allowed_paths.iter().any(|p| p == &cwd.join("sibling")));
+        assert!(config.denied_paths.iter().any(|p| p == Path::new("/tmp/denied/traversal")));
+        assert!(config.denied_paths.iter().any(|p| p == Path::new("/tmp/target")));
+    }
+
+    /// A denied path that lexically escapes toward the filesystem root is
+    /// clamped at `/` and dropped when it normalizes to the root itself:
+    /// denying `/` is nonsensical (it would overlay the sandbox root) and a
+    /// `..` above `/` can never be a real target.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_drops_paths_that_normalize_to_filesystem_root() {
+        let dir = tempfile::TempDir::new().expect("temp root");
+        let root = dir.path().canonicalize().expect("canonicalize temp root");
+        let config = resolve(
+            Some(&settings(
+                Some(true),
+                None,
+                Some(vec!["/tmp/allowed"]),
+                Some(vec!["/tmp/escape/../../.."]), // -> /, dropped
+            )),
+            &root.join("work"),
+            &root.join("agent"),
+        )
+        .expect("config");
+        assert!(
+            config.denied_paths.is_empty(),
+            "a denied path that normalizes to '/' is dropped: {config:?}"
+        );
+    }
+
+    /// `validate` is the fail-closed gate for directly-constructed configs:
+    /// it must reject any allowed/denied path carrying `..`/`.`/prefix or that
+    /// is non-absolute or the filesystem root — the shapes that would let
+    /// `$ROOT$path` escape the private root during staging. A clean absent
+    /// denied child is still accepted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_rejects_paths_with_traversal_or_anomalies() {
+        let allowed = Path::new("/tmp/allowed");
+        let base = SandboxConfig {
+            enabled: true,
+            network: false,
+            allowed_paths: vec![allowed.to_path_buf()],
+            denied_paths: Vec::new(),
+            read_only: false,
+        };
+        let reject_denied = |denied: &str, needle: &str| {
+            let mut config = base.clone();
+            config.denied_paths = vec![PathBuf::from(denied)];
+            let error = config.validate(allowed).expect_err(denied);
+            assert!(error.to_string().contains(needle), "{denied}: expected {needle:?} in: {error}");
+        };
+        // Traversal (`..`) in denied and allowed paths is the P1 shape.
+        reject_denied("/tmp/allowed/../sibling", "'..'");
+        let config = SandboxConfig {
+            enabled: true,
+            network: false,
+            allowed_paths: vec![PathBuf::from("/tmp/allowed/../sibling")],
+            denied_paths: Vec::new(),
+            read_only: false,
+        };
+        let error = config.validate(Path::new("/tmp/allowed/../sibling")).expect_err("traversal allowed");
+        assert!(error.to_string().contains("'..'"), "got: {error}");
+        // Non-absolute and root are degenerate transports too. (`.` components
+        // are not a traversal risk and are not observable via `Path::components`;
+        // the setup script rejects them as defense-in-depth — see
+        // `setup_script_rejects_traversal_paths_before_mounting`.)
+        reject_denied("relative/denied", "is not absolute");
+        reject_denied("/", "filesystem root");
+        // A clean denied path (the valid absent-denied-child case) is accepted.
+        let mut clean = base.clone();
+        clean.denied_paths = vec![PathBuf::from("/tmp/allowed/secret")];
+        clean.validate(allowed).expect("a clean absolute denied path is accepted");
+    }
+
+    /// Regression for the 0.2.4 P1: a denied path that lexically escapes its
+    /// intended parent toward a host sentinel directory must be rejected at
+    /// the config boundary BEFORE any spawn — no staging `mkdir`/`mount` may
+    /// touch the host, and no sentinel directory may come into existence.
+    /// Works on any kernel: `validate()` fails closed inside `build_command`
+    /// before namespaces are created.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn denied_traversal_path_is_rejected_before_spawn_and_creates_no_host_dir() {
+        let dir = tempfile::TempDir::new().expect("allowed parent temp dir");
+        let allowed = dir.path().canonicalize().expect("canonicalize allowed parent");
+        // Host sentinel: a directory beside the allowed parent that the
+        // traversal would target. It must not pre-exist and must never be
+        // created by the sandbox staging. The denied path is built to
+        // lexically resolve to EXACTLY this sentinel so the assertion below
+        // checks the real traversal target, not an unrelated path.
+        let sentinel_name = format!(
+            "pi-traversal-sentinel-{}",
+            allowed.file_name().expect("name").to_string_lossy()
+        );
+        let sentinel = allowed
+            .parent()
+            .expect("allowed parent has a parent")
+            .join(&sentinel_name);
+        let _ = std::fs::remove_dir(&sentinel);
+        // Denied path that lexically carries `..` into the sentinel — the bug
+        // shape: nonexistent denied paths are never canonicalized, so the `..`
+        // used to reach the shell and escape `$ROOT$path` during staging.
+        let denied = allowed.join("..").join(&sentinel_name);
+        assert!(
+            denied
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "the regression denied path must carry a literal `..`"
+        );
+        let config = SandboxConfig {
+            enabled: true,
+            network: false,
+            allowed_paths: vec![allowed.clone()],
+            denied_paths: vec![denied.clone()],
+            read_only: false,
+        };
+        // 1. Config validation rejects the traversal before any spawn.
+        let error = config
+            .validate(&allowed)
+            .expect_err("a traversal denied path must fail validation");
+        assert!(error.to_string().contains(".."), "validation must name the traversal: {error}");
+        // 2. The runner fails closed before spawning (validate() runs first).
+        let err = run_in_sandbox(
+            Some(&config),
+            &allowed,
+            &["/bin/true".to_owned()],
+            Vec::new(),
+            None,
+            AbortSignal::none(),
+            None,
+        )
+        .await
+        .expect_err("sandboxed run must fail closed on traversal before spawn");
+        assert!(err.to_string().contains(".."), "runner error must name the traversal: {err}");
+        // 3. No host directory was created by the rejected spawn.
+        assert!(
+            !sentinel.exists(),
+            "the traversal must never create the host sentinel: {}",
+            sentinel.display()
+        );
+        let _ = std::fs::remove_dir(&sentinel);
+    }
+
+    /// Defense-in-depth: the setup script itself rejects any transported path
+    /// carrying a `..` (or `.`) component BEFORE a single mount runs, so even
+    /// a `..` that bypassed the Rust-side normalization can never make
+    /// `$ROOT$path` escape the private root during staging. Runs the script
+    /// directly with `/bin/sh`; no namespaces are required because the
+    /// validation precedes the first `mount`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_script_rejects_traversal_paths_before_mounting() {
+        let run = |code: u8, args: &[&str]| {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(SANDBOX_SETUP_SCRIPT)
+                .arg(args[0])
+                .args(&args[1..])
+                .output()
+                .expect("run setup script");
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert_eq!(
+                out.status.code(),
+                Some(i32::from(code)),
+                "expected exit {code}, got {:?}: {stderr}",
+                out.status.code()
+            );
+            stderr
+        };
+        // A denied path with a `..` component is rejected (exit 70) before the
+        // mount step, with a message naming the traversal — never exit 90/95.
+        let stderr = run(70, &[
+            "pi-sandbox",
+            "1",
+            "1",
+            "/tmp/allowed",
+            "/tmp/allowed/../escape",
+            "--",
+            "/bin/true",
+        ]);
+        assert!(stderr.contains("'..'"), "the script must name the traversal: {stderr}");
+        // A `.` component is rejected the same way.
+        let stderr = run(70, &[
+            "pi-sandbox",
+            "1",
+            "0",
+            "/tmp/allowed/./sub",
+            "--",
+            "/bin/true",
+        ]);
+        assert!(stderr.contains("'.'"), "the script must name the curdir: {stderr}");
+        // A clean transport still proceeds to the mount step (exit 90 when
+        // mount privileges are unavailable) — the validation is not a false
+        // positive on legitimate paths.
+        let mount_denied = std::process::Command::new("mount")
+            .args(["--make-rprivate", "/"])
+            .status();
+        if matches!(mount_denied, Ok(status) if !status.success()) {
+            let stderr = run(90, &[
+                "pi-sandbox",
+                "1",
+                "1",
+                "/tmp/allowed",
+                "/tmp/allowed/secret",
+                "--",
+                "/bin/true",
+            ]);
+            assert!(
+                !stderr.contains("malformed transport"),
+                "clean paths must pass the validation: {stderr}"
+            );
+        }
+    }
+
+    /// A valid absent denied child (nonexistent, no traversal) must still be
+    /// accepted by the new clean-path gate and travel to the setup script, so
+    /// the existing fail-closed semantics (exit 95 when the absent path is
+    /// covered by an allowed bind) are preserved. The live exit-95 behavior is
+    /// exercised by `denied_absent_under_allowed_parent_never_leaks_to_host`;
+    /// here we assert the gate no longer rejects the valid shape.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn valid_absent_denied_child_is_accepted_by_clean_path_gate() {
+        let dir = tempfile::TempDir::new().expect("allowed parent temp dir");
+        let allowed = dir.path().canonicalize().expect("canonicalize allowed parent");
+        let denied = allowed.join("secret"); // absent, clean
+        assert!(!denied.exists(), "the denied child starts absent");
+        let config = SandboxConfig {
+            enabled: true,
+            network: false,
+            allowed_paths: vec![allowed.clone()],
+            denied_paths: vec![denied.clone()],
+            read_only: false,
+        };
+        config
+            .validate(&allowed)
+            .expect("a clean absent denied child validates");
+        match config.wrapper_command(&allowed, &["/bin/true".to_owned()]) {
+            Ok(argv) => {
+                assert!(
+                    argv.iter().any(|arg| *arg == denied.to_string_lossy()),
+                    "the absent denied child must travel to the setup script: {argv:?}"
+                );
+            }
+            Err(error) => {
+                // The only legitimate failure is the missing-unshare fail-closed
+                // error, never a clean-path rejection.
+                assert!(error.to_string().contains("unshare"), "got: {error}");
+            }
+        }
+    }
+
+    /// Static ordering guard for the sandbox P1 fix: the setup script must
+    /// mount allowed paths in two passes — a staging pass that pre-creates every
+    /// `$ROOT$p` mountpoint on the unbound tmpfs root, and a later bind pass that
+    /// attaches the host path. A single pass that creates a mountpoint and binds
+    /// it in the same loop lets a bind onto a parent (e.g. /foo) funnel the
+    /// `: > "$ROOT$p"`/`mkdir -p "$ROOT$p"` staging for a later nested allowed
+    /// path (e.g. /foo/bar/baz.txt) through the parent bind onto the real host
+    /// file, truncating/creating host content before the confined command runs.
+    /// Guards the script text directly: no namespaces are needed because the
+    /// ordering is structural, not behavioral.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_script_stages_allowed_mountpoints_before_any_allowed_bind() {
+        let script = SANDBOX_SETUP_SCRIPT;
+        // The two passes are fenced by unique code-adjacent markers so the
+        // slices below cover the ACTUAL staging subshell and bind loop, not
+        // the explanatory preamble above them.
+        let stage_begin = script
+            .find("# >>> allowed-staging-begin")
+            .expect("allowed staging begin marker present");
+        let stage_end = script
+            .find("# >>> allowed-staging-end")
+            .expect("allowed staging end marker present");
+        let bind_begin = script
+            .find("# >>> allowed-bind-begin")
+            .expect("allowed bind begin marker present");
+        let bind_end = script
+            .find("# >>> allowed-bind-end")
+            .expect("allowed bind end marker present");
+        assert!(
+            stage_begin < stage_end && bind_begin < bind_end && stage_end < bind_begin,
+            "allowed mountpoint staging must precede the allowed bind so a parent bind cannot funnel staging onto the host"
+        );
+        // Pass 1 (staging) must create mountpoints and must NOT bind. It must
+        // also run before the system host binds, so a system bind (whose
+        // read-only remount can silently fail, leaving a writable parent)
+        // can never expose host content to allowed staging. Anchor on the
+        // actual system bind line, not the `for` header.
+        let staging = &script[stage_begin..stage_end];
+        let system_bind = script
+            .find("mount --bind \"$d\" \"$ROOT$d\"")
+            .expect("system bind mount line present");
+        assert!(
+            stage_end < system_bind,
+            "allowed staging must run before the system host binds (mount --bind \"$d\"), not just before the allowed bind"
+        );
+        assert!(
+            staging.contains("mkdir -p \"$ROOT$p\"") && staging.contains(": > \"$ROOT$p\""),
+            "the staging pass must create directory and file mountpoints"
+        );
+        assert!(
+            !staging.contains("mount --bind \"$p\" \"$ROOT$p\""),
+            "the staging pass must not bind allowed paths"
+        );
+        // Pass 2 (bind) must not create or truncate targets — staging belongs
+        // to the earlier subshell.
+        let binding = &script[bind_begin..bind_end];
+        assert!(
+            binding.contains("mount --bind \"$p\" \"$ROOT$p\""),
+            "the bind pass must bind allowed paths onto their pre-created mountpoints"
+        );
+        assert!(
+            !binding.contains(": > \"$ROOT$p\"") && !binding.contains("mkdir -p \"$ROOT$p\""),
+            "the bind pass must not create/truncate targets; staging belongs to the earlier subshell: {binding}"
+        );
+    }
+
+    /// Live regression for the sandbox P1: an allowed parent plus a nested
+    /// existing host file carrying sentinel content. The old single-pass
+    /// allowed loop bound the parent (`/parent`) onto `$ROOT/parent` FIRST,
+    /// which made `$ROOT/parent/nested/deep.txt` resolve through that bind
+    /// onto the host file; the later `: > "$ROOT$p"` staging for the nested
+    /// allowed path then TRUNCATED the host file before the confined command
+    /// ran, and the nested bind ended up exposing an empty file. The two-pass
+    /// split pre-creates the mountpoint on the unbound tmpfs root, so the host
+    /// file is never touched during staging and the nested bind stays usable.
+    /// On hosts where namespace setup itself fails, the fail-closed path
+    /// (exit 1 or 90-99) still proves the host file was never modified: setup
+    /// aborts at its first mount, before any allowed staging.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "live confinement test: requires Linux unprivileged user namespaces (run with --include-ignored on a supported kernel)"]
+    async fn allowed_nested_host_file_survives_staging_and_stays_usable() {
+        let dir = tempfile::TempDir::new().expect("allowed parent temp dir");
+        // Canonicalize so the sandbox bind matches the path the config names.
+        let allowed = dir.path().canonicalize().expect("canonicalize allowed parent");
+        // Nested existing host file carrying a sentinel the bug would erase.
+        let nested_dir = allowed.join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("mkdir nested dir");
+        let nested = nested_dir.join("deep.txt");
+        std::fs::write(&nested, "SENTINEL").expect("write sentinel host file");
+        // Both the parent and the nested file are allowed: this is exactly the
+        // ordering that let the old single-pass loop truncate the host file.
+        let config = SandboxConfig {
+            enabled: true,
+            network: false,
+            allowed_paths: vec![allowed.clone(), nested.clone()],
+            denied_paths: Vec::new(),
+            read_only: false,
+        };
+        // The confined command reads the nested file through the bind and
+        // writes the result into the (bound, writable) allowed parent, where
+        // it is observable on the host after the run. Under the bug the file
+        // was already truncated during staging, so this would be empty.
+        let result = allowed.join("result.txt");
+        let _ = std::fs::remove_file(&result);
+        let argv = vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "cat nested/deep.txt > result.txt".to_owned(),
+        ];
+        let outcome = run_in_sandbox(
+            Some(&config),
+            &allowed,
+            &argv,
+            Vec::new(),
+            None,
+            AbortSignal::none(),
+            None,
+        )
+        .await
+        .expect("sandboxed run must not error at the runner level");
+        match outcome.exit_code {
+            Some(0) => {}
+            Some(code) if code == 1 || (90..=99).contains(&code) => {
+                // Host cannot create the namespaces (or the launcher is
+                // missing): the confined command never ran, which still
+                // proves staging never touched the host file.
+                eprintln!(
+                    "allowed-nested live-run: sandbox namespace setup unavailable here (exit {code}); the fail-closed path still proved the host file was untouched"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&nested).expect("read host sentinel"),
+                    "SENTINEL",
+                    "the host sentinel must survive a fail-closed setup abort"
+                );
+                assert!(!result.exists(), "the confined command never ran, so no result file was produced");
+                return;
+            }
+            other => panic!("unexpected sandbox outcome: {other:?}"),
+        }
+        // The host sentinel must survive staging intact (the P1 fix).
+        assert_eq!(
+            std::fs::read_to_string(&nested).expect("read host sentinel"),
+            "SENTINEL",
+            "staging must never truncate the nested host file: {}",
+            nested.display()
+        );
+        // The nested bind must stay usable: the confined command read the
+        // sentinel through it and wrote it back to the allowed parent.
+        assert_eq!(
+            std::fs::read_to_string(&result).expect("read captured result"),
+            "SENTINEL",
+            "the nested allowed bind must expose the real host content to the confined command"
+        );
+        let _ = std::fs::remove_file(&result);
     }
 }

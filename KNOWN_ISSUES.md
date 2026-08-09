@@ -560,7 +560,11 @@ together with an explicit `--listen <lan-address>`; rpi prints a startup
 warning that plaintext HTTP/WebSocket exposes the bearer token and control
 traffic to passive network observers. `rpi agent serve` remains loopback-only
 in this release. Neither surface provides TLS; use a TLS reverse proxy for
-remote access. End-to-end TLS is tracked for a later release.
+remote access. End-to-end TLS is tracked for a later release. Collaboration
+links on wildcard binds (0.0.0.0 or `::`) additionally require
+`--listen-advertised-origin <URL>` (a strict http/https origin without
+credentials, path, query, or fragment); loopback binds advertise their local
+address automatically.
 
 ## Web client
 
@@ -1935,6 +1939,16 @@ not a pass report.
 - `cargo +1.88.0 test -p pi-agent --lib --locked -- --test-threads=1`
 - `cargo +1.88.0 test -p pi-coding --lib --locked -- --test-threads=1`
 - `cargo +1.88.0 test -p pi-cli --lib --locked -- --test-threads=1`
+- Coverage tooling for the workspace coverage run below: provision once per
+  environment, before running it. A clean Rust 1.88.0 setup has neither
+  `llvm-tools-preview` nor `cargo llvm-cov` until these two steps run:
+- `rustup component add llvm-tools-preview --toolchain 1.88.0` — matches the
+  `components = ["llvm-tools-preview"]` entry in `rust-toolchain.toml`, which
+  also makes rustup install the component when the 1.88.0 toolchain is
+  (re)installed from that file.
+- `cargo +1.88.0 install cargo-llvm-cov --locked --version 0.8.7` — pinned
+  maintained release; the coverage JSON this command produces below was
+  generated with this exact version.
 - `cargo +1.88.0 llvm-cov --workspace --locked --json --output-path target/pi-rs-cov-final.json -- --test-threads=1`
 - `cargo +1.88.0 test -p pi-coding --lib sandbox --locked`
 - `cargo +1.88.0 test -p pi-sandbox --all-features --locked -- --test-threads=1`
@@ -1943,8 +1957,11 @@ not a pass report.
 - `cargo +1.88.0 test -p pi-coding --lib hindsight --locked`
 - `RPI_BIN=target/release-dist/rpi bash E2E.d/release/install-self-update.sh run`
 - `RPI_BIN=target/release-dist/rpi bash E2E.d/release/archive-fixture-smoke.sh run`
-- `RPI_BIN=target/release-dist/rpi bash E2E.d/ci/workflow.sh run`
-  — evidence under `$EVIDENCE_ROOT/workflow`
+- `RPI_BIN=target/release-dist/rpi bash E2E.d/ci/workflow.sh release`
+  — hard release gate (tmux required): `workflow.rpc`, `workflow.tmux`, and
+    `workflow.goal-tmux` must all record `execution_status=passed` before
+    `workflow campaigns passed` is printed
+  — evidence under `$EVIDENCE_ROOT/workflow-{rpc,tmux,goal-tmux}`
 - `RPI_BIN=target/release-dist/rpi bash E2E.d/collab/collab_scenario.sh run`
   — evidence under `$EVIDENCE_ROOT/collab`
 - `bash E2E.d/web/coverage.sh run` — measured gate that runs every web lane:

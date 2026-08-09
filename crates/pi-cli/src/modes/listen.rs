@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use pi_coding::Application;
@@ -41,6 +41,16 @@ const MAX_HEADER_BYTES: usize = 32 * 1024;
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Server-side ping cadence for established collaboration guests. Browsers
+/// answer pings automatically at the protocol level (RFC 6455 5.5.2), so a
+/// healthy guest always yields incoming pongs; a silent scripted client does
+/// not and is evicted by [`COLLAB_IDLE_TIMEOUT`].
+const COLLAB_PING_INTERVAL: Duration = Duration::from_secs(5);
+/// A collaboration guest that produces no incoming frame (not even a pong to
+/// our pings) within this window is closed cleanly and its participant slot
+/// released, so one silent client cannot hold one of the room's participant
+/// slots indefinitely.
+const COLLAB_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const CONTENT_TYPE_JSON: &str = "application/json";
 const REMOTE_EXTENSION_UI_ERROR: &str = "remote interactive extension UI is disabled";
 
@@ -50,6 +60,30 @@ pub use super::ws_auth::MAX_CONNECTION_TASKS;
 use super::ws_auth::{
     ListenAddressPolicy, authorized, constant_work_eq, load_auth_token, read_token_file,
     websocket_subprotocol,
+};
+
+/// Bounds for authenticated WebSocket handshakes and idle collaboration
+/// guests. Production uses [`DEFAULT_WS_TIMEOUTS`]; tests shrink the windows
+/// so stalled-handshake and silent-guest capacity reclamation is provable
+/// without waiting out the real durations.
+#[derive(Clone, Copy)]
+struct WebSocketTimeouts {
+    /// Ceiling for an upgrade handshake once the request headers are in hand.
+    /// A client that sends headers and then stalls must not pin the
+    /// connection task — or, for collaboration, the participant slot its
+    /// already-issued lease holds — forever.
+    handshake: Duration,
+    /// Cadence for server pings to established collaboration guests.
+    collab_ping_interval: Duration,
+    /// A collaboration guest sending no frame within this window is closed
+    /// cleanly and its participant slot released.
+    collab_idle: Duration,
+}
+
+const DEFAULT_WS_TIMEOUTS: WebSocketTimeouts = WebSocketTimeouts {
+    handshake: READ_TIMEOUT,
+    collab_ping_interval: COLLAB_PING_INTERVAL,
+    collab_idle: COLLAB_IDLE_TIMEOUT,
 };
 
 /// Web client assets (vite build output) embedded into the binary by
@@ -70,6 +104,12 @@ pub struct ListenConfig {
     pub token_file: Option<PathBuf>,
     /// Permit a non-loopback plaintext bind only when `token_file` is valid.
     pub allow_insecure_remote: bool,
+    /// Explicitly advertised HTTP(S) origin used to build collaboration
+    /// links when `address` is a wildcard bind (0.0.0.0/::). Validated and
+    /// normalized by `parse_advertised_origin` at CLI parse time; loopback
+    /// and other specific binds synthesize from the bound address and never
+    /// need this.
+    pub advertised_origin: Option<String>,
     /// Factory that builds manager-owned session runtimes for the Web
     /// control plane (switch_session / new_session / fork / clone). `None`
     /// disables lifecycle opens with a clear error; tests inject a faux
@@ -79,6 +119,7 @@ pub struct ListenConfig {
 
 pub struct ListenHandle {
     address: SocketAddr,
+    advertised_origin: Option<String>,
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<()>>,
     manager: std::sync::Arc<SessionRuntimeManager>,
@@ -94,11 +135,16 @@ impl ListenHandle {
     pub fn collab_service(&self) -> CollabService {
         self.collab.clone()
     }
+    /// Effective advertised origin used to build collaboration links.
+    ///
+    /// Loopback and other specific binds synthesize `http://<bound address>`
+    /// automatically; a wildcard bind (0.0.0.0/::) yields `None` unless an
+    /// explicit advertised origin was configured, so `/collab` fails closed
+    /// instead of printing links synthesized from an unreachable wildcard.
     #[must_use]
-    pub fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+    pub fn base_url(&self) -> Option<String> {
+        advertised_base_url(self.address, self.advertised_origin.as_deref())
     }
-
 
     pub async fn stop(self) -> Result<()> {
         let shutdown_result = self
@@ -129,7 +175,10 @@ struct ServerState {
     manager: std::sync::Arc<SessionRuntimeManager>,
     collab: CollabService,
     token: Option<Arc<[u8]>>,
-    base_url: String,
+    /// Resolved advertised origin for `collab_start` requests that omit an
+    /// explicit `baseUrl`. `None` for wildcard binds without an explicit
+    /// advertised origin: link generation then fails closed.
+    base_url: Option<String>,
 }
 
 pub async fn start(
@@ -160,17 +209,115 @@ pub async fn start(
         manager: manager.clone(),
         collab: collab.clone(),
         token: token.map(Arc::from),
-        base_url: format!("http://{address}"),
+        base_url: advertised_base_url(address, config.advertised_origin.as_deref()),
     };
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(run_listener(listener, state, shutdown_rx));
     Ok(ListenHandle {
         address,
+        advertised_origin: config.advertised_origin,
         shutdown,
         task,
         manager,
         collab,
     })
+}
+
+/// Parse and normalize the `--listen-advertised-origin` value.
+///
+/// Accepts a strict HTTP(S) origin: an `http://` or `https://` scheme, a
+/// non-empty host (optionally with a numeric port in 1..=65535), and nothing
+/// else — credentials, non-root paths, query strings, and fragments are
+/// rejected. A single trailing `/` (the root path) is allowed and normalized
+/// away. Runs at CLI validation time so bad values fail before the listener
+/// starts; the normalized value is what collaboration links are built from.
+pub(crate) fn parse_advertised_origin(input: &str) -> Result<String> {
+    let Some(rest) = input
+        .strip_prefix("http://")
+        .or_else(|| input.strip_prefix("https://"))
+    else {
+        bail!(
+            "--listen-advertised-origin must be an http:// or https:// origin (no credentials, path, query, or fragment)"
+        );
+    };
+    let (authority, tail) = match rest.find(['/', '?', '#']) {
+        Some(index) => rest.split_at(index),
+        None => (rest, ""),
+    };
+    if tail.starts_with('?') {
+        bail!("--listen-advertised-origin must not contain a query string");
+    }
+    if tail.starts_with('#') {
+        bail!("--listen-advertised-origin must not contain a fragment");
+    }
+    if !tail.is_empty() && tail != "/" {
+        bail!("--listen-advertised-origin must not contain a path");
+    }
+    if authority.is_empty() {
+        bail!("--listen-advertised-origin must include a host");
+    }
+    if authority.contains('@') {
+        bail!("--listen-advertised-origin must not contain credentials");
+    }
+    if authority.chars().any(char::is_whitespace) {
+        bail!("--listen-advertised-origin must not contain whitespace");
+    }
+    let (host, port, bracketed) = if authority.starts_with('[') {
+        let end = authority
+            .find(']')
+            .ok_or_else(|| anyhow!("--listen-advertised-origin has an invalid IPv6 host"))?;
+        let host = &authority[1..end];
+        let after = &authority[end + 1..];
+        let port = match after {
+            "" => None,
+            rest => Some(
+                rest.strip_prefix(':').ok_or_else(|| {
+                    anyhow!("--listen-advertised-origin has an invalid host")
+                })?,
+            ),
+        };
+        (host, port, true)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() => (host, Some(port), false),
+            _ => (authority, None, false),
+        }
+    };
+    if host.is_empty()
+        || host
+            .bytes()
+            .any(|byte| !byte.is_ascii_graphic() || (!bracketed && byte == b':'))
+    {
+        bail!("--listen-advertised-origin has an invalid host");
+    }
+    if bracketed && host.parse::<std::net::Ipv6Addr>().is_err() {
+        bail!("--listen-advertised-origin has an invalid IPv6 host");
+    }
+    if let Some(port) = port {
+        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("--listen-advertised-origin has an invalid port");
+        }
+        let port_value: u16 = port
+            .parse()
+            .map_err(|_| anyhow!("--listen-advertised-origin has an invalid port"))?;
+        if port_value == 0 {
+            bail!("--listen-advertised-origin has an invalid port");
+        }
+    }
+    Ok(input.trim_end_matches('/').to_owned())
+}
+
+/// Resolve the effective advertised origin used to build collaboration links.
+///
+/// An explicitly configured `--listen-advertised-origin` wins. Loopback and
+/// other specific bind addresses synthesize `http://<bound address>`
+/// automatically, unchanged. A wildcard bind (0.0.0.0/::) without an explicit
+/// origin yields `None` so `/collab` and `collab_start` fail closed instead
+/// of printing unreachable links.
+fn advertised_base_url(bind: SocketAddr, advertised: Option<&str>) -> Option<String> {
+    advertised
+        .map(str::to_owned)
+        .or_else(|| (!bind.ip().is_unspecified()).then(|| format!("http://{bind}")))
 }
 
 async fn run_listener(
@@ -242,7 +389,7 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<
                     return Ok(());
                 }
             };
-            return collab_websocket_connection(stream, raw, connection, protocol).await;
+            return collab_websocket_connection(stream, raw, connection, protocol, DEFAULT_WS_TIMEOUTS).await;
         }
         if raw.path != "/ws" {
             write_plain_response(&mut stream, StatusCode::NOT_FOUND, "not found").await?;
@@ -253,7 +400,7 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<
             write_plain_response(&mut stream, StatusCode::UNAUTHORIZED, "unauthorized").await?;
             return Ok(());
         }
-        return websocket_connection(stream, raw, state, protocol).await;
+        return websocket_connection(stream, raw, state, protocol, DEFAULT_WS_TIMEOUTS).await;
     }
 
     // The static web client page is served without authentication: it carries
@@ -354,8 +501,21 @@ async fn dispatch_http_command(
     let name = command.command_name();
     match command {
         super::rpc::RpcCommand::CollabStart { base_url, .. } => {
-            let base_url = base_url.as_deref().unwrap_or(&state.base_url);
-            match state.collab.start(session_id.as_deref(), base_url).await {
+            let base_url = match base_url {
+                Some(requested) => requested,
+                None => match &state.base_url {
+                    Some(advertised) => advertised.clone(),
+                    None => {
+                        return RpcResponse::failure(
+                            id,
+                            name,
+                            "collaboration link generation requires an advertised origin: pass --listen-advertised-origin <URL> for wildcard binds (or an explicit baseUrl in the request)"
+                                .to_owned(),
+                        );
+                    }
+                },
+            };
+            match state.collab.start(session_id.as_deref(), &base_url).await {
                 Ok(started) => RpcResponse::success(id, name, serde_json::to_value(started).ok()),
                 Err(error) => RpcResponse::failure(id, name, error.to_string()),
             }
@@ -635,6 +795,7 @@ async fn collab_websocket_connection(
     raw: RawRequest,
     mut connection: super::collab_service::CollabConnection,
     protocol: String,
+    timeouts: WebSocketTimeouts,
 ) -> Result<()> {
     let path = raw.path.clone();
     let mut prefix = raw.raw_headers;
@@ -643,32 +804,43 @@ async fn collab_websocket_connection(
         .max_message_size(Some(pi_coding::collab::MAX_FRAME_BYTES))
         .max_frame_size(Some(pi_coding::collab::MAX_FRAME_BYTES))
         .max_write_buffer_size(2 * pi_coding::collab::MAX_FRAME_BYTES);
-    let websocket = accept_hdr_async_with_config(
-        PrefixedStream {
-            prefix,
-            offset: 0,
-            stream,
-        },
-        move |request: &Request, mut response: Response| -> std::result::Result<Response, ErrorResponse> {
-            if request.uri().path() != path {
-                let mut error = ErrorResponse::new(Some("not found".into()));
-                *error.status_mut() = StatusCode::NOT_FOUND;
-                return Err(error);
-            }
-            response.headers_mut().insert(
-                http::header::SEC_WEBSOCKET_PROTOCOL,
-                HeaderValue::from_str(&protocol).map_err(|_| {
-                    let mut error = ErrorResponse::new(Some("invalid subprotocol".into()));
-                    *error.status_mut() = StatusCode::BAD_REQUEST;
-                    error
-                })?,
-            );
-            Ok(response)
-        },
-        Some(config),
+    // Bound the upgrade itself. The lease for this guest's participant slot
+    // was issued during authentication, before the handshake, so a client
+    // that sends request headers and then stalls must not hold the slot (or
+    // the connection task) forever: the timeout cancels the accept and drops
+    // the connection, releasing the lease with it.
+    let websocket = match tokio::time::timeout(
+        timeouts.handshake,
+        accept_hdr_async_with_config(
+            PrefixedStream {
+                prefix,
+                offset: 0,
+                stream,
+            },
+            move |request: &Request, mut response: Response| -> std::result::Result<Response, ErrorResponse> {
+                if request.uri().path() != path {
+                    let mut error = ErrorResponse::new(Some("not found".into()));
+                    *error.status_mut() = StatusCode::NOT_FOUND;
+                    return Err(error);
+                }
+                response.headers_mut().insert(
+                    http::header::SEC_WEBSOCKET_PROTOCOL,
+                    HeaderValue::from_str(&protocol).map_err(|_| {
+                        let mut error = ErrorResponse::new(Some("invalid subprotocol".into()));
+                        *error.status_mut() = StatusCode::BAD_REQUEST;
+                        error
+                    })?,
+                );
+                Ok(response)
+            },
+            Some(config),
+        ),
     )
     .await
-    .context("upgrading collaboration WebSocket")?;
+    {
+        Ok(result) => result.context("upgrading collaboration WebSocket")?,
+        Err(_) => bail!("collaboration WebSocket handshake timed out"),
+    };
 
     let (mut write, mut read) = websocket.split();
     if *connection.stopped.borrow() {
@@ -690,6 +862,21 @@ async fn collab_websocket_connection(
         .await
         .context("sending collaboration snapshot")?;
 
+    // Idle watchdog: the server pings the guest on a fixed cadence; browsers
+    // answer automatically with pongs at the protocol level (RFC 6455
+    // 5.5.2), so every live guest keeps producing incoming frames. A guest
+    // that sends nothing — not even a pong — within `collab_idle` is closed
+    // cleanly and its participant slot released instead of being pinned
+    // indefinitely.
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + timeouts.collab_ping_interval,
+        timeouts.collab_ping_interval,
+    );
+    // A prompt dispatch can outlast several intervals; catch up with a single
+    // ping on the next aligned tick instead of bursting a backlog.
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut idle = tokio::time::sleep(timeouts.collab_idle);
+    tokio::pin!(idle);
     loop {
         tokio::select! {
             biased;
@@ -715,35 +902,62 @@ async fn collab_websocket_connection(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
             },
+            _ = ping.tick() => {
+                if write.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return Ok(());
+                }
+            }
+            _ = &mut idle => {
+                let _ = write.send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "collaboration connection idle".into(),
+                }))).await;
+                return Ok(());
+            }
             incoming = read.next() => match incoming {
-                Some(Ok(Message::Binary(frame))) => {
-                    let pending = match connection.prepare_client_frame(&frame) {
-                        Ok(pending) => pending,
-                        Err(_) => {
+                Some(Ok(frame)) => {
+                    match frame {
+                        Message::Binary(frame) => {
+                            let pending = match connection.prepare_client_frame(&frame) {
+                                Ok(pending) => pending,
+                                Err(_) => {
+                                    let _ = write.send(Message::Close(Some(CloseFrame {
+                                        code: CloseCode::Policy,
+                                        reason: "invalid collaboration frame".into(),
+                                    }))).await;
+                                    return Ok(());
+                                }
+                            };
+                            let response = pending.execute().await;
+                            let frame = connection.response_frame(response)?;
+                            write.send(Message::Binary(frame.into())).await
+                                .context("sending collaboration response")?;
+                        }
+                        Message::Ping(payload) => {
+                            write.send(Message::Pong(payload)).await
+                                .context("sending collaboration pong")?;
+                        }
+                        // Pongs are protocol-level replies to our pings (and
+                        // the browser's automatic pong), never application
+                        // data; a healthy guest may send them at any time.
+                        Message::Pong(_) => {}
+                        Message::Close(_) => return Ok(()),
+                        Message::Text(_) | Message::Frame(_) => {
                             let _ = write.send(Message::Close(Some(CloseFrame {
-                                code: CloseCode::Policy,
-                                reason: "invalid collaboration frame".into(),
+                                code: CloseCode::Unsupported,
+                                reason: "encrypted binary messages required".into(),
                             }))).await;
                             return Ok(());
                         }
-                    };
-                    let response = pending.execute().await;
-                    let frame = connection.response_frame(response)?;
-                    write.send(Message::Binary(frame.into())).await
-                        .context("sending collaboration response")?;
+                    }
+                    // Any inbound frame (a command, a ping, or the browser's
+                    // automatic pong) proves the guest is alive; restart the
+                    // idle window only after it is handled, so a long-running
+                    // prompt dispatch never counts against a guest that is
+                    // legitimately awaiting the response.
+                    idle.as_mut().reset(tokio::time::Instant::now() + timeouts.collab_idle);
                 }
-                Some(Ok(Message::Ping(payload))) => {
-                    write.send(Message::Pong(payload)).await
-                        .context("sending collaboration pong")?;
-                }
-                Some(Ok(Message::Close(_))) | None => return Ok(()),
-                Some(Ok(Message::Text(_) | Message::Pong(_) | Message::Frame(_))) => {
-                    let _ = write.send(Message::Close(Some(CloseFrame {
-                        code: CloseCode::Unsupported,
-                        reason: "encrypted binary messages required".into(),
-                    }))).await;
-                    return Ok(());
-                }
+                None => return Ok(()),
                 Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(_))) => {
                     let _ = write.send(Message::Close(Some(CloseFrame {
                         code: CloseCode::Size,
@@ -769,6 +983,7 @@ async fn websocket_connection(
     raw: RawRequest,
     state: ServerState,
     protocol: Option<String>,
+    timeouts: WebSocketTimeouts,
 ) -> Result<()> {
     // Fan-in: the manager merges every session runtime's projected events
     // (tagged with the owning top-level `sessionId`); every connection sees
@@ -784,37 +999,45 @@ async fn websocket_connection(
         .max_message_size(Some(MAX_RPC_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_RPC_MESSAGE_BYTES))
         .max_write_buffer_size(2 * MAX_RPC_MESSAGE_BYTES);
-    let websocket = accept_hdr_async_with_config(
-        PrefixedStream {
-            prefix,
-            offset: 0,
-            stream,
-        },
-        |request: &Request, mut response: Response| -> std::result::Result<Response, ErrorResponse> {
-            if request.uri().path() != "/ws" {
-                let mut error = ErrorResponse::new(Some("not found".into()));
-                *error.status_mut() = StatusCode::NOT_FOUND;
-                return Err(error);
-            }
-            // RFC 6455: the server must select at most one offered subprotocol
-            // and echo it, otherwise browsers abort the handshake. Only echo a
-            // protocol that already passed the auth check above.
-            if let Some(protocol) = protocol.as_deref() {
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    HeaderValue::from_str(protocol).map_err(|_| {
-                        let mut error = ErrorResponse::new(Some("invalid subprotocol".into()));
-                        *error.status_mut() = StatusCode::BAD_REQUEST;
-                        error
-                    })?,
-                );
-            }
-            Ok(response)
-        },
-        Some(config),
+    // Bound the upgrade itself so a client that sends request headers and
+    // then stalls cannot pin one of the listener's connection tasks forever.
+    let websocket = match tokio::time::timeout(
+        timeouts.handshake,
+        accept_hdr_async_with_config(
+            PrefixedStream {
+                prefix,
+                offset: 0,
+                stream,
+            },
+            |request: &Request, mut response: Response| -> std::result::Result<Response, ErrorResponse> {
+                if request.uri().path() != "/ws" {
+                    let mut error = ErrorResponse::new(Some("not found".into()));
+                    *error.status_mut() = StatusCode::NOT_FOUND;
+                    return Err(error);
+                }
+                // RFC 6455: the server must select at most one offered subprotocol
+                // and echo it, otherwise browsers abort the handshake. Only echo a
+                // protocol that already passed the auth check above.
+                if let Some(protocol) = protocol.as_deref() {
+                    response.headers_mut().insert(
+                        http::header::SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_str(protocol).map_err(|_| {
+                            let mut error = ErrorResponse::new(Some("invalid subprotocol".into()));
+                            *error.status_mut() = StatusCode::BAD_REQUEST;
+                            error
+                        })?,
+                    );
+                }
+                Ok(response)
+            },
+            Some(config),
+        ),
     )
     .await
-    .context("upgrading control plane WebSocket")?;
+    {
+        Ok(result) => result.context("upgrading control plane WebSocket")?,
+        Err(_) => bail!("control plane WebSocket handshake timed out"),
+    };
 
     let (mut websocket_write, mut websocket_read) = websocket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
@@ -1202,13 +1425,23 @@ mod tests {
         WebSocketStream<MaybeTlsStream<TcpStream>>,
         JoinHandle<Result<()>>,
     ) {
+        open_collab_socket_with(connection, DEFAULT_WS_TIMEOUTS).await
+    }
+
+    async fn open_collab_socket_with(
+        connection: CollabConnection,
+        timeouts: WebSocketTimeouts,
+    ) -> (
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        JoinHandle<Result<()>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
         let address = listener.local_addr().expect("listener address");
         let protocol = "rpi-collab.test";
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept connection");
             let raw = read_http_request(&mut stream).await.expect("read upgrade request");
-            collab_websocket_connection(stream, raw, connection, protocol.to_owned()).await
+            collab_websocket_connection(stream, raw, connection, protocol.to_owned(), timeouts).await
         });
         let mut request = format!("ws://{address}/collab/ws/test-room")
             .into_client_request()
@@ -1236,6 +1469,72 @@ mod tests {
             .await
             .expect("authenticate");
         (service, started.room_id, connection)
+    }
+
+    /// A real control-plane server state (manager with a faux primary) for
+    /// driving `websocket_connection` end to end. The manager is never asked
+    /// to dispatch: the tests below only exercise the upgrade and read loops.
+    async fn ws_server_state() -> ServerState {
+        use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
+        let mut model = pi_ai::Model::default();
+        model.id = "ws-stall-model".into();
+        model.name = "ws-stall-model".into();
+        model.api = "ws-stall-api".into();
+        model.provider = "faux".into();
+        model.base_url = "http://localhost:0".into();
+        let registration = register_faux_provider(FauxProviderOptions {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            models: vec![model.clone()],
+            chunk_size: 4,
+        });
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model,
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: "faux".into(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        let application = pi_coding::Application::new(session).await;
+        registration.unregister();
+        let manager = SessionRuntimeManager::new(
+            application,
+            ExtensionUiAdapter::default(),
+            None,
+        )
+        .await;
+        ServerState {
+            manager: manager.clone(),
+            collab: CollabService::new(manager),
+            token: None,
+            base_url: None,
+        }
+    }
+
+    /// An incomplete buffered HTTP request: the headers never terminate, so
+    /// the WebSocket accept reads the partial prefix and then blocks on the
+    /// live socket waiting for the rest — exactly the stall the handshake
+    /// timeout must bound.
+    fn stalled_upgrade_request(path: &str) -> RawRequest {
+        let head = format!(
+            "GET {path} HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\nconnection: Upgrade\r\n"
+        );
+        RawRequest {
+            method: Method::GET,
+            path: path.to_owned(),
+            headers: HeaderMap::new(),
+            raw_headers: head.into_bytes(),
+            remainder: Vec::new(),
+        }
     }
 
     async fn next_collab_message(
@@ -1485,6 +1784,195 @@ mod tests {
         server.await.expect("server task").expect("server result");
     }
 
+    #[tokio::test]
+    async fn stalled_collab_handshake_releases_participant_lease() {
+        let (service, room_id, connection) = test_collab_connection().await;
+        assert_eq!(service.status(Some(&room_id)).await[0].participants, 1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            // The buffered request never terminates, so the upgrade blocks on
+            // the live socket; the handshake timeout is the only release for
+            // this task and the participant lease it already holds.
+            let raw = stalled_upgrade_request("/collab/ws/test-room");
+            collab_websocket_connection(
+                stream,
+                raw,
+                connection,
+                "rpi-collab.test".to_owned(),
+                WebSocketTimeouts {
+                    handshake: Duration::from_millis(150),
+                    collab_ping_interval: Duration::from_secs(3600),
+                    collab_idle: Duration::from_secs(3600),
+                },
+            )
+            .await
+        });
+        // A connected-but-silent client: the handshake cannot complete and
+        // the client never closes, so the server-side timeout must fire.
+        let _client = TcpStream::connect(address).await.expect("connect stalled client");
+
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stalled handshake must release the connection task")
+            .expect("server task")
+            .expect_err("stalled handshake must time out instead of completing");
+        assert_eq!(
+            service.status(Some(&room_id)).await[0].participants,
+            0,
+            "the stalled guest's participant lease must be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_ws_handshake_releases_connection_task() {
+        let state = ws_server_state().await;
+        let manager = state.manager.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            let raw = stalled_upgrade_request("/ws");
+            websocket_connection(
+                stream,
+                raw,
+                state,
+                None,
+                WebSocketTimeouts {
+                    handshake: Duration::from_millis(150),
+                    collab_ping_interval: Duration::from_secs(3600),
+                    collab_idle: Duration::from_secs(3600),
+                },
+            )
+            .await
+        });
+        let _client = TcpStream::connect(address).await.expect("connect stalled client");
+
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stalled /ws handshake must release the connection task")
+            .expect("server task")
+            .expect_err("stalled /ws handshake must time out instead of completing");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn silent_collab_guest_is_evicted_and_releases_participant_lease() {
+        let (service, room_id, connection) = test_collab_connection().await;
+        let (mut socket, server) = open_collab_socket_with(
+            connection,
+            WebSocketTimeouts {
+                handshake: Duration::from_secs(2),
+                collab_ping_interval: Duration::from_millis(20),
+                collab_idle: Duration::from_millis(120),
+            },
+        )
+        .await;
+        // The normal handshake, hello, and snapshot are unaffected.
+        assert!(matches!(next_collab_message(&mut socket).await, Message::Text(_)));
+        assert!(matches!(next_collab_message(&mut socket).await, Message::Binary(_)));
+        assert_eq!(service.status(Some(&room_id)).await[0].participants, 1);
+
+        // The guest goes silent. A tungstenite client auto-pongs every Ping it
+        // reads (RFC 6455 5.5.2: tungstenite queues the Pong inside `read` and
+        // flushes it on the next poll), so polling `socket.next()` here would
+        // itself keep the guest "alive" and starve the watchdog — the per-read
+        // timeout never elapses because pings arrive faster than it. Instead
+        // the client stops reading entirely, modeling a dead network peer, and
+        // we first wait for the server's idle watchdog to evict it and release
+        // the participant lease. The bound is a safety ceiling; eviction lands
+        // at `collab_idle` (120ms), so it is not a mask for a product bug.
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("silent guest must be evicted within the idle window")
+            .expect("server task")
+            .expect("idle close is a clean server exit");
+        assert_eq!(
+            service.status(Some(&room_id)).await[0].participants,
+            0,
+            "the silent guest's participant lease must be released after the idle timeout"
+        );
+
+        // The eviction Close was written before the server task returned, so
+        // the guest now receives a Close or a disconnect within a bounded
+        // window. The server side has exited and dropped the connection/lease,
+        // so draining the buffered pings cannot keep the lease alive. Skip the
+        // pings and observe how the guest terminates: a Close carries the
+        // policy/idle reason, and a read error or EOF is equally valid — once
+        // the server has closed, tungstenite's auto-pong for a buffered ping
+        // flushes into a half-closed socket and surfaces as a BrokenPipe,
+        // which is the disconnect half of "receives close or disconnects".
+        // The capacity contract (lease released) was already asserted above;
+        // the timeout is a ceiling only, never the eviction signal.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), socket.next()).await {
+                Ok(Some(Ok(Message::Close(Some(frame))))) => {
+                    assert_eq!(frame.code, CloseCode::Policy);
+                    assert!(
+                        frame.reason.contains("idle"),
+                        "unexpected idle close reason: {}",
+                        frame.reason
+                    );
+                    break;
+                }
+                Ok(Some(Ok(Message::Close(None)))) | Ok(None) | Ok(Some(Err(_))) => break,
+                Ok(Some(Ok(_))) => continue,
+                Err(_) => {
+                    panic!("silent guest was neither closed nor disconnected within the bound")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responding_collab_guest_survives_idle_windows() {
+        let (service, room_id, connection) = test_collab_connection().await;
+        let (mut socket, server) = open_collab_socket_with(
+            connection,
+            WebSocketTimeouts {
+                handshake: Duration::from_secs(2),
+                collab_ping_interval: Duration::from_millis(20),
+                collab_idle: Duration::from_millis(300),
+            },
+        )
+        .await;
+        assert!(matches!(next_collab_message(&mut socket).await, Message::Text(_)));
+        assert!(matches!(next_collab_message(&mut socket).await, Message::Binary(_)));
+
+        // A healthy browser never sends application frames unprompted, but it
+        // answers server pings with pongs at the protocol level (RFC 6455
+        // 5.5.2). A guest that keeps answering stays connected across many
+        // idle windows instead of losing its slot.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), socket.next()).await {
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    socket.send(Message::Pong(payload)).await.expect("send pong");
+                }
+                Ok(Some(Ok(Message::Close(frame)))) => {
+                    panic!("responding guest was evicted: {frame:?}");
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(error))) => panic!("read error while responding: {error}"),
+                Ok(None) => panic!("responding guest was disconnected"),
+                Err(_) => {}
+            }
+        }
+        assert_eq!(
+            service.status(Some(&room_id)).await[0].participants,
+            1,
+            "a guest that answers pings must keep its participant slot"
+        );
+        assert!(!server.is_finished(), "server must still be serving the guest");
+
+        // Clean teardown: closing the client releases the lease.
+        drop(socket);
+        server.await.expect("server task").expect("clean exit after client close");
+        assert_eq!(service.status(Some(&room_id)).await[0].participants, 0);
+    }
+
     #[test]
     fn collaboration_browser_path_accepts_only_valid_room_ids() {
         assert_eq!(collab_room_id("/collab/ws/room-123_abc"), Some("room-123_abc"));
@@ -1492,5 +1980,150 @@ mod tests {
         assert_eq!(collab_room_id("/collab/ws/room/child"), None);
         assert_eq!(collab_room_id("/collab/ws/room?secret=x"), None);
         assert_eq!(collab_room_id("/collab/ws/room%23fragment"), None);
+    }
+
+    #[test]
+    fn advertised_origin_parser_accepts_strict_origins_and_normalizes_root() {
+        for (input, expected) in [
+            ("http://127.0.0.1:8765", "http://127.0.0.1:8765"),
+            ("http://127.0.0.1:8765/", "http://127.0.0.1:8765"),
+            ("https://collab.example", "https://collab.example"),
+            ("https://collab.example:8443", "https://collab.example:8443"),
+            ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"),
+            ("https://[2001:db8::1]", "https://[2001:db8::1]"),
+        ] {
+            assert_eq!(
+                parse_advertised_origin(input).expect("valid origin"),
+                expected,
+                "origin {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_origin_parser_rejects_credentials_paths_queries_and_bad_hosts() {
+        for bad in [
+            "",
+            "ftp://collab.example",
+            "//collab.example",
+            "http://",
+            "http:///path",
+            "http://host/path",
+            "http://host//",
+            "http://host/?x=1",
+            "http://host?query=1",
+            "http://host#fragment",
+            "http://user:pass@host",
+            "http://ho st",
+            "http://host:",
+            "http://host:0",
+            "http://host:99999",
+            "http://host:port",
+            "http://:8080",
+            "http://a:b:8080",
+            "http://[::1",
+            "http://[]:8080",
+            "http://[nope]:8080",
+            "http://[::1]extra",
+        ] {
+            assert!(
+                parse_advertised_origin(bad).is_err(),
+                "accepted non-origin {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_binds_fail_closed_without_advertised_origin_and_loopback_stays_automatic() {
+        // IPv4 and IPv6 wildcards: no origin -> fail closed (None); a
+        // configured origin is used verbatim in both cases.
+        for address in ["0.0.0.0:4321", "[::]:4321"] {
+            let bind: SocketAddr = address.parse().expect("wildcard bind");
+            assert!(bind.ip().is_unspecified(), "{address} must be a wildcard");
+            assert_eq!(
+                advertised_base_url(bind, None),
+                None,
+                "{address} must fail closed without an advertised origin"
+            );
+            assert_eq!(
+                advertised_base_url(bind, Some("https://lan.example:8443")),
+                Some("https://lan.example:8443".to_owned()),
+                "{address} must use the configured origin"
+            );
+        }
+        // Loopback stays automatic, both stacks.
+        for address in ["127.0.0.1:4321", "[::1]:4321"] {
+            let bind: SocketAddr = address.parse().expect("loopback bind");
+            assert!(bind.ip().is_loopback(), "{address} must be loopback");
+            assert_eq!(
+                advertised_base_url(bind, None),
+                Some(format!("http://{bind}")),
+                "loopback {address} must synthesize from the bound address"
+            );
+        }
+        // A specific non-loopback bind keeps synthesizing from the address.
+        let bind: SocketAddr = "198.51.100.7:4321".parse().expect("specific bind");
+        assert_eq!(
+            advertised_base_url(bind, None),
+            Some("http://198.51.100.7:4321".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn collab_host_fails_closed_on_wildcard_without_origin_and_uses_configured_origin() {
+        let service = CollabService::with_runtime(CollabTestRuntime::new());
+
+        // Wildcard bind without an advertised origin: starting a room must
+        // fail closed with an actionable error naming the flag — never a
+        // synthesized 0.0.0.0/:: link.
+        let host = crate::collab_commands::CollabHost::new(service.clone(), None);
+        let error = host
+            .execute(crate::interactive_commands::CollabInvocation::Start)
+            .await
+            .expect_err("wildcard without advertised origin must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("--listen-advertised-origin"),
+            "fail-closed error must name the flag: {message}"
+        );
+        assert!(
+            !message.contains("http://0.0.0.0") && !message.contains("http://[::]"),
+            "fail-closed error must not synthesize wildcard links: {message}"
+        );
+
+        // Configured reachable origin: both the control and the view-only
+        // link are built from it.
+        let host = crate::collab_commands::CollabHost::new(
+            service,
+            Some("https://lan.example:8443".to_owned()),
+        );
+        let output = host
+            .execute(crate::interactive_commands::CollabInvocation::Start)
+            .await
+            .expect("start with configured advertised origin");
+        let control = output
+            .lines()
+            .find(|line| line.starts_with("Control link: "))
+            .expect("control link line");
+        let view = output
+            .lines()
+            .find(|line| line.starts_with("View-only link: "))
+            .expect("view link line");
+        assert!(
+            control.starts_with("Control link: https://lan.example:8443/collab/ws/"),
+            "control link must use the advertised origin: {output}"
+        );
+        assert!(
+            view.starts_with("View-only link: https://lan.example:8443/collab/ws/"),
+            "view link must use the advertised origin: {output}"
+        );
+        assert!(
+            control.contains("#c=") && view.contains("#v="),
+            "links must carry the role fragments: {output}"
+        );
+        assert!(
+            !output.contains("0.0.0.0") && !output.contains("[::]"),
+            "links must never contain the wildcard bind: {output}"
+        );
     }
 }

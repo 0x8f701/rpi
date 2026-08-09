@@ -246,10 +246,11 @@ def find_managed_worktree(managed_root: Path, workflow_id: str) -> Path:
 
 def verify_planner_engagement(evidence: Path) -> dict[str, int]:
     """Prove the deterministic planner really served the campaign: the mock
-    logs one `user-mock scenario=workflow request#N user=...` line per
-    provider request (see user_mock_server.py), so the request counts are
-    durable evidence that planning turns produced the DAG and worker turns
-    executed it — the lifecycle assertions must never run against a fake."""
+    logs one `user-mock scenario=workflow request#N user_len=... user_digest=...`
+    line plus a `kind=planning|worker` line per provider request (see
+    user_mock_server.py), so the kind counts are durable evidence that
+    planning turns produced the DAG and worker turns executed it — the
+    lifecycle assertions must never run against a fake."""
     log_path = evidence / "mock-server.log"
     text = log_path.read_text(encoding="utf-8", errors="replace")
     planning = sum(1 for line in text.splitlines() if " kind=planning" in line)

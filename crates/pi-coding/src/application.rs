@@ -3790,7 +3790,7 @@ fn session_extension_event(event: &SessionEvent) -> Option<ExtensionEvent> {
         ),
         SessionEvent::ModelSelect { model } => (
             "model_select",
-            serde_json::json!({ "model": model }),
+            serde_json::json!({ "model": public_extension_model(model.clone()) }),
         ),
         SessionEvent::ThinkingLevelSelect { thinking_level } => (
             "thinking_level_select",

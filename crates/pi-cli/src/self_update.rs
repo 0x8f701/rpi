@@ -79,6 +79,7 @@ struct WindowsActivationCommand {
     state_new: PathBuf,
     state_path: PathBuf,
     status_path: PathBuf,
+    expected_version: String,
 }
 
 #[derive(Deserialize)]
@@ -799,7 +800,7 @@ async fn activate(
     install: &ManagedInstall,
     staged: &Path,
     state: &UpdateState,
-    _expected: &Version,
+    expected: &Version,
     lock: &mut InstallLock,
 ) -> Result<()> {
     let backup = unique(&install.root.join("bin"), ".rpi-backup", ".exe")?;
@@ -814,6 +815,7 @@ async fn activate(
         state_new,
         state_path: install.state_path.clone(),
         status_path: install.root.join("last-update-result.json"),
+        expected_version: expected.to_string(),
     })?;
     Ok(())
 }
@@ -844,12 +846,14 @@ using System; using System.Runtime.InteropServices; public static class RpiMove 
 '@
  try {
   if (-not [RpiMove]::MoveFileEx($config.staged,$config.destination,1)) { throw 'atomic executable activation failed' }
-  & $config.destination --version *> $null
-  if ($LASTEXITCODE -ne 0) {
-   if (-not [RpiMove]::MoveFileEx($config.backup,$config.destination,1)) { throw 'binary failed and rollback failed' }
+  # The moved binary must print exactly 'rpi <expected-version>'; exit status
+  # alone is not proof of identity. Any mismatch rolls the previous binary back.
+  $versionOutput = (& $config.destination --version 2>$null | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or $versionOutput -cne ("rpi " + $config.expected_version)) {
+   if (-not [RpiMove]::MoveFileEx($config.backup,$config.destination,1)) { throw 'new binary failed identity check and rollback failed' }
    & $config.destination --version *> $null
    if ($LASTEXITCODE -ne 0) { throw 'rollback verification failed' }
-   throw 'new binary failed; previous binary restored and verified'
+   throw 'new binary failed identity check; previous binary restored and verified'
   }
   if (-not [RpiMove]::MoveFileEx($config.state_new,$config.state_path,1)) {
    if (-not [RpiMove]::MoveFileEx($config.backup,$config.destination,1)) { throw 'state commit and rollback failed' }
@@ -867,16 +871,6 @@ using System; using System.Runtime.InteropServices; public static class RpiMove 
  if ($mutexAcquired) {try {$mutex.ReleaseMutex()} catch {}}
  $mutex.Dispose()
 }
-"#;
-
-#[cfg(windows)]
-const WINDOWS_ACTIVATOR: &str = r#"param([int]$ParentId,[string]$New,[string]$Dest,[string]$Backup,[string]$NewState,[string]$State,[string]$Script)
-$ErrorActionPreference='Stop'; Wait-Process -Id $ParentId -ErrorAction SilentlyContinue
-Add-Type -TypeDefinition @'
-using System; using System.Runtime.InteropServices; public static class PiMove {[DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] public static extern bool MoveFileEx(string a,string b,int f);}
-'@
-$log=Join-Path (Split-Path -Parent $State) 'last-update-error.log'
-try {if (-not [PiMove]::MoveFileEx($New,$Dest,1)){throw 'activation failed'}; & $Dest --version *> $null; if ($LASTEXITCODE -ne 0){if (-not [PiMove]::MoveFileEx($Backup,$Dest,1)){throw 'rollback failed'}; & $Dest --version *> $null; if ($LASTEXITCODE -ne 0){throw 'rollback verification failed'}; throw 'new binary failed; previous binary restored'}; if (-not [PiMove]::MoveFileEx($NewState,$State,1)){if (-not [PiMove]::MoveFileEx($Backup,$Dest,1)){throw 'state commit and rollback failed'}; & $Dest --version *> $null; if ($LASTEXITCODE -ne 0){throw 'rollback verification failed'}; throw 'state commit failed; previous binary restored'}; Remove-Item -LiteralPath $Backup,$log -Force -ErrorAction SilentlyContinue} catch {[IO.File]::WriteAllText($log,$_.Exception.Message+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))} finally {Remove-Item -LiteralPath $New,$NewState,$Script -Force -ErrorAction SilentlyContinue}
 "#;
 
 fn write_state_atomic(path: &Path, state: &UpdateState) -> Result<()> {
@@ -1390,9 +1384,10 @@ mod tests {
 
     #[test]
     fn Windows_mutex_name_matches_installer_replacement() {
+        let install_root = Path::new("C:\\").join("rpi-fixtures").join("managed");
         assert_eq!(
-            windows_mutex_name(Path::new(r"C:\Users\pi\.rpi")),
-            "Local\\rpi-install-C__Users_pi_.rpi"
+            windows_mutex_name(&install_root),
+            "Local\\rpi-install-C___rpi-fixtures_managed"
         );
     }
 
@@ -1400,6 +1395,7 @@ mod tests {
     fn Windows_activation_payload_is_json_without_secrets_or_shell_quoting() {
         let command = WindowsActivationCommand {
             action: "activate",
+            expected_version: "0.2.4".to_owned(),
             staged: PathBuf::from(r"C:\path with spaces\rpi.new.exe"),
             destination: PathBuf::from(r"C:\path with spaces\rpi.exe"),
             backup: PathBuf::from(r"C:\path with spaces\rpi.backup.exe"),
@@ -1411,6 +1407,7 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse command");
         assert_eq!(value["action"], "activate");
+        assert_eq!(value["expected_version"], "0.2.4");
         assert_eq!(value["destination"], r"C:\path with spaces\rpi.exe");
     }
 
@@ -1430,6 +1427,33 @@ mod tests {
         assert!(WINDOWS_LOCKER.contains(
             "if ($mutexAcquired) {try {$mutex.ReleaseMutex()} catch {}}"
         ));
+    }
+
+    #[test]
+    fn Windows_locker_requires_exact_version_identity_before_state_commit() {
+        let captured = WINDOWS_LOCKER
+            .find("$versionOutput = (& $config.destination --version")
+            .expect("activation captures the moved binary's version output");
+        let identity = WINDOWS_LOCKER[captured..]
+            .find("$versionOutput -cne (\"rpi \" + $config.expected_version)")
+            .map(|offset| captured + offset)
+            .expect("activation requires exactly 'rpi <expected-version>' output");
+        let rollback = WINDOWS_LOCKER[identity..]
+            .find("[RpiMove]::MoveFileEx($config.backup,$config.destination,1)")
+            .map(|offset| identity + offset)
+            .expect("identity mismatch restores the previous binary");
+        let commit = WINDOWS_LOCKER
+            .find("[RpiMove]::MoveFileEx($config.state_new,$config.state_path,1)")
+            .expect("state commit");
+        assert!(captured < identity && identity < rollback && rollback < commit);
+        assert!(
+            WINDOWS_LOCKER.contains("$LASTEXITCODE -ne 0 -or $versionOutput -cne"),
+            "exit status alone must not prove identity"
+        );
+        assert!(
+            WINDOWS_LOCKER
+                .contains("throw 'new binary failed identity check; previous binary restored and verified'")
+        );
     }
 
     #[cfg(unix)]

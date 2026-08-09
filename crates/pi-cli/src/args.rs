@@ -220,6 +220,15 @@ pub struct Cli {
     /// the bearer token and control traffic.
     #[arg(long, requires_all = ["listen", "listen_token_file"])]
     pub listen_allow_insecure_remote: bool,
+
+    /// Advertised HTTP(S) origin used to build collaboration links when
+    /// --listen binds a wildcard address (0.0.0.0 or ::). Strict origin:
+    /// http/https scheme, a host with an optional numeric port, and no
+    /// credentials, path, query, or fragment (a trailing "/" is normalized
+    /// away). Loopback binds advertise their local address automatically;
+    /// wildcard binds fail closed without this flag.
+    #[arg(long, value_name = "URL", requires = "listen")]
+    pub listen_advertised_origin: Option<String>,
 }
 
 /// Headless application adapters.
@@ -827,6 +836,11 @@ impl Cli {
                 "--listen-allow-insecure-remote requires --listen-token-file".to_owned(),
             );
         }
+        if let Some(origin) = self.listen_advertised_origin.as_deref()
+            && let Err(error) = crate::modes::listen::parse_advertised_origin(origin)
+        {
+            return Err(error.to_string());
+        }
         for (flag, names) in [
             ("--tools", self.tools.as_deref()),
             ("--exclude-tools", Some(self.exclude_tools.as_slice())),
@@ -1431,6 +1445,72 @@ mod tests {
         assert_eq!(
             direct.validate().expect_err("validation must require listen"),
             "--listen-allow-insecure-remote requires --listen"
+        );
+    }
+
+    #[test]
+    fn listen_advertised_origin_parses_strict_origins_and_rejects_non_origins() {
+        let with_root = Cli::try_parse_from([
+            "rpi",
+            "--listen",
+            "0.0.0.0:0",
+            "--listen-advertised-origin",
+            "https://collab.example:8443/",
+        ])
+        .expect("parse advertised origin with root slash");
+        with_root
+            .validate()
+            .expect("root-slash origin must validate");
+        assert_eq!(
+            crate::modes::listen::parse_advertised_origin(
+                with_root.listen_advertised_origin.as_deref().expect("origin")
+            )
+            .expect("normalize root-slash origin"),
+            "https://collab.example:8443"
+        );
+
+        let plaintext = Cli::try_parse_from([
+            "rpi",
+            "--listen",
+            "0.0.0.0:0",
+            "--listen-advertised-origin",
+            "http://127.0.0.1:8765",
+        ])
+        .expect("parse plaintext advertised origin");
+        plaintext
+            .validate()
+            .expect("plaintext origin must validate");
+
+        for bad in [
+            "ftp://collab.example",
+            "http://",
+            "http://host/path",
+            "http://host?x=1",
+            "http://host#fragment",
+            "http://user:pass@host",
+            "http://ho st",
+            "http://host:99999",
+        ] {
+            let cli = Cli::try_parse_from([
+                "rpi",
+                "--listen",
+                "0.0.0.0:0",
+                "--listen-advertised-origin",
+                bad,
+            ])
+            .expect("parse origin candidate");
+            let error = cli
+                .validate()
+                .expect_err("strict origin validation must reject non-origin");
+            assert!(
+                error.contains("--listen-advertised-origin"),
+                "{bad:?} must produce a flag-named error: {error}"
+            );
+        }
+
+        assert!(
+            Cli::try_parse_from(["rpi", "--listen-advertised-origin", "http://host"]).is_err(),
+            "--listen-advertised-origin requires --listen"
         );
     }
 

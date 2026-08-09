@@ -5,7 +5,7 @@
 //   RPI_TOKEN       token file content (served via rpi-auth.<token> subprotocol)
 //   RPI_MOCK_CONTROL_URL loopback mock origin for the T3 release barrier
 //   RPI_CHROME      executable path of the system Chrome (optional)
-//   RPI_EVIDENCE    evidence dir for screenshots
+//   RPI_EVIDENCE    evidence dir for screenshots + executed-assertion evidence
 //
 // REQUIRES the MultiSessionRuntimeManager backend: top-level `sessionId`
 // command routing, lifecycle responses `{sessionId,state,messages}`, every
@@ -48,14 +48,45 @@
 //       T7.2 session pick closes the drawer
 //       T7.3 picked session's transcript restores from the backend
 //       T7.4 header has no feature buttons on mobile either
+//
+// Every passing contract records its machine-readable ID (T0.1..T7.4); on
+// full success the lane writes $RPI_EVIDENCE/coverage-assertions.json
+// ({ "executed": [...] }). The Web coverage matrix
+// (E2E.d/web/coverage_matrix.mjs, feature "multi-session") requires ALL of
+// DOCUMENTED_IDS below: the matrix fails when any named contract is absent,
+// and this lane fails — before writing evidence — unless every documented ID
+// actually executed, so the 10th lane is quantitatively gated, never just a
+// shell PASS.
 
 import { chromium } from 'playwright';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
 const mockControlUrl = process.env.RPI_MOCK_CONTROL_URL || '';
 const chromePath = process.env.RPI_CHROME || '';
 const evidence = process.env.RPI_EVIDENCE || '.';
+
+// Machine-readable executed-assertion evidence for the coverage matrix: every
+// passing T<x>.<y> contract is recorded here (a Set, so repeated waits under
+// one contract dedupe) and written to $RPI_EVIDENCE/coverage-assertions.json
+// only after the FULL documented matrix below has executed.
+const DOCUMENTED_IDS = [
+  'T0.1', 'T0.2', 'T0.3',
+  'T1.1', 'T1.2', 'T1.3', 'T1.4', 'T1.5', 'T1.6',
+  'T2.1', 'T2.2', 'T2.3', 'T2.4', 'T2.5',
+  'T3.1', 'T3.2',
+  'T4.1', 'T4.2', 'T4.3',
+  'T5.1', 'T5.2', 'T5.3',
+  'T6.1', 'T6.2', 'T6.3', 'T6.4',
+  'T7.1', 'T7.2', 'T7.3', 'T7.4',
+];
+const executed = new Set();
+function record(id) {
+  executed.add(id);
+  console.log(`[web-sess:assert] ${id}`);
+}
 
 function fail(message) {
   // Exit 2 (not 1): run.sh treats 1 as "npm install unavailable -> fall
@@ -70,6 +101,11 @@ async function waitFor(page, fn, id, timeoutMs = 30000, arg) {
   } catch {
     fail(`${id} (timeout ${timeoutMs}ms)`);
   }
+  // Every label in this lane starts with its contract's T<x>.<y> ID; record
+  // it on success so the coverage matrix can quantify this lane. Direct
+  // (non-waitFor) checks record explicitly at their own sites.
+  const tid = typeof id === 'string' ? (id.match(/^T\d+\.\d+/) || [null])[0] : null;
+  if (tid) record(tid);
 }
 
 async function activeTranscript(page) {
@@ -89,14 +125,40 @@ async function rowExists(page, sid) {
 }
 
 async function clickRow(page, sid, id) {
-  const ok = await page.evaluate((s) => {
-    const rows = [...document.querySelectorAll('.session-sidebar__switch')];
-    const row = rows.find((r) => r.dataset.sessionId === s);
-    if (!row || row.disabled) return false;
-    row.click();
-    return true;
+  const isAlreadyActive = await page.evaluate((s) => {
+    const row = [...document.querySelectorAll('.session-sidebar__row')]
+      .find((candidate) => candidate.querySelector('.session-sidebar__switch')?.dataset.sessionId === s);
+    return row?.classList.contains('session-sidebar__row--active') === true;
   }, sid);
-  if (!ok) fail(`${id}: session row ${sid} missing or disabled in the sidebar`);
+  if (!isAlreadyActive) {
+    await waitFor(
+      page,
+      (s) => {
+        const rows = [...document.querySelectorAll('.session-sidebar__switch')];
+        const row = rows.find((candidate) => candidate.dataset.sessionId === s);
+        return row !== undefined && !row.disabled;
+      },
+      `${id}: session row ${sid} never became clickable`,
+      30000,
+      sid
+    );
+    await page.evaluate((s) => {
+      const rows = [...document.querySelectorAll('.session-sidebar__switch')];
+      const row = rows.find((candidate) => candidate.dataset.sessionId === s);
+      row.click();
+    }, sid);
+  }
+  await waitFor(
+    page,
+    (s) => {
+      const row = [...document.querySelectorAll('.session-sidebar__row')]
+        .find((candidate) => candidate.querySelector('.session-sidebar__switch')?.dataset.sessionId === s);
+      return row?.classList.contains('session-sidebar__row--active') === true;
+    },
+    `${id}: session ${sid} never became active`,
+    30000,
+    sid
+  );
 }
 
 async function rowUnread(page, sid) {
@@ -113,13 +175,19 @@ async function rowLoaded(page, sid) {
 }
 
 async function clickRowClose(page, sid, id) {
-  const ok = await page.evaluate((s) => {
-    const btn = document.querySelector(`.session-sidebar__close[data-session-id="${s}"]`);
-    if (!btn || btn.disabled) return false;
-    btn.click();
-    return true;
+  await waitFor(
+    page,
+    (s) => {
+      const btn = document.querySelector(`.session-sidebar__close[data-session-id="${s}"]`);
+      return btn !== null && !btn.disabled;
+    },
+    `${id}: close button for session ${sid} never became clickable`,
+    30000,
+    sid
+  );
+  await page.evaluate((s) => {
+    document.querySelector(`.session-sidebar__close[data-session-id="${s}"]`).click();
   }, sid);
-  if (!ok) fail(`${id}: close button for session ${sid} missing or disabled`);
 }
 
 async function waitForNewRow(page, knownIds, id, timeoutMs = 30000) {
@@ -201,6 +269,7 @@ async function assertNoHeaderFeatureButtons(page, id) {
   if (missing.length > 0) {
     fail(`${id}: sidebar nav missing feature buttons: ${missing.join(', ')}`);
   }
+  record(id);
 }
 
 async function main() {
@@ -286,6 +355,7 @@ async function main() {
     if (!aTranscript.includes('sessions-reply: a-prompt-0') || !aTranscript.includes('slow-a-done')) {
       fail("T1.6: A's authoritative transcript was not restored (history missing)");
     }
+    record('T1.6');
     await page.screenshot({ path: `${evidence}/sessions-t1-restored.png`, fullPage: true });
 
     /* ---------------- T2: abort/toast isolation ---------------- */
@@ -317,6 +387,7 @@ async function main() {
     if (cAborted.includes('slow-b-done')) {
       fail(`T2.4: aborted C stream still rendered the final tail: ${cAborted}`);
     }
+    record('T2.4');
 
     // T2.5: A was not affected — its stream completes in full.
     await clickRow(page, sessionA, 'T2.5: switch back to A after aborting C');
@@ -496,8 +567,8 @@ async function main() {
       earlier
     );
     const loadedCount = await page.evaluate(() => document.querySelectorAll('.session-sidebar__loaded').length);
-    if (loadedCount < 8) {
-      fail(`T4.3: expected 8 loaded sessions after the cap refusal, found ${loadedCount} (eviction?)`);
+    if (loadedCount !== 8) {
+      fail(`T4.3: expected exactly 8 loaded sessions after the cap refusal, found ${loadedCount} (eviction?)`);
     }
     await page.screenshot({ path: `${evidence}/sessions-t4-no-eviction.png`, fullPage: true });
 
@@ -585,10 +656,15 @@ async function main() {
     await page.click('#workflow-create-btn');
     await waitFor(
       page,
-      () => [...document.querySelectorAll('.workflow-row')].some((r) => (r.textContent || '').includes('a-wf')),
-      'T5.3: workflow never created on A',
+      () => [...document.querySelectorAll('.workflow-row')].some((r) => (r.textContent || '').includes('a-wf'))
+        || document.querySelector('.workflow-panel__error') !== null,
+      'T5.3: workflow create returned neither a row nor an error',
       30000
     );
+    const workflowCreateError = await page.evaluate(
+      () => document.querySelector('.workflow-panel__error')?.textContent || ''
+    );
+    if (workflowCreateError !== '') fail(`T5.3: workflow create failed on A: ${workflowCreateError}`);
     await page.click('#workflow-close-btn');
     await waitFor(page, () => document.getElementById('workflow-panel') === null, 'T5.3: workflow panel did not close on A');
 
@@ -664,7 +740,18 @@ async function main() {
     await mobile.screenshot({ path: `${evidence}/sessions-t7-picked.png`, fullPage: true });
     await mobile.close();
 
-    console.log('web-sessions: PASSED (T0 boot, T1 concurrent streaming + unread + restore, T2 abort/toast isolation, T6 rail collapse/reopen + header, T3 close busy/idle, T4 8-session cap + no eviction, T5 Todo/Goal/Workflow isolation, T7 390x844 drawer pick-close)');
+    // The lane may only report PASS (and may only write evidence) once the
+    // FULL documented matrix executed: a renamed/renumbered contract that no
+    // longer records its ID fails the lane instead of silently shrinking the
+    // evidence the coverage matrix quantifies.
+    const missing = DOCUMENTED_IDS.filter((id) => !executed.has(id));
+    if (missing.length > 0) {
+      fail(`T-lane evidence incomplete: ${missing.join(', ')} never executed (coverage matrix contract)`);
+    }
+    fs.mkdirSync(evidence, { recursive: true });
+    fs.writeFileSync(path.join(evidence, 'coverage-assertions.json'), JSON.stringify({ executed: [...executed] }, null, 2));
+
+    console.log(`web-sessions: PASSED (${executed.size}/${DOCUMENTED_IDS.length} assertions, T0 boot, T1 concurrent streaming + unread + restore, T2 abort/toast isolation, T6 rail collapse/reopen + header, T3 close busy/idle, T4 8-session cap + no eviction, T5 Todo/Goal/Workflow isolation, T7 390x844 drawer pick-close) — evidence at ${path.join(evidence, 'coverage-assertions.json')}`);
   } finally {
     await browser.close().catch(() => {});
   }

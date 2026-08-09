@@ -34,6 +34,7 @@ it. Scenarios:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -107,10 +108,14 @@ XSS_PAYLOAD_TEXT = (
 )
 
 # Web transcript-renderer fixture: markdown table + task list, a mermaid
-# flowchart fence, inline $...$ math and a $$...$$ display block. Raw string
-# so backslashes in the LaTeX survive; returned only when the prompt asks for
-# "render rich content" (never by request number, so other steering lanes
-# keep their odd/even slow/instant cadence untouched).
+# flowchart fence, inline $...$ math and a $$...$$ display block, plus (for
+# renderer coverage) an ordinary ```text code fence, a safe http link, a
+# blocked javascript link, a safe data:image PNG, and a blocked data:text
+# image. Raw string so backslashes in the LaTeX survive; returned only when
+# the prompt asks for "render rich content" (never by request number, so
+# other steering lanes keep their odd/even slow/instant cadence untouched).
+# The fence/links/images render inert (no raw markers in textContent) and
+# only ADD observable elements, so the existing assertions still hold.
 RICH_TEXT = r"""## Rendering upgrade e2e
 
 | Name  | Value |
@@ -133,6 +138,18 @@ Inline math $E=mc^2$ renders, and a display block:
 $$
 \int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}
 $$
+
+Renderer coverage — ordinary code fence, link/image URL policy:
+
+```text
+const answer = 42
+```
+
+Safe link [pi web docs](https://example.org/pi-web) and a blocked
+[evil](javascript:alert(1)) link that must not become a live anchor.
+
+Safe image ![pic](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=)
+and a blocked ![x](data:text/html,<b>hi</b>) image that must stay inert.
 """
 
 
@@ -255,6 +272,13 @@ def last_user_text(body: dict[str, Any]) -> str:
     return ""
 
 
+def user_text_digest(text: str) -> str:
+    """Deterministic 12-hex sha256 marker for one request's last real user
+    input. Queue-order assertions compare digests across requests; the
+    digest never echoes prompt content into the evidence log."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 def message_text(body: dict[str, Any]) -> str:
     fragments: list[str] = []
     for message in body.get("messages") or []:
@@ -314,19 +338,29 @@ class UserMockServer(BaseHTTPRequestHandler):
         type(self).serial += 1
         request_number = type(self).serial
         # One line per request, stderr (every scenario redirects it to its
-        # evidence log). Scenarios use the user-text of each request to prove
-        # queue ordering: a follow-up typed mid-turn must NOT appear in the
-        # in-flight request's body and must be the LAST user message of the
-        # next request (drained after the turn).
+        # evidence log). Scenarios use the digest of each request's last user
+        # text to prove queue ordering: a follow-up typed mid-turn must NOT
+        # appear in the in-flight request's body and must be the LAST user
+        # message of the next request (drained after the turn). Only the
+        # bounded length and the digest are logged — never the prompt itself.
+        user_text = last_user_text(body)
         print(
-            f"user-mock scenario={self.scenario} request#{request_number} user={last_user_text(body)!r}",
+            f"user-mock scenario={self.scenario} request#{request_number} "
+            f"user_len={len(user_text)} user_digest={user_text_digest(user_text)}",
             file=sys.stderr,
             flush=True,
         )
         try:
             response = self.route(request_number, body)
         except BaseException as error:  # never let a routing bug wedge the client
-            print(f"user-mock scenario={self.scenario} request#{request_number} error: {error!r}", file=sys.stderr)
+            # Exception class only: the repr could embed request bodies or
+            # paths that must never reach the evidence log.
+            print(
+                f"user-mock scenario={self.scenario} request#{request_number} "
+                f"error={type(error).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
             response = stream_response([text_payload(f"user-mock-err-{request_number}", "mock rejected")])
         # Routing kind for the campaign's planner-engagement evidence: held
         # workflow streams are worker turns; the sessions barrier is merely a
@@ -342,6 +376,11 @@ class UserMockServer(BaseHTTPRequestHandler):
             file=sys.stderr,
             flush=True,
         )
+        if response is None:
+            # Slow routes wrote the complete HTTP response and streamed their
+            # body directly. Never append a second status line to that SSE
+            # body; the handler return closes the HTTP/1.0 response cleanly.
+            return
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         if isinstance(response, HeldStream):
@@ -349,10 +388,6 @@ class UserMockServer(BaseHTTPRequestHandler):
             # delta is impossible until the scenario-specific release POST.
             self.end_headers()
             stream_held_response(self.wfile, response)
-            return
-        if response is None:
-            # The slow path already streamed its body chunk-by-chunk.
-            self.end_headers()
             return
         self.send_header("content-length", str(len(response)))
         self.end_headers()
@@ -417,6 +452,27 @@ class UserMockServer(BaseHTTPRequestHandler):
                 self.end_headers()
                 slow_stream_response(self.wfile, payloads, delay=0.7)
                 return None
+            # Web coverage ToolCard driver: a main-session prompt carrying
+            # this marker makes the agent call the `read` tool exactly once
+            # (the second call, with the tool result, falls through to the
+            # parity cadence below via completed_tool_results). Deterministic;
+            # the file read is the fixture's seed.txt. Drives App.ToolCard +
+            # redact.safeJson (the tool-card args pre).
+            if "tool-card coverage read seed" in last_user_text(body):
+                if completed_tool_results(body, "read"):
+                    return stream_response(
+                        [text_payload(f"user-mock-{request_number}", "seed file read complete")]
+                    )
+                return stream_response(
+                    [
+                        tool_call_payload(
+                            f"user-mock-{request_number}",
+                            f"call-read-seed-{request_number}",
+                            "read",
+                            {"path": "seed.txt"},
+                        )
+                    ]
+                )
             if request_number % 2 == 1:
                 # Slow stream: several chunks over ~4s so a follow-up typed
                 # while the turn is in flight lands in the queue. Chunks embed

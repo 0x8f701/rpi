@@ -93,7 +93,10 @@ Open a new terminal before running `rpi` after such a change.
 | `PI_UPDATE_BASE_URL` | `https://api.github.com/repos/0x8f701/rpi/releases` | Release API base |
 | `GITHUB_TOKEN` | (none) | Authenticates the GitHub API call to avoid unauthenticated rate limits |
 
-The token is sent **only** to the GitHub API endpoint, never to release-asset hosts.
+The token is sent **only** to the fixed GitHub API endpoint
+(`https://api.github.com/repos/0x8f701/rpi/releases`), never to release-asset
+hosts or a custom `PI_UPDATE_BASE_URL` endpoint. `install.sh`, `install.ps1`,
+and `rpi update --self` all apply the same scoping.
 
 ## Developer source build
 
@@ -145,6 +148,11 @@ $PI_HOME/   # default ~/.rpi on Unix, %USERPROFILE%\.rpi on Windows
 
 On Windows the active executable is `$PI_HOME/bin/rpi.exe` rather than a
 symlink into `downloads/`.
+
+On Unix, the installer creates the managed directories (`$PI_HOME`,
+`bin/`, `downloads/`) owner-only (`0700`) and writes `update-state.json` and
+the install lock as owner-only (`0600`), independent of the caller's umask.
+Installed binaries keep their executable mode (`0755`).
 
 Runtime configuration and sessions are stored separately under `<agent-dir>/`
 (the upstream pi layout, defaulting to `~/.pi/agent`). The binary location and

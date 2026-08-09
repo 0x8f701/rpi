@@ -29,6 +29,14 @@
 # Requirements: rpi binary (target/release-dist/rpi or RPI_BIN), node, python3,
 #   tmux is NOT required. Playwright + Chromium must be available for the
 #   browser guest (hard-fail if absent, never skip).
+#
+# Evidence hygiene: the host's stdout carries the /collab control/view join
+# links with live capability fragments (#c=…/#v=…). It is captured through an
+# owner-only private file (mode 600) and mirrored into rpi.stdout through a
+# redaction filter, so retained evidence never contains capability bytes. The
+# private capture is key-scrubbed in place immediately after link extraction
+# and zeroized/deleted at its last use and again by the EXIT/signal trap, so
+# abort/crash paths cannot retain live capability material.
 set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 E2E_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
@@ -119,16 +127,28 @@ spawn_host() {
 EOF
     mkfifo "$root/stdin" 2>/dev/null || true
     exec 9<>"$root/stdin"
+    # Private capture of host stdout: the /collab control/view join links
+    # (capability fragments) must never land in retained evidence. The mirror
+    # writes a redacted copy to rpi.stdout; the capture itself is owner-only
+    # (600), key-scrubbed right after link extraction, and zeroized/deleted by
+    # collab_cleanup on every exit path.
+    COLLAB_PRIV_CAPTURE="$root/host-capture.priv"
+    COLLAB_PRIV_KEYS="$root/host-capture.keys"
+    COLLAB_EVIDENCE_DIR="$evidence"
+    ( umask 077; : >"$COLLAB_PRIV_CAPTURE"; : >"$COLLAB_PRIV_KEYS" )
+    chmod 600 "$COLLAB_PRIV_CAPTURE" "$COLLAB_PRIV_KEYS"
+    start_stdout_mirror "$evidence/rpi.stdout" "$COLLAB_PRIV_CAPTURE" "$COLLAB_PRIV_KEYS"
     cd "$root/workspace"
     env -i \
         HOME="$root/home" USERPROFILE="$root/home" \
         PATH="${PATH:-/usr/bin:/bin}" LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" \
         PI_CODING_AGENT_DIR="$root/home/.pi/agent" \
         PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+        RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
         "$RPI_BIN" --offline \
         --listen "127.0.0.1:$listen_port" \
         --model user-bash-card/mock --api-key user-mock-key \
-        <"$root/stdin" >"$evidence/rpi.stdout" 2>"$evidence/rpi.stderr" &
+        <"$root/stdin" >"$COLLAB_PRIV_CAPTURE" 2>"$evidence/rpi.stderr" &
     RPI_PID=$!
     register_pid $RPI_PID
 }
@@ -185,8 +205,17 @@ run_browser_guest() {
     local name
     name="$(basename "$test_file")"
     cp "$test_file" "$work/$name"
+    # Hard-coverage mode: preload the V8 coverage hook (node --import) and
+    # point it at the per-run payload dir, mirroring the web fixture's
+    # web_run_playwright. Gated on RPI_COVERAGE_DIR, so the normal
+    # (non-coverage) collab scenario run is a strict no-op passthrough.
+    local -a node_preload=()
+    if [ -n "${RPI_COVERAGE_DIR:-}" ] && [ -f "$E2E_DIR/web/lib/coverage-hook.mjs" ]; then
+        node_preload+=(--import "$E2E_DIR/web/lib/coverage-hook.mjs")
+    fi
     (cd "$work" && RPI_URL="$url" RPI_EVIDENCE="$evidence" RPI_CHROME="$chrome" \
-        env "${envs[@]}" node "$name")
+        RPI_COVERAGE_DIR="${RPI_COVERAGE_DIR:-}" RPI_COVERAGE_LANE="${RPI_COVERAGE_LANE:-collab}" \
+        env "${envs[@]}" node "${node_preload[@]}" "$name")
 }
 
 # ---------------------------------------------------------------------------
@@ -271,6 +300,196 @@ scrub_and_scan_evidence() {
 }
 
 # ---------------------------------------------------------------------------
+# Capability-link capture/scrub lifecycle.
+#
+# Host stdout (which carries the /collab control/view join links) is captured
+# through an owner-only private file and mirrored into the retained rpi.stdout
+# through a redaction filter, so capability fragments never land in retained
+# evidence. The file-level globals below let the EXIT/signal trap finish the
+# lifecycle on every exit path (normal, fail, abort, or crash).
+# ---------------------------------------------------------------------------
+COLLAB_PRIV_CAPTURE=""
+COLLAB_PRIV_KEYS=""
+COLLAB_MIRROR_PID=""
+COLLAB_EVIDENCE_DIR=""
+COLLAB_CTRL_KEY=""
+COLLAB_VIEW_KEY=""
+COLLAB_HOST_PATH=""
+
+# Overwrite a small private file with zeros, then delete it. Best-effort and
+# silent: cleanup must never fail or change the exit status.
+zeroize_and_remove() {
+    local path="$1"
+    if [ -f "$path" ]; then
+        node -e '
+            const fs = require("fs");
+            const p = process.argv[1];
+            try {
+                const size = fs.statSync(p).size;
+                if (size > 0) {
+                    const fd = fs.openSync(p, "r+");
+                    try { fs.writeSync(fd, Buffer.alloc(size), 0, size, 0); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+                }
+                fs.unlinkSync(p);
+            } catch { /* already gone */ }
+        ' "$path" 2>/dev/null || rm -f "$path"
+    else
+        rm -f "$path"
+    fi
+}
+
+# Replace every occurrence of the given capability key strings with 0x58 bytes
+# in place, preserving file length (same technique as the final evidence
+# scrub). Used to strip live keys out of the private capture the moment they
+# are extracted, so even an abort before cleanup cannot retain them.
+scrub_keys_in_file() {
+    local file="$1"; shift
+    [ -f "$file" ] || return 0
+    node -e '
+        const fs = require("fs");
+        const file = process.argv[1];
+        const keys = process.argv.slice(2).filter(Boolean).map((k) => Buffer.from(k, "utf8"));
+        const buffer = fs.readFileSync(file);
+        let changed = false;
+        for (const key of keys) {
+            for (let off = buffer.indexOf(key); off !== -1; off = buffer.indexOf(key, off + key.length)) {
+                buffer.fill(0x58, off, off + key.length);
+                changed = true;
+            }
+        }
+        if (changed) {
+            const fd = fs.openSync(file, "r+");
+            try {
+                let written = 0;
+                while (written < buffer.length) {
+                    const n = fs.writeSync(fd, buffer, written, buffer.length - written, written);
+                    if (n === 0) throw new Error("short capture write");
+                    written += n;
+                }
+                fs.fsyncSync(fd);
+            } finally { fs.closeSync(fd); }
+        }
+    ' "$file" "$@"
+}
+
+# In-place X-fill of extracted capability keys and the host path across every
+# regular file under the evidence root. Silent variant of the SO-08 scrub used
+# by the exit trap so abort/crash paths cannot leave live capability bytes in
+# retained evidence.
+scrub_evidence_root() {
+    local evidence_dir="$1" ctrl_key="$2" view_key="$3" host_path="$4"
+    [ -n "$ctrl_key$view_key$host_path" ] || return 0
+    [ -d "$evidence_dir" ] || return 0
+    RPI_SCRUB_ROOT="$evidence_dir" \
+    RPI_SCRUB_CTRL_KEY="$ctrl_key" \
+    RPI_SCRUB_VIEW_KEY="$view_key" \
+    RPI_SCRUB_HOST_PATH="$host_path" \
+    node -e '
+        const fs = require("fs");
+        const path = require("path");
+        const root = process.env.RPI_SCRUB_ROOT;
+        const needles = [process.env.RPI_SCRUB_CTRL_KEY, process.env.RPI_SCRUB_VIEW_KEY, process.env.RPI_SCRUB_HOST_PATH]
+            .filter(Boolean).map((v) => Buffer.from(v, "utf8"));
+        const walk = (dir) => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) walk(full);
+                else if (entry.isFile()) {
+                    const buffer = fs.readFileSync(full);
+                    let changed = false;
+                    for (const needle of needles) {
+                        for (let off = buffer.indexOf(needle); off !== -1; off = buffer.indexOf(needle, off + needle.length)) {
+                            buffer.fill(0x58, off, off + needle.length);
+                            changed = true;
+                        }
+                    }
+                    if (changed) {
+                        const fd = fs.openSync(full, "r+");
+                        try {
+                            let written = 0;
+                            while (written < buffer.length) {
+                                const n = fs.writeSync(fd, buffer, written, buffer.length - written, written);
+                                if (n === 0) throw new Error("short evidence write");
+                                written += n;
+                            }
+                            fs.fsyncSync(fd);
+                        } finally { fs.closeSync(fd); }
+                    }
+                }
+            }
+        };
+        try { walk(root); } catch { /* cleanup must never fail */ }
+    '
+}
+
+# Stream a redacted copy of the private host capture into the retained
+# rpi.stdout evidence file. Capability fragments (#c=…/#v=…) are stripped from
+# every line, and any extracted role key bytes (published to the private keys
+# file) are replaced with a fixed placeholder. Scenario assertions read the
+# private capture; this mirror is evidence-only.
+start_stdout_mirror() {
+    local out="$1" capture="$2" keys_file="$3"
+    COLLAB_PRIV_KEYS_FILE="$keys_file" node -e '
+        const fs = require("fs");
+        const capture = process.argv[1];
+        const keysFile = process.env.COLLAB_PRIV_KEYS_FILE;
+        const fragRe = /#[cv]=[A-Za-z0-9_-]+/g;
+        const placeholder = "<redacted>";
+        let keys = [];
+        let keysSig = "";
+        const loadKeys = () => {
+            try {
+                const raw = fs.readFileSync(keysFile, "utf8");
+                if (raw !== keysSig) { keysSig = raw; keys = raw.split("\n").filter(Boolean); }
+            } catch { /* keys not published yet */ }
+        };
+        const redact = (line) => {
+            let out = line.replace(fragRe, "");
+            for (const k of keys) out = out.split(k).join(placeholder);
+            return out;
+        };
+        let pos = 0;
+        let pending = "";
+        const poll = () => {
+            let size;
+            try { size = fs.statSync(capture).size; } catch { return; }
+            if (size < pos) pos = 0;
+            if (size === pos) return;
+            const buffer = Buffer.alloc(size - pos);
+            const fd = fs.openSync(capture, "r");
+            try { fs.readSync(fd, buffer, 0, buffer.length, pos); } finally { fs.closeSync(fd); }
+            pos = size;
+            loadKeys();
+            const parts = (pending + buffer.toString("utf8")).split("\n");
+            pending = parts.pop() || "";
+            for (const part of parts) process.stdout.write(redact(part) + "\n");
+        };
+        setInterval(poll, 200);
+    ' "$capture" >"$out" &
+    COLLAB_MIRROR_PID=$!
+}
+
+# Finish the capture/scrub lifecycle on every exit path, then run the shared
+# cleanup. Registered last so it also covers aborts before main() starts.
+collab_cleanup() {
+    local rc=$?
+    if [ -n "$COLLAB_MIRROR_PID" ]; then
+        kill "$COLLAB_MIRROR_PID" 2>/dev/null || true
+        wait "$COLLAB_MIRROR_PID" 2>/dev/null || true
+    fi
+    if [ -n "$COLLAB_PRIV_CAPTURE" ]; then
+        zeroize_and_remove "$COLLAB_PRIV_CAPTURE"
+    fi
+    if [ -n "$COLLAB_PRIV_KEYS" ]; then
+        zeroize_and_remove "$COLLAB_PRIV_KEYS"
+    fi
+    scrub_evidence_root "$COLLAB_EVIDENCE_DIR" "$COLLAB_CTRL_KEY" "$COLLAB_VIEW_KEY" "$COLLAB_HOST_PATH"
+    cleanup_e2e
+    exit "$rc"
+}
+trap collab_cleanup EXIT HUP INT TERM
+
+# ---------------------------------------------------------------------------
 # Main scenario
 # ---------------------------------------------------------------------------
 main() {
@@ -322,22 +541,31 @@ main() {
     local room_id control_link view_link session_id status_resp
     local collab_deadline=$((SECONDS + 15))
     while [ "$SECONDS" -lt "$collab_deadline" ]; do
-        if grep -q 'Control link:' "$evidence/rpi.stdout" 2>/dev/null && grep -q 'View-only link:' "$evidence/rpi.stdout" 2>/dev/null; then
+        if grep -q 'Control link:' "$COLLAB_PRIV_CAPTURE" 2>/dev/null && grep -q 'View-only link:' "$COLLAB_PRIV_CAPTURE" 2>/dev/null; then
             break
         fi
         sleep 0.2
     done
-    control_link="$(sed -n 's/^Control link: //p' "$evidence/rpi.stdout" | sed -n '1p')"
-    view_link="$(sed -n 's/^View-only link: //p' "$evidence/rpi.stdout" | sed -n '1p')"
+    control_link="$(sed -n 's/^Control link: //p' "$COLLAB_PRIV_CAPTURE" | sed -n '1p')"
+    view_link="$(sed -n 's/^View-only link: //p' "$COLLAB_PRIV_CAPTURE" | sed -n '1p')"
     room_id="$(printf '%s' "$control_link" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>process.stdout.write(new URL(d).pathname.split("/").pop()||""));')"
     if [ -z "$room_id" ] || [ -z "$control_link" ] || [ -z "$view_link" ]; then
         fail "$SCENARIO: FAIL SO-03: /collab did not return complete room links"
     fi
     log "$SCENARIO: PASS SO-03: /collab returned roomId=$room_id"
-    # Extract role keys from links for evidence scanning (never logged).
+    # Extract role keys from links for evidence scanning (never logged), then
+    # immediately strip the live capability bytes out of the private capture
+    # and publish them to the redaction mirror, so neither the capture (should
+    # the run abort before cleanup) nor any later mirrored host output can
+    # retain them.
     local ctrl_key_b64 view_key_b64
     ctrl_key_b64="$(printf '%s' "$control_link" | sed -n 's/.*#c=//p')"
     view_key_b64="$(printf '%s' "$view_link" | sed -n 's/.*#v=//p')"
+    printf '%s\n%s\n' "$ctrl_key_b64" "$view_key_b64" >"$COLLAB_PRIV_KEYS"
+    scrub_keys_in_file "$COLLAB_PRIV_CAPTURE" "$ctrl_key_b64" "$view_key_b64"
+    COLLAB_CTRL_KEY="$ctrl_key_b64"
+    COLLAB_VIEW_KEY="$view_key_b64"
+    COLLAB_HOST_PATH="$root/workspace"
 
     # ── collab_status: verify room exists with correct config ─────────────
     local rooms_json
@@ -504,13 +732,18 @@ main() {
     printf '/collab stop\n' >&9
     local stop_deadline=$((SECONDS + 15))
     while [ "$SECONDS" -lt "$stop_deadline" ]; do
-        if grep -q "Stopped collaboration room $room_id" "$evidence/rpi.stdout" 2>/dev/null; then
+        if grep -q "Stopped collaboration room $room_id" "$COLLAB_PRIV_CAPTURE" 2>/dev/null; then
             break
         fi
         sleep 0.2
     done
-    if grep -q "Stopped collaboration room $room_id" "$evidence/rpi.stdout" 2>/dev/null; then
+    if grep -q "Stopped collaboration room $room_id" "$COLLAB_PRIV_CAPTURE" 2>/dev/null; then
         log "$SCENARIO: PASS SO-06: /collab stop stopped the room"
+        # Last use of the private capture: zeroize and delete it (and its key
+        # list) now. collab_cleanup repeats this on every exit path, including
+        # any earlier fail/abort before this point.
+        zeroize_and_remove "$COLLAB_PRIV_CAPTURE"
+        zeroize_and_remove "$COLLAB_PRIV_KEYS"
     else
         fail "$SCENARIO: FAIL SO-06: /collab stop confirmation not observed"
     fi

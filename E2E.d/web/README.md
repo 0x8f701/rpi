@@ -1,7 +1,9 @@
 # Web client E2E regression suite
 
 One command runs the complete web regression suite against the REAL `rpi
---listen` binary (loopback mock provider + real browser):
+--listen` binary (loopback mock provider + real browser). The suite is
+10 lanes — `core goal xss abort reconnect switch mobile auth extras
+sessions` (mirroring `LANES` in `E2E.d/web/run.sh`):
 
 ```sh
 bash E2E.d/web/run.sh          # run every lane
@@ -15,8 +17,8 @@ provides the shared fixture helpers) — opens `/web` in a real browser, and
 asserts against the live DOM. The browser driver is playwright (ephemeral npm
 install in the scenario work dir) over a system Chrome/Chromium binary or
 playwright's bundled chromium. The web lanes are **playwright-only hard
-gates**: a missing `node` runtime, a failed playwright install, or no usable
-Chromium FAILS the lane (exit 1 = setup failure; exit 2+ = assertion
+gates**: a missing `node`/`npm` runtime, a failed playwright install, or no
+usable Chromium FAILS the lane (exit 1 = setup failure; exit 2+ = assertion
 failure) — there is no skip and no fallback driver. Per-lane pass/fail +
 evidence paths are aggregated into `$EVIDENCE_ROOT/web/REPORT.md`; `run.sh`
 exits non-zero when any lane failed.
@@ -61,6 +63,36 @@ registry, the chromium download, or any lane's assertions are unavailable or
 fail, the job FAILS — no lane skips and nothing falls back.
 `E2E.d/ci.sh run` also gates the same runner behind `E2E_CI_WEB=1` for
 local/CI reuse.
+
+## Measured coverage
+
+`bash E2E.d/web/coverage.sh` measures real line/function/branch coverage of
+`crates/pi-cli/web/src/**/*.{ts,tsx}` through the REAL `rpi --listen` binary +
+loopback mock + REAL Playwright assertions, and enforces explicit Istanbul
+thresholds. Every step is a hard gate — no skips, no agent-browser fallback:
+
+1. Build a TEMPORARY conditionally-instrumented bundle
+   (`vite.coverage.config.ts`: inline source map, unminified) into the
+   evidence root (`$EVIDENCE_ROOT/coverage/web-coverage-dist`) — the tracked
+   `dist/` is never modified; the bundle is served via `RPI_WEB_DEV_DIR`.
+2. Verify playwright installs and that chromium actually launches (missing
+   `node`/`npm`, a failed playwright install, or no usable Chromium FAILS the
+   run).
+3. Run the matrix driver (`coverage_test.mjs`) against the steering fixture —
+   including a REAL server kill/respawn reconnect — and the XSS matrix driver
+   (`coverage_xss.mjs`) against the xss scenario + approval extension.
+4. Run the REAL web lane suite (`E2E.d/web/run.sh`, every lane) against the
+   same coverage bundle — each lane must pass AND must produce a coverage
+   payload (a lane that skipped or fell back fails the coverage run).
+5. Merge every V8 payload, convert through the inline source map
+   (`crates/pi-cli/web/scripts/coverage-report.mjs`), verify source mapping
+   for every expected `src/` file, emit text + JSON summary + lcov, and
+   enforce the thresholds.
+6. Validate the feature matrix against the executed assertion evidence
+   (`coverage_matrix.mjs`) — zero uncovered required assertions.
+
+The packaged `dist/index.html` is rebuilt by the normal `npm run build` step;
+`coverage.sh` never writes `dist/`.
 
 ## Adding a lane
 

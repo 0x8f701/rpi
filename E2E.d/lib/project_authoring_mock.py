@@ -37,6 +37,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -573,6 +574,14 @@ def log(line: str) -> None:
     print(line, file=sys.stderr, flush=True)
 
 
+def text_digest(text: str) -> str:
+    """Deterministic 12-hex sha256 marker for log lines. Evidence logs must
+    never echo user prompts, request bodies, or tool-result payloads; the
+    digest keeps per-request lines distinguishable and fail-closed lines
+    debuggable without leaking content."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 class ProjectAuthoringServer(BaseHTTPRequestHandler):
     serial = 0
     workspace: Path = Path(".")
@@ -585,14 +594,20 @@ class ProjectAuthoringServer(BaseHTTPRequestHandler):
         try:
             response, step = self.route(request_number, body)
         except BaseException as error:  # never let a routing bug wedge the client
-            log(f"project-authoring request#{request_number} error: {error!r}")
+            # Exception class only: the repr could embed request bodies or
+            # paths that must never reach the evidence log.
+            log(f"project-authoring request#{request_number} error={type(error).__name__}")
             response = stream_response(
                 [text_payload(f"pa-err-{request_number}", "mock rejected")]
             )
             step = "error"
+        # One line per request; `step` is the deterministic route
+        # classification, and the user line carries only a bounded length and
+        # a digest — never the prompt itself.
+        user_text = last_user_text(body)
         log(
             f"project-authoring request#{request_number} step={step} "
-            f"user={last_user_text(body)!r}"
+            f"user_len={len(user_text)} user_digest={text_digest(user_text)}"
         )
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
@@ -702,7 +717,8 @@ class ProjectAuthoringServer(BaseHTTPRequestHandler):
             if "test result: FAILED" not in text:
                 log(
                     f"project-authoring request#{request_number} FAIL-CLOSED: "
-                    f"first cargo test did not fail on the planted defect: {text!r}"
+                    f"first cargo test did not fail on the planted defect: "
+                    f"len={len(text)} digest={text_digest(text)}"
                 )
                 return (
                     stream_response(
@@ -790,7 +806,8 @@ class ProjectAuthoringServer(BaseHTTPRequestHandler):
         if "test result: ok" not in pass_text:
             log(
                 f"project-authoring request#{request_number} FAIL-CLOSED: "
-                f"second cargo test did not pass: {pass_text!r}"
+                f"second cargo test did not pass: "
+                f"len={len(pass_text)} digest={text_digest(pass_text)}"
             )
             return (
                 stream_response(
@@ -834,7 +851,8 @@ class ProjectAuthoringServer(BaseHTTPRequestHandler):
             if needle not in valid_text:
                 log(
                     f"project-authoring request#{request_number} FAIL-CLOSED: "
-                    f"valid CLI run missing {needle!r}: {valid_text!r}"
+                    f"valid CLI run missing {needle!r}: "
+                    f"len={len(valid_text)} digest={text_digest(valid_text)}"
                 )
                 return (
                     stream_response(
@@ -895,7 +913,8 @@ class ProjectAuthoringServer(BaseHTTPRequestHandler):
             if "Command exited with code 1" not in text or needle not in text:
                 log(
                     f"project-authoring request#{request_number} FAIL-CLOSED: "
-                    f"invalid CLI run {call_id} missing {needle!r} or non-zero exit: {text!r}"
+                    f"invalid CLI run {call_id} missing {needle!r} or non-zero exit: "
+                    f"len={len(text)} digest={text_digest(text)}"
                 )
                 return (
                     stream_response(

@@ -109,23 +109,48 @@ async function main() {
   try {
     const page = await browser.newPage();
     const connectionStates = [];
+    let streamSeen = false;
     page.on('pageerror', (err) => {
       console.error(`collab-browser: page error: ${sanitizeDetails(err.message)}`);
     });
     await page.exposeFunction('recordCollabConnectionState', (state) => {
       connectionStates.push(String(state));
     });
+    await page.exposeFunction('recordCollabStreamSeen', () => {
+      streamSeen = true;
+    });
     await page.addInitScript(() => {
+      let streamReported = false;
+      const checkStream = () => {
+        if (streamReported) return;
+        const badge = document.getElementById('stream-badge');
+        if (badge && !badge.hidden) {
+          streamReported = true;
+          window.recordCollabStreamSeen();
+        }
+      };
       const observer = new MutationObserver(() => {
         const state = document.getElementById('conn-state')?.dataset?.state;
         if (state) window.recordCollabConnectionState(state);
+        checkStream();
       });
-      observer.observe(document.documentElement, {
+      // Observe `document` (always a Node at init time) rather than
+      // `document.documentElement`, which may not yet exist when the init
+      // script runs and would throw "not of type 'Node'", silently dropping
+      // every observer callback. subtree covers the whole tree.
+      observer.observe(document, {
         subtree: true,
         childList: true,
         attributes: true,
-        attributeFilter: ['data-state'],
+        attributeFilter: ['data-state', 'hidden'],
       });
+      checkStream();
+      // Belt-and-suspenders: the live run can be brief, and a single
+      // mutation-batch could in principle skip the visible window. Poll the
+      // badge for the first 12s so the streaming render path is reliably
+      // observed even if the observer microtask races the settle render.
+      const poll = setInterval(checkStream, 50);
+      setTimeout(() => clearInterval(poll), 12000);
     });
 
     // ── BG-01: page loads collab guest view ─────────────────────────────
@@ -211,6 +236,13 @@ async function main() {
     }
     assert('BG-06', 'live stream renders every expected marker after control prompt', liveRendered,
       `expected=${eventTexts.length} messagesBefore=${msgCountBefore} messagesAfter=${await page.evaluate(() => document.querySelectorAll('#transcript .msg').length)}`);
+    // ── BG-06b: streaming badge becomes visible during the live run ────
+    // The host's live assistant turn flips `streaming` true, which toggles
+    // the #stream-badge `hidden` binding off — exercising the streaming
+    // render path (setStreaming(true) -> hidden={!streaming}). The init
+    // observer records the first visible transition; assert it fired.
+    assert('BG-06b', 'stream badge becomes visible during the live run (streaming render path)',
+      streamSeen, 'streamBadgeNeverVisible');
 
     await page.screenshot({ path: path.join(evidence, 'collab-live.png'), fullPage: true });
 

@@ -320,6 +320,7 @@ async fn start_listen(
         address,
         token_file: cli.listen_token_file.clone(),
         allow_insecure_remote: cli.listen_allow_insecure_remote,
+        advertised_origin: cli.listen_advertised_origin.clone(),
         session_factory: Some(std::sync::Arc::new(spawner)),
     };
     let handle = modes::listen::start(application.clone(), extension_ui, config).await?;

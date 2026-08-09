@@ -65,6 +65,7 @@ does not force print mode.
 | `--listen <SOCKET_ADDR>` | | e.g. `127.0.0.1:8765` | Bind a plaintext HTTP/WebSocket control plane around the live TUI/REPL application. Loopback is the default; non-loopback addresses are rejected unless both the token file and explicit insecure-remote opt-in are present. Only valid on the text path. |
 | `--listen-token-file <PATH>` | | token file | Exact Bearer authentication. Optional on loopback and mandatory for insecure remote listening. Enables browser access; tokenless loopback accepts only native clients without `Origin`. |
 | `--listen-allow-insecure-remote` | | | Permit a non-loopback `--listen` address only with `--listen-token-file`. Plaintext HTTP/WebSocket exposes the bearer token and control traffic to passive network observers. |
+| `--listen-advertised-origin <URL>` | | http(s) origin | Advertised origin used for collaboration links (`/collab`, `collab_start` without an explicit `baseUrl`) when `--listen` binds a wildcard address (0.0.0.0 or `::`). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing `/` is normalized away). Loopback binds advertise their local address automatically; wildcard binds fail closed without this flag. |
 | `--version` | `-v`, `-V` | | Print version and exit. |
 | `--help` | `-h` | | Print help and exit. |
 
@@ -83,7 +84,9 @@ $ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token --listen-a
 Open `http://<host-lan-ip>:8765/web` from another machine. The flag is an
 authenticated plaintext opt-in, not encryption; use only on a network where
 passive observers are an accepted risk. `rpi agent serve` remains
-loopback-only.
+loopback-only. Collaboration links need a reachable origin on wildcard binds:
+add `--listen-advertised-origin http://<host-lan-ip>:8765` (loopback binds
+advertise their local address automatically and never need it).
 
 ## Subcommands
 

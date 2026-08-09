@@ -178,6 +178,13 @@ WebSocket expose the bearer token and all control traffic to passive LAN
 observers. Prefer loopback or a TLS-terminating proxy on untrusted networks.
 `rpi agent serve` remains loopback-only.
 
+Collaboration join links (`/collab`, `collab_start` without an explicit
+`baseUrl`) cannot be synthesized from a wildcard bind. For a wildcard
+`--listen` address (0.0.0.0 or `::`), pass
+`--listen-advertised-origin <URL>` — a strict http/https origin with no
+credentials, path, query, or fragment — so links point at a reachable host.
+Loopback binds advertise their local address automatically.
+
 ## Changelog
 
 See [`CHANGELOG.md`](CHANGELOG.md).

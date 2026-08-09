@@ -281,9 +281,9 @@ voice and real image generation are manual.
 
 ## Verification
 
-First full green run (2026-08-08): `E2E_RUN_ID=user-final3 bash E2E.d/ci/user_scenarios.sh run` → exit 0.
+First full green run (2026-08-08): `bash E2E.d/ci/user_scenarios.sh run` → exit 0.
 Re-verified on the post-web-wave tree (2026-08-09, freshly rebuilt `target/release-dist/rpi`,
-rust-toolchain 1.88.0): `E2E_RUN_ID=user-reverify2 bash E2E.d/ci/user_scenarios.sh run` → exit 0.
+rust-toolchain 1.88.0): `bash E2E.d/ci/user_scenarios.sh run` → exit 0.
 
 | Scenario | Result | Evidence |
 |---|---|---|

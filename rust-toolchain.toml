@@ -3,3 +3,9 @@
 # the pinned toolchain. Keep in sync with .github/workflows/*.yml.
 [toolchain]
 channel = "1.88.0"
+# llvm-tools-preview backs `cargo llvm-cov`, the release coverage-evidence
+# run in KNOWN_ISSUES.md. Declaring it here makes rustup install the matching
+# component automatically when the 1.88.0 toolchain is installed (or
+# reinstalled) from this file, so a clean environment can run the pinned
+# coverage tooling without extra steps.
+components = ["llvm-tools-preview"]

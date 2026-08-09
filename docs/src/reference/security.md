@@ -157,7 +157,7 @@ controls.
   raw graphics protocol bytes. Source: `crates/pi-cli/src/terminal_images.rs` and
   `crates/pi-cli/src/tui.rs`.
 - `--listen` is available only on the live text TUI/REPL path and shares that exact `Application`; it is rejected with subcommands, print, JSON/RPC, or model-listing exits. HTTP and WebSocket messages are capped at 4 MiB, ordinary commands at 16 concurrent operations, pre-auth connections at 64 tasks, and outbound WebSocket delivery uses a bounded queue. Recovery commands such as abort and process stop can bypass saturated ordinary-work slots.
-- `--listen` is loopback-only (127.0.0.0/8 or ::1) by default. A non-loopback or wildcard bind is permitted only when `--listen-allow-insecure-remote` and a valid `--listen-token-file` are both present; tokenless remote binds are always rejected before the socket is opened. This opt-in authenticates browser and native clients but does not encrypt plaintext HTTP/WebSocket: passive LAN observers can capture the bearer token and all control traffic. `agent serve` remains strictly loopback-only with no remote opt-in. On loopback, the bounded regular token file is optional; a token enables browser access with exact `Authorization: Bearer <token>` or the constant-time `rpi-auth.<token>` WebSocket subprotocol, while tokenless loopback accepts only native clients without `Origin`. Origin, subprotocol, and authentication checks remain mandatory. Interactive extension dialogs remain exclusively owned by the local TUI: remote clients cannot observe or answer them.
+- `--listen` is loopback-only (127.0.0.0/8 or ::1) by default. A non-loopback or wildcard bind is permitted only when `--listen-allow-insecure-remote` and a valid `--listen-token-file` are both present; tokenless remote binds are always rejected before the socket is opened. This opt-in authenticates browser and native clients but does not encrypt plaintext HTTP/WebSocket: passive LAN observers can capture the bearer token and all control traffic. `agent serve` remains strictly loopback-only with no remote opt-in. On loopback, the bounded regular token file is optional; a token enables browser access with exact `Authorization: Bearer <token>` or the constant-time `rpi-auth.<token>` WebSocket subprotocol, while tokenless loopback accepts only native clients without `Origin`. Origin, subprotocol, and authentication checks remain mandatory. Wildcard binds (0.0.0.0 or `::`) cannot synthesize reachable collaboration links: `/collab` and `collab_start` without an explicit `baseUrl` fail closed unless `--listen-advertised-origin <URL>` supplies a strict http/https origin (no credentials, path, query, or fragment), while loopback binds keep advertising their local address automatically. Interactive extension dialogs remain exclusively owned by the local TUI: remote clients cannot observe or answer them.
 
 ## Extension manifest, environment, and process isolation
 
@@ -283,7 +283,9 @@ the security-relevant parts are:
   downloads both, enforces a 1 MiB limit on the manifest and a 1 GiB limit on
   the archive, requires exactly one valid 64-character hex digest for the
   platform asset, recomputes the digest locally, and aborts on mismatch.
-- A smoke test runs the staged binary with `--version` before activation.
+- A smoke test runs the staged binary with `--version` and requires the output
+  to be exactly `rpi <version>` before activation — exit status alone is not
+  proof of identity.
 - Unix: the versioned binary is placed with a single `rename(2)`, then the
   active `bin/rpi` symlink is swapped with another `rename(2)`. The active path
   is never missing. The prior symlink target is captured so rollback restores
@@ -297,7 +299,9 @@ the security-relevant parts are:
 - `update-state.json` is written atomically (temp file + rename) and is rolled
   back if activation or smoke testing fails. On Windows, activation is deferred
   to a short-lived PowerShell process that runs after the current `rpi` process
-  exits. Source: `crates/pi-cli/src/self_update.rs`.
+  exits; the deferred activation re-verifies that the moved binary prints
+  exactly `rpi <version>` and restores the previous binary on any mismatch.
+  Source: `crates/pi-cli/src/self_update.rs`.
 - Concurrent installs are serialized: `install.sh` uses a PID-based lockfile;
   `install.ps1` uses a named mutex; `self_update.rs` acquires an install lock.
 - Package updates use the same staging/rollback model: git checkouts are

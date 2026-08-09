@@ -9,6 +9,9 @@
 # Execution status is explicit:
 #   - list always works
 #   - run/rpc/tmux HARD-fail when product APIs are absent (no false pass)
+#   - release (alias full) is the hard gate: requires tmux, runs the rpc,
+#     tmux, and goal-tmux lanes, and prints "workflow campaigns passed" only
+#     after all three lanes record execution_status=passed
 #   - never claim "passed" until a full executed campaign succeeds
 set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -24,7 +27,8 @@ list_scenarios() {
         'workflow.rpc - concurrent create, worktrees, ownership Todo roots, pause/resume/cancel, integrate/conflict' \
         'workflow.tmux - compact header, workflow list-to-detail, settings scrollback exclusion' \
         'workflow.goal-tmux - exact Chinese goal/workflow commands, real Todo calls/workers, multi-DAG Todo detail' \
-        'workflow.run - rpc + tmux + goal-tmux umbrella release gate'
+        'workflow.release - HARD release gate: requires tmux; rpc + tmux + goal-tmux; claims pass only after all three pass' \
+        'workflow.run - developer umbrella: rpc always; tmux lanes skipped when tmux is missing (no release claim)'
 }
 
 require_workflow_apis_or_block() {
@@ -42,6 +46,20 @@ require_workflow_apis_or_block() {
     write_workflow_execution_status "$status_path" "blocked_missing_product_apis" \
         "workflow_list RPC not successful; campaign registered but not executable"
     fail "workflow product APIs not landed (workflow_list probe failed); refusing false pass"
+}
+
+# The complete-pass claim is only legal after all three required lanes record
+# execution_status=passed. Absence of a status file, or any non-passed status,
+# fails the release gate without printing the claim.
+require_workflow_release_statuses() {
+    local root="$1"
+    local lane
+    for lane in workflow-rpc workflow-tmux workflow-goal-tmux; do
+        if [ ! -f "$root/$lane/execution-status.txt" ] \
+            || ! grep -q '^execution_status=passed$' "$root/$lane/execution-status.txt"; then
+            fail "release gate incomplete: $lane did not record execution_status=passed ($root/$lane/execution-status.txt); refusing to claim workflow campaigns passed"
+        fi
+    done
 }
 
 run_workflow_rpc() {
@@ -300,19 +318,37 @@ if int(summary.get("workerCompletions") or 0) < 8:
     raise SystemExit(f"workflow goal-tmux lacks real worker completions: {summary!r}")
 print("workflow.goal-tmux assertions passed")
 PY
+    write_workflow_execution_status "$evidence/execution-status.txt" "passed" "goal-tmux checks green"
     log "workflow.goal-tmux evidence=$evidence"
 }
 
+# Hard release gate: tmux is required; absence or failure of any lane fails,
+# and "workflow campaigns passed" is printed only after all three lanes pass.
+run_release() {
+    require_cmd tmux
+    prepare_roots
+    run_workflow_rpc
+    run_workflow_tmux
+    run_goal_workflow_tmux
+    require_workflow_release_statuses "$EVIDENCE_ROOT"
+    printf 'workflow campaigns passed\nevidence=%s\n' "$EVIDENCE_ROOT"
+}
+
+# Developer umbrella: rpc always runs; tmux lanes run when tmux is available.
+# When any lane is skipped or fails, the complete-pass claim is never printed.
 run_all() {
     prepare_roots
     run_workflow_rpc
     if command -v tmux >/dev/null 2>&1; then
         run_workflow_tmux
         run_goal_workflow_tmux
+        require_workflow_release_statuses "$EVIDENCE_ROOT"
+        printf 'workflow campaigns passed\nevidence=%s\n' "$EVIDENCE_ROOT"
     else
         log "tmux not available; skipped workflow.tmux and workflow.goal-tmux (rpc still ran)"
+        printf 'workflow.rpc passed; workflow.tmux and workflow.goal-tmux skipped (tmux not available) - no release claim\nevidence=%s\n' "$EVIDENCE_ROOT"
+        printf 'note: run the hard release gate on a tmux-capable host: bash E2E.d/ci/workflow.sh release\n'
     fi
-    printf 'workflow campaigns passed\nevidence=%s\n' "$EVIDENCE_ROOT"
 }
 
 case "${1:-list}" in
@@ -320,6 +356,7 @@ case "${1:-list}" in
     rpc) prepare_roots; run_workflow_rpc; printf 'workflow.rpc passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
     tmux) prepare_roots; run_workflow_tmux ;;
     goal-tmux) prepare_roots; run_goal_workflow_tmux ;;
+    release|full) run_release ;;
     run) run_all ;;
-    *) fail "usage: $0 [list|--dry-run|run|rpc|tmux|goal-tmux]" ;;
+    *) fail "usage: $0 [list|--dry-run|release|full|run|rpc|tmux|goal-tmux]" ;;
 esac

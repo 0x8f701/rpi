@@ -107,21 +107,24 @@ web_spawn_rpi() {
     # fd 9 holds the fifo open (read-write so the open never blocks) so the
     # REPL never sees stdin EOF and the listener stays up for the scenario.
     exec 9<>"$root/stdin$tag"
-    # Session/worktree state is cwd-scoped; run the fixture from the isolated
-    # workspace so concurrent rpi instances (live demo, other lanes) sharing
-    # the repo root never contend on the same session store.
-    cd "$root/workspace"
-    env -i \
-        HOME="$root/home" USERPROFILE="$root/home" \
-        PATH="${PATH:-/usr/bin:/bin}" LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" \
-        PI_CODING_AGENT_DIR="$root/home/.pi/agent" \
-        PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
-        RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
-        "$RPI_BIN" --offline "${extra_args[@]}" \
-        --listen "127.0.0.1:$listen_port" \
-        --listen-token-file "$root/token" \
-        --model user-steering/mock --api-key user-mock-key \
-        <"$root/stdin$tag" >"$evidence/rpi$tag.stdout" 2>"$evidence/rpi$tag.stderr" &
+    # Session/worktree state is cwd-scoped; launch the fixture from its
+    # isolated workspace without changing the caller's cwd. Coverage drivers
+    # start several fixtures sequentially and delete each workspace after use;
+    # leaking this `cd` leaves the parent shell inside a deleted directory.
+    (
+        cd "$root/workspace"
+        exec env -i \
+            HOME="$root/home" USERPROFILE="$root/home" \
+            PATH="${PATH:-/usr/bin:/bin}" LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" \
+            PI_CODING_AGENT_DIR="$root/home/.pi/agent" \
+            PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+            RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
+            "$RPI_BIN" --offline "${extra_args[@]}" \
+            --listen "127.0.0.1:$listen_port" \
+            --listen-token-file "$root/token" \
+            --model user-steering/mock --api-key user-mock-key \
+            <"$root/stdin$tag" >"$evidence/rpi$tag.stdout" 2>"$evidence/rpi$tag.stderr"
+    ) &
     RPI_PID=$!
     register_pid $RPI_PID
 }

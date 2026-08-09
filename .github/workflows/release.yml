@@ -1,10 +1,12 @@
 name: Release
 
-# On tag push v*, build the `rpi` binary for the five supported native targets,
-# package per-target archives named rpi-<version>-<target-triple>.{tar.gz|zip}
-# (each containing a root rpi/rpi.exe plus LICENSE), generate SHA256SUMS, and
-# publish as a GitHub Release. install.sh / install.ps1 resolve these exact
-# asset names.
+# On tag push v*, run the measured web coverage gate (E2E.d/web/coverage.sh)
+# against the exact tag SHA, build the `rpi` binary for the five supported
+# native targets, package per-target archives named
+# rpi-<version>-<target-triple>.{tar.gz|zip} (each containing a root rpi/rpi.exe
+# plus LICENSE), generate SHA256SUMS, and publish as a GitHub Release.
+# install.sh / install.ps1 resolve these exact asset names. No build or
+# publication job runs until the measured coverage gate passes.
 
 on:
   push:
@@ -30,6 +32,7 @@ jobs:
   validate-release:
     name: validate release tag
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -62,9 +65,122 @@ jobs:
             exit 1
           fi
 
+  # Measured Web coverage is a MANDATORY release gate, distinct from the
+  # ordinary web suite (which already runs inside verify-tag-commit via
+  # test.yml). This job rebuilds a conditionally-instrumented bundle from
+  # crates/pi-cli/web/src, drives the REAL `rpi --listen` binary (built from
+  # this exact tag content) through the full lane suite plus the coverage
+  # matrix drivers, enforces the Istanbul thresholds, and uploads durable
+  # evidence. It runs ONCE per release at the verified tag SHA (checkout ref
+  # is ${{ github.sha }}, the tag commit) and only after validate-release
+  # proves the tag matches the workspace version. Every build/publication job
+  # gates on this job: a failing or skipped coverage run blocks the release.
+  web-coverage:
+    name: measured web coverage at tag SHA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: [validate-release, verify-tag-commit]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup_init="$RUNNER_TEMP/rustup-init"
+          rustup_sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init" \
+            --output "$rustup_init"
+          actual_sha256="$(sha256sum "$rustup_init" | cut -d ' ' -f 1)"
+          [ "$actual_sha256" = "$rustup_sha256" ] || {
+            echo "rustup-init SHA-256 mismatch" >&2
+            exit 1
+          }
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *)
+              echo "Expected rustc 1.88.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: web-coverage
+
+      # The coverage fixture drives the REAL release binary (RPI_BIN), so the
+      # exact tag content must be built with the same release-dist profile the
+      # distribution archives use.
+      - name: Build rpi (release-dist)
+        run: cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
+
+      # Deterministic Node/npm/Chromium provisioning: pinned Node 20, a clean
+      # `npm ci` of the web client's locked dependencies (vite + the istanbul
+      # reporting toolchain the coverage command requires), and a shared
+      # playwright@1.55.0 + chromium warm-up so every lane's ephemeral npm
+      # install reuses the npm cache and the browser download. Each of these
+      # is a hard gate (no skip, no fallback).
+      - name: Set up Node 20
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+
+      - name: Install web coverage dependencies (npm ci)
+        working-directory: crates/pi-cli/web
+        shell: bash
+        run: |
+          npm ci --no-audit --no-fund --loglevel=error
+
+      - name: Warm shared playwright install and chromium
+        shell: bash
+        run: |
+          # Warm the shared playwright install + chromium once; every lane's
+          # ephemeral `npm install` then reuses the npm cache and the browser
+          # download (default cache dir ~/.cache/ms-playwright). Failure here
+          # fails the job (no skip) — measured coverage is a release gate.
+          pw="$RUNNER_TEMP/web-coverage-playwright"
+          mkdir -p "$pw"
+          (
+            cd "$pw" &&
+            npm install --no-save --no-audit --no-fund --loglevel=error playwright@1.55.0 ws &&
+            npx playwright install chromium
+          )
+
+      - name: Run measured web coverage (hard gate)
+        shell: bash
+        env:
+          RPI_BIN: target/release-dist/rpi
+          # Fixed evidence root so the durable artifact path is deterministic
+          # regardless of the coverage runner's internal run id.
+          EVIDENCE_ROOT: ${{ runner.temp }}/rpi-e2e-evidence/web-coverage
+        run: E2E.d/web/coverage.sh run
+
+      # Durable coverage evidence: the threshold report (coverage-summary.json,
+      # lcov.info, lcov-report/), merged V8 payloads, matrix assertion evidence,
+      # per-lane evidence and REPORT.md. Uploading it is itself a hard gate
+      # (if-no-files-found: error) — a release without coverage evidence cannot
+      # be published. The job inherits the workflow-level read-only token, so
+      # publication stays the only write-permission job.
+      - name: Upload web coverage evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: web-coverage-evidence
+          path: ${{ runner.temp }}/rpi-e2e-evidence/web-coverage
+          if-no-files-found: error
+          retention-days: 90
+
   build-linux:
     name: build (${{ matrix.target }})
-    needs: [validate-release, verify-tag-commit]
+    needs: [validate-release, verify-tag-commit, web-coverage]
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -227,7 +343,8 @@ jobs:
             expected_arch: AMD64
             rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.os }}
-    needs: [validate-release, verify-tag-commit]
+    needs: [validate-release, verify-tag-commit, web-coverage]
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -350,8 +467,9 @@ jobs:
 
   release:
     name: publish GitHub Release
-    needs: [verify-tag-commit, build-linux, build-native]
+    needs: [verify-tag-commit, web-coverage, build-linux, build-native]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
     concurrency:
@@ -454,13 +572,13 @@ jobs:
             ### Install
 
             ```sh
-            # macOS / Linux — installer source and candidate are pinned to this release
-            curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/${{ github.ref_name }}/install.sh | bash -s -- --version ${{ github.ref_name }}
+            # macOS / Linux — installer source pinned to this release commit; candidate pinned to this release tag
+            curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/${{ github.sha }}/install.sh | bash -s -- --version ${{ github.ref_name }}
             ```
 
             ```powershell
-            # Windows PowerShell — installer source and candidate are pinned to this release
-            & ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/${{ github.ref_name }}/install.ps1))) -Version ${{ github.ref_name }}
+            # Windows PowerShell — installer source pinned to this release commit; candidate pinned to this release tag
+            & ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/${{ github.sha }}/install.ps1))) -Version ${{ github.ref_name }}
             ```
 
       - name: Verify remote draft inventory

@@ -7,7 +7,7 @@ import { chromium } from 'playwright';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
-const evidence = process.env.RPI_EVIDENCE || '/tmp/rpi-d93-evidence';
+const evidence = process.env.RPI_EVIDENCE || '.';
 const chromePath = process.env.RPI_CHROME || '';
 
 function fail(message) {

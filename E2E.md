@@ -91,7 +91,7 @@ bash E2E.d/ci/campaign.sh run
 bash E2E.d/ci/orchestration.sh list
 bash E2E.d/ci/orchestration.sh run
 bash E2E.d/ci/workflow.sh list
-bash E2E.d/ci/workflow.sh run          # opt-in multi-workflow RPC + tmux campaign
+bash E2E.d/ci/workflow.sh release      # hard release gate: requires tmux; rpc + tmux + goal-tmux
 ```
 
 ### Release archive fixture
@@ -167,7 +167,7 @@ Orchestration-focused cargo gates are also driven by `bash E2E.d/ci/orchestratio
 | `campaign.rpc-state` | same umbrella | 40s | `$EVIDENCE_ROOT/rpc-state/{output.jsonl,stderr.log}` | RPC responses succeed for models, commands, bash, todos, todo-state, goal, goal-get, loop, loops, spawn, process-list, state, name, tree; goal objective `deterministic release readiness`; todo task blockedBy inventory; ≥1 process |
 | `campaign.orchestration` | `bash E2E.d/ci/campaigns.sh orchestration` or umbrella `run` | see orchestration | nested under orchestration evidence | `todo_dag_execution` + NL/IRC both ways + hard compact-agent tmux + TUI Todo refresh gate; rpc+rust always; tmux when available |
 | `campaign.bash-tui` | `bash E2E.d/ci/campaigns.sh bash-tui` or umbrella `run` | 90s | `$EVIDENCE_ROOT/bash-tui/{tui.txt,assertions.json}` | foreground Bash sees EOF, unattended prompt/pager environment reaches the child, the tool turn completes, and an unsent composer sentinel remains editable |
-| `campaign.workflow` | `bash E2E.d/ci/campaigns.sh workflow` or `bash E2E.d/ci/workflow.sh run` (**opt-in**, not default `ci.sh`) | see workflow | nested under workflow evidence | Multi-workflow RPC and tmux contracts below; full 0.2.4 campaign passed (`RPI_BIN=target/release-dist/rpi bash E2E.d/ci/workflow.sh run`, exit 0, evidence under `$EVIDENCE_ROOT`; `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` all passed) |
+| `campaign.workflow` | `bash E2E.d/ci/campaigns.sh workflow` (dev umbrella) or `bash E2E.d/ci/workflow.sh release` (**hard release gate**, tmux required; **opt-in**, not default `ci.sh`) | see workflow | nested under workflow evidence | Multi-workflow RPC and tmux contracts below; pass requires `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` execution statuses all `passed` (`RPI_BIN=target/release-dist/rpi bash E2E.d/ci/workflow.sh release`, exit 0, evidence under `$EVIDENCE_ROOT`); `workflow campaigns passed` is printed only then |
 | `campaign.extension` | `E2E_CI_EXTENSION=1 bash E2E.d/ci.sh` or `bash E2E.d/ci/campaigns.sh extension` | tmux sleeps ~5s + command | `$EVIDENCE_ROOT/extension/{tui.txt,tui.ansi}` | pane contains `alpha:hello` and `beta:two` |
 | `campaign.tmux-matrix` | `E2E_CI_TMUX=1 bash E2E.d/ci.sh` or `bash E2E.d/ci/campaigns.sh tmux-matrix` | ~6s per size | `$EVIDENCE_ROOT/tmux-{90x31,120x31,163x40}/{tui.txt,tui.ansi,metadata.txt}` | each size captures `matrix input probe` |
 
@@ -292,17 +292,21 @@ Cleanup: `tmux kill-session` for the unique session name; outer `cleanup_e2e` re
 ### Workflow campaigns (`E2E.d/ci/workflow.sh`)
 
 **Execution status: passed for 0.2.4.**
-The full `bash E2E.d/ci/workflow.sh run` campaign passed for 0.2.4 with
-`workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` execution statuses
-set to `passed` (evidence under `$EVIDENCE_ROOT`).
+The full workflow campaign passed for 0.2.4 with `workflow.rpc`,
+`workflow.tmux`, and `workflow.goal-tmux` execution statuses all set to
+`passed` (evidence under `$EVIDENCE_ROOT`). Releases re-verify with the hard
+`release` mode below: tmux is required, and `workflow campaigns passed` is
+printed only after all three lanes record `execution_status=passed`.
 Workflow remains an explicit release lane rather than part of default
 `bash E2E.d/ci.sh`.
 
 ```sh
 bash E2E.d/ci/workflow.sh list
-bash E2E.d/ci/workflow.sh run          # rpc + tmux (tmux skipped if missing)
+bash E2E.d/ci/workflow.sh release      # HARD release gate: requires tmux; rpc + tmux + goal-tmux
+bash E2E.d/ci/workflow.sh run          # developer umbrella (tmux lanes skipped if tmux missing)
 bash E2E.d/ci/workflow.sh rpc
 bash E2E.d/ci/workflow.sh tmux
+bash E2E.d/ci/workflow.sh goal-tmux
 # aliases via campaigns.sh:
 bash E2E.d/ci/campaigns.sh workflow
 bash E2E.d/ci/campaigns.sh workflow-rpc
@@ -313,7 +317,9 @@ bash E2E.d/ci/campaigns.sh workflow-tmux
 | --- | --- | --- | --- | --- |
 | `workflow.rpc` | `bash E2E.d/ci/workflow.sh rpc` | 120s outer / 45s RPC client | `$EVIDENCE_ROOT/workflow-rpc/{output.jsonl,stderr.log,summary.json,rpc-rows.jsonl,execution-status.txt}` | concurrent create, separate worktrees, ownership Todo roots, supervisors+IRC ownership, pause/resume/cancel idempotent, clean integrate, explicit conflict visible |
 | `workflow.tmux` | `bash E2E.d/ci/workflow.sh tmux` | ~45s interactive + wait helpers | `$EVIDENCE_ROOT/workflow-tmux/*` (see table below) | compact header; `/workflow` master-detail; settings overlay excluded from scrollback; unsent workflow composer sentinel remains editable |
-| `workflow.run` | `bash E2E.d/ci/workflow.sh run` | sum of above | `$EVIDENCE_ROOT` | Umbrella |
+| `workflow.goal-tmux` | `bash E2E.d/ci/workflow.sh goal-tmux` | 180s outer / bounded waits | `$EVIDENCE_ROOT/workflow-goal-tmux/{assertions.json,execution-status.txt}` | exact Chinese goal/workflow commands; real Todo calls/workers; four distinct workflow DAGs; multi-DAG Todo detail with phases, tasks, linked jobs |
+| `workflow.release` | `bash E2E.d/ci/workflow.sh release` | sum of lanes | `$EVIDENCE_ROOT` | **Hard gate**: tmux required; `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` must all record `execution_status=passed` before `workflow campaigns passed` is printed; absence or failure of any lane exits non-zero |
+| `workflow.run` | `bash E2E.d/ci/workflow.sh run` | sum of lanes (tmux lanes skipped if missing) | `$EVIDENCE_ROOT` | Developer umbrella; never prints the complete-pass claim while a required lane was skipped |
 
 Wire contract (product-owned; E2E asserts only):
 
@@ -800,6 +806,8 @@ Scheduled and goal system reminders are model-only data. Human TUI, print output
 | orchestration.tmux | wait ≤20s boot; ≤25s compact agents; fixed sleeps | missing HARD `Task N agents`/researcher needles; `Todos ·` during agent-only capture; `/goall`; skill-only flood; `/ps` empty; raw `<orchestration-message` |
 | workflow.rpc | 120s / client 45s | missing product APIs; missing check ids; worktree/ownership/conflict contract fail |
 | workflow.tmux | wait ≤20s boot; ≤15s workflow list; fixed sleeps | missing compact header; full Todos on normal screen; workflow list names/detail labels absent; settings chrome in scrollback |
+| workflow.goal-tmux | 180s outer / bounded waits | `status != passed`; missing check ids; not four distinct workflow ids; <8 worker completions |
+| workflow.release | sum of lanes | tmux absent; any lane fails; `workflow campaigns passed` printed without all three `execution_status=passed` |
 | extension / tmux-matrix | short fixed sleeps | grep needles missing |
 | live | 900s default | timeout; missing artifact contract |
 | installer / archive | script-local | inventory or checksum mismatch |
@@ -824,7 +832,7 @@ Any `timeout` kill is a hard failure. Evidence directories MUST remain for diagn
 | Clipboard image in tmux | Optional/best-effort; rust fixture authoritative. |
 | Sparse palette / code highlighting / user no-indent | Covered by focused `cargo +1.88.0` tests, not `orchestration.sh`. |
 | Skills loading beyond routing | Resource/selector cargo tests; not a separate E2E.d shell scenario. |
-| Multi-workflow campaign (`E2E.d/ci/workflow.sh run`) | Passed for 0.2.4 (`workflow.rpc`, `workflow.tmux`, `workflow.goal-tmux`). Default `E2E.d/ci.sh` includes the user-perspective workflow TUI scenario on tmux hosts; the authoritative RPC/tmux/goal lanes run separately (and are gated by the hosted Test workflow). |
+| Multi-workflow campaign (`E2E.d/ci/workflow.sh release`) | Hard gate: requires tmux; `workflow campaigns passed` only after `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` all record `execution_status=passed`; absence or failure of any lane fails. Passed for 0.2.4 (all three statuses `passed`). Default `E2E.d/ci.sh` includes the user-perspective workflow TUI scenario on tmux hosts; the authoritative RPC/tmux/goal lanes run separately (and are gated by the hosted Test workflow). |
 
 ## Release checklist
 
@@ -834,15 +842,16 @@ Any `timeout` kill is a hard failure. Evidence directories MUST remain for diagn
 4. Complete library suites pass, including `cargo +1.88.0 test -p pi-ai --test codex_transport --locked` (Codex WS/SSE loopback contracts).
 5. `bash E2E.d/ci.sh` passes (includes orchestration umbrella after core campaigns).
 6. `bash E2E.d/ci/orchestration.sh run` passes on a tmux-capable host (or rpc+rust with explicit tmux skip log).
-7. The release archive fixture passes.
-8. Installer and self-update fixtures pass.
-9. README installation commands match `install.sh`, `install.ps1`, and the published archive names.
-10. The release commit contains no credentials, local paths, build artifacts, exported sessions, or generated diagrams.
-11. Tag `v0.2.4` points exactly at the verified release commit.
+7. `RPI_BIN=target/release-dist/rpi bash E2E.d/ci/workflow.sh release` passes on a tmux-capable host — the hard gate: tmux is required, and `workflow campaigns passed` is emitted only after `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` each record `execution_status=passed` under `$EVIDENCE_ROOT`; absence or failure of any lane fails the gate. A plain `workflow.sh run` dev run that skips tmux lanes is not release evidence.
+8. The release archive fixture passes.
+9. Installer and self-update fixtures pass.
+10. README installation commands match `install.sh`, `install.ps1`, and the published archive names.
+11. The release commit contains no credentials, local paths, build artifacts, exported sessions, or generated diagrams.
+12. Tag `v0.2.4` points exactly at the verified release commit.
     — Tagging is not performed locally per repository policy (`AGENTS.md` push
       prohibition); left for the release manager after final review.
-12. Push the release commit, then push `v0.2.4` to the GitHub remote.
+13. Push the release commit, then push `v0.2.4` to the GitHub remote.
     — **Not performed locally** per `AGENTS.md`; this agent does not push.
-13. Confirm every hosted build and the GitHub Release publication job succeeds.
-    — Depends on step 12, which is not performed locally.
-14. Confirm regression matrix rows 1–12 either passed or are explicitly listed under Known gaps for this tag.
+14. Confirm every hosted build and the GitHub Release publication job succeeds.
+    — Depends on step 13, which is not performed locally.
+15. Confirm regression matrix rows 1–12 either passed or are explicitly listed under Known gaps for this tag.

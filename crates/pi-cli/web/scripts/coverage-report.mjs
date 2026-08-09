@@ -57,7 +57,8 @@ if (configPath) {
   config = { ...defaultConfig, ...(await import(pathToFileURL(path.resolve(configPath)).href)).default };
 }
 
-const SRC_RE = /^src\/.+\.(ts|tsx)$/;
+const SOURCE_FILE_RE = /\.(ts|tsx)$/;
+const MAPPED_SOURCE_RE = /(?:^|\/)src\/(.+\.(?:ts|tsx))$/;
 
 /** Walk webRoot/src and return the expected instrumented source set. */
 function expectedSources() {
@@ -67,7 +68,7 @@ function expectedSources() {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
-      else if (SRC_RE.test(entry.name)) out.push(path.normalize(full));
+      else if (SOURCE_FILE_RE.test(entry.name)) out.push(path.normalize(full));
     }
   };
   if (fs.existsSync(root)) walk(root);
@@ -85,13 +86,22 @@ function extractInlineMap(source) {
   }
 }
 
-/** Resolve the map's relative `sources` to absolute paths. */
+/** Resolve source-map entries, canonicalizing project sources below webRoot/src. */
 function absolutizeMapSources(map, distFile) {
   const distDir = path.dirname(path.resolve(distFile));
   const base = path.join(distDir, path.dirname(map.file || '.'));
   return {
     ...map,
-    sources: map.sources.map((s) => (path.isAbsolute(s) ? s : path.resolve(base, s))),
+    sourceRoot: '',
+    sources: map.sources.map((source) => {
+      const normalized = source.replace(/\\/g, '/');
+      const projectSource = normalized.match(MAPPED_SOURCE_RE);
+      if (projectSource) return path.join(webRoot, 'src', projectSource[1]);
+      if (!normalized.includes('/') && SOURCE_FILE_RE.test(normalized)) {
+        return path.join(webRoot, 'src', normalized);
+      }
+      return path.isAbsolute(source) ? source : path.resolve(base, source);
+    }),
   };
 }
 
@@ -153,6 +163,10 @@ if (!mapSeen) {
 
 // ---- 2. source-mapping verification over expected src files ----
 const expected = expectedSources();
+if (expected.length === 0) {
+  console.error('coverage-report: FAIL: expected Web source set is empty');
+  process.exit(2);
+}
 const coveredRel = new Set(
   Object.keys(coverageMap.data)
     .filter((k) => path.resolve(k).startsWith(webRoot + path.sep))
@@ -164,12 +178,20 @@ if (missing.length > 0) {
   for (const f of missing) console.error(`  - ${path.relative(webRoot, f)}`);
   process.exit(2);
 }
+if (coveredRel.size === 0) {
+  console.error('coverage-report: FAIL: source map produced no Web src coverage');
+  process.exit(2);
+}
 
 // ---- 3. filter to src files and report ----
 const srcOnly = createCoverageMap();
 for (const f of expected) {
   const abs = path.resolve(f);
   if (coverageMap.data[abs]) srcOnly.addFileCoverage(coverageMap.fileCoverageFor(abs));
+}
+if (srcOnly.files().length === 0) {
+  console.error('coverage-report: FAIL: filtered Web source coverage is empty');
+  process.exit(2);
 }
 const totals = srcOnly.getCoverageSummary();
 const summary = totals.toJSON();
@@ -200,13 +222,22 @@ for (const m of ['lines', 'functions', 'branches', 'statements']) {
 reports.create('text-summary', {}).execute(context);
 reports.create('json-summary', { file: 'coverage-summary.json' }).execute(context);
 reports.create('lcov', {}).execute(context);
+const lcovPath = path.join(outDir, 'lcov.info');
+const lcov = fs.existsSync(lcovPath) ? fs.readFileSync(lcovPath, 'utf8') : '';
+if (!/^SF:/m.test(lcov) || !/^DA:/m.test(lcov) || !/^FN:/m.test(lcov)) {
+  console.error('coverage-report: FAIL: LCOV report contains no source, line, or function records');
+  process.exit(2);
+}
 
 // ---- 4. thresholds ----
 const failures = [];
 for (const metric of ['lines', 'functions', 'branches', 'statements']) {
   const want = config.thresholds[metric];
-  const got = summary[metric].pct;
-  if (typeof want === 'number' && got < want) {
+  const measured = summary[metric];
+  const got = Number(measured.pct);
+  if (measured.total === 0 || !Number.isFinite(got)) {
+    failures.push(`${metric}: coverage total is zero or non-finite`);
+  } else if (typeof want === 'number' && got < want) {
     failures.push(`${metric}: ${got}% < required ${want}%`);
   }
 }

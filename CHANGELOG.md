@@ -78,7 +78,10 @@ All notable changes to `rpi` are documented in this file.
   `/join` `/leave` commands in the TUI/REPL, and CLI/browser guest clients.
   Server-side snapshots and live events are privacy-redacted before guests see
   them, and the full E2E scenario passes with all control/view/browser guest
-  assertions passing.
+  assertions passing. Wildcard `--listen` binds (0.0.0.0 or `::`) require
+  `--listen-advertised-origin <URL>` (a strict http/https origin) before
+  `/collab` can print links; loopback binds advertise their local address
+  automatically.
 - Persona lifecycle: durable `<scope>/personas/<name>/persona.md` definitions,
   `/persona` command to create, switch, and manage personas, and persistent
   per-persona memory and session continuity.

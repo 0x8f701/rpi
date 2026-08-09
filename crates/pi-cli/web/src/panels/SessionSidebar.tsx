@@ -182,7 +182,7 @@ export function SessionSidebar({
                   className="session-sidebar__close"
                   data-session-id={row.sessionId}
                   title={`Close session ${row.name ? safeText(row.name) : safeText(row.sessionId)}`}
-                  disabled={busy}
+                  disabled={false}
                   onClick={() => onCloseSession(row.sessionId)}
                 >
                   ✕

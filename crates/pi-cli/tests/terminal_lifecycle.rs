@@ -657,6 +657,39 @@ fn wait_for_idle_composer(probe: &PtyProbe, timeout: Duration) -> bool {
     }
 }
 
+/// Wait until the inline composer goes *busy* past a pre-submit baseline:
+/// the OMP-style status row above the `╭── π` header paints the generic
+/// `Working…` fallback the moment a faux turn streams, and the append-only
+/// PTY capture retains that paint even when the streaming window is narrower
+/// than the poll interval.
+///
+/// This is the turn-boundary signal [`PtyProbe::wait_for_after`] keyed on the
+/// assistant marker cannot provide: the faux response is byte-identical
+/// across turns, and the inline TUI re-emits the live viewport (including the
+/// prior turn's assistant text) on every redraw, so a marker match after the
+/// submit offset is satisfied by a *re-render* of the previous turn's
+/// assistant — before the new turn's `AgentStart` is processed. Submitting
+/// the next prompt at that point lands while the prior turn is still
+/// streaming and is treated as a steering message (`StreamingBehavior::Steer`),
+/// duplicating the prior user echo and dropping the new turn from the
+/// transcript. A `Working` count rising past the pre-submit baseline proves
+/// the new turn's `AgentStart` was processed; the subsequent
+/// [`wait_for_idle_composer`] then observes its `AgentSettled` (the
+/// animation-tick poll that used to race the indicator ahead of `AgentSettled`
+/// was removed, so an idle status row is now proof the turn settled).
+fn wait_for_busy_after(probe: &PtyProbe, baseline: usize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if probe.count_plain("Working") > baseline {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Wait until `needle` appears in the *committed* scrollback — the replayed
 /// region above the live 24-row viewport — rather than merely in the live
 /// paint. The inline TUI streams assistant content into the live viewport
@@ -740,18 +773,24 @@ fn pty_committed_turns_never_promote_standalone_working_composer() {
 
     for turn in 1..=3 {
         let prompt = format!("user-scrollback-marker-{turn} ").repeat(24);
-        let turn_start = probe.snapshot().len();
+        // The faux assistant response is byte-identical across turns, and the
+        // inline TUI re-emits the live viewport (including the prior turn's
+        // assistant text) on every redraw, so a marker match after the submit
+        // offset is satisfied by a re-render of the previous turn's assistant
+        // before the new turn's `AgentStart` is processed. Submitting the next
+        // prompt then lands while the prior turn is still streaming and is
+        // treated as a steering message, duplicating the prior user echo and
+        // dropping the new turn. Observe the new turn's `AgentStart` instead:
+        // a rising `Working` count past the pre-submit baseline proves the
+        // composer went busy for this turn before we wait for it to settle.
+        let busy_baseline = probe.count_plain("Working");
         probe.bracketed_paste(&prompt);
         probe.send(b"\r");
-        let response_end = probe
-            .wait_for_after(
-                "assistant-scrollback-marker",
-                turn_start,
-                Duration::from_secs(20),
-            )
-            .unwrap_or_else(|| {
-                panic!("turn {turn} must render its faux response: {}", probe.snapshot())
-            });
+        assert!(
+            wait_for_busy_after(&probe, busy_baseline, Duration::from_secs(20)),
+            "turn {turn} must start streaming (composer goes busy) before it can settle: {}",
+            probe.snapshot()
+        );
         assert!(
             wait_for_idle_composer(&probe, Duration::from_secs(20)),
             "turn {turn} must settle, commit, and redraw an idle composer before the next submission: {}",

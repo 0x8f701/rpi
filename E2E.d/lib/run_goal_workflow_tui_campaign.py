@@ -629,11 +629,11 @@ def main() -> None:
         workflow_list = wait_for_all(
             session,
             [
-                "Workflows · 4/4",
+                "Workflows · 4/4 · 0 active",
                 "zig-agent",
-                "moonbit-agent",
-                ZIG_WORKFLOW_OBJECTIVE[:10],
-                MOONBIT_WORKFLOW_OBJECTIVE[:10],
+                "moonbit-age",
+                ZIG_WORKFLOW_OBJECTIVE[:5],
+                MOONBIT_WORKFLOW_OBJECTIVE[:6],
             ],
         )
         (evidence / "workflow-list.txt").write_text(workflow_list, encoding="utf-8")

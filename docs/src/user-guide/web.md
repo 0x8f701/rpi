@@ -46,6 +46,12 @@ and WebSocket: authentication remains mandatory, but passive LAN observers can
 capture the bearer token and control traffic. Use loopback or a
 TLS-terminating proxy unless that risk is explicitly acceptable.
 
+Collaboration join links follow the same bind/advertise separation: wildcard
+binds (0.0.0.0 or `::`) require `--listen-advertised-origin <URL>` (a strict
+http/https origin without credentials, path, query, or fragment) before
+`/collab` — or `collab_start` without an explicit `baseUrl` — can print
+reachable links; loopback binds advertise their local address automatically.
+
 The page itself is served without authentication: it carries no data, and
 every command and event flows through the token-gated `/rpc` and `/ws` routes.
 
@@ -79,9 +85,11 @@ handshake header and kept in `sessionStorage` by the page.
   `connecting / connected / reconnecting / offline`; unexpected disconnects
   retry with exponential backoff (1s → 15s cap). A manual **Connect** button
   reconnects after changing the token.
-- **Prompt box** — Enter sends `prompt`; Shift+Enter inserts a newline;
-  Esc (or the **Abort** button) sends `abort` while a run is active.
-  **Steer** and **Follow up** send the corresponding queued messages.
+- **Prompt box** — while idle, Enter and the primary **Send** button send
+  `prompt`; while a run is active, both switch to **Steer** and send `steer`,
+  avoiding a rejected second prompt. Shift+Enter inserts a newline; Esc (or
+  **Abort**) stops the active run. Dedicated **Steer** and **Follow up** buttons
+  remain available for explicit queue control.
 - **Streaming transcript** — assistant turns render live from the event
   stream: text deltas, collapsible `thinking` blocks, tool-call cards with
   arguments and results, bash/tool-result blocks, and final text rendered as

@@ -29687,8 +29687,22 @@ mod tests {
         // acknowledgment exactly while it mattered.
         let mut state = todo_test_state(Vec::new());
         state.model = "user-steering/mock".to_owned();
-        state.cwd = "/tmp/rpi-e2e-work/20260808T233451Z-1594574/steering-queue-handoff/workspace"
-            .to_owned();
+        // Deep workspace path built at runtime in the E2E layout
+        // (`$TMPDIR/rpi-e2e-work/<run-id>/<scenario>/workspace`): the squeeze
+        // turns on the rendered cwd depth, so the generic run-id slot is
+        // padded to the original fixture's 75 columns — no fixed /tmp literal
+        // and no timestamped run id baked into the tree.
+        let root = std::env::temp_dir().join("rpi-e2e-work");
+        let pad = 41usize.saturating_sub(root.as_os_str().len());
+        let cwd = root
+            .join(if pad > 0 {
+                "x".repeat(pad)
+            } else {
+                "session".to_owned()
+            })
+            .join("steering-queue-handoff")
+            .join("workspace");
+        state.cwd = cwd.to_string_lossy().into_owned();
         state.context_usage = Some(SessionContextUsage {
             tokens: Some(31_000),
             context_window: 32_768,

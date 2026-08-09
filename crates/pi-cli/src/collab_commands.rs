@@ -9,19 +9,29 @@ use crate::modes::collab_service::{CollabRoomInfo, CollabService};
 #[derive(Clone)]
 pub struct CollabHost {
     service: CollabService,
-    base_url: String,
+    /// Effective advertised origin used to build collaboration links. `None`
+    /// when the listener binds a wildcard address (0.0.0.0/::) without an
+    /// explicit `--listen-advertised-origin`: starting a room then fails
+    /// closed instead of printing links synthesized from an unreachable
+    /// wildcard.
+    base_url: Option<String>,
 }
 
 impl CollabHost {
     #[must_use]
-    pub fn new(service: CollabService, base_url: String) -> Self {
+    pub fn new(service: CollabService, base_url: Option<String>) -> Self {
         Self { service, base_url }
     }
 
     pub async fn execute(&self, invocation: CollabInvocation) -> Result<String> {
         match invocation {
             CollabInvocation::Start => {
-                let room = self.service.start_default(&self.base_url).await?;
+                let base_url = self.base_url.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "/collab cannot print reachable links: the listener is bound to a wildcard address (0.0.0.0/::). Pass --listen-advertised-origin <URL> to advertise an http(s) origin"
+                    )
+                })?;
+                let room = self.service.start_default(base_url).await?;
                 Ok(format!(
                     "Collaboration room {}\nControl link: {}\nView-only link: {}",
                     room.room_id, room.control_link, room.view_link

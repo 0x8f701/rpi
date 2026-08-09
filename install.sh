@@ -15,6 +15,8 @@
 #   PI_HOME                install root (default: ~/.rpi)
 #   PI_UPDATE_BASE_URL     GitHub-Releases-shaped API base (default:
 #                          https://api.github.com/repos/0x8f701/rpi/releases)
+#   GITHUB_TOKEN           authenticate the fixed GitHub API endpoint (default:
+#                          none; never sent to release-asset hosts)
 #
 # Fails fast on any error; never leaves a partial binary as the active rpi.
 
@@ -30,7 +32,7 @@ err() {
 }
 
 usage() {
-    sed -n '2,20p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
 }
 
 is_semver() {
@@ -339,6 +341,8 @@ ensure_directory() {
     else
         mkdir -p "$path" || err "could not create $label: $path"
     fi
+    # Managed install state is owner-only, independent of the caller's umask.
+    chmod 0700 "$path" || err "could not secure $label permissions: $path"
 }
 
 DOWNLOADS_DIR="$PI_HOME/downloads"
@@ -362,7 +366,7 @@ LOCK_OWNER="unknown"
 acquire_install_lock() {
     waited=0
     while :; do
-        if ( set -C; printf '%s\n' "$$" > "$LOCKFILE" ) 2>/dev/null; then
+        if ( set -C; printf '%s\n' "$$" > "$LOCKFILE" && chmod 0600 "$LOCKFILE" ) 2>/dev/null; then
             LOCK_HELD=1
             return 0
         fi
@@ -641,6 +645,9 @@ printf '{\n  "installed_version": "%s",\n  "installed_asset": "%s",\n  "installe
 if ! mv -f "$STATE_TMP" "$STATE_FILE"; then
     fail_after_rollback "could not record rpi update state"
 fi
+# Owner-only updater state, independent of the caller's umask (mktemp already
+# creates the temp 0600; this also tightens a pre-existing looser state file).
+chmod 0600 "$STATE_FILE" || fail_after_rollback "could not secure rpi update state permissions"
 STATE_TMP=""
 TRANSACTION_ACTIVE=0
 

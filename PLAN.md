@@ -393,16 +393,16 @@ default = "local"  # or a named environment
 [[execution.environments]]
 name = "lab-box"
 kind = "ssh"        # local | ssh | runner
-host = "my-lab.lan"
+host = "lab-box.example.org"
 user = "alice"
-keyPath = "~/.ssh/id_ed25519"
+keyPath = "<path-to-ssh-key>"
 allowed = true
 
 [[execution.environments]]
 name = "build-runner"
 kind = "runner"
-runnerUrl = "wss://build-runner.lan:8443/rpi"
-secretFile = "~/.config/rpi/runner-secret"   # 0600
+runnerUrl = "wss://build-runner.example.org:8443/rpi"
+secretFile = "<path-to-runner-secret>"   # 0600
 allowedRoots = ["/srv/builds", "/var/tmp"]
 allowed = true
 ```

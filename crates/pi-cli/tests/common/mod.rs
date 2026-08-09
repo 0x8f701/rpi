@@ -113,6 +113,7 @@ pub async fn listen(application: Application) -> (ListenHandle, ExtensionUiAdapt
             address: "127.0.0.1:0".parse().unwrap(),
             token_file: None,
             allow_insecure_remote: false,
+            advertised_origin: None,
             session_factory: None,
         },
     )
@@ -137,6 +138,7 @@ pub async fn listen_with_token(
             address: "127.0.0.1:0".parse().unwrap(),
             token_file: Some(token_path),
             allow_insecure_remote: false,
+            advertised_origin: None,
             session_factory: None,
         },
     )

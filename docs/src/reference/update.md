@@ -51,7 +51,7 @@ Source: `crates/pi-cli/src/self_update.rs:211-223`, `crates/pi-cli/src/self_upda
    when the installed digest already matches (unless `--force` is used).
 5. Downloads the archive, verifies its SHA-256 digest against `SHA256SUMS`, and
    extracts the binary to a staged path.
-6. Runs a smoke test: the staged binary must report `rpi <version>` from
+6. Runs a smoke test: the staged binary must print exactly `rpi <version>` from
    `--version`.
 7. Atomically installs the versioned binary and swaps the active symlink, then
    writes `update-state.json` atomically.
@@ -68,8 +68,9 @@ Sources: `crates/pi-cli/src/self_update.rs:223-304`,
   `SHA256SUMS` manifest.
 - **Size limits** — archives and extracted binaries are capped at 1 GiB;
   `SHA256SUMS` is capped at 1 MiB.
-- **Smoke test** — the downloaded binary must run `--version` successfully
-  before activation.
+- **Smoke test** — the downloaded binary must print exactly `rpi <version>`
+  from `--version` before activation; exit status alone is not proof of
+  identity.
 - **Atomic activation** — the active symlink is swapped with `rename(2)` on Unix
   and `MoveFileEx` on Windows, so the active `rpi` path is never missing during
   an update.
@@ -93,9 +94,12 @@ Source: `crates/pi-cli/src/self_update.rs:250-253`,
 On Windows the running executable cannot be replaced while it is executing, so
 the self-updater writes a deferred activation script and a
 `last-update-result.json` status file. The new binary is moved into place by a
-short-lived PowerShell process after the current `rpi` process exits.
-Source: `crates/pi-cli/src/self_update.rs:795-875`,
-`crates/pi-cli/src/self_update.rs:936-955`.
+short-lived PowerShell process after the current `rpi` process exits. The
+deferred activation then re-verifies that the moved binary prints exactly
+`rpi <version>` and restores the previous binary on any mismatch or rollback
+failure.
+Source: `crates/pi-cli/src/self_update.rs:798-875`,
+`crates/pi-cli/src/self_update.rs:987-1025`.
 
 ### Update state
 

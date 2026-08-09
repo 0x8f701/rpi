@@ -16,12 +16,15 @@
 #      + fixture approval extension
 #   5. run the REAL web lane suite (E2E.d/web/run.sh, every lane) against the
 #      same coverage bundle — each lane must PASS and must produce a coverage
-#      payload (a lane that skipped or fell back fails the coverage run)
+#      payload (a lane that skipped or fell back fails the coverage run); the
+#      sessions lane additionally writes its executed-assertion evidence
+#      ($EVIDENCE_ROOT/web-sessions/coverage-assertions.json)
 #   6. merge every V8 payload, convert through the inline source map
 #      (scripts/coverage-report.mjs), verify source mapping for every expected
 #      src file, emit text + JSON summary + lcov, enforce thresholds
 #   7. validate the feature matrix against the executed assertion evidence
-#      (coverage_matrix.mjs) — zero uncovered required assertions
+#      (coverage_matrix.mjs) — zero uncovered required assertions across the
+#      steering/xss drivers AND the sessions lane (T0.1-T7.4)
 #
 # The normal bundle is rebuilt afterwards by the packaging owner
 # (FixWebDistPackaging); this command never writes dist/.
@@ -126,7 +129,14 @@ run_driver() { # lane url evidence work testfile [env...]
 # a payload.
 run_real_lanes() {
     log "coverage: running the real web lane suite against the coverage bundle"
-    if ! bash "$SCRIPT_DIR/run.sh" run; then
+    # The lanes (run.sh -> bash <lane>.sh) re-source common.sh and would
+    # otherwise re-roll E2E_RUN_ID/EVIDENCE_ROOT. Keep evidence under THIS
+    # run so the sessions assertion file reaches step 7, but give child lanes
+    # a disposable work subtree. Each lane's EXIT trap deletes its WORK_ROOT;
+    # sharing the parent's WORK_ROOT would delete the coverage fixture cwd and
+    # break later lanes with getcwd errors.
+    local lanes_work_root="$WORK_ROOT/real-lanes"
+    if ! E2E_RUN_ID="$E2E_RUN_ID" EVIDENCE_ROOT="$EVIDENCE_ROOT" WORK_ROOT="$lanes_work_root" bash "$SCRIPT_DIR/run.sh" run; then
         fail "coverage: one or more real web lanes FAILED (see report)"
     fi
 }
@@ -295,6 +305,80 @@ EOF
     web_kill_rpi
     web_kill_mock "$xroot"
 
+    # ---- 4c. fallback coverage driver (zero-hit panel margin) ----
+    # An INDEPENDENT steering-fixture driver (coverage_fallback.mjs) that
+    # closes the zero-hit margin on panels the core steering driver does not
+    # exhaustively exercise: SessionPanel refresh/rename-Enter/clone/fork/
+    # switch-row, GoalPanel unpin, MaintenancePanel compact + actual rewind
+    # apply, SideChatPanel Enter-prompt/tab-switch/tab-close, redact
+    # credential-shape branches through real panel safeText rendering, and the
+    # App panel close callbacks. Uses its OWN dedicated deterministic steering
+    # fixture (own mock + rpi --listen on a fresh port) so it never collides
+    # with the core driver's reconnect sequence; collects V8 coverage through
+    # the same standard hook (lane = coverage-fallback). No overlap with the
+    # core driver's files — coverage_test.mjs / coverage_xss.mjs are untouched.
+    local froot fevidence fport furl pw_status=0
+    froot="$(scenario_workspace "coverage-fallback")"
+    fevidence="$EVIDENCE_DIR/driver-fallback"
+    mkdir -p "$fevidence"
+    printf '%s\n' "$TOKEN" >"$froot/token"
+    require_cmd git
+    git -C "$froot/workspace" init -q
+    git -C "$froot/workspace" config user.email "web-coverage@example.com"
+    git -C "$froot/workspace" config user.name "Web Coverage"
+    git -C "$froot/workspace" config commit.gpgsign false
+    printf 'web coverage fallback seed\n' >"$froot/workspace/seed.txt"
+    git -C "$froot/workspace" add -- seed.txt
+    git -C "$froot/workspace" -c commit.gpgsign=false commit -q -m seed
+    cat >"$froot/home/.pi/agent/settings.json" <<EOF
+{
+  "compaction": {
+    "snapKeepTurns": 1
+  }
+}
+EOF
+    fport="$(web_start_mock "$froot" "$fevidence")"
+    web_spawn_rpi "$froot" "$fevidence" "$fport"
+    furl="$(web_wait_for_listener "$fevidence")"
+    log "coverage: fallback fixture listener at $furl"
+    RPI_COVERAGE_LANE="coverage-fallback" RPI_WORK="$froot/playwright" \
+        web_run_playwright "$furl" "$fevidence" "$froot/playwright" "$SCRIPT_DIR/coverage_fallback.mjs" \
+        >"$fevidence/driver.out" 2>&1 || pw_status=$?
+    if [ "$pw_status" -eq 0 ]; then
+        log "coverage: fallback matrix driver PASSED"
+    elif [ "$pw_status" -eq 1 ]; then
+        fail "coverage: fallback matrix driver — playwright SETUP FAILED"
+    else
+        cat "$fevidence/driver.out" >&2 || true
+        fail "coverage: fallback matrix driver failed (exit $pw_status)"
+    fi
+    web_sanity_http "$furl"
+    web_kill_rpi
+    web_kill_mock "$froot"
+
+    # ---- 4b. collab browser guest coverage driver ----
+    # The real encrypted browser guest scenario (one host + two CLI guests +
+    # one Playwright control guest) already drives the CollabGuestView/collab
+    # happy path end-to-end. Run it under the coverage env so the browser guest
+    # loads the instrumented bundle (host serves RPI_WEB_DEV_DIR/index.html at
+    # the /collab/ws/<roomId> document path) and the coverage hook collects V8
+    # coverage into the shared payload dir (lane = coverage-collab). The child
+    # gets its OWN WORK_ROOT/EVIDENCE_ROOT (E2E_RUN_ID/WORK_ROOT/EVIDENCE_ROOT
+    # are intentionally NOT exported, so its cleanup trap cannot delete this
+    # command's coverage fixtures or payloads — same isolation the step-5
+    # lanes rely on); only RPI_BIN/RPI_WEB_DEV_DIR/RPI_COVERAGE_DIR are passed.
+    local collab_status=0
+    RPI_BIN="$RPI_BIN" RPI_WEB_DEV_DIR="$COV_DIST" \
+        RPI_COVERAGE_DIR="$PAYLOADS_DIR" RPI_COVERAGE_LANE="coverage-collab" \
+        bash "$E2E_DIR/collab/collab_scenario.sh" run \
+        >"$EVIDENCE_DIR/driver-collab.out" 2>&1 || collab_status=$?
+    if [ "$collab_status" -eq 0 ]; then
+        log "coverage: collab browser guest driver PASSED"
+    else
+        cat "$EVIDENCE_DIR/driver-collab.out" >&2 || true
+        fail "coverage: collab browser guest driver failed (exit $collab_status)"
+    fi
+
     # ---- 5. real lane suite ----
     run_real_lanes
 
@@ -311,7 +395,7 @@ EOF
             missing=1
         fi
     done
-    for driver_lane in coverage-main coverage-xss; do
+    for driver_lane in coverage-main coverage-xss coverage-fallback coverage-collab; do
         if ! ls "$PAYLOADS_DIR/$driver_lane-"*.json >/dev/null 2>&1; then
             log "coverage: FAIL: driver '$driver_lane' produced no coverage payload"
             missing=1
@@ -329,9 +413,14 @@ EOF
         --out "$report_dir"
 
     # ---- 7. matrix validation ----
+    # The sessions lane (10th web lane) writes its own executed-assertion
+    # evidence ($EVIDENCE_ROOT/web-sessions/coverage-assertions.json) during
+    # the step-5 real lane suite; it is gated here like the two drivers.
     node "$SCRIPT_DIR/coverage_matrix.mjs" \
         --evidence "$EVIDENCE_DIR/driver-steering/coverage-assertions.json" \
-        --evidence "$EVIDENCE_DIR/driver-xss/coverage-assertions.json"
+        --evidence "$EVIDENCE_DIR/driver-xss/coverage-assertions.json" \
+        --evidence "$EVIDENCE_DIR/driver-fallback/coverage-assertions.json" \
+        --evidence "$EVIDENCE_ROOT/web-sessions/coverage-assertions.json"
 
     # persist payloads next to the report for later inspection
     mkdir -p "$EVIDENCE_DIR/payloads"

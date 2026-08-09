@@ -1664,7 +1664,7 @@ export function App() {
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
-              submit('prompt');
+              submit(activeStreaming ? 'steer' : 'prompt');
             } else if (e.key === 'Escape') {
               if (activeStreaming && sessionId) {
                 abortPendingBySessionIdRef.current[sessionId] = true;
@@ -1675,8 +1675,8 @@ export function App() {
           onInput={(e) => autoResize(e.currentTarget)}
         />
         <div id="composer-buttons">
-          <button id="send-btn" type="button" onClick={() => submit('prompt')}>
-            Send
+          <button id="send-btn" type="button" onClick={() => submit(activeStreaming ? 'steer' : 'prompt')}>
+            {activeStreaming ? 'Steer' : 'Send'}
           </button>
           <button id="steer-btn" type="button" title="Queue a steering message for the active run" onClick={() => submit('steer')}>
             Steer
