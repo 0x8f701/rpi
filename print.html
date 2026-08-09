@@ -270,10 +270,11 @@ for every flag, subcommand, and slash command.</p>
 # Or stream events as JSON lines for tooling
 rpi --mode json -m openai/gpt-5.5 "List all unfinished task markers in src/"
 </code></pre>
-<p>Positional prompts initialize the interactive session on a terminal. They select
-print mode only when stdin or stdout is not a terminal and <code>--listen</code> is absent;
-with <code>--listen</code>, a non-terminal run stays on the live line REPL path. Use
-<code>--print</code> when a script must be non-interactive:</p>
+<p>Positional prompts initialize the interactive session on a terminal and select
+print mode when stdin or stdout is not a terminal. <code>--listen</code> is a separate
+headless Web-only service and rejects positional prompts; submit Web prompts
+through <code>/web</code>, <code>/ws</code>, or <code>/rpc</code>. Use <code>--print</code> when a script must be
+non-interactive:</p>
 <pre><code class="language-sh">rpi -m openai/gpt-5.5 "Review this repository"
 </code></pre>
 <h2 id="interactive-session"><a class="header" href="#interactive-session">Interactive session</a></h2>
@@ -405,11 +406,11 @@ If the release does not contain the exact platform archive and <code>SHA256SUMS<
 installer fails without changing the existing installation.</p>
 <h2 id="pin-a-version"><a class="header" href="#pin-a-version">Pin a version</a></h2>
 <p>Pin both the installer script and the requested release tag:</p>
-<pre><code class="language-sh">curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.6/install.sh | bash -s -- --version v0.2.6
+<pre><code class="language-sh">curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.7/install.sh | bash -s -- --version v0.2.7
 </code></pre>
 <p>On Windows, download the script from the same tag before invoking it:</p>
-<pre><code class="language-powershell">irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.6/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.6
+<pre><code class="language-powershell">irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.7/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.7
 </code></pre>
 <h2 id="what-the-installer-does"><a class="header" href="#what-the-installer-does">What the installer does</a></h2>
 <ol>
@@ -845,15 +846,18 @@ dialogs cannot be answered interactively.</li>
 </code></pre>
 <p>When no subcommand is given, a top-level run is selected by the flags and terminal:</p>
 <ol>
+<li><code>--listen</code> → headless Web-only service. It does not start or display a TUI
+or line REPL, ignores terminal interactivity, and remains alive until
+Ctrl-C/SIGTERM even when standard input is closed.</li>
 <li><code>--mode json</code> or <code>--mode rpc</code> → headless structured I/O.</li>
 <li><code>-p</code> / <code>--print</code> → print mode.</li>
-<li>A non-empty positional prompt with non-terminal stdin or stdout → print mode, unless <code>--listen</code> is active.</li>
+<li>A non-empty positional prompt with non-terminal stdin or stdout → print mode.</li>
 <li>Both stdin and stdout are terminals → TUI, with positional prompts submitted as initial turns.</li>
-<li>Otherwise → line REPL, with positional prompts submitted as initial turns. <code>--listen</code> keeps non-terminal prompt runs on this live REPL path so the listener shares the running <code>Application</code> until EOF.</li>
-</ol>
-<p>Multiple positional <code>[PROMPT]</code> arguments are separate initial turns in JSON,
+<li>Otherwise → line REPL, with positional prompts submitted as initial turns.
+Multiple positional <code>[PROMPT]</code> arguments are separate initial turns in JSON,
 print, TUI, and REPL modes. An empty prompt is skipped by structured modes and
-does not force print mode.</p>
+does not force print mode.</li>
+</ol>
 <h2 id="top-level-flags"><a class="header" href="#top-level-flags">Top-level flags</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Short</th><th>Value</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>--model &lt;SPEC&gt;</code></td><td><code>-m</code></td><td>e.g. <code>anthropic/claude-sonnet-4-5</code></td><td>Model to use.</td></tr>
@@ -894,7 +898,7 @@ does not force print mode.</p>
 <tr><td><code>--approve</code></td><td><code>-a</code></td><td></td><td>Trust project-local <code>.pi</code> settings/resources for this run only.</td></tr>
 <tr><td><code>--no-approve</code></td><td></td><td></td><td>Refuse project-local <code>.pi</code> settings/resources for this run only.</td></tr>
 <tr><td><code>--approval-mode &lt;MODE&gt;</code></td><td></td><td><code>yolo|write|ask</code></td><td>Host tool approval policy. <code>yolo</code> allows all capabilities, <code>write</code> confirms Exec, and <code>ask</code> confirms every tool call. Non-interactive confirmation fails closed. This is separate from project trust flags.</td></tr>
-<tr><td><code>--listen &lt;SOCKET_ADDR&gt;</code></td><td></td><td>e.g. <code>127.0.0.1:8765</code></td><td>Bind a plaintext HTTP/WebSocket control plane around the live TUI/REPL application. Loopback is the default. Authentication is optional: a tokenless loopback bind accepts same-origin browsers and native clients; non-loopback binds require <code>--listen-allow-insecure-remote</code> (token optional there too). Only valid on the text path.</td></tr>
+<tr><td><code>--listen &lt;SOCKET_ADDR&gt;</code></td><td></td><td>e.g. <code>127.0.0.1:8765</code></td><td>Start the headless Web-only HTTP/WebSocket service. Serves <code>/web</code>, <code>/ws</code>, and <code>/rpc</code>; never starts a TUI or REPL and stays alive with closed stdin until Ctrl-C/SIGTERM. Positional prompts are rejected; submit them through the Web/RPC API. Loopback is the default. Authentication is optional: a tokenless loopback bind accepts same-origin browsers and native clients; non-loopback binds require <code>--listen-allow-insecure-remote</code> (token optional there too).</td></tr>
 <tr><td><code>--listen-token-file &lt;PATH&gt;</code></td><td></td><td>token file</td><td>Optional Bearer token file. When set, the token is mandatory on every bind (browsers present <code>rpi-auth.&lt;token&gt;</code>; <code>/rpc</code> requires <code>Authorization: Bearer</code>). When unset, the listener is tokenless: loopback accepts same-origin browsers, and <code>--listen-allow-insecure-remote</code> accepts same-origin LAN browsers (browser <code>Origin</code> authority equals HTTP <code>Host</code>).</td></tr>
 <tr><td><code>--listen-allow-insecure-remote</code></td><td></td><td></td><td>Permit a non-loopback <code>--listen</code> address (token optional). Plaintext HTTP/WebSocket exposes any bearer token and control traffic to passive network observers.</td></tr>
 <tr><td><code>--listen-advertised-origin &lt;URL&gt;</code></td><td></td><td>http(s) origin</td><td>Advertised origin for collaboration links (<code>/collab</code>, <code>collab_start</code> without an explicit <code>baseUrl</code>) and the reachable <code>/web</code> URL printed at startup. Not required for ordinary <code>/web</code>, <code>/ws</code>, or <code>/rpc</code>: tokenless browser access uses ordinary same-origin (<code>Origin</code> authority equals HTTP <code>Host</code>). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing <code>/</code> is normalized away). Loopback and other specific binds advertise their bound address automatically; a wildcard bind (0.0.0.0 or <code>::</code>) without this flag prints no reachable URL and <code>/collab</code> fails closed instead of synthesizing links from an unreachable wildcard.</td></tr>
@@ -979,8 +983,10 @@ rpi sessions -C /path
 <tr><td><code>installed</code></td><td>List local downloads</td></tr>
 </tbody></table>
 </div>
-<h2 id="interactive-modes"><a class="header" href="#interactive-modes">Interactive modes</a></h2>
+<h2 id="interactive-and-service-modes"><a class="header" href="#interactive-and-service-modes">Interactive and service modes</a></h2>
 <ol>
+<li><strong>Web-only listener</strong> — when <code>--listen</code> is passed. This service is headless
+and signal-driven; standard input is not an input or lifetime owner.</li>
 <li><strong>Headless JSON/RPC</strong> — when <code>--mode json</code> or <code>--mode rpc</code> is passed.</li>
 <li><strong>Print mode</strong> — when <code>-p</code> / <code>--print</code> is set, or a positional prompt is
 supplied while stdin or stdout is not a terminal.</li>
@@ -2652,8 +2658,13 @@ regenerates the committed <code>dist/index.html</code>; rebuilding the Rust bina
 embeds the new bundle. <code>RPI_WEB_DEV_DIR=&lt;dir&gt;</code> makes the listener serve a
 built page from disk instead, for iterating without recompiling Rust.</p>
 <h2 id="starting-the-listener"><a class="header" href="#starting-the-listener">Starting the listener</a></h2>
-<p>The web client connects to the control-plane listener that <code>rpi --listen</code>
-serves. Authentication is <strong>optional</strong>: a tokenless listener accepts browser
+<p><code>rpi --listen</code> is a headless Web-only backend. It never initializes terminal
+raw mode, cursor probing, a TUI, or a line REPL. Standard input may be closed;
+the service stays alive until Ctrl-C or SIGTERM, then flushes the active session
+and shuts down its listener and runtime manager cleanly. Web prompts use the
+normal session recorder, so restarting with <code>--continue</code>, <code>--resume</code>,
+<code>--session</code>, or <code>--session-id</code> restores the recorded conversation.</p>
+<p>Authentication is <strong>optional</strong>: a tokenless listener accepts browser
 connections directly, and a configured token makes authentication mandatory.</p>
 <p><strong>One-command local startup</strong> (loopback, no token — the browser auto-connects):</p>
 <pre><code class="language-console">$ rpi --listen 127.0.0.1:8765
@@ -2730,22 +2741,24 @@ reconnects after changing the token.</li>
 <li><strong>Prompt box</strong> — while idle, Enter and the primary <strong>Send</strong> button send
 <code>prompt</code>; while a run is active, both switch to <strong>Steer</strong> and send <code>steer</code>,
 avoiding a rejected second prompt. Shift+Enter inserts a newline; Esc (or
-<strong>Abort</strong>) stops the active run. Dedicated <strong>Steer</strong> and <strong>Follow up</strong> buttons
-remain available for explicit queue control.</li>
+the active-only <strong>Abort</strong> button) stops the run. Redundant dedicated Steer
+and Follow up buttons are intentionally absent, leaving the textarea usable
+on phone-width screens.</li>
 <li><strong>Streaming transcript</strong> — assistant turns render live from the event
-stream: text deltas, collapsible <code>thinking</code> blocks, tool-call cards with
-arguments and results, bash/tool-result blocks, and final text rendered as
-markdown (headings, lists, code fences, blockquotes, links, images with
-MIME-whitelisted <code>data:</code> URIs).</li>
+stream: text deltas, collapsible <code>thinking</code> blocks, compact tool-call cards,
+bash/tool-result blocks, and final markdown. Internal <code>display: false</code>
+system scaffolding is hidden like the TUI; bash output keeps the last 10
+lines and other tool output keeps the last 6 with an omitted-line count.</li>
 <li><strong>Model / thinking switch</strong> — model and thinking-level dropdowns populated
 from <code>get_available_models</code> / <code>get_available_thinking_levels</code>, applying
 <code>set_model</code> and <code>set_thinking_level</code>; the session name comes from
 <code>get_state</code>.</li>
 <li><strong>Status line</strong> — a pulsing "streaming" badge while a run is in flight and
 error toasts for failed commands, failed runs, and connection problems.</li>
-<li><strong>Multi-session authoritative restore</strong> — reloading <code>/web</code> restores the
-active session's transcript, goal, todo, and running jobs from the server
-(<code>get_entries</code>, <code>get_state</code>, <code>get_tree</code>) rather than starting empty.</li>
+<li><strong>Multi-session authoritative restore</strong> — switching sessions consumes the
+target runtime's backend snapshot; closed sessions resume from disk, and a
+listener restart rebinds before controls become active. Web prompts use the
+normal session recorder and remain available after restart.</li>
 <li><strong>Panels</strong> — dedicated views for todo, goal, workflow, session tree,
 settings, subagent jobs, side chat, and maintenance, each driven by the same
 JSONL RPC control plane.</li>
@@ -2787,16 +2800,13 @@ binary embeds).</li>
 <code>cargo test -p pi-cli --test listen_control_plane</code> (GET /web route, positive
 and negative subprotocol auth, existing routes unchanged).</li>
 <li>Browser E2E (playwright-only hard gate): <code>bash E2E.d/web/run.sh</code> spawns the
-real binary with the loopback mock provider and runs 11 lanes: core
-(load/auth/stream/abort/todo/rich/workflow/settings/session/subagents),
-goal, xss, abort, reconnect, mobile, auth (tokened listener: no-token
-silent probe, wrong-token error toast, good-token connect), auth_tokenless
-(tokenless listener: empty-token boot auto-connect reaches <code>connected</code> and a
-prompt round-trips), and extras/sessions. Most lanes start the listener with a
-token file; the <code>auth_tokenless</code> lane starts it without one. Playwright is
-installed ephemerally via npm over a system Chrome/Chromium binary or
-playwright's bundled chromium; a lane with no usable browser driver FAILS —
-there is no skip and no fallback to the <code>agent-browser</code> CDP tool.</li>
+real binary with the loopback mock provider and runs 12 lanes: core, goal,
+xss, abort, reconnect, switch, mobile, auth, auth_tokenless, extras,
+sessions, and session_restore. The final lane proves loaded switching,
+close/resume from disk, and listener-restart history restoration. Most lanes
+use a token file; auth_tokenless starts without one. Playwright uses a system
+Chrome/Chromium binary or its bundled Chromium; an unavailable browser or
+failed assertion fails the lane with no skip or fallback.</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="e2e-scenarios-user-perspective-tmux-tests"><a class="header" href="#e2e-scenarios-user-perspective-tmux-tests">E2E scenarios (user-perspective tmux tests)</a></h1>
 <p>This page is the <strong>scenario catalog</strong> for user-perspective, goal-driven E2E
@@ -5747,7 +5757,7 @@ emit protocol noise or escape the sandbox. Source:
 terminal guard. JSON, RPC, print mode, logs, and ratatui buffers never receive
 raw graphics protocol bytes. Source: <code>crates/pi-cli/src/terminal_images.rs</code> and
 <code>crates/pi-cli/src/tui.rs</code>.</li>
-<li><code>--listen</code> is available only on the live text TUI/REPL path and shares that exact <code>Application</code>; it is rejected with subcommands, print, JSON/RPC, or model-listing exits. HTTP and WebSocket messages are capped at 4 MiB, ordinary commands at 16 concurrent operations, pre-auth connections at 64 tasks, and outbound WebSocket delivery uses a bounded queue. Recovery commands such as abort and process stop can bypass saturated ordinary-work slots.</li>
+<li><code>--listen</code> selects a headless Web-only service around one live <code>Application</code>; it never acquires the terminal or reads stdin, and stops on Ctrl-C/SIGTERM. It is rejected with positional prompts, subcommands, print, JSON/RPC, or model-listing exits. HTTP and WebSocket messages are capped at 4 MiB, ordinary commands at 16 concurrent operations, pre-auth connections at 64 tasks, and outbound WebSocket delivery uses a bounded queue. Recovery commands such as abort and process stop can bypass saturated ordinary-work slots.</li>
 <li><code>--listen</code> is loopback-only (127.0.0.0/8 or ::1) by default. A non-loopback or wildcard bind requires the explicit <code>--listen-allow-insecure-remote</code> opt-in; a token file is optional there (strongly recommended). The opt-in does not encrypt plaintext HTTP/WebSocket: passive LAN observers can capture control traffic and, when a token is configured, the bearer token. <code>agent serve</code> remains strictly loopback-only with no remote opt-in and no tokenless browser access. On loopback, the bounded regular token file is optional; a configured token must be presented exactly as <code>Authorization: Bearer &lt;token&gt;</code> or the constant-time <code>rpi-auth.&lt;token&gt;</code> WebSocket subprotocol on every bind. Without a token, the listener is tokenless: native clients without <code>Origin</code> are always accepted, and a browser (which always sends <code>Origin</code>) is accepted only when its <code>Origin</code> authority equals the request's HTTP <code>Host</code> — an ordinary same-origin check that rejects unrelated cross-origin pages, not authentication and not DNS-rebinding protection. This works on any bind, including a wildcard address (0.0.0.0 or <code>::</code>), with no <code>--listen-advertised-origin</code> required for <code>/web</code>, <code>/ws</code>, or <code>/rpc</code>. <code>--listen-advertised-origin &lt;URL&gt;</code> (a strict http/https origin with no credentials, path, query, or fragment) is only for collaboration-link generation (<code>/collab</code>, <code>collab_start</code> without an explicit <code>baseUrl</code>) and the reachable <code>/web</code> URL printed at startup; loopback and other specific binds advertise their bound address automatically, and a wildcard bind without it prints no reachable URL while <code>/collab</code> fails closed instead of synthesizing links from an unreachable wildcard. Interactive extension dialogs remain exclusively owned by the local TUI: remote clients cannot observe or answer them.</li>
 </ul>
 <h2 id="extension-manifest-environment-and-process-isolation"><a class="header" href="#extension-manifest-environment-and-process-isolation">Extension manifest, environment, and process isolation</a></h2>
@@ -6120,7 +6130,7 @@ unusable state.</p>
 <p>When you start an interactive session (TUI or REPL), <code>rpi</code> checks GitHub
 releases in the background. If a newer release exists, a non-fatal status
 message is shown:</p>
-<pre><code class="language-text">Update available: current v0.2.5, latest v0.2.6 — summary — URL (run `rpi update --self`)
+<pre><code class="language-text">Update available: current v0.2.6, latest v0.2.7 — summary — URL (run `rpi update --self`)
 </code></pre>
 <p>Source: <code>crates/pi-cli/src/self_update.rs:187-213</code>.</p>
 <p>Two environment variables control this check:</p>

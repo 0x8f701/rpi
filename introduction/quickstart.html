@@ -219,10 +219,11 @@ for every flag, subcommand, and slash command.</p>
 # Or stream events as JSON lines for tooling
 rpi --mode json -m openai/gpt-5.5 "List all unfinished task markers in src/"
 </code></pre>
-<p>Positional prompts initialize the interactive session on a terminal. They select
-print mode only when stdin or stdout is not a terminal and <code>--listen</code> is absent;
-with <code>--listen</code>, a non-terminal run stays on the live line REPL path. Use
-<code>--print</code> when a script must be non-interactive:</p>
+<p>Positional prompts initialize the interactive session on a terminal and select
+print mode when stdin or stdout is not a terminal. <code>--listen</code> is a separate
+headless Web-only service and rejects positional prompts; submit Web prompts
+through <code>/web</code>, <code>/ws</code>, or <code>/rpc</code>. Use <code>--print</code> when a script must be
+non-interactive:</p>
 <pre><code class="language-sh">rpi -m openai/gpt-5.5 "Review this repository"
 </code></pre>
 <h2 id="interactive-session"><a class="header" href="#interactive-session">Interactive session</a></h2>
