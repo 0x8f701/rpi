@@ -11507,16 +11507,7 @@ fn render(
         completion_height,
         below_height,
     );
-    let todo_needs_trailing_gap = todo_lines.last().is_some_and(|line| line.spans.is_empty());
     todo_lines.truncate(usize::from(layout.todo));
-    if todo_needs_trailing_gap
-        && todo_lines.len() == usize::from(layout.todo)
-        && todo_lines.last().is_some_and(|line| !line.spans.is_empty())
-    {
-        if let Some(last) = todo_lines.last_mut() {
-            *last = Line::default();
-        }
-    }
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -23558,6 +23549,29 @@ mod tests {
         let text = todo_line_texts(&lines);
         assert_eq!(text.iter().filter(|line| line.contains("active task")).count(), TODO_HUD_TASK_LIMIT);
         assert!(text.iter().any(|line| line.contains("7 more active todos")));
+        use ratatui::backend::TestBackend;
+        let mut state = todo_test_state(phases);
+        state.editor.set_text("composer stays visible");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut images = TerminalImageRenderer::default();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row.contains("7 more active todos")), "{rows:?}");
+        let composer_row = rows
+            .iter()
+            .position(|row| row.trim_start().starts_with("╭── π"))
+            .expect("composer row");
+        assert!(rows[composer_row - 1].trim().is_empty());
     }
 
     #[test]
