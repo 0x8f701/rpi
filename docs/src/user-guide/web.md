@@ -183,8 +183,8 @@ handshake header and kept in `sessionStorage` by the page.
 ## Testing
 
 - Frontend type-check + build: `cd crates/pi-cli/web && npm run build`
-  (`tsc --noEmit && vite build`; the committed `dist/index.html` is what the
-  binary embeds).
+  (type-check, focused transcript assertions, Vite bundle, and deterministic
+  trim); the committed `dist/index.html` is what the binary embeds.
 - Rust: `cargo test -p pi-cli --lib` (subprotocol unit tests) and
   `cargo test -p pi-cli --test listen_control_plane` (GET /web route, positive
   and negative subprotocol auth, existing routes unchanged).
