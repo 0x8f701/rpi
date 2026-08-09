@@ -24,6 +24,15 @@ pub const API_GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
 pub const API_GOOGLE_VERTEX: &str = "google-vertex";
 pub const API_MISTRAL_CONVERSATIONS: &str = "mistral-conversations";
 pub const API_PI_MESSAGES: &str = "pi-messages";
+/// OpenAI-compatible image generation (POST `{base}/images/generations`).
+/// The endpoint, model id, and credential come from the model's own
+/// `base_url`/`provider` resolution — nothing is vendor-hardcoded.
+pub const API_IMAGE_GEN: &str = "imagegen";
+/// OpenRouter's image-generation API name (upstream `KnownImagesApi`). Routes
+/// to the same OpenAI-compatible `images/generations` client as
+/// [`API_IMAGE_GEN`]; the model carries the base URL and credential like every
+/// other provider.
+pub const API_OPENROUTER_IMAGES: &str = "openrouter-images";
 pub const API_FAUX: &str = "faux";
 /// All statically-cataloged model APIs. Every entry MUST be registered by
 /// [`crate::providers::register_builtins`] and every catalog model MUST use
@@ -40,6 +49,8 @@ pub const KNOWN_CATALOG_APIS: &[&str] = &[
     API_GOOGLE_VERTEX,
     API_MISTRAL_CONVERSATIONS,
     API_PI_MESSAGES,
+    API_IMAGE_GEN,
+    API_OPENROUTER_IMAGES,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -450,6 +461,12 @@ pub struct Model {
     pub base_url: String,
     #[serde(default)]
     pub reasoning: bool,
+    /// Declared image-generation capability (`imageGeneration` in model
+    /// configs). Models with `api: "imagegen"` or `api: "openrouter-images"`
+    /// route to the images/generations provider; the tool refuses models
+    /// without this flag with an actionable error.
+    #[serde(default)]
+    pub image_generation: bool,
     #[serde(default)]
     pub thinking_level_map: Option<ThinkingLevelMap>,
     #[serde(default)]
@@ -472,6 +489,7 @@ impl Default for Model {
             provider: String::new(),
             base_url: String::new(),
             reasoning: false,
+            image_generation: false,
             thinking_level_map: None,
             input: vec!["text".into()],
             cost: ModelCost::default(),
@@ -701,6 +719,12 @@ pub struct SimpleStreamOptions {
     pub stream: StreamOptions,
     pub reasoning: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Opt-in stateful turn chaining for the OpenAI Responses API. When set,
+    /// the responses provider keeps the previous response id per session and
+    /// sends it as `previous_response_id` on the next turn, sending only the
+    /// new input items instead of the full conversation history. Ignored by
+    /// every other provider.
+    pub responses_stateful_chain: bool,
 }
 impl From<StreamOptions> for SimpleStreamOptions {
     fn from(stream: StreamOptions) -> Self {
@@ -708,9 +732,96 @@ impl From<StreamOptions> for SimpleStreamOptions {
             stream,
             reasoning: None,
             thinking_budgets: None,
+            responses_stateful_chain: false,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Image generation (OpenAI-compatible `images/generations`)
+// ---------------------------------------------------------------------------
+
+/// Maximum prompt length for image generation (4 KiB). Enforced by both the
+/// client and the `generate_image` tool.
+pub const MAX_IMAGE_GEN_PROMPT_CHARS: usize = 4096;
+pub const MAX_IMAGE_GEN_N: u32 = 4;
+pub const IMAGE_GEN_SIZES: &[&str] = &["256x256", "512x512", "1024x1024"];
+/// Per-image decoded-byte cap, mirroring the inspect_image decoded-allocation
+/// guard (128 MiB). Checked against the base64 length BEFORE any allocation.
+pub const MAX_IMAGE_GEN_DECODED_BYTES: u64 = 128 * 1024 * 1024;
+/// Whole response-body cap for `images/generations` JSON. Generous relative to
+/// the whitelisted sizes (a 1024x1024 PNG decodes to ~4 MiB), but bounded so a
+/// hostile or runaway payload cannot exhaust memory.
+pub const MAX_IMAGE_GEN_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+/// Dimension pre-check for generated images (16 MP), mirroring inspect_image:
+/// an image whose header claims more pixels is rejected before it is saved.
+pub const MAX_IMAGE_GEN_PIXELS: u64 = 16_000_000;
+
+/// Options for a single `images/generations` call. The endpoint base URL and
+/// credential resolve exactly like streaming does: the model's `base_url`
+/// (plus an optional `base_url` override from settings `images.genBaseUrl`)
+/// and the api key supplied by the caller or resolved from env.
+#[derive(Clone, Default)]
+pub struct ImageGenerationOptions {
+    /// Required prompt. Bounded to [`MAX_IMAGE_GEN_PROMPT_CHARS`] characters.
+    pub prompt: String,
+    /// Number of images (default 1, bounded by [`MAX_IMAGE_GEN_N`]).
+    pub n: Option<u32>,
+    /// Square size from [`IMAGE_GEN_SIZES`] (absent lets the endpoint choose).
+    pub size: Option<String>,
+    /// Endpoint override (settings `images.genBaseUrl`). When set, replaces
+    /// the model's resolved `base_url` for this call.
+    pub base_url: Option<String>,
+    /// Credential for the endpoint. Resolved by the caller (auth resolver /
+    /// settings `images.genApiKey` / env); never hardcoded.
+    pub api_key: Option<String>,
+    /// Extra request headers, applied after the model's own headers.
+    pub headers: HashMap<String, String>,
+    pub timeout_ms: Option<u64>,
+    pub max_retries: usize,
+    pub max_retry_delay_ms: Option<u64>,
+    pub env: HashMap<String, String>,
+    pub abort_signal: Option<CancellationToken>,
+}
+
+impl std::fmt::Debug for ImageGenerationOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageGenerationOptions")
+            .field("prompt", &self.prompt)
+            .field("n", &self.n)
+            .field("size", &self.size)
+            .field("base_url", &self.base_url)
+            .field("has_api_key", &self.api_key.as_ref().is_some_and(|k| !k.trim().is_empty()))
+            .field("header_count", &self.headers.len())
+            .field("timeout_ms", &self.timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One generated image, decoded in memory under
+/// [`MAX_IMAGE_GEN_DECODED_BYTES`]. `Debug` never prints the bytes.
+#[derive(Clone)]
+pub struct GeneratedImage {
+    pub data: Vec<u8>,
+    /// Endpoint-provided revised prompt (when the service rewrote the input).
+    pub revised_prompt: Option<String>,
+}
+
+impl std::fmt::Debug for GeneratedImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratedImage")
+            .field("data", &format_args!("<{} bytes>", self.data.len()))
+            .field("revised_prompt", &self.revised_prompt)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ImageGenerationResult {
+    pub images: Vec<GeneratedImage>,
+}
+
 pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

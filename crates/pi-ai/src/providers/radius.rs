@@ -327,6 +327,7 @@ pub fn models_from_config(provider: &str, config: RadiusGatewayConfig) -> Result
                 provider: provider.into(),
                 base_url: config.base_url.clone(),
                 reasoning: m.reasoning,
+                image_generation: false,
                 thinking_level_map: m.thinking_level_map,
                 input: m.input,
                 cost: m.cost,

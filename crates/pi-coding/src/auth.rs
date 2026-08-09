@@ -23,8 +23,17 @@ const AUTH_LOCK_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTH_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_AUTH_LOCK_BYTES: u64 = 16 * 1024;
+/// Environment variable that selects the active credential scope. It wins
+/// over the `authScope` settings key when both are set.
+pub const AUTH_SCOPE_ENV: &str = "PI_AUTH_SCOPE";
+/// Reserved top-level auth.json key holding the `scope -> provider -> credential`
+/// section. A provider literally named `scopes` is disambiguated on load by
+/// shape: a single credential object (has a `type` field) is a legacy flat
+/// entry, anything else is the scoped section.
+const AUTH_SCOPES_KEY: &str = "scopes";
+const MAX_SCOPE_LABEL_BYTES: usize = 128;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Credential {
     ApiKey {
@@ -32,6 +41,10 @@ pub enum Credential {
         key: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         env: HashMap<String, String>,
+        /// Unknown fields preserved verbatim so rewriting auth.json never
+        /// drops metadata written by newer tool versions.
+        #[serde(default, flatten)]
+        extra: Map<String, Value>,
     },
     #[serde(rename = "oauth", alias = "o_auth")]
     OAuth {
@@ -97,6 +110,175 @@ impl AuthType {
 pub struct CredentialInfo {
     pub provider_id: String,
     pub credential_type: AuthType,
+    /// Scope label the credential is stored under; `None` is the default
+    /// (unscoped) credential. Never carries secret material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+/// One stored credential slot: the credential itself plus its optional scope
+/// label. A `None` scope is the default (unscoped) credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedCredential {
+    pub credential: Credential,
+    pub scope: Option<String>,
+}
+
+impl ScopedCredential {
+    #[must_use]
+    pub fn unscoped(credential: Credential) -> Self {
+        Self {
+            credential,
+            scope: None,
+        }
+    }
+
+    #[must_use]
+    pub fn scoped(credential: Credential, scope: impl Into<String>) -> Self {
+        Self {
+            credential,
+            scope: Some(scope.into()),
+        }
+    }
+}
+
+/// Validate and normalize a scope label supplied by the user. Labels are
+/// trimmed, single-line, and limited in length so they stay safe as JSON keys
+/// and in interactive prompts.
+pub fn validate_scope_label(label: &str) -> Result<String> {
+    let label = label.trim();
+    if label.is_empty() {
+        bail!("credential scope must not be empty");
+    }
+    if label.len() > MAX_SCOPE_LABEL_BYTES {
+        bail!(
+            "credential scope exceeds {MAX_SCOPE_LABEL_BYTES} bytes: {label:?}"
+        );
+    }
+    if label
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+    {
+        bail!("credential scope must be a single-line label without slashes");
+    }
+    Ok(label.to_owned())
+}
+
+/// Resolve which stored credential entry applies to `provider` under an
+/// active scope preference.
+///
+/// - With an active scope: the scope-matched entry wins; the unscoped entry
+///   is the fallback default.
+/// - Without an active scope: the unscoped entry is the default.
+/// - When entries exist but none can be selected, the error names the
+///   available scopes and how to activate one. Errors never include secret
+///   values.
+pub fn select_scoped_credential<'a>(
+    provider: &str,
+    entries: &'a [ScopedCredential],
+    active_scope: Option<&str>,
+) -> Result<Option<&'a ScopedCredential>> {
+    select_scoped_credential_by(provider, entries, |entry| entry.scope.as_deref(), active_scope)
+}
+
+/// Shared credential-selection core behind [`select_scoped_credential`] and
+/// pi-cli's `models_config` stored-credential lookup. Resolves which stored
+/// credential entry applies to `provider` under an active scope preference,
+/// reading each entry's optional scope label through `scope_of` (`None` =
+/// unscoped default entry).
+///
+/// - With an active scope: the scope-matched entry wins; the unscoped entry
+///   is the fallback default.
+/// - Without an active scope: the unscoped entry is the default.
+/// - When entries exist but none can be selected, the error names the
+///   available scopes and how to activate one. Errors never include secret
+///   values.
+pub fn select_scoped_credential_by<'a, T, F>(
+    provider: &str,
+    entries: &'a [T],
+    scope_of: F,
+    active_scope: Option<&str>,
+) -> Result<Option<&'a T>>
+where
+    F: Fn(&T) -> Option<&str>,
+{
+    let Some(active_scope) = active_scope.filter(|scope| !scope.trim().is_empty()) else {
+        if let Some(entry) = entries.iter().find(|entry| scope_of(entry).is_none()) {
+            return Ok(Some(entry));
+        }
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let scopes = list_scopes(entries, &scope_of);
+        bail!(
+            "provider {provider:?} has credentials only in scope(s) {scopes}; set {AUTH_SCOPE_ENV} or the authScope setting to select one"
+        );
+    };
+    if let Some(entry) = entries.iter().find(|entry| scope_of(entry) == Some(active_scope)) {
+        return Ok(Some(entry));
+    }
+    if let Some(entry) = entries.iter().find(|entry| scope_of(entry).is_none()) {
+        return Ok(Some(entry));
+    }
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let scopes = list_scopes(entries, &scope_of);
+    bail!(
+        "provider {provider:?} has credentials only in scope(s) {scopes}; none match active scope {active_scope:?} (set {AUTH_SCOPE_ENV} or the authScope setting)"
+    );
+}
+
+fn list_scopes<T, F>(entries: &[T], scope_of: &F) -> String
+where
+    F: Fn(&T) -> Option<&str>,
+{
+    let mut scopes = entries
+        .iter()
+        .filter_map(|entry| scope_of(entry))
+        .collect::<Vec<_>>();
+    scopes.sort_unstable();
+    scopes
+        .into_iter()
+        .map(|scope| format!("{scope:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Active credential scope preference: the `PI_AUTH_SCOPE` environment
+/// variable wins, then the `authScope` settings key. Settings lookup is
+/// best-effort: unreadable or invalid settings fall back to no active scope.
+#[must_use]
+pub fn active_auth_scope() -> Option<String> {
+    resolve_scope_preference(
+        std::env::var(AUTH_SCOPE_ENV).ok(),
+        settings_auth_scope(),
+    )
+}
+
+/// Precedence for the active credential scope: a non-empty `PI_AUTH_SCOPE`
+/// environment value wins, otherwise the `authScope` settings value applies.
+/// Values are trimmed; empty or whitespace-only values behave as unset.
+#[must_use]
+pub fn resolve_scope_preference(
+    env_scope: Option<String>,
+    settings_scope: Option<String>,
+) -> Option<String> {
+    env_scope
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            settings_scope
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn settings_auth_scope() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let manager = crate::settings::SettingsManager::load_phase_one(cwd, crate::resources::agent_dir_path())
+        .ok()?;
+    manager.global_settings().auth_scope
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -618,50 +800,120 @@ impl AuthStorage {
         &self.path
     }
 
-    pub async fn read(&self, provider: &str) -> Result<Option<Credential>> {
+    /// Read the credential stored in exactly one slot: `scope == None` is the
+    /// default (unscoped) slot, `Some(label)` that scope's slot. No fallback
+    /// resolution is applied.
+    pub async fn read(&self, provider: &str, scope: Option<&str>) -> Result<Option<Credential>> {
         let _guard = self.lock.lock().await;
         let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        Ok(load_credentials(&self.path)?.remove(provider))
+        let store = load_scoped_credentials(&self.path)?;
+        Ok(store
+            .get(provider)
+            .and_then(|entries| entries.iter().find(|entry| entry.scope.as_deref() == scope))
+            .map(|entry| entry.credential.clone()))
+    }
+
+    /// Resolve the credential for `provider` under an active scope preference
+    /// (scope match wins, unscoped falls back) without touching the file.
+    pub async fn resolve_entry(
+        &self,
+        provider: &str,
+        active_scope: Option<&str>,
+    ) -> Result<Option<ScopedCredential>> {
+        let _guard = self.lock.lock().await;
+        let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
+        let store = load_scoped_credentials(&self.path)?;
+        let entries = store.get(provider).map(Vec::as_slice).unwrap_or_default();
+        Ok(select_scoped_credential(provider, entries, active_scope)?.cloned())
+    }
+
+    /// All stored slots for one provider (default plus every scope), without
+    /// resolution.
+    pub async fn entries(&self, provider: &str) -> Result<Vec<ScopedCredential>> {
+        let _guard = self.lock.lock().await;
+        let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
+        Ok(load_scoped_credentials(&self.path)?
+            .get(provider)
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub async fn list(&self) -> Result<Vec<CredentialInfo>> {
         let _guard = self.lock.lock().await;
         let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        Ok(load_credentials(&self.path)?
+        let mut entries = load_scoped_credentials(&self.path)?
             .into_iter()
-            .map(|(provider_id, credential)| CredentialInfo {
-                provider_id,
-                credential_type: credential.credential_type(),
+            .flat_map(|(provider_id, entries)| {
+                entries.into_iter().map(move |entry| CredentialInfo {
+                    provider_id: provider_id.clone(),
+                    credential_type: entry.credential.credential_type(),
+                    scope: entry.scope,
+                })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.provider_id
+                .cmp(&right.provider_id)
+                .then_with(|| left.scope.cmp(&right.scope))
+        });
+        Ok(entries)
     }
 
-    pub async fn modify<F, Fut>(&self, provider: &str, update: F) -> Result<Option<Credential>>
+    /// Read-modify-write one exact slot (`scope == None` is the default slot).
+    pub async fn modify<F, Fut>(
+        &self,
+        provider: &str,
+        scope: Option<&str>,
+        update: F,
+    ) -> Result<Option<Credential>>
     where
         F: FnOnce(Option<Credential>) -> Fut + Send,
         Fut: Future<Output = Result<Option<Credential>>> + Send,
     {
         let _guard = self.lock.lock().await;
         let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        let mut credentials = load_credentials(&self.path)?;
-        let current = credentials.get(provider).cloned();
+        let mut store = load_scoped_credentials(&self.path)?;
+        let entries = store.entry(provider.to_owned()).or_default();
+        let current = entries
+            .iter()
+            .find(|entry| entry.scope.as_deref() == scope)
+            .map(|entry| entry.credential.clone());
         let Some(next) = update(current.clone()).await? else {
             return Ok(current);
         };
-        credentials.insert(provider.to_owned(), next.clone());
-        write_credentials_atomic(&self.path, &credentials)?;
+        match entries
+            .iter_mut()
+            .find(|entry| entry.scope.as_deref() == scope)
+        {
+            Some(entry) => entry.credential = next.clone(),
+            None => entries.push(ScopedCredential {
+                credential: next.clone(),
+                scope: scope.map(str::to_owned),
+            }),
+        }
+        write_scoped_credentials_atomic(&self.path, &store)?;
         Ok(Some(next))
     }
 
-    pub async fn delete(&self, provider: &str) -> Result<bool> {
+    pub async fn delete(&self, provider: &str, scope: Option<&str>) -> Result<bool> {
         let _guard = self.lock.lock().await;
         let _file_guard = AuthFileLock::acquire(&self.path, self.lock_options).await?;
-        let mut credentials = load_credentials(&self.path)?;
-        let removed = credentials.remove(provider).is_some();
-        if removed {
-            write_credentials_atomic(&self.path, &credentials)?;
+        let mut store = load_scoped_credentials(&self.path)?;
+        let Some(entries) = store.get_mut(provider) else {
+            return Ok(false);
+        };
+        let Some(index) = entries
+            .iter()
+            .position(|entry| entry.scope.as_deref() == scope)
+        else {
+            return Ok(false);
+        };
+        entries.remove(index);
+        if entries.is_empty() {
+            store.remove(provider);
         }
-        Ok(removed)
+        write_scoped_credentials_atomic(&self.path, &store)?;
+        Ok(true)
     }
 }
 
@@ -707,8 +959,13 @@ impl AuthManager {
         &self,
         provider: Option<&str>,
         auth_type: Option<AuthType>,
+        scope: Option<&str>,
         interaction: &dyn AuthInteraction,
     ) -> Result<CredentialInfo> {
+        let scope = scope
+            .filter(|value| !value.trim().is_empty())
+            .map(validate_scope_label)
+            .transpose()?;
         let provider_id = match provider.filter(|value| !value.trim().is_empty()) {
             Some(provider) => provider.trim().to_owned(),
             None => select_provider(interaction, &self.providers(), "Select provider to configure:").await?,
@@ -772,6 +1029,7 @@ impl AuthManager {
                 Credential::ApiKey {
                     key: Some(key),
                     env: HashMap::new(),
+                    extra: Map::new(),
                 }
             }
             AuthType::OAuth => oauth::login(&provider_id, interaction, &self.client)
@@ -779,23 +1037,28 @@ impl AuthManager {
                 .with_context(|| format!("{} login failed", info.name))?,
         };
         self.storage
-            .modify(&provider_id, |_| async move { Ok(Some(credential)) })
+            .modify(&provider_id, scope.as_deref(), |_| async move { Ok(Some(credential)) })
             .await
             .with_context(|| format!("storing credential for provider {provider_id:?}"))?;
         Ok(CredentialInfo {
             provider_id,
             credential_type: selected_type,
+            scope,
         })
     }
 
     pub async fn logout(
         &self,
         provider: Option<&str>,
+        scope: Option<&str>,
         interaction: &dyn AuthInteraction,
     ) -> Result<CredentialInfo> {
         let configured = self.storage.list().await.context("listing stored credentials")?;
-        let provider_id = match provider.filter(|value| !value.trim().is_empty()) {
-            Some(provider) => provider.trim().to_owned(),
+        let (provider_id, scope) = match provider.filter(|value| !value.trim().is_empty()) {
+            Some(provider) => (
+                provider.trim().to_owned(),
+                scope.filter(|value| !value.trim().is_empty()).map(str::to_owned),
+            ),
             None => {
                 if configured.is_empty() {
                     bail!("no stored credentials to remove")
@@ -803,27 +1066,59 @@ impl AuthManager {
                 let options = configured
                     .iter()
                     .map(|entry| AuthPromptOption {
-                        id: entry.provider_id.clone(),
+                        id: scoped_selection_id(&entry.provider_id, entry.scope.as_deref()),
                         label: provider_info(&entry.provider_id).name,
-                        description: Some(entry.credential_type.label().to_owned()),
+                        description: Some(match &entry.scope {
+                            Some(scope) => format!("{} (scope {scope})", entry.credential_type.label()),
+                            None => entry.credential_type.label().to_owned(),
+                        }),
                     })
                     .collect();
-                interaction
+                let selected = interaction
                     .prompt(AuthPrompt::Select {
                         message: "Select provider to log out:".to_owned(),
                         options,
                     })
-                    .await?
+                    .await?;
+                let (provider_id, scope) = parse_scoped_selection_id(&selected);
+                (provider_id, scope)
             }
         };
         let credential_type = configured
             .iter()
-            .find(|entry| entry.provider_id == provider_id)
+            .find(|entry| {
+                entry.provider_id == provider_id && entry.scope == scope
+            })
             .map(|entry| entry.credential_type)
-            .ok_or_else(|| anyhow!("provider {provider_id:?} has no stored credential"))?;
+            .ok_or_else(|| {
+                match &scope {
+                    Some(scope) => anyhow!(
+                        "provider {provider_id:?} has no stored credential in scope {scope:?}"
+                    ),
+                    None => {
+                        let stored_scopes = configured
+                            .iter()
+                            .filter(|entry| entry.provider_id == provider_id)
+                            .filter_map(|entry| entry.scope.as_deref())
+                            .collect::<Vec<_>>();
+                        if stored_scopes.is_empty() {
+                            anyhow!("provider {provider_id:?} has no stored credential")
+                        } else {
+                            anyhow!(
+                                "provider {provider_id:?} has no unscoped credential; stored scope(s): {}; use --scope <label> to remove one",
+                                stored_scopes
+                                    .into_iter()
+                                    .map(|scope| format!("{scope:?}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    }
+                }
+            })?;
         if !self
             .storage
-            .delete(&provider_id)
+            .delete(&provider_id, scope.as_deref())
             .await
             .with_context(|| format!("removing credential for provider {provider_id:?}"))?
         {
@@ -832,6 +1127,7 @@ impl AuthManager {
         Ok(CredentialInfo {
             provider_id,
             credential_type,
+            scope,
         })
     }
 
@@ -840,30 +1136,56 @@ impl AuthManager {
         provider: &str,
         env: Option<&HashMap<String, String>>,
     ) -> Result<Option<RequestAuth>> {
-        let provider_id = provider.to_owned();
+        let active_scope = active_auth_scope();
+        self.resolve_stored_with_scope(provider, env, active_scope.as_deref())
+            .await
+    }
+
+    /// Resolve a stored credential under an explicit scope preference. This is
+    /// the testable core of [`Self::resolve_stored`]; callers that want the
+    /// ambient `PI_AUTH_SCOPE` / `authScope` selection use [`Self::resolve_stored`].
+    pub async fn resolve_stored_with_scope(
+        &self,
+        provider: &str,
+        env: Option<&HashMap<String, String>>,
+        active_scope: Option<&str>,
+    ) -> Result<Option<RequestAuth>> {
+        let Some(selected) = self.storage.resolve_entry(provider, active_scope).await? else {
+            return Ok(None);
+        };
+        let slot = selected.scope.as_deref();
         let client = self.client.clone();
-        let credential = self
-            .storage
-            .modify(provider, move |current| {
-                let provider_id = provider_id.clone();
-                let client = client.clone();
-                async move {
-                    let Some(Credential::OAuth { expires, .. }) = current.as_ref() else {
-                        return Ok(None);
-                    };
-                    if chrono::Utc::now().timestamp_millis() < *expires {
-                        return Ok(None);
-                    }
-                    let current = current.expect("OAuth credential is present");
-                    let refreshed = oauth::refresh(&provider_id, &current, &client)
-                        .await
-                        .with_context(|| format!("refreshing OAuth credential for provider {provider_id:?}"))?;
-                    Ok(Some(refreshed))
-                }
-            })
-            .await?;
+        let provider_id = provider.to_owned();
+        let credential = match selected.credential {
+            Credential::OAuth { expires, .. }
+                if chrono::Utc::now().timestamp_millis() >= expires =>
+            {
+                self.storage
+                    .modify(provider, slot, move |current| {
+                        let provider_id = provider_id.clone();
+                        let client = client.clone();
+                        async move {
+                            let Some(Credential::OAuth { expires, .. }) = current.as_ref() else {
+                                return Ok(None);
+                            };
+                            if chrono::Utc::now().timestamp_millis() < *expires {
+                                return Ok(None);
+                            }
+                            let current = current.expect("OAuth credential is present");
+                            let refreshed = oauth::refresh(&provider_id, &current, &client)
+                                .await
+                                .with_context(|| {
+                                    format!("refreshing OAuth credential for provider {provider_id:?}")
+                                })?;
+                            Ok(Some(refreshed))
+                        }
+                    })
+                    .await?
+            }
+            credential => Some(credential),
+        };
         match credential {
-            Some(Credential::ApiKey { key, env: credential_env }) => {
+            Some(Credential::ApiKey { key, env: credential_env, .. }) => {
                 let key = match key {
                     Some(key) => resolve_stored_value(&key, env, &credential_env)?,
                     None => String::new(),
@@ -880,6 +1202,25 @@ impl AuthManager {
             }
             None => Ok(None),
         }
+    }
+}
+
+/// Encode a provider + optional scope into an interactive selection id.
+/// Scope labels are validated to exclude the separator, so the encoding is
+/// unambiguous.
+const SCOPED_SELECTION_SEPARATOR: char = '\u{1f}';
+
+fn scoped_selection_id(provider: &str, scope: Option<&str>) -> String {
+    match scope {
+        Some(scope) => format!("{provider}{SCOPED_SELECTION_SEPARATOR}{scope}"),
+        None => provider.to_owned(),
+    }
+}
+
+fn parse_scoped_selection_id(id: &str) -> (String, Option<String>) {
+    match id.split_once(SCOPED_SELECTION_SEPARATOR) {
+        Some((provider, scope)) => (provider.to_owned(), Some(scope.to_owned())),
+        None => (id.to_owned(), None),
     }
 }
 
@@ -1025,6 +1366,9 @@ pub fn load_credentials(path: &Path) -> Result<BTreeMap<String, Credential>> {
     })?;
     let mut credentials = BTreeMap::new();
     for (provider, value) in entries {
+        if provider == AUTH_SCOPES_KEY && value.get("type").is_none() {
+            continue;
+        }
         let credential = serde_json::from_value(value.clone()).map_err(|error| {
             anyhow!(
                 "invalid auth.json credential for provider {provider:?} at {}: {error}",
@@ -1036,12 +1380,192 @@ pub fn load_credentials(path: &Path) -> Result<BTreeMap<String, Credential>> {
     Ok(credentials)
 }
 
+/// Load every stored credential slot: the flat map holds the default
+/// (unscoped) entries, and the optional reserved `scopes` section holds
+/// `scope label -> provider -> credential`. Old files without a `scopes`
+/// section load as unscoped entries only. Invalid scope labels are rejected
+/// with an actionable error.
+pub fn load_scoped_credentials(
+    path: &Path,
+) -> Result<BTreeMap<String, Vec<ScopedCredential>>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading auth.json metadata at {}", path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        bail!("auth.json path is not a file: {}", path.display());
+    }
+    if metadata.len() > MAX_AUTH_FILE_BYTES {
+        bail!(
+            "auth.json at {} exceeds {MAX_AUTH_FILE_BYTES} bytes",
+            path.display()
+        );
+    }
+
+    let mut file = File::open(path)
+        .with_context(|| format!("opening auth.json at {}", path.display()))?;
+    let mut content = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    Read::by_ref(&mut file)
+        .take(MAX_AUTH_FILE_BYTES + 1)
+        .read_to_end(&mut content)
+        .with_context(|| format!("reading auth.json at {}", path.display()))?;
+    if content.len() as u64 > MAX_AUTH_FILE_BYTES {
+        bail!(
+            "auth.json at {} exceeds {MAX_AUTH_FILE_BYTES} bytes",
+            path.display()
+        );
+    }
+    if content.iter().all(u8::is_ascii_whitespace) {
+        return Ok(BTreeMap::new());
+    }
+
+    let root: Value = serde_json::from_slice(&content)
+        .with_context(|| format!("parsing auth.json at {}", path.display()))?;
+    let entries = root.as_object().ok_or_else(|| {
+        anyhow!("invalid auth.json at {}: expected an object", path.display())
+    })?;
+    let mut store: BTreeMap<String, Vec<ScopedCredential>> = BTreeMap::new();
+    for (provider, value) in entries {
+        if provider == AUTH_SCOPES_KEY {
+            // A single credential object under `scopes` (it carries a `type`
+            // tag) is a legacy flat entry for a provider literally named
+            // "scopes"; anything else is the scoped section.
+            if value.get("type").is_some() {
+                let credential = serde_json::from_value(value.clone()).map_err(|error| {
+                    anyhow!(
+                        "invalid auth.json credential for provider {provider:?} at {}: {error}",
+                        path.display()
+                    )
+                })?;
+                store
+                    .entry(provider.clone())
+                    .or_default()
+                    .push(ScopedCredential::unscoped(credential));
+            } else {
+                parse_scopes_section(&mut store, value, path)?;
+            }
+            continue;
+        }
+        let credential = serde_json::from_value(value.clone()).map_err(|error| {
+            anyhow!(
+                "invalid auth.json credential for provider {provider:?} at {}: {error}",
+                path.display()
+            )
+        })?;
+        store
+            .entry(provider.clone())
+            .or_default()
+            .push(ScopedCredential::unscoped(credential));
+    }
+    for entries in store.values_mut() {
+        sort_credential_entries(entries);
+    }
+    Ok(store)
+}
+
+/// Deterministic per-provider slot order: the default (unscoped) entry first,
+/// then scoped entries by label.
+fn sort_credential_entries(entries: &mut [ScopedCredential]) {
+    entries.sort_by(|left, right| left.scope.cmp(&right.scope));
+}
+
+fn parse_scopes_section(
+    store: &mut BTreeMap<String, Vec<ScopedCredential>>,
+    value: &Value,
+    path: &Path,
+) -> Result<()> {
+    let scopes = value.as_object().ok_or_else(|| {
+        anyhow!(
+            "invalid auth.json {AUTH_SCOPES_KEY} section at {}: expected an object of scope labels",
+            path.display()
+        )
+    })?;
+    for (scope, providers) in scopes {
+        let scope = validate_scope_label(scope)
+            .with_context(|| format!("invalid auth.json scope at {}", path.display()))?;
+        let providers = providers.as_object().ok_or_else(|| {
+            anyhow!(
+                "invalid auth.json credential for provider in scope {scope:?} at {}: expected an object",
+                path.display()
+            )
+        })?;
+        for (provider, credential_value) in providers {
+            let credential = serde_json::from_value(credential_value.clone()).map_err(|error| {
+                anyhow!(
+                    "invalid auth.json credential for provider {provider:?} in scope {scope:?} at {}: {error}",
+                    path.display()
+                )
+            })?;
+            store
+                .entry(provider.clone())
+                .or_default()
+                .push(ScopedCredential::scoped(credential, scope.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Serialize a scoped credential store back to auth.json: default entries in
+/// the flat map, scoped entries under the reserved `scopes` section. Old flat
+/// files round-trip byte-for-byte at the JSON level (plus pretty-printing).
+pub fn write_scoped_credentials_atomic(
+    path: &Path,
+    store: &BTreeMap<String, Vec<ScopedCredential>>,
+) -> Result<()> {
+    let has_unscoped_scopes_provider = store
+        .get(AUTH_SCOPES_KEY)
+        .is_some_and(|entries| entries.iter().any(|entry| entry.scope.is_none()));
+    let has_scoped_entries = store
+        .values()
+        .flatten()
+        .any(|entry| entry.scope.is_some());
+    if has_unscoped_scopes_provider && has_scoped_entries {
+        bail!(
+            "cannot write auth.json: a provider named {AUTH_SCOPES_KEY:?} cannot coexist with scoped credentials (the {AUTH_SCOPES_KEY} key is reserved for the scoped section)"
+        );
+    }
+    let mut root = Map::new();
+    for (provider, entries) in store {
+        let mut entries = entries.clone();
+        sort_credential_entries(&mut entries);
+        for entry in entries {
+            let value = serde_json::to_value(&entry.credential)
+                .with_context(|| format!("serializing credential for provider {provider:?}"))?;
+            match &entry.scope {
+                None => {
+                    root.insert(provider.clone(), value);
+                }
+                Some(scope) => {
+                    let scopes = root
+                        .entry(AUTH_SCOPES_KEY.to_owned())
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    let scope_map = scopes
+                        .as_object_mut()
+                        .expect("scopes section is always an object");
+                    let providers = scope_map
+                        .entry(scope.clone())
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    providers
+                        .as_object_mut()
+                        .expect("scope entry is always an object")
+                        .insert(provider.clone(), value);
+                }
+            }
+        }
+    }
+    write_auth_json(path, &Value::Object(root))
+}
+
 /// Read one stored credential without constructing an [`AuthStorage`] or
 /// resolving configured API-key values.
 ///
 /// Missing, unreadable, or invalid files are treated as having no credential.
 /// The helper never includes stored values in an error because it does not
-/// surface storage errors.
+/// surface storage errors. Returns the default (unscoped) credential.
 #[must_use]
 pub fn read_stored_credential(provider: &str, path: impl AsRef<Path>) -> Option<Credential> {
     load_credentials(path.as_ref()).ok()?.remove(provider)
@@ -1051,6 +1575,11 @@ pub fn write_credentials_atomic(
     path: &Path,
     credentials: &BTreeMap<String, Credential>,
 ) -> Result<()> {
+    let root = serde_json::to_value(credentials).context("serializing auth.json")?;
+    write_auth_json(path, &root)
+}
+
+fn write_auth_json(path: &Path, root: &Value) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("creating auth directory {}", parent.display()))?;
@@ -1063,8 +1592,7 @@ pub fn write_credentials_atomic(
     let result = (|| -> Result<()> {
         let file = open_private_file(&temporary)?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, credentials)
-            .context("serializing auth.json")?;
+        serde_json::to_writer_pretty(&mut writer, root).context("serializing auth.json")?;
         writer.write_all(b"\n").context("writing auth.json newline")?;
         writer.flush().context("flushing auth.json temporary file")?;
         writer
@@ -1258,6 +1786,7 @@ mod tests {
         Credential::ApiKey {
             key: Some(value.to_owned()),
             env: HashMap::new(),
+            extra: Map::new(),
         }
     }
 
@@ -1274,7 +1803,7 @@ mod tests {
 
         let first_store = tokio::spawn(async move {
             first
-                .modify("provider-a", move |_| async move {
+                .modify("provider-a", None, move |_| async move {
                     first_ready.send(()).expect("signal first updater");
                     wait_for_release.await.expect("release first updater");
                     Ok(Some(api_key("secret-a")))
@@ -1286,7 +1815,7 @@ mod tests {
 
         let second_store = tokio::spawn(async move {
             second
-                .modify("provider-b", |_| async { Ok(Some(api_key("secret-b"))) })
+                .modify("provider-b", None, |_| async { Ok(Some(api_key("secret-b"))) })
                 .await
         });
         while !auth_lock_path(&path).exists() {
@@ -1422,7 +1951,7 @@ mod tests {
 
         let store_task = tokio::spawn(async move {
             updater
-                .modify("keep-me", move |_| async move {
+                .modify("keep-me", None, move |_| async move {
                     updater_ready.send(()).expect("signal updater");
                     wait_for_release.await.expect("release updater");
                     Ok(Some(api_key("new-secret")))
@@ -1431,7 +1960,7 @@ mod tests {
         });
         wait_for_updater.await.expect("updater entered");
         assert!(auth_lock_path(&path).exists(), "updater must own the file lock");
-        let delete_task = tokio::spawn(async move { deleter.delete("remove-me").await });
+        let delete_task = tokio::spawn(async move { deleter.delete("remove-me", None).await });
         tokio::task::yield_now().await;
         assert!(!delete_task.is_finished(), "delete must wait for the file lock");
         release_updater.send(()).expect("release updater");
@@ -1453,12 +1982,13 @@ mod tests {
             Credential::ApiKey {
                 key: Some("$TOKEN".to_owned()),
                 env: HashMap::from([("TOKEN".to_owned(), "stored-secret".to_owned())]),
+                extra: Map::new(),
             },
         )]);
         write_credentials_atomic(&path, &credentials).expect("write credential file");
 
         match read_stored_credential("provider", &path).expect("read stored credential") {
-            Credential::ApiKey { key, env } => {
+            Credential::ApiKey { key, env, .. } => {
                 assert_eq!(key.as_deref(), Some("$TOKEN"));
 
                 assert_eq!(env.get("TOKEN").map(String::as_str), Some("stored-secret"));
@@ -1490,4 +2020,300 @@ mod tests {
         assert!(message.contains("auth.json"), "{message}");
     }
 
+    #[test]
+    fn flat_file_backward_compat_loads_unscoped_and_preserves_unknown_fields() {
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{
+  "anthropic": {
+    "type": "api_key",
+    "key": "legacy-key",
+    "futureField": { "kept": true }
+  }
+}
+"#,
+        )
+        .expect("write legacy flat auth file");
+
+        let flat = load_credentials(&path).expect("load legacy flat file");
+        let Credential::ApiKey { key, extra, .. } = flat.get("anthropic").expect("provider") else {
+            panic!("expected api_key credential");
+        };
+        assert_eq!(key.as_deref(), Some("legacy-key"));
+        assert_eq!(
+            extra
+                .get("futureField")
+                .and_then(|value| value.get("kept")),
+            Some(&Value::Bool(true)),
+            "unknown fields must survive parsing"
+        );
+
+        let scoped = load_scoped_credentials(&path).expect("load scoped view");
+        let entries = scoped.get("anthropic").expect("provider entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].scope, None, "legacy entries are unscoped");
+
+        // Rewriting through the flat writer must preserve the unknown field.
+        write_credentials_atomic(&path, &flat).expect("rewrite flat file");
+        let reloaded: Value = serde_json::from_slice(&fs::read(&path).expect("reload"))
+            .expect("parse rewritten file");
+        assert_eq!(
+            reloaded
+                .get("anthropic")
+                .and_then(|value| value.get("futureField"))
+                .and_then(|value| value.get("kept")),
+            Some(&Value::Bool(true)),
+            "rewrite must preserve unknown fields"
+        );
+    }
+
+    #[test]
+    fn scoped_store_round_trips_file_shape_and_reserved_key_handling() {
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        let mut store = BTreeMap::new();
+        store.insert(
+            "anthropic".to_owned(),
+            vec![
+                ScopedCredential::unscoped(api_key("default-key")),
+                ScopedCredential::scoped(api_key("work-key"), "work"),
+                ScopedCredential::scoped(api_key("personal-key"), "personal"),
+            ],
+        );
+        write_scoped_credentials_atomic(&path, &store).expect("write scoped store");
+
+        let file: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read file")).expect("parse file");
+        assert_eq!(
+            file.get("anthropic").and_then(|value| value.get("key")),
+            Some(&Value::String("default-key".to_owned())),
+            "unscoped entry stays in the flat map"
+        );
+        let scopes = file.get("scopes").expect("scopes section");
+        assert_eq!(
+            scopes
+                .get("work")
+                .and_then(|value| value.get("anthropic"))
+                .and_then(|value| value.get("key")),
+            Some(&Value::String("work-key".to_owned()))
+        );
+        assert_eq!(
+            scopes
+                .get("personal")
+                .and_then(|value| value.get("anthropic"))
+                .and_then(|value| value.get("key")),
+            Some(&Value::String("personal-key".to_owned()))
+        );
+
+        let reloaded = load_scoped_credentials(&path).expect("reload scoped store");
+        let entries = reloaded.get("anthropic").expect("provider entries");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].scope, None, "unscoped slot sorts first");
+        assert_eq!(entries[1].scope.as_deref(), Some("personal"));
+        assert_eq!(entries[2].scope.as_deref(), Some("work"));
+
+        // The flat view must expose only the default entry.
+        let flat = load_credentials(&path).expect("flat view");
+        assert_eq!(flat.len(), 1);
+        assert!(flat.contains_key("anthropic"));
+    }
+
+    #[test]
+    fn scoped_store_rejects_invalid_scope_labels_actionably() {
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{
+  "scopes": {
+    "": { "anthropic": { "type": "api_key", "key": "k" } }
+  }
+}
+"#,
+        )
+        .expect("write invalid scope file");
+        let error = load_scoped_credentials(&path).expect_err("empty scope must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("scope"), "{message}");
+        assert!(message.contains("empty"), "{message}");
+    }
+
+    #[test]
+    fn provider_named_scopes_is_disambiguated_from_section() {
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        // Legacy flat entry for a provider literally named "scopes".
+        fs::write(
+            &path,
+            r#"{
+  "scopes": { "type": "api_key", "key": "provider-secret" }
+}
+"#,
+        )
+        .expect("write provider-named-scopes file");
+        let scoped = load_scoped_credentials(&path).expect("load");
+        let entries = scoped.get("scopes").expect("provider named scopes");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].scope, None);
+        let Credential::ApiKey { key, .. } = &entries[0].credential else {
+            panic!("expected api_key credential");
+        };
+        assert_eq!(key.as_deref(), Some("provider-secret"));
+        let flat = load_credentials(&path).expect("flat view");
+        assert!(
+            flat.contains_key("scopes"),
+            "flat view must keep a legacy provider literally named scopes"
+        );
+
+        // A real section plus the provider-named entry must both parse.
+        fs::write(
+            &path,
+            r#"{
+  "scopes": {
+    "work": { "anthropic": { "type": "api_key", "key": "work-key" } }
+  }
+}
+"#,
+        )
+        .expect("write scopes section");
+        let scoped = load_scoped_credentials(&path).expect("load section");
+        assert!(scoped.get("scopes").is_none());
+        let entries = scoped.get("anthropic").expect("anthropic entries");
+        assert_eq!(entries[0].scope.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn scope_selection_prefers_match_then_unscoped_and_errors_actionably() {
+        let entries = vec![
+            ScopedCredential::unscoped(api_key("default-key")),
+            ScopedCredential::scoped(api_key("work-key"), "work"),
+        ];
+        let matched = select_scoped_credential("p", &entries, Some("work"))
+            .expect("match")
+            .expect("entry");
+        assert_eq!(matched.scope.as_deref(), Some("work"));
+        let fallback = select_scoped_credential("p", &entries, Some("other"))
+            .expect("fallback")
+            .expect("entry");
+        assert_eq!(fallback.scope, None);
+        let default = select_scoped_credential("p", &entries, None)
+            .expect("default")
+            .expect("entry");
+        assert_eq!(default.scope, None);
+        assert!(select_scoped_credential("p", &[], None)
+            .expect("empty")
+            .is_none());
+        assert!(select_scoped_credential("p", &[], Some("work"))
+            .expect("empty with scope")
+            .is_none());
+
+        let scoped_only = vec![ScopedCredential::scoped(api_key("work-key"), "work")];
+        let error = select_scoped_credential("p", &scoped_only, None)
+            .expect_err("scoped-only without active scope must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("p"), "{message}");
+        assert!(message.contains("\"work\""), "{message}");
+        assert!(message.contains("PI_AUTH_SCOPE"), "{message}");
+        assert!(!message.contains("work-key"), "secret leak: {message}");
+
+        let mismatch = select_scoped_credential("p", &scoped_only, Some("personal"))
+            .expect_err("unmatched scope without fallback must fail");
+        let message = format!("{mismatch:#}");
+        assert!(message.contains("personal"), "{message}");
+        assert!(message.contains("work"), "{message}");
+    }
+
+    #[test]
+    fn scope_labels_are_validated_and_normalized() {
+        assert_eq!(
+            validate_scope_label("  work  ").expect("trimmed label"),
+            "work"
+        );
+        assert!(validate_scope_label("").is_err());
+        assert!(validate_scope_label("   ").is_err());
+        assert!(validate_scope_label("a\nb").is_err());
+        assert!(validate_scope_label("a/b").is_err());
+        assert!(validate_scope_label(&"x".repeat(129)).is_err());
+        assert_eq!(
+            validate_scope_label("work-1.personal_x").expect("typical label"),
+            "work-1.personal_x"
+        );
+    }
+
+    #[test]
+    fn scope_preference_prefers_env_and_ignores_blank_values() {
+        assert_eq!(resolve_scope_preference(None, None), None);
+        assert_eq!(
+            resolve_scope_preference(Some("work".to_owned()), Some("personal".to_owned())),
+            Some("work".to_owned()),
+            "env wins over settings"
+        );
+        assert_eq!(
+            resolve_scope_preference(None, Some("personal".to_owned())),
+            Some("personal".to_owned()),
+            "settings apply without env"
+        );
+        assert_eq!(
+            resolve_scope_preference(Some("  work  ".to_owned()), None),
+            Some("work".to_owned()),
+            "whitespace-only env is trimmed but still wins"
+        );
+        assert_eq!(
+            resolve_scope_preference(Some("   ".to_owned()), Some("personal".to_owned())),
+            Some("personal".to_owned()),
+            "blank env behaves as unset"
+        );
+        assert_eq!(
+            resolve_scope_preference(Some(String::new()), Some("personal".to_owned())),
+            Some("personal".to_owned()),
+            "empty env behaves as unset"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_slots_read_modify_delete_per_scope() {
+        let directory = tempfile::tempdir().expect("temporary auth directory");
+        let path = directory.path().join("auth.json");
+        let storage = AuthStorage::new(path.clone());
+        storage
+            .modify("p", Some("work"), |_| async {
+                Ok(Some(api_key("work-key")))
+            })
+            .await
+            .expect("store scoped");
+        storage
+            .modify("p", None, |_| async {
+                Ok(Some(api_key("default-key")))
+            })
+            .await
+            .expect("store unscoped");
+
+        assert_eq!(
+            storage.read("p", Some("work")).await.expect("read work"),
+            Some(api_key("work-key"))
+        );
+        assert_eq!(
+            storage.read("p", None).await.expect("read default"),
+            Some(api_key("default-key"))
+        );
+        assert_eq!(
+            storage.read("p", Some("missing")).await.expect("read missing scope"),
+            None
+        );
+
+        assert!(storage.delete("p", Some("work")).await.expect("delete work"));
+        assert!(
+            storage.read("p", Some("work")).await.expect("work gone").is_none(),
+            "scoped slot must be removed"
+        );
+        assert!(
+            storage.read("p", None).await.expect("default survives").is_some(),
+            "unscoped slot must survive scoped delete"
+        );
+        assert!(storage.delete("p", Some("work")).await.expect("idempotent delete") == false);
+        assert!(storage.delete("p", None).await.expect("delete default"));
+        assert!(load_credentials(&path).expect("empty file").is_empty());
+    }
 }

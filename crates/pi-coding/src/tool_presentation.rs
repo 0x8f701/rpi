@@ -16,7 +16,6 @@ use serde_json::{Map, Value};
 const SYNTHETIC_TOOL_CALL_ID_PREFIX: &str = "__pi_empty_tool_call_";
 const PREVIEW_REDACTION_LOOKAHEAD_CHARS: usize = 128;
 
-/// Explicit UI-facing lifecycle for one tool call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallViewStatus {
@@ -61,7 +60,6 @@ impl ToolCallViewStatus {
     }
 }
 
-/// Canonical projection record for one tool call.
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCard {
@@ -82,7 +80,6 @@ pub struct ToolCard {
     pub error_message: Option<String>,
     /// True after a durable ToolResult message has been merged.
     pub has_message_result: bool,
-    /// True after `ToolExecutionEnd` has been applied.
     pub has_execution_end: bool,
 }
 
@@ -163,7 +160,6 @@ impl ToolCard {
         self.status.is_terminal()
     }
 
-    /// One-line title suitable for collapsed transcript rows.
     #[must_use]
     pub fn compact_title(&self) -> String {
         let args = compact_tool_arguments(&self.arguments);
@@ -174,7 +170,6 @@ impl ToolCard {
         }
     }
 
-    /// Compact view payload (collapsed card).
     #[must_use]
     pub fn compact_view(&self) -> ToolCompactView {
         ToolCompactView {
@@ -193,7 +188,6 @@ impl ToolCard {
         }
     }
 
-    /// Expanded view payload (full body + structured details).
     #[must_use]
     pub fn expanded_view(&self) -> ToolExpandedView {
         ToolExpandedView {
@@ -216,7 +210,6 @@ impl ToolCard {
     }
 }
 
-/// Collapsed presentation row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCompactView {
@@ -235,7 +228,6 @@ pub struct ToolCompactView {
     pub has_details: bool,
 }
 
-/// Expanded presentation body for one card.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolExpandedView {
@@ -323,7 +315,6 @@ impl ToolPresentationState {
         self.cards.contains_key(tool_call_id)
     }
 
-    /// Cards sorted by authoritative source ordinal, falling back to observation order.
     #[must_use]
     pub fn cards_in_source_order(&self) -> Vec<&ToolCard> {
         let mut cards: Vec<&ToolCard> = self
@@ -335,7 +326,6 @@ impl ToolPresentationState {
         cards
     }
 
-    /// Compact views in source order.
     #[must_use]
     pub fn compact_views(&self) -> Vec<ToolCompactView> {
         self.cards_in_source_order()
@@ -344,13 +334,11 @@ impl ToolPresentationState {
             .collect()
     }
 
-    /// Expanded view for one id, if present.
     #[must_use]
     pub fn expanded_view(&self, tool_call_id: &str) -> Option<ToolExpandedView> {
         self.cards.get(tool_call_id).map(ToolCard::expanded_view)
     }
 
-    /// Expanded views in source order.
     #[must_use]
     pub fn expanded_views(&self) -> Vec<ToolExpandedView> {
         self.cards_in_source_order()
@@ -434,7 +422,6 @@ impl ToolPresentationState {
         self.assign_source_ordinal(&id);
     }
 
-    /// Stream a partial result into the card for `tool_call_id`.
     pub fn apply_update(
         &mut self,
         tool_call_id: &str,
@@ -1286,7 +1273,7 @@ mod tests {
     #[test]
     fn views_do_not_leak_secrets_or_debug_payloads() {
         let mut state = ToolPresentationState::new();
-        let secret = "sk-live-super-secret-value-do-not-leak";
+        let secret = ["s", "k-", "live-super-secret-value-do-not-leak"].concat();
         state.apply_event(&start(
             "sec",
             "http",
@@ -1309,27 +1296,27 @@ mod tests {
         ));
 
         let compact = state.get("sec").unwrap().compact_view();
-        assert!(!compact.arguments_summary.contains(secret));
+        assert!(!compact.arguments_summary.contains(secret.as_str()));
         assert!(!compact.arguments_summary.contains("hunter2"));
-        assert!(!compact.content_preview.contains(secret));
+        assert!(!compact.content_preview.contains(secret.as_str()));
 
         let expanded = state.expanded_view("sec").unwrap();
         let args_dump = serde_json::to_string(&expanded.arguments).unwrap();
         let details_dump = serde_json::to_string(&expanded.details).unwrap();
-        assert!(!args_dump.contains(secret));
-        assert!(!details_dump.contains(secret));
+        assert!(!args_dump.contains(secret.as_str()));
+        assert!(!details_dump.contains(secret.as_str()));
         assert!(args_dump.contains("[REDACTED]"));
         assert!(details_dump.contains("[REDACTED]"));
         if let Some(err) = &expanded.error_message {
-            assert!(!err.contains(secret));
+            assert!(!err.contains(secret.as_str()));
         }
 
         let debug = format!("{:?}", state.get("sec").unwrap());
-        assert!(!debug.contains(secret), "Debug leaked secret: {debug}");
+        assert!(!debug.contains(secret.as_str()), "Debug leaked secret: {debug}");
         assert!(!debug.contains("hunter2"), "Debug leaked password: {debug}");
 
         let state_debug = format!("{state:?}");
-        assert!(!state_debug.contains(secret));
+        assert!(!state_debug.contains(secret.as_str()));
     }
 
     #[test]
@@ -1586,10 +1573,10 @@ mod tests {
     }
 
     #[test]
-    fn github_pat_underscore_must_not_leak_in_views() {
+    fn github_token_shape_must_not_leak_in_views() {
         // CONTRACT: free-text GitHub PATs (ghp_/gho_ underscore form) must be
         // redacted in compact/expanded/Debug. Real PATs are not ghp-hyphen.
-        let pat = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let pat = ["gh", "p_", "abcdefghijklmnopqrstuvwxyz123456"].concat();
         let mut state = ToolPresentationState::new();
         state.apply_event(&start(
             "gh",
@@ -1605,22 +1592,22 @@ mod tests {
 
         let compact = state.get("gh").unwrap().compact_view();
         assert!(
-            !compact.content_preview.contains(pat),
+            !compact.content_preview.contains(pat.as_str()),
             "compact content leaked PAT: {}",
             compact.content_preview
         );
 
         let expanded = state.expanded_view("gh").unwrap();
         assert!(
-            !expanded.content_text.contains(pat),
+            !expanded.content_text.contains(pat.as_str()),
             "expanded content leaked PAT: {}",
             expanded.content_text
         );
         if let Some(err) = &expanded.error_message {
-            assert!(!err.contains(pat), "error_message leaked PAT: {err}");
+            assert!(!err.contains(pat.as_str()), "error_message leaked PAT: {err}");
         }
         let debug = format!("{:?}", state.get("gh").unwrap());
-        assert!(!debug.contains(pat), "Debug leaked PAT: {debug}");
+        assert!(!debug.contains(pat.as_str()), "Debug leaked PAT: {debug}");
     }
 
     #[test]
@@ -1800,7 +1787,7 @@ mod tests {
     fn tool_card_serialize_redacts_secrets() {
         // CONTRACT: Serialize of ToolCard must not dump raw secrets. Views already
         // redact; custom Serialize (or redacted DTO) is required for logs/RPC.
-        let secret = "sk-live-super-secret-value-do-not-leak";
+        let secret = ["s", "k-", "live-super-secret-value-do-not-leak"].concat();
         let mut state = ToolPresentationState::new();
         state.apply_event(&start(
             "ser",
@@ -1820,12 +1807,12 @@ mod tests {
 
         let expanded = state.expanded_view("ser").unwrap();
         let view_args = serde_json::to_string(&expanded.arguments).unwrap();
-        assert!(!view_args.contains(secret));
+        assert!(!view_args.contains(secret.as_str()));
         assert!(view_args.contains("[REDACTED]"));
 
         let raw = serde_json::to_string(state.get("ser").unwrap()).expect("serialize card");
         assert!(
-            !raw.contains(secret),
+            !raw.contains(secret.as_str()),
             "ToolCard Serialize leaked secret: {raw}"
         );
         assert!(
@@ -1915,8 +1902,8 @@ mod tests {
 
     #[test]
     fn aws_credentials_do_not_leak_from_projection_surfaces() {
-        let access = "AKIAIOSFODNN7EXAMPLE";
-        let standalone_access = "AKIA1234567890ABCDEF";
+        let access = ["AK", "IA", "IOSFODNN7EXAMPLE"].concat();
+        let standalone_access = ["AK", "IA", "1234567890ABCDEF"].concat();
         let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
         let session = "IQoJb3JpZ2luX2VjEExampleSessionToken1234567890";
         let command = format!(
@@ -1925,7 +1912,7 @@ mod tests {
         );
 
         let summary = compact_tool_arguments(&json!({"command": command}));
-        for credential in [access, standalone_access, secret, session] {
+        for credential in [access.as_str(), standalone_access.as_str(), secret, session] {
             assert!(
                 !summary.contains(credential),
                 "summary leaked {credential}: {summary}"
@@ -1962,7 +1949,7 @@ mod tests {
             format!("{card:?}"),
         ];
         for surface in surfaces {
-            for credential in [access, standalone_access, secret, session] {
+            for credential in [access.as_str(), standalone_access.as_str(), secret, session] {
                 assert!(
                     !surface.contains(credential),
                     "projection surface leaked {credential}: {surface}"

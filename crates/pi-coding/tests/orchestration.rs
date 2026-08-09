@@ -13,18 +13,20 @@ use pi_coding::{
 };
 
 fn definition(name: &str) -> AgentDefinition {
-    AgentDefinition {
-        name: name.to_owned(),
-        description: format!("{name} description"),
-        system_prompt: format!("{name} prompt"),
-        tools: Some(Vec::new()),
-        autoload_skills: Vec::new(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        source: AgentDefinitionSource::Bundled,
-        path: None,
-        trusted: true,
-    }
+    AgentDefinition { name: name.to_owned(),
+    description: format!("{name} description"),
+    system_prompt: format!("{name} prompt"),
+    tools: Some(Vec::new()),
+    autoload_skills: Vec::new(),
+    model: None,
+    thinking_level: Some(ThinkingLevel::Off),
+    max_turns: None,
+    max_tool_calls: None,
+    timeout_secs: None,
+    disallowed_tools: Vec::new(),
+    capability_ceiling: None,
+    source: AgentDefinitionSource::Bundled,
+    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
 fn faux_factory(
@@ -198,27 +200,33 @@ fn discovery_is_first_wins_and_project_trust_gated() {
     assert_eq!(task.source, AgentDefinitionSource::Project);
 }
 
-#[test]
-fn orchestration_excludes_incompatible_agent_without_blocking_valid_agents() {
+#[tokio::test]
+async fn orchestration_ignores_unknown_tools_without_blocking_any_agents() {
     let artifacts = tempfile::tempdir().expect("artifacts");
     let mut architect = definition("architect");
-    architect.tools = Some(vec!["read".to_owned(), "lsp".to_owned()]);
+    architect.tools = Some(vec![
+        "read".to_owned(),
+        "unsupported_child_tool".to_owned(),
+        "yield_output".to_owned(),
+    ]);
     let runtime = OrchestrationRuntime::new(
         OrchestrationConfig::new(
             AgentCatalog::from_agents(vec![architect, definition("task")]),
             artifacts.path(),
         ),
-        Arc::new(|_| Box::pin(async { panic!("validation test must not create children") })),
+        Arc::new(|_| Box::pin(async { Err(anyhow::anyhow!("stop after capture")) })),
     )
-    .expect("one incompatible agent must not block runtime startup");
+    .expect("an unknown-tool agent must not block runtime startup");
 
+    // OMP alignment: unknown declared tools never make an agent unavailable —
+    // the architect is advertised alongside task.
     assert_eq!(
         runtime
             .enabled_agents()
             .into_iter()
             .map(|agent| agent.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["task"],
+        vec!["architect", "task"],
     );
     let task_tool = runtime
         .agent_tools("Main", 0)
@@ -226,14 +234,21 @@ fn orchestration_excludes_incompatible_agent_without_blocking_valid_agents() {
         .find(|tool| tool.name == "task")
         .expect("task tool");
     assert!(task_tool.description.contains("task —"));
-    assert!(!task_tool.description.contains("architect —"));
+    assert!(
+        task_tool.description.contains("architect —"),
+        "architect must be advertised in the task tool description: {}",
+        task_tool.description
+    );
 
-    let diagnostics = runtime.incompatible_agent_diagnostics();
-    assert_eq!(diagnostics.len(), 1);
-    assert!(diagnostics[0].contains("architect"), "{}", diagnostics[0]);
-    assert!(diagnostics[0].contains("lsp"), "{}", diagnostics[0]);
+    // The compatibility channel is model-only now; the unknown-tool report
+    // lives on the dedicated deduped-warning channel, recorded at spawn.
+    assert!(
+        runtime.incompatible_agent_diagnostics().is_empty(),
+        "unknown tools are not incompatibilities"
+    );
 
-    let error = runtime
+    // Spawning the unknown-tool agent succeeds: no batch abort, no error.
+    let spawns = runtime
         .spawn_tasks(
             "Main",
             0,
@@ -243,13 +258,40 @@ fn orchestration_excludes_incompatible_agent_without_blocking_valid_agents() {
                 agent: "architect".to_owned(),
                 assignment: "design the system".to_owned(),
                 todo_task_id: None,
+                ..TaskItem::default()
             }],
         )
-        .expect_err("explicit incompatible agent must fail")
-        .to_string();
-    assert!(error.contains("architect"), "{error}");
-    assert!(error.contains("unsupported child tools: lsp"), "{error}");
-    assert!(error.contains("settings.agents.architect.tools"), "{error}");
+        .expect("an unknown-tool agent must spawn");
+    assert_eq!(spawns.len(), 1);
+    // Let the async child run settle (the factory errors by design) so the
+    // spawned task finishes before the runtime drops.
+    runtime
+        .wait_jobs(
+            &[spawns[0].job_id.clone()],
+            Some(std::time::Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect("job settles");
+
+    // The unknown-tool warnings fire once per (agent, tool) — the architect
+    // has two unknown names, so exactly two messages, each naming the agent.
+    let warnings = runtime.unknown_tool_warnings();
+    assert_eq!(warnings.len(), 2, "one warning per unknown tool: {warnings:?}");
+    assert!(
+        warnings.iter().all(|warning| warning.contains("architect")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("unsupported_child_tool")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning.contains("yield_output")),
+        "{warnings:?}"
+    );
+    // Repeated spawns do not re-warn: still exactly two entries.
+    assert_eq!(runtime.unknown_tool_warnings().len(), 2);
 }
 
 #[tokio::test]
@@ -347,7 +389,10 @@ async fn user_task_spawns_child_that_invokes_configured_glob() {
         .await
         .expect("child completion");
     let result = jobs[0].result.as_ref().expect("settled result");
-    assert_eq!(result.output, "glob completed");
+    assert_eq!(
+        result.output,
+        format!("glob completed\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+    );
     assert!(result.error.is_none(), "{:?}", result.error);
 
     let history = runtime
@@ -460,10 +505,13 @@ async fn real_task_children_route_main_alpha_beta_main_through_owned_hub_tools()
     };
     let spawned = tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        (task.execute)(context("spawn-alpha-beta", serde_json::json!({"tasks":[
-            {"name":"Alpha","agent":"alpha","task":"Wait for Main, then relay to Beta."},
-            {"name":"Beta","agent":"beta","task":"Wait for Alpha, then relay to Main."}
-        ]}))),
+        (task.execute)(context("spawn-alpha-beta", serde_json::json!({
+            "context": "Hub relay exercise: Main coordinates; each child waits for a hub message then relays the exact body onward. Do not settle before the relay completes.",
+            "tasks":[
+                {"name":"Alpha","agent":"alpha","task":"Wait for Main, then relay to Beta."},
+                {"name":"Beta","agent":"beta","task":"Wait for Alpha, then relay to Main."}
+            ]
+        }))),
     ).await.expect("task returns before children settle").expect("spawn children");
     let mut spawns: Vec<pi_coding::TaskSpawn> = serde_json::from_value(spawned.details).expect("spawn details");
     spawns.sort_by_key(|spawn| spawn.index);
@@ -585,10 +633,15 @@ async fn parent_factory_disables_ambient_discovery_and_forbidden_child_tools() {
         orchestration_tools: Vec::new(),
         thinking_level: None,
         model: parent.model().unwrap_or_default(),
+        yield_state: Arc::new(pi_coding::YieldState::default()),
+    output_schema: None,
+    schema_mode: None,
     })
     .await
     .expect("child");
-    assert_eq!(child.get_active_tool_names(), vec!["read"]);
+    // Orchestration plumbing is auto-provided: todo/process/task/hub/goal are
+    // never ambient-discovered, and the child-only `yield` tool is appended.
+    assert_eq!(child.get_active_tool_names(), vec!["read", "yield"]);
     assert!(child.select_for_request("local skill").await.skills.is_empty());
 }
 
@@ -648,6 +701,9 @@ async fn child_factory_resolves_auth_for_a_different_provider() {
             orchestration_tools: Vec::new(),
             thinking_level: None,
             model: child_model.clone(),
+            yield_state: Arc::new(pi_coding::YieldState::default()),
+        output_schema: None,
+        schema_mode: None,
         },
     )
     .await
@@ -699,6 +755,9 @@ async fn child_factory_rejects_cross_provider_reuse_without_auth_resolver() {
                 provider: "child-provider".to_owned(),
                 ..Model::default()
             },
+            yield_state: Arc::new(pi_coding::YieldState::default()),
+        output_schema: None,
+        schema_mode: None,
         },
     )
     .await
@@ -714,7 +773,9 @@ fn orchestration_settings_are_explicitly_off_by_default() {
     let runtime = pi_coding::Settings::default().runtime_settings().expect("runtime settings");
     assert!(!runtime.orchestration_enabled);
     assert!(!runtime.process_tool_enabled);
-    assert!(!runtime.todo_tool_enabled);
+    // The todo tool is on by default (OMP parity); `orchestration.todo: false`
+    // opts out. Only orchestration itself and its process tool default off.
+    assert!(runtime.todo_tool_enabled);
 }
 
 #[tokio::test]
@@ -777,6 +838,7 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
                     agent: "task".to_owned(),
                     assignment: "second assignment".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 },
                 TaskItem {
                     index: 0,
@@ -784,6 +846,7 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
                     agent: "task".to_owned(),
                     assignment: "first assignment".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 },
             ],
             abort,
@@ -797,8 +860,14 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
-    assert_eq!(results[0].output, "first");
-    assert_eq!(results[1].output, "second");
+    assert_eq!(
+        results[0].output,
+        format!("first\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+    );
+    assert_eq!(
+        results[1].output,
+        format!("second\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+    );
     for result in &results {
         assert_eq!(result.status, AgentStatus::Idle);
         assert!(
@@ -939,6 +1008,7 @@ async fn batch_never_exceeds_configured_concurrency() {
                         agent: "task".to_owned(),
                         assignment: format!("work {index}"),
                         todo_task_id: None,
+                        ..Default::default()
                     })
                     .collect(),
                 abort,
@@ -985,6 +1055,7 @@ async fn mailbox_cap_wait_and_peer_roster_are_enforced() {
                 agent: "task".to_owned(),
                 assignment: "finish".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
             abort,
         )
@@ -1132,6 +1203,7 @@ async fn cancellation_aborts_a_running_child() {
                     agent: "task".to_owned(),
                     assignment: "wait".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 }],
                 abort,
             )
@@ -1224,6 +1296,7 @@ async fn dropping_runtime_owner_cancels_children() {
                     agent: "task".to_owned(),
                     assignment: "wait".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 }],
                 abort,
             )
@@ -1364,6 +1437,7 @@ async fn run_one_child(runtime: &OrchestrationRuntime, child_id: &str) {
                 agent: "task".to_owned(),
                 assignment: "finish".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
             abort,
         )
@@ -1482,6 +1556,7 @@ async fn running_child_observes_mid_run_steering_exactly_once() {
                     agent: "task".to_owned(),
                     assignment: "start with the original plan".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 }],
                 abort,
             )
@@ -1497,7 +1572,10 @@ async fn running_child_observes_mid_run_steering_exactly_once() {
     assert_eq!(receipt[0].outcome, pi_coding::DeliveryOutcome::Woken);
     release_first.cancel();
     let results = run.await.expect("run join").expect("run result");
-    assert_eq!(results[0].output, "urgent instruction followed");
+    assert_eq!(
+        results[0].output,
+        format!("urgent instruction followed\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let captured = contexts.lock();
     let second = captured.get(1).expect("steered provider request");
@@ -1529,6 +1607,7 @@ async fn cancellation_race_does_not_report_or_deliver_fake_wake() {
                     agent: "task".to_owned(),
                     assignment: "remain active".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 }],
                 abort,
             )
@@ -1567,6 +1646,7 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
                     agent: "task".to_owned(),
                     assignment: "hang".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 }],
                 abort,
             )
@@ -1632,6 +1712,7 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
                     agent: "task".to_owned(),
                     assignment: "hang".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 }],
                 abort2,
             )
@@ -1698,6 +1779,7 @@ async fn parked_agent_delivery_retains_registry_refs_without_claiming_revival() 
                 agent: "task".to_owned(),
                 assignment: "produce".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
             {
                 let (_, abort) = AbortController::new();
@@ -1862,6 +1944,7 @@ async fn group_bound_resolver_keeps_same_agent_artifacts_unique_and_stale_safe()
                 agent: "task".to_owned(),
                 assignment: "runtime a".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
             abort_a,
         )
@@ -1884,6 +1967,7 @@ async fn group_bound_resolver_keeps_same_agent_artifacts_unique_and_stale_safe()
                 agent: "task".to_owned(),
                 assignment: "runtime b".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
             abort_b,
         )
@@ -1895,8 +1979,14 @@ async fn group_bound_resolver_keeps_same_agent_artifacts_unique_and_stale_safe()
         .expect("runtime b artifact");
 
     assert_ne!(path_a, path_b, "job-unique physical paths must not collide");
-    assert_eq!(std::fs::read_to_string(&path_a).expect("runtime a body"), "runtime a");
-    assert_eq!(std::fs::read_to_string(&path_b).expect("runtime b body"), "runtime b");
+    assert_eq!(
+        std::fs::read_to_string(&path_a).expect("runtime a body"),
+        format!("runtime a\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path_b).expect("runtime b body"),
+        format!("runtime b\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+    );
     assert_eq!(
         stale_resolver("artifact://Shared").expect("group-bound resolver"),
         path_a,
@@ -1972,6 +2062,7 @@ async fn disabled_agent_prevents_spawn_with_actionable_error() {
                 agent: "task".to_owned(),
                 assignment: "should fail".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
             abort,
         )
@@ -2046,6 +2137,7 @@ async fn agent_model_override_changes_child_session_model() {
                 agent: "task".to_owned(),
                 assignment: "use override model".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn");
@@ -2120,6 +2212,7 @@ async fn live_parent_model_provider_changes_fallback_between_spawns() {
                 agent: "task".to_owned(),
                 assignment: "first parent".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("first spawn");
@@ -2144,6 +2237,7 @@ async fn live_parent_model_provider_changes_fallback_between_spawns() {
                 agent: "task".to_owned(),
                 assignment: "second parent".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("second spawn");
@@ -2177,6 +2271,7 @@ async fn public_events_report_queued_running_terminal_and_parked_truthfully() {
         2,
     );
     let mut events = runtime.subscribe();
+    let assignment_secret = ["s", "k-", "live-super", "-secret"].concat();
     let spawn = runtime
         .spawn_tasks(
             "Main",
@@ -2185,8 +2280,9 @@ async fn public_events_report_queued_running_terminal_and_parked_truthfully() {
                 index: 0,
                 id: "EventChild".to_owned(),
                 agent: "task".to_owned(),
-                assignment: "summarize\nsecret sk-live-super-secret".to_owned(),
+                assignment: format!("summarize\nsecret {assignment_secret}"),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn")
@@ -2212,7 +2308,12 @@ async fn public_events_report_queued_running_terminal_and_parked_truthfully() {
                 pi_coding::JobStatus::Running => running = true,
                 pi_coding::JobStatus::Completed => {
                     completed = true;
-                    assert_eq!(job.result.as_ref().map(|result| result.output.as_str()), Some("event result"));
+                    assert_eq!(
+                        job.result
+                            .as_ref()
+                            .map(|result| result.output.clone()),
+                        Some(format!("event result\n\n{}", pi_coding::MISSING_YIELD_WARNING))
+                    );
                 }
                 pi_coding::JobStatus::Failed | pi_coding::JobStatus::Cancelled => {}
             }

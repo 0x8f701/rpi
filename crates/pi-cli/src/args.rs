@@ -2,13 +2,14 @@
 //!
 //! Mirrors the Go upstream flag surface: top-level flags drive the agent run
 //! path (print mode or interactive REPL), while `models`, `sessions`, and
-//! `import-session` are first-class subcommands. `--version` is provided by
-//! clap for release smoke tests.
+//! `import-session` are first-class subcommands. The top-level `--export`
+//! flag mirrors the `export` subcommand for upstream parity. `--version` is
+//! provided by clap for release smoke tests.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 /// `rpi` — Rust coding agent.
 #[derive(Debug, Clone, Parser)]
@@ -18,18 +19,32 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "rpi - Rust coding agent",
     long_about = None,
     args_override_self = true,
+    propagate_version = true,
 )]
 pub struct Cli {
     /// Subcommand dispatch. When absent, the top-level flags drive a run.
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// Export a session to a self-contained HTML file, same as the `export`
+    /// subcommand (no model/auth/network required).
+    #[arg(long, value_name = "SESSION_PATH")]
+    pub export: Option<PathBuf>,
+
+    /// Write the export to this explicit path (with --export).
+    #[arg(long, short = 'o', value_name = "PATH", requires = "export")]
+    pub output: Option<PathBuf>,
+
+    /// Export the current branch as JSONL instead of HTML (with --export).
+    #[arg(long, requires = "export")]
+    pub jsonl: bool,
+
     /// Provider id used with --model.
     #[arg(long, value_name = "PROVIDER", requires = "model")]
     pub provider: Option<String>,
 
     /// Model spec (provider/id or bare id).
-    #[arg(short = 'm', long, value_name = "SPEC")]
+    #[arg(short = 'm', long, value_name = "SPEC", global = true)]
     pub model: Option<String>,
 
     /// Comma-separated model patterns used to scope interactive model cycling.
@@ -66,8 +81,15 @@ pub struct Cli {
     pub fork: Option<String>,
 
     /// Override the directory used for session storage and id lookup.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", global = true)]
     pub session_dir: Option<PathBuf>,
+
+    /// Active config profile: relocates the user base dir (agent dir,
+    /// sessions, settings, auth, memory, skills) to `<base>/profiles/<name>`.
+    /// `default` keeps the default base; `PI_PROFILE` is honored when the flag
+    /// is absent.
+    #[arg(long, value_name = "NAME", global = true)]
+    pub profile: Option<String>,
 
     /// Do not persist a session file for this run.
     #[arg(long, conflicts_with_all = ["continue_latest", "resume", "session", "session_id", "fork"])]
@@ -159,7 +181,7 @@ pub struct Cli {
     pub list_models: Option<String>,
 
     /// Disable nonessential startup networking such as catalog refreshes and update checks.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub offline: bool,
 
     /// Force verbose startup diagnostics.
@@ -183,13 +205,21 @@ pub struct Cli {
     #[arg(value_name = "PROMPT")]
     pub prompt: Vec<String>,
 
-    /// Bind an opt-in HTTP/WebSocket control plane sharing the live application.
+    /// Bind an HTTP/WebSocket control plane sharing the live application.
+    /// Loopback is the default and requires no remote-exposure opt-in.
     #[arg(long, value_name = "SOCKET_ADDR")]
     pub listen: Option<std::net::SocketAddr>,
 
-    /// Bearer token file required for non-loopback --listen (optional on loopback).
+    /// Optional bearer token file for --listen. Enables browser access and is
+    /// mandatory when insecure remote listening is explicitly enabled.
     #[arg(long, value_name = "PATH", requires = "listen")]
     pub listen_token_file: Option<PathBuf>,
+
+    /// Explicitly allow authenticated plaintext HTTP/WebSocket on a
+    /// non-loopback --listen address. Passive network observers can capture
+    /// the bearer token and control traffic.
+    #[arg(long, requires_all = ["listen", "listen_token_file"])]
+    pub listen_allow_insecure_remote: bool,
 }
 
 /// Headless application adapters.
@@ -198,6 +228,33 @@ pub enum Mode {
     Text,
     Json,
     Rpc,
+}
+
+/// Maximum length of a config profile name.
+pub const MAX_PROFILE_NAME_LENGTH: usize = 64;
+
+/// Validate a config profile name: 1-64 ASCII letters, digits, `-`, or `_`
+/// (whitespace is trimmed first; `default` is a valid name that selects the
+/// default profile). Returns an actionable message on failure.
+pub fn validate_profile_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("profile name cannot be empty".to_owned());
+    }
+    if name.chars().count() > MAX_PROFILE_NAME_LENGTH {
+        return Err(format!(
+            "profile name {name:?} exceeds {MAX_PROFILE_NAME_LENGTH} characters"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    {
+        return Err(format!(
+            "invalid profile name {name:?}: use only letters, digits, '-' and '_' (at most {MAX_PROFILE_NAME_LENGTH} characters)"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -217,6 +274,35 @@ impl From<ApprovalModeArg> for pi_agent::ApprovalMode {
     }
 }
 
+/// Shell supported by the `completion` subcommand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CompletionShell {
+    /// Bourne-again shell completions.
+    Bash,
+    /// Z shell completions.
+    Zsh,
+    /// Friendly interactive shell completions.
+    Fish,
+}
+
+impl CompletionShell {
+    /// Map to the underlying `clap_complete` shell.
+    #[must_use]
+    pub fn to_clap_shell(self) -> clap_complete::Shell {
+        match self {
+            Self::Bash => clap_complete::Shell::Bash,
+            Self::Zsh => clap_complete::Shell::Zsh,
+            Self::Fish => clap_complete::Shell::Fish,
+        }
+    }
+}
+
+/// Generate shell completions for the `rpi` command into `writer`.
+pub fn write_completion<W: std::io::Write>(shell: CompletionShell, writer: &mut W) {
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell.to_clap_shell(), &mut cmd, "rpi", writer);
+}
+
 /// First-class subcommands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
@@ -225,12 +311,21 @@ pub enum Command {
         /// Provider id; omit in an interactive terminal to choose from a list.
         #[arg(value_name = "PROVIDER")]
         provider: Option<String>,
+        /// Store the credential under this scope label (e.g. "work"). The
+        /// active scope (`PI_AUTH_SCOPE` or the authScope setting) then picks
+        /// this credential over the unscoped default.
+        #[arg(long, value_name = "LABEL")]
+        scope: Option<String>,
     },
     /// Remove the stored credential for one provider.
     Logout {
         /// Provider id; omit in an interactive terminal to choose from configured providers.
         #[arg(value_name = "PROVIDER")]
         provider: Option<String>,
+        /// Remove the credential stored under this scope label instead of the
+        /// unscoped default.
+        #[arg(long, value_name = "LABEL")]
+        scope: Option<String>,
     },
     /// List available models, optionally filtered by a substring.
     Models {
@@ -254,6 +349,28 @@ pub enum Command {
     },
     /// Validate and print the active settings/resource snapshot.
     Reload,
+    /// Diagnose the rpi environment and report PASS/FAIL per check. Never
+    /// prints secret material: auth presence is reported as provider names
+    /// and the file path only, never credential contents.
+    Doctor {
+        /// Emit a machine-readable JSON report instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print what to configure and where: the models.json and auth.json
+    /// paths, with example contents on an interactive terminal.
+    Setup {
+        /// Emit a machine-readable JSON report instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Summarize session and usage state for this directory: session count,
+    /// latest session, goal state (if any), and available tools.
+    Dashboard {
+        /// Emit a machine-readable JSON report instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Export a session to a self-contained HTML file (no model/auth/network).
     Export {
         /// Session file to export.
@@ -287,11 +404,14 @@ pub enum Command {
     },
     /// List configured packages.
     List,
-    /// Configure enabled package resources for global or project scope.
+    /// Configure enabled package resources for global or project scope, or
+    /// inspect/change settings keys (`rpi config get|set|reset|list`).
     Config {
         /// Edit project-local settings instead of global settings.
         #[arg(short = 'l', long)]
         local: bool,
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
     },
     /// Update rpi itself, configured extensions, or model catalogs.
     Update {
@@ -321,6 +441,207 @@ pub enum Command {
     Llama {
         #[command(subcommand)]
         command: LlamaCommand,
+    },
+    /// Manage marketplace plugins (packaged extensions): list, install,
+    /// remove, and update. Installed plugins land in
+    /// `<agent_dir>/extensions/<name>/` and are loadable as extensions once
+    /// trusted by the trust store.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+    /// Serve the Agent Client Protocol (agentclientprotocol.com) so ACP-speaking
+    /// editors can embed rpi as a coding agent. `stdio` speaks JSON-RPC 2.0
+    /// over stdin/stdout with Content-Length framing; `serve` speaks it over a
+    /// local WebSocket endpoint.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// Manage Model Context Protocol (MCP) servers: list configured servers
+    /// and import definitions from Claude Desktop or Cursor config files.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    /// rpi headless RPC server: serve the JSONL RPC control plane on
+    /// stdin/stdout (same as `--mode rpc`).
+    #[command(display_name = "rpi rpc")]
+    Rpc,
+    /// Generate shell completions for bash, zsh, or fish.
+    Completion {
+        /// Target shell.
+        #[arg(value_name = "SHELL")]
+        shell: CompletionShell,
+    },
+}
+
+/// Settings-key operations for `rpi config` (OMP `omp config get/set/reset/list`
+/// parity). `rpi config` with no subcommand keeps the package-resource
+/// selector; these verbs reuse the settings catalog and the atomic draft+apply
+/// pipeline, so scripts can configure rpi without the TUI.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum ConfigCommand {
+    /// Print one setting's effective value, source, and behavior.
+    Get {
+        /// Catalog setting key (e.g. `retry.maxRetries`).
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Settings layer to read: global (default) or project.
+        #[arg(long, value_enum)]
+        scope: Option<ConfigScopeArg>,
+        /// Emit machine-readable JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set a setting through the atomic draft+apply path (identical
+    /// validation and scope rules to the TUI).
+    Set {
+        /// Catalog setting key (e.g. `retry.maxRetries`).
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Typed value: booleans/integers/enums pass through directly, arrays
+        /// and objects are parsed as JSON (e.g. `[{"source":"example"}]`).
+        #[arg(value_name = "VALUE")]
+        value: String,
+        /// Settings layer to write: global (default) or project.
+        #[arg(long, value_enum)]
+        scope: Option<ConfigScopeArg>,
+        /// Emit machine-readable JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reset a setting to its default/inherited value.
+    Reset {
+        /// Catalog setting key (e.g. `retry.maxRetries`).
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Settings layer to clear: global (default) or project.
+        #[arg(long, value_enum)]
+        scope: Option<ConfigScopeArg>,
+        /// Emit machine-readable JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every catalog setting, grouped by category.
+    List {
+        /// Restrict output to one category (Models, Session, Compaction,
+        /// RetryTransport, TerminalUi, Orchestration, Resources,
+        /// TrustSecurity, Live).
+        #[arg(long, value_name = "CATEGORY")]
+        category: Option<String>,
+        /// Settings layer to report: global (default) or project.
+        #[arg(long, value_enum)]
+        scope: Option<ConfigScopeArg>,
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Settings scope selector for `rpi config get/set/reset/list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ConfigScopeArg {
+    Global,
+    Project,
+}
+
+/// MCP server management commands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum McpCommand {
+    /// List configured MCP servers from settings (name, transport,
+    /// command/url, disabled state). Entries with `disabled: true` are never
+    /// spawned by the session and are marked here.
+    List {
+        /// Read project-local settings instead of global settings.
+        #[arg(short = 'l', long)]
+        local: bool,
+    },
+    /// Import MCP servers from a Claude Desktop or Cursor config file into
+    /// settings. Entries are validated individually; existing servers are
+    /// never overwritten unless `--force` is given.
+    Import {
+        /// Config format: claude|cursor|auto (default: auto — try Claude
+        /// Desktop, then Cursor in the current project).
+        #[arg(long, value_name = "SOURCE", value_enum)]
+        source: Option<McpImportSourceArg>,
+        /// Read from this explicit config file instead of the standard
+        /// location. With `--source auto`, a file named `mcp.json` parses as
+        /// Cursor, anything else as Claude Desktop.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Write into project-local settings instead of global settings.
+        #[arg(short = 'l', long)]
+        local: bool,
+        /// Overwrite existing servers with the same name instead of skipping them.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Config format selector for `rpi mcp import`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpImportSourceArg {
+    /// Claude Desktop's `claude_desktop_config.json`.
+    Claude,
+    /// Cursor's `.cursor/mcp.json`.
+    Cursor,
+    /// Try Claude Desktop first, then the project's Cursor config.
+    Auto,
+}
+
+/// Agent Client Protocol transports.
+#[derive(Debug, Clone, Subcommand)]
+pub enum AgentCommand {
+    /// ACP over stdio: the client launches `rpi agent stdio` as a subprocess
+    /// and exchanges Content-Length framed JSON-RPC messages on stdin/stdout.
+    Stdio,
+    /// ACP over a local WebSocket server. Each connected client speaks plain
+    /// JSON-RPC 2.0 messages as WebSocket text frames (no Content-Length
+    /// headers — the WebSocket frame replaces them).
+    Serve {
+        /// Loopback socket address to bind (plaintext; non-loopback is refused
+        /// until TLS support lands).
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:34567")]
+        address: std::net::SocketAddr,
+        /// Optional token file for WebSocket connections. The server is
+        /// loopback-only (plaintext WebSocket cannot safely carry the token
+        /// off the local host); on loopback this switches the server from
+        /// native-client-only to token-gated. Clients present the token as
+        /// `Authorization: Bearer <token>` or the `rpi-auth.<token>`
+        /// subprotocol.
+        #[arg(long, value_name = "FILE")]
+        token_file: Option<PathBuf>,
+    },
+}
+
+/// Plugin marketplace commands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum PluginCommand {
+    /// List installed plugins with name, version, runtime, and trust state.
+    List {
+        /// Check the marketplace index and print available updates.
+        #[arg(long)]
+        updates: bool,
+    },
+    /// Install a plugin from a local directory, a local or remote
+    /// .tgz/.tar.gz/.tar archive, an owner/repo GitHub reference, an
+    /// npm:<name>[@<version>] reference, or a git URL (git+https://host/owner/
+    /// repo, git+ssh://git@host/owner/repo.git, https://host/owner/repo.git,
+    /// ssh://git@host/owner/repo.git, git@host:owner/repo.git).
+    Install {
+        #[arg(value_name = "SOURCE")]
+        source: String,
+    },
+    /// Remove an installed plugin.
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Update one installed plugin from the marketplace index.
+    Update {
+        #[arg(value_name = "NAME")]
+        name: String,
     },
 }
 
@@ -418,6 +739,13 @@ impl Cli {
         {
             return Err("--session-id requires a non-empty value".to_owned());
         }
+        if let Some(profile) = self.profile.as_deref() {
+            let name = profile.trim();
+            if !name.is_empty() && name != "default" {
+                validate_profile_name(name)
+                    .map_err(|message| format!("--profile: {message}"))?;
+            }
+        }
         if self
             .models
             .as_ref()
@@ -455,6 +783,21 @@ impl Cli {
         if self.listen.is_some() && self.command.is_some() {
             return Err("--listen cannot be combined with subcommands".to_owned());
         }
+        if self.export.is_some() && self.command.is_some() {
+            return Err("--export cannot be combined with subcommands".to_owned());
+        }
+        // `rpi rpc` ≡ `rpi --mode rpc`: the subcommand forces RPC mode, so an
+        // explicit conflicting `--mode` is rejected rather than silently
+        // overridden (mirrors the old rpi-rpc wrapper's args_override_self
+        // authority with explicit rejection).
+        if matches!(self.command, Some(Command::Rpc))
+            && matches!(self.mode, Some(mode) if mode != Mode::Rpc)
+        {
+            return Err(
+                "`rpc` subcommand forces RPC mode and conflicts with --mode (use `rpi rpc` or `rpi --mode rpc`, not both)"
+                    .to_owned(),
+            );
+        }
         if self.listen.is_some()
             && matches!(self.mode, Some(Mode::Json) | Some(Mode::Rpc))
         {
@@ -475,6 +818,14 @@ impl Cli {
             && path.as_os_str().is_empty()
         {
             return Err("--listen-token-file requires a non-empty path".to_owned());
+        }
+        if self.listen_allow_insecure_remote && self.listen.is_none() {
+            return Err("--listen-allow-insecure-remote requires --listen".to_owned());
+        }
+        if self.listen_allow_insecure_remote && self.listen_token_file.is_none() {
+            return Err(
+                "--listen-allow-insecure-remote requires --listen-token-file".to_owned(),
+            );
         }
         for (flag, names) in [
             ("--tools", self.tools.as_deref()),
@@ -665,6 +1016,50 @@ mod tests {
             .expect("no-approve alias after command");
         assert!(no_approve.no_approve);
 
+        // `rpi config` settings-key verbs (OMP `omp config` parity).
+        let get = Cli::try_parse_from(["rpi", "config", "get", "retry.maxRetries", "--scope", "project", "--json"])
+            .expect("config get");
+        assert!(matches!(
+            get.command,
+            Some(Command::Config {
+                local: false,
+                command: Some(ConfigCommand::Get { ref key, scope: Some(ConfigScopeArg::Project), json: true, .. }),
+            }) if key == "retry.maxRetries"
+        ));
+        let set = Cli::try_parse_from(["rpi", "config", "set", "transport", "sse"])
+            .expect("config set");
+        assert!(matches!(
+            set.command,
+            Some(Command::Config {
+                local: false,
+                command: Some(ConfigCommand::Set { ref key, ref value, scope: None, json: false, .. }),
+            }) if key == "transport" && value == "sse"
+        ));
+        let reset = Cli::try_parse_from(["rpi", "config", "--local", "reset", "theme"])
+            .expect("config reset with --local");
+        assert!(matches!(
+            reset.command,
+            Some(Command::Config {
+                local: true,
+                command: Some(ConfigCommand::Reset { ref key, .. }),
+            }) if key == "theme"
+        ));
+        let list = Cli::try_parse_from(["rpi", "config", "list", "--category", "Models"])
+            .expect("config list");
+        assert!(matches!(
+            list.command,
+            Some(Command::Config {
+                local: false,
+                command: Some(ConfigCommand::List { ref category, json: false, .. }),
+            }) if category.as_deref() == Some("Models")
+        ));
+        // Bare `rpi config` keeps the package-resource selector.
+        let bare = Cli::try_parse_from(["rpi", "config"]).expect("bare config");
+        assert!(matches!(
+            bare.command,
+            Some(Command::Config { local: false, command: None })
+        ));
+
         for args in [
             ["rpi", "update", "--all"].as_slice(),
             ["rpi", "update", "--models"].as_slice(),
@@ -703,6 +1098,175 @@ mod tests {
         assert!(package.validate().is_err());
     }
     #[test]
+    fn parses_plugin_subcommands() {
+        let list = Cli::try_parse_from(["rpi", "plugin", "list"]).expect("plugin list");
+        assert!(matches!(
+            list.command,
+            Some(Command::Plugin {
+                command: PluginCommand::List { updates: false }
+            })
+        ));
+
+        let updates =
+            Cli::try_parse_from(["rpi", "plugin", "list", "--updates"]).expect("plugin list --updates");
+        assert!(matches!(
+            updates.command,
+            Some(Command::Plugin {
+                command: PluginCommand::List { updates: true }
+            })
+        ));
+
+        let install = Cli::try_parse_from(["rpi", "plugin", "install", "./ext"])
+            .expect("plugin install");
+        assert!(matches!(
+            install.command,
+            Some(Command::Plugin {
+                command: PluginCommand::Install { .. }
+            })
+        ));
+
+        let remove = Cli::try_parse_from(["rpi", "plugin", "remove", "ext"])
+            .expect("plugin remove");
+        assert!(matches!(
+            remove.command,
+            Some(Command::Plugin {
+                command: PluginCommand::Remove { .. }
+            })
+        ));
+
+        let update = Cli::try_parse_from(["rpi", "plugin", "update", "ext"])
+            .expect("plugin update");
+        assert!(matches!(
+            update.command,
+            Some(Command::Plugin {
+                command: PluginCommand::Update { .. }
+            })
+        ));
+
+        // `rpi plugin update` must not be confused with the top-level `rpi update`.
+        let top_level = Cli::try_parse_from(["rpi", "update", "self"]).expect("rpi update self");
+        assert!(matches!(top_level.command, Some(Command::Update { .. })));
+
+        // `rpi plugin` without a subcommand is a parse error.
+        assert!(Cli::try_parse_from(["rpi", "plugin"]).is_err());
+    }
+
+    #[test]
+    fn rpc_subcommand_parses_and_rejects_conflicting_mode() {
+        // `rpi rpc` selects the subcommand with no explicit mode; dispatch
+        // resolves it to forced RPC mode (≡ `rpi --mode rpc`).
+        let rpc = Cli::try_parse_from(["rpi", "rpc"]).expect("parse rpi rpc");
+        assert!(matches!(rpc.command, Some(Command::Rpc)));
+        assert_eq!(rpc.mode, None, "rpc subcommand must not set --mode itself");
+        rpc.validate().expect("rpi rpc validates");
+
+        // `--mode rpc` before the subcommand is redundant but consistent: allowed.
+        let redundant =
+            Cli::try_parse_from(["rpi", "--mode", "rpc", "rpc"]).expect("parse redundant mode");
+        redundant.validate().expect("--mode rpc matches the rpc subcommand");
+
+        // A conflicting explicit --mode is rejected: after the subcommand it
+        // is an unexpected top-level argument (--mode is not global)...
+        assert!(
+            Cli::try_parse_from(["rpi", "rpc", "--mode", "json"]).is_err(),
+            "rpi rpc --mode json must be a parse error"
+        );
+        // ...and before the subcommand it parses but fails validation.
+        let conflicting =
+            Cli::try_parse_from(["rpi", "--mode", "json", "rpc"]).expect("parses conflicting");
+        let error = conflicting
+            .validate()
+            .expect_err("conflicting --mode must fail validation");
+        assert!(
+            error.contains("forces RPC mode"),
+            "conflict error must be actionable: {error}"
+        );
+
+        // Back-compat: `rpi --mode rpc` still parses and validates unchanged.
+        let back_compat = Cli::try_parse_from(["rpi", "--mode", "rpc"]).expect("parse --mode rpc");
+        assert!(matches!(back_compat.command, None));
+        assert_eq!(back_compat.mode, Some(Mode::Rpc));
+        back_compat.validate().expect("--mode rpc validates");
+    }
+
+    #[test]
+    fn rpc_subcommand_help_describes_the_rpc_server() {
+        let command = Cli::command();
+        let rpc = command
+            .find_subcommand("rpc")
+            .expect("rpc subcommand exists");
+        let about = rpc
+            .get_about()
+            .expect("rpc subcommand about")
+            .to_string();
+        assert!(
+            about.contains("rpi headless RPC server"),
+            "rpc subcommand help must describe the RPC server: {about}"
+        );
+    }
+
+    #[test]
+    fn parses_mcp_subcommands() {
+        let list = Cli::try_parse_from(["rpi", "mcp", "list"]).expect("mcp list");
+        assert!(matches!(
+            list.command,
+            Some(Command::Mcp {
+                command: McpCommand::List { local: false }
+            })
+        ));
+        let list_local = Cli::try_parse_from(["rpi", "mcp", "list", "--local"])
+            .expect("mcp list --local");
+        assert!(matches!(
+            list_local.command,
+            Some(Command::Mcp {
+                command: McpCommand::List { local: true }
+            })
+        ));
+
+        let import = Cli::try_parse_from(["rpi", "mcp", "import"]).expect("mcp import");
+        assert!(matches!(
+            import.command,
+            Some(Command::Mcp {
+                command: McpCommand::Import {
+                    source: None,
+                    file: None,
+                    local: false,
+                    force: false,
+                }
+            })
+        ));
+
+        let import_cursor = Cli::try_parse_from([
+            "rpi",
+            "mcp",
+            "import",
+            "--source",
+            "cursor",
+            "--file",
+            "/tmp/mcp.json",
+            "--local",
+            "--force",
+        ])
+        .expect("mcp import --source cursor --file ... --local --force");
+        assert!(matches!(
+            import_cursor.command,
+            Some(Command::Mcp {
+                command: McpCommand::Import {
+                    source: Some(McpImportSourceArg::Cursor),
+                    file: Some(path),
+                    local: true,
+                    force: true,
+                }
+            }) if path == PathBuf::from("/tmp/mcp.json")
+        ));
+
+        // `rpi mcp` without a subcommand is a parse error.
+        assert!(Cli::try_parse_from(["rpi", "mcp"]).is_err());
+        // `rpi mcp import --source` must reject unknown formats.
+        assert!(Cli::try_parse_from(["rpi", "mcp", "import", "--source", "grok"]).is_err());
+    }
+
+    #[test]
     fn cwd_is_global_for_sessions_subcommand() {
         let before =
             Cli::try_parse_from(["rpi", "--cwd", "workspace-a", "sessions"]).expect("before");
@@ -720,7 +1284,101 @@ mod tests {
     }
 
     #[test]
-    fn listen_flags_parse_and_require_socket_addr() {
+    fn profile_flag_is_global_and_mirrors_session_dir() {
+        // `--profile` is a global arg like `--session-dir`: accepted before or
+        // after a subcommand.
+        let before =
+            Cli::try_parse_from(["rpi", "--profile", "work", "sessions"]).expect("before");
+        assert_eq!(before.profile.as_deref(), Some("work"));
+        assert!(matches!(before.command, Some(Command::Sessions)));
+
+        let after = Cli::try_parse_from(["rpi", "sessions", "--profile", "work"]).expect("after");
+        assert_eq!(after.profile.as_deref(), Some("work"));
+        assert!(matches!(after.command, Some(Command::Sessions)));
+
+        let plain = Cli::try_parse_from(["rpi"]).expect("plain");
+        assert_eq!(plain.profile, None, "--profile must default to none");
+
+        let with_session_dir =
+            Cli::try_parse_from(["rpi", "--profile", "work", "--session-dir", "sessions"])
+                .expect("profile plus session dir");
+        assert_eq!(with_session_dir.profile.as_deref(), Some("work"));
+        assert_eq!(
+            with_session_dir.session_dir.as_deref(),
+            Some(PathBuf::from("sessions").as_path())
+        );
+    }
+
+    #[test]
+    fn profile_names_validate_to_actionable_errors() {
+        for name in ["work", "my-profile", "my_profile", "work2", "A-Z_09", "default"] {
+            validate_profile_name(name)
+                .unwrap_or_else(|error| panic!("{name:?} must be valid: {error}"));
+        }
+        let empty = validate_profile_name("").expect_err("empty name must be rejected");
+        assert!(
+            empty.contains("cannot be empty"),
+            "empty-name error must be actionable: {empty}"
+        );
+        for name in ["a/b", "a b", "a.b", "work:high", "a\\b", "über", "a,b"] {
+            let error = validate_profile_name(name)
+                .expect_err("invalid profile name must be rejected");
+            assert!(
+                error.contains("profile name") && error.contains("letters, digits"),
+                "{name:?} error must be actionable: {error}"
+            );
+        }
+        // 64 chars is the maximum; 65 is rejected.
+        let max = "a".repeat(MAX_PROFILE_NAME_LENGTH);
+        validate_profile_name(&max).expect("64-char name is valid");
+        let too_long = "a".repeat(MAX_PROFILE_NAME_LENGTH + 1);
+        let error = validate_profile_name(&too_long).expect_err("65-char name is invalid");
+        assert!(
+            error.contains("exceeds") && error.contains("64"),
+            "length error must be actionable: {error}"
+        );
+    }
+
+    #[test]
+    fn cli_validate_rejects_invalid_profile_but_accepts_default_and_empty() {
+        for args in [
+            ["rpi", "--profile", "bad/name"].as_slice(),
+            ["rpi", "--profile", "has space"].as_slice(),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parse for validation");
+            let error = cli.validate().expect_err("invalid profile must fail");
+            assert!(
+                error.contains("--profile") && error.contains("letters, digits"),
+                "validation error must be actionable: {error}"
+            );
+        }
+        let cli = Cli::try_parse_from(["rpi", "--profile", "x".repeat(65).as_str()])
+            .expect("parse for validation");
+        let error = cli.validate().expect_err("overlong profile must fail");
+        assert!(
+            error.contains("--profile") && error.contains("exceeds 64"),
+            "validation error must be actionable: {error}"
+        );
+        for args in [
+            ["rpi", "--profile", "default"].as_slice(),
+            ["rpi", "--profile", ""].as_slice(),
+            ["rpi", "--profile", "work"].as_slice(),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parse for validation");
+            cli.validate().expect("valid profile must pass validation");
+        }
+    }
+
+    #[test]
+    fn profile_flag_appears_in_help() {
+        let mut buf = Vec::new();
+        write_completion(CompletionShell::Bash, &mut buf);
+        let script = String::from_utf8(buf).expect("completion script is valid UTF-8");
+        assert!(script.contains("--profile"), "completion mentions --profile");
+    }
+
+    #[test]
+    fn listen_flags_parse_and_enforce_remote_opt_in_dependencies() {
         let cli = Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0"])
             .expect("parse listen loopback");
         assert_eq!(
@@ -728,21 +1386,51 @@ mod tests {
             Some("127.0.0.1:0".to_owned())
         );
         assert!(cli.listen_token_file.is_none());
-        let with_token = Cli::try_parse_from([
+        assert!(!cli.listen_allow_insecure_remote);
+
+        let with_remote_opt_in = Cli::try_parse_from([
             "rpi",
             "--listen",
-            "127.0.0.1:0",
+            "0.0.0.0:0",
             "--listen-token-file",
-            "token",
+            "token-file",
+            "--listen-allow-insecure-remote",
         ])
-        .expect("parse listen token");
+        .expect("parse authenticated remote listen opt-in");
         assert_eq!(
-            with_token.listen_token_file.as_deref(),
-            Some(PathBuf::from("token").as_path())
+            with_remote_opt_in.listen_token_file.as_deref(),
+            Some(PathBuf::from("token-file").as_path())
         );
-        assert!(
-            Cli::try_parse_from(["rpi", "--listen-token-file", "token"]).is_err(),
-            "token file without --listen parses"
+        assert!(with_remote_opt_in.listen_allow_insecure_remote);
+
+        for args in [
+            ["rpi", "--listen-token-file", "token-file"].as_slice(),
+            ["rpi", "--listen-allow-insecure-remote"].as_slice(),
+            [
+                "rpi",
+                "--listen",
+                "0.0.0.0:0",
+                "--listen-allow-insecure-remote",
+            ]
+            .as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "accepted incomplete listen dependency set: {args:?}"
+            );
+        }
+
+        let mut direct = Cli::try_parse_from(["rpi", "--listen", "0.0.0.0:0"])
+            .expect("parse direct validation fixture");
+        direct.listen_allow_insecure_remote = true;
+        assert_eq!(
+            direct.validate().expect_err("validation must require token file"),
+            "--listen-allow-insecure-remote requires --listen-token-file"
+        );
+        direct.listen = None;
+        assert_eq!(
+            direct.validate().expect_err("validation must require listen"),
+            "--listen-allow-insecure-remote requires --listen"
         );
     }
 
@@ -775,5 +1463,105 @@ mod tests {
         ])
         .expect_err("empty token path should be rejected at parse time");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn completion_parses_supported_shells_and_rejects_others() {
+        for (wire, expected) in [("bash", CompletionShell::Bash), ("zsh", CompletionShell::Zsh), ("fish", CompletionShell::Fish)] {
+            let cli = Cli::try_parse_from(["rpi", "completion", wire])
+                .expect("parse completion {wire}");
+            assert!(
+                matches!(cli.command, Some(Command::Completion { shell }) if shell == expected),
+                "expected parsed shell {wire}"
+            );
+        }
+        assert!(Cli::try_parse_from(["rpi", "completion"]).is_err(), "missing shell accepted");
+        assert!(
+            Cli::try_parse_from(["rpi", "completion", "powershell"]).is_err(),
+            "powershell accepted"
+        );
+        assert!(
+            Cli::try_parse_from(["rpi", "completion", "elvish"]).is_err(),
+            "elvish accepted"
+        );
+    }
+
+    #[test]
+    fn completion_generates_non_empty_script_per_shell() {
+        for shell in [CompletionShell::Bash, CompletionShell::Zsh, CompletionShell::Fish] {
+            let mut buf = Vec::new();
+            write_completion(shell, &mut buf);
+            let script = String::from_utf8(buf).expect("completion script is valid UTF-8");
+            assert!(!script.is_empty(), "{shell:?} generated empty script");
+            assert!(script.contains("rpi"), "{shell:?} script does not mention rpi");
+            assert!(script.contains("--help"), "{shell:?} script does not mention --help");
+        }
+    }
+
+    #[test]
+    fn top_level_export_flag_parses_like_export_subcommand() {
+        let cli = Cli::try_parse_from(["rpi", "--export", "sessions/a.jsonl"])
+            .expect("parse --export");
+        assert!(cli.command.is_none(), "--export must not select a subcommand");
+        assert_eq!(cli.export, Some(PathBuf::from("sessions/a.jsonl")));
+        assert!(cli.output.is_none(), "--output must default to none");
+        assert!(!cli.jsonl, "--jsonl must default to false");
+
+        let cli = Cli::try_parse_from([
+            "rpi", "--export", "sessions/a.jsonl", "-o", "out.html", "--jsonl",
+        ])
+        .expect("parse --export with output and jsonl");
+        assert_eq!(cli.export, Some(PathBuf::from("sessions/a.jsonl")));
+        assert_eq!(cli.output, Some(PathBuf::from("out.html")));
+        assert!(cli.jsonl, "--jsonl must be honored");
+    }
+
+    #[test]
+    fn top_level_export_flag_conflicts_with_subcommand_and_requires_export() {
+        // The flag surface mirrors the `export` subcommand; combining them is
+        // ambiguous and must fail validation (clap models subcommands as
+        // separate commands, so the mutual exclusion lives in `validate`).
+        let mixed = Cli::try_parse_from(["rpi", "--export", "x", "export", "y"])
+            .expect("parse flag plus subcommand");
+        assert!(mixed.validate().is_err(), "flag plus subcommand must fail");
+        let sessions = Cli::try_parse_from(["rpi", "--export", "x", "sessions"])
+            .expect("parse flag plus sessions subcommand");
+        assert!(sessions.validate().is_err(), "flag plus sessions must fail");
+        // -o/--output and --jsonl only make sense with --export.
+        assert!(Cli::try_parse_from(["rpi", "--output", "out.html"]).is_err());
+        assert!(Cli::try_parse_from(["rpi", "-o", "out.html"]).is_err());
+        assert!(Cli::try_parse_from(["rpi", "--jsonl"]).is_err());
+    }
+
+    #[test]
+    fn login_and_logout_accept_optional_scope_label() {
+        let login = Cli::try_parse_from(["rpi", "login", "anthropic", "--scope", "work"])
+            .expect("parse login with scope");
+        match login.command {
+            Some(Command::Login { provider, scope }) => {
+                assert_eq!(provider.as_deref(), Some("anthropic"));
+                assert_eq!(scope.as_deref(), Some("work"));
+            }
+            other => panic!("expected login command, got {other:?}"),
+        }
+
+        let logout = Cli::try_parse_from(["rpi", "logout", "--scope", "personal", "xai"])
+            .expect("parse logout with scope before provider");
+        match logout.command {
+            Some(Command::Logout { provider, scope }) => {
+                assert_eq!(provider.as_deref(), Some("xai"));
+                assert_eq!(scope.as_deref(), Some("personal"));
+            }
+            other => panic!("expected logout command, got {other:?}"),
+        }
+
+        let plain = Cli::try_parse_from(["rpi", "login", "anthropic"]).expect("parse login");
+        match plain.command {
+            Some(Command::Login { provider, scope }) => {
+                assert_eq!(provider.as_deref(), Some("anthropic"));
+                assert_eq!(scope, None, "scope must default to none");
+            }
+            other => panic!("expected login command, got {other:?}"),
+        }
     }
 }

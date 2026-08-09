@@ -2,6 +2,172 @@
 
 All notable changes to `rpi` are documented in this file.
 
+## [0.2.4] - 2026-08-09
+
+### Added
+
+- `/rewind [<entry-index|checkpoint-name>]` rolls the session back to before
+  an entry: the record file is truncated at the cut (the dropped tail is
+  archived verbatim to a `.rewind-<timestamp>.jsonl` sidecar first), and the
+  in-memory transcript, todo list, goal state, session name, and the
+  Responses stateful chain are rebuilt from the retained journal — a goal
+  journal cut through at the rewind point re-derives the goal away. Bare
+  `/rewind` lists the last 20 records with indices and first-line previews to
+  pick from. Rewinding is refused past the first entry, while a prompt is
+  processing, while bash is running, or while orchestration jobs or
+  workflows are still active.
+- `/checkpoint <name>` marks the current position as a named rewind target
+  (a `checkpoint` journal record that never joins the linear record chain or
+  the transcript); `/rewind <name>` rolls back to the marked position.
+- `/fresh` starts a new clean session (alias for `/new`): the current session
+  stays archived on disk and the TUI resets to the new recorder.
+- `/dump [--jsonl] [path]` exports the current session through the existing
+  export path — HTML by default, JSONL with `--jsonl` (or a `.jsonl` path),
+  defaulting to the session-file-derived path for HTML and
+  `cwd/<name>.jsonl` for JSONL.
+- `/share --encrypt [passphrase]` writes a passphrase-encrypted
+  AES-256-GCM `.jsonl.enc` share of the current session (nonce prefix +
+  ciphertext; key = SHA-256(passphrase)), with an optional best-effort
+  secret-gist upload when `gh` is available. The passphrase is never stored
+  or logged.
+- `/queue` shows the pending steering/follow-up prompts (counts plus
+  per-item previews); `/queue cancel` clears them instead of restoring them
+  into the editor. Works in the TUI and the line REPL while a turn streams.
+- The idle composer status line now shows a subtle deterministic `Next:`
+  suggestion (dim, one line, no model calls) derived from state: pending
+  follow-up prompts → `/queue`, an active goal → `/goal`, live workflows →
+  `/workflow list`.
+- Doom-loop recovery: when the same tool fails with the same error three
+  times in a row within a turn, the turn stops with an actionable message
+  (`repeated failure — stopping; try a different approach or /undo`) instead
+  of letting the model retry the failing call forever. Transient
+  network/timeout errors never count toward the threshold.
+- Opt-in Linux filesystem sandbox for the `bash` tool (`settings.sandbox` or
+  the per-call `sandboxed` parameter; default off). Commands run inside
+  `unshare` mount/pid/net namespaces confined to `sandbox.allowedPaths`
+  (default: the working directory plus the agent directory), with
+  `sandbox.deniedPaths` hidden and network off unless `sandbox.network` is
+  true. Same-user confinement, not isolation; requires Linux and `unshare`.
+- Model Context Protocol (MCP) client: session-scoped stdio servers declared
+  under `settings.mcpServers` (Grok-compatible `[mcp_servers.<name>]` shape),
+  the `mcp` tool for server discovery and tool calls, and `rpi mcp list` /
+  `rpi mcp import` (Claude Desktop or Cursor configs) CLI commands. Configured
+  `env` values are never echoed into tool output.
+- Agent Client Protocol (ACP) v1 mode: `rpi agent stdio` (Content-Length
+  framed JSON-RPC on stdin/stdout) and `rpi agent serve` (WebSocket) let
+  ACP-speaking editors embed rpi, with `session/request_permission` approval
+  round trips; rpi authenticates with configured credentials (`rpi-auth`) and
+  never collects secrets over the wire. `agent serve` is loopback-only
+  (plaintext WebSocket; TLS is tracked for a later release).
+- Web chat client: `rpi --listen` serves a self-contained React/TypeScript
+  app at `/web`, inlined into the binary and driving the existing WebSocket
+  control plane through token-gated `/rpc` and `/ws` routes. Browser
+  connections require `--listen-token-file` (DNS-rebinding defense). The
+  listener defaults to loopback. Remote LAN access requires both
+  `--listen-allow-insecure-remote` and `--listen-token-file` together with an
+  explicit `--listen <lan-address>`; rpi prints a startup warning that
+  plaintext HTTP/WebSocket exposes the bearer token and control traffic to
+  passive network observers. Remote deployments should place the listener
+  behind a TLS reverse proxy; this release does not provide TLS on `--listen`.
+  Multi-session authoritative restore and dedicated panels for
+  todo, goal, workflow, session tree, settings, subagent jobs, side chat, and
+  maintenance are implemented.
+- Encrypted live collaboration under `rpi --listen`: AES-256-GCM framed
+  WebSocket relay with HKDF epoch keys, capability-hash subprotocol auth,
+  control/view role links, `collab_start/status/stop` RPC, interactive `/collab`
+  `/join` `/leave` commands in the TUI/REPL, and CLI/browser guest clients.
+  Server-side snapshots and live events are privacy-redacted before guests see
+  them, and the full E2E scenario passes with all control/view/browser guest
+  assertions passing.
+- Persona lifecycle: durable `<scope>/personas/<name>/persona.md` definitions,
+  `/persona` command to create, switch, and manage personas, and persistent
+  per-persona memory and session continuity.
+- In-process QuickJS extension host (`runtime: "quickjs"` manifests) that
+  replaces the Bun subprocess host: async runtime/context, ESM loader,
+  per-runtime memory limits, cancellation, and the existing
+  tools/commands/event-hooks/renderers/provider capabilities.
+- Plugin marketplace: `rpi plugin install|list|remove|update` with directory,
+  tarball, GitHub `owner/repo`, git URL, and `npm:<name>[@<version>]` sources.
+  npm tarballs are verified against the registry's `dist.integrity` sha512
+  digest; installs fail closed when it is missing or mismatched.
+- Host hooks (`settings.hooks`) for `pre_tool_call`, `post_tool_call`,
+  `session_start`, `session_end`, `turn_start`, `turn_end`, and
+  `pre_trust_decision`, plus an extension trust hook that can recommend a
+  trust decision.
+- Memory backends: the local `memory` store and Hindsight-backed
+  `recall`/`retain`/`reflect` tools, injected into model context.
+- Extended tool catalog: LSP (hover/definition/references/diagnostics/
+  symbols/rename/code actions), headless browser, GitHub, DAP debugger, eval,
+  notebook, document conversion (PDF/DOCX/IPYNB), image generation and
+  inspection, ast-grep structural search/rewrite, web search, and the `ask`
+  tool.
+- `rpi doctor` (text and `--json`) installation diagnostics and
+  `rpi config get|set|reset|list` (OMP parity) for inspecting and changing
+  settings from the CLI.
+- Configuration profiles (`--profile`), TOML settings files, environment
+  variable expansion in settings, and scoped per-provider auth keys.
+- Overlayfs isolation backend for workflow checkouts on Linux (`worktree`,
+  `overlayfs`, or `none`).
+- Startup session TTL pruning (`sessionTtlDays`, default 30 days) for
+  untouched native session files.
+- Orchestration soft budgets (`maxRequests`, `maxTokens`, `yieldAfter`) that
+  settle child jobs with a partial result instead of failing, and workflow
+  Todo-DAG ownership (`WorkflowTaskOwnership {workflowId, todoTaskId}`) so
+  concurrent workflows execute owned tasks without cross-workflow collisions.
+- The RPC control plane gained settings-draft, workflow-lifecycle, queue,
+  handoff, snap-compact, rewind, and steering commands.
+
+### Changed
+
+- The standalone `rpi-rpc` companion binary was removed; the JSONL RPC control
+  plane is served by the `rpi rpc` subcommand (≡ `--mode rpc`).
+- JS extensions run in-process via QuickJS instead of a Bun subprocess:
+  Bun-hosted `.ts` fixtures were migrated to `.mjs` manifests with
+  `runtime: "quickjs"`, and the Node/Bun runtime dependency is gone.
+- Todo DAG execution reworked around a coordinator that runs ready tasks,
+  joins on blocked dependencies, and keeps failed/cancelled owners open with
+  idempotent terminal reconciliation; sessions switching away wait for owned
+  orchestration jobs to settle.
+- Natural-language routing: an exact agent mention (`Have <agent> ...`) spawns
+  that agent and wins over overlapping skills; skill-only text never spawns.
+- TUI rework: Todo DAG list/detail views, workflow master/detail panel,
+  subagents panel with job cards, two-pane settings and two-column model
+  selectors, sender → recipient IRC rendering, and rendering fixes (CJK
+  padding, border contrast, sparse cyan palette, scrollback handling, no
+  phantom user-message indent).
+- `/handoff` now produces an English prose briefing (objective, todos, active
+  jobs, recent asks) in addition to the structured envelope.
+- Documentation restructured into an mdBook reference manual under
+  `docs/src/` (including the `architecture.md` reference), and the E2E
+  handbook gained user-scenario and web-client lanes.
+
+### Fixed
+
+- Session recovery: `/rewind` truncates the record file with an archived
+  sidecar and rebuilds goal/todo/transcript state, refusing while prompts,
+  bash, orchestration jobs, or workflows are active; `/snapcompact` fsyncs
+  the snapshot before referencing it; startup TTL pruning no longer breaks
+  fresh recorders.
+- Doom-loop recovery stops a turn after repeated identical tool failures with
+  an actionable message instead of retrying forever; transient network and
+  timeout errors never count toward the threshold.
+- Security: passphrase-encrypted session shares (`/share --encrypt`,
+  AES-256-GCM), scoped auth keys, secret redaction in hook/MCP/extension
+  diagnostics, and fail-closed trust decisions when a `pre_trust_decision`
+  hook errors or times out.
+- Workflow and runtime errors are redacted from user-visible output; hub wait
+  delivery and concurrent provider-registration races resolved; settled
+  orchestration jobs are retained within bounds and interrupted jobs are
+  truthfully marked cancelled on recovery.
+- Mermaid rendering no longer panics on multibyte CJK block keywords;
+  fenced-code frames stream and settle correctly.
+
+### Known limitations
+
+- `npm:` package sources are not implemented for the `rpi install` package
+  manager (the plugin marketplace accepts `npm:` sources via
+  `rpi plugin install`).
+
 ## [0.2.3] - 2026-08-05
 
 ### Added
@@ -11,6 +177,12 @@ All notable changes to `rpi` are documented in this file.
 - Added persistent `/btw` side conversations, interactive host-tool approval,
   the authenticated `--listen` control plane, supervised PTY attachment, Todo
   DAG navigation, and agent management in the TUI.
+- Added the deterministic auto-mode classifier (`selector.autoMode`:
+  `off` | `suggest` | `auto`). It detects code tasks, plain questions, and
+  long-running goals from the prompt; `suggest` shows a status hint
+  (`Detected: code task — /todo to plan`) after the prompt, and `auto`
+  additionally creates and starts a todo DAG for code tasks when
+  orchestration is enabled and no todo list exists.
 - `/workflow create <objective>` now accepts a single objective and uses it as
   the workflow name when no explicit name is provided.
 
@@ -140,7 +312,10 @@ All notable changes to `rpi` are documented in this file.
 
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
+- `npm:` package sources are not implemented; attempting to install one fails
+  with a clear error.
 
+[0.2.4]: https://github.com/0x8f701/rpi/releases/tag/v0.2.4
 [0.2.3]: https://github.com/0x8f701/rpi/releases/tag/v0.2.3
 [0.2.2]: https://github.com/0x8f701/rpi/releases/tag/v0.2.2
 [0.2.1]: https://github.com/0x8f701/rpi/releases/tag/v0.2.1

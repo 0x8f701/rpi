@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use pi_agent::AgentEvent;
 use pi_ai::{AssistantMessageEvent, Message};
 use pi_coding::{Application, ApplicationEvent, SessionEvent};
+use pi_coding::redact::redact_secrets;
 use pi_coding::markdown::{
     MarkdownRenderOptions, StreamingMarkdownRenderer, render_markdown,
     render_markdown_streaming,
@@ -323,7 +324,9 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
     }
 
     fn write_styled_line(&mut self, style: &str, text: &str) -> io::Result<()> {
-        let text = sanitize_terminal_text(text);
+        // Status/error lines may embed provider or tool diagnostics that echo
+        // tokens; redact obvious credential shapes before they reach stdout.
+        let text = sanitize_terminal_text(&redact_secrets(text));
         if self.ansi {
             write!(self.writer, "{style}{text}{RESET}\n")?;
         } else {
@@ -336,7 +339,11 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
 
     fn append_assistant_markdown(&mut self, text: &str) {
         let mut sanitized = String::with_capacity(text.len());
-        sanitize_terminal_chunk(text, &mut self.untrusted_state, &mut sanitized);
+        sanitize_terminal_chunk(
+            &redact_secrets(text),
+            &mut self.untrusted_state,
+            &mut sanitized,
+        );
         self.assistant_markdown.push_str(&sanitized);
     }
 
@@ -350,7 +357,7 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
     }
 
     fn write_markdown(&mut self, text: &str) -> io::Result<()> {
-        let sanitized = sanitize_terminal_text(text);
+        let sanitized = sanitize_terminal_text(&redact_secrets(text));
         let rendered = render_markdown(
             &sanitized,
             &MarkdownRenderOptions {
@@ -363,7 +370,11 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
 
     fn write_untrusted(&mut self, text: &str) -> io::Result<()> {
         let mut sanitized = String::with_capacity(text.len());
-        sanitize_terminal_chunk(text, &mut self.untrusted_state, &mut sanitized);
+        sanitize_terminal_chunk(
+            &redact_secrets(text),
+            &mut self.untrusted_state,
+            &mut sanitized,
+        );
         self.write_trusted_raw(&sanitized)
     }
 
@@ -922,6 +933,56 @@ mod tests {
             }))
             .expect("render bash bytes");
         assert_eq!(output, b"\x1b[31muser-red\x1b[0m");
+    }
+
+    #[test]
+    fn print_mode_redacts_credential_shapes_but_keeps_plain_text() {
+        let ghp = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let sk = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::new(&mut output, false);
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: assistant(&format!("deploy with {ghp} and token=abc123")),
+            }))
+            .expect("render assistant text");
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+                tool_call_id: "t".into(),
+                tool_name: "bash".into(),
+                arguments: json!({"command": "curl -H 'Authorization: Bearer xyz789' api"}),
+            }))
+            .expect("render tool line");
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageUpdate {
+                message: assistant(""),
+                assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                    content_index: 0,
+                    delta: format!("thinking about {sk}").into(),
+                    partial: partial(),
+                },
+            }))
+            .expect("render thinking");
+        drop(renderer);
+        let text = String::from_utf8(output).expect("utf8");
+        for leaked in [ghp.as_str(), "abc123", "xyz789", sk.as_str()] {
+            assert!(!text.contains(leaked), "{leaked:?} leaked into print mode: {text}");
+        }
+        assert_eq!(text.matches("[REDACTED]").count(), 4);
+    }
+
+    #[test]
+    fn print_mode_leaves_plain_text_unchanged() {
+        let mut output = Vec::new();
+        HumanEventRenderer::new(&mut output, false)
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: assistant("ordinary prose without secrets"),
+            }))
+            .expect("render");
+        assert_eq!(
+            String::from_utf8(output).expect("utf8"),
+            "ordinary prose without secrets"
+        );
     }
 
     #[test]

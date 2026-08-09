@@ -5,6 +5,7 @@
 //! atomic settings writes.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -38,6 +39,18 @@ pub(crate) struct AgentPanelRow {
     /// Present when settings model resolution failed (invalid override).
     pub model_error: Option<String>,
     pub definition: AgentDefinition,
+    /// Whether this row is a durable persona (vs an ordinary agent).
+    pub is_persona: bool,
+    /// Bounded one-line persona contract summary (empty for agents).
+    pub persona_summary: String,
+    /// Persona local-memory entry count (None for agents or unreadable state).
+    pub memory_entries: Option<usize>,
+    /// Persona transcript archive count (None for agents or unreadable state).
+    pub transcript_count: Option<usize>,
+    /// Set when persona state counting hit a symlink/non-regular file.
+    pub state_error: Option<String>,
+    /// Whether this row is the currently preferred agent for unnamed spawns.
+    pub preferred: bool,
 }
 
 /// Result of a key press handled by the panel.
@@ -69,6 +82,8 @@ pub(crate) struct AgentsPanel {
     effective_baseline: BTreeMap<String, AgentRuntimeSettings>,
     parent_model: Model,
     status: String,
+    /// Currently preferred agent name (for marking persona/agent selection).
+    preferred: Option<String>,
 }
 
 impl AgentsPanel {
@@ -104,6 +119,7 @@ impl AgentsPanel {
             effective_baseline: effective_agents.clone(),
             parent_model,
             status: "Global settings · Enter toggle · m model · Ctrl+S save · Esc close".to_owned(),
+            preferred: None,
         };
         panel.rebuild_rows(definitions);
         panel
@@ -125,13 +141,15 @@ impl AgentsPanel {
             .resource_manager()
             .map(|resources| resources.settings_manager().global_settings().agents)
             .unwrap_or_default();
-        Ok(Self::new_with_effective(
+        let mut panel = Self::new_with_effective(
             snapshot.agents.clone(),
             &global_agents,
             &snapshot.settings.agents,
             parent_model,
             available_models,
-        ))
+        );
+        panel.set_preferred(preferred_agent(application));
+        Ok(panel)
     }
 
     #[must_use]
@@ -202,7 +220,7 @@ impl AgentsPanel {
             return;
         }
         let count = self.rows.len();
-        self.selected = self.selected.saturating_add_signed(delta).min(count - 1);
+        self.selected = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
     }
 
     pub(crate) fn move_models(&mut self, delta: isize) {
@@ -211,10 +229,7 @@ impl AgentsPanel {
             self.model_selected = 0;
             return;
         }
-        self.model_selected = self
-            .model_selected
-            .saturating_add_signed(delta)
-            .min(count - 1);
+        self.model_selected = (self.model_selected as isize + delta).rem_euclid(count as isize) as usize;
     }
 
     pub(crate) fn toggle_selected_enabled(&mut self) {
@@ -459,6 +474,13 @@ impl AgentsPanel {
         }
     }
 
+    /// Update the currently preferred agent (e.g. after `/role --select` or a
+    /// reload) and refresh the per-row selection markers.
+    pub(crate) fn set_preferred(&mut self, preferred: Option<String>) {
+        self.preferred = preferred;
+        self.rebuild_rows_from_existing();
+    }
+
     /// Refresh definition metadata after `/reload` while preserving pending edits.
     ///
     /// `disk_settings` must be the **global** agents map (not project-merged).
@@ -528,6 +550,16 @@ impl AgentsPanel {
                         )
                     }
                 };
+                let is_persona = definition.is_persona();
+                let (persona_summary, memory_entries, transcript_count, state_error) =
+                    if is_persona {
+                        let summary = persona_contract_summary(&definition);
+                        let counts = persona_state_counts(definition.persona_root());
+                        (summary, counts.memory_entries, counts.transcript_count, counts.error)
+                    } else {
+                        (String::new(), None, None, None)
+                    };
+                let preferred = self.preferred.as_deref() == Some(definition.name.as_str());
                 AgentPanelRow {
                     name: definition.name.clone(),
                     description: definition.description.clone(),
@@ -551,6 +583,12 @@ impl AgentsPanel {
                     },
                     model_error,
                     definition,
+                    is_persona,
+                    persona_summary,
+                    memory_entries,
+                    transcript_count,
+                    state_error,
+                    preferred,
                 }
             })
             .collect();
@@ -573,22 +611,45 @@ impl AgentsPanel {
                 .iter()
                 .enumerate()
                 .map(|(index, row)| {
-                    let marker = if row.enabled { "ON " } else { "OFF" };
-                    let source_tier = if row.model_error.is_some() {
-                        "INVALID"
+                    let text = if row.is_persona {
+                        let selection = if row.preferred { "*" } else { " " };
+                        let counts = match &row.state_error {
+                            Some(error) => format!("state=ERR({})", truncate_count_error(error)),
+                            None => format!(
+                                "mem={} sessions={}",
+                                row.memory_entries.unwrap_or(0),
+                                row.transcript_count.unwrap_or(0)
+                            ),
+                        };
+                        format!(
+                            "{selection} P {:<16} {:<8} {} · {}",
+                            row.name,
+                            source_label(row.source),
+                            if row.persona_summary.is_empty() {
+                                "(default contract)"
+                            } else {
+                                row.persona_summary.as_str()
+                            },
+                            counts,
+                        )
                     } else {
-                        model_source_label(row.model_source)
+                        let marker = if row.enabled { "ON " } else { "OFF" };
+                        let source_tier = if row.model_error.is_some() {
+                            "INVALID"
+                        } else {
+                            model_source_label(row.model_source)
+                        };
+                        format!(
+                            "{marker} {:<16} {:<8} model={} ({}) think={} tools={} skills={}",
+                            row.name,
+                            source_label(row.source),
+                            row.effective_model,
+                            source_tier,
+                            row.thinking,
+                            row.tools,
+                            row.skills,
+                        )
                     };
-                    let text = format!(
-                        "{marker} {:<16} {:<8} model={} ({}) think={} tools={} skills={}",
-                        row.name,
-                        source_label(row.source),
-                        row.effective_model,
-                        source_tier,
-                        row.thinking,
-                        row.tools,
-                        row.skills,
-                    );
                     AgentsPanelViewLine {
                         selected: index == self.selected,
                         text,
@@ -682,6 +743,177 @@ fn model_source_label(source: AgentModelSource) -> &'static str {
     }
 }
 
+/// Upper bound for persona state counts so a runaway dir never stalls the panel.
+const PERSONA_COUNT_BOUND: usize = 9_999;
+
+/// Bounded persona contract summary for one panel row.
+fn persona_contract_summary(definition: &AgentDefinition) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(
+        if definition
+            .personality
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            "personality:present".to_owned()
+        } else {
+            "personality:absent".to_owned()
+        },
+    );
+    if let Some(budget) = &definition.soft_budget {
+        let mut budget_parts: Vec<String> = Vec::new();
+        if let Some(value) = budget.max_requests {
+            budget_parts.push(format!("maxRequests:{value}"));
+        }
+        if let Some(value) = budget.max_tokens {
+            budget_parts.push(format!("maxTokens:{value}"));
+        }
+        if let Some(value) = budget.yield_after {
+            budget_parts.push(format!("yieldAfter:{value}"));
+        }
+        if !budget_parts.is_empty() {
+            parts.push(format!("softBudget:{}", budget_parts.join(",")));
+        }
+    }
+    if let Some(value) = definition.max_turns {
+        parts.push(format!("maxTurns:{value}"));
+    }
+    if let Some(value) = definition.max_tool_calls {
+        parts.push(format!("maxToolCalls:{value}"));
+    }
+    if let Some(value) = definition.timeout_secs {
+        parts.push(format!("timeoutSecs:{value}"));
+    }
+    if let Some(models) = &definition.model {
+        if !models.is_empty() {
+            parts.push(format!("model:{}", models.join(",")));
+        }
+    }
+    parts.join(" ")
+}
+
+/// Persona local-memory and transcript counts. Missing state is tolerated
+/// (returns 0); symlinked or non-regular state reports an error instead of
+/// being followed.
+#[derive(Clone, Debug, Default)]
+struct PersonaStateCounts {
+    memory_entries: Option<usize>,
+    transcript_count: Option<usize>,
+    error: Option<String>,
+}
+
+fn persona_state_counts(root: Option<PathBuf>) -> PersonaStateCounts {
+    let Some(root) = root else {
+        return PersonaStateCounts::default();
+    };
+    let memory = count_persona_memory(&root.join("memory").join("entries.jsonl"));
+    let (memory_entries, error) = match memory {
+        Ok(count) => (Some(count), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    if error.is_some() {
+        return PersonaStateCounts {
+            memory_entries,
+            transcript_count: None,
+            error,
+        };
+    }
+    let transcripts = count_persona_transcripts(&root.join("sessions"));
+    let (transcript_count, error) = match transcripts {
+        Ok(count) => (Some(count), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    PersonaStateCounts {
+        memory_entries,
+        transcript_count,
+        error,
+    }
+}
+fn count_persona_memory(path: &Path) -> Result<usize> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("persona memory is a symlink");
+            }
+            if !meta.is_file() {
+                anyhow::bail!("persona memory is not a regular file");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    }
+    let file = std::fs::File::open(path).with_context(|| format!("opening persona memory {}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    use std::io::BufRead;
+    let mut count = 0;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("reading persona memory {}", path.display()))?;
+        if !line.trim().is_empty() {
+            count += 1;
+            if count >= PERSONA_COUNT_BOUND {
+                break;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn count_persona_transcripts(dir: &Path) -> Result<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut count = 0;
+    for entry in entries {
+        let entry = entry?;
+        let meta = std::fs::symlink_metadata(entry.path())?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("persona transcript is a symlink");
+        }
+        if !meta.is_file() {
+            anyhow::bail!("persona transcript is not a regular file");
+        }
+        if entry.file_name().to_string_lossy().ends_with(".jsonl") {
+            count += 1;
+            if count >= PERSONA_COUNT_BOUND {
+                break;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn truncate_count_error(error: &str) -> String {
+    let bound = 48;
+    if error.len() <= bound {
+        error.to_owned()
+    } else {
+        format!("{}…", &error[..bound])
+    }
+}
+
+/// Resolve the currently preferred agent name (runtime preference, then the
+/// persisted settings value). `None` when nothing is preferred.
+pub(crate) fn preferred_agent(application: &Application) -> Option<String> {
+    if let Some(name) = application
+        .orchestration_runtime()
+        .and_then(|runtime| runtime.preferred_agent())
+    {
+        return Some(name);
+    }
+    application
+        .settings_manager()
+        .ok()
+        .and_then(|manager| {
+            manager
+                .settings()
+                .orchestration
+                .as_ref()
+                .and_then(|orchestration| orchestration.preferred_agent.clone())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,18 +931,20 @@ mod tests {
     }
 
     fn definition(name: &str, models: Option<Vec<&str>>) -> AgentDefinition {
-        AgentDefinition {
-            name: name.to_owned(),
-            description: format!("{name} does work"),
-            system_prompt: "prompt".to_owned(),
-            tools: Some(vec!["read".to_owned(), "bash".to_owned()]),
-            autoload_skills: vec!["rust".to_owned()],
-            model: models.map(|values| values.into_iter().map(str::to_owned).collect()),
-            thinking_level: Some(ThinkingLevel::Medium),
-            source: AgentDefinitionSource::User,
-            path: None,
-            trusted: true,
-        }
+        AgentDefinition { name: name.to_owned(),
+        description: format!("{name} does work"),
+        system_prompt: "prompt".to_owned(),
+        tools: Some(vec!["read".to_owned(), "bash".to_owned()]),
+        autoload_skills: vec!["rust".to_owned()],
+        model: models.map(|values| values.into_iter().map(str::to_owned).collect()),
+        thinking_level: Some(ThinkingLevel::Medium),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::User,
+        path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
     }
 
     #[test]
@@ -1097,5 +1331,228 @@ mod tests {
             panel.visible_model_ids(),
             vec!["google/gemini-2.5-pro".to_owned()]
         );
+    }
+
+    #[test]
+    fn move_list_and_models_wrap_around() {
+        let parent = model("openai", "gpt-4.1");
+        let available = vec![
+            model("openai", "gpt-4.1"),
+            model("anthropic", "claude-sonnet-4-5"),
+            model("google", "gemini-2.5-pro"),
+        ];
+        let mut panel = AgentsPanel::new(
+            vec![
+                definition("one", None),
+                definition("two", None),
+                definition("three", None),
+            ],
+            &BTreeMap::new(),
+            parent,
+            available,
+        );
+        assert_eq!(panel.rows().len(), 3);
+        // Down past the end returns to the first row.
+        panel.move_list(3);
+        assert_eq!(panel.selected(), 0);
+        assert_eq!(panel.selected_row().unwrap().name, "one");
+        panel.move_list(1);
+        assert_eq!(panel.selected(), 1);
+        assert_eq!(panel.selected_row().unwrap().name, "two");
+        // Up from the first row wraps to the last.
+        panel.move_list(-2);
+        assert_eq!(panel.selected(), 2);
+        assert_eq!(panel.selected_row().unwrap().name, "three");
+        // Model picker wraps within its visible choices.
+        panel.open_model_picker();
+        assert_eq!(panel.visible_model_ids().len(), 3);
+        panel.move_models(3);
+        assert_eq!(panel.model_selected(), 0);
+        panel.move_models(-1);
+        assert_eq!(panel.model_selected(), 2);
+        // A single-row list stays put in both directions.
+        let mut single = AgentsPanel::new(
+            vec![definition("solo", None)],
+            &BTreeMap::new(),
+            model("openai", "gpt-4.1"),
+            vec![model("openai", "gpt-4.1")],
+        );
+        single.move_list(5);
+        assert_eq!(single.selected(), 0);
+        single.move_list(-5);
+        assert_eq!(single.selected(), 0);
+        single.open_model_picker();
+        single.move_models(5);
+        assert_eq!(single.model_selected(), 0);
+        single.move_models(-5);
+        assert_eq!(single.model_selected(), 0);
+    }
+    fn persona_definition(
+        name: &str,
+        root: &Path,
+        personality: Option<&str>,
+        soft_budget: Option<pi_coding::JobSoftBudget>,
+        max_turns: Option<usize>,
+    ) -> AgentDefinition {
+        AgentDefinition {
+            name: name.to_owned(),
+            description: format!("{name} persona"),
+            system_prompt: "prompt".to_owned(),
+            tools: None,
+            autoload_skills: Vec::new(),
+            model: None,
+            thinking_level: None,
+            max_turns,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
+            source: AgentDefinitionSource::User,
+            path: Some(root.join("persona.md")),
+            trusted: true,
+            kind: pi_coding::AgentDefinitionKind::Persona,
+            personality: personality.map(str::to_owned),
+            soft_budget,
+        }
+    }
+
+    fn persona_panel_with(definition: AgentDefinition) -> AgentsPanel {
+        AgentsPanel::new(
+            vec![definition],
+            &BTreeMap::new(),
+            model("openai", "gpt-4.1"),
+            vec![model("openai", "gpt-4.1")],
+        )
+    }
+
+    fn persona_view_line(panel: &AgentsPanel, name: &str) -> String {
+        panel
+            .view_lines()
+            .into_iter()
+            .find(|line| line.text.contains(name))
+            .unwrap_or_else(|| panic!("no panel line for {name}"))
+            .text
+    }
+
+    #[test]
+    fn persona_panel_row_renders_source_summary_and_counts() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("memory")).unwrap();
+        std::fs::create_dir_all(root.path().join("sessions")).unwrap();
+        std::fs::write(
+            root.path().join("memory").join("entries.jsonl"),
+            "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("sessions").join("a.jsonl"), "{}\n").unwrap();
+        std::fs::write(root.path().join("sessions").join("b.jsonl"), "{}\n").unwrap();
+        let def = persona_definition(
+            "mentor",
+            root.path(),
+            Some("steady mentor"),
+            Some(pi_coding::JobSoftBudget {
+                max_requests: Some(4),
+                ..Default::default()
+            }),
+            Some(8),
+        );
+        let panel = persona_panel_with(def);
+        let line = persona_view_line(&panel, "mentor");
+        assert!(line.contains("P "), "persona marker: {line}");
+        assert!(line.contains("user"), "source marker: {line}");
+        assert!(line.contains("personality:present"), "{line}");
+        assert!(line.contains("softBudget:maxRequests:4"), "{line}");
+        assert!(line.contains("maxTurns:8"), "{line}");
+        assert!(line.contains("mem=3"), "memory count: {line}");
+        assert!(line.contains("sessions=2"), "transcript count: {line}");
+    }
+
+    #[test]
+    fn persona_panel_counts_tolerate_missing_state() {
+        let root = tempdir().unwrap();
+        let def = persona_definition("scout", root.path(), None, None, None);
+        let panel = persona_panel_with(def);
+        let line = persona_view_line(&panel, "scout");
+        assert!(line.contains("mem=0"), "missing memory tolerated: {line}");
+        assert!(line.contains("sessions=0"), "missing sessions tolerated: {line}");
+        assert!(line.contains("personality:absent"), "{line}");
+    }
+
+    #[test]
+    fn persona_panel_counts_bounded_for_large_state() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("memory")).unwrap();
+        std::fs::create_dir_all(root.path().join("sessions")).unwrap();
+        let big = "{\"x\":1}\n".repeat(20_000);
+        std::fs::write(root.path().join("memory").join("entries.jsonl"), big).unwrap();
+        let def = persona_definition("big", root.path(), None, None, None);
+        let panel = persona_panel_with(def);
+        let line = persona_view_line(&panel, "big");
+        assert!(
+            line.contains(&format!("mem={}", PERSONA_COUNT_BOUND)),
+            "count is bounded: {line}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persona_panel_counts_error_on_symlinked_memory() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("memory")).unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("leak.jsonl"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("leak.jsonl"),
+            root.path().join("memory").join("entries.jsonl"),
+        )
+        .unwrap();
+        let def = persona_definition("sneaky", root.path(), None, None, None);
+        let panel = persona_panel_with(def);
+        let line = persona_view_line(&panel, "sneaky");
+        assert!(line.contains("state=ERR"), "symlinked memory reported: {line}");
+        assert!(!line.contains("secret"), "no leak via symlink: {line}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persona_panel_counts_error_on_symlinked_transcript() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("sessions")).unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("leak.jsonl"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("leak.jsonl"),
+            root.path().join("sessions").join("run-1.jsonl"),
+        )
+        .unwrap();
+        let def = persona_definition("sneaky", root.path(), None, None, None);
+        let panel = persona_panel_with(def);
+        let line = persona_view_line(&panel, "sneaky");
+        assert!(line.contains("state=ERR"), "symlinked transcript reported: {line}");
+        assert!(!line.contains("secret"), "no leak via symlink: {line}");
+    }
+
+    #[test]
+    fn persona_panel_counts_error_on_nonregular_transcript() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("sessions")).unwrap();
+        std::fs::create_dir_all(root.path().join("sessions").join("stray")).unwrap();
+        let def = persona_definition("odd", root.path(), None, None, None);
+        let panel = persona_panel_with(def);
+        let line = persona_view_line(&panel, "odd");
+        assert!(line.contains("state=ERR"), "non-regular transcript reported: {line}");
+    }
+
+    #[test]
+    fn persona_panel_selection_marker_shows_preferred() {
+        let root = tempdir().unwrap();
+        let def = persona_definition("mentor", root.path(), Some("steady"), None, None);
+        let mut panel = persona_panel_with(def);
+        assert!(!persona_view_line(&panel, "mentor").starts_with('*'));
+        panel.set_preferred(Some("mentor".to_owned()));
+        let line = persona_view_line(&panel, "mentor");
+        assert!(line.starts_with("* P"), "preferred persona marked: {line}");
+        panel.set_preferred(None);
+        assert!(!persona_view_line(&panel, "mentor").starts_with('*'));
     }
 }

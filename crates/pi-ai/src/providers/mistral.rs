@@ -116,6 +116,7 @@ pub fn register_mistral() {
             api: API_MISTRAL_CONVERSATIONS.into(),
             stream: native,
             stream_simple: simple,
+            generate_image: None,
         },
         None,
     );

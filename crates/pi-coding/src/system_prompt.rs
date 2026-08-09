@@ -141,10 +141,10 @@ rpi documentation (read only when the user asks about rpi itself, its SDK, exten
 - Main documentation: {readme_path}\n\
 - Additional docs: {docs_path}\n\
 - Examples: {examples_path} (extensions, custom tools, SDK)\n\
-- When reading rpi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n\
-- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), rpi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n\
+- When reading rpi docs or examples, resolve docs/src/... under Additional docs and examples/... under Examples, not the current working directory\n\
+- When asked about: extensions (docs/src/reference/extensions.md, examples/process_extension.md), themes (docs/src/user-guide/tui.md), skills (docs/src/reference/skills.md), prompt templates (docs/src/reference/prompt-templates.md), TUI components (docs/src/user-guide/tui.md), keybindings (docs/src/user-guide/tui.md), SDK integrations (examples/README.md), custom providers (docs/src/user-guide/models.md), adding models (docs/src/user-guide/models.md), rpi packages (docs/src/reference/packages.md), environment variables (docs/src/reference/environment-variables.md)\n\
 - When working on rpi topics, read the docs and examples, and follow .md cross-references before implementing\n\
-- Always read rpi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
+- Always read rpi .md files completely and follow links to related docs (e.g., docs/src/user-guide/tui.md for TUI API details)",
     );
 
     let mut prompt = format!(

@@ -5,7 +5,10 @@ use futures_util::FutureExt;
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 // OpenAI Responses rejects max_output_tokens below this floor (#6265).
@@ -28,6 +31,18 @@ pub struct OpenAIResponsesOptions {
     pub service_tier: Option<String>,
     /// Responses API tool_choice param, sent verbatim when set.
     pub tool_choice: Option<Value>,
+    /// Opt-in stateful turn chaining. When enabled (with a non-empty
+    /// `stream.session_id`), the provider stores the response id per session
+    /// and sends it as `previous_response_id` on the next turn, sending only
+    /// the new input items instead of the full conversation history. The
+    /// chain breaks (falls back to full history) after consecutive failures
+    /// or when the session transcript is replaced (see
+    /// [`reset_responses_chain`]). While enabled, every response is stored
+    /// server-side (`store: true`) — both the initial response that seeds the
+    /// chain and each chained response — because the provider must be able to
+    /// resolve `previous_response_id` from its stored responses. Stateless
+    /// mode (`store: false`) never chains.
+    pub responses_stateful_chain: bool,
 }
 
 impl From<StreamOptions> for OpenAIResponsesOptions {
@@ -36,6 +51,139 @@ impl From<StreamOptions> for OpenAIResponsesOptions {
             stream,
             ..Default::default()
         }
+    }
+}
+
+// ---- stateful turn chaining (previous_response_id) ----
+
+/// Consecutive chained-request failures (non-2xx status or stream error)
+/// after which the stored previous response id is dropped and the next
+/// request sends the full conversation history again. Mirrors the upstream
+/// stale-chain fallback behavior. User cancellations are not failures and
+/// never advance this counter: an aborted turn keeps the chain intact so the
+/// next turn can continue from the last valid response id.
+const RESPONSES_CHAIN_MAX_FAILURES: u32 = 3;
+
+/// Maximum number of distinct session chains kept in process memory. A
+/// long-lived daemon must not leak one entry per abandoned session id; once
+/// the map is at capacity the least-recently-used chain is evicted. An
+/// evicted chain simply restarts from the full conversation history on its
+/// next request — the same fallback a session resumed from disk takes.
+const RESPONSES_CHAINS_MAX: usize = 128;
+
+/// Monotonic tick backing least-recently-used eviction of
+/// [`RESPONSES_CHAINS`]. Overflow is irrelevant for a process-lifetime
+/// counter.
+static RESPONSES_CHAIN_TICK: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Default)]
+struct ResponsesChainState {
+    previous_response_id: Option<String>,
+    consecutive_failures: u32,
+    /// Monotonic last-access tick; the least-recently-used entry is evicted
+    /// first when [`RESPONSES_CHAINS`] is at capacity.
+    last_used: u64,
+}
+
+/// Per-session chain state for the Responses API `previous_response_id`
+/// feature, keyed by `StreamOptions.session_id`. Kept in process memory,
+/// bounded to [`RESPONSES_CHAINS_MAX`] entries with least-recently-used
+/// eviction: a session resumed from disk starts a fresh chain, which is
+/// correct because the stored id would not match a foreign transcript.
+static RESPONSES_CHAINS: LazyLock<parking_lot::Mutex<HashMap<String, ResponsesChainState>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Insert `state` for `session_id`, keeping the map bounded: when it is at
+/// capacity and `session_id` is new, the least-recently-used entry is evicted
+/// first. Returns the evicted session id, if any.
+fn insert_responses_chain(
+    chains: &mut HashMap<String, ResponsesChainState>,
+    session_id: String,
+    state: ResponsesChainState,
+) -> Option<String> {
+    let mut evicted = None;
+    if !chains.contains_key(&session_id) && chains.len() >= RESPONSES_CHAINS_MAX {
+        evicted = chains
+            .iter()
+            .min_by_key(|(_, state)| state.last_used)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = evicted.as_ref() {
+            chains.remove(id);
+        }
+    }
+    chains.insert(session_id, state);
+    evicted
+}
+
+fn responses_chain(session_id: &str) -> ResponsesChainState {
+    let mut chains = RESPONSES_CHAINS.lock();
+    let Some(state) = chains.get_mut(session_id) else {
+        return ResponsesChainState::default();
+    };
+    state.last_used = RESPONSES_CHAIN_TICK.fetch_add(1, Ordering::Relaxed);
+    state.clone()
+}
+
+/// Record a successful chained response for a session.
+///
+/// `#[doc(hidden)]`: an observability seam used by the session layer's rewind
+/// tests to seed a chain id and verify `reset_responses_chain` applied.
+#[doc(hidden)]
+pub fn responses_chain_note_success(session_id: &str, response_id: &str) {
+    insert_responses_chain(
+        &mut RESPONSES_CHAINS.lock(),
+        session_id.to_string(),
+        ResponsesChainState {
+            previous_response_id: Some(response_id.to_string()),
+            consecutive_failures: 0,
+            last_used: RESPONSES_CHAIN_TICK.fetch_add(1, Ordering::Relaxed),
+        },
+    );
+}
+
+/// Record a failed chained request. After [`RESPONSES_CHAIN_MAX_FAILURES`]
+/// consecutive failures the stored previous response id is dropped so the
+/// next request falls back to the full conversation history.
+fn responses_chain_note_failure(session_id: &str) {
+    let mut chains = RESPONSES_CHAINS.lock();
+    let Some(state) = chains.get_mut(session_id) else {
+        return;
+    };
+    if state.previous_response_id.is_none() {
+        return;
+    }
+    state.consecutive_failures += 1;
+    state.last_used = RESPONSES_CHAIN_TICK.fetch_add(1, Ordering::Relaxed);
+    if state.consecutive_failures >= RESPONSES_CHAIN_MAX_FAILURES {
+        chains.remove(session_id);
+    }
+}
+
+/// Drop the stateful Responses chain for `session_id` so the next request
+/// sends the full conversation history again. Called when a session transcript
+/// is compacted or otherwise replaced wholesale — the stored response id would
+/// reference a conversation that no longer matches the transcript.
+pub fn reset_responses_chain(session_id: &str) {
+    RESPONSES_CHAINS.lock().remove(session_id);
+}
+
+/// Read the stored chained response id for a session, if any.
+///
+/// `#[doc(hidden)]`: an observability seam used by the session layer's rewind
+/// tests to verify the chain was reset after a transcript replacement.
+#[doc(hidden)]
+pub fn responses_chain_previous_id(session_id: &str) -> Option<String> {
+    responses_chain(session_id).previous_response_id
+}
+
+/// Messages that are new since the previous chained response: everything
+/// after the last assistant message. rpi appends the user message or tool
+/// results before each model call, so the trailing slice is never the whole
+/// transcript once a chain exists.
+fn chained_input_messages(messages: &[Message]) -> &[Message] {
+    match messages.iter().rposition(|m| matches!(m, Message::Assistant(_))) {
+        Some(last_assistant) => &messages[last_assistant + 1..],
+        None => messages,
     }
 }
 
@@ -51,6 +199,7 @@ pub fn register_openai_responses() {
             stream_simple: Arc::new(|m, c, o| {
                 async move { stream_simple_openai_responses(m, c, o) }.boxed()
             }),
+            generate_image: None,
         },
         None,
     );
@@ -85,6 +234,7 @@ pub(crate) fn build_simple_responses_options(
     OpenAIResponsesOptions {
         stream,
         reasoning_effort,
+        responses_stateful_chain: opts.responses_stateful_chain,
         ..Default::default()
     }
 }
@@ -142,6 +292,27 @@ pub fn stream_openai_responses(
     let s = stream.clone();
     tokio::spawn(async move {
         let mut out = AssistantMessage::pending(&model);
+
+        // Stateful chaining is per session: a stored previous response id is
+        // looked up at request-build time, refreshed on success, and dropped
+        // after consecutive failures so the next turn sends full history.
+        let chain_session = opts
+            .responses_stateful_chain
+            .then(|| opts.stream.session_id.clone())
+            .flatten();
+        let note_chain_failure = || {
+            // User cancellation is not a provider/transport failure: it must
+            // not count toward the stale-chain threshold (three aborts must
+            // not evict a valid previous_response_id) nor mark the chain
+            // stale. Only real non-2xx/stream/transport failures advance the
+            // counter.
+            if common::is_aborted(&opts.stream) {
+                return;
+            }
+            if let Some(session_id) = chain_session.as_deref() {
+                responses_chain_note_failure(session_id);
+            }
+        };
 
         let key = match responses_api_key(&model, &opts.stream) {
             Ok(key) => key,
@@ -213,15 +384,18 @@ pub fn stream_openai_responses(
         {
             Ok(r) => r,
             Err(e) => {
+                note_chain_failure();
                 common::fail(&s, out, e.to_string(), common::is_aborted(&opts.stream)).await;
                 return;
             }
         };
         if let Err(e) = common::notify_response(&opts.stream, &resp, &model).await {
+            note_chain_failure();
             common::fail(&s, out, e.to_string(), false).await;
             return;
         }
         if !resp.status().is_success() {
+            note_chain_failure();
             let (msg, aborted) =
                 match common::error_body("OpenAI Responses", resp, &opts.stream).await {
                     Ok(m) => (m, common::is_aborted(&opts.stream)),
@@ -266,14 +440,17 @@ pub fn stream_openai_responses(
         let _ = drainer.await;
 
         if let Err(e) = stream_err {
+            note_chain_failure();
             common::fail(&s, out, e.to_string(), common::is_aborted(&opts.stream)).await;
             return;
         }
         if common::is_aborted(&opts.stream) {
+            note_chain_failure();
             common::fail(&s, out, "Request was aborted".to_string(), true).await;
             return;
         }
         if !state.saw_terminal {
+            note_chain_failure();
             common::fail(
                 &s,
                 out,
@@ -284,6 +461,7 @@ pub fn stream_openai_responses(
             return;
         }
         if out.stop_reason == StopReason::Pending {
+            note_chain_failure();
             common::fail(
                 &s,
                 out,
@@ -294,10 +472,18 @@ pub fn stream_openai_responses(
             return;
         }
         if out.stop_reason == StopReason::Error || out.stop_reason == StopReason::Aborted {
+            note_chain_failure();
             common::fail(&s, out, "An unknown error occurred".to_string(), false).await;
             return;
         }
         state.materialize(&mut out);
+        // Successful response: the chain advances to the new response id so the
+        // next turn can continue from it instead of resending full history.
+        if let Some(session_id) = chain_session.as_deref() {
+            if let Some(response_id) = out.response_id.as_deref() {
+                responses_chain_note_success(session_id, response_id);
+            }
+        }
         s.push(AssistantMessageEvent::Done {
             reason: out.stop_reason,
             message: out.clone(),
@@ -371,19 +557,55 @@ pub(crate) fn build_responses_params(
 ) -> Result<Value> {
     let compat = get_responses_compat(model);
     let placement = split_deferred_tools(&req.tools, &req.messages, compat.supports_tool_search);
-    let transformed = transform_messages(&req.messages, model, normalize_responses_tool_call_id);
+    // Stateful chaining: with a known previous response id and new input
+    // items, continue the server-side conversation instead of resending full
+    // history. The system prompt is not carried over chained responses, so it
+    // is re-sent as the `instructions` param. An empty delta (transcript ends
+    // with an assistant message) falls back to full history.
+    let session_id = opts.stream.session_id.as_deref().filter(|s| !s.is_empty());
+    let chain_previous: Option<String> = opts
+        .responses_stateful_chain
+        .then(|| session_id.and_then(|sid| responses_chain(sid).previous_response_id))
+        .flatten();
+    let chained_delta = chained_input_messages(&req.messages);
+    let chaining = chain_previous.is_some() && !chained_delta.is_empty();
+    let transformed = transform_messages(
+        if chaining {
+            chained_delta
+        } else {
+            &req.messages
+        },
+        model,
+        normalize_responses_tool_call_id,
+    );
     let input = convert_input(
         model,
         req,
         &transformed,
         &placement.deferred_by_name,
         &compat,
+        chaining,
     )?;
     let mut params = serde_json::Map::new();
     params.insert("model".into(), json!(model.id));
+    if let Some(previous) = chain_previous.filter(|_| chaining) {
+        params.insert("previous_response_id".into(), json!(previous));
+        if !req.system_prompt.is_empty() {
+            params.insert("instructions".into(), json!(req.system_prompt));
+        }
+    }
     params.insert("input".into(), input);
     params.insert("stream".into(), json!(true));
-    params.insert("store".into(), json!(false));
+    // Stateful chaining references the stored previous response id on the next
+    // turn, so every response produced while chaining is enabled must be
+    // persisted server-side (`store: true`). OpenAI's stateless path
+    // (`store: false`) cannot be referenced via `previous_response_id` — the
+    // client would have to replay the full response output, which the
+    // delta-only chain does not carry — so a chain with `store: false` is
+    // rejected by the provider. Stateless mode never sends
+    // `previous_response_id`: `chain_previous` is only derived when
+    // `responses_stateful_chain` is enabled above.
+    params.insert("store".into(), json!(opts.responses_stateful_chain));
 
     let retention = resolve_cache_retention(opts.stream.cache_retention, &opts.stream.env);
     // Prompt caching: route same-session requests to a stable cache key so OpenAI
@@ -877,12 +1099,15 @@ fn convert_input(
     messages: &[Message],
     deferred_by_name: &HashMap<String, &ToolDefinition>,
     compat: &ResponsesCompat,
+    chained: bool,
 ) -> Result<Value> {
     let mut items: Vec<Value> = Vec::new();
     let mut loaded_tool_names: HashSet<String> = HashSet::new();
     let grammar_input_properties =
         grammar_tool_input_properties(&req.tools, compat.supports_openai_grammar_tools)?;
-    if !req.system_prompt.is_empty() {
+    // Chained requests continue the server-side conversation: the system
+    // prompt is re-sent via the `instructions` param instead of an input item.
+    if !req.system_prompt.is_empty() && !chained {
         let role = if model.reasoning && compat.supports_developer_role {
             "developer"
         } else {
@@ -1966,6 +2191,14 @@ mod test {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    /// Serializes tests that touch the process-global [`RESPONSES_CHAINS`]
+    /// map. The bounded-eviction test churns the map past capacity, which can
+    /// evict a live entry another test is asserting on; running chain tests
+    /// one at a time keeps every assertion deterministic.
+    static CHAIN_TESTS_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     const SSE: &str = "\
 data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}
@@ -2073,6 +2306,101 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             sock.write_all(SSE.as_bytes()).unwrap();
             sock.flush().unwrap();
             let _ = sock.shutdown(std::net::Shutdown::Both);
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Mock Responses server that accepts one connection, replies with the
+    /// SSE response headers, and then stalls mid-stream until the client
+    /// disconnects — the shape a user-cancel (Escape) hits while the body is
+    /// still streaming. Signals `ready` (if given) once the headers are out.
+    fn spawn_stalled_sse(ready: Option<oneshot::Sender<()>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+                if let Some(idx) = find_subsequence(&buf, b"\r\n\r\n") {
+                    let cl = extract_content_length(&buf[..idx]);
+                    if buf.len() >= idx + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            let _ = parse_request(&buf);
+            let resp =
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            sock.write_all(resp).unwrap();
+            sock.flush().unwrap();
+            if let Some(ready) = ready {
+                let _ = ready.send(());
+            }
+            // Stall: block until the client aborts and closes the connection.
+            let mut one = [0u8; 1];
+            let _ = sock.read(&mut one);
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Mock Responses server that enforces the provider contract: a request
+    /// referencing `previous_response_id` MUST store the response
+    /// (`store: true`); a chained request with `store: false` is rejected with
+    /// 400 because the stateless path cannot resolve the referenced response.
+    /// Accepts exactly `expected` connections, recording the HTTP status and
+    /// the parsed request of each.
+    fn spawn_chain_contract_mock(
+        expected: usize,
+        statuses: Arc<Mutex<Vec<u16>>>,
+        captured: Arc<Mutex<Vec<Captured>>>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..expected {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match sock.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                    if let Some(idx) = find_subsequence(&buf, b"\r\n\r\n") {
+                        let cl = extract_content_length(&buf[..idx]);
+                        if buf.len() >= idx + 4 + cl {
+                            break;
+                        }
+                    }
+                }
+                let cap = parse_request(&buf);
+                let body: Value = serde_json::from_str(&cap.body).unwrap_or(Value::Null);
+                let chained = body.get("previous_response_id").is_some();
+                let stored = body.get("store").and_then(Value::as_bool).unwrap_or(false);
+                if chained && !stored {
+                    statuses.lock().unwrap().push(400);
+                    let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"response not found: previous_response_id requires store:true\"}}";
+                    let _ = sock.write_all(resp);
+                    let _ = sock.flush();
+                } else {
+                    statuses.lock().unwrap().push(200);
+                    captured.lock().unwrap().push(cap);
+                    let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(resp);
+                    let _ = sock.write_all(SSE.as_bytes());
+                    let _ = sock.flush();
+                }
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
         });
         format!("http://127.0.0.1:{port}")
     }
@@ -2229,6 +2557,550 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         );
     }
 
+    fn responses_chain_model() -> Model {
+        Model {
+            id: "gpt-5".into(),
+            api: API_OPENAI_RESPONSES.into(),
+            provider: "openai".into(),
+            reasoning: true,
+            ..Model::default()
+        }
+    }
+
+    #[test]
+    fn responses_stateful_chain_sends_previous_response_id_and_delta_input() {
+        let _guard = CHAIN_TESTS_SERIAL.lock();
+        let model = responses_chain_model();
+        let req = Context {
+            system_prompt: "be terse".into(),
+            messages: vec![
+                Message::user_text("turn one", 1),
+                Message::Assistant(assistant_with_text_blocks(
+                    &model,
+                    vec![ContentBlock::text("first answer")],
+                )),
+                Message::user_text("turn two", 2),
+            ],
+            ..Context::default()
+        };
+        let session_id = "chain-sess-params";
+        responses_chain_note_success(session_id, "resp_turn_one");
+
+        // Opt-in enabled: previous_response_id + instructions + delta input.
+        let opts = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                session_id: Some(session_id.into()),
+                ..StreamOptions::default()
+            },
+            responses_stateful_chain: true,
+            ..OpenAIResponsesOptions::default()
+        };
+        let body = build_responses_params(&model, &req, &opts).expect("params");
+        assert_eq!(body["previous_response_id"], "resp_turn_one");
+        // The system prompt is not carried over chained responses; re-send it
+        // as instructions instead of a developer input item.
+        assert_eq!(body["instructions"], "be terse");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1, "only the new user turn: {input:?}");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "turn two");
+        // A chained request must store the response server-side: the provider
+        // rejects previous_response_id on the stateless (store:false) path.
+        assert_eq!(body["store"], true, "chained request must store the response");
+
+        // Initial turn with the opt-in enabled but no stored id yet: no
+        // previous_response_id is sent, but the response is still stored so
+        // the next turn can chain from it.
+        reset_responses_chain(session_id);
+        let body = build_responses_params(&model, &req, &opts).expect("params");
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["store"], true, "the response seeding the chain must be stored");
+
+        // Opt-in off (default): full history, no chaining params, stateless.
+        let opts = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                session_id: Some(session_id.into()),
+                ..StreamOptions::default()
+            },
+            responses_stateful_chain: false,
+            ..OpenAIResponsesOptions::default()
+        };
+        let body = build_responses_params(&model, &req, &opts).expect("params");
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("instructions").is_none());
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 4, "developer + user + assistant + user: {input:?}");
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"], "be terse");
+        assert_eq!(body["store"], false, "stateless mode must not store responses");
+        reset_responses_chain(session_id);
+    }
+
+    #[tokio::test]
+    async fn responses_stateful_chain_advances_after_successful_stream() {
+        let _guard = CHAIN_TESTS_SERIAL.lock();
+        let captured = Arc::new(Mutex::new(None::<Captured>));
+        let url = spawn_mock(captured.clone());
+
+        let mut model = responses_chain_model();
+        model.base_url = url;
+        model.max_tokens = 4096;
+
+        // Second turn: the first turn stored resp_turn_one in the session chain.
+        let session_id = "chain-sess-stream";
+        responses_chain_note_success(session_id, "resp_turn_one");
+        let req = Context {
+            system_prompt: "be terse".into(),
+            messages: vec![
+                Message::user_text("what is 6*7?", 1),
+                Message::Assistant(assistant_with_text_blocks(
+                    &model,
+                    vec![ContentBlock::text("Answer: 42")],
+                )),
+                Message::user_text("what about 7*6?", 2),
+            ],
+            ..Context::default()
+        };
+        let opts = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("sk".into()),
+                session_id: Some(session_id.into()),
+                ..StreamOptions::default()
+            },
+            responses_stateful_chain: true,
+            ..OpenAIResponsesOptions::default()
+        };
+        let stream = stream_openai_responses(model, req, opts);
+        let final_msg = stream.result().await.expect("final message");
+        while stream.next().await.is_some() {}
+
+        assert_eq!(final_msg.response_id.as_deref(), Some("resp_1"));
+        // The successful stream advanced the per-session chain.
+        assert_eq!(
+            responses_chain(session_id).previous_response_id.as_deref(),
+            Some("resp_1")
+        );
+        assert_eq!(responses_chain(session_id).consecutive_failures, 0);
+
+        // The request carried the stored previous id, only the delta input,
+        // and store:true so the provider can resolve the referenced response.
+        let cap = captured.lock().unwrap().clone().expect("request captured");
+        let body: Value = serde_json::from_str(&cap.body).expect("body is json");
+        assert_eq!(body["previous_response_id"], "resp_turn_one");
+        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(body["store"], true, "chained request must store the response");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1, "only the new user turn: {input:?}");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "what about 7*6?");
+        reset_responses_chain(session_id);
+    }
+
+    #[tokio::test]
+    async fn responses_chain_must_store_responses_provider_contract() {
+        let _guard = CHAIN_TESTS_SERIAL.lock();
+        // The mock enforces the real provider contract: a chained request with
+        // store:false is rejected (stateless responses cannot be referenced via
+        // previous_response_id), while a chained request with store:true passes.
+        let statuses = Arc::new(Mutex::new(Vec::<u16>::new()));
+        let captured = Arc::new(Mutex::new(Vec::<Captured>::new()));
+        let url = spawn_chain_contract_mock(2, statuses.clone(), captured.clone());
+
+        // Hand-built request simulating what the pre-fix client sent (a chain
+        // with store:false): the provider must reject it.
+        let client = reqwest::Client::new();
+        let rejected = client
+            .post(format!("{url}/responses"))
+            .json(&json!({
+                "model": "gpt-5",
+                "previous_response_id": "resp_missing",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "next"}]}],
+                "stream": true,
+                "store": false,
+            }))
+            .send()
+            .await
+            .expect("raw request");
+        assert_eq!(
+            rejected.status().as_u16(),
+            400,
+            "a chain with store:false must be rejected by the provider contract"
+        );
+
+        // The real client with chaining enabled sends store:true, so the
+        // provider accepts the request and streams the response.
+        let mut model = responses_chain_model();
+        model.base_url = url;
+        model.max_tokens = 4096;
+        let session_id = "chain-sess-contract";
+        responses_chain_note_success(session_id, "resp_turn_one");
+        let req = Context {
+            system_prompt: "be terse".into(),
+            messages: vec![
+                Message::user_text("first turn", 1),
+                Message::Assistant(assistant_with_text_blocks(
+                    &model,
+                    vec![ContentBlock::text("Answer: 42")],
+                )),
+                Message::user_text("second turn", 2),
+            ],
+            ..Context::default()
+        };
+        let opts = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("sk".into()),
+                session_id: Some(session_id.into()),
+                ..StreamOptions::default()
+            },
+            responses_stateful_chain: true,
+            ..OpenAIResponsesOptions::default()
+        };
+        let stream = stream_openai_responses(model, req, opts);
+        let final_msg = stream.result().await.expect("final message");
+        while stream.next().await.is_some() {}
+        assert!(
+            final_msg.error_message.is_none(),
+            "a chain with store:true must pass the provider contract: {:?}",
+            final_msg.error_message,
+        );
+        assert_eq!(final_msg.response_id.as_deref(), Some("resp_1"));
+
+        let bodies = captured.lock().unwrap();
+        let body: Value = serde_json::from_str(&bodies[0].body).expect("body is json");
+        assert_eq!(body["previous_response_id"], "resp_turn_one");
+        assert_eq!(body["store"], true, "chained request must store the response");
+        assert_eq!(*statuses.lock().unwrap(), vec![400, 200]);
+        reset_responses_chain(session_id);
+    }
+
+    #[test]
+    fn responses_stateful_chain_falls_back_to_full_history_after_failures() {
+        let _guard = CHAIN_TESTS_SERIAL.lock();
+        let model = responses_chain_model();
+        let req = Context {
+            system_prompt: "be terse".into(),
+            messages: vec![Message::user_text("hi", 1)],
+            ..Context::default()
+        };
+        let session_id = "chain-sess-fail";
+        responses_chain_note_success(session_id, "resp_stale");
+        // Failures below the threshold keep the chain alive.
+        responses_chain_note_failure(session_id);
+        responses_chain_note_failure(session_id);
+        assert_eq!(
+            responses_chain(session_id).previous_response_id.as_deref(),
+            Some("resp_stale")
+        );
+        // The third consecutive failure breaks the chain (stale-chain fallback).
+        responses_chain_note_failure(session_id);
+        assert!(responses_chain(session_id).previous_response_id.is_none());
+
+        // The next request falls back to the full conversation history.
+        let opts = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                session_id: Some(session_id.into()),
+                ..StreamOptions::default()
+            },
+            responses_stateful_chain: true,
+            ..OpenAIResponsesOptions::default()
+        };
+        let body = build_responses_params(&model, &req, &opts).expect("params");
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("instructions").is_none());
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2, "developer + user: {input:?}");
+        // Chaining is still enabled even on the fallback turn: the response is
+        // stored so a later successful turn can re-establish the chain.
+        assert_eq!(body["store"], true);
+
+        // A successful turn re-establishes the chain.
+        responses_chain_note_success(session_id, "resp_new");
+        let body = build_responses_params(&model, &req, &opts).expect("params");
+        assert_eq!(body["previous_response_id"], "resp_new");
+        assert_eq!(body["store"], true);
+        reset_responses_chain(session_id);
+    }
+
+    #[tokio::test]
+    async fn responses_stateful_chain_breaks_on_stream_error() {
+        let _guard = CHAIN_TESTS_SERIAL.lock();
+        // Mock server answers 500: the chained request fails, counting toward
+        // the stale-chain fallback threshold.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+                if let Some(idx) = find_subsequence(&buf, b"\r\n\r\n") {
+                    let cl = extract_content_length(&buf[..idx]);
+                    if buf.len() >= idx + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            let _ = parse_request(&buf);
+            let resp = b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"stale chain\",\"type\":\"invalid_request_error\"}}";
+            sock.write_all(resp).unwrap();
+            sock.flush().unwrap();
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        });
+        let url = format!("http://127.0.0.1:{port}");
+
+        let mut model = responses_chain_model();
+        model.base_url = url;
+        model.max_tokens = 4096;
+
+        let session_id = "chain-sess-error";
+        responses_chain_note_success(session_id, "resp_turn_one");
+        let req = Context {
+            system_prompt: "be terse".into(),
+            messages: vec![Message::user_text("retry me", 1)],
+            ..Context::default()
+        };
+        let opts = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("sk".into()),
+                session_id: Some(session_id.into()),
+                ..StreamOptions::default()
+            },
+            responses_stateful_chain: true,
+            ..OpenAIResponsesOptions::default()
+        };
+        let stream = stream_openai_responses(model, req, opts);
+        let final_msg = stream.result().await.expect("final message");
+        while stream.next().await.is_some() {}
+        assert!(final_msg.error_message.is_some(), "500 must surface an error");
+        assert_eq!(responses_chain(session_id).consecutive_failures, 1);
+        // Still below the threshold: the chain survives one failure.
+        assert_eq!(
+            responses_chain(session_id).previous_response_id.as_deref(),
+            Some("resp_turn_one")
+        );
+        // Two more failures drop the stale chain entirely.
+        responses_chain_note_failure(session_id);
+        responses_chain_note_failure(session_id);
+        assert!(responses_chain(session_id).previous_response_id.is_none());
+        reset_responses_chain(session_id);
+    }
+
+    #[test]
+    fn chain_insert_evicts_least_recently_used_when_at_capacity() {
+        // Local map so the eviction policy is exercised deterministically,
+        // independent of the process-global chain state.
+        let mut chains = HashMap::new();
+        for i in 0..RESPONSES_CHAINS_MAX {
+            chains.insert(
+                format!("sess-{i}"),
+                ResponsesChainState {
+                    previous_response_id: Some(format!("resp_{i}")),
+                    consecutive_failures: 0,
+                    last_used: i as u64,
+                },
+            );
+        }
+        // Touch the middle entry: it is now the most recently used and must
+        // survive the eviction.
+        chains.get_mut("sess-64").unwrap().last_used = RESPONSES_CHAINS_MAX as u64;
+
+        let evicted = insert_responses_chain(
+            &mut chains,
+            "sess-new".to_string(),
+            ResponsesChainState {
+                previous_response_id: Some("resp_new".into()),
+                consecutive_failures: 0,
+                last_used: RESPONSES_CHAINS_MAX as u64 + 1,
+            },
+        );
+
+        // The least-recently-used entry (sess-0, tick 0) was evicted; the new
+        // chain is present and the touched entry survived.
+        assert_eq!(evicted.as_deref(), Some("sess-0"));
+        assert_eq!(chains.len(), RESPONSES_CHAINS_MAX);
+        assert!(!chains.contains_key("sess-0"));
+        assert!(chains.contains_key("sess-64"));
+        assert_eq!(
+            chains.get("sess-new").unwrap().previous_response_id.as_deref(),
+            Some("resp_new")
+        );
+    }
+
+    #[test]
+    fn chain_map_stays_bounded_across_abandoned_sessions() {
+        let _guard = CHAIN_TESTS_SERIAL.lock();
+        // A long-lived daemon churning through abandoned session ids must not
+        // grow the process-global chain map without bound: the least-recently-
+        // used chains are evicted once the map is at capacity.
+        let churn = RESPONSES_CHAINS_MAX + 32;
+        let mut ids = Vec::with_capacity(churn);
+        for i in 0..churn {
+            let id = format!("chain-bound-{i}");
+            ids.push(id.clone());
+            responses_chain_note_success(&id, &format!("resp_{i}"));
+        }
+        {
+            let chains = RESPONSES_CHAINS.lock();
+            assert!(
+                chains.len() <= RESPONSES_CHAINS_MAX,
+                "chain map must stay bounded: {} entries after {} distinct sessions",
+                chains.len(),
+                churn,
+            );
+            // The earliest abandoned chains are the ones evicted.
+            for id in &ids[..8] {
+                assert!(!chains.contains_key(id), "{id} should have been evicted");
+            }
+        }
+        for id in &ids {
+            reset_responses_chain(id);
+        }
+    }
+
+    #[tokio::test]
+    async fn user_abort_does_not_count_as_chain_failure() {
+        let _guard = CHAIN_TESTS_SERIAL.lock();
+        let session_id = "chain-sess-abort";
+        responses_chain_note_success(session_id, "resp_turn_one");
+
+        // Three user cancellations (Escape mid-stream) must not advance the
+        // stale-chain counter: the valid previous_response_id survives and no
+        // failure is recorded.
+        for _ in 0..3 {
+            let (headers_sent, headers_seen) = oneshot::channel();
+            let url = spawn_stalled_sse(Some(headers_sent));
+            let token = CancellationToken::new();
+            let mut model = responses_chain_model();
+            model.base_url = url;
+            model.max_tokens = 4096;
+            let req = Context {
+                system_prompt: "be terse".into(),
+                messages: vec![Message::user_text("turn", 1)],
+                ..Context::default()
+            };
+            let opts = OpenAIResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("sk".into()),
+                    session_id: Some(session_id.into()),
+                    abort_signal: Some(token.clone()),
+                    ..StreamOptions::default()
+                },
+                responses_stateful_chain: true,
+                ..OpenAIResponsesOptions::default()
+            };
+            let stream = stream_openai_responses(model, req, opts);
+            // Abort only once the request is mid-stream (the user-press-Escape
+            // path), not before the request is even sent.
+            headers_seen.await.expect("server sent headers");
+            token.cancel();
+            let final_msg = stream.result().await.expect("aborted stream result");
+            while stream.next().await.is_some() {}
+            assert_eq!(final_msg.stop_reason, StopReason::Aborted);
+            assert_eq!(
+                final_msg.error_message.as_deref(),
+                Some("Request was aborted")
+            );
+        }
+
+        assert_eq!(
+            responses_chain(session_id).previous_response_id.as_deref(),
+            Some("resp_turn_one"),
+            "three user aborts must preserve the valid previous response id"
+        );
+        assert_eq!(
+            responses_chain(session_id).consecutive_failures,
+            0,
+            "user aborts must not count toward the stale-chain threshold"
+        );
+        reset_responses_chain(session_id);
+    }
+
+    #[test]
+    fn reset_responses_chain_drops_the_stored_id() {
+        let _guard = CHAIN_TESTS_SERIAL.lock();
+        let session_id = "chain-sess-reset";
+        responses_chain_note_success(session_id, "resp_x");
+        assert!(responses_chain(session_id).previous_response_id.is_some());
+        // Compaction replaces the transcript; the stored id no longer matches.
+        reset_responses_chain(session_id);
+        assert!(responses_chain(session_id).previous_response_id.is_none());
+        // Resetting an unknown session is a no-op.
+        reset_responses_chain("chain-sess-unknown");
+    }
+
+    #[test]
+    fn chained_input_messages_is_the_trailing_turn_only() {
+        let _guard = CHAIN_TESTS_SERIAL.lock();
+        let model = responses_chain_model();
+        let messages = vec![
+            Message::user_text("one", 1),
+            Message::Assistant(assistant_with_text_blocks(
+                &model,
+                vec![ContentBlock::text("a")],
+            )),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                tool_name: "calc".into(),
+                content: vec![ContentBlock::text("6")],
+                usage: None,
+                details: None,
+                added_tool_names: Vec::new(),
+                is_error: false,
+                timestamp: 3,
+            }),
+            Message::user_text("two", 2),
+        ];
+        let delta = chained_input_messages(&messages);
+        assert_eq!(delta.len(), 2);
+        assert!(matches!(delta[0], Message::ToolResult(_)));
+        assert!(matches!(delta[1], Message::User(_)));
+
+        // No assistant message yet → the whole transcript is the delta.
+        let no_assistant = vec![Message::user_text("only", 1)];
+        assert_eq!(chained_input_messages(&no_assistant).len(), 1);
+
+        // Transcript ending with an assistant message → empty delta, which
+        // makes build_responses_params fall back to full history.
+        let ends_assistant = vec![
+            Message::user_text("one", 1),
+            Message::Assistant(assistant_with_text_blocks(
+                &model,
+                vec![ContentBlock::text("a")],
+            )),
+        ];
+        assert!(chained_input_messages(&ends_assistant).is_empty());
+
+        let session_id = "chain-sess-delta";
+        responses_chain_note_success(session_id, "resp_1");
+        let opts = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                session_id: Some(session_id.into()),
+                ..StreamOptions::default()
+            },
+            responses_stateful_chain: true,
+            ..OpenAIResponsesOptions::default()
+        };
+        let req = Context {
+            system_prompt: "be terse".into(),
+            messages: ends_assistant,
+            ..Context::default()
+        };
+        let body = build_responses_params(&model, &req, &opts).expect("params");
+        assert!(
+            body.get("previous_response_id").is_none(),
+            "empty delta must fall back to full history: {body}"
+        );
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 3, "developer + user + assistant: {input:?}");
+        reset_responses_chain(session_id);
+    }
+
     #[test]
     fn responses_projects_visible_bash_and_excludes_hidden_bash() {
         let model = Model {
@@ -2270,6 +3142,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             &transformed,
             &HashMap::new(),
             &get_responses_compat(&model),
+            false,
         )
         .expect("input");
         assert_eq!(input.as_array().map(Vec::len), Some(1));
@@ -2701,7 +3574,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
             transform_messages(&req.messages, &model, normalize_responses_tool_call_id);
         let empty_deferred = HashMap::new();
         let compat = get_responses_compat(&model);
-        let input = convert_input(&model, &req, &transformed, &empty_deferred, &compat)
+        let input = convert_input(&model, &req, &transformed, &empty_deferred, &compat, false)
             .expect("replayed input");
         let replayed = &input.as_array().expect("input array")[0];
         assert_eq!(replayed["id"], "msg_signed");
@@ -2724,7 +3597,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         let transformed = transform_messages(&messages, model, normalize_responses_tool_call_id);
         let empty_deferred = HashMap::new();
         let compat = get_responses_compat(model);
-        let input = convert_input(model, &req, &transformed, &empty_deferred, &compat)
+        let input = convert_input(model, &req, &transformed, &empty_deferred, &compat, false)
             .expect("convert_input");
         input
             .as_array()
@@ -2928,6 +3801,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
                 stream: stream.clone(),
                 reasoning: Some(ThinkingLevel::Max),
                 thinking_budgets: None,
+                responses_stateful_chain: false,
             },
         );
         assert_eq!(built.stream.max_tokens, Some(expected_max));
@@ -3637,5 +4511,75 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["strict"], false);
         assert!(body["tools"][0].get("format").is_none());
+    }
+
+    #[test]
+    fn xai_responses_always_request_encrypted_reasoning_content() {
+        // responses.rs:669-673: xAI only returns encrypted reasoning when
+        // asked. Request include=["reasoning.encrypted_content"] for every
+        // reasoning-capable xai model, including the no-effort / off path.
+        let model = get_model("xai", "grok-4.5")
+            .unwrap_or_else(|| panic!("missing builtin model xai/grok-4.5"));
+        assert_eq!(model.provider, "xai");
+        assert_eq!(model.api, API_OPENAI_RESPONSES);
+        assert!(model.reasoning);
+
+        let with_effort = build_responses_params(
+            &model,
+            &Context::default(),
+            &OpenAIResponsesOptions {
+                reasoning_effort: Some("high".into()),
+                reasoning_summary: Some("auto".into()),
+                ..OpenAIResponsesOptions::default()
+            },
+        )
+        .expect("xai effort payload");
+        assert_eq!(
+            with_effort["reasoning"],
+            json!({ "effort": "high", "summary": "auto" })
+        );
+        assert_eq!(
+            with_effort["include"],
+            json!(["reasoning.encrypted_content"]),
+            "effort path must request encrypted reasoning: {with_effort}"
+        );
+
+        // thinkingLevelMap maps off -> null, so the default off path omits
+        // reasoning.effort entirely — but the xai branch must still set include.
+        let off = build_responses_params(
+            &model,
+            &Context::default(),
+            &OpenAIResponsesOptions::default(),
+        )
+        .expect("xai off payload");
+        assert!(
+            off.get("reasoning").is_none(),
+            "grok-4.5 off maps to null and must omit reasoning: {off}"
+        );
+        assert_eq!(
+            off["include"],
+            json!(["reasoning.encrypted_content"]),
+            "xai off path must still request encrypted reasoning: {off}"
+        );
+
+        // Non-xai providers must not pick up the xai-only include when off.
+        let openai = Model {
+            id: "gpt-5".into(),
+            api: API_OPENAI_RESPONSES.into(),
+            provider: "openai".into(),
+            reasoning: true,
+            ..Model::default()
+        };
+        let openai_off = build_responses_params(
+            &openai,
+            &Context::default(),
+            &OpenAIResponsesOptions::default(),
+        )
+        .expect("openai off payload");
+        assert_eq!(openai_off["reasoning"], json!({ "effort": "off" }));
+        assert!(
+            openai_off.get("include").is_none(),
+            "non-xai off path must not request encrypted reasoning: {openai_off}"
+        );
     }
 }

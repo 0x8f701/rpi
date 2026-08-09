@@ -1,10 +1,14 @@
 use crate::markdown::{LineRole, MarkdownRenderOptions, MarkdownRenderOutput, render_markdown};
+use crate::redact::redact_secrets;
 
 const EXPORT_MARKDOWN_WIDTH: usize = 100;
 
 pub(super) fn render_markdown_html(source: &str) -> String {
+    // Export-time redaction: user/assistant/tool content rendered into the
+    // HTML transcript is passed through the shared redactor (storage keeps
+    // the raw text for fidelity).
     let rendered = render_markdown(
-        source,
+        &redact_secrets(source),
         &MarkdownRenderOptions {
             width: EXPORT_MARKDOWN_WIDTH,
             ..MarkdownRenderOptions::default()
@@ -80,7 +84,7 @@ mod tests {
 
     #[test]
     fn html_adapter_preserves_shared_text_and_roles() {
-        let source = "# Heading\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: nope\n```";
+        let source = "# Heading\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\npie\n\"Breakfast\" 5\n```";
         let neutral = render_markdown(
             source,
             &MarkdownRenderOptions {
@@ -107,5 +111,16 @@ mod tests {
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("&#39;x&#39;"));
+    }
+
+    #[test]
+    fn html_adapter_redacts_credential_shapes() {
+        let ghp = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let html = render_markdown_html(&format!(
+            "deploy with token=abc123 and {ghp}"
+        ));
+        assert!(html.contains("[REDACTED]"));
+        assert!(!html.contains("abc123"));
+        assert!(!html.contains(ghp.as_str()));
     }
 }

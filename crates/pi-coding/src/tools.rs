@@ -8,13 +8,31 @@
 //! modules; this module assembles the tools and exposes the factory API used
 //! by the Session facade.
 
+mod ast_edit;
+mod ast_grep;
+mod web_search;
 mod bash;
+mod browser;
+mod debug;
+mod doc_convert;
 mod editdiff;
 mod editmatch;
+mod eval;
+/// Shared `Content-Length` JSON-RPC framing (LSP/MCP/DAP/ACP). Public so the
+/// ACP server in pi-cli reuses the same wire format instead of reimplementing
+/// header parsing.
+pub mod framing;
+pub(crate) mod ask;
+mod github;
 mod glob;
+mod image;
+mod image_gen;
 mod imageresize;
+mod lsp;
+mod lsp_client;
 mod mime;
 mod mutation_queue;
+mod notebook;
 mod paths;
 
 use std::collections::{BTreeMap, HashMap};
@@ -43,18 +61,39 @@ use crate::truncate::{
     GREP_DEFAULT_LIMIT, GREP_MAX_LINE_LENGTH, LS_DEFAULT_LIMIT, utf16_len,
 };
 use crate::todo::{TodoRuntime, TodoToolDetails, TODO_ERROR_MARKER, deserialize_todo_op, tool_failure_result};
+use crate::SandboxConfig;
+use crate::sandbox::SandboxRunOutcome;
 
 use bash::{OutputAccumulator, OutputSnapshot};
+use doc_convert::{extract_doc_text, is_doc};
 use editdiff::generate_edit_details;
 use editmatch::{
     apply_edits_to_normalized_content, detect_line_ending, normalize_to_lf, restore_line_endings,
     strip_bom, EditEntry,
 };
 use glob::{match_fd_glob, match_rg_glob, IgnoreStack};
+use github::github_tool;
+use browser::browser_tool;
+use image::inspect_image_tool;
+use ast_edit::ast_edit_tool;
+use ast_grep::ast_grep_tool;
+use debug::debug_tool;
+use eval::eval_tool;
+use image_gen::{generate_image_tool, generate_image_tool_for_workspace};
+use notebook::notebook_tool;
+use lsp::{lsp_tool, lsp_tool_with_rules};
+use crate::memory::{
+    memory_tool, memory_tool_with_session_env, memory_tools_for, memory_tools_for_persona,
+    recall_tool, reflect_tool, retain_tool, MemoryConfig,
+};
+use crate::mcp::{McpRegistry, mcp_tool};
+use web_search::web_search_tool;
 use imageresize::process_image;
-use mime::detect_supported_image_mime_type_from_file;
+use mime::{detect_supported_image_mime_type_from_file, is_pdf};
 use mutation_queue::with_file_mutation_queue;
 use paths::{resolve_mutation_path, resolve_read_path, resolve_scoped_path};
+
+pub use image_gen::{ImageGenConfig, ImageGenConfigFn};
 
 /// pi `MAX_TIMEOUT_MS` (INT32_MAX): the bash tool rejects any timeout that
 /// would exceed this many milliseconds (`resolveTimeoutMs`).
@@ -79,20 +118,27 @@ const PI_SESSION_ENV_KEYS: &[&str] = &[
 
 /// Throttle window for partial bash `onUpdate` emits (leading + trailing edge).
 const BASH_UPDATE_THROTTLE: Duration = Duration::from_millis(100);
-/// Idle grace kept reading merged stdout/stderr after the process exits so
-/// output a detached descendant writes past exit is captured.
-const BASH_EXIT_STDIO_GRACE: Duration = Duration::from_millis(200);
 
 /// Supplies the PI_* session metadata exposed to bash commands. Called per
 /// execution so a mid-session change is reflected. `None` for standalone
 /// construction (matches pi's `exposeSessionEnvironment && ctx` guard).
 pub type SessionEnvFn = Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>;
+/// Resolves the current bash sandbox configuration from live settings. Called
+/// per execution so a settings reload takes effect on the next spawn (the
+/// sandbox flags apply per spawn). `None` means the sandbox is not configured
+/// (settings.sandbox absent); a per-call `sandboxed` parameter still works in
+/// that case with default allowed paths (cwd + agent dir).
+pub type SandboxConfigFn = Arc<dyn Fn() -> Option<crate::SandboxConfig> + Send + Sync>;
 pub type SkillSnapshotFn = Arc<dyn Fn() -> Vec<crate::Skill> + Send + Sync>;
 /// Resolves internal `agent://`, `history://`, and `artifact://` URIs passed to
 /// the `read` tool to a local file path. Recognized internal schemes MUST
 /// propagate errors (no fall-through); unrecognized schemes fall through to
 /// ordinary file-path resolution. `None` for standalone construction.
 pub type InternalUriResolverFn = Arc<dyn Fn(&str) -> anyhow::Result<std::path::PathBuf> + Send + Sync>;
+/// Resolves the live `settings.memory` configuration for memory-tool builds
+/// and turn-start injection. Returns `None` before settings are attached
+/// (fall back to the built-in `local` backend).
+pub type MemoryConfigFn = Arc<dyn Fn() -> Option<MemoryConfig> + Send + Sync>;
 #[derive(Clone)]
 pub struct BashProcessContext {
     pub manager: crate::ProcessManager,
@@ -104,13 +150,15 @@ fn factory_workspace(cwd: &str) -> crate::WorkspaceRoots {
 }
 
 /// Built-in coding tool identifiers.
-pub const TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "glob", "ls"];
+pub const TOOL_NAMES: &[&str] = &["read", "inspect_image", "generate_image", "bash", "edit", "write", "grep", "find", "glob", "ls", "browser", "web_search", "ast_grep", "ast_edit", "ask", "lsp", "github", "memory", "recall", "retain", "reflect", "mcp", "debug", "eval", "notebook"];
 
 /// One-line prompt snippets keyed by tool name.
 #[must_use]
 pub fn tool_snippet(name: &str) -> Option<&'static str> {
     Some(match name {
         "read" => "Read file contents",
+        "inspect_image" => "Inspect an image file's metadata and statistics without rendering it (format, dimensions, color type, brightness, dominant colors)",
+        "generate_image" => "Generate images through the configured OpenAI-compatible provider (images/generations): saves PNG/JPEG/WebP/GIF/BMP to the workspace (default <cwd>/images), returns paths, dimensions, and a bounded prompt echo; prompts capped at 4096 characters, n 1-4, sizes 256x256/512x512/1024x1024",
         "bash" => "Execute finite foreground shell commands, or supervised long-running commands with background=true",
         "edit" => "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
         "write" => "Create or overwrite files",
@@ -118,6 +166,21 @@ pub fn tool_snippet(name: &str) -> Option<&'static str> {
         "find" => "Find files by glob pattern (respects .gitignore)",
         "glob" => "Match files by glob pattern under workspace roots (sandboxed, bounded)",
         "ls" => "List directory contents",
+        "browser" => "Automate a headless Chrome/Chromium browser: navigate, click, fill, screenshot, extract, list_tabs, close",
+        "web_search" => "Search the web via the DuckDuckGo Instant Answer API (disabled while PI_OFFLINE is set)",
+        "ast_grep" => "Search code structurally with ast-grep patterns ($-metavariables, tree-sitter)",
+        "ast_edit" => "Rewrite a single file structurally with ast-grep pattern→rewrite (metavariables substituted)",
+        "ask" => "Ask the user a question and use their answer (interactive sessions only)",
+        "lsp" => "Query a language server: hover, definition, references, diagnostics, symbols, rename, code actions (spawns a per-language server per call)",
+        "github" => "Query the GitHub API via the gh CLI (GH_TOKEN/reqwest fallback): search/get/list issues and PRs, create issues and comments, list commits, view files, search code",
+        "mcp" => "Call Model Context Protocol (MCP) servers configured in settings mcpServers: list_servers, list_tools, call (stdio child processes, session-scoped)",
+        "debug" => "Drive a DAP debug adapter over stdio (gdb, lldb-dap, debugpy): launch, set_breakpoint, continue_, pause, step_over/step_in/step_out, stack_trace, variables, evaluate, threads, terminate (session-scoped, one adapter at a time)",
+        "eval" => "Evaluate code in a persistent session-scoped kernel: python (python3 subprocess, full stdlib) or js (embedded QuickJS); state persists across calls, output bounded at 64 KiB and redacted, errors classified (syntax/runtime/timeout)",
+        "notebook" => "Read, execute, and edit Jupyter notebooks (.ipynb): read lists cells, execute runs code cells through a session-scoped Python kernel (write=true persists outputs), edit appends a markdown/code cell",
+        "memory" => "Persistent per-project memory: learn, recall, list, and forget note-style entries that survive across sessions in the same repository",
+        "recall" => "Recall related memories from the configured Hindsight HTTP API",
+        "retain" => "Record a memory through the configured Hindsight HTTP API",
+        "reflect" => "Reflect on stored memories through the configured Hindsight HTTP API",
         "process" => "Start and control supervised long-running processes listed by /ps",
         "todo" => "Track phased session work and completion state",
         _ => return None,
@@ -128,28 +191,28 @@ pub fn tool_snippet(name: &str) -> Option<&'static str> {
 // Schema helpers (pi's TypeBox `Object`/`Prop`/`Opt`/`String`/... analogues)
 // ---------------------------------------------------------------------------
 
-fn s_string(desc: &str) -> Schema {
+pub(crate) fn s_string(desc: &str) -> Schema {
     Schema {
         schema_type: Some(Value::String("string".into())),
         description: Some(desc.to_string()),
         ..Default::default()
     }
 }
-fn s_number(desc: &str) -> Schema {
+pub(crate) fn s_number(desc: &str) -> Schema {
     Schema {
         schema_type: Some(Value::String("number".into())),
         description: Some(desc.to_string()),
         ..Default::default()
     }
 }
-fn s_boolean(desc: &str) -> Schema {
+pub(crate) fn s_boolean(desc: &str) -> Schema {
     Schema {
         schema_type: Some(Value::String("boolean".into())),
         description: Some(desc.to_string()),
         ..Default::default()
     }
 }
-fn s_array(item: Schema, desc: &str) -> Schema {
+pub(crate) fn s_array(item: Schema, desc: &str) -> Schema {
     Schema {
         schema_type: Some(Value::String("array".into())),
         items: Some(Box::new(item)),
@@ -174,7 +237,7 @@ fn fill_missing_with_null(mut arguments: Value) -> Result<Value> {
 }
 /// Builds an object schema from ordered `(name, schema)` pairs. Names in
 /// `required` are required (the rest are optional, like pi's `Opt`).
-fn s_object(props: Vec<(&str, Schema)>, required: Vec<&str>) -> Schema {
+pub(crate) fn s_object(props: Vec<(&str, Schema)>, required: Vec<&str>) -> Schema {
     let properties = props
         .into_iter()
         .map(|(n, s)| (n.to_string(), s))
@@ -192,13 +255,28 @@ fn s_object(props: Vec<(&str, Schema)>, required: Vec<&str>) -> Schema {
 // Argument helpers (operate on the decoded `serde_json::Value` object)
 // ---------------------------------------------------------------------------
 
-fn arg_str(args: &Value, key: &str) -> String {
+pub(crate) fn arg_str(args: &Value, key: &str) -> String {
     args.get(key)
         .and_then(|v| v.as_str())
         .map(String::from)
         .unwrap_or_default()
 }
-fn arg_int(args: &Value, key: &str) -> Result<Option<i64>> {
+
+/// Reads a required string argument, distinguishing a missing key from an
+/// explicitly empty value. A missing required field fails actionably (the
+/// tool schema declares the key required); an explicitly empty value passes
+/// through unchanged so schema-valid empty payloads (e.g. `write` with
+/// `content: ""`) keep working.
+pub(crate) fn required_arg_str(args: &Value, key: &str) -> Result<String> {
+    let value = args
+        .get(key)
+        .ok_or_else(|| anyhow!("missing required argument {key:?}"))?;
+    let text = value
+        .as_str()
+        .ok_or_else(|| anyhow!("invalid {key}: must be a string"))?;
+    Ok(text.to_owned())
+}
+pub(crate) fn arg_int(args: &Value, key: &str) -> Result<Option<i64>> {
     let Some(value) = args.get(key) else {
         return Ok(None);
     };
@@ -214,11 +292,11 @@ fn arg_float(args: &Value, key: &str) -> Option<f64> {
     args.get(key)
         .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|x| x as f64)))
 }
-fn arg_bool(args: &Value, key: &str) -> bool {
+pub(crate) fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-fn text_result(text: impl Into<String>) -> AgentToolResult {
+pub(crate) fn text_result(text: impl Into<String>) -> AgentToolResult {
     AgentToolResult::text(text)
 }
 
@@ -239,15 +317,48 @@ pub fn create_tool_with_session_env(
     cwd: &str,
     session_env: Option<SessionEnvFn>,
 ) -> Result<AgentTool> {
+    create_tool_with_session_env_and_rules(name, cwd, session_env, None)
+}
+
+/// [`create_tool_with_session_env`] with the session's live path permission
+/// rules (`Some(source)`) threaded into the `lsp` tool so its rename preflight
+/// obeys the current rules at execution time. `None` keeps the standalone
+/// behavior (empty rules).
+pub fn create_tool_with_session_env_and_rules(
+    name: &str,
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    rules: Option<crate::PermissionRulesSource>,
+) -> Result<AgentTool> {
     match name {
         "read" => Ok(read_tool(cwd)),
-        "bash" => Ok(bash_tool(cwd, session_env, None)),
+        "inspect_image" => Ok(inspect_image_tool(cwd)),
+        "generate_image" => Ok(generate_image_tool(cwd, None)),
+        "bash" => Ok(bash_tool(cwd, session_env, None, None)),
         "edit" => Ok(edit_tool(cwd)),
         "write" => Ok(write_tool(cwd)),
         "grep" => Ok(grep_tool(cwd)),
         "find" => Ok(find_tool(cwd)),
         "glob" => Ok(glob_tool(cwd)),
         "ls" => Ok(ls_tool(cwd)),
+        "browser" => Ok(browser_tool(cwd)),
+        "web_search" => Ok(web_search_tool()),
+        "ast_grep" => Ok(ast_grep_tool(cwd)),
+        "ast_edit" => Ok(ast_edit_tool(cwd)),
+        "ask" => Ok(ask::standalone_ask_tool()),
+        "lsp" => Ok(match rules {
+            Some(rules) => lsp_tool_with_rules(cwd, rules),
+            None => lsp_tool(cwd),
+        }),
+        "github" => Ok(github_tool()),
+        "memory" => Ok(memory_tool_with_session_env(cwd, session_env)),
+        "recall" => Ok(recall_tool(cwd, MemoryConfig::default())),
+        "retain" => Ok(retain_tool(cwd, MemoryConfig::default())),
+        "reflect" => Ok(reflect_tool(cwd, MemoryConfig::default())),
+        "mcp" => Ok(mcp_tool(McpRegistry::new())),
+        "debug" => Ok(debug_tool(cwd)),
+        "eval" => Ok(eval_tool(cwd)),
+        "notebook" => Ok(notebook_tool(cwd)),
         "todo" => Ok(todo_tool(TodoRuntime::memory())),
         _ => Err(anyhow!("Unknown tool name: {name}")),
     }
@@ -267,35 +378,127 @@ pub fn create_tool_with_context(
 }
 
 /// Like [`create_tool_with_context`] but also threads an internal-URI resolver
-/// into the `read` tool for `agent://`, `history://`, and `artifact://` URIs.
+/// into the `read` tool for `agent://`, `history://`, and `artifact://` URIs,
+/// and a sandbox resolver into the `bash` tool.
 pub fn create_tool_with_context_and_resolver(
     name: &str,
     cwd: &str,
     session_env: Option<SessionEnvFn>,
     skills: Option<SkillSnapshotFn>,
+    sandbox: Option<SandboxConfigFn>,
     resolver: Option<InternalUriResolverFn>,
+) -> Result<AgentTool> {
+    create_tool_with_context_and_resolver_and_rules(
+        name,
+        cwd,
+        session_env,
+        skills,
+        sandbox,
+        resolver,
+        None,
+    )
+}
+
+/// [`create_tool_with_context_and_resolver`] with the session's live path
+/// permission rules threaded into the `lsp` tool (see
+/// [`create_tool_with_session_env_and_rules`]).
+pub fn create_tool_with_context_and_resolver_and_rules(
+    name: &str,
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    skills: Option<SkillSnapshotFn>,
+    sandbox: Option<SandboxConfigFn>,
+    resolver: Option<InternalUriResolverFn>,
+    rules: Option<crate::PermissionRulesSource>,
 ) -> Result<AgentTool> {
     match name {
         "read" => Ok(read_tool_with_resolver(cwd, skills, resolver)),
-        _ => create_tool_with_session_env(name, cwd, session_env),
+        "bash" => Ok(bash_tool(cwd, session_env, None, sandbox)),
+        _ => create_tool_with_session_env_and_rules(name, cwd, session_env, rules),
     }
 }
 
+/// Persona-aware child-tool factory for non-memory built-ins. Orchestration
+/// resolves any requested memory-family name as the selected family once.
+pub(crate) fn create_tool_with_context_and_resolver_and_rules_for_persona(
+    name: &str,
+    cwd: &str,
+    _persona_root: &Path,
+    session_env: Option<SessionEnvFn>,
+    skills: Option<SkillSnapshotFn>,
+    sandbox: Option<SandboxConfigFn>,
+    resolver: Option<InternalUriResolverFn>,
+    rules: Option<crate::PermissionRulesSource>,
+) -> Result<AgentTool> {
+    create_tool_with_context_and_resolver_and_rules(
+        name, cwd, session_env, skills, sandbox, resolver, rules,
+    )
+}
+
+/// Default child coding tools with memory selected from the parent's live
+/// configuration and local storage redirected to the durable persona root.
+pub(crate) fn create_coding_tools_with_context_and_resolver_for_persona(
+    cwd: &str,
+    persona_root: &Path,
+    session_env: Option<SessionEnvFn>,
+    skills: Option<SkillSnapshotFn>,
+    process: Option<BashProcessContext>,
+    sandbox: Option<SandboxConfigFn>,
+    resolver: Option<InternalUriResolverFn>,
+    memory: Option<MemoryConfigFn>,
+    image_gen: Option<ImageGenConfigFn>,
+) -> Vec<AgentTool> {
+    let mut tools = vec![
+        read_tool_with_resolver(cwd, skills, resolver),
+        bash_tool(cwd, session_env.clone(), process, sandbox),
+        edit_tool(cwd),
+        write_tool(cwd),
+        ast_edit_tool(cwd),
+        generate_image_tool(cwd, image_gen),
+    ];
+    tools.extend(memory_tools_for_persona(
+        cwd,
+        persona_root,
+        session_env,
+        memory.as_ref().and_then(|resolver| resolver()),
+    ));
+    tools
+}
+
 /// Workspace-aware variant used by sessions with explicit additional roots.
+/// `sandbox` supplies live `settings.sandbox` resolution for the bash tool;
+/// `None` for standalone construction (per-call `sandboxed` still works with
+/// default allowed paths). `image_gen` supplies the `generate_image` tool's
+/// model/endpoint/credential resolution; `None` falls back to the turn's
+/// model and env credentials.
 pub fn create_coding_tools_for_workspace_with_context_and_resolver(
     workspace: crate::WorkspaceRoots,
     session_env: Option<SessionEnvFn>,
     skills: Option<SkillSnapshotFn>,
     process: Option<BashProcessContext>,
     resolver: Option<InternalUriResolverFn>,
+    sandbox: Option<SandboxConfigFn>,
+    memory: Option<MemoryConfigFn>,
+    image_gen: Option<ImageGenConfigFn>,
 ) -> Vec<AgentTool> {
     let cwd = workspace.cwd().to_string_lossy().into_owned();
-    vec![
+    let mut tools = vec![
         read_tool_for_workspace(workspace.clone(), skills, resolver),
-        bash_tool(&cwd, session_env, process),
+        bash_tool(&cwd, session_env.clone(), process, sandbox),
         edit_tool_for_workspace(workspace.clone()),
-        write_tool_for_workspace(workspace),
-    ]
+        write_tool_for_workspace(workspace.clone()),
+        ast_edit_tool(&cwd),
+        generate_image_tool_for_workspace(workspace.clone(), image_gen),
+    ];
+    // Memory tools follow the live settings.memory.backend: off → none,
+    // local → `memory`, hindsight → `recall`/`retain`/`reflect`. A resolver
+    // that is not yet attached (no settings) falls back to `local`.
+    tools.extend(memory_tools_for(
+        &cwd,
+        session_env.clone(),
+        memory.as_ref().and_then(|resolver| resolver()),
+    ));
+    tools
 }
 
 /// Default coding tools with live session metadata and safe `skill://` resolution.
@@ -307,36 +510,52 @@ pub fn create_coding_tools_with_context(
 ) -> Vec<AgentTool> {
     vec![
         read_tool_with_skills(cwd, skills),
-        bash_tool(cwd, session_env, process),
+        bash_tool(cwd, session_env.clone(), process, None),
         edit_tool(cwd),
         write_tool(cwd),
+        ast_edit_tool(cwd),
+        memory_tool_with_session_env(cwd, session_env),
     ]
 }
 
 /// Like [`create_coding_tools_with_context`] but the `read` tool also resolves
-/// `agent://`, `history://`, and `artifact://` URIs via the supplied resolver.
+/// internal URIs, bash receives the sandbox resolver, and memory follows the
+/// parent session's live backend selection.
 pub fn create_coding_tools_with_context_and_resolver(
     cwd: &str,
     session_env: Option<SessionEnvFn>,
     skills: Option<SkillSnapshotFn>,
     process: Option<BashProcessContext>,
+    sandbox: Option<SandboxConfigFn>,
     resolver: Option<InternalUriResolverFn>,
+    memory: Option<MemoryConfigFn>,
+    image_gen: Option<ImageGenConfigFn>,
 ) -> Vec<AgentTool> {
-    vec![
+    let mut tools = vec![
         read_tool_with_resolver(cwd, skills, resolver),
-        bash_tool(cwd, session_env, process),
+        bash_tool(cwd, session_env.clone(), process, sandbox),
         edit_tool(cwd),
         write_tool(cwd),
-    ]
+        ast_edit_tool(cwd),
+        generate_image_tool(cwd, image_gen),
+    ];
+    tools.extend(memory_tools_for(
+        cwd,
+        session_env,
+        memory.as_ref().and_then(|resolver| resolver()),
+    ));
+    tools
 }
 
-/// The default coding tool set `[read, bash, edit, write]`.
+/// The default coding tool set `[read, bash, edit, write, ast_edit, memory]`.
 pub fn create_coding_tools(cwd: &str) -> Vec<AgentTool> {
     vec![
         read_tool(cwd),
-        bash_tool(cwd, None, None),
+        bash_tool(cwd, None, None, None),
         edit_tool(cwd),
         write_tool(cwd),
+        ast_edit_tool(cwd),
+        memory_tool(cwd),
     ]
 }
 /// The default coding tool set with live session metadata for bash.
@@ -346,15 +565,25 @@ pub fn create_coding_tools_with_session_env(
 ) -> Vec<AgentTool> {
     vec![
         read_tool(cwd),
-        bash_tool(cwd, session_env, None),
+        bash_tool(cwd, session_env.clone(), None, None),
         edit_tool(cwd),
         write_tool(cwd),
+        ast_edit_tool(cwd),
+        memory_tool_with_session_env(cwd, session_env),
     ]
 }
 
-/// Read-only built-ins in upstream order: `[read, grep, find, glob, ls]`.
+/// Read-only built-ins in upstream order: `[read, grep, find, glob, ls, web_search, ast_grep]`.
 pub fn create_read_only_tools(cwd: &str) -> Vec<AgentTool> {
-    vec![read_tool(cwd), grep_tool(cwd), find_tool(cwd), glob_tool(cwd), ls_tool(cwd)]
+    vec![
+        read_tool(cwd),
+        grep_tool(cwd),
+        find_tool(cwd),
+        glob_tool(cwd),
+        ls_tool(cwd),
+        web_search_tool(),
+        ast_grep_tool(cwd),
+    ]
 }
 
 /// Serializable definitions for the read-only built-ins.
@@ -412,15 +641,44 @@ pub fn create_all_tool_definitions_map(cwd: &str) -> HashMap<String, pi_ai::Tool
 
 /// All built-in tools (including `glob`), no session metadata.
 pub fn create_all_tools(cwd: &str) -> Vec<AgentTool> {
+    create_all_tools_with_rules(cwd, None)
+}
+
+/// [`create_all_tools`] with the session's live path permission rules threaded
+/// into the `lsp` tool (see [`create_tool_with_session_env_and_rules`]).
+pub fn create_all_tools_with_rules(
+    cwd: &str,
+    rules: Option<crate::PermissionRulesSource>,
+) -> Vec<AgentTool> {
     vec![
         read_tool(cwd),
-        bash_tool(cwd, None, None),
+        inspect_image_tool(cwd),
+        generate_image_tool(cwd, None),
+        bash_tool(cwd, None, None, None),
         edit_tool(cwd),
         write_tool(cwd),
+        ast_edit_tool(cwd),
         grep_tool(cwd),
         find_tool(cwd),
         glob_tool(cwd),
         ls_tool(cwd),
+        browser_tool(cwd),
+        web_search_tool(),
+        ast_grep_tool(cwd),
+        ask::standalone_ask_tool(),
+        match rules {
+            Some(rules) => lsp_tool_with_rules(cwd, rules),
+            None => lsp_tool(cwd),
+        },
+        github_tool(),
+        memory_tool(cwd),
+        recall_tool(cwd, MemoryConfig::default()),
+        retain_tool(cwd, MemoryConfig::default()),
+        reflect_tool(cwd, MemoryConfig::default()),
+        mcp_tool(McpRegistry::new()),
+        debug_tool(cwd),
+        eval_tool(cwd),
+        notebook_tool(cwd),
     ]
 }
 
@@ -429,15 +687,46 @@ pub fn create_all_tools_with_session_env(
     cwd: &str,
     session_env: Option<SessionEnvFn>,
 ) -> Vec<AgentTool> {
+    create_all_tools_with_session_env_and_rules(cwd, session_env, None)
+}
+
+/// [`create_all_tools_with_session_env`] with the session's live path
+/// permission rules threaded into the `lsp` tool (see
+/// [`create_tool_with_session_env_and_rules`]).
+pub fn create_all_tools_with_session_env_and_rules(
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    rules: Option<crate::PermissionRulesSource>,
+) -> Vec<AgentTool> {
     vec![
         read_tool(cwd),
-        bash_tool(cwd, session_env, None),
+        inspect_image_tool(cwd),
+        generate_image_tool(cwd, None),
+        bash_tool(cwd, session_env.clone(), None, None),
         edit_tool(cwd),
         write_tool(cwd),
+        ast_edit_tool(cwd),
         grep_tool(cwd),
         find_tool(cwd),
         glob_tool(cwd),
         ls_tool(cwd),
+        browser_tool(cwd),
+        web_search_tool(),
+        ast_grep_tool(cwd),
+        ask::standalone_ask_tool(),
+        match rules {
+            Some(rules) => lsp_tool_with_rules(cwd, rules),
+            None => lsp_tool(cwd),
+        },
+        github_tool(),
+        memory_tool_with_session_env(cwd, session_env),
+        recall_tool(cwd, MemoryConfig::default()),
+        retain_tool(cwd, MemoryConfig::default()),
+        reflect_tool(cwd, MemoryConfig::default()),
+        mcp_tool(McpRegistry::new()),
+        debug_tool(cwd),
+        eval_tool(cwd),
+        notebook_tool(cwd),
     ]
 }
 
@@ -451,15 +740,51 @@ pub fn create_all_tools_with_context_and_resolver(
     process: Option<BashProcessContext>,
     resolver: Option<InternalUriResolverFn>,
 ) -> Vec<AgentTool> {
+    create_all_tools_with_context_and_resolver_and_rules(
+        cwd, session_env, skills, process, resolver, None,
+    )
+}
+
+/// [`create_all_tools_with_context_and_resolver`] with the session's live path
+/// permission rules threaded into the `lsp` tool (see
+/// [`create_tool_with_session_env_and_rules`]).
+pub fn create_all_tools_with_context_and_resolver_and_rules(
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    skills: Option<SkillSnapshotFn>,
+    process: Option<BashProcessContext>,
+    resolver: Option<InternalUriResolverFn>,
+    rules: Option<crate::PermissionRulesSource>,
+) -> Vec<AgentTool> {
     vec![
         read_tool_with_resolver(cwd, skills, resolver),
-        bash_tool(cwd, session_env, process),
+        inspect_image_tool(cwd),
+        generate_image_tool(cwd, None),
+        bash_tool(cwd, session_env.clone(), process, None),
         edit_tool(cwd),
         write_tool(cwd),
+        ast_edit_tool(cwd),
         grep_tool(cwd),
         find_tool(cwd),
         glob_tool(cwd),
         ls_tool(cwd),
+        browser_tool(cwd),
+        web_search_tool(),
+        ast_grep_tool(cwd),
+        ask::standalone_ask_tool(),
+        match rules {
+            Some(rules) => lsp_tool_with_rules(cwd, rules),
+            None => lsp_tool(cwd),
+        },
+        github_tool(),
+        memory_tool_with_session_env(cwd, session_env),
+        recall_tool(cwd, MemoryConfig::default()),
+        retain_tool(cwd, MemoryConfig::default()),
+        reflect_tool(cwd, MemoryConfig::default()),
+        mcp_tool(McpRegistry::new()),
+        debug_tool(cwd),
+        eval_tool(cwd),
+        notebook_tool(cwd),
     ]
 }
 
@@ -481,8 +806,15 @@ fn todo_tool(runtime: TodoRuntime) -> AgentTool {
                     ..s_array(s_string("task content"), "tasks for this phase")
                 },
             ),
+            (
+                "agents".to_owned(),
+                Schema {
+                    min_items: Some(1),
+                    ..s_array(s_string("agent name"), "optional explicit agent that must execute each task; parallel to items (agents[i] names the agent for items[i]); length must equal items")
+                },
+            ),
         ]),
-        property_order: vec!["phase".to_owned(), "items".to_owned()],
+        property_order: vec!["phase".to_owned(), "items".to_owned(), "agents".to_owned()],
         required: vec!["phase".to_owned(), "items".to_owned()],
         additional_properties: Some(Value::Bool(false)),
         ..Schema::default()
@@ -527,7 +859,7 @@ fn todo_tool(runtime: TodoRuntime) -> AgentTool {
     };
     let mut tool = AgentTool::new(
         "todo",
-        "Maintain the durable session todo DAG while preserving phased presentation. Every returned task has a stable id, dependsOn, ready, and blockedBy. Phase order is not a dependency: any ready task may proceed. Completed and dropped dependencies both satisfy dependents. Use init/append, start/done/drop/rm, add_dependency/remove_dependency/update_dependencies, or read-only view. Dependency operations require stable task IDs. rm rejects dependency targets unless cascade=true explicitly removes the surviving dependency edges. This tool changes canonical readiness/status; an attached parent application may orchestrate ready items.",
+        "Maintain the durable session todo DAG while preserving phased presentation. Every returned task has a stable id, dependsOn, ready, and blockedBy. Phase order is not a dependency: any ready task may proceed. Completed and dropped dependencies both satisfy dependents. The attached executor runs every ready task concurrently up to its configured limit, so keep independent work in separate tasks without dependsOn edges — reserve dependencies for genuine data or control ordering (a task consumes another's output, or must not start before it); never chain unrelated steps. Use init/append, start/done/drop/rm, add_dependency/remove_dependency/update_dependencies, or read-only view. Dependency operations require stable task IDs. rm rejects dependency targets unless cascade=true explicitly removes the surviving dependency edges. init phase entries may carry an optional agents array parallel to items to bind each task to a specific agent that must execute it. This tool changes canonical readiness/status; an attached parent application may orchestrate ready items. Use concise task titles (≤60 chars): the task content is the title the panel shows — longer titles are truncated.",
         parameters,
         move |context| {
             let runtime = runtime.clone();
@@ -627,7 +959,7 @@ fn read_tool_for_workspace(
         vec!["path"],
     );
     let description = format!(
-        "Read the contents of a file or trusted skill:// URI. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to {} lines or {}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+        "Read the contents of a file or trusted skill:// URI. Supports text files, images (jpg, png, gif, webp, bmp), PDFs (text layer extracted via pdftotext; requires poppler-utils), Office documents (docx, xlsx, pptx, odt, ods, odp, rtf; extracted via pandoc or LibreOffice), EPUB ebooks (via pandoc), and Jupyter notebooks (ipynb; via jupyter nbconvert). Images are sent as attachments. For text, PDF, and converted document files, output is truncated to {} lines or {}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
         DEFAULT_MAX_LINES,
         DEFAULT_MAX_BYTES / 1024
     );
@@ -644,6 +976,7 @@ fn read_tool_for_workspace(
                 ctx.model.as_ref(),
                 ctx.abort,
             )
+            .await
         }
     })
     .with_capability(ToolCapability::Read)
@@ -662,7 +995,7 @@ fn internal_uri_scheme(path: &str) -> Option<&'static str> {
     }
 }
 
-fn run_read(
+async fn run_read(
     workspace: &crate::WorkspaceRoots,
     args: Value,
     skills: Option<&SkillSnapshotFn>,
@@ -731,13 +1064,48 @@ fn run_read(
         });
     }
 
+    // PDF path: extract the text layer with pdftotext (poppler-utils), then
+    // apply the same offset/limit/truncate selection as the text path.
+    if is_pdf(Path::new(&abs)) {
+        check_aborted(&abort)?;
+        let text = extract_pdf_text(&abs, abort).await?;
+        // The hint is spliced into a `sed -n 'Np' <(...) | head -c N` bash
+        // escape hatch as a process substitution, so the raw path must be
+        // shell-quoted (single quotes, embedded quotes escaped).
+        let quoted_abs = format!("'{}'", abs.replace('\'', "'\\''"));
+        let first_line_hint = format!("<(pdftotext -layout -nopgbrk {} -)", quoted_abs);
+        return render_read_result(&first_line_hint, &text, &args);
+    }
+
+    // Office/notebook path: extract the text layer with an external converter
+    // (pandoc, LibreOffice, or jupyter nbconvert), then apply the same
+    // offset/limit/truncate selection as the text path. The converter is
+    // reported back so the `sed -n` escape hatch can re-run the same command.
+    if is_doc(Path::new(&abs)) {
+        check_aborted(&abort)?;
+        let extracted = extract_doc_text(&abs, abort).await?;
+        let quoted_abs = format!("'{}'", abs.replace('\'', "'\\''"));
+        let first_line_hint = extracted.converter.sed_hint(&quoted_abs);
+        return render_read_result(&first_line_hint, &extracted.text, &args);
+    }
+
     // Text path.
     let data = std::fs::read(&abs).map_err(|e| anyhow!("{}", e))?;
     check_aborted(&abort)?;
     let text = String::from_utf8_lossy(&data);
+    render_read_result(&path, &text, &args)
+}
+
+/// Applies the read tool's offset/limit/truncate selection to `text` and
+/// renders the result, honoring the `[Showing lines ...]` / `[N more lines in
+/// file. Use offset=...]` contracts. Shared by the text and PDF branches.
+/// `first_line_hint` names what the `sed -n` escape hatch should operate on
+/// when a single line exceeds the byte limit: the original path for text, a
+/// `<(pdftotext ... -)` process substitution for PDFs.
+fn render_read_result(first_line_hint: &str, text: &str, args: &Value) -> Result<AgentToolResult> {
     let all_lines: Vec<&str> = text.split('\n').collect();
     let total_file_lines = all_lines.len();
-    let (offset, has_offset) = match arg_int(&args, "offset")? {
+    let (offset, has_offset) = match arg_int(args, "offset")? {
         Some(o) => (o, true),
         None => (0, false),
     };
@@ -757,7 +1125,7 @@ fn run_read(
     let mut has_limit = false;
     let mut user_limited_lines = 0i64;
     let selected: String;
-    if let Some(limit) = arg_int(&args, "limit")? {
+    if let Some(limit) = arg_int(args, "limit")? {
         has_limit = true;
         // endLine = min(startLine + limit, allLines.length); JS slice semantics for
         // negative ends; an end before start yields an empty slice.
@@ -786,7 +1154,7 @@ fn run_read(
     let out = if tr.first_line_exceeds_limit {
         let first_line_size = format_size(all_lines[start_line].len());
         format!(
-            "[Line {start_line_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_line_display}p' {path} | head -c {DEFAULT_MAX_BYTES}]",
+            "[Line {start_line_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_line_display}p' {first_line_hint} | head -c {DEFAULT_MAX_BYTES}]",
             format_size(DEFAULT_MAX_BYTES)
         )
     } else if tr.truncated {
@@ -820,6 +1188,327 @@ fn run_read(
         res.details = json!({ "truncation": tr });
     }
     Ok(res)
+}
+
+/// pdftotext (poppler-utils) deadline for extracting a PDF's text layer.
+const PDF_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Hard cap on the bytes read from `pdftotext` stdout. Bounds per-extraction
+/// memory so a runaway or malicious PDF cannot exhaust the heap; extraction
+/// stops at the bound and the result carries a cap notice (mirrors the bash
+/// full-output disk cap contract in `tools/bash.rs`).
+const PDF_EXTRACT_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Copies from `reader` into `out`, stopping once `out` reaches `max_bytes`.
+/// Returns `true` if the cap was hit (more input remained), `false` on EOF.
+/// The caller is responsible for closing/terminating the reader's producer so
+/// it does not block on a full pipe. Shared with the document-converter
+/// extraction in `tools/doc_convert.rs`.
+pub(crate) async fn copy_capped<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<bool> {
+    let mut buf = [0u8; 8192];
+    loop {
+        if out.len() >= max_bytes {
+            return Ok(true);
+        }
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        let room = max_bytes - out.len();
+        if n > room {
+            out.extend_from_slice(&buf[..room]);
+            return Ok(true);
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// Prepends the cap notice to extracted text when the extraction bound was
+/// hit. Prefixed (not appended) because `render_read_result` truncates from
+/// the head, so the notice must lead to stay visible.
+fn apply_pdf_cap_notice(mut text: String, capped: bool) -> String {
+    if capped {
+        text.insert_str(
+            0,
+            &format!("[PDF text output capped at {}]\n", format_size(PDF_EXTRACT_MAX_BYTES)),
+        );
+    }
+    text
+}
+
+/// Runs `pdftotext -layout -nopgbrk <abs> -` and returns the extracted text.
+/// Errors are actionable: a missing binary (poppler-utils not installed), a
+/// nonzero exit (encrypted/corrupted PDF), a timeout, or cancellation. The
+/// process runs in its own group with `kill_on_drop` so a timeout or abort
+/// reaps the whole tree (same pattern as `run_bash_core`).
+async fn extract_pdf_text(abs: &str, abort: AbortSignal) -> Result<String> {
+    extract_pdf_text_with("pdftotext", abs, abort).await
+}
+
+/// `extract_pdf_text` with an injectable binary name so tests can exercise
+/// the missing-binary rejection deterministically (a name that never
+/// resolves on PATH).
+async fn extract_pdf_text_with(bin: &str, abs: &str, abort: AbortSignal) -> Result<String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(["-layout", "-nopgbrk", abs, "-"]);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    // Own process group: a timeout/abort kill reaps pdftotext and any
+    // descendants sharing the output pipes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
+    let mut child = match spawn_with_etxtbsy_retry(&mut cmd, "pdftotext").await {
+        Ok(child) => child,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Err(anyhow!(
+                    "PDF extraction requires poppler-utils (pdftotext); install it or use bash: pdftotext -layout -nopgbrk {} -",
+                    abs
+                ));
+            }
+            return Err(anyhow!("failed to start pdftotext: {}", e));
+        }
+    };
+
+    // Collect stdout/stderr on separate tasks so `child` stays available for
+    // the timeout/abort kill (same structure as `run_bash_core`). stdout is
+    // hard-capped at `PDF_EXTRACT_MAX_BYTES` so a runaway PDF cannot exhaust
+    // memory; the (out, capped) pair lets the caller attach the cap notice.
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let mut out_task = tokio::spawn(async move {
+        let mut out = Vec::new();
+        let capped = copy_capped(&mut stdout, &mut out, PDF_EXTRACT_MAX_BYTES)
+            .await
+            .unwrap_or(false);
+        (out, capped)
+    });
+    let err_task = tokio::spawn(async move {
+        let mut err = Vec::new();
+        let _ = tokio::io::copy(&mut stderr, &mut err).await;
+        err
+    });
+
+    // Timeout, abort, and the stdout cap win over extraction; each kills the
+    // process group so the piped output closes and the readers finish. The
+    // wait future is scoped so its `&mut child` borrow ends before any kill
+    // below (same structure as `run_bash_core`). `biased` with the abort
+    // branch first makes an already-cancelled signal deterministically win
+    // over a fast child exit (the abort test aborts before extraction). A
+    // single deadline bounds both this select and the post-EOF reap below,
+    // so a child that closes stdout then hangs cannot exceed the budget.
+    enum ExtractionOutcome {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        TimedOut,
+        Aborted,
+        // The stdout reader finished inside the select; its JoinHandle output
+        // is carried here so the handle is never polled twice (polling a
+        // completed JoinHandle panics). The carried `capped` flag distinguishes
+        // the byte cap (we stopped draining; the child must be killed so it
+        // does not block on a full pipe) from EOF (the child closed stdout; do
+        // NOT kill — it is already exiting, and killing would race a clean
+        // exit into a "terminated by signal" status and discard the real exit
+        // status that distinguishes a genuine failure from an empty PDF).
+        Output(Result<(Vec<u8>, bool), tokio::task::JoinError>),
+    }
+    let deadline = tokio::time::Instant::now() + PDF_EXTRACT_TIMEOUT;
+    let outcome = {
+        let wait = child.wait();
+        tokio::pin!(wait);
+        let sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(sleep);
+        let abort_fut = abort.cancelled();
+        tokio::pin!(abort_fut);
+        tokio::select! {
+            biased;
+            _ = &mut abort_fut => ExtractionOutcome::Aborted,
+            _ = &mut sleep => ExtractionOutcome::TimedOut,
+            res = &mut wait => ExtractionOutcome::Exited(res),
+            joined = &mut out_task => ExtractionOutcome::Output(joined),
+        }
+    };
+
+    // Kill the process group only for the cases that need it: timeout, abort,
+    // a capped reader (we stopped draining stdout, so leaving the child
+    // running would block it on a full pipe until the timeout), and a panicked
+    // output task. EOF does NOT kill: the child closed stdout and is already
+    // exiting — killing it would race a clean exit into a signal death and
+    // discard the status that distinguishes a genuine pdftotext failure from
+    // an empty (scanned/encrypted) PDF. Exited already reaped the child.
+    match &outcome {
+        ExtractionOutcome::TimedOut | ExtractionOutcome::Aborted => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        ExtractionOutcome::Output(Ok((_, capped))) => {
+            if *capped {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
+        }
+        ExtractionOutcome::Output(Err(_)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        ExtractionOutcome::Exited(_) => {}
+    }
+    let stderr = err_task.await.map_err(|e| anyhow!("pdftotext error task failed: {e}"))?;
+    let (stdout, capped, wait_status) = match outcome {
+        // The Exited branch won the biased select before out_task was polled,
+        // so awaiting the handle here is safe (it has not completed).
+        ExtractionOutcome::Exited(Ok(status)) => {
+            let (stdout, capped) = out_task
+                .await
+                .map_err(|e| anyhow!("pdftotext output task failed: {e}"))?;
+            (stdout, capped, Some(status))
+        }
+        ExtractionOutcome::Exited(Err(e)) => {
+            return Err(anyhow!("failed to wait for pdftotext: {e}"));
+        }
+        // The Output branch already consumed the handle output in the select;
+        // reuse it instead of polling the handle again. `capped` selects
+        // between the cap kill (status reflects our intentional kill, so
+        // nothing to check) and EOF (reap the real status so a genuine non-zero
+        // pdftotext exit stays actionable instead of being masked as "no
+        // extractable text"). The EOF reap still honors the remaining timeout
+        // budget and abort; we do NOT kill, so a clean exit can never be raced
+        // into a signal death.
+        ExtractionOutcome::Output(joined) => {
+            let (stdout, capped) = joined
+                .map_err(|e| anyhow!("pdftotext output task failed: {e}"))?;
+            if capped {
+                (stdout, capped, None)
+            } else {
+                // EOF: reap the real exit status (still honoring the remaining
+                // timeout budget and abort) without killing. A scoped enum
+                // lets the `wait` borrow end before any kill below, matching the
+                // outer-select structure; killing would race a clean exit into
+                // a signal death and discard the status that distinguishes a
+                // genuine pdftotext failure from an empty (scanned/encrypted)
+                // PDF.
+                enum EofReap {
+                    Status(std::process::ExitStatus),
+                    TimedOut,
+                    Aborted,
+                }
+                let reap = {
+                    let wait = child.wait();
+                    tokio::pin!(wait);
+                    let sleep = tokio::time::sleep_until(deadline);
+                    tokio::pin!(sleep);
+                    let abort_fut = abort.cancelled();
+                    tokio::pin!(abort_fut);
+                    tokio::select! {
+                        biased;
+                        _ = &mut abort_fut => EofReap::Aborted,
+                        _ = &mut sleep => EofReap::TimedOut,
+                        res = &mut wait => match res {
+                            Ok(s) => EofReap::Status(s),
+                            Err(e) => return Err(anyhow!("failed to wait for pdftotext: {e}")),
+                        },
+                    }
+                };
+                match reap {
+                    EofReap::Status(status) => (stdout, capped, Some(status)),
+                    EofReap::TimedOut => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(anyhow!(
+                            "PDF text extraction timed out after {}s (PDF may be corrupted or encrypted). Use bash: pdftotext -layout -nopgbrk {} -",
+                            PDF_EXTRACT_TIMEOUT.as_secs(),
+                            abs
+                        ));
+                    }
+                    EofReap::Aborted => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(anyhow!("PDF text extraction cancelled"));
+                    }
+                }
+            }
+        }
+        ExtractionOutcome::TimedOut => {
+            return Err(anyhow!(
+                "PDF text extraction timed out after {}s (PDF may be corrupted or encrypted). Use bash: pdftotext -layout -nopgbrk {} -",
+                PDF_EXTRACT_TIMEOUT.as_secs(),
+                abs
+            ));
+        }
+        ExtractionOutcome::Aborted => {
+            return Err(anyhow!("PDF text extraction cancelled"));
+        }
+    };
+
+    if let Some(wait_status) = wait_status {
+        if !wait_status.success() {
+            let status_desc = match wait_status.code() {
+                Some(code) => format!("exit status {code}"),
+                None => "terminated by signal".to_string(),
+            };
+            let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+            return Err(anyhow!(
+                "pdftotext failed ({status_desc}): {detail}. Use bash: pdftotext -layout -nopgbrk {} - to inspect (PDF may be encrypted or corrupted).",
+                abs
+            ));
+        }
+    }
+    let text = String::from_utf8_lossy(&stdout).into_owned();
+    if text.trim().is_empty() {
+        return Err(anyhow!("PDF contains no extractable text (scanned or encrypted)"));
+    }
+    Ok(apply_pdf_cap_notice(text, capped))
+}
+
+/// Spawns a command, briefly retrying on `ETXTBSY` ("Text file busy", os
+/// error 26). The kernel can transiently report a just-touched executable as
+/// busy on overlay/tmp filesystems under parallel load (same fix class as
+/// hooks.rs `spawn_with_etxtbsy_retry`); the binary is closed for writing by
+/// the time spawn runs, so a short retry resolves it. Shared with the
+/// document-converter extraction in `tools/doc_convert.rs`; `program` names
+/// the executable in the retry log line.
+pub(crate) async fn spawn_with_etxtbsy_retry(
+    command: &mut Command,
+    program: &str,
+) -> std::io::Result<tokio::process::Child> {
+    let mut attempts = 0u32;
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if retryable_etxtbsy(&error) => {
+                attempts += 1;
+                if attempts >= 5 {
+                    return Err(error);
+                }
+                eprintln!("{program} hit ETXTBSY (attempt {attempts}); retrying");
+                tokio::time::sleep(Duration::from_millis(10 * u64::from(attempts))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Detects `ETXTBSY` (Text file busy, os error 26) from a spawn error via the
+/// raw OS error, since `ErrorKind` maps unclassified errno values to
+/// `Uncategorized`.
+fn retryable_etxtbsy(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -856,8 +1545,8 @@ async fn run_write(
     args: Value,
     abort: AbortSignal,
 ) -> Result<AgentToolResult> {
-    let path = arg_str(&args, "path");
-    let content = arg_str(&args, "content");
+    let path = required_arg_str(&args, "path")?;
+    let content = required_arg_str(&args, "content")?;
     let abs = resolve_mutation_path(&path, workspace)?;
     with_file_mutation_queue(&abs, || async {
         check_aborted(&abort)?;
@@ -987,7 +1676,7 @@ fn ensure_regular_mutation_target(
     }
 }
 
-fn check_aborted(abort: &AbortSignal) -> Result<()> {
+pub(crate) fn check_aborted(abort: &AbortSignal) -> Result<()> {
     if abort.is_aborted() {
         return Err(anyhow!("Operation aborted"));
     }
@@ -1041,13 +1730,19 @@ fn prepare_edit_arguments(input: Value) -> Result<Value> {
 // bash
 // ---------------------------------------------------------------------------
 
-fn bash_tool(cwd: &str, session_env: Option<SessionEnvFn>, process: Option<BashProcessContext>) -> AgentTool {
+fn bash_tool(
+    cwd: &str,
+    session_env: Option<SessionEnvFn>,
+    process: Option<BashProcessContext>,
+    sandbox: Option<SandboxConfigFn>,
+) -> AgentTool {
     let cwd = cwd.to_string();
     let params = s_object(
         vec![
             ("command", s_string("Bash command to execute. Do not use nohup, setsid, disown, or shell background '&' syntax.")),
             ("timeout", s_number("Timeout in seconds (optional, no default timeout)")),
             ("background", s_boolean("Start the command under the supervised process manager, return immediately, and list it in /ps")),
+            ("sandboxed", s_boolean("Run this command inside the Linux filesystem sandbox (filesystem confined to sandbox.allowedPaths, network off unless sandbox.network). Overrides the sandbox.enabled setting for this call; unsupported on non-Linux platforms.")),
         ],
         vec!["command"],
     );
@@ -1060,12 +1755,16 @@ fn bash_tool(cwd: &str, session_env: Option<SessionEnvFn>, process: Option<BashP
         let cwd = cwd.clone();
         let session_env = session_env.clone();
         let process = process.clone();
-        async move { run_bash(&cwd, ctx.arguments, ctx.on_update, ctx.abort, session_env, process).await }
+        let sandbox = sandbox.clone();
+        async move {
+            run_bash(&cwd, ctx.arguments, ctx.on_update, ctx.abort, session_env, process, sandbox).await
+        }
     })
     .with_capability(ToolCapability::Exec)
     .with_prompt_guidelines(vec![
         "Inspect PI_* environment variables for current model and session details.".to_string(),
         "Use foreground bash only for finite commands. For servers, watchers, or commands intended to outlive the tool call, set background=true; never use nohup, setsid, disown, or shell '&'. Supervised commands are visible in /ps with logs, signal, stop, and wait controls.".to_string(),
+        "When the sandbox is enabled (sandbox.enabled or the sandboxed parameter), commands see only sandbox.allowedPaths; system binaries are read-only; the network is loopback-only unless sandbox.network is true.".to_string(),
     ])
 }
 
@@ -1111,12 +1810,6 @@ const NON_INTERACTIVE_COMMAND_ENV: &[(&str, &str)] = &[
     ("COMPOSER_NO_INTERACTION", "1"),
     ("CLOUDSDK_CORE_DISABLE_PROMPTS", "1"),
 ];
-
-fn apply_non_interactive_command_env(command: &mut Command) {
-    for (key, value) in NON_INTERACTIVE_COMMAND_ENV {
-        command.env(key, value);
-    }
-}
 
 /// Builds the child environment: the inherited environment minus the PI_*
 /// session keys, plus whatever the session currently provides.
@@ -1240,13 +1933,6 @@ impl BashState {
     }
 }
 
-#[derive(Debug)]
-enum BashOutcome {
-    Exited(std::io::Result<std::process::ExitStatus>),
-    TimedOut(f64),
-    Aborted,
-}
-
 /// The low-level outcome of running a command: bounded output snapshot, exit
 /// status, and whether it was cancelled/timed out. Spawn and wait I/O errors
 /// propagate as `Err`; nonzero exit and abort are encoded in the fields so each
@@ -1275,157 +1961,121 @@ async fn run_bash_core(
     abort: AbortSignal,
     on_chunk: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
     on_update: Option<ToolUpdateFn>,
+    sandbox: Option<&SandboxConfig>,
 ) -> Result<BashRunOutput> {
     let (shell, shell_args) = get_shell_config();
-    let mut cmd = Command::new(&shell);
-    cmd.args(&shell_args).arg(command);
-    cmd.current_dir(cwd);
-    // Merge stdout+stderr onto one stream so child write order is preserved
-    // (pi/Go: same pipe on both fds, shared onData handler). UnixStream::pair
-    // gives us ordered interleaving without a new dependency; a cloned end is
-    // shut down after the exit grace so a held-open descendant can't hang us.
-    #[cfg(unix)]
-    let (merged_reader, reader_shutdown) = {
-        use std::os::fd::OwnedFd;
-        use std::os::unix::net::UnixStream;
-        let (reader, writer) = UnixStream::pair().map_err(|e| anyhow!("{}", e))?;
-        let writer_err = writer.try_clone().map_err(|e| anyhow!("{}", e))?;
-        let reader_shutdown = reader.try_clone().map_err(|e| anyhow!("{}", e))?;
-        cmd.stdout(Stdio::from(OwnedFd::from(writer)));
-        cmd.stderr(Stdio::from(OwnedFd::from(writer_err)));
-        (reader, reader_shutdown)
+    let mut argv = Vec::with_capacity(shell_args.len() + 2);
+    argv.push(shell);
+    argv.extend(shell_args);
+    argv.push(command.to_owned());
+    // The child environment: the inherited environment minus the PI_* session
+    // keys, plus the session metadata and the unattended-command contract.
+    // Foreground bash follows OMP's unattended command contract; these are
+    // applied after inherited/session values so pagers, editors, and
+    // credential prompts cannot reclaim the parent TUI.
+    let mut env = bash_command_env(session_env);
+    for (key, value) in NON_INTERACTIVE_COMMAND_ENV {
+        env.push(((*key).to_owned(), (*value).to_owned()));
+    }
+    // With a sandbox config the shell runs behind `unshare` (fresh
+    // mount/pid/net namespaces) through the shared runner; the wrapper is
+    // spawned through the same Command machinery, so streaming, timeout,
+    // abort, and process-group handling are unchanged. Without a sandbox, the
+    // command runs through the embedded brush shell (OMP/pi parity); see
+    // `tools/bash/brush.rs` for the session model, sandbox split, fallback
+    // policy, and timeout/abort reaping.
+    //
+    // Every bash execution is serialized process-wide (brush and subprocess
+    // paths alike): brush's timeout/abort descendant reaping is only sound
+    // when no other bash run is spawning descendants concurrently. The wait
+    // is bounded by the run's own timeout, so a run that cannot even start in
+    // time reports timed out instead of queueing forever; an aborted call
+    // reports cancelled.
+    let timeout_duration = timeout.map(Duration::from_secs_f64);
+    let Some(_exec_guard) = bash::brush::acquire_bash_exec_lock(timeout_duration, &abort).await?
+    else {
+        // Could not start within the timeout (or abort fired while queued);
+        // nothing ran, so there is no output to publish.
+        return Ok(BashRunOutput {
+            content: String::new(),
+            truncation: TruncationResult::default(),
+            full_output_path: String::new(),
+            disk_truncated: false,
+            exit_code: None,
+            cancelled: abort.is_aborted(),
+            timed_out: !abort.is_aborted(),
+            last_line_bytes: 0,
+        });
     };
-    #[cfg(not(unix))]
-    {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    }
-    // Foreground tool commands are non-interactive. Never let a child race the
-    // TUI for terminal input; interactive services belong in ProcessManager,
-    // where stdin is explicitly piped and controlled through process_send.
-    cmd.stdin(Stdio::null());
-    cmd.kill_on_drop(true);
-    // Run in its own process group; on cancel/timeout kill the whole tree.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.as_std_mut().process_group(0);
-    }
-    cmd.env_clear();
-    for (k, v) in bash_command_env(session_env) {
-        cmd.env(k, v);
-    }
-    // Foreground bash follows OMP's unattended command contract. Apply these
-    // after inherited/session values so pagers, editors, and credential
-    // prompts cannot reclaim the parent TUI.
-    apply_non_interactive_command_env(&mut cmd);
-
-    let mut child = cmd.spawn().map_err(|e| anyhow!("{}", e))?;
     let state = Arc::new(Mutex::new(BashState::new(on_update, on_chunk)));
-
-    #[cfg(unix)]
-    let reader_task = {
-        use std::io::Read;
-        let mut reader = merged_reader;
-        let s = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 32 * 1024];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => s.lock().append(&buf[..n]),
-                }
-            }
-        })
+    let stream: Arc<dyn Fn(&[u8]) + Send + Sync> = {
+        let state = state.clone();
+        Arc::new(move |data: &[u8]| state.lock().append(data))
     };
-    #[cfg(not(unix))]
-    let reader_task = {
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let s1 = state.clone();
-        let s2 = state.clone();
-        let t1 = tokio::spawn(async move { read_pipe(stdout, s1).await });
-        let t2 = tokio::spawn(async move { read_pipe(stderr, s2).await });
-        tokio::spawn(async move {
-            let _ = t1.await;
-            let _ = t2.await;
-        })
-    };
-
-    // Wait with optional timeout and abort; abort wins over timeout.
-    let outcome = {
-        let wait = child.wait();
-        tokio::pin!(wait);
-        if let Some(t) = timeout {
-            let sleep = tokio::time::sleep(Duration::from_secs_f64(t));
-            tokio::pin!(sleep);
-            let abort_fut = abort.cancelled();
-            tokio::pin!(abort_fut);
-            tokio::select! {
-                res = &mut wait => BashOutcome::Exited(res),
-                _ = &mut sleep => BashOutcome::TimedOut(t),
-                _ = &mut abort_fut => BashOutcome::Aborted,
-            }
-        } else {
-            let abort_fut = abort.cancelled();
-            tokio::pin!(abort_fut);
-            tokio::select! {
-                res = &mut wait => BashOutcome::Exited(res),
-                _ = &mut abort_fut => BashOutcome::Aborted,
-            }
-        }
-    };
-
-    // On timeout/abort kill the process group (best-effort child kill); the
-    // reader finishes when the stream closes or we shut it down below.
-    if matches!(outcome, BashOutcome::TimedOut(_) | BashOutcome::Aborted) {
-        let _ = child.kill().await;
-    }
-
-    // Drain remaining merged output. A held-open stream from a detached
-    // descendant can't hang us past the idle grace — shut the local end down
-    // so the blocking reader unblocks (Go closes the pipe reader the same way).
-    {
-        tokio::pin!(reader_task);
-        let finished = tokio::select! {
-            r = &mut reader_task => { let _ = r; true }
-            _ = tokio::time::sleep(BASH_EXIT_STDIO_GRACE) => false,
-        };
-        if !finished {
-            #[cfg(unix)]
+    let outcome = match sandbox {
+        // Sandboxed invocations keep the subprocess path (sandbox wins): the
+        // in-process brush shell cannot be wrapped by `unshare`.
+        Some(config) => crate::sandbox::run_in_sandbox(
+            Some(config),
+            Path::new(cwd),
+            &argv,
+            env,
+            timeout_duration,
+            abort,
+            Some(stream),
+        )
+        .await?,
+        // Unsandboxed default: the embedded brush shell. If brush cannot
+        // parse the command (or descendant reaping is unavailable), fall back
+        // to the plain /bin/bash subprocess path for an identical observable
+        // result (documented policy in `tools/bash/brush.rs`).
+        None => {
+            use bash::brush::BrushRunOutcome;
+            match bash::brush::run_brush_command(
+                Path::new(cwd),
+                command,
+                &env,
+                timeout_duration,
+                abort.clone(),
+                stream.clone(),
+            )
+            .await?
             {
-                use std::net::Shutdown;
-                let _ = reader_shutdown.shutdown(Shutdown::Both);
+                BrushRunOutcome::Executed { exit_code } => SandboxRunOutcome {
+                    exit_code,
+                    timed_out: false,
+                    cancelled: false,
+                },
+                BrushRunOutcome::TimedOut => SandboxRunOutcome {
+                    exit_code: None,
+                    timed_out: true,
+                    cancelled: false,
+                },
+                BrushRunOutcome::Cancelled => SandboxRunOutcome {
+                    exit_code: None,
+                    timed_out: false,
+                    cancelled: true,
+                },
+                BrushRunOutcome::Fallback => crate::sandbox::run_in_sandbox(
+                    None,
+                    Path::new(cwd),
+                    &argv,
+                    env,
+                    timeout_duration,
+                    abort,
+                    Some(stream),
+                )
+                .await?,
             }
-            let _ = reader_task.await;
         }
-    }
-    // Reap the child so it doesn't linger.
-    let wait_status = child.wait().await;
-
-    // Abort wins over timeout; a wait I/O error only surfaces when neither fired.
-    let (exit_code, timed_out, wait_err, outcome_aborted) = match outcome {
-        BashOutcome::Exited(Ok(s)) => (s.code(), false, None, false),
-        BashOutcome::Exited(Err(e)) => (None, false, Some(e), false),
-        BashOutcome::TimedOut(_) => (None, true, None, false),
-        BashOutcome::Aborted => (None, false, None, true),
     };
-    let cancelled = abort.is_aborted() || outcome_aborted;
 
     let snap = state.lock().finish();
     let last_line_bytes = state.lock().get_last_line_bytes();
-    if let Some(err) = wait_err {
-        if !cancelled && !timed_out {
-            // The reap may also surface it; prefer the original wait error.
-            if let Err(e) = wait_status {
-                return Err(anyhow!("{}", e));
-            }
-            return Err(anyhow!("{}", err));
-        }
-    }
-    // Detach the temp file so the returned `full_output_path` stays valid for the
-    // agent to `read`; the caller owns cleanup. Done only AFTER the wait-error
-    // check so a wait I/O error returns without detaching — the accumulator's
-    // Drop then deletes the spill file (no leak on wait failure).
+    // Detach the temp file so the returned `full_output_path` stays valid for
+    // the agent to `read`; the caller owns cleanup. The runner only returns
+    // `Err` on spawn/wait I/O failure, in which case this is never reached and
+    // the accumulator's Drop deletes the spill file (no leak on failure).
     let _ = state.lock().take_temp_file();
 
     Ok(BashRunOutput {
@@ -1433,9 +2083,9 @@ async fn run_bash_core(
         truncation: snap.truncation,
         full_output_path: snap.full_output_path,
         disk_truncated: snap.disk_truncated,
-        exit_code,
-        cancelled,
-        timed_out,
+        exit_code: outcome.exit_code,
+        cancelled: outcome.cancelled,
+        timed_out: outcome.timed_out,
         last_line_bytes,
     })
 }
@@ -1924,8 +2574,9 @@ async fn run_bash(
     abort: AbortSignal,
     session_env: Option<SessionEnvFn>,
     process: Option<BashProcessContext>,
+    sandbox: Option<SandboxConfigFn>,
 ) -> Result<AgentToolResult> {
-    let command = arg_str(&args, "command");
+    let command = required_arg_str(&args, "command")?;
     let timeout = arg_float(&args, "timeout");
     if let Some(t) = timeout {
         if !t.is_finite() || t <= 0.0 {
@@ -1937,6 +2588,29 @@ async fn run_bash(
     }
     check_aborted(&abort)?;
     let background = arg_bool(&args, "background");
+    // Per-call `sandboxed` overrides the `sandbox.enabled` setting; missing
+    // falls back to the setting. Resolution happens per spawn so a settings
+    // reload takes effect on the next command (RELOAD apply behavior).
+    let mut sandbox_config: Option<crate::SandboxConfig> = None;
+    match args.get("sandboxed").and_then(|value| value.as_bool()) {
+        Some(true) => {
+            let mut config = sandbox
+                .as_ref()
+                .and_then(|resolve| resolve())
+                .unwrap_or_else(|| {
+                    crate::SandboxConfig::default_for(Path::new(cwd), &crate::agent_dir_path())
+                });
+            config.enabled = true;
+            sandbox_config = Some(config);
+        }
+        Some(false) => {}
+        None => {
+            sandbox_config = sandbox
+                .as_ref()
+                .and_then(|resolve| resolve())
+                .filter(|config| config.enabled);
+        }
+    }
     let detach = shell_detach_analysis(&command);
     if contains_detaching_shell_substitution(&command) {
         return Err(anyhow!(
@@ -1947,6 +2621,11 @@ async fn run_bash(
         reject_unsupervised_shell_detach(&detach)?;
     }
     if background {
+        if sandbox_config.is_some() {
+            return Err(anyhow!(
+                "sandboxed background bash is not supported: the supervised process manager runs outside the sandbox. Run the command in the foreground with sandboxed=true, or drop the sandbox for the background run."
+            ));
+        }
         let process = process.ok_or_else(|| anyhow!("background bash is unavailable in this context"))?;
         if !path_exists(cwd) {
             return Err(anyhow!("Working directory does not exist: {cwd}\nCannot execute bash commands."));
@@ -1990,8 +2669,17 @@ async fn run_bash(
     }
     // pi emits an initial empty update before spawning.
     (on_update)(AgentToolResult::default());
-    let out = run_bash_core(cwd, &command, session_env.as_ref(), timeout, abort, None, Some(on_update))
-        .await?;
+    let out = run_bash_core(
+        cwd,
+        &command,
+        session_env.as_ref(),
+        timeout,
+        abort,
+        None,
+        Some(on_update),
+        sandbox_config.as_ref(),
+    )
+    .await?;
 
     let content = out.content;
     let truncation = out.truncation;
@@ -2117,13 +2805,29 @@ pub async fn execute_bash(
     cwd: &Path,
     command: &str,
     session_env: Option<SessionEnvFn>,
+    sandbox: Option<SandboxConfigFn>,
     on_chunk: Arc<dyn Fn(String) + Send + Sync>,
     abort: AbortSignal,
 ) -> Result<BashResult> {
     let cwd_str = cwd.to_string_lossy().into_owned();
     let raw: Arc<dyn Fn(&[u8]) + Send + Sync> =
         Arc::new(move |b: &[u8]| on_chunk(String::from_utf8_lossy(b).into_owned()));
-    let out = run_bash_core(&cwd_str, command, session_env.as_ref(), None, abort, Some(raw), None).await?;
+    // RPC bash has no per-call override; honor the settings default only.
+    let sandbox_config = sandbox
+        .as_ref()
+        .and_then(|resolve| resolve())
+        .filter(|config| config.enabled);
+    let out = run_bash_core(
+        &cwd_str,
+        command,
+        session_env.as_ref(),
+        None,
+        abort,
+        Some(raw),
+        None,
+        sandbox_config.as_ref(),
+    )
+    .await?;
     Ok(BashResult {
         output: out.content,
         exit_code: out.exit_code,
@@ -2152,16 +2856,6 @@ fn format_float(t: f64) -> String {
         format!("{t:.0}")
     } else {
         format!("{t}")
-    }
-}
-
-async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(mut r: R, state: Arc<Mutex<BashState>>) {
-    let mut buf = [0u8; 32 * 1024];
-    loop {
-        match r.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => state.lock().append(&buf[..n]),
-        }
     }
 }
 
@@ -2884,10 +3578,12 @@ mod tests {
     }
 
     fn tiny_png() -> Vec<u8> {
-        let image = image::DynamicImage::new_rgba8(2, 2);
+        // `::image` — the local `image` module (inspect_image) shadows the
+        // extern crate name inside tools.rs.
+        let image = ::image::DynamicImage::new_rgba8(2, 2);
         let mut bytes = Vec::new();
         image
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), ::image::ImageFormat::Png)
             .unwrap();
         bytes
     }
@@ -3019,6 +3715,286 @@ mod tests {
         let c = make_ctx(json!({ "path": "small.txt", "offset": 99 }));
         let err = (tool.execute)(c).await.unwrap_err().to_string();
         assert!(err.contains("beyond end of file"));
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    fn pdftotext_available() -> bool {
+        std::process::Command::new("pdftotext")
+            .arg("-v")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn read_pdf_extracts_text() {
+        if !pdftotext_available() {
+            eprintln!("skipping: pdftotext not available");
+            return;
+        }
+        let fixture = fixture_path("sample.pdf");
+        assert!(fixture.is_file(), "missing fixture {}", fixture.display());
+        let tool = read_tool(&fixture.parent().unwrap().to_string_lossy());
+        let c = make_ctx(json!({ "path": fixture.to_string_lossy() }));
+        let res = (tool.execute)(c).await.unwrap();
+        let text = text_of(&res);
+        for i in 1..=6 {
+            assert!(
+                text.contains(&format!("Line {i} of PDF fixture")),
+                "missing extracted line {i} in: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_pdf_offset_limit_paginates() {
+        if !pdftotext_available() {
+            eprintln!("skipping: pdftotext not available");
+            return;
+        }
+        let fixture = fixture_path("sample.pdf");
+        let tool = read_tool(&fixture.parent().unwrap().to_string_lossy());
+        let c = make_ctx(json!({ "path": fixture.to_string_lossy(), "offset": 3, "limit": 2 }));
+        let res = (tool.execute)(c).await.unwrap();
+        let text = text_of(&res);
+        assert!(text.contains("Line 3 of PDF fixture"), "got: {text}");
+        assert!(text.contains("Line 4 of PDF fixture"), "got: {text}");
+        assert!(!text.contains("Line 2 of PDF fixture"), "got: {text}");
+        assert!(!text.contains("Line 5 of PDF fixture"), "got: {text}");
+        // The extracted text is 6 lines each terminated by '\n', so the line
+        // total includes the trailing empty split element (same convention as
+        // text files); offset=3 limit=2 consumes lines 3-4 of 7.
+        assert!(text.contains("[3 more lines in file. Use offset=5 to continue.]"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn read_pdf_offset_beyond_end_errors() {
+        if !pdftotext_available() {
+            eprintln!("skipping: pdftotext not available");
+            return;
+        }
+        let fixture = fixture_path("sample.pdf");
+        let tool = read_tool(&fixture.parent().unwrap().to_string_lossy());
+        let c = make_ctx(json!({ "path": fixture.to_string_lossy(), "offset": 99 }));
+        let err = (tool.execute)(c).await.unwrap_err().to_string();
+        assert!(err.contains("Offset 99 is beyond end of file"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_pdf_without_text_layer_notices() {
+        if !pdftotext_available() {
+            eprintln!("skipping: pdftotext not available");
+            return;
+        }
+        let fixture = fixture_path("no-text.pdf");
+        let tool = read_tool(&fixture.parent().unwrap().to_string_lossy());
+        let c = make_ctx(json!({ "path": fixture.to_string_lossy() }));
+        let err = (tool.execute)(c).await.unwrap_err().to_string();
+        assert!(
+            err.contains("PDF contains no extractable text (scanned or encrypted)"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_pdf_missing_binary_is_actionable() {
+        let err = extract_pdf_text_with(
+            "pdftotext-definitely-missing-xyz",
+            "/nonexistent/sample.pdf",
+            make_ctx(json!({})).abort,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("poppler-utils"), "got: {err}");
+        assert!(err.contains("pdftotext"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn extract_pdf_abort_cancels_extraction() {
+        if !pdftotext_available() {
+            eprintln!("skipping: pdftotext not available");
+            return;
+        }
+        let fixture = fixture_path("sample.pdf");
+        let (ctrl, abort) = pi_agent::AbortController::new();
+        ctrl.abort();
+        let err = extract_pdf_text(fixture.to_str().unwrap(), abort)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PDF text extraction cancelled"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn extract_pdf_caps_oversized_stdout() {
+        // A reader larger than the bound: copy_capped must stop at the cap and
+        // report truncation (no unbounded accumulation).
+        let oversized = vec![b'x'; PDF_EXTRACT_MAX_BYTES + 4096];
+        let mut reader = oversized.as_slice();
+        let mut out = Vec::new();
+        let capped = copy_capped(&mut reader, &mut out, PDF_EXTRACT_MAX_BYTES)
+            .await
+            .expect("in-memory read cannot fail");
+        assert!(capped, "oversized reader must hit the cap");
+        assert_eq!(out.len(), PDF_EXTRACT_MAX_BYTES, "output must be exactly the cap");
+        assert!(out.iter().all(|&b| b == b'x'));
+
+        // The extraction path attaches a leading notice so the truncation is
+        // visible in the head-truncated result.
+        let notice = apply_pdf_cap_notice(String::new(), true);
+        assert!(
+            notice.starts_with("[PDF text output capped at 32.0MB]"),
+            "cap notice must name the bound: {notice:?}"
+        );
+        assert_eq!(apply_pdf_cap_notice("body".to_owned(), false), "body");
+    }
+
+    #[tokio::test]
+    async fn extract_pdf_under_cap_passes_through() {
+        let small = b"small pdf text\n".to_vec();
+        let mut reader = small.as_slice();
+        let mut out = Vec::new();
+        let capped = copy_capped(&mut reader, &mut out, PDF_EXTRACT_MAX_BYTES)
+            .await
+            .expect("in-memory read cannot fail");
+        assert!(!capped, "small reader must not hit the cap");
+        assert_eq!(out, small, "under-cap output must pass through untouched");
+    }
+
+    /// Regression for the wait/stdout-reader race: a child that closes stdout
+    /// (EOF) while still running must NOT be killed just because the uncapped
+    /// reader finished before `wait`. The old code treated any reader
+    /// completion as a "cap" kill, racing a legitimate exit into a signal
+    /// death and masking a genuine non-zero pdftotext failure as "no
+    /// extractable text". The fix reaps the real exit status on EOF, so a
+    /// non-zero exit stays actionable. This would fail on the old code (which
+    /// returned "PDF contains no extractable text" for the case below).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extract_pdf_eof_before_exit_keeps_nonzero_actionable() {
+        let dir = tmpdir();
+        let script = dir.join("fake-pdftotext.sh");
+        fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                // Close stdout (the pipe the helper reads) so the uncapped
+                // reader hits EOF while the child is still alive — the exact
+                // race window. Then linger so `wait` is not ready yet, and exit
+                // nonzero to prove the real status is preserved.
+                "exec 1>&-\n",
+                "sleep 0.2\n",
+                "exit 1\n",
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let err = extract_pdf_text_with(
+            script.to_str().unwrap(),
+            "/nonexistent/no-text.pdf",
+            make_ctx(json!({})).abort,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("pdftotext failed") && err.contains("exit status 1"),
+            "EOF race must preserve the nonzero exit, got: {err}"
+        );
+        assert!(
+            !err.contains("PDF contains no extractable text"),
+            "EOF race must not mask a nonzero failure as empty, got: {err}"
+        );
+    }
+
+    /// Whether any Office converter (pandoc or a working LibreOffice) exists on
+    /// this host, so the end-to-end read path can run at all. Per-converter
+    /// guards live in `tools/doc_convert.rs`; this probes the real binaries the
+    /// read tool would spawn.
+    fn office_converter_available() -> bool {
+        let probe = |bin: &str| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        probe("pandoc") || probe("libreoffice")
+    }
+
+    fn nbconvert_available() -> bool {
+        std::process::Command::new("jupyter")
+            .args(["nbconvert", "--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn read_docx_converts_to_text() {
+        if !office_converter_available() {
+            eprintln!("skipping: neither pandoc nor libreoffice available");
+            return;
+        }
+        let fixture = fixture_path("sample.docx");
+        assert!(fixture.is_file(), "missing fixture {}", fixture.display());
+        let tool = read_tool(&fixture.parent().unwrap().to_string_lossy());
+        let c = make_ctx(json!({ "path": fixture.to_string_lossy() }));
+        let res = (tool.execute)(c).await.unwrap();
+        let text = text_of(&res);
+        for i in 1..=6 {
+            assert!(
+                text.contains(&format!("Line {i} of docx fixture")),
+                "missing extracted line {i} in: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_docx_offset_paginates_converted_text() {
+        if !office_converter_available() {
+            eprintln!("skipping: neither pandoc nor libreoffice available");
+            return;
+        }
+        let fixture = fixture_path("sample.docx");
+        let tool = read_tool(&fixture.parent().unwrap().to_string_lossy());
+        let c = make_ctx(json!({ "path": fixture.to_string_lossy(), "offset": 1, "limit": 2 }));
+        let res = (tool.execute)(c).await.unwrap();
+        let text = text_of(&res);
+        assert!(
+            text.contains("Line 1 of docx fixture") || text.contains("Line 2 of docx fixture"),
+            "offset/limit must select the head of the converted text, got: {text}"
+        );
+        assert!(text.contains("more lines in file"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn read_ipynb_converts_to_text() {
+        if !nbconvert_available() {
+            eprintln!("skipping: jupyter nbconvert not available");
+            return;
+        }
+        let fixture = fixture_path("sample.ipynb");
+        assert!(fixture.is_file(), "missing fixture {}", fixture.display());
+        let tool = read_tool(&fixture.parent().unwrap().to_string_lossy());
+        let c = make_ctx(json!({ "path": fixture.to_string_lossy() }));
+        let res = (tool.execute)(c).await.unwrap();
+        let text = text_of(&res);
+        assert!(text.contains("answer = 40 + 2"), "missing code cell in: {text}");
+        assert!(text.contains("print(answer)"), "missing code cell in: {text}");
     }
 
     #[tokio::test]
@@ -3211,12 +4187,12 @@ mod tests {
         let cwd = cwd.to_string_lossy();
         assert_eq!(
             create_read_only_tools(&cwd).into_iter().map(|tool| tool.name).collect::<Vec<_>>(),
-            ["read", "grep", "find", "glob", "ls"]
+            ["read", "grep", "find", "glob", "ls", "web_search", "ast_grep"]
         );
         assert_eq!(create_tool("glob", &cwd).unwrap().name, "glob");
-        assert!(create_tool("lsp", &cwd).is_err());
+        assert_eq!(create_tool("lsp", &cwd).unwrap().name, "lsp");
         assert!(create_tool("ast", &cwd).is_err());
-        assert_eq!(create_read_only_tool_definitions(&cwd).len(), 5);
+        assert_eq!(create_read_only_tool_definitions(&cwd).len(), 7);
         let tools = create_all_tools_by_name(&cwd);
         assert_eq!(tools.len(), TOOL_NAMES.len());
         for name in TOOL_NAMES {
@@ -3225,8 +4201,8 @@ mod tests {
         let definitions = create_all_tool_definitions_by_name(&cwd);
         assert_eq!(definitions.len(), TOOL_NAMES.len());
         assert_eq!(create_tool_definition("read", &cwd).unwrap().name, "read");
-        assert_eq!(create_coding_tool_definitions(&cwd).len(), 4);
-        assert_eq!(create_read_only_tool_definitions(&cwd).len(), 5);
+        assert_eq!(create_coding_tool_definitions(&cwd).len(), 6);
+        assert_eq!(create_read_only_tool_definitions(&cwd).len(), 7);
         assert_eq!(create_all_tools_map(&cwd).len(), TOOL_NAMES.len());
         assert_eq!(create_all_tool_definitions(&cwd).len(), TOOL_NAMES.len());
         assert_eq!(create_all_tool_definitions_map(&cwd).len(), TOOL_NAMES.len());
@@ -3238,18 +4214,291 @@ mod tests {
         let cwd = cwd.to_string_lossy();
         for (name, expected) in [
             ("read", ToolCapability::Read),
+            ("inspect_image", ToolCapability::Read),
             ("grep", ToolCapability::Read),
             ("find", ToolCapability::Read),
             ("glob", ToolCapability::Read),
             ("ls", ToolCapability::Read),
+            ("web_search", ToolCapability::Read),
+            ("ast_grep", ToolCapability::Read),
             ("write", ToolCapability::Write),
             ("edit", ToolCapability::Write),
+            ("ast_edit", ToolCapability::Write),
             ("todo", ToolCapability::Write),
+            ("lsp", ToolCapability::Write),
+            ("github", ToolCapability::Write),
+            ("memory", ToolCapability::Write),
             ("bash", ToolCapability::Exec),
+            ("browser", ToolCapability::Exec),
         ] {
             let tool = create_tool(name, &cwd).expect("built-in tool");
             assert_eq!(tool.capability, expected, "{name}");
         }
+    }
+
+    #[test]
+    fn inspect_image_tool_is_registered_with_schema_and_snippet() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        assert!(TOOL_NAMES.contains(&"inspect_image"));
+        assert!(
+            tool_snippet("inspect_image").is_some_and(|s| s.contains("metadata") && s.contains("dominant colors"))
+        );
+        let tool = create_tool("inspect_image", &cwd).expect("inspect_image tool builds");
+        assert_eq!(tool.name, "inspect_image");
+        assert_eq!(tool.capability, ToolCapability::Read);
+        assert_eq!(tool.parameters.required, vec!["path".to_string()]);
+        assert_eq!(schema_type(&tool, "path"), Some("string"));
+    }
+
+    #[test]
+    fn browser_tool_is_registered_with_schema_and_snippet() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        assert!(TOOL_NAMES.contains(&"browser"));
+        assert_eq!(tool_snippet("browser"), Some("Automate a headless Chrome/Chromium browser: navigate, click, fill, screenshot, extract, list_tabs, close"));
+        let tool = create_tool("browser", &cwd).expect("browser tool builds");
+        assert_eq!(tool.name, "browser");
+        assert_eq!(tool.capability, ToolCapability::Exec);
+        let action = tool.parameters.properties.get("action").expect("action prop");
+        assert_eq!(
+            action.schema_type.as_ref().and_then(Value::as_str),
+            Some("string")
+        );
+        assert_eq!(tool.parameters.required, vec!["action"]);
+        // Serializes as a ToolDefinition (used by agent providers).
+        let definition = tool.as_tool_definition();
+        assert_eq!(definition.name, "browser");
+    }
+
+    #[test]
+    fn github_tool_is_registered_with_schema_and_snippet() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        assert!(TOOL_NAMES.contains(&"github"));
+        assert!(tool_snippet("github").is_some_and(|s| s.contains("GitHub API")));
+        let tool = create_tool("github", &cwd).expect("github tool builds");
+        assert_eq!(tool.name, "github");
+        assert_eq!(tool.capability, ToolCapability::Write);
+        // Every action is enumerated in the schema's action enum.
+        let action = tool.parameters.properties.get("action").expect("action prop");
+        let actions: Vec<&str> = action
+            .enum_values
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "search_issues",
+                "get_issue",
+                "list_issues",
+                "create_issue",
+                "comment_issue",
+                "list_prs",
+                "get_pr",
+                "list_commits",
+                "view_file",
+                "search_code"
+            ]
+        );
+        assert!(tool.parameters.required.contains(&"action".to_string()));
+        // Serializes as a ToolDefinition (used by agent providers).
+        let definition = tool.as_tool_definition();
+        assert_eq!(definition.name, "github");
+    }
+
+    #[test]
+    fn memory_tool_is_registered_with_schema_and_snippet() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        assert!(TOOL_NAMES.contains(&"memory"));
+        assert!(
+            tool_snippet("memory")
+                .is_some_and(|s| s.contains("learn") && s.contains("recall") && s.contains("forget"))
+        );
+        let tool = create_tool("memory", &cwd).expect("memory tool builds");
+        assert_eq!(tool.name, "memory");
+        assert_eq!(tool.capability, ToolCapability::Write);
+        // Every action is enumerated in the schema's action enum.
+        let op = tool.parameters.properties.get("op").expect("op prop");
+        let actions: Vec<&str> = op
+            .enum_values
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(actions, ["learn", "recall", "list", "forget"]);
+        assert!(tool.parameters.required.contains(&"op".to_string()));
+        for prop in ["content", "tags", "query", "limit", "tag", "id"] {
+            assert!(tool.parameters.properties.contains_key(prop), "missing {prop} prop");
+        }
+        // The default factory stores under the agent dir without touching disk.
+        let definition = tool.as_tool_definition();
+        assert_eq!(definition.name, "memory");
+    }
+
+    #[test]
+    fn hindsight_tools_are_registered_with_schema_and_snippet() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        for name in ["recall", "retain", "reflect"] {
+            assert!(TOOL_NAMES.contains(&name), "{name} in TOOL_NAMES");
+            assert!(tool_snippet(name).is_some(), "{name} snippet");
+            let tool = create_tool(name, &cwd).expect("tool builds");
+            assert_eq!(tool.name, name);
+            // Serializes as a ToolDefinition (used by agent providers).
+            assert_eq!(tool.as_tool_definition().name, name);
+        }
+        let recall = create_tool("recall", &cwd).expect("recall tool builds");
+        assert_eq!(recall.capability, ToolCapability::Read);
+        assert!(recall.parameters.required.contains(&"query".to_string()));
+        assert!(recall.parameters.properties.contains_key("query"));
+        let retain = create_tool("retain", &cwd).expect("retain tool builds");
+        assert_eq!(retain.capability, ToolCapability::Write);
+        assert!(retain.parameters.required.contains(&"content".to_string()));
+        let reflect = create_tool("reflect", &cwd).expect("reflect tool builds");
+        assert_eq!(reflect.capability, ToolCapability::Read);
+        assert!(reflect.parameters.required.contains(&"query".to_string()));
+    }
+    #[test]
+    fn ordinary_and_persona_child_factories_use_selected_nondefault_hindsight_config() {
+        let cwd = tmpdir();
+        let persona_root = tmpdir();
+        let config = MemoryConfig {
+            backend: crate::MemoryBackend::Hindsight,
+            hindsight_api_url: Some("https://memory.example.test/base".to_owned()),
+            hindsight_bank_id: "review-bank".to_owned(),
+            hindsight_bank_id_prefix: Some("team".to_owned()),
+            ..Default::default()
+        };
+        let resolver: MemoryConfigFn = Arc::new(move || Some(config.clone()));
+        let ordinary = create_coding_tools_with_context_and_resolver(
+            &cwd.to_string_lossy(), None, None, None, None, None, Some(resolver.clone()), None,
+        );
+        let persona = create_coding_tools_with_context_and_resolver_for_persona(
+            &cwd.to_string_lossy(), &persona_root, None, None, None, None, None, Some(resolver), None,
+        );
+        for tools in [ordinary, persona] {
+            let names = tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>();
+            assert!(!names.iter().any(|name| name == "memory"), "{names:?}");
+            for expected in ["recall", "retain", "reflect"] {
+                assert!(names.iter().any(|name| name == expected), "{names:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn persona_child_factory_preserves_local_persona_scope_and_off_selection() {
+        let cwd = tmpdir();
+        let persona_root = tmpdir();
+        let local: MemoryConfigFn = Arc::new(|| Some(MemoryConfig::default()));
+        let local_tools = create_coding_tools_with_context_and_resolver_for_persona(
+            &cwd.to_string_lossy(), &persona_root, None, None, None, None, None, Some(local), None,
+        );
+        assert!(local_tools.iter().any(|tool| tool.name == "memory"));
+        let off: MemoryConfigFn = Arc::new(|| Some(MemoryConfig {
+            backend: crate::MemoryBackend::Off,
+            ..Default::default()
+        }));
+        let off_tools = create_coding_tools_with_context_and_resolver_for_persona(
+            &cwd.to_string_lossy(), &persona_root, None, None, None, None, None, Some(off), None,
+        );
+        assert!(!off_tools.iter().any(|tool| matches!(tool.name.as_str(), "memory" | "recall" | "retain" | "reflect")));
+    }
+
+    #[test]
+    fn mcp_tool_is_registered_with_schema_and_snippet() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        assert!(TOOL_NAMES.contains(&"mcp"));
+        assert!(
+            tool_snippet("mcp")
+                .is_some_and(|s| s.contains("list_servers") && s.contains("list_tools") && s.contains("call"))
+        );
+        let tool = create_tool("mcp", &cwd).expect("mcp tool builds");
+        assert_eq!(tool.name, "mcp");
+        assert_eq!(tool.capability, ToolCapability::Write);
+        for prop in ["action", "server", "tool", "args"] {
+            assert!(tool.parameters.properties.contains_key(prop), "missing {prop} prop");
+        }
+        assert!(tool.parameters.required.contains(&"action".to_string()));
+        // Serializes as a ToolDefinition (used by agent providers).
+        let definition = tool.as_tool_definition();
+        assert_eq!(definition.name, "mcp");
+    }
+
+    #[test]
+    fn debug_tool_is_registered_with_schema_and_snippet() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        assert!(TOOL_NAMES.contains(&"debug"));
+        assert!(
+            tool_snippet("debug").is_some_and(|s| {
+                s.contains("launch") && s.contains("set_breakpoint") && s.contains("continue_")
+            })
+        );
+        let tool = create_tool("debug", &cwd).expect("debug tool builds");
+        assert_eq!(tool.name, "debug");
+        assert_eq!(tool.capability, ToolCapability::Write);
+        for prop in [
+            "action",
+            "adapter",
+            "program",
+            "file",
+            "line",
+            "variables_reference",
+            "expression",
+        ] {
+            assert!(tool.parameters.properties.contains_key(prop), "missing {prop} prop");
+        }
+        assert!(tool.parameters.required.contains(&"action".to_string()));
+        // Serializes as a ToolDefinition (used by agent providers).
+        let definition = tool.as_tool_definition();
+        assert_eq!(definition.name, "debug");
+    }
+
+    #[test]
+    fn eval_tool_is_registered_with_schema_and_snippet() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        assert!(TOOL_NAMES.contains(&"eval"));
+        assert!(
+            tool_snippet("eval")
+                .is_some_and(|s| s.contains("python") && s.contains("QuickJS") && s.contains("syntax"))
+        );
+        let tool = create_tool("eval", &cwd).expect("eval tool builds");
+        assert_eq!(tool.name, "eval");
+        assert_eq!(tool.capability, ToolCapability::Exec);
+        for prop in ["language", "code", "timeout"] {
+            assert!(tool.parameters.properties.contains_key(prop), "missing {prop} prop");
+        }
+        assert!(tool.parameters.required.contains(&"language".to_string()));
+        assert!(tool.parameters.required.contains(&"code".to_string()));
+        // Serializes as a ToolDefinition (used by agent providers).
+        let definition = tool.as_tool_definition();
+        assert_eq!(definition.name, "eval");
+    }
+
+    #[test]
+    fn notebook_tool_is_registered_with_schema_and_snippet() {
+        let cwd = tmpdir();
+        let cwd = cwd.to_string_lossy();
+        assert!(TOOL_NAMES.contains(&"notebook"));
+        assert!(
+            tool_snippet("notebook")
+                .is_some_and(|s| s.contains("ipynb") && s.contains("execute") && s.contains("edit"))
+        );
+        let tool = create_tool("notebook", &cwd).expect("notebook tool builds");
+        assert_eq!(tool.name, "notebook");
+        assert_eq!(tool.capability, ToolCapability::Exec);
+        for prop in ["action", "path", "cell", "write", "cell_type", "source", "timeout"] {
+            assert!(tool.parameters.properties.contains_key(prop), "missing {prop} prop");
+        }
+        assert!(tool.parameters.required.contains(&"action".to_string()));
+        assert!(tool.parameters.required.contains(&"path".to_string()));
+        // Serializes as a ToolDefinition (used by agent providers).
+        let definition = tool.as_tool_definition();
+        assert_eq!(definition.name, "notebook");
     }
 
     #[tokio::test]
@@ -3299,7 +4548,7 @@ mod tests {
         fs::create_dir_all(&external).expect("external directory");
         let workspace = crate::WorkspaceRoots::new(&cwd, [&added]).expect("workspace");
         let tools = create_coding_tools_for_workspace_with_context_and_resolver(
-            workspace, None, None, None, None,
+            workspace, None, None, None, None, None, None, None,
         );
         let write = tools
             .iter()
@@ -3434,6 +4683,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_missing_required_args_error_without_creating_files() {
+        let d = tmpdir();
+        let tool = write_tool(&d.to_string_lossy());
+
+        let missing_content = (tool.execute)(make_ctx(json!({ "path": "m.txt" })))
+            .await
+            .expect_err("missing content must fail actionably")
+            .to_string();
+        assert!(missing_content.contains("missing required argument"), "{missing_content}");
+        assert!(missing_content.contains("content"), "{missing_content}");
+        assert!(
+            !d.join("m.txt").exists(),
+            "no file may be written when content is missing"
+        );
+
+        let missing_path = (tool.execute)(make_ctx(json!({ "content": "x" })))
+            .await
+            .expect_err("missing path must fail actionably")
+            .to_string();
+        assert!(missing_path.contains("missing required argument"), "{missing_path}");
+        assert!(missing_path.contains("path"), "{missing_path}");
+    }
+
+    #[tokio::test]
+    async fn write_explicit_empty_content_creates_empty_file() {
+        let d = tmpdir();
+        let tool = write_tool(&d.to_string_lossy());
+        // The schema requires `content` but imposes no minLength: an explicitly
+        // empty value stays valid and writes an empty file (missing is the
+        // error, not empty).
+        let res = (tool.execute)(make_ctx(json!({ "path": "empty.txt", "content": "" })))
+            .await
+            .expect("explicit empty content is schema-valid");
+        assert!(
+            text_of(&res).contains("Successfully wrote 0 bytes"),
+            "got: {}",
+            text_of(&res)
+        );
+        assert_eq!(fs::read(d.join("empty.txt")).unwrap(), b"");
+    }
+
+    #[tokio::test]
     async fn edit_applies_unique_replacement() {
         let d = tmpdir();
         fs::write(d.join("e.txt"), b"fn foo() {\n    return 1;\n}\n").unwrap();
@@ -3498,7 +4789,7 @@ mod tests {
     #[tokio::test]
     async fn bash_success() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         let c = make_ctx(json!({ "command": "echo hello world" }));
         let res = (tool.execute)(c).await.unwrap();
         assert_eq!(text_of(&res), "hello world\n");
@@ -3507,7 +4798,7 @@ mod tests {
     #[tokio::test]
     async fn bash_closes_stdin_and_applies_non_interactive_environment() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         let result = (tool.execute)(make_ctx(json!({
             "command": "if read line; then printf 'unexpected:%s' \"$line\"; else printf 'stdin-closed:%s:%s:%s' \"$GIT_TERMINAL_PROMPT\" \"$GH_PROMPT_DISABLED\" \"$PAGER\"; fi",
             "timeout": 2
@@ -3519,7 +4810,7 @@ mod tests {
     #[tokio::test]
     async fn bash_nonzero_exit() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         let c = make_ctx(json!({ "command": "exit 7" }));
         let err = (tool.execute)(c).await.unwrap_err().to_string();
         assert!(err.contains("Command exited with code 7"), "got: {err}");
@@ -3528,7 +4819,7 @@ mod tests {
     #[tokio::test]
     async fn bash_timeout_kills_command() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         let c = make_ctx(json!({ "command": "sleep 30", "timeout": 0.5 }));
         let err = (tool.execute)(c).await.unwrap_err().to_string();
         assert!(err.contains("Command timed out after"), "got: {err}");
@@ -3537,10 +4828,36 @@ mod tests {
     #[tokio::test]
     async fn bash_invalid_timeout_rejected() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         let c = make_ctx(json!({ "command": "echo hi", "timeout": -1 }));
         let err = (tool.execute)(c).await.unwrap_err().to_string();
         assert!(err.contains("Invalid timeout"));
+    }
+
+    #[tokio::test]
+    async fn bash_missing_command_errors_actionably() {
+        let d = tmpdir();
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
+        let err = (tool.execute)(make_ctx(json!({})))
+            .await
+            .expect_err("missing command must fail, never run `bash -c ''`")
+            .to_string();
+        assert!(err.contains("missing required argument"), "{err}");
+        assert!(err.contains("command"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn bash_explicit_empty_command_follows_schema() {
+        let d = tmpdir();
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
+        // The bash schema requires `command` but imposes no minLength, so an
+        // explicitly empty command is schema-valid: `bash -c ''` runs and
+        // exits 0, rendered with the standard empty-output "(no output)"
+        // contract (pi parity) instead of a required-argument error.
+        let res = (tool.execute)(make_ctx(json!({ "command": "" })))
+            .await
+            .expect("explicit empty command is schema-valid");
+        assert_eq!(text_of(&res), "(no output)");
     }
 
     #[tokio::test]
@@ -3553,7 +4870,7 @@ mod tests {
                 u.lock().push(text.clone());
             }
         });
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         let (_ctrl, abort) = pi_agent::AbortController::new();
         let ctx = ToolCallContext {
             tool_call_id: "t".to_string(),
@@ -3570,7 +4887,7 @@ mod tests {
     #[tokio::test]
     async fn bash_preserves_stdout_stderr_write_order() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         // Sequential stdout → stderr → stdout; merged stream must keep source order.
         let c = make_ctx(json!({
             "command": "printf 'OUT1\\n'; sleep 0.05; printf 'ERR1\\n' >&2; sleep 0.05; printf 'OUT2\\n'"
@@ -3588,7 +4905,7 @@ mod tests {
             Arc::new(move |s| c.lock().push_str(&s));
         let (_ctrl, abort) = pi_agent::AbortController::new();
 
-        let res = execute_bash(&d, "echo hello", None, on_chunk, abort).await.unwrap();
+        let res = execute_bash(&d, "echo hello", None, None, on_chunk, abort).await.unwrap();
         assert!(!res.cancelled);
         assert_eq!(res.exit_code, Some(0));
         assert!(res.output.contains("hello"));
@@ -3598,7 +4915,7 @@ mod tests {
     #[tokio::test]
     async fn bash_rejects_unsupervised_detach_without_rejecting_literal_ampersands() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         for command in [
             "nohup python3 -m http.server 8765 &",
             "python3 -m http.server 8765 &",
@@ -3667,6 +4984,7 @@ mod tests {
                 manager: manager.clone(),
                 owner_id: owner.clone(),
             }),
+            None,
         );
         let result = (tool.execute)(make_ctx(json!({
             "command": "printf background-ok",
@@ -3707,6 +5025,7 @@ mod tests {
                 manager: manager.clone(),
                 owner_id: owner.clone(),
             }),
+            None,
         );
         let (controller, abort) = pi_agent::AbortController::new();
         controller.abort();
@@ -3729,7 +5048,7 @@ mod tests {
         let on_chunk: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_s| {});
         let (_ctrl, abort) = pi_agent::AbortController::new();
         std::mem::forget(_ctrl);
-        let res = execute_bash(&d, "exit 7", None, on_chunk, abort).await.unwrap();
+        let res = execute_bash(&d, "exit 7", None, None, on_chunk, abort).await.unwrap();
         assert!(!res.cancelled);
         assert_eq!(res.exit_code, Some(7));
     }
@@ -3744,10 +5063,221 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(80)).await;
             ctrl.abort();
         });
-        let res = execute_bash(&d, "sleep 30", None, on_chunk, abort).await.unwrap();
+        let res = execute_bash(&d, "sleep 30", None, None, on_chunk, abort).await.unwrap();
         h.await.unwrap();
         assert!(res.cancelled, "expected cancelled=true, got {res:?}");
         assert_eq!(res.exit_code, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Embedded brush shell (default unsandboxed path)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bash_default_path_uses_embedded_brush() {
+        let d = tmpdir();
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
+        // BASH_VERSION is a well-known shell variable: real bash sets it, the
+        // embedded brush session skips well-known vars. Its absence proves the
+        // default (unsandboxed) path executed through brush, not a /bin/bash
+        // subprocess.
+        let res = (tool.execute)(make_ctx(json!({
+            "command": "printf 'shell=%s' \"${BASH_VERSION:-brush}\""
+        })))
+        .await
+        .unwrap();
+        assert_eq!(text_of(&res), "shell=brush");
+    }
+
+    #[tokio::test]
+    async fn bash_brush_rebuilds_env_explicitly() {
+        let d = tmpdir();
+        // The session rebuilds the environment explicitly: live session
+        // metadata is visible, and $PWD mirrors the working directory (the
+        // subprocess path derives it the same way).
+        let session_env: SessionEnvFn = Arc::new(|| {
+            HashMap::from([("PI_MODEL".to_owned(), "session-value".to_owned())])
+        });
+        let tool = bash_tool(&d.to_string_lossy(), Some(session_env), None, None);
+        let res = (tool.execute)(make_ctx(json!({
+            "command": "printf 'model=%s pwd=%s' \"${PI_MODEL:-unset}\" \"$PWD\""
+        })))
+        .await
+        .unwrap();
+        assert_eq!(
+            text_of(&res),
+            format!("model=session-value pwd={}", d.display())
+        );
+    }
+
+    #[test]
+    fn bash_command_env_exports_all_five_session_keys_and_passes_through_host_env() {
+        // Upstream compatibility contract: PI_SESSION_ID, PI_SESSION_FILE,
+        // PI_PROVIDER, PI_MODEL, and PI_REASONING_LEVEL are exported to bash
+        // children with the live session's values.
+        let session_env: SessionEnvFn = Arc::new(|| {
+            HashMap::from([
+                ("PI_SESSION_ID".to_owned(), "sess-123".to_owned()),
+                ("PI_SESSION_FILE".to_owned(), "/tmp/sess.jsonl".to_owned()),
+                ("PI_PROVIDER".to_owned(), "anthropic".to_owned()),
+                ("PI_MODEL".to_owned(), "claude-x".to_owned()),
+                ("PI_REASONING_LEVEL".to_owned(), "high".to_owned()),
+            ])
+        });
+        let env: HashMap<String, String> = bash_command_env(Some(&session_env)).into_iter().collect();
+        for (key, value) in [
+            ("PI_SESSION_ID", "sess-123"),
+            ("PI_SESSION_FILE", "/tmp/sess.jsonl"),
+            ("PI_PROVIDER", "anthropic"),
+            ("PI_MODEL", "claude-x"),
+            ("PI_REASONING_LEVEL", "high"),
+        ] {
+            assert_eq!(
+                env.get(key).map(String::as_str),
+                Some(value),
+                "{key} must be exported to bash children"
+            );
+        }
+        // Host environment passes through for everything else.
+        assert!(
+            env.contains_key("PATH"),
+            "host environment must reach bash children"
+        );
+    }
+
+    #[test]
+    fn bash_command_env_scrubs_stale_host_session_keys_and_skips_empty_values() {
+        // The session keys are rebuilt from the session alone: values the host
+        // process inherited (e.g. an outer rpi's PI_MODEL) never leak into the
+        // child, and keys the session provides as empty are omitted entirely.
+        let session_env: SessionEnvFn = Arc::new(|| {
+            HashMap::from([
+                ("PI_MODEL".to_owned(), "session-model".to_owned()),
+                ("PI_SESSION_ID".to_owned(), String::new()),
+            ])
+        });
+        let env: HashMap<String, String> = bash_command_env(Some(&session_env)).into_iter().collect();
+        assert_eq!(
+            env.get("PI_MODEL").map(String::as_str),
+            Some("session-model"),
+            "the session value must win over any inherited host value"
+        );
+        for key in ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_REASONING_LEVEL"] {
+            assert!(
+                !env.contains_key(key),
+                "{key} must be scrubbed when the session provides no non-empty value"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_brush_rejects_host_dangerous_builtins() {
+        let d = tmpdir();
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
+        // In-process execution shares the rpi process: builtins that would
+        // replace/stop/mutate the host are refused with an actionable message.
+        for command in ["exec sleep 0.1", "suspend", "ulimit -n", "umask 077"] {
+            let err = (tool.execute)(make_ctx(json!({ "command": command })))
+                .await
+                .expect_err("host-dangerous builtins must be refused")
+                .to_string();
+            assert!(
+                err.contains("not supported in the embedded brush shell"),
+                "{command}: {err}"
+            );
+        }
+        // `kill` of the host pid ($$ is the rpi process in-process) is refused…
+        let err = (tool.execute)(make_ctx(json!({ "command": "kill -9 $$" })))
+            .await
+            .expect_err("kill of the host pid must be refused")
+            .to_string();
+        assert!(err.contains("refusing to signal the host process"), "{err}");
+        // …but legitimate kill uses pass through the guarded builtin.
+        let res = (tool.execute)(make_ctx(json!({ "command": "kill -l" })))
+            .await
+            .expect("kill -l passes through the guarded builtin");
+        assert!(text_of(&res).contains("SIGTERM"), "{}", text_of(&res));
+        // `exec` inside a subshell still works (brush spawns a child there).
+        let res = (tool.execute)(make_ctx(json!({ "command": "(exec echo subshell-ok)" })))
+            .await
+            .expect("subshell exec passes through");
+        assert_eq!(text_of(&res), "subshell-ok\n");
+    }
+
+    #[tokio::test]
+    async fn bash_brush_kill_guard_checks_every_numeric_target() {
+        let d = tmpdir();
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
+        // A multi-target kill that names the host pid anywhere in the list
+        // must be refused: brush's kill applies the signal to ALL listed
+        // targets, so a first-pid-only scan (`kill 1234 $$`) would delegate
+        // and then signal the rpi process itself.
+        for command in ["kill 1234 $$", "kill -9 1234 $$", "kill $$ 1234", "kill 1234 5678 $$"] {
+            let err = (tool.execute)(make_ctx(json!({ "command": command })))
+                .await
+                .expect_err("a multi-target kill naming the host pid must be refused")
+                .to_string();
+            assert!(
+                err.contains("refusing to signal the host process"),
+                "{command}: {err}"
+            );
+        }
+        // A multi-target kill that never names the host pid passes through
+        // the guarded builtin (the targets themselves do not exist, so kill
+        // reports its own error instead of a host-guard refusal).
+        let err = (tool.execute)(make_ctx(json!({ "command": "kill 1234 5678" })))
+            .await
+            .expect_err("multi-target kill without the host pid must not hit the host guard")
+            .to_string();
+        assert!(
+            !err.contains("refusing to signal the host process"),
+            "non-host multi-target kill must pass through: {err}"
+        );
+        // The signal-only form still passes through untouched.
+        let res = (tool.execute)(make_ctx(json!({ "command": "kill -l" })))
+            .await
+            .expect("kill -l passes through the guarded builtin");
+        assert!(text_of(&res).contains("SIGTERM"), "{}", text_of(&res));
+    }
+
+    #[tokio::test]
+    async fn bash_brush_falls_back_to_subprocess_when_parse_fails() {
+        let d = tmpdir();
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
+        // `echo )` is a syntax error for every shell; brush's parse check
+        // fails, so execution falls back to the /bin/bash subprocess path,
+        // which reports bash's own syntax error (documented fallback policy).
+        let err = (tool.execute)(make_ctx(json!({ "command": "echo )" })))
+            .await
+            .expect_err("unparseable command must fail")
+            .to_string();
+        assert!(
+            err.contains("syntax error"),
+            "expected bash syntax error via the subprocess fallback: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_brush_timeout_reaps_descendants() {
+        let d = tmpdir();
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
+        let before = bash::brush::test_descendant_count();
+        let err = (tool.execute)(make_ctx(json!({ "command": "sleep 30", "timeout": 0.5 })))
+            .await
+            .expect_err("sleep must time out")
+            .to_string();
+        assert!(err.contains("timed out"), "{err}");
+        // The external child must be reaped, not orphaned (the descendant
+        // enumeration covers children forked by the brush thread).
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if bash::brush::test_descendant_count() <= before {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("brush timeout left orphaned descendants behind");
     }
 
     fn extract_full_output_path(text: &str) -> String {
@@ -3761,7 +5291,7 @@ mod tests {
     #[tokio::test]
     async fn bash_full_output_spill_persists_then_cleanup_removes() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         // 60000 bytes > 50 KiB display cap → spills to a temp file; exit 0.
         let res = (tool.execute)(make_ctx(json!({ "command": "yes x | head -c 60000", "timeout": 10 })))
             .await
@@ -3786,7 +5316,7 @@ mod tests {
     #[tokio::test]
     async fn bash_full_output_spill_removed_on_nonzero_exit() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         // Big output (spill) + nonzero exit: run_bash must clean up the spill
         // and must NOT publish a (dead) Full output path in the error text.
         // (Owned-file cleanup is covered race-free by bash.rs Drop/take unit
@@ -3805,7 +5335,7 @@ mod tests {
     #[tokio::test]
     async fn bash_full_output_spill_removed_on_timeout() {
         let d = tmpdir();
-        let tool = bash_tool(&d.to_string_lossy(), None, None);
+        let tool = bash_tool(&d.to_string_lossy(), None, None, None);
         // Produce output continuously, then time out: spill must be cleaned up
         // and the error must not publish a dead Full output path.
         let err = (tool.execute)(make_ctx(json!({ "command": "yes x", "timeout": 0.5 })))

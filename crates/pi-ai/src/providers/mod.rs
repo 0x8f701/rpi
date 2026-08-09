@@ -5,6 +5,7 @@ mod codex;
 mod common;
 mod faux;
 mod google;
+mod imagegen;
 mod mistral;
 mod openai;
 mod pi_messages;
@@ -18,6 +19,7 @@ pub use bedrock::*;
 pub use codex::*;
 pub use faux::*;
 pub use google::*;
+pub use imagegen::*;
 pub use mistral::*;
 pub use openai::*;
 pub use pi_messages::*;
@@ -40,5 +42,6 @@ pub fn register_builtins() {
         register_bedrock();
         register_google_vertex();
         register_pi_messages();
+        register_imagegen();
     });
 }

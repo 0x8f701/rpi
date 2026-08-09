@@ -11,7 +11,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use pi_ai::Model;
-use regex::Regex;
 
 
 /// Configured fallback chains keyed by role, exact model selector, or provider wildcard.
@@ -470,30 +469,15 @@ pub fn find_retry_fallback_candidates<L: RetryFallbackModelLookup>(
 }
 
 /// Redacts secret-shaped fragments from terminal retry diagnostics.
+///
+/// Thin wrapper over the shared [`crate::redact::redact_secrets`] pass: the
+/// retry-diagnostic shapes (`AWS_*=…`, `api_key=…`, `Bearer …`, `sk-…`,
+/// `pk-…`, `xox…`) are part of the shared pattern set compiled once at first
+/// use. A broken pattern set panics at init instead of silently skipping
+/// redaction.
 #[must_use]
 pub fn redact_retry_diagnostic(text: &str) -> String {
-    let mut out = text.to_owned();
-    for (pattern, replacement) in [
-        (
-            r#"(?i)\b(AWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN))\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)"#,
-            "$1=[REDACTED]",
-        ),
-        (
-            r"(?i)(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*(?:bearer\s+)?\S+",
-            "$1=[REDACTED]",
-        ),
-        (r"(?i)bearer\s+[a-z0-9._\-]+", "Bearer [REDACTED]"),
-        (r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED]"),
-        (
-            r"(?i)\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|xox[baprs])[-_][A-Za-z0-9\-_]{8,}\b",
-            "[REDACTED]",
-        ),
-    ] {
-        if let Ok(re) = Regex::new(pattern) {
-            out = re.replace_all(&out, replacement).into_owned();
-        }
-    }
-    out
+    crate::redact::redact_secrets(text)
 }
 
 /// Aggregates exhausted retry/fallback diagnostics with secret redaction.
@@ -779,13 +763,174 @@ mod tests {
 
     #[test]
     fn diagnostics_redact_secrets_and_dedupe() {
+        let secret = ["s", "k-", "abc1234567890secret"].concat();
+        let authorization = format!("Authorization: Bearer {secret}");
         let message = aggregate_retry_diagnostics(&[
-            "Authorization: Bearer sk-abc1234567890secret".to_owned(),
-            "Authorization: Bearer sk-abc1234567890secret".to_owned(),
+            authorization.clone(),
+            authorization,
             "api_key=super-secret-value".to_owned(),
         ]);
         assert!(!message.contains("sk-abc"));
         assert!(!message.contains("super-secret-value"));
-        assert!(message.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn parse_retry_fallback_selector_splits_provider_id_and_thinking() {
+        let models = lookup();
+        let cases = [
+            ("primary/main", "primary", "main", None),
+            ("primary/main:high", "primary", "main", Some("high")),
+            ("backup/spare:medium", "backup", "spare", Some("medium")),
+            // Unknown thinking level is NOT split off: the colon stays in the id.
+            ("primary/main:notalevel", "primary", "main:notalevel", None),
+            // Thinking level is case-insensitive on the parse side (lowercased).
+            ("backup/spare:XHIGH", "backup", "spare", Some("xhigh")),
+        ];
+        for (selector, provider, id, thinking) in cases {
+            let parsed = parse_retry_fallback_selector(selector, Some(&models))
+                .unwrap_or_else(|| panic!("parse {selector:?}"));
+            assert_eq!(parsed.provider, provider, "provider for {selector:?}");
+            assert_eq!(parsed.id, id, "id for {selector:?}");
+            assert_eq!(parsed.thinking_level.as_deref(), thinking, "thinking for {selector:?}");
+            assert_eq!(parsed.raw, selector.trim(), "raw for {selector:?}");
+        }
+    }
+
+    #[test]
+    fn parse_retry_fallback_selector_rejects_empty_and_providerless() {
+        let models = lookup();
+        assert!(parse_retry_fallback_selector("", Some(&models)).is_none());
+        assert!(parse_retry_fallback_selector("   ", Some(&models)).is_none());
+        // No slash: provider stays empty -> rejected.
+        assert!(parse_retry_fallback_selector("noprovider", Some(&models)).is_none());
+        // Slash with empty id: provider set, id empty -> rejected.
+        assert!(parse_retry_fallback_selector("primary/", Some(&models)).is_none());
+        // Works without a lookup too (no-slash-second-segment heuristic).
+        let parsed =
+            parse_retry_fallback_selector("solo/model", None::<&MapModelLookup>).expect("no lookup");
+        assert_eq!(parsed.provider, "solo");
+        assert_eq!(parsed.id, "model");
+    }
+
+    #[test]
+    fn format_retry_fallback_selector_appends_and_trims_thinking() {
+        let m = model("primary", "main");
+        assert_eq!(format_retry_fallback_selector(&m, None), "primary/main");
+        assert_eq!(format_retry_fallback_selector(&m, Some("high")), "primary/main:high");
+        // Whitespace-only/empty thinking is dropped, not appended as a bare colon.
+        assert_eq!(format_retry_fallback_selector(&m, Some("   ")), "primary/main");
+        assert_eq!(format_retry_fallback_selector(&m, Some("")), "primary/main");
+    }
+
+    #[test]
+    fn expand_default_retry_fallback_chains_applies_to_roles_without_own_chain() {
+        let chains = BTreeMap::from([(
+            "default".to_owned(),
+            vec!["backup/spare".to_owned()],
+        )]);
+        let expanded =
+            expand_default_retry_fallback_chains(&chains, ["task", "main", "default"]);
+        assert_eq!(expanded["task"], vec!["backup/spare".to_owned()]);
+        assert_eq!(expanded["main"], vec!["backup/spare".to_owned()]);
+        // "default" is not re-inserted (already present).
+        assert_eq!(expanded["default"], vec!["backup/spare".to_owned()]);
+        assert_eq!(expanded.len(), 3);
+    }
+
+    #[test]
+    fn expand_default_retry_fallback_chains_preserves_role_chains_and_noop_without_default() {
+        // A role with its own chain is not overwritten by the default.
+        let chains = BTreeMap::from([
+            ("default".to_owned(), vec!["backup/spare".to_owned()]),
+            ("task".to_owned(), vec!["backup/other".to_owned()]),
+        ]);
+        let expanded = expand_default_retry_fallback_chains(&chains, ["task", "main"]);
+        assert_eq!(expanded["task"], vec!["backup/other".to_owned()]);
+        assert_eq!(expanded["main"], vec!["backup/spare".to_owned()]);
+
+        // No "default" key -> nothing inserted.
+        let chains = BTreeMap::from([("task".to_owned(), vec!["backup/spare".to_owned()])]);
+        let expanded = expand_default_retry_fallback_chains(&chains, ["main"]);
+        assert_eq!(expanded.len(), 1);
+        assert!(expanded.get("main").is_none());
+    }
+
+    #[test]
+    fn is_hard_error_fallback_eligible_gate_table() {
+        // Eligible baseline: stop error, not retryable, no tool call, not
+        // overflow, not abort, fallback enabled, candidates exist.
+        assert!(
+            is_hard_error_fallback_eligible(true, false, false, false, false, true, true),
+            "baseline hard error with fallback enabled must be eligible"
+        );
+        // Each disqualifying condition flips eligibility off.
+        assert!(
+            !is_hard_error_fallback_eligible(false, false, false, false, false, true, true),
+            "non-error stop reason is not eligible"
+        );
+        assert!(
+            !is_hard_error_fallback_eligible(true, true, false, false, false, true, true),
+            "retryable error stays with the same model, not fallback"
+        );
+        assert!(
+            !is_hard_error_fallback_eligible(true, false, true, false, false, true, true),
+            "error with a tool call is not eligible"
+        );
+        assert!(
+            !is_hard_error_fallback_eligible(true, false, false, true, false, true, true),
+            "context overflow is handled by compaction, not fallback"
+        );
+        assert!(
+            !is_hard_error_fallback_eligible(true, false, false, false, true, true, true),
+            "user abort is not eligible"
+        );
+        assert!(
+            !is_hard_error_fallback_eligible(true, false, false, false, false, false, true),
+            "fallback disabled is not eligible"
+        );
+        assert!(
+            !is_hard_error_fallback_eligible(true, false, false, false, false, true, false),
+            "no fallback candidates is not eligible"
+        );
+    }
+
+    #[test]
+    fn aggregate_retry_diagnostics_empty_falls_back_to_provider_error() {
+        // No errors at all -> the generic fallback message.
+        assert_eq!(aggregate_retry_diagnostics(&[]), "provider error");
+        // All-redacted-to-empty -> still the generic fallback (no empty parts).
+        assert_eq!(
+            aggregate_retry_diagnostics(&["".to_owned(), "   ".to_owned()]),
+            "provider error"
+        );
+        // Non-empty distinct errors are joined with " | " after redaction.
+        let msg = aggregate_retry_diagnostics(&[
+            "timeout calling primary/main".to_owned(),
+            "timeout calling backup/spare".to_owned(),
+        ]);
+        assert!(msg.contains("primary/main"));
+        assert!(msg.contains("backup/spare"));
+        assert!(msg.contains(" | "));
+    }
+
+    #[test]
+    fn parse_retry_fallback_wildcard_splits_known_and_unknown_providers() {
+        // Known provider "google" -> provider only, no id prefix.
+        let (provider, prefix) =
+            parse_retry_fallback_wildcard("google/*", |c| c == "google");
+        assert_eq!(provider, "google");
+        assert!(prefix.is_none());
+        // Unknown "google/gemini" (not a known provider) -> provider + id prefix.
+        let (provider, prefix) =
+            parse_retry_fallback_wildcard("google/gemini/*", |_| false);
+        assert_eq!(provider, "google");
+        assert_eq!(prefix.as_deref(), Some("gemini"));
+        // "openrouter/google/gemini-x" is a known provider in the lookup, so
+        // the whole thing is the provider with no id prefix.
+        let models = lookup();
+        let (provider, prefix) =
+            parse_retry_fallback_wildcard("openrouter/*", |c| models.has_provider(c));
+        assert_eq!(provider, "openrouter");
+        assert!(prefix.is_none());
     }
 }

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Deserialize;
@@ -27,19 +27,43 @@ struct ProviderAuthConfig {
     auth_header: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum StoredCredential {
     ApiKey {
         key: String,
         env: HashMap<String, String>,
+        scope: Option<String>,
     },
-    OAuth,
+    OAuth {
+        scope: Option<String>,
+    },
+}
+
+impl StoredCredential {
+    fn scope(&self) -> Option<&str> {
+        match self {
+            Self::ApiKey { scope, .. } | Self::OAuth { scope } => scope.as_deref(),
+        }
+    }
+}
+
+/// Pick the stored credential for `provider` under the active scope
+/// preference. The selection rules (scope match wins, unscoped fallback,
+/// secret-free errors) live in the shared
+/// [`pi_coding::select_scoped_credential_by`] core; this thin accessor maps
+/// the CLI's [`StoredCredential`] slots onto their scope labels.
+fn select_stored_credential<'a>(
+    provider: &str,
+    entries: &'a [StoredCredential],
+    active_scope: Option<&str>,
+) -> Result<Option<&'a StoredCredential>> {
+    pi_coding::select_scoped_credential_by(provider, entries, StoredCredential::scope, active_scope)
 }
 
 #[derive(Default)]
 struct ConfigState {
     providers: HashMap<String, ProviderAuthConfig>,
-    stored_credentials: HashMap<String, StoredCredential>,
+    stored_credentials: HashMap<String, Vec<StoredCredential>>,
     runtime_keys: HashMap<String, String>,
     owned_models: Vec<ModelKey>,
     auth_path: Option<PathBuf>,
@@ -213,7 +237,7 @@ fn resolve_agent_config_path(
     override_dir
         .or(env_dir)
         .or_else(|| home.map(|directory| directory.join(".pi").join("agent")))
-        .map(|directory| directory.join(file_name))
+        .map(|directory| pi_coding::apply_profile(directory).join(file_name))
 }
 #[must_use]
 pub fn radius_catalog_store_path() -> Option<PathBuf> {
@@ -317,20 +341,25 @@ pub async fn resolve_provider_api_key_async(
     if let Some(key) = runtime_key.filter(|key| !key.trim().is_empty()) {
         return Ok(Some(key));
     }
-    if let Some(stored) = stored {
-        match stored {
-            StoredCredential::ApiKey { key, env: stored_env } => {
-                if let Some(key) = resolve_stored_api_key(&key, &stored_env, provider, env)? {
-                    return Ok(Some(key));
+    if let Some(entries) = stored {
+        let active_scope = pi_coding::active_auth_scope();
+        if let Some(stored) =
+            select_stored_credential(provider, &entries, active_scope.as_deref())?
+        {
+            match stored {
+                StoredCredential::ApiKey { key, env: stored_env, .. } => {
+                    if let Some(key) = resolve_stored_api_key(&key, &stored_env, provider, env)? {
+                        return Ok(Some(key));
+                    }
                 }
-            }
-            StoredCredential::OAuth => {
-                let path = auth_path.ok_or_else(|| anyhow!("auth.json path is unavailable"))?;
-                return Ok(pi_coding::AuthManager::new(path)?
-                    .resolve_stored(provider, env)
-                    .await?
-                    .map(|auth| auth.api_key)
-                    .filter(|key| !key.trim().is_empty()));
+                StoredCredential::OAuth { .. } => {
+                    let path = auth_path.ok_or_else(|| anyhow!("auth.json path is unavailable"))?;
+                    return Ok(pi_coding::AuthManager::new(path)?
+                        .resolve_stored(provider, env)
+                        .await?
+                        .map(|auth| auth.api_key)
+                        .filter(|key| !key.trim().is_empty()));
+                }
             }
         }
     }
@@ -357,12 +386,12 @@ pub fn has_configured_auth(model: &Model) -> bool {
         .runtime_keys
         .get(&model.provider)
         .is_some_and(|key| !key.trim().is_empty())
-        || state.stored_credentials.get(&model.provider).is_some_and(
-            |credential| match credential {
+        || state.stored_credentials.get(&model.provider).is_some_and(|entries| {
+            entries.iter().any(|credential| match credential {
                 StoredCredential::ApiKey { key, .. } => !key.trim().is_empty(),
-                StoredCredential::OAuth => true,
-            },
-        )
+                StoredCredential::OAuth { .. } => true,
+            })
+        })
         || config
             .and_then(|provider| provider.api_key.as_deref())
             .is_some_and(|key| !key.trim().is_empty())
@@ -405,13 +434,14 @@ pub fn resolve_model_request_auth(
     let state = state_read();
     let config = state.providers.get(&model.provider);
     let mut credential_env = None;
+    let active_scope = pi_coding::active_auth_scope();
     let key = if let Some(key) = explicit_key.filter(|key| !key.trim().is_empty()) {
         Some(key.to_owned())
     } else if let Some(key) = state.runtime_keys.get(&model.provider) {
         Some(key.clone())
-    } else if let Some(credential) = state.stored_credentials.get(&model.provider) {
-        match credential {
-            StoredCredential::ApiKey { key, env: stored_env } => {
+    } else if let Some(entries) = state.stored_credentials.get(&model.provider) {
+        match select_stored_credential(&model.provider, entries, active_scope.as_deref())? {
+            Some(StoredCredential::ApiKey { key, env: stored_env, .. }) => {
                 let resolved = resolve_stored_api_key(key, stored_env, &model.provider, env)?;
                 if resolved.is_some() {
                     credential_env = Some(stored_env);
@@ -420,9 +450,10 @@ pub fn resolve_model_request_auth(
                     resolve_configured_api_key(config, &model.provider, env)?
                 }
             }
-            StoredCredential::OAuth => {
+            Some(StoredCredential::OAuth { .. }) => {
                 bail!("OAuth credential for provider {:?} requires asynchronous request auth resolution", model.provider)
             }
+            None => resolve_configured_api_key(config, &model.provider, env)?,
         }
     } else {
         resolve_configured_api_key(config, &model.provider, env)?
@@ -458,6 +489,7 @@ pub fn resolve_model_request_auth(
     }
     if key.as_ref().is_none_or(|value| value.trim().is_empty())
         && !has_recognized_auth_header(&model.api, &headers)
+        && !pi_ai::is_extension_provider(&model.api)
     {
         bail!(
             "no API key found for provider {:?} (set the appropriate *_API_KEY env var or add authentication in auth.json or models.json)",
@@ -478,14 +510,20 @@ pub async fn resolve_model_request_auth_async(
     explicit_key: Option<&str>,
     env: Option<&HashMap<String, String>>,
 ) -> Result<ModelRequestAuth> {
+    let active_scope = pi_coding::active_auth_scope();
     let stored_oauth = {
         let state = state_read();
         explicit_key.filter(|key| !key.trim().is_empty()).is_none()
             && state.runtime_keys.get(&model.provider).is_none()
-            && matches!(
-                state.stored_credentials.get(&model.provider),
-                Some(StoredCredential::OAuth)
-            )
+            && state
+                .stored_credentials
+                .get(&model.provider)
+                .and_then(|entries| {
+                    select_stored_credential(&model.provider, entries, active_scope.as_deref())
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|entry| matches!(entry, StoredCredential::OAuth { .. }))
     };
     if !stored_oauth {
         return resolve_model_request_auth(model, explicit_key, env);
@@ -690,7 +728,7 @@ fn build_snapshot(
 
 fn apply_snapshot(
     providers: HashMap<String, ProviderAuthConfig>,
-    stored_credentials: HashMap<String, StoredCredential>,
+    stored_credentials: HashMap<String, Vec<StoredCredential>>,
     models: Vec<Model>,
     auth_path: Option<PathBuf>,
 ) -> Result<()> {
@@ -996,7 +1034,7 @@ fn read_bounded_config(path: &Path, name: &str) -> Result<Option<String>> {
         .with_context(|| format!("Failed to load {name}: file is not UTF-8\nFile: {}", path.display()))
 }
 
-fn load_stored_credentials(path: &Path) -> Result<HashMap<String, StoredCredential>> {
+fn load_stored_credentials(path: &Path) -> Result<HashMap<String, Vec<StoredCredential>>> {
     let Some(content) = read_bounded_config(path, "auth.json")? else {
         return Ok(HashMap::new());
     };
@@ -1011,87 +1049,134 @@ fn load_stored_credentials(path: &Path) -> Result<HashMap<String, StoredCredenti
             path.display()
         )
     })?;
-    let mut credentials = HashMap::with_capacity(entries.len());
+    let mut credentials: HashMap<String, Vec<StoredCredential>> =
+        HashMap::with_capacity(entries.len());
     for (provider, value) in entries {
-        let credential = value.as_object().ok_or_else(|| {
-            invalid_stored_credential(provider, path, "credential must be an object")
+        if provider == "scopes" {
+            // A single credential object under `scopes` (it carries a `type`
+            // tag) is a legacy flat entry for a provider literally named
+            // "scopes"; anything else is the scoped section.
+            if value.get("type").is_some() {
+                let credential = parse_stored_credential(provider, value, path, None)?;
+                credentials.entry(provider.clone()).or_default().push(credential);
+            } else {
+                parse_scopes_section(&mut credentials, value, path)?;
+            }
+            continue;
+        }
+        let credential = parse_stored_credential(provider, value, path, None)?;
+        credentials.entry(provider.clone()).or_default().push(credential);
+    }
+    Ok(credentials)
+}
+
+fn parse_scopes_section(
+    credentials: &mut HashMap<String, Vec<StoredCredential>>,
+    value: &Value,
+    path: &Path,
+) -> Result<()> {
+    let scopes = value.as_object().ok_or_else(|| {
+        anyhow!(
+            "Invalid auth.json \"scopes\" section: expected an object of scope labels\nFile: {}",
+            path.display()
+        )
+    })?;
+    for (scope, providers) in scopes {
+        let scope = pi_coding::validate_scope_label(scope).with_context(|| {
+            format!("Invalid auth.json scope\nFile: {}", path.display())
         })?;
-        match credential.get("type").and_then(Value::as_str) {
-            Some("oauth") => {
-                for field in ["access", "refresh"] {
-                    if credential.get(field).and_then(Value::as_str).is_none() {
-                        return Err(invalid_stored_credential(
-                            provider,
-                            path,
-                            &format!("field {field:?} must be a string"),
-                        ));
-                    }
-                }
-                if credential.get("expires").and_then(Value::as_i64).is_none() {
+        let providers = providers.as_object().ok_or_else(|| {
+            anyhow!(
+                "Invalid auth.json credential for provider in scope {scope:?}: expected an object\nFile: {}",
+                path.display()
+            )
+        })?;
+        for (provider, credential_value) in providers {
+            let credential =
+                parse_stored_credential(provider, credential_value, path, Some(&scope))?;
+            credentials
+                .entry(provider.clone())
+                .or_default()
+                .push(credential);
+        }
+    }
+    Ok(())
+}
+
+fn parse_stored_credential(
+    provider: &str,
+    value: &Value,
+    path: &Path,
+    scope: Option<&str>,
+) -> Result<StoredCredential> {
+    let scope = scope.map(str::to_owned);
+    let credential = value.as_object().ok_or_else(|| {
+        invalid_stored_credential(provider, path, "credential must be an object")
+    })?;
+    match credential.get("type").and_then(Value::as_str) {
+        Some("oauth") => {
+            for field in ["access", "refresh"] {
+                if credential.get(field).and_then(Value::as_str).is_none() {
                     return Err(invalid_stored_credential(
                         provider,
                         path,
-                        "field \"expires\" must be an integer",
+                        &format!("field {field:?} must be a string"),
                     ));
                 }
-                credentials.insert(provider.clone(), StoredCredential::OAuth);
             }
-            Some("api_key") => {
-                let key = credential
-                    .get("key")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        invalid_stored_credential(provider, path, "field \"key\" must be a string")
-                    })?;
-                let env = match credential.get("env") {
-                    None => HashMap::new(),
-                    Some(Value::Object(values)) => {
-                        let mut env = HashMap::with_capacity(values.len());
-                        for (name, value) in values {
-                            let value = value.as_str().ok_or_else(|| {
-                                invalid_stored_credential(
-                                    provider,
-                                    path,
-                                    "all field \"env\" values must be strings",
-                                )
-                            })?;
-                            env.insert(name.clone(), value.to_owned());
-                        }
-                        env
-                    }
-                    Some(_) => {
-                        return Err(invalid_stored_credential(
-                            provider,
-                            path,
-                            "field \"env\" must be an object",
-                        ));
-                    }
-                };
-                credentials.insert(
-                    provider.clone(),
-                    StoredCredential::ApiKey {
-                        key: key.to_owned(),
-                        env,
-                    },
-                );
-            }
-            Some(_) => {
+            if credential.get("expires").and_then(Value::as_i64).is_none() {
                 return Err(invalid_stored_credential(
                     provider,
                     path,
-                    "credential type is not supported",
+                    "field \"expires\" must be an integer",
                 ));
             }
-            None => {
-                return Err(invalid_stored_credential(
-                    provider,
-                    path,
-                    "field \"type\" must be \"api_key\" or \"oauth\"",
-                ));
-            }
+            Ok(StoredCredential::OAuth { scope })
         }
+        Some("api_key") => {
+            let key = credential
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    invalid_stored_credential(provider, path, "field \"key\" must be a string")
+                })?;
+            let env = match credential.get("env") {
+                None => HashMap::new(),
+                Some(Value::Object(values)) => {
+                    let mut env = HashMap::with_capacity(values.len());
+                    for (name, value) in values {
+                        let value = value.as_str().ok_or_else(|| {
+                            invalid_stored_credential(
+                                provider,
+                                path,
+                                "all field \"env\" values must be strings",
+                            )
+                        })?;
+                        env.insert(name.clone(), value.to_owned());
+                    }
+                    env
+                }
+                Some(_) => {
+                    return Err(invalid_stored_credential(
+                        provider,
+                        path,
+                        "field \"env\" must be an object",
+                    ));
+                }
+            };
+            Ok(StoredCredential::ApiKey { key: key.to_owned(), env, scope })
+        }
+        Some(_) => Err(invalid_stored_credential(
+            provider,
+            path,
+            "credential type is not supported",
+        )),
+        None => Err(invalid_stored_credential(
+            provider,
+            path,
+            "field \"type\" must be \"api_key\" or \"oauth\"",
+        )),
     }
-    Ok(credentials)
 }
 
 fn invalid_stored_credential(provider: &str, path: &Path, reason: &str) -> anyhow::Error {
@@ -1177,5 +1262,115 @@ mod tests {
             merge_compat(Some(&base), Some(&override_value)),
             Some(serde_json::json!({"openRouterRouting":{"a":1,"b":3,"c":4}}))
         );
+    }
+
+    #[test]
+    fn stored_credential_parsing_reads_scopes_section_and_legacy_flat_map() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{
+  "anthropic": { "type": "api_key", "key": "default-key", "env": { "A": "1" } },
+  "scopes": {
+    "work": {
+      "anthropic": { "type": "api_key", "key": "work-key" },
+      "openai-codex": { "type": "oauth", "access": "acc", "refresh": "ref", "expires": 42 }
+    }
+  }
+}
+"#,
+        )
+        .expect("write scoped auth file");
+
+        let credentials = load_stored_credentials(&path).expect("load scoped auth file");
+        let anthropic = credentials.get("anthropic").expect("anthropic entries");
+        assert_eq!(anthropic.len(), 2);
+        let default = anthropic
+            .iter()
+            .find(|entry| entry.scope().is_none())
+            .expect("unscoped entry");
+        match default {
+            StoredCredential::ApiKey { key, env, .. } => {
+                assert_eq!(key, "default-key");
+                assert_eq!(env.get("A").map(String::as_str), Some("1"));
+            }
+            StoredCredential::OAuth { .. } => panic!("expected api_key entry"),
+        }
+        let work = anthropic
+            .iter()
+            .find(|entry| entry.scope() == Some("work"))
+            .expect("work entry");
+        match work {
+            StoredCredential::ApiKey { key, .. } => assert_eq!(key, "work-key"),
+            StoredCredential::OAuth { .. } => panic!("expected api_key entry"),
+        }
+
+        let codex = credentials.get("openai-codex").expect("codex entries");
+        assert_eq!(codex.len(), 1);
+        assert!(matches!(codex[0], StoredCredential::OAuth { ref scope } if scope.as_deref() == Some("work")));
+    }
+
+    #[test]
+    fn stored_credential_parsing_rejects_invalid_scope_labels() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{
+  "scopes": {
+    "": { "anthropic": { "type": "api_key", "key": "k" } }
+  }
+}
+"#,
+        )
+        .expect("write invalid scope file");
+        let error = load_stored_credentials(&path).expect_err("empty scope must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("scope"), "{message}");
+        assert!(message.contains("empty"), "{message}");
+    }
+
+    #[test]
+    fn extension_provider_models_resolve_auth_without_a_key() {
+        // An api marked as extension-provided must pass the auth gate without
+        // any stored credential (the extension streams itself).
+        let mut model = Model::default();
+        model.id = "ext-model".into();
+        model.api = "extension-llm".into();
+        model.provider = "extension-llm".into();
+        model.base_url = "http://localhost:0".into();
+
+        // Without the mark the gate fails closed (no key, no recognized
+        // header).
+        let error =
+            resolve_model_request_auth(&model, None, None).expect_err("keyless non-extension model must be refused");
+        assert!(format!("{error:#}").contains("no API key found"));
+
+        // Register the api as extension-provided → auth resolves without a
+        // key, and unregistering restores the gate.
+        let stream: pi_ai::StreamFn = Arc::new(|_, _, _| {
+            Box::pin(async { pi_ai::new_assistant_message_event_stream() })
+        });
+        let simple: pi_ai::SimpleStreamFn = Arc::new(|_, _, _| {
+            Box::pin(async { pi_ai::new_assistant_message_event_stream() })
+        });
+        pi_ai::register_extension_provider(
+            pi_ai::ApiProvider {
+                api: "extension-llm".into(),
+                stream,
+                stream_simple: simple,
+                generate_image: None,
+            },
+            "models-config-extension-source".into(),
+        );
+        let auth = resolve_model_request_auth(&model, None, None)
+            .expect("extension-provider model must resolve auth without a key");
+        assert!(auth.api_key.is_empty());
+        assert!(auth.headers.is_empty());
+        pi_ai::unregister_api_providers("models-config-extension-source");
+        let error = resolve_model_request_auth(&model, None, None)
+            .expect_err("after unregister the key gate must apply again");
+        assert!(format!("{error:#}").contains("no API key found"));
     }
 }

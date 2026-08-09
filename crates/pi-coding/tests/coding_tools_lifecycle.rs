@@ -337,7 +337,9 @@ async fn opt_in_glob_tool_is_absent_by_default_and_matches_disk_when_enabled() {
     .expect("default session");
     assert_eq!(
         default_session.get_active_tool_names(),
-        ["read", "bash", "edit", "write"]
+        [
+            "read", "bash", "edit", "write", "ast_edit", "generate_image", "memory", "ask", "mcp"
+        ]
     );
     assert!(
         default_session.get_tool_definition("glob").is_none(),

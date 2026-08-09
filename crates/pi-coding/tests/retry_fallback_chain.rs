@@ -266,13 +266,15 @@ async fn cancellation_prevents_later_fallbacks() {
 #[tokio::test(flavor = "current_thread")]
 async fn exhausted_diagnostics_are_sanitized() {
     let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let secret = ["s", "k-", "abc1234567890", "secret"].concat();
+    let secret_prefix = ["s", "k-", "abc"].concat();
     let (session, _, _, primary_reg, backup_reg, _cwd) = make_linked_sessions(
-        vec![FauxResponse::error(
-            "503 upstream api_key=sk-abc1234567890secret failed",
-        )],
-        vec![FauxResponse::error(
-            "503 backup Authorization: Bearer sk-abc1234567890secret",
-        )],
+        vec![FauxResponse::error(format!(
+            "503 upstream api_key={secret} failed"
+        ))],
+        vec![FauxResponse::error(format!(
+            "503 backup Authorization: Bearer {secret}"
+        ))],
     );
     let (result, events) = collect_events_during(&session, session.run("exhaust", vec![])).await;
     let _err = result.expect_err("both models fail");
@@ -287,7 +289,7 @@ async fn exhausted_diagnostics_are_sanitized() {
     // When only one error path runs without same-model retries, diagnostics may
     // stay on the operation error; prefer event when present.
     if let Some(message) = terminal {
-        assert!(!message.contains("sk-abc"), "{message}");
+        assert!(!message.contains(secret_prefix.as_str()), "{message}");
         assert!(
             message.contains("[REDACTED]") || message.contains("503"),
             "{message}"

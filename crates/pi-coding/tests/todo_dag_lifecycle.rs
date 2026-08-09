@@ -497,15 +497,22 @@ async fn todo_tool_persisted_snapshot_restores_readiness_without_silent_edge_rew
         vec![implement_id.clone()]
     );
 
-    // Force durable flush: todo snapshots alone do not open the session file
-    // until an assistant message lands or persist_now is called.
-    recorder.persist_now().expect("flush todo_snapshot bytes");
+    // Every successful mutation is durable before the tool call returns. The
+    // session file therefore exists without an assistant message, timer, or
+    // explicit flush, and a clean close has no Todo-only tail left to rescue.
     assert!(
         path.is_file(),
-        "session file must exist on disk after persist_now: {}",
+        "todo mutation must write through to disk immediately: {}",
         path.display()
     );
-    // Drop the live session so the next attach is a true restore.
+    assert_eq!(
+        load_session_tree(&path)
+            .expect("load write-through tree")
+            .latest_todo_state(),
+        Some(live.clone())
+    );
+    // Drop the live session and close its writer before reopening, matching a
+    // normal rpi close followed by --resume.
     drop(session);
     recorder.close().expect("close writer before reopen");
 
@@ -583,15 +590,77 @@ async fn todo_tool_persisted_snapshot_restores_readiness_without_silent_edge_rew
         "unlock must not strip dependsOn"
     );
 
-    // Flush the same recorder the session just wrote through.
-    restored_recorder
-        .persist_now()
-        .expect("flush post-restore snapshot");
+    // The restored mutation is also write-through; no explicit final flush is
+    // required for the next process to observe it.
     let reloaded = load_session_tree(&path)
         .expect("reload tree")
         .latest_todo_state()
         .expect("latest snapshot after mutation");
     assert_eq!(reloaded, after);
+
+    // A different session owns a different Todo journal and starts empty.
+    let (_other_agent, other_recorder) =
+        start_isolated_recording(cwd.path(), "todo-dag-restore-isolated");
+    let other = todo_session(cwd.path());
+    attach_recorder(&other, other_recorder);
+    assert!(
+        other.todo_state().phases.is_empty(),
+        "Todo restore must remain isolated to the resumed session"
+    );
+}
+
+/// Abrupt termination can only restore snapshots whose durable append
+/// completed. An operation interrupted before that append is not successful
+/// and must leave the previous durable state as the recovery point.
+#[test]
+fn interrupted_unwritten_todo_operation_restores_last_durable_snapshot() {
+    let cwd = tempfile::tempdir().expect("cwd");
+    let (_agent, recorder) = start_isolated_recording(cwd.path(), "todo-crash-boundary");
+    let durable = TodoState {
+        phases: vec![TodoPhase {
+            name: "Recovery".to_owned(),
+            tasks: vec![TodoItem {
+                id: "task-written".to_owned(),
+                content: "written before interruption".to_owned(),
+                status: TodoStatus::InProgress,
+                depends_on: Vec::new(),
+                ready: true,
+                blocked_by: Vec::new(),
+                agent: None,
+            }],
+        }],
+        storage: TodoStorage::Session,
+    };
+    recorder
+        .record_todo_snapshot(&durable)
+        .expect("durably record completed operation");
+    let path = recorder.path();
+
+    // This is the prospective state of an operation interrupted before its
+    // recorder append. Deliberately do not record or close the live recorder,
+    // which models process death at that boundary.
+    let mut interrupted = durable.clone();
+    interrupted.phases[0].tasks.push(TodoItem {
+        id: "task-unwritten".to_owned(),
+        content: "interrupted before durable append".to_owned(),
+        status: TodoStatus::Pending,
+        depends_on: Vec::new(),
+        ready: false,
+        blocked_by: Vec::new(),
+        agent: None,
+    });
+    assert_ne!(interrupted, durable);
+    drop(recorder);
+
+    let restored = todo_session(cwd.path());
+    restored
+        .record(resume_session(&path).expect("resume after interruption"))
+        .expect("attach interrupted session");
+    assert_eq!(
+        restored.todo_state(),
+        durable,
+        "resume must stop at the last fully written Todo operation"
+    );
 }
 
 /// Direct recorder snapshot attach path restores complete DAG public state.
@@ -618,6 +687,7 @@ fn attaching_recorded_todo_snapshot_restores_public_state_bytes() {
                     depends_on: Vec::new(),
                     ready: false,
                     blocked_by: Vec::new(),
+                    agent: None,
                 },
                 TodoItem {
                     id: "task-child".to_owned(),
@@ -626,6 +696,7 @@ fn attaching_recorded_todo_snapshot_restores_public_state_bytes() {
                     depends_on: vec!["task-root".to_owned()],
                     ready: true,
                     blocked_by: Vec::new(),
+                    agent: None,
                 },
             ],
         }],

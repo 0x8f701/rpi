@@ -6,6 +6,7 @@ case "${1:-run}" in
     list|--list|--dry-run)
         "$SCRIPT_DIR/ci/campaigns.sh" list
         printf '%s\n' 'installer.static - checked-in install.sh regression suite'
+        printf '%s\n' 'web - unified client suite: core (load/auth/stream/abort/todo/rich/workflow/settings/session/subagents), goal, xss, abort, reconnect, mobile, auth, extras, sessions — 10 lanes (E2E_CI_WEB=1)'
         ;;
     run)
         [ -f "$REPO_ROOT/tests/install-sh-static.sh" ] || {
@@ -21,6 +22,11 @@ case "${1:-run}" in
         fi
         if [ "${E2E_CI_EXTENSION:-0}" = 1 ]; then
             "$SCRIPT_DIR/ci/campaigns.sh" extension
+        fi
+        if [ "${E2E_CI_WEB:-0}" = 1 ]; then
+            # The unified runner aggregates every web lane (core, goal, xss,
+            # abort, reconnect, switch, mobile, auth, extras, sessions).
+            "$SCRIPT_DIR/web/run.sh" run
         fi
         ;;
     *)

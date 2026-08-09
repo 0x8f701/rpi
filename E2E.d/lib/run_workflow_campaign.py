@@ -20,6 +20,18 @@ Aligned to landed public wire (pi-cli workflow_rpc + pi-coding workflow domain):
   Branch namespace (domain worktree): rpi/workflow/<workflowId>
   Events: workflow_updated | workflow_status_changed with workflowId+generation
 
+Deterministic planner seam: the campaign spawns `user_mock_server.py
+--scenario workflow --hold-workers` (loopback OpenAI-completions provider) and
+points the binary at it via a per-run models.json. The mock answers the
+supervisor's planning prompt with a real `todo` init tool call plus a `bash`
+commit inside the workflow worktree (so every workflow plans a genuine Todo
+DAG), and holds worker completion streams open until the campaign POSTs
+/__release. Holding workers keeps each workflow deterministically
+non-terminal (its DAG can never settle while a worker turn is in flight), so
+pause/resume/integrate/conflict never race auto-integrate; the campaign
+releases after the lifecycle assertions and hard-fails if any workflow ever
+reports `failed`.
+
 HARD assertions only. Missing product APIs fail closed (no false pass).
 """
 
@@ -27,12 +39,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import hashlib
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +134,139 @@ def commit_file(repo: Path, relative: str, text: str, message: str) -> None:
     )
 
 
+def start_planner_mock(evidence: Path) -> tuple[subprocess.Popen[bytes], int]:
+    """Spawn the shared loopback mock in deterministic-planner mode.
+
+    The mock's `workflow` scenario answers planning prompts with a real Todo
+    DAG (todo init + a bash commit inside the workflow worktree) and, with
+    --hold-workers, keeps worker completions in flight until the campaign
+    releases them (see module docstring). Returns (process, port).
+    """
+    script = Path(__file__).resolve().parent / "user_mock_server.py"
+    port_file = evidence / "mock-port.txt"
+    log_path = evidence / "mock-server.log"
+    log = log_path.open("wb")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            "--scenario",
+            "workflow",
+            "--hold-workers",
+            "--port-file",
+            str(port_file),
+        ],
+        stdout=log,
+        stderr=log,
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if not port_file.exists() or port_file.stat().st_size == 0:
+            if proc.poll() is not None:
+                log.close()
+                fail(
+                    f"planner mock exited early (see {log_path}): "
+                    f"rc={proc.returncode}"
+                )
+            time.sleep(0.1)
+            continue
+        try:
+            port = int(port_file.read_text(encoding="utf-8").strip())
+        except ValueError:
+            time.sleep(0.1)
+            continue
+        log.close()
+        return proc, port
+    log.close()
+    proc.kill()
+    fail(f"planner mock did not write its port file within 20s (see {log_path})")
+
+
+def write_provider_models(home: Path, port: int) -> None:
+    agent_dir = Path(home) / ".pi" / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "workflow-e2e": {
+                        "baseUrl": f"http://127.0.0.1:{port}",
+                        "api": "openai-completions",
+                        "models": [
+                            {
+                                "id": "mock",
+                                "name": "Workflow E2E Mock",
+                                "contextWindow": 32768,
+                                "maxTokens": 2048,
+                            }
+                        ],
+                    }
+                }
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+
+def release_workers(port: int) -> None:
+    """Complete every held worker stream so the DAGs can settle."""
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/__release",
+        data=b"{}",
+        headers={"content-type": "application/json"},
+    )
+    urllib.request.urlopen(request, timeout=10).read()
+
+
+def find_managed_worktree(managed_root: Path, workflow_id: str) -> Path:
+    """Locate the managed git worktree for one workflow id.
+
+    The product lays worktrees out as
+    `agent_dir/workflow-worktrees/<repo-digest>/<session-id>/workflow-worktrees/
+    <workflow-id>` (session-scoped namespaces, see session_run.rs
+    workflow_storage_roots), so the path is not stable across session ids.
+    The worktree directory name is exactly the workflow id, which makes
+    discovery unambiguous under the managed root.
+    """
+    if not managed_root.is_dir():
+        fail(f"HARD: managed worktree root is missing: {managed_root}")
+    candidates = [
+        path
+        for path in managed_root.rglob(workflow_id)
+        if path.is_dir() and path.name == workflow_id
+    ]
+    if len(candidates) != 1:
+        fail(
+            f"HARD: expected exactly one managed worktree for {workflow_id} "
+            f"under {managed_root}, found {candidates!r}"
+        )
+    return candidates[0]
+
+
+def verify_planner_engagement(evidence: Path) -> dict[str, int]:
+    """Prove the deterministic planner really served the campaign: the mock
+    logs one `user-mock scenario=workflow request#N user=...` line per
+    provider request (see user_mock_server.py), so the request counts are
+    durable evidence that planning turns produced the DAG and worker turns
+    executed it — the lifecycle assertions must never run against a fake."""
+    log_path = evidence / "mock-server.log"
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    planning = sum(1 for line in text.splitlines() if " kind=planning" in line)
+    workers = sum(1 for line in text.splitlines() if " kind=worker" in line)
+    if planning < 3:
+        fail(
+            f"HARD: planner served {planning} supervisor planning turns "
+            f"(expected >= 3 for alpha/beta/gamma); see {log_path}"
+        )
+    if workers < 2:
+        fail(
+            f"HARD: planner served {workers} worker delegation turns "
+            f"(expected >= 2 for the shared two-task DAG); see {log_path}"
+        )
+    return {"planningTurns": planning, "workerTurns": workers}
+
+
 class RpcClient:
     def __init__(
         self,
@@ -129,6 +275,7 @@ class RpcClient:
         workspace: str,
         output: Path,
         stderr: Path,
+        port: int,
         timeout: float = 40.0,
     ) -> None:
         self.timeout = timeout
@@ -143,17 +290,28 @@ class RpcClient:
             "PI_CODING_AGENT_DIR": str(Path(home) / ".pi" / "agent"),
             "PI_OFFLINE": "1",
             "PI_SKIP_VERSION_CHECK": "1",
-            "PI_FAUX_RESPONSE": os.environ.get(
-                "PI_FAUX_RESPONSE", "deterministic-workflow-reply"
-            ),
             "TERM": "xterm-256color",
         }
         stderr.parent.mkdir(parents=True, exist_ok=True)
         output.parent.mkdir(parents=True, exist_ok=True)
         self._stderr = stderr.open("wb")
         self._output = output.open("w", encoding="utf-8")
+        # The deterministic planner provider (loopback mock, see module
+        # docstring) replaces the plain-text faux seam: faux could never
+        # produce a Todo DAG, so every workflow failed planning instantly.
         self.proc = subprocess.Popen(
-            [rpi, "--offline", "-C", workspace, "--model", "faux/faux-1", "--mode", "rpc"],
+            [
+                rpi,
+                "--offline",
+                "-C",
+                workspace,
+                "--model",
+                "workflow-e2e/mock",
+                "--api-key",
+                secrets.token_urlsafe(24),
+                "--mode",
+                "rpc",
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=self._stderr,
@@ -353,12 +511,15 @@ def main() -> None:
     evidence = Path(args.evidence)
     evidence.mkdir(parents=True, exist_ok=True)
     output = Path(args.output)
+    mock_proc, mock_port = start_planner_mock(evidence)
+    write_provider_models(Path(args.home), mock_port)
     client = RpcClient(
         rpi=args.rpi,
         home=args.home,
         workspace=args.workspace,
         output=output,
         stderr=Path(args.stderr),
+        port=mock_port,
         timeout=args.timeout,
     )
     summary: dict[str, Any] = {
@@ -367,6 +528,7 @@ def main() -> None:
         "execution_status": "running",
         "product_apis": "assumed_present",
         "wire": "WorkflowWireSnapshot camelCase + snake_case status",
+        "planner": f"user_mock_server workflow+hold http://127.0.0.1:{mock_port}",
     }
 
     try:
@@ -751,26 +913,9 @@ def main() -> None:
         # --- Explicit conflict preserved and visible (alpha) ---
         # Build an actual two-sided conflict using the managed worktree layout;
         # this exercises production integration rather than a test-only RPC.
-        common_git_dir = subprocess.run(
-            ["git", "-C", args.workspace, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        workflow_namespace = hashlib.sha256(
-            str(Path(common_git_dir).resolve()).encode()
-        ).hexdigest()[:32]
-        alpha_worktree = (
-            Path(args.home)
-            / ".pi"
-            / "agent"
-            / "workflow-worktrees"
-            / workflow_namespace
-            / "workflow-worktrees"
-            / alpha_id
+        alpha_worktree = find_managed_worktree(
+            Path(args.home) / ".pi" / "agent" / "workflow-worktrees", alpha_id
         )
-        if not alpha_worktree.is_dir():
-            fail("HARD: managed alpha worktree is missing")
         commit_file(alpha_worktree, "README.e2e", "workflow side\n", "workflow conflict side")
         commit_file(Path(args.workspace), "README.e2e", "source side\n", "source conflict side")
         conflict_req = client.request(
@@ -781,6 +926,26 @@ def main() -> None:
             },
             allow_failure=True,
         )
+        if conflict_req.get("success") is not True:
+            # Integrate is only legal on Completed/Paused/Conflicted; alpha is
+            # Running here (deterministic held workers keep its DAG live), so
+            # pause it first — same fallback as the beta integrate path.
+            client.request(
+                {
+                    "type": "workflow_pause",
+                    "id": "wf-pause-alpha-for-conflict",
+                    "workflowId": alpha_id,
+                },
+                allow_failure=True,
+            )
+            conflict_req = client.request(
+                {
+                    "type": "workflow_integrate",
+                    "id": "wf-integrate-alpha-conflict-retry",
+                    "workflowId": alpha_id,
+                },
+                allow_failure=True,
+            )
 
         alpha_conflict = snapshot_of(
             client.request(
@@ -873,6 +1038,51 @@ def main() -> None:
             fail(f"HARD: raw workflow domain events reached RPC: {raw_workflow_events!r}")
         summary["checks"].append("workflow-events-public-wire-only")
 
+        # --- Deterministic workers complete after release ---
+        # The lifecycle assertions above ran while worker turns were held open
+        # (the DAG could not settle, so no workflow could auto-integrate or
+        # fail mid-campaign). Release every held stream now and verify the
+        # real worker completions settle the workflow without a `failed` end
+        # state — hard proof the deterministic planner's DAG executes.
+        release_workers(mock_port)
+        settle_deadline = time.monotonic() + min(30.0, args.timeout)
+        final_beta = beta_integrated
+        final_alpha = alpha_conflict
+        while time.monotonic() < settle_deadline:
+            final_beta = snapshot_of(
+                client.request(
+                    {
+                        "type": "workflow_get",
+                        "id": f"wf-get-beta-settle-{int(time.monotonic())}",
+                        "workflowId": beta_id,
+                    }
+                )
+            )
+            if final_beta.get("status") in ("completed", "conflicted", "failed", "cancelled"):
+                break
+            time.sleep(0.4)
+        if final_beta.get("status") == "failed":
+            fail(f"HARD: beta must not settle failed after worker release: {final_beta!r}")
+        final_alpha = snapshot_of(
+            client.request(
+                {
+                    "type": "workflow_get",
+                    "id": "wf-get-alpha-after-settle",
+                    "workflowId": alpha_id,
+                }
+            )
+        )
+        if final_alpha.get("status") == "failed":
+            fail(f"HARD: alpha must not settle failed after worker release: {final_alpha!r}")
+        summary["checks"].append("no-failed-after-planner-release")
+        summary["plannerTurns"] = verify_planner_engagement(evidence)
+        summary["checks"].append("planner-provider-engaged")
+        summary["final"] = {
+            "alphaStatus": final_alpha.get("status"),
+            "betaStatus": final_beta.get("status"),
+            "released": True,
+        }
+
         required = {
             "workflow-list-empty-initial",
             "two-workflows-created-concurrently",
@@ -891,6 +1101,8 @@ def main() -> None:
             "generation-field-typed-when-present",
             "workflow-events-generation-gated",
             "workflow-events-public-wire-only",
+            "no-failed-after-planner-release",
+            "planner-provider-engaged",
         }
         missing = sorted(required - set(summary["checks"]))
         if missing:
@@ -914,6 +1126,16 @@ def main() -> None:
         )
     finally:
         client.close()
+        try:
+            if mock_proc.poll() is None:
+                mock_proc.terminate()
+                try:
+                    mock_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    mock_proc.kill()
+                    mock_proc.wait(timeout=5)
+        except BaseException:
+            pass
 
 
 if __name__ == "__main__":

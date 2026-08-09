@@ -24,9 +24,11 @@ use pi_cli::workflow_commands::{
 };
 use pi_cli::interactive_commands::{
     BUILTIN_COMMANDS, PRIMARY_COMMAND_NAMES, builtin, executable_catalog, is_primary_command,
-    parse_chain_invocation, parse_interactive_settings_command, parse_run_invocation,
-    requires_arguments, usage, visible_catalog,
+    parse_chain_invocation, parse_collab_invocation, parse_interactive_persona_command,
+    parse_interactive_settings_command, parse_join_invocation, parse_run_invocation,
+    requires_arguments, usage, visible_catalog, CollabInvocation,
 };
+use pi_cli::collab_commands;
 use pi_cli::keybindings::KeyBindingsManager;
 use pi_cli::loop_commands::{
     execute_interactive_loop_command, parse_interactive_loop_command,
@@ -307,11 +309,12 @@ fn primary_command_surface_is_help_and_completion_only() {
     assert_eq!(
         PRIMARY_COMMAND_NAMES,
         &[
-            "settings", "model", "branch", "resume", "fork", "export", "agents", "compact", "ps",
-            "loop", "goal", "workflow", "code-review", "btw",
+            "settings", "model", "branch", "resume", "fork", "export", "dump", "handoff",
+            "agents", "role", "persona", "compact", "rewind", "checkpoint", "ps", "loop",
+            "goal", "workflow", "code-review", "btw", "queue", "live",
         ]
     );
-    assert_eq!(PRIMARY_COMMAND_NAMES.len(), 14);
+    assert_eq!(PRIMARY_COMMAND_NAMES.len(), 22);
     let visible = visible_catalog()
         .into_iter()
         .map(|command| command.name)
@@ -324,6 +327,7 @@ fn primary_command_surface_is_help_and_completion_only() {
     );
     assert!(is_primary_command("goal"));
     assert!(is_primary_command("workflow"));
+    assert!(is_primary_command("persona"), "persona is intentionally primary");
     assert!(!is_primary_command("workfloww"));
     assert!(!is_primary_command("skill:release"));
     assert!(!is_primary_command("help"));
@@ -457,6 +461,39 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         covered.insert("import");
     }
 
+    // dump — HTML export to an explicit path succeeds; --jsonl selects JSONL.
+    {
+        let html_path = fixture.cwd.path().join("dump-smoke.html");
+        let request = pi_cli::interactive_commands::parse_dump_invocation(
+            html_path.to_string_lossy().as_ref(),
+        );
+        let output = pi_cli::interactive_commands::execute_dump(app, request)
+            .await
+            .expect("dump html");
+        assert_eq!(output, html_path);
+        assert!(
+            std::fs::metadata(&html_path).expect("dump exists").len() > 0,
+            "dump must write bytes"
+        );
+        covered.insert("dump");
+    }
+
+    // skill — unknown name on a skill-less fixture resolves to a typed None;
+    // bare /skill is a required-arg builtin with angle-bracket usage.
+    {
+        let command = builtin("skill").expect("skill builtin");
+        assert_eq!(usage(command), "/skill <name>");
+        assert!(
+            requires_arguments(command),
+            "bare /skill must be rejected with usage"
+        );
+        assert!(
+            pi_cli::interactive_commands::skill_frontmatter_summary(app, "research").is_none(),
+            "a fixture without skills must not resolve any /skill <name>"
+        );
+        covered.insert("skill");
+    }
+
     // share — background share fails closed without gh/network (ShareFailed).
     {
         let mut events = app.subscribe();
@@ -517,6 +554,31 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             "recorded session exposes id or path: {state:?}"
         );
         covered.insert("session");
+    }
+
+    // handoff — deterministic envelope renders a well-formed copyable block
+    // without a model turn.
+    {
+        let handoff = app.generate_handoff();
+        assert!(
+            handoff.prose.is_none(),
+            "envelope-only handoff must not run a provider call"
+        );
+        let block = handoff.render();
+        for section in [
+            "# Handoff",
+            "## Goal",
+            "## Todos",
+            "## Running jobs",
+            "## Recent asks",
+            "## Next steps",
+        ] {
+            assert!(
+                block.contains(section),
+                "/handoff block missing {section:?}:\n{block}"
+            );
+        }
+        covered.insert("handoff");
     }
 
     // sessions — listing for cwd must not panic.
@@ -592,6 +654,29 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             "session tree must serialize: {encoded}"
         );
         covered.insert("tree");
+    }
+
+    // rewind / checkpoint — preview lists bounded rewind targets; marking a
+    // checkpoint on an entry-less session surfaces an actionable error, and
+    // on a recorded session it appends a marker (never a model turn).
+    {
+        let previews = app.rewind_preview(20).expect("rewind preview");
+        assert!(
+            previews.len() <= 20,
+            "rewind preview must be bounded to the requested window"
+        );
+        match app.set_checkpoint("coverage") {
+            Ok(_) => {}
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("empty") || message.contains("checkpoint"),
+                    "checkpoint error must be actionable: {message}"
+                );
+            }
+        }
+        covered.insert("rewind");
+        covered.insert("checkpoint");
     }
 
     // loop / loops / loop-update / loop-delete / loop-cancel
@@ -717,6 +802,116 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         covered.insert("loop-update");
         covered.insert("loop-delete");
         covered.insert("loop-cancel");
+
+        // Primary subcommand style: /loop create|list|update|delete|cancel.
+        let sub_created = execute_interactive_loop_command(
+            app,
+            parse_interactive_loop_command("loop", Some("1h slash subcommand lifecycle"))
+                .expect("parse create subcommand")
+                .expect("create subcommand"),
+        )
+        .await
+        .expect("create via subcommand");
+        assert!(
+            sub_created.contains("scheduled"),
+            "loop create subcommand: {sub_created}"
+        );
+        let sub_id = sub_created
+            .strip_prefix("scheduled ")
+            .and_then(|rest| rest.split_once(" · ").map(|(id, _)| id))
+            .expect("subcommand task id")
+            .to_owned();
+
+        let sub_listed = execute_interactive_loop_command(
+            app,
+            parse_interactive_loop_command("loop", Some("list"))
+                .expect("parse list subcommand")
+                .expect("list subcommand"),
+        )
+        .await
+        .expect("list via subcommand");
+        assert!(
+            sub_listed.contains(&sub_id) && sub_listed.contains("slash subcommand lifecycle"),
+            "loop list subcommand: {sub_listed}"
+        );
+
+        let sub_updated = execute_interactive_loop_command(
+            app,
+            parse_interactive_loop_command(
+                "loop",
+                Some(&format!("update {sub_id} 2h slash subcommand updated")),
+            )
+            .expect("parse update subcommand")
+            .expect("update subcommand"),
+        )
+        .await
+        .expect("update via subcommand");
+        assert!(
+            sub_updated.contains("every 2 hours")
+                && sub_updated.contains("slash subcommand updated"),
+            "loop update subcommand: {sub_updated}"
+        );
+
+        let sub_deleted = execute_interactive_loop_command(
+            app,
+            parse_interactive_loop_command("loop", Some(&format!("delete {sub_id}")))
+                .expect("parse delete subcommand")
+                .expect("delete subcommand"),
+        )
+        .await
+        .expect("delete via subcommand");
+        assert_eq!(sub_deleted, format!("deleted loop {sub_id}"));
+
+        let cancel_target = execute_interactive_loop_command(
+            app,
+            parse_interactive_loop_command("loop", Some("1h slash subcommand cancel target"))
+                .expect("parse cancel target")
+                .expect("cancel target create"),
+        )
+        .await
+        .expect("create cancel target");
+        let cancel_target_id = cancel_target
+            .strip_prefix("scheduled ")
+            .and_then(|rest| rest.split_once(" · ").map(|(id, _)| id))
+            .expect("cancel target id")
+            .to_owned();
+        let sub_cancelled = execute_interactive_loop_command(
+            app,
+            parse_interactive_loop_command("loop", Some(&format!("cancel {cancel_target_id}")))
+                .expect("parse cancel subcommand")
+                .expect("cancel subcommand"),
+        )
+        .await
+        .expect("cancel via subcommand");
+        assert_eq!(
+            sub_cancelled,
+            format!("cancelled loop {cancel_target_id}")
+        );
+
+        let err = parse_interactive_loop_command("loop", Some("update only-id"))
+            .expect_err("loop update needs interval or prompt");
+        assert!(
+            err.to_string().contains("usage") || err.to_string().contains("update"),
+            "loop update usage: {err:#}"
+        );
+        for (invocation, label) in [
+            ("list extra", "list takes no arguments"),
+            ("delete", "delete requires id"),
+            ("cancel", "cancel requires id"),
+        ] {
+            let err = parse_interactive_loop_command("loop", Some(invocation))
+                .expect_err(label);
+            assert!(
+                err.to_string().contains("usage"),
+                "loop {label}: {err:#}"
+            );
+        }
+        let err = parse_interactive_loop_command("loop", Some("create"))
+            .expect_err("create requires interval + prompt");
+        assert!(
+            err.to_string().contains("usage") || err.to_string().contains("interval"),
+            "loop create usage: {err:#}"
+        );
     }
 
     // goal — show empty, create, lifecycle, typed errors.
@@ -750,6 +945,38 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             created.contains("active") && created.contains("ship slash coverage"),
             "goal create: {created}"
         );
+        let pinned = execute_interactive_goal_command(
+            app,
+            parse_interactive_goal_command(Some("pin keep the release checklist in scope"))
+                .expect("parse pin"),
+        )
+        .await
+        .expect("goal pin");
+        assert!(pinned.contains("active"), "goal pin: {pinned}");
+        let pins = execute_interactive_goal_command(
+            app,
+            parse_interactive_goal_command(Some("pins")).expect("parse pins"),
+        )
+        .await
+        .expect("goal pins");
+        assert!(
+            pins.contains("1. keep the release checklist in scope"),
+            "goal pins listing: {pins}"
+        );
+        let unpinned = execute_interactive_goal_command(
+            app,
+            parse_interactive_goal_command(Some("unpin 0")).expect("parse unpin"),
+        )
+        .await
+        .expect("goal unpin");
+        assert!(unpinned.contains("active"), "goal unpin: {unpinned}");
+        let empty_pins = execute_interactive_goal_command(
+            app,
+            parse_interactive_goal_command(Some("pins")).expect("parse pins again"),
+        )
+        .await
+        .expect("goal pins after unpin");
+        assert_eq!(empty_pins, "no pins", "unpin must empty the pin list: {empty_pins}");
         let paused = execute_interactive_goal_command(
             app,
             parse_interactive_goal_command(Some("pause")).expect("parse pause"),
@@ -867,14 +1094,14 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
 
     // login / logout — non-interactive without provider fails with typed error.
     {
-        let err = pi_cli::auth_commands::login(None, false)
+        let err = pi_cli::auth_commands::login(None, None, false)
             .await
             .expect_err("login requires provider outside TTY");
         assert!(
             err.to_string().contains("provider"),
             "login error: {err:#}"
         );
-        let err = pi_cli::auth_commands::logout(None, false)
+        let err = pi_cli::auth_commands::logout(None, None, false)
             .await
             .expect_err("logout requires provider outside TTY");
         assert!(
@@ -929,6 +1156,29 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
             }
         }
         covered.insert("compact");
+    }
+
+    // snapcompact — deterministic archive either reports tokens or a clear
+    // error; never panics and never calls the provider.
+    {
+        match app.compact_snap().await {
+            Ok(result) => {
+                assert!(
+                    result.tokens_before >= 0,
+                    "snap compaction tokens_before: {}",
+                    result.tokens_before
+                );
+                assert!(
+                    !result.summary.is_empty(),
+                    "snap compaction summary must be non-empty"
+                );
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(!message.is_empty(), "snapcompact error must be non-empty");
+            }
+        }
+        covered.insert("snapcompact");
     }
 
     // resume — hermetic catalog for the fixture home does not panic.
@@ -1018,6 +1268,34 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         let snapshot = app.resource_snapshot();
         let _ = snapshot.map(|snap| snap.agents.len());
         covered.insert("agents");
+    }
+
+    // role — bare /role renders the loaded role list or a typed error, never a
+    // model turn or a TUI-only fallback.
+    {
+        let command = pi_cli::interactive_commands::parse_interactive_role_command(None)
+            .expect("bare /role parses to List");
+        assert!(
+            matches!(
+                command,
+                pi_cli::interactive_commands::InteractiveRoleCommand::List
+            ),
+            "bare /role must parse to List"
+        );
+        match pi_cli::interactive_commands::execute_interactive_role_command(app, command) {
+            Ok(output) => assert!(
+                !output.trim().is_empty(),
+                "/role List must render a non-empty listing"
+            ),
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    !message.is_empty() && !message.contains("full-screen"),
+                    "typed role error: {message}"
+                );
+            }
+        }
+        covered.insert("role");
     }
 
     // reload — resource reload advances generation without a model turn.
@@ -1122,12 +1400,181 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
         covered.insert("btw");
     }
 
+    // queue — read-only listing is empty without steering or follow-ups.
+    {
+        let (steering, follow_up) = app.queued_messages().await;
+        assert!(
+            steering.is_empty() && follow_up.is_empty(),
+            "idle fixture must have an empty queue: {} steering, {} follow-up",
+            steering.len(),
+            follow_up.len()
+        );
+        covered.insert("queue");
+    }
+
+    // fresh — archives the current session and switches to a new recorder.
+    {
+        let before_id = app.state().await.session_id;
+        assert!(
+            pi_cli::interactive_commands::execute_fresh(app)
+                .await
+                .expect("fresh must complete"),
+            "fresh must not be cancelled in this flow"
+        );
+        let after_id = app.state().await.session_id;
+        assert_ne!(after_id, before_id, "/fresh must switch to a new recorder");
+        covered.insert("fresh");
+    }
+
     // quit — present in catalog; dispatch returns exit without side effects.
     {
         let command = builtin("quit").expect("quit builtin");
         assert_eq!(command.name, "quit");
         assert!(command.argument_hint.is_none());
         covered.insert("quit");
+    }
+
+    // live — a no-argument TUI toggle (hold-to-talk voice mode); present in the
+    // catalog as a primary command with no argument hint.
+    {
+        let command = builtin("live").expect("live builtin");
+        assert_eq!(command.name, "live");
+        assert!(command.argument_hint.is_none());
+        assert!(!requires_arguments(command), "live is a no-arg toggle");
+        assert!(is_primary_command("live"));
+        covered.insert("live");
+    }
+
+    // persona — intentionally primary; bare /persona renders the persona
+    // catalog (panel precursor) without a model turn; typed parse/usage errors
+    // for the destructive/run keyword surfaces. No editor, no model turn.
+    {
+        let command = builtin("persona").expect("persona builtin");
+        assert!(
+            usage(command).starts_with("/persona"),
+            "persona usage must start with /persona: {}",
+            usage(command)
+        );
+        assert!(
+            !requires_arguments(command),
+            "bare /persona must reach the List precursor, not a usage gate"
+        );
+        let list = parse_interactive_persona_command(None).expect("bare /persona parses");
+        assert!(
+            matches!(
+                list,
+                pi_cli::interactive_commands::InteractivePersonaCommand::List
+            ),
+            "bare /persona must parse to List"
+        );
+        let output = pi_cli::interactive_commands::execute_interactive_persona_command(app, list)
+            .await
+            .expect("persona list");
+        assert!(
+            output.contains("personas"),
+            "/persona List must render a persona catalog precursor: {output}"
+        );
+        let err = parse_interactive_persona_command(Some("run only-name"))
+            .expect_err("run needs name + assignment");
+        assert!(
+            err.to_string().contains("usage"),
+            "/persona run usage: {err:#}"
+        );
+        let err = parse_interactive_persona_command(Some("reset"))
+            .expect_err("bare reset is a keyword");
+        assert!(
+            err.to_string().contains("usage") || err.to_string().contains("persona"),
+            "/persona reset keyword usage: {err:#}"
+        );
+        covered.insert("persona");
+    }
+
+    // collab — exported parser + typed validation; no live listener, no network.
+    {
+        let command = builtin("collab").expect("collab builtin");
+        assert!(
+            usage(command).starts_with("/collab"),
+            "collab usage must start with /collab: {}",
+            usage(command)
+        );
+        assert_eq!(
+            parse_collab_invocation("").expect("bare /collab -> Start"),
+            CollabInvocation::Start
+        );
+        assert_eq!(
+            parse_collab_invocation("status").expect("status"),
+            CollabInvocation::Status
+        );
+        assert_eq!(
+            parse_collab_invocation("stop").expect("stop"),
+            CollabInvocation::Stop
+        );
+        let err = parse_collab_invocation("bogus").expect_err("unknown collab arg");
+        assert!(
+            err.to_string().contains("usage"),
+            "collab typo must surface typed usage: {err:#}"
+        );
+        // No --listen host: /collab fails closed without touching the network.
+        let err = pi_cli::collab_commands::execute(None, CollabInvocation::Start)
+            .await
+            .expect_err("collab requires a listener");
+        assert!(
+            err.to_string().contains("listen"),
+            "collab missing-listener error must be actionable: {err:#}"
+        );
+        covered.insert("collab");
+    }
+
+    // join — exported link parser; empty and malformed links are typed errors
+    // (no network connection, no key material echoed).
+    {
+        let command = builtin("join").expect("join builtin");
+        assert_eq!(usage(command), "/join <link>");
+        assert!(
+            requires_arguments(command),
+            "join must remain a required-arg builtin"
+        );
+        let err = parse_join_invocation("").expect_err("join requires a link");
+        assert!(
+            err.to_string().contains("usage"),
+            "join empty usage: {err:#}"
+        );
+        let err = parse_join_invocation("not-a-valid-link").expect_err("malformed link");
+        assert!(
+            !err.to_string().is_empty(),
+            "join malformed link must be a typed error: {err:#}"
+        );
+        covered.insert("join");
+    }
+
+    // leave — no-arg catalog builtin; a no-listener/no-guest toggle with no
+    // model turn, no editor, and no argument hint.
+    {
+        let command = builtin("leave").expect("leave builtin");
+        assert_eq!(command.name, "leave");
+        assert!(command.argument_hint.is_none());
+        assert!(
+            !requires_arguments(command),
+            "leave is a no-arg toggle"
+        );
+        assert_eq!(usage(command), "/leave");
+        covered.insert("leave");
+    }
+
+    // overlay — required-arg panel-open command; bare invocation surfaces the
+    // typed angle-bracket usage dispatch rejects with before any panel opens.
+    {
+        let command = builtin("overlay").expect("overlay builtin");
+        assert_eq!(usage(command), "/overlay <id>");
+        assert!(
+            requires_arguments(command),
+            "overlay must remain a required-arg builtin"
+        );
+        assert!(
+            command.argument_hint.is_some(),
+            "overlay must advertise an <id> argument hint"
+        );
+        covered.insert("overlay");
     }
 
     let expected = BUILTIN_COMMANDS
@@ -1199,4 +1646,302 @@ async fn import_missing_path_is_typed_error() {
         "import missing path error must be non-empty"
     );
     fixture.application.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch-level round-trip coverage for the Q2 shallow-assertion findings.
+// Each test drives the same Application / parse / execute helpers the REPL
+// and TUI dispatch into, asserting a concrete observable contract — never a
+// model turn. They complement the catalog-coverage mega-test above.
+// ---------------------------------------------------------------------------
+
+/// Recorded application fixture with a populated journal, for round-trip
+/// tests (rewind, checkpoint, queue, share, fresh) that need real session
+/// records on disk. Owns the temp dirs that must outlive the application.
+struct RecordedFixture {
+    cwd: TempDir,
+    sessions: TempDir,
+    application: Application,
+}
+
+impl RecordedFixture {
+    async fn new(tag: &str, messages: &[&str]) -> Self {
+        let cwd = TempDir::new().expect("cwd");
+        let sessions = TempDir::new().expect("sessions");
+        let recorder = pi_coding::start_session_in(
+            cwd.path(),
+            None,
+            Some("off"),
+            Some(sessions.path()),
+            Some(tag),
+            None,
+        )
+        .expect("start recorder");
+        for message in messages {
+            recorder
+                .record_message(&pi_ai::Message::user_text(*message, 0))
+                .expect("record message");
+        }
+        recorder.persist_now().expect("persist session");
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.set_session_dir(sessions.path().to_path_buf());
+        session.record(recorder).expect("attach recorder");
+        let application = Application::new(session).await;
+        Self {
+            cwd,
+            sessions,
+            application,
+        }
+    }
+}
+
+/// Contract: `/rewind <N>` through `Application::rewind` truncates the journal
+/// to the first N records, archives the dropped tail to a sidecar file, and
+/// leaves the recorder appendable at the new end. A regression that no-ops the
+/// rewind (or fails to archive) fails the preview-count and archive checks.
+#[tokio::test]
+async fn rewind_by_index_truncates_journal_and_archives_tail() {
+    let fixture = RecordedFixture::new("rewind-index", &["one", "two", "three", "four"]).await;
+    let app = &fixture.application;
+
+    let before = app.rewind_preview(100).expect("preview before");
+    let total = before.len();
+    // Header (session_info) + four user messages.
+    assert!(
+        total >= 5,
+        "journal must hold the header plus four messages: {total}"
+    );
+
+    let keep = total - 2;
+    let outcome = app
+        .rewind(pi_coding::RewindTarget::Index(keep))
+        .await
+        .expect("rewind by index");
+    assert_eq!(outcome.retained_entries, keep, "retained count must match the cut");
+    assert_eq!(outcome.dropped_entries, 2, "two tail records must be dropped");
+    assert!(
+        outcome.archive_path.exists(),
+        "the truncated tail must be archived to a sidecar file"
+    );
+
+    let after = app.rewind_preview(100).expect("preview after");
+    assert_eq!(
+        after.len(),
+        keep,
+        "preview must reflect the truncated journal, not the pre-rewind state"
+    );
+
+    // The archived tail must contain the dropped message text verbatim.
+    let archive = std::fs::read_to_string(&outcome.archive_path).expect("read archive");
+    assert!(archive.contains("three"), "archive must hold the dropped 'three' record");
+    assert!(archive.contains("four"), "archive must hold the dropped 'four' record");
+
+    app.cleanup().await;
+}
+
+/// Contract: `/checkpoint <name>` then `/rewind <name>` round-trips through
+/// `Application::rewind` — the checkpoint marks the current position, later
+/// records are appended, and the rewind rolls back to the marked position.
+/// A regression where the checkpoint lookup or the keep-count is off-by-one
+/// fails the retained/dropped counts or the resolved checkpoint name.
+#[tokio::test]
+async fn checkpoint_then_rewind_by_name_round_trips() {
+    let fixture = RecordedFixture::new("rewind-checkpoint", &["one", "two"]).await;
+    let app = &fixture.application;
+
+    app.set_checkpoint("snap").expect("mark checkpoint");
+    // Append two entries after the checkpoint marker so there is a tail to
+    // rewind away.
+    app.session()
+        .append_custom_entry("note", None)
+        .expect("append note 1");
+    app.session()
+        .append_custom_entry("note", None)
+        .expect("append note 2");
+
+    let outcome = app
+        .rewind(pi_coding::RewindTarget::Checkpoint("snap".to_owned()))
+        .await
+        .expect("rewind to checkpoint");
+    assert_eq!(
+        outcome.checkpoint.as_deref(),
+        Some("snap"),
+        "the resolved checkpoint name must round-trip"
+    );
+    // Journal: header, one, two, checkpoint-marker, note, note (6 entries).
+    // The checkpoint targets 'two' (index 2), so keep = 3 (header, one, two).
+    assert_eq!(outcome.retained_entries, 3);
+    assert_eq!(outcome.dropped_entries, 3);
+
+    // An unknown checkpoint name must surface an actionable error, not panic.
+    let error = app
+        .rewind(pi_coding::RewindTarget::Checkpoint("nope".to_owned()))
+        .await
+        .expect_err("unknown checkpoint must be rejected");
+    assert!(format!("{error:#}").contains("not found"));
+
+    app.cleanup().await;
+}
+
+/// Contract: `/queue cancel` (drain_queued_messages) removes queued steering
+/// and follow-up messages and leaves the queue empty. A regression that
+/// no-ops the drain fails the post-drain empty assertion.
+#[tokio::test]
+async fn queue_cancel_drains_pending_messages_and_clears_count() {
+    let fixture = RecordedFixture::new("queue-cancel", &["base turn"]).await;
+    let app = &fixture.application;
+
+    // Idle fixture must start with an empty queue.
+    let (steering, follow_up) = app.queued_messages().await;
+    assert!(
+        steering.is_empty() && follow_up.is_empty(),
+        "idle fixture must start with an empty queue"
+    );
+
+    // Queue a steering message; the queue must reflect it.
+    app.steer("steer the model mid-turn".to_owned(), Vec::new())
+        .await;
+    let (steering, follow_up) = app.queued_messages().await;
+    assert_eq!(steering.len(), 1, "one steering message must be queued");
+    assert!(follow_up.is_empty(), "no follow-up expected");
+
+    // drain (the /queue cancel action) must remove and return the message.
+    let (drained_steering, drained_follow_up) = app.drain_queued_messages().await;
+    assert_eq!(
+        drained_steering.len(),
+        1,
+        "drain must return the queued steering message"
+    );
+    assert!(drained_follow_up.is_empty());
+
+    // The queue must now be empty — the cancel cleared it.
+    let (steering, follow_up) = app.queued_messages().await;
+    assert!(
+        steering.is_empty() && follow_up.is_empty(),
+        "queue must be empty after /queue cancel"
+    );
+
+    app.cleanup().await;
+}
+
+/// Contract: `/share --encrypt` (execute_encrypted_share →
+/// share_session_encrypted → encrypt) writes a `.jsonl.enc` file using the
+/// salt+nonce+ciphertext AES-256-GCM layout, the plaintext never appears in
+/// the ciphertext, a correct passphrase decrypts it back to the session
+/// JSONL, a wrong passphrase fails on tag verification, and the note never
+/// contains the passphrase. A regression writing plaintext or a malformed
+/// nonce layout fails the ciphertext/layout or decrypt checks.
+#[tokio::test]
+async fn share_encrypt_round_trips_to_encrypted_file() {
+    let fixture = RecordedFixture::new("share-encrypt", &["plaintext fixture marker"]).await;
+    let app = &fixture.application;
+
+    let enc_path = fixture.sessions.path().join("share-encrypt.jsonl.enc");
+    let result = app
+        .share_session_encrypted("correct horse battery", Some(&enc_path))
+        .await
+        .expect("encrypted share");
+    assert_eq!(result.ciphertext_path, enc_path, "ciphertext must land at the requested path");
+    assert!(enc_path.exists(), "the .jsonl.enc file must be written");
+
+    let bytes = std::fs::read(&enc_path).expect("read enc");
+    // Layout: 16-byte salt + 12-byte nonce + ciphertext (incl. 16-byte tag).
+    assert!(
+        bytes.len() > pi_coding::encrypt::SALT_LEN + pi_coding::encrypt::NONCE_LEN,
+        "payload must exceed the salt+nonce prefix"
+    );
+    // The plaintext marker must NOT appear verbatim in the ciphertext.
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("plaintext fixture marker"),
+        "ciphertext must not contain plaintext"
+    );
+
+    // Correct passphrase decrypts back to the session JSONL containing the marker.
+    let plaintext = pi_coding::encrypt::decrypt("correct horse battery", &bytes)
+        .expect("decrypt with correct passphrase");
+    assert!(
+        String::from_utf8_lossy(&plaintext).contains("plaintext fixture marker"),
+        "decrypted plaintext must contain the original session content"
+    );
+    // Wrong passphrase fails on GCM tag verification.
+    assert!(
+        pi_coding::encrypt::decrypt("wrong passphrase", &bytes).is_err(),
+        "wrong passphrase must fail decryption"
+    );
+    // The human-readable note must never leak the passphrase.
+    assert!(
+        !result.note.contains("correct horse battery"),
+        "the share note must never contain the passphrase"
+    );
+
+    // The dispatch helper returns a non-empty message naming the path.
+    let message =
+        pi_cli::interactive_commands::execute_encrypted_share(app, "correct horse battery")
+            .await
+            .expect("dispatch encrypted share");
+    assert!(!message.trim().is_empty());
+    assert!(
+        message.contains(".jsonl.enc"),
+        "the dispatch message must name the ciphertext path"
+    );
+
+    app.cleanup().await;
+}
+
+/// Contract: `/fresh` archives the current session on disk (the old file
+// remains intact) and switches the recorder to a new session. A regression
+/// that deletes the old session instead of archiving it fails the
+/// old-file-exists assertion.
+#[tokio::test]
+async fn fresh_archives_current_session_and_switches_recorder() {
+    let fixture = RecordedFixture::new("fresh-archive", &["archive me"]).await;
+    let app = &fixture.application;
+
+    let before = app.state().await;
+    let before_file = std::path::PathBuf::from(
+        before
+            .session_file
+            .clone()
+            .expect("session must be recording to a file"),
+    );
+    assert!(before_file.exists(), "the source session file must exist before /fresh");
+
+    assert!(
+        pi_cli::interactive_commands::execute_fresh(app)
+            .await
+            .expect("fresh must complete"),
+        "fresh must not be cancelled in this flow"
+    );
+
+    let after = app.state().await;
+    assert_ne!(
+        after.session_id, before.session_id,
+        "/fresh must switch to a new recorder identity"
+    );
+    // The changelog contract: the current session STAYS archived on disk.
+    assert!(
+        before_file.exists(),
+        "the archived session file must remain on disk after /fresh"
+    );
+    assert_ne!(
+        after.session_file.as_deref(),
+        Some(before_file.to_string_lossy().as_ref()),
+        "/fresh must record into a new session file"
+    );
+
+    app.cleanup().await;
 }

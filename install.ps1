@@ -6,7 +6,7 @@
 #
 # Usage:
 #   irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.3
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.4
 #
 # Environment:
 #   PI_HOME                install root (default: %USERPROFILE%\.rpi)
@@ -24,6 +24,28 @@ Set-StrictMode -Version Latest
 function Fail([string]$Message) {
     Write-Error "install.ps1: error: $Message"
     exit 1
+}
+
+function Get-CandidateIdentityFailure([string]$Path, [string]$ExpectedVersion) {
+    $CandidateError = $null
+    $CandidateExit = $null
+    $CandidateOutput = @()
+    try {
+        $CandidateOutput = @(& $Path --version 2>$null)
+        $CandidateExit = $LASTEXITCODE
+    } catch {
+        $CandidateError = $_.Exception.Message
+    }
+    if ($CandidateError) {
+        return "failed smoke test ($CandidateError)"
+    }
+    if ($CandidateExit -ne 0) {
+        return "failed smoke test (exit $CandidateExit)"
+    }
+    if ($CandidateOutput.Count -ne 1 -or [string]$CandidateOutput[0] -cne "rpi $ExpectedVersion") {
+        return "reported unexpected identity/version (expected 'rpi $ExpectedVersion')"
+    }
+    return $null
 }
 
 function Ensure-SafeDirectory([string]$Path, [string]$Label) {
@@ -286,18 +308,11 @@ try {
         }
     }
 
-    # Smoke-test the downloaded binary *before* replacing the active install.
-    $PreSmokeError = $null
-    $PreSmokeExit = $null
-    try {
-        & $Binary.FullName --version *> $null
-        $PreSmokeExit = $LASTEXITCODE
-    } catch {
-        $PreSmokeError = $_.Exception.Message
-    }
-    if ($PreSmokeError -or $PreSmokeExit -ne 0) {
-        $PreSmokeDetail = if ($PreSmokeError) { $PreSmokeError } else { "exit $PreSmokeExit" }
-        Fail "downloaded binary failed smoke test ($PreSmokeDetail); existing install left untouched"
+    # Verify the downloaded candidate's exact identity before replacing the
+    # active executable or persisting updater state.
+    $PreSmokeFailure = Get-CandidateIdentityFailure $Binary.FullName $ResolvedVersion
+    if ($PreSmokeFailure) {
+        Fail "downloaded binary $PreSmokeFailure; existing install left untouched"
     }
 
     # Prepare parseable updater state before touching the active executable.
@@ -374,17 +389,11 @@ try {
     } catch {
         Fail "could not stage downloaded rpi for activation: $($_.Exception.Message)"
     }
-    # Re-smoke the staged copy in its final directory before activation.
-    $StagedSmokeExit = $null
-    try {
-        & $Staged --version *> $null
-        $StagedSmokeExit = $LASTEXITCODE
-    } catch {
-        $StagedSmokeExit = -1
-    }
-    if ($StagedSmokeExit -ne 0) {
+    # Re-verify the staged copy in its final directory before activation.
+    $StagedSmokeFailure = Get-CandidateIdentityFailure $Staged $ResolvedVersion
+    if ($StagedSmokeFailure) {
         Remove-Item -LiteralPath $Staged -Force -ErrorAction SilentlyContinue
-        Fail "staged binary failed smoke test; existing install left untouched"
+        Fail "staged binary $StagedSmokeFailure; existing install left untouched"
     }
 
     $HadPrior = Test-Path -LiteralPath $Dest
@@ -419,17 +428,10 @@ try {
         }
     }
 
-    # Secondary smoke-test of the activated path; restore prior bytes on failure.
-    $ActiveSmokeError = $null
-    $ActiveSmokeExit = $null
-    try {
-        & $Dest --version *> $null
-        $ActiveSmokeExit = $LASTEXITCODE
-    } catch {
-        $ActiveSmokeError = $_.Exception.Message
-    }
-    if ($ActiveSmokeError -or $ActiveSmokeExit -ne 0) {
-        $ActiveSmokeDetail = if ($ActiveSmokeError) { $ActiveSmokeError } else { "exit $ActiveSmokeExit" }
+    # Verify the activated path still exposes the exact candidate identity;
+    # restore prior bytes on any execution or identity failure.
+    $ActiveSmokeFailure = Get-CandidateIdentityFailure $Dest $ResolvedVersion
+    if ($ActiveSmokeFailure) {
         $RollbackErrors = [System.Collections.Generic.List[string]]::new()
         if ($HadPrior -and $Backup) {
             # Atomic-replace path: restore the pre-emptive backup atomically.
@@ -446,7 +448,7 @@ try {
             Confirm-RollbackPath $Dest "new rpi executable" $false $RollbackErrors
         }
         if ($Backup) { Remove-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue }
-        Fail-WithRollbackErrors "installed binary failed to run ($ActiveSmokeDetail)" $RollbackErrors
+        Fail-WithRollbackErrors "installed binary $ActiveSmokeFailure" $RollbackErrors
     }
 
     # Commit updater state only after the binary activates.

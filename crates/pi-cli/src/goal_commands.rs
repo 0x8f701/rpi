@@ -12,6 +12,13 @@ pub enum InteractiveGoalCommand {
     Resume,
     Complete,
     Drop,
+    Pin {
+        text: String,
+    },
+    Pins,
+    Unpin {
+        index: usize,
+    },
 }
 
 
@@ -28,6 +35,28 @@ pub fn parse_interactive_goal_command(argument: Option<&str>) -> Result<Interact
         "resume" => no_trailing(parts, InteractiveGoalCommand::Resume),
         "complete" => no_trailing(parts, InteractiveGoalCommand::Complete),
         "drop" => no_trailing(parts, InteractiveGoalCommand::Drop),
+        "pin" => {
+            let text = argument[operation.len()..].trim();
+            if text.is_empty() {
+                bail!("usage: /goal pin <text>");
+            }
+            Ok(InteractiveGoalCommand::Pin {
+                text: text.to_owned(),
+            })
+        }
+        "pins" => no_trailing(parts, InteractiveGoalCommand::Pins),
+        "unpin" => {
+            let index = parts
+                .next()
+                .ok_or_else(|| anyhow!("usage: /goal unpin <index>"))?;
+            if parts.next().is_some() {
+                bail!("usage: /goal unpin <index>");
+            }
+            let index = index
+                .parse::<usize>()
+                .map_err(|_| anyhow!("usage: /goal unpin <index>"))?;
+            Ok(InteractiveGoalCommand::Unpin { index })
+        }
         "create" | "set" => parse_create(argument[operation.len()..].trim()),
         _ => parse_create(argument),
     }
@@ -35,7 +64,7 @@ pub fn parse_interactive_goal_command(argument: Option<&str>) -> Result<Interact
 
 fn no_trailing<'a>(mut parts: impl Iterator<Item = &'a str>, command: InteractiveGoalCommand) -> Result<InteractiveGoalCommand> {
     if parts.next().is_some() {
-        bail!("usage: /goal [show|inspect|create [--tokens N] <objective>|pause|resume|complete|drop]");
+        bail!("usage: /goal [show|inspect|create [--tokens N] <objective>|pause|resume|complete|drop|pin <text>|pins|unpin <index>]");
     }
     Ok(command)
 }
@@ -95,6 +124,17 @@ pub async fn execute_interactive_goal_command(
             application.goal_drop()?;
             None
         }
+        InteractiveGoalCommand::Pin { text } => {
+            application.goal_pin(text)?;
+            None
+        }
+        InteractiveGoalCommand::Pins => {
+            return Ok(format_goal_pins(&application.goal_state()));
+        }
+        InteractiveGoalCommand::Unpin { index } => {
+            application.goal_unpin(index)?;
+            None
+        }
     };
     let state = format_goal_state(&application.goal_state());
     Ok(match activation {
@@ -103,6 +143,24 @@ pub async fn execute_interactive_goal_command(
         Some(GoalActivationOutcome::AlreadyActive) => format!("Goal work already active · {state}"),
         None => state,
     })
+}
+
+/// Renders the goal's role-model pins as a numbered listing, or a short
+/// "no pins"/"no goal" marker when there is nothing to list.
+#[must_use]
+pub fn format_goal_pins(state: &GoalState) -> String {
+    let Some(goal) = &state.current else {
+        return "no goal".to_owned();
+    };
+    if goal.pins.is_empty() {
+        return "no pins".to_owned();
+    }
+    goal.pins
+        .iter()
+        .enumerate()
+        .map(|(index, pin)| format!("{}. {pin}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[must_use]
@@ -138,10 +196,17 @@ pub fn format_goal_details(state: &GoalState) -> String {
         || format!("{} (no budget)", goal.usage.tokens_used),
         |budget| format!("{} / {budget}", goal.usage.tokens_used),
     );
-    format!(
+    let mut details = format!(
         "Objective: {}\nStatus: {lifecycle}\nTokens: {tokens}\nTime spent: {}s",
         goal.objective, goal.usage.active_time_seconds
-    )
+    );
+    if !goal.pins.is_empty() {
+        details.push_str("\nPins:");
+        for (index, pin) in goal.pins.iter().enumerate() {
+            details.push_str(&format!("\n  {}. {pin}", index + 1));
+        }
+    }
+    details
 }
 
 #[cfg(test)]
@@ -185,6 +250,65 @@ mod tests {
                 token_budget: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_goal_pin_pins_and_unpin_commands() {
+        assert_eq!(
+            parse_interactive_goal_command(Some("pin keep the release checklist in scope")).unwrap(),
+            InteractiveGoalCommand::Pin {
+                text: "keep the release checklist in scope".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_interactive_goal_command(Some("pins")).unwrap(),
+            InteractiveGoalCommand::Pins
+        );
+        assert_eq!(
+            parse_interactive_goal_command(Some("unpin 0")).unwrap(),
+            InteractiveGoalCommand::Unpin { index: 0 }
+        );
+        assert_eq!(
+            parse_interactive_goal_command(Some("unpin 7")).unwrap(),
+            InteractiveGoalCommand::Unpin { index: 7 }
+        );
+        assert!(parse_interactive_goal_command(Some("pin")).is_err(), "pin needs text");
+        assert!(parse_interactive_goal_command(Some("pin   ")).is_err(), "pin needs text");
+        assert!(parse_interactive_goal_command(Some("unpin")).is_err(), "unpin needs an index");
+        assert!(parse_interactive_goal_command(Some("unpin nope")).is_err(), "unpin index must be a number");
+        assert!(parse_interactive_goal_command(Some("unpin 0 extra")).is_err(), "unpin takes one index");
+        assert!(parse_interactive_goal_command(Some("pins extra")).is_err(), "pins takes no arguments");
+    }
+
+    #[test]
+    fn formats_goal_pins_and_details_with_pin_section() {
+        let mut state: GoalState = serde_json::from_value(serde_json::json!({
+            "current": {
+                "id": "goal-1",
+                "objective": "ship safely",
+                "tokenBudget": 10,
+                "pins": ["follow the checklist", "reference the omp style"],
+                "lifecycle": "active",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "usage": { "tokensUsed": 0, "activeTimeSeconds": 0 }
+            },
+            "revision": 1
+        }))
+        .expect("goal state json");
+        assert_eq!(
+            format_goal_pins(&state),
+            "1. follow the checklist\n2. reference the omp style"
+        );
+        let details = format_goal_details(&state);
+        assert!(details.contains("Pins:"), "{details}");
+        assert!(details.contains("  1. follow the checklist"), "{details}");
+        assert!(details.contains("  2. reference the omp style"), "{details}");
+
+        state.current.as_mut().expect("goal").pins.clear();
+        assert_eq!(format_goal_pins(&state), "no pins");
+        assert!(!format_goal_details(&state).contains("Pins:"), "empty pins must not render a Pins section");
+        assert_eq!(format_goal_pins(&GoalState::default()), "no goal");
     }
 
     #[test]

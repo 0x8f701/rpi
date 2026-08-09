@@ -127,5 +127,5 @@ Valid `capabilities`: `commands`, `tools`, `event_hooks`, `message_renderers`,
 `provider_metadata`, `session_actions`, `ui`. Add `uiCapabilities` when using
 `ui`.
 
-See [`docs/extensions.md`](../docs/extensions.md) for the full protocol,
+See [`src/reference/extensions.md`](../docs/src/reference/extensions.md) for the full protocol,
 request/response shapes, timeouts, and security rules.

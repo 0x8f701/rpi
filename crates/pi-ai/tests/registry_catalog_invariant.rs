@@ -37,6 +37,8 @@ fn known_api_constants_are_centralized_with_expected_values() {
     assert_eq!(API_GOOGLE_VERTEX, "google-vertex");
     assert_eq!(API_MISTRAL_CONVERSATIONS, "mistral-conversations");
     assert_eq!(API_PI_MESSAGES, "pi-messages");
+    assert_eq!(API_IMAGE_GEN, "imagegen");
+    assert_eq!(API_OPENROUTER_IMAGES, "openrouter-images");
 
     let unique: BTreeSet<&str> = KNOWN_CATALOG_APIS.iter().copied().collect();
     assert_eq!(
@@ -44,7 +46,7 @@ fn known_api_constants_are_centralized_with_expected_values() {
         KNOWN_CATALOG_APIS.len(),
         "KNOWN_CATALOG_APIS contains duplicates"
     );
-    assert_eq!(KNOWN_CATALOG_APIS.len(), 10, "expected exactly 10 known catalog APIs");
+    assert_eq!(KNOWN_CATALOG_APIS.len(), 12, "expected exactly 12 known catalog APIs");
 }
 
 #[test]

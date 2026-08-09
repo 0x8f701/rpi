@@ -9,7 +9,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
-#   sh install.sh --version v0.2.3      # pin a specific release
+#   sh install.sh --version v0.2.4      # pin a specific release
 #
 # Environment:
 #   PI_HOME                install root (default: ~/.rpi)
@@ -452,9 +452,15 @@ STAGED="$(mktemp "$DOWNLOADS_DIR/.rpi-stage.XXXXXX")" \
     || err "could not create a staged binary under $DOWNLOADS_DIR"
 cp "$TMP_DIR/rpi" "$STAGED" || err "could not stage downloaded rpi"
 chmod 0755 "$STAGED"
-# Smoke-test the staged bytes before touching either live component.
-"$STAGED" --version >/dev/null 2>&1 \
-    || err "downloaded binary failed smoke test; existing install left untouched"
+# Capture and verify the candidate identity before touching the active binary
+# or updater state. A checksum-valid archive with the wrong executable must
+# fail closed even when its `--version` command exits successfully.
+if ! CANDIDATE_VERSION_OUTPUT="$("$STAGED" --version 2>/dev/null)"; then
+    err "downloaded binary failed smoke test; existing install left untouched"
+fi
+EXPECTED_VERSION_OUTPUT="rpi $RESOLVED_VERSION"
+[ "$CANDIDATE_VERSION_OUTPUT" = "$EXPECTED_VERSION_OUTPUT" ] \
+    || err "downloaded binary reported unexpected identity/version (expected '$EXPECTED_VERSION_OUTPUT'); existing install left untouched"
 
 TMP_LINK="$BIN_DIR/rpi.install.$$"
 [ ! -e "$TMP_LINK" ] && [ ! -L "$TMP_LINK" ] \

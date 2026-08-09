@@ -233,6 +233,7 @@ fn register_scripted_provider(label: &str) -> ScriptedProvider {
             api: api.clone(),
             stream: stream_fn,
             stream_simple: simple,
+            generate_image: None,
         },
         Some(source_id.clone()),
     );

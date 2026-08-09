@@ -8,24 +8,27 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::side_chat::{SideChatController, SideChatEntry, SideChatRole};
+use crate::side_chat::{SideChatController, SideChatEntry, SideChatRole, SideChatTabs};
 use crate::theme::Theme;
 use crate::tui::clean_terminal_text;
 
-/// Render the side-chat overlay into `frame`.
+/// Render the side-chat overlay into `frame`: a tab bar row over the active
+/// tab's transcript and editor.
 pub fn render_side_chat_panel(
     frame: &mut ratatui::Frame<'_>,
-    controller: &SideChatController,
+    tabs: &SideChatTabs,
     theme: Theme,
 ) {
+    let controller: &SideChatController = tabs;
     let area = centered_rect(frame.area().width.saturating_mul(9) / 10, frame.area().height.saturating_mul(4) / 5, frame.area());
     frame.render_widget(Clear, area);
 
     let mode = controller.tool_mode().label();
+    let tab_name = tabs.active_name();
     let title = if controller.show_edit_warning() {
-        format!(" Side chat · EDIT MODE · {mode} · Ctrl+T toggle · Esc close ")
+        format!(" Side chat · {tab_name} · EDIT MODE · {mode} · Ctrl+T toggle · Esc close ")
     } else {
-        format!(" Side chat · {mode} · Ctrl+T edit · Esc close ")
+        format!(" Side chat · {tab_name} · {mode} · Ctrl+T edit · Esc close ")
     };
     let border_color = if controller.show_edit_warning() {
         theme.error
@@ -42,6 +45,7 @@ pub fn render_side_chat_panel(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(if controller.show_edit_warning() { 2 } else { 0 }),
@@ -63,8 +67,15 @@ pub fn render_side_chat_panel(
         chunks[0],
     );
 
-    let transcript_width = usize::from(chunks[1].width.saturating_sub(1)).max(1);
-    let transcript_height = usize::from(chunks[1].height).max(1);
+    if chunks[1].height > 0 {
+        frame.render_widget(
+            Paragraph::new(tab_bar_line(tabs, theme, usize::from(chunks[1].width))),
+            chunks[1],
+        );
+    }
+
+    let transcript_width = usize::from(chunks[2].width.saturating_sub(1)).max(1);
+    let transcript_height = usize::from(chunks[2].height).max(1);
     let lines = build_transcript_lines(controller, theme, transcript_width);
     let total = lines.len();
     let scroll = controller.scroll().min(total.saturating_sub(1));
@@ -77,10 +88,10 @@ pub fn render_side_chat_panel(
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(visible).wrap(Wrap { trim: false }),
-        chunks[1],
+        chunks[2],
     );
 
-    if controller.show_edit_warning() && chunks[2].height > 0 {
+    if controller.show_edit_warning() && chunks[3].height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " ⚠ EDIT MODE: Write/Exec enabled — may overlap main agent file changes ",
@@ -88,25 +99,25 @@ pub fn render_side_chat_panel(
                     .fg(theme.error)
                     .add_modifier(Modifier::BOLD),
             ))),
-            chunks[2],
+            chunks[3],
         );
     }
 
-    if chunks[3].height > 0 {
+    if chunks[4].height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" {} ", clean_terminal_text(controller.status())),
                 Style::default().fg(theme.muted),
             ))),
-            chunks[3],
+            chunks[4],
         );
     }
 
     let editor_block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(theme.border));
-    let editor_inner = editor_block.inner(chunks[4]);
-    frame.render_widget(editor_block, chunks[4]);
+    let editor_inner = editor_block.inner(chunks[5]);
+    frame.render_widget(editor_block, chunks[5]);
     let editor_text = clean_terminal_text(&controller.editor_text());
     let prompt = if editor_text.is_empty() && !controller.is_streaming() {
         "Type a side-chat message…"
@@ -145,6 +156,62 @@ pub fn render_side_chat_panel(
             frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
+}
+
+/// Build the tab-bar line: every open tab name, active one highlighted with a
+/// leading arrow. Truncated to `width` display columns.
+fn tab_bar_line(tabs: &SideChatTabs, theme: Theme, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::from("");
+    }
+    let mut spans = vec![Span::styled(" tabs: ", Style::default().fg(theme.muted))];
+    let active = tabs.active_name();
+    for (index, name) in tabs.tab_names().into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(theme.muted)));
+        }
+        if name == active {
+            spans.push(Span::styled(
+                format!("▸{name}"),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(name.to_owned(), Style::default().fg(theme.muted)));
+        }
+    }
+    truncate_line(Line::from(spans), width)
+}
+
+fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::from("");
+    }
+    let mut used = 0usize;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if used >= width {
+            break;
+        }
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        if used + span_width <= width {
+            spans.push(span);
+            used += span_width;
+        } else {
+            let mut content = String::new();
+            for ch in span.content.chars() {
+                let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+                if used + ch_width > width {
+                    break;
+                }
+                content.push(ch);
+                used += ch_width;
+            }
+            spans.push(Span::styled(content, span.style));
+        }
+    }
+    Line::from(spans)
 }
 
 fn build_transcript_lines(
@@ -424,10 +491,11 @@ mod tests {
         let side = crate::side_chat::SideChatController::fork_from(&application)
             .await
             .expect("fork");
+        let tabs = crate::side_chat::SideChatTabs::from_single("default", side);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_side_chat_panel(frame, &side, crate::theme::DARK))
+            .draw(|frame| render_side_chat_panel(frame, &tabs, crate::theme::DARK))
             .expect("draw");
         let text = buffer_text(&terminal);
         assert!(text.contains("Side chat") || text.contains("read-only") || text.contains("read"));
@@ -441,10 +509,11 @@ mod tests {
         let side = crate::side_chat::SideChatController::fork_from(&application)
             .await
             .expect("fork");
+        let tabs = crate::side_chat::SideChatTabs::from_single("default", side);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_side_chat_panel(frame, &side, crate::theme::DARK))
+            .draw(|frame| render_side_chat_panel(frame, &tabs, crate::theme::DARK))
             .expect("draw");
 
         let area = centered_rect(90, 24, Rect::new(0, 0, 100, 30));
@@ -459,16 +528,17 @@ mod tests {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(0),
                 Constraint::Length(1),
                 Constraint::Length(3),
             ])
             .split(inner);
-        let divider = (chunks[4].left()..chunks[4].right())
-            .map(|x| buffer[(x, chunks[4].top())].symbol())
+        let divider = (chunks[5].left()..chunks[5].right())
+            .map(|x| buffer[(x, chunks[5].top())].symbol())
             .collect::<String>();
-        assert_eq!(divider, "─".repeat(usize::from(chunks[4].width)));
+        assert_eq!(divider, "─".repeat(usize::from(chunks[5].width)));
     }
 
     #[tokio::test]
@@ -486,11 +556,12 @@ mod tests {
         side.handle_paste(
             "edit \u{1b}]8;;https://example.com\u{7}label\u{1b}]8;;\u{7} \u{1b}]8;;https://example.com\u{1b}\\st\u{1b}]8;;\u{1b}\\\u{7}",
         );
+        let tabs = crate::side_chat::SideChatTabs::from_single("default", side);
 
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_side_chat_panel(frame, &side, crate::theme::DARK))
+            .draw(|frame| render_side_chat_panel(frame, &tabs, crate::theme::DARK))
             .expect("draw");
         let text = buffer_text(&terminal);
 
@@ -507,6 +578,43 @@ mod tests {
         assert!(
             !text.contains("[31m") && !text.contains("[0m") && !text.contains("[2;5H"),
             "raw CSI payload leaked: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_side_chat_shows_tab_bar_with_active_marker() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let application = Application::new(session).await;
+        let mut tabs = crate::side_chat::SideChatTabs::new_default(&application)
+            .await
+            .expect("default");
+        tabs.new_tab(&application, "alpha").await.expect("alpha");
+        tabs.new_tab(&application, "beta").await.expect("beta");
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_side_chat_panel(frame, &tabs, crate::theme::DARK))
+            .expect("draw");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("default"), "tab bar must list every tab: {text:?}");
+        assert!(text.contains("alpha"), "tab bar must list every tab: {text:?}");
+        assert!(text.contains("beta"), "tab bar must list every tab: {text:?}");
+        assert!(
+            text.contains("▸beta"),
+            "active tab must carry the ▸ marker: {text:?}"
+        );
+
+        // Switch and re-render: the marker moves.
+        tabs.switch_to("alpha").expect("switch");
+        terminal
+            .draw(|frame| render_side_chat_panel(frame, &tabs, crate::theme::DARK))
+            .expect("draw");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("▸alpha"), "marker must follow the active tab: {text:?}");
+        assert!(
+            !text.contains("▸beta"),
+            "inactive tabs must not carry the marker: {text:?}"
         );
     }
 }

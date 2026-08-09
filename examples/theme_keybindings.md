@@ -49,5 +49,5 @@ Create `$PI_CODING_AGENT_DIR/keybindings.json` or `$CWD/.pi/keybindings.json`:
 Project keybindings overlay global keybindings, which overlay built-in defaults.
 A malformed file is rejected in full.
 
-See [`docs/tui.md`](../docs/tui.md) for the full list of color roles, actions,
+See [`src/user-guide/tui.md`](../docs/src/user-guide/tui.md) for the full list of color roles, actions,
 and chord syntax.

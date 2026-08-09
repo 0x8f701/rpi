@@ -11,13 +11,14 @@ use pi_ai::{ContentBlock, Message, Model};
 use pi_coding::{
     Application, ApplicationEvent, ApplicationState, GoalState, GoalUsageDelta, LoopCreateRequest,
     LoopUpdateRequest, ProcessId, ProcessKey, ProcessSignal, ProcessSpawnSpec, ProcessTerminalSize,
-    StreamingBehavior, TodoPhase,
+    StreamingBehavior, TodoOp, TodoPhase,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     io::{self, Write},
     path::Path,
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex},
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -139,6 +140,13 @@ pub enum RpcCommand {
         #[serde(default)]
         id: Option<String>,
     },
+    /// List the unified resume catalog (native + enabled foreign sessions),
+    /// scoped to the session working directory, mirroring the TUI `/sessions`
+    /// panel. Wire shape: `{ "type": "session_list", "id"?: string }`.
+    SessionList {
+        #[serde(default)]
+        id: Option<String>,
+    },
     ExportHtml {
         #[serde(default)]
         id: Option<String>,
@@ -198,6 +206,12 @@ pub enum RpcCommand {
         #[serde(default, rename = "workflowId")]
         workflow_id: Option<String>,
         phases: Vec<TodoPhase>,
+    },
+    TodoOp {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(flatten)]
+        op: TodoOp,
     },
     LoopCreate {
         #[serde(default)]
@@ -330,6 +344,22 @@ pub enum RpcCommand {
         #[serde(default, rename = "activeTimeSeconds")]
         active_time_seconds: u64,
     },
+    GoalPin {
+        #[serde(default)]
+        id: Option<String>,
+        text: String,
+    },
+    GoalUnpin {
+        #[serde(default)]
+        id: Option<String>,
+        index: usize,
+    },
+    /// Replay the goal journal (every goal event on the active session branch).
+    /// Wire shape: `{ "type": "goal_journal", "id"?: string }`.
+    GoalJournal {
+        #[serde(default)]
+        id: Option<String>,
+    },
     /// Return the redacted schema catalog, effective values, provenance, and paths.
     /// Wire shape: `{ "type": "settings_inspect", "id"?: string }`.
     SettingsInspect {
@@ -407,6 +437,14 @@ pub enum RpcCommand {
         #[serde(default)]
         name: Option<String>,
     },
+    WorkflowDetail {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default, rename = "workflowId")]
+        workflow_id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
     WorkflowPause {
         #[serde(default)]
         id: Option<String>,
@@ -437,9 +475,148 @@ pub enum RpcCommand {
         #[serde(rename = "workflowId")]
         workflow_id: String,
     },
+    /// Open a new named side-chat tab (the `/btw new <name>` mirror). Each
+    /// tab is a detached parallel agent forked from the main conversation.
+    /// Returns the full side-chat snapshot.
+    SideChatNew {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+    },
+    /// Switch the active side-chat tab by name.
+    SideChatSwitch {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+    },
+    /// Close a side-chat tab by name (defaults to the active tab). Closing
+    /// the last tab replaces it with a fresh `default` tab.
+    SideChatClose {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Submit a prompt to the active side-chat tab. Never touches the main
+    /// session/transcript.
+    SideChatPrompt {
+        #[serde(default)]
+        id: Option<String>,
+        message: String,
+    },
+    /// Snapshot every side-chat tab: names, streaming state, and per-tab
+    /// transcript rows.
+    SideChatList {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Deterministic archive compaction with no LLM call (`/snapcompact`).
+    /// Returns the same A→B token report as `compact`.
+    #[serde(rename = "snapcompact")]
+    SnapCompact {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Roll the session back to before an entry (`/rewind <entry-index>` or
+    /// `/rewind <checkpoint-name>`); the dropped tail is archived to a
+    /// `.rewind-*.jsonl` sidecar. List rewind targets via `get_entries`.
+    Rewind {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        index: Option<usize>,
+        #[serde(default)]
+        checkpoint: Option<String>,
+    },
+    /// Render the `/handoff` envelope (`prose: false`, default) or the
+    /// envelope plus one bounded summarizer paragraph (`prose: true`).
+    Handoff {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        prose: bool,
+    },
+    /// View queued steering/follow-up prompts (`/queue`).
+    QueueList {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Cancel (drain) every queued steering/follow-up prompt (`/queue cancel`).
+    QueueCancel {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Snapshot the orchestration runtime for the Subagents panel: jobs,
+    /// agents, and delivered messages. `enabled` reports whether the session
+    /// has orchestration attached (otherwise the lists are empty).
+    JobList {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Spawn one or more orchestration child jobs. Wire args mirror the `task`
+    /// tool exactly: `{"task": "..."}` for a single spawn, or
+    /// `{"context": "...", "tasks": [...]}` for a batch.
+    TaskSpawn {
+        #[serde(default)]
+        id: Option<String>,
+        args: Value,
+    },
+    /// Cancel orchestration jobs by job id or agent id.
+    JobCancel {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default, rename = "jobIds")]
+        job_ids: Vec<String>,
+    },
+    /// Send a message from the main agent to a subagent (`hub send` mirror).
+    HubSend {
+        #[serde(default)]
+        id: Option<String>,
+        to: String,
+        body: String,
+        #[serde(default, rename = "replyTo")]
+        reply_to: Option<String>,
+    },
+    /// Fetch one orchestration job snapshot (settled `result.output` is the
+    /// delivered yield payload).
+    JobOutput {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "jobId")]
+        job_id: String,
+    },
+    /// Start an encrypted room bound to the selected recorded session.
+    CollabStart {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default, rename = "baseUrl")]
+        base_url: Option<String>,
+    },
+    /// Inspect active encrypted collaboration rooms.
+    CollabStatus {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default, rename = "roomId")]
+        room_id: Option<String>,
+    },
+    /// Stop one collaboration room and disconnect its participants.
+    CollabStop {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "roomId")]
+        room_id: String,
+    },
+    /// Close an idle manager-owned session on the Web control plane. The
+    /// target is selected by the top-level `sessionId`; the primary TUI
+    /// runtime and busy secondaries are rejected without cancelling work.
+    /// Wire shape: `{ "type": "close_session", "id"?: string, "sessionId": string }`.
+    CloseSession {
+        #[serde(default)]
+        id: Option<String>,
+    },
 }
 impl RpcCommand {
-    fn id(&self) -> Option<String> {
+    pub(crate) fn id(&self) -> Option<String> {
         match self {
             Self::Prompt { id, .. }
             | Self::Steer { id, .. }
@@ -462,6 +639,7 @@ impl RpcCommand {
             | Self::Bash { id, .. }
             | Self::AbortBash { id }
             | Self::GetSessionStats { id }
+            | Self::SessionList { id }
             | Self::ExportHtml { id, .. }
             | Self::SwitchSession { id, .. }
             | Self::Fork { id, .. }
@@ -474,6 +652,7 @@ impl RpcCommand {
             | Self::GetMessages { id }
             | Self::GetCommands { id }
             | Self::SetTodos { id, .. }
+            | Self::TodoOp { id, .. }
             | Self::LoopCreate { id, .. }
             | Self::LoopUpdate { id, .. }
             | Self::LoopList { id }
@@ -495,6 +674,9 @@ impl RpcCommand {
             | Self::GoalComplete { id }
             | Self::GoalDrop { id }
             | Self::GoalUpdateUsage { id, .. }
+            | Self::GoalPin { id, .. }
+            | Self::GoalUnpin { id, .. }
+            | Self::GoalJournal { id }
             | Self::SettingsInspect { id }
             | Self::SettingsSearch { id, .. }
             | Self::SettingsOpenDraft { id, .. }
@@ -508,14 +690,34 @@ impl RpcCommand {
             | Self::WorkflowCreate { id, .. }
             | Self::WorkflowList { id }
             | Self::WorkflowGet { id, .. }
+            | Self::WorkflowDetail { id, .. }
             | Self::WorkflowPause { id, .. }
             | Self::WorkflowResume { id, .. }
             | Self::WorkflowCancel { id, .. }
             | Self::WorkflowIntegrate { id, .. }
-            | Self::WorkflowRemove { id, .. } => id.clone(),
+            | Self::WorkflowRemove { id, .. }
+            | Self::SideChatNew { id, .. }
+            | Self::SideChatSwitch { id, .. }
+            | Self::SideChatClose { id, .. }
+            | Self::SideChatPrompt { id, .. }
+            | Self::SideChatList { id }
+            | Self::SnapCompact { id }
+            | Self::Rewind { id, .. }
+            | Self::Handoff { id, .. }
+            | Self::QueueList { id }
+            | Self::QueueCancel { id }
+            | Self::JobList { id }
+            | Self::TaskSpawn { id, .. }
+            | Self::JobCancel { id, .. }
+            | Self::HubSend { id, .. }
+            | Self::JobOutput { id, .. }
+            | Self::CollabStart { id, .. }
+            | Self::CollabStatus { id, .. }
+            | Self::CollabStop { id, .. }
+            | Self::CloseSession { id } => id.clone(),
         }
     }
-    const fn command_name(&self) -> &'static str {
+    pub(crate) const fn command_name(&self) -> &'static str {
         match self {
             Self::Prompt { .. } => "prompt",
             Self::Steer { .. } => "steer",
@@ -538,6 +740,7 @@ impl RpcCommand {
             Self::Bash { .. } => "bash",
             Self::AbortBash { .. } => "abort_bash",
             Self::GetSessionStats { .. } => "get_session_stats",
+            Self::SessionList { .. } => "session_list",
             Self::ExportHtml { .. } => "export_html",
             Self::SwitchSession { .. } => "switch_session",
             Self::Fork { .. } => "fork",
@@ -550,6 +753,7 @@ impl RpcCommand {
             Self::GetMessages { .. } => "get_messages",
             Self::GetCommands { .. } => "get_commands",
             Self::SetTodos { .. } => "set_todos",
+            Self::TodoOp { .. } => "todo_op",
             Self::LoopCreate { .. } => "loop_create",
             Self::LoopUpdate { .. } => "loop_update",
             Self::LoopList { .. } => "loop_list",
@@ -572,6 +776,9 @@ impl RpcCommand {
             Self::GoalComplete { .. } => "goal_complete",
             Self::GoalDrop { .. } => "goal_drop",
             Self::GoalUpdateUsage { .. } => "goal_update_usage",
+            Self::GoalPin { .. } => "goal_pin",
+            Self::GoalUnpin { .. } => "goal_unpin",
+            Self::GoalJournal { .. } => "goal_journal",
             Self::SettingsInspect { .. } => "settings_inspect",
             Self::SettingsSearch { .. } => "settings_search",
             Self::SettingsOpenDraft { .. } => "settings_open_draft",
@@ -584,14 +791,42 @@ impl RpcCommand {
             Self::WorkflowCreate { .. } => "workflow_create",
             Self::WorkflowList { .. } => "workflow_list",
             Self::WorkflowGet { .. } => "workflow_get",
+            Self::WorkflowDetail { .. } => "workflow_detail",
             Self::WorkflowPause { .. } => "workflow_pause",
             Self::WorkflowResume { .. } => "workflow_resume",
             Self::WorkflowCancel { .. } => "workflow_cancel",
             Self::WorkflowIntegrate { .. } => "workflow_integrate",
             Self::WorkflowRemove { .. } => "workflow_remove",
+            Self::SideChatNew { .. } => "side_chat_new",
+            Self::SideChatSwitch { .. } => "side_chat_switch",
+            Self::SideChatClose { .. } => "side_chat_close",
+            Self::SideChatPrompt { .. } => "side_chat_prompt",
+            Self::SideChatList { .. } => "side_chat_list",
+            Self::SnapCompact { .. } => "snapcompact",
+            Self::Rewind { .. } => "rewind",
+            Self::Handoff { .. } => "handoff",
+            Self::QueueList { .. } => "queue_list",
+            Self::QueueCancel { .. } => "queue_cancel",
+            Self::JobList { .. } => "job_list",
+            Self::TaskSpawn { .. } => "task_spawn",
+            Self::JobCancel { .. } => "job_cancel",
+            Self::HubSend { .. } => "hub_send",
+            Self::JobOutput { .. } => "job_output",
+            Self::CollabStart { .. } => "collab_start",
+            Self::CollabStatus { .. } => "collab_status",
+            Self::CollabStop { .. } => "collab_stop",
+            Self::CloseSession { .. } => "close_session",
         }
     }
+
+    pub(crate) const fn is_collab_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::CollabStart { .. } | Self::CollabStatus { .. } | Self::CollabStop { .. }
+        )
+    }
 }
+
 impl RpcCommand {
     pub(crate) const fn runs_inline(&self) -> bool {
         matches!(
@@ -602,6 +837,7 @@ impl RpcCommand {
                 | Self::LoopCancel { .. }
                 | Self::ProcessSignal { .. }
                 | Self::ProcessStop { .. }
+                | Self::SessionList { .. }
                 | Self::SettingsInspect { .. }
                 | Self::SettingsSearch { .. }
                 | Self::SettingsOpenDraft { .. }
@@ -614,15 +850,27 @@ impl RpcCommand {
                 | Self::WorkflowCreate { .. }
                 | Self::WorkflowList { .. }
                 | Self::WorkflowGet { .. }
+                | Self::WorkflowDetail { .. }
                 | Self::WorkflowPause { .. }
                 | Self::WorkflowResume { .. }
                 | Self::WorkflowCancel { .. }
                 | Self::WorkflowIntegrate { .. }
                 | Self::WorkflowRemove { .. }
+                | Self::SideChatNew { .. }
+                | Self::SideChatSwitch { .. }
+                | Self::SideChatClose { .. }
+                | Self::SideChatPrompt { .. }
+                | Self::SideChatList { .. }
+                | Self::QueueList { .. }
+                | Self::QueueCancel { .. }
+                | Self::CollabStart { .. }
+                | Self::CollabStatus { .. }
+                | Self::CollabStop { .. }
+                | Self::CloseSession { .. }
         )
     }
 
-    const fn bypasses_command_slots(&self) -> bool {
+    pub(crate) const fn bypasses_command_slots(&self) -> bool {
         matches!(
             self,
             Self::Abort { .. }
@@ -631,6 +879,8 @@ impl RpcCommand {
                 | Self::LoopCancel { .. }
                 | Self::ProcessSignal { .. }
                 | Self::ProcessStop { .. }
+                | Self::CollabStop { .. }
+                | Self::CloseSession { .. }
         )
     }
 }
@@ -657,6 +907,7 @@ pub struct RpcSessionState {
     pub session_file: Option<String>,
     pub session_id: Option<String>,
     pub session_name: Option<String>,
+    pub cwd: String,
     pub auto_compaction_enabled: bool,
     pub message_count: usize,
     pub pending_message_count: usize,
@@ -665,9 +916,10 @@ pub struct RpcSessionState {
     pub runtime_settings: pi_coding::RuntimeSettingsState,
 }
 impl RpcSessionState {
-    fn from_application(
+    pub(crate) fn from_application(
         s: ApplicationState,
         runtime_settings: pi_coding::RuntimeSettingsState,
+        cwd: &Path,
     ) -> Self {
         Self {
             model: s.model.map(public_model),
@@ -679,6 +931,7 @@ impl RpcSessionState {
             session_file: s.session_file,
             session_id: s.session_id,
             session_name: s.session_name,
+            cwd: cwd.to_string_lossy().into_owned(),
             auto_compaction_enabled: s.auto_compaction_enabled,
             message_count: s.message_count,
             pending_message_count: s.pending_message_count,
@@ -688,6 +941,43 @@ impl RpcSessionState {
         }
     }
 }
+/// One session row of the `session_list` response — the RPC-visible subset of
+/// the resume catalog's `ResumeSelectorRow` (search/message corpora are
+/// internal and never leave the process).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcSessionListRow {
+    pub source: &'static str,
+    pub session_id: String,
+    pub name: Option<String>,
+    pub cwd: String,
+    pub display_time: String,
+    pub modified_epoch: f64,
+    pub summary: String,
+    pub path: String,
+    pub size: u64,
+    pub message_count: Option<usize>,
+    pub status: String,
+}
+
+impl RpcSessionListRow {
+    fn from_resume_row(row: crate::resume_catalog::ResumeSelectorRow) -> Self {
+        Self {
+            source: row.source.label(),
+            session_id: row.session_id,
+            name: row.name,
+            cwd: row.cwd.to_string_lossy().into_owned(),
+            display_time: row.display_time,
+            modified_epoch: row.modified_epoch,
+            summary: row.summary,
+            path: row.path.to_string_lossy().into_owned(),
+            size: row.size,
+            message_count: row.message_count,
+            status: row.status.is_native().then_some("native").unwrap_or("foreign").to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RpcResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -702,7 +992,7 @@ pub struct RpcResponse {
     pub error: Option<String>,
 }
 impl RpcResponse {
-    fn success(id: Option<String>, command: impl Into<String>, data: Option<Value>) -> Self {
+    pub(crate) fn success(id: Option<String>, command: impl Into<String>, data: Option<Value>) -> Self {
         Self {
             id,
             record_type: "response",
@@ -732,8 +1022,29 @@ pub(crate) struct RpcExtensionUiRequest {
     #[serde(rename = "type")]
     record_type: &'static str,
     id: String,
+    /// Owning session of the extension that produced this request; injected
+    /// by the session runtime manager's fan-in forwarder.
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
     #[serde(flatten)]
     request: Value,
+}
+
+impl RpcExtensionUiRequest {
+    /// Error-notice frame for projection/lag failures, tagged with the owning
+    /// session when known.
+    pub(crate) fn error_notice(session_id: Option<String>, message: String) -> Self {
+        Self {
+            record_type: "extension_ui_request",
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            request: json!({
+                "method": "notify",
+                "message": message,
+                "notifyType": "error",
+            }),
+        }
+    }
 }
 #[derive(Clone, Debug)]
 enum JsonlFrame {
@@ -743,7 +1054,12 @@ enum JsonlFrame {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum RpcInput {
-    Command(RpcCommand),
+    Command {
+        command: RpcCommand,
+        /// Optional top-level `sessionId` selecting a runtime on the Web
+        /// control plane. Absent targets the initial runtime.
+        session_id: Option<String>,
+    },
     ExtensionUiResponse(RpcExtensionUiResponse),
 }
 
@@ -753,6 +1069,7 @@ pub(crate) struct RpcDispatcher {
     settings: crate::settings_rpc::SettingsRpcState,
     workflows: crate::workflow_rpc::WorkflowRpcState,
     command_slots: Arc<Semaphore>,
+    side_chat: SideChatRpcState,
 }
 
 impl RpcDispatcher {
@@ -763,6 +1080,7 @@ impl RpcDispatcher {
             workflows: crate::workflow_rpc::WorkflowRpcState::for_application(&application),
             application,
             command_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMANDS)),
+            side_chat: SideChatRpcState::default(),
         }
     }
 
@@ -770,15 +1088,32 @@ impl RpcDispatcher {
         &self.application
     }
 
+    /// Dispatch a command with this dispatcher's full state. Side-chat
+    /// commands live outside the settings/workflows handler because the tabs
+    /// are controller state owned by the RPC session, not by the application.
+    pub(crate) async fn dispatch_inner(&self, command: RpcCommand) -> RpcResponse {
+        if matches!(
+            command,
+            RpcCommand::SideChatNew { .. }
+                | RpcCommand::SideChatSwitch { .. }
+                | RpcCommand::SideChatClose { .. }
+                | RpcCommand::SideChatPrompt { .. }
+                | RpcCommand::SideChatList { .. }
+        ) {
+            return handle_side_chat_command(&self.application, &self.side_chat, command).await;
+        }
+        handle_command(
+            &self.application,
+            &self.settings,
+            &self.workflows,
+            command,
+        )
+        .await
+    }
+
     pub(crate) async fn dispatch(&self, command: RpcCommand) -> RpcResponse {
         if command.bypasses_command_slots() {
-            return handle_command(
-                &self.application,
-                &self.settings,
-                &self.workflows,
-                command,
-            )
-            .await;
+            return self.dispatch_inner(command).await;
         }
         let id = command.id();
         let name = command.command_name();
@@ -789,13 +1124,196 @@ impl RpcDispatcher {
                 format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
             );
         };
-        handle_command(
-            &self.application,
-            &self.settings,
-            &self.workflows,
-            command,
-        )
+        self.dispatch_inner(command).await
+    }
+
+    /// Shut down the RPC-owned side-chat tab container (session close /
+    /// listener shutdown).
+    pub(crate) async fn shutdown_side_chat(&self) {
+        self.side_chat.shutdown().await;
+    }
+
+    /// Whether the RPC-owned side-chat container has a tab currently
+    /// streaming a reply (part of the conservative close busy check).
+    pub(crate) async fn side_chat_busy(&self) -> bool {
+        self.side_chat.is_streaming().await
+    }
+}
+
+/// RPC-owned side-chat controller state.
+///
+/// The `/btw` tabs are TUI-internal controller state (fork + agent + per-tab
+/// transcript), so the RPC session owns a lazily-created [`SideChatTabs`]
+/// container. Every side-chat command serializes through one mutex; prompts
+/// never touch the main session, mirroring the TUI surface exactly.
+#[derive(Clone, Default)]
+pub(crate) struct SideChatRpcState {
+    tabs: Arc<tokio::sync::Mutex<Option<crate::side_chat::SideChatTabs>>>,
+}
+
+impl SideChatRpcState {
+    /// Lock the tab container, lazily creating the legacy `default` tab on
+    /// first use, and run a synchronous closure over it.
+    async fn with_tabs<T>(
+        &self,
+        app: &Application,
+        f: impl FnOnce(&mut crate::side_chat::SideChatTabs) -> Result<T>,
+    ) -> Result<T> {
+        let mut guard = self.lock_tabs(app).await?;
+        f(guard.as_mut().expect("side-chat tabs initialized"))
+    }
+
+    /// Lock the tab container, lazily creating the legacy `default` tab on
+    /// first use. Async callers (fork/close) operate on the guard directly
+    /// and must drop it before re-entering [`SideChatRpcState::snapshot`].
+    async fn lock_tabs(
+        &self,
+        app: &Application,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<crate::side_chat::SideChatTabs>>> {
+        let mut guard = self.tabs.lock().await;
+        if guard.is_none() {
+            *guard = Some(crate::side_chat::SideChatTabs::new_default(app).await?);
+        }
+        Ok(guard)
+    }
+
+    /// Snapshot every tab after draining pending agent events, so a streamed
+    /// reply that finished between polls is reflected immediately.
+    async fn snapshot(&self, app: &Application) -> Result<Value> {
+        self.with_tabs(app, |tabs| {
+            tabs.poll_events();
+            Ok(side_chat_snapshot(tabs))
+        })
         .await
+    }
+
+    /// Shut down every tab's agent/subscription (RPC session exit).
+    async fn shutdown(&self) {
+        let mut guard = self.tabs.lock().await;
+        if let Some(tabs) = guard.as_mut() {
+            tabs.shutdown().await;
+        }
+    }
+
+    /// Whether any tab is currently streaming a reply (close busy check).
+    /// Drain completion events first: the controller's streaming flag is
+    /// event-driven, so inspecting it without polling can leave an idle tab
+    /// permanently classified as busy after its task has finished.
+    async fn is_streaming(&self) -> bool {
+        let mut guard = self.tabs.lock().await;
+        let Some(tabs) = guard.as_mut() else {
+            return false;
+        };
+        tabs.poll_events();
+        tabs.tabs().any(|(_, controller)| controller.is_streaming())
+    }
+}
+
+/// Build the wire snapshot of the whole tab container.
+fn side_chat_snapshot(tabs: &crate::side_chat::SideChatTabs) -> Value {
+    use crate::side_chat::SideChatRole;
+    let tab_values = tabs
+        .tabs()
+        .map(|(name, controller)| {
+            let entries = controller
+                .entries()
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "role": match entry.role {
+                            SideChatRole::User => "user",
+                            SideChatRole::Assistant => "assistant",
+                            SideChatRole::Tool => "tool",
+                            SideChatRole::System => "system",
+                        },
+                        "text": entry.text,
+                        "isError": entry.is_error,
+                        "isPartial": entry.is_partial,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "name": name,
+                "streaming": controller.is_streaming(),
+                "status": controller.status(),
+                "entries": entries,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "active": tabs.active_name(),
+        "maxTabs": crate::side_chat::SideChatTabs::max_tabs(),
+        "tabs": tab_values,
+    })
+}
+
+/// Dispatch a side-chat RPC command against the RPC-owned tab container.
+async fn handle_side_chat_command(
+    app: &Application,
+    side_chat: &SideChatRpcState,
+    c: RpcCommand,
+) -> RpcResponse {
+    let id = c.id();
+    let name = c.command_name();
+    let result: Result<Value> = async {
+        match c {
+            RpcCommand::SideChatList { .. } => side_chat.snapshot(app).await,
+            RpcCommand::SideChatNew { name, .. } => {
+                {
+                    let mut guard = side_chat.lock_tabs(app).await?;
+                    guard
+                        .as_mut()
+                        .expect("side-chat tabs initialized")
+                        .new_tab(app, &name)
+                        .await?;
+                }
+                side_chat.snapshot(app).await
+            }
+            RpcCommand::SideChatSwitch { name, .. } => {
+                side_chat.with_tabs(app, |tabs| tabs.switch_to(&name)).await?;
+                side_chat.snapshot(app).await
+            }
+            RpcCommand::SideChatClose { name, .. } => {
+                let target = match &name {
+                    Some(name) => name.clone(),
+                    None => side_chat
+                        .with_tabs(app, |tabs| Ok(tabs.active_name().to_owned()))
+                        .await?,
+                };
+                {
+                    let mut guard = side_chat.lock_tabs(app).await?;
+                    guard
+                        .as_mut()
+                        .expect("side-chat tabs initialized")
+                        .close_tab(app, &target)
+                        .await?;
+                }
+                side_chat.snapshot(app).await
+            }
+            RpcCommand::SideChatPrompt { message, .. } => {
+                let accepted = side_chat
+                    .with_tabs(app, |tabs| {
+                        if tabs.is_streaming() {
+                            return Ok(false);
+                        }
+                        tabs.submit_prompt(&message);
+                        Ok(true)
+                    })
+                    .await?;
+                let mut snapshot = side_chat.snapshot(app).await?;
+                if let Some(object) = snapshot.as_object_mut() {
+                    object.insert("accepted".to_owned(), json!(accepted));
+                    object.insert("busy".to_owned(), json!(!accepted));
+                }
+                Ok(snapshot)
+            }
+            _ => unreachable!("dispatch_inner only routes side_chat_* commands here"),
+        }
+    }
+    .await;
+    match result {
+        Ok(data) => RpcResponse::success(id, name, Some(data)),
+        Err(e) => RpcResponse::failure(id, name, e.to_string()),
     }
 }
 
@@ -818,6 +1336,19 @@ pub(crate) fn project_application_event(event: ApplicationEvent) -> Result<Value
         ApplicationEvent::Workflow(event) => Ok(serde_json::to_value(
             crate::workflow_rpc::project_workflow_event(&event),
         )?),
+        // The multi-session manager reserves the top-level `sessionId` for the
+        // OWNING/source runtime, so the forked TARGET identity is renamed
+        // `forkedSessionId` in the projected payload.
+        ApplicationEvent::SessionForked(event) => {
+            let mut value = serde_json::to_value(event)?;
+            if let Some(object) = value.as_object_mut() {
+                if let Some(session_id) = object.remove("sessionId") {
+                    object.insert("forkedSessionId".to_owned(), session_id);
+                }
+                object.insert("type".to_owned(), json!("session_forked"));
+            }
+            Ok(value)
+        }
         event => Ok(serde_json::to_value(event)?),
     }
 }
@@ -883,35 +1414,39 @@ where
             line = lines_rx.recv(), if input_open => {
                 match line {
                     Some(JsonlFrame::Line(line)) => match parse_input(&line) {
-                        Ok(RpcInput::Command(command)) if command.runs_inline() => {
-                            let response = handle_command(
-                                &application,
-                                &dispatcher.settings,
-                                &dispatcher.workflows,
-                                command,
-                            ).await;
-                            write_shared_json(&output, &response)?;
-                        }
-                        Ok(RpcInput::Command(command)) if commands.len() >= MAX_CONCURRENT_COMMANDS => {
-                            let response = RpcResponse::failure(
-                                command.id(),
-                                command.command_name(),
-                                format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
-                            );
-                            write_shared_json(&output, &response)?;
-                        }
-                        Ok(RpcInput::Command(command)) => {
-                            let dispatcher = dispatcher.clone();
-                            let output = output.clone();
-                            commands.spawn(async move {
-                                let response = handle_command(
-                                    &dispatcher.application,
-                                    &dispatcher.settings,
-                                    &dispatcher.workflows,
-                                    command,
-                                ).await;
-                                write_shared_json(&output, &response)
-                            });
+                        Ok(RpcInput::Command { command, session_id }) => {
+                            // The stdio RPC transport keeps single-Application
+                            // semantics: sessionId routing exists only on the
+                            // Web control plane manager.
+                            if let Some(session_id) = session_id {
+                                let response = RpcResponse::failure(
+                                    command.id(),
+                                    command.command_name(),
+                                    format!(
+                                        "sessionId is only supported on the Web control plane (unknown session {session_id})"
+                                    ),
+                                );
+                                write_shared_json(&output, &response)?;
+                                continue;
+                            }
+                            if command.runs_inline() {
+                                let response = dispatcher.dispatch_inner(command).await;
+                                write_shared_json(&output, &response)?;
+                            } else if commands.len() >= MAX_CONCURRENT_COMMANDS {
+                                let response = RpcResponse::failure(
+                                    command.id(),
+                                    command.command_name(),
+                                    format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
+                                );
+                                write_shared_json(&output, &response)?;
+                            } else {
+                                let dispatcher = dispatcher.clone();
+                                let output = output.clone();
+                                commands.spawn(async move {
+                                    let response = dispatcher.dispatch_inner(command).await;
+                                    write_shared_json(&output, &response)
+                                });
+                            }
                         }
                         Ok(RpcInput::ExtensionUiResponse(response)) => {
                             if let Err(error) = handle_ui_response(&extension_ui, response) {
@@ -968,6 +1503,7 @@ where
         }
     }
     reader.await.context("joining JSONL reader")??;
+    dispatcher.side_chat.shutdown().await;
     application.cleanup().await;
     Ok(())
 }
@@ -1045,6 +1581,15 @@ fn rpc_command_from_workflow(command: crate::workflow_rpc::WorkflowRpcCommand) -
             workflow_id,
             name,
         },
+        crate::workflow_rpc::WorkflowRpcCommand::WorkflowDetail {
+            id,
+            workflow_id,
+            name,
+        } => RpcCommand::WorkflowDetail {
+            id,
+            workflow_id,
+            name,
+        },
         crate::workflow_rpc::WorkflowRpcCommand::WorkflowPause { id, workflow_id } => {
             RpcCommand::WorkflowPause { id, workflow_id }
         }
@@ -1063,10 +1608,29 @@ fn rpc_command_from_workflow(command: crate::workflow_rpc::WorkflowRpcCommand) -
     }
 }
 pub(crate) fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcResponse> {
-    let value: Value = serde_json::from_slice(line).map_err(|e| {
+    let mut value: Value = serde_json::from_slice(line).map_err(|e| {
         RpcResponse::failure(None, "parse", format!("Failed to parse command: {e}"))
     })?;
     let id = value.get("id").and_then(Value::as_str).map(str::to_owned);
+    // Optional top-level sessionId selects a runtime on the Web control
+    // plane. It is stripped BEFORE command deserialization so no variant
+    // carries it (the workflow commands use deny_unknown_fields schemas).
+    let session_id = match value.get("sessionId") {
+        None => None,
+        Some(Value::String(session_id)) => Some(session_id.clone()),
+        Some(_) => {
+            return Err(RpcResponse::failure(
+                id,
+                "parse",
+                "sessionId must be a string",
+            ))
+        }
+    };
+    if session_id.is_some()
+        && let Some(object) = value.as_object_mut()
+    {
+        object.remove("sessionId");
+    }
     let Some(command) = value.get("type").and_then(Value::as_str).map(str::to_owned) else {
         return Err(RpcResponse::failure(
             id,
@@ -1084,7 +1648,10 @@ pub(crate) fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcRespo
     // Workflow commands use a deny_unknown_fields wire schema.
     if crate::workflow_rpc::WorkflowRpcCommand::is_workflow_type(&command) {
         return match crate::workflow_rpc::parse_workflow_command(value) {
-            Ok(workflow) => Ok(RpcInput::Command(rpc_command_from_workflow(workflow))),
+            Ok(workflow) => Ok(RpcInput::Command {
+                command: rpc_command_from_workflow(workflow),
+                session_id,
+            }),
             Err(error) => Err(RpcResponse::failure(
                 id,
                 command,
@@ -1093,7 +1660,7 @@ pub(crate) fn parse_input(line: &[u8]) -> std::result::Result<RpcInput, RpcRespo
         };
     }
     serde_json::from_value(value)
-        .map(RpcInput::Command)
+        .map(|command| RpcInput::Command { command, session_id })
         .map_err(|e| {
             let message = if e.to_string().starts_with("unknown variant") {
                 format!("Unknown command: {command}")
@@ -1229,10 +1796,39 @@ fn ui_event_request(event: ExtensionUiEvent) -> Result<Option<RpcExtensionUiRequ
             "extensionId": instance.extension_id,
             "generation": instance.generation,
         }),
+        ExtensionUiEvent::OverlayOpenRequested {
+            instance,
+            id,
+            title,
+            rows,
+            non_capturing,
+            input,
+        } => json!({
+            "method": "overlay_open",
+            "overlayId": id,
+            "title": title,
+            "rows": rows,
+            "nonCapturing": non_capturing,
+            "input": input,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
+        ExtensionUiEvent::OverlayRowsChanged {
+            instance,
+            id,
+            rows,
+        } => json!({
+            "method": "overlay_rows_changed",
+            "overlayId": id,
+            "rows": rows,
+            "extensionId": instance.extension_id,
+            "generation": instance.generation,
+        }),
     };
     Ok(Some(RpcExtensionUiRequest {
         record_type: "extension_ui_request",
         id,
+        session_id: None,
         request,
     }))
 }
@@ -1313,10 +1909,27 @@ fn ui_request(id: String, request: pi_coding::ExtensionUiRequest) -> Result<RpcE
         ExtensionUiRequest::SetToolsExpanded { expanded } => {
             json!({ "method": "set_tools_expanded", "expanded": expanded })
         }
+        ExtensionUiRequest::OverlaySetRows { id, rows } => {
+            json!({ "method": "overlay_set_rows", "overlayId": id, "rows": rows })
+        }
+        ExtensionUiRequest::OverlayOpen {
+            id,
+            non_capturing,
+            input,
+            ..
+        } => {
+            json!({
+                "method": "overlay_open",
+                "overlayId": id,
+                "nonCapturing": non_capturing,
+                "input": input,
+            })
+        }
     };
     Ok(RpcExtensionUiRequest {
         record_type: "extension_ui_request",
         id,
+        session_id: None,
         request,
     })
 }
@@ -1359,6 +1972,11 @@ async fn handle_command_inner(
         } => Ok(Some(serde_json::to_value(app.goal_update_usage(
             GoalUsageDelta::new(tokens, active_time_seconds),
         )?)?)),
+        RpcCommand::GoalPin { text, .. } => Ok(Some(serde_json::to_value(app.goal_pin(text)?)?)),
+        RpcCommand::GoalUnpin { index, .. } => {
+            Ok(Some(serde_json::to_value(app.goal_unpin(index)?)?))
+        }
+        RpcCommand::GoalJournal { .. } => Ok(Some(serde_json::to_value(app.goal_journal()?)?)),
         RpcCommand::SettingsInspect { .. } => Ok(Some(serde_json::to_value(
             crate::settings_rpc::SettingsRpcState::inspect(app)
                 .ok_or_else(|| anyhow!("session has no resource manager"))?,
@@ -1422,10 +2040,19 @@ async fn handle_command_inner(
             let outcome = app
                 .new_session_with_parent(parent_session.as_deref().map(Path::new))
                 .await?;
+            if !outcome.cancelled {
+                crate::session_run::rebind_workflows_for_active_session(&app)
+                    .await
+                    .context("rebinding workflow storage after new session")?;
+            }
             Ok(Some(json!({"cancelled":outcome.cancelled})))
         }
         RpcCommand::GetState { .. } => Ok(Some(serde_json::to_value(
-            RpcSessionState::from_application(app.state().await, app.runtime_settings_state()),
+            RpcSessionState::from_application(
+                app.state().await,
+                app.runtime_settings_state(),
+                app.session().cwd(),
+            ),
         )?)),
         RpcCommand::SetModel {
             provider, model_id, ..
@@ -1509,15 +2136,56 @@ async fn handle_command_inner(
             Ok(None)
         }
         RpcCommand::GetSessionStats { .. } => Ok(Some(serde_json::to_value(app.session_stats())?)),
+        RpcCommand::SessionList { .. } => {
+            let session = app.session();
+            let catalog = pi_coding::SessionCatalog::from_env()?
+                .with_native_session_root(session.session_dir());
+            let rows = crate::resume_catalog::load_resume_catalog(
+                &catalog,
+                &crate::resume_catalog::ResumeCatalogRequest {
+                    sources: crate::resume_catalog::effective_resume_sources(app),
+                    cwd_scope: Some(session.cwd().to_path_buf()),
+                    ..crate::resume_catalog::ResumeCatalogRequest::default()
+                },
+            )?;
+            // The catalog reads persisted session files; the live recorder's
+            // name is authoritative and may not have flushed yet (a fresh
+            // session with no assistant turn keeps appends in memory), so
+            // overlay it onto the current session's row.
+            let live_name = session.session_name();
+            let live_id = session.recorder_info().map(|(id, _)| id);
+            let sessions = rows
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let mut row = RpcSessionListRow::from_resume_row(row);
+                    if live_name.is_some() && Some(row.session_id.as_str()) == live_id.as_deref() {
+                        row.name = live_name.clone();
+                    }
+                    row
+                })
+                .collect::<Vec<_>>();
+            Ok(Some(json!({"sessions": sessions})))
+        }
         RpcCommand::ExportHtml { output_path, .. } => Ok(Some(
             json!({"path":app.export_html(output_path.as_deref().map(Path::new))?.to_string_lossy()}),
         )),
         RpcCommand::SwitchSession { session_path, .. } => {
             let outcome = app.switch_session(Path::new(&session_path)).await?;
+            if !outcome.cancelled {
+                crate::session_run::rebind_workflows_for_active_session(&app)
+                    .await
+                    .context("rebinding workflow storage after session switch")?;
+            }
             Ok(Some(json!({"cancelled":outcome.cancelled})))
         }
         RpcCommand::Fork { entry_id, .. } => {
             let outcome = app.fork_session(&entry_id).await?;
+            if !outcome.cancelled {
+                crate::session_run::rebind_workflows_for_active_session(&app)
+                    .await
+                    .context("rebinding workflow storage after session fork")?;
+            }
             Ok(Some(json!({
                 "text": outcome.text,
                 "cancelled": outcome.cancelled,
@@ -1525,6 +2193,11 @@ async fn handle_command_inner(
         }
         RpcCommand::Clone { .. } => {
             let outcome = app.clone_session().await?;
+            if !outcome.cancelled {
+                crate::session_run::rebind_workflows_for_active_session(&app)
+                    .await
+                    .context("rebinding workflow storage after session clone")?;
+            }
             Ok(Some(json!({"cancelled":outcome.cancelled})))
         }
         RpcCommand::GetForkMessages { .. } => Ok(Some(json!({"messages":app.fork_messages()?}))),
@@ -1585,6 +2258,17 @@ async fn handle_command_inner(
                 Some(workflow_id) => app.set_workflow_todos(&pi_coding::WorkflowId::new(workflow_id), phases)?,
                 None => app.set_todos(phases)?,
             };
+            Ok(Some(
+                json!({"phases":result.phases,"completedTasks":result.completed_tasks,"summary":result.summary}),
+            ))
+        }
+        RpcCommand::TodoOp { op, .. } => {
+            // Mirror the per-op todo vocabulary of the agent `todo` tool
+            // (pi_coding::TodoOp) over RPC so web clients can mutate the DAG
+            // atomically (append/done/start/drop/rm/dependencies) instead of
+            // round-tripping the full phase list through set_todos. The
+            // application publishes `todo_updated` for every successful op.
+            let result = app.apply_todo(op)?;
             Ok(Some(
                 json!({"phases":result.phases,"completedTasks":result.completed_tasks,"summary":result.summary}),
             ))
@@ -1689,6 +2373,17 @@ async fn handle_command_inner(
                 name,
             },
         ).await?)),
+        RpcCommand::WorkflowDetail {
+            id,
+            workflow_id,
+            name,
+        } => Ok(Some(workflows.dispatch(
+            crate::workflow_rpc::WorkflowRpcCommand::WorkflowDetail {
+                id,
+                workflow_id,
+                name,
+            },
+        ).await?)),
         RpcCommand::WorkflowPause { id, workflow_id } => Ok(Some(workflows.dispatch(
             crate::workflow_rpc::WorkflowRpcCommand::WorkflowPause { id, workflow_id },
         ).await?)),
@@ -1704,9 +2399,143 @@ async fn handle_command_inner(
         RpcCommand::WorkflowRemove { id, workflow_id } => Ok(Some(workflows.dispatch(
             crate::workflow_rpc::WorkflowRpcCommand::WorkflowRemove { id, workflow_id },
         ).await?)),
+        RpcCommand::SnapCompact { .. } => Ok(Some(serde_json::to_value(
+            app.compact_snap().await?,
+        )?)),
+        RpcCommand::Rewind {
+            index,
+            checkpoint,
+            ..
+        } => {
+            let target = match (index, checkpoint) {
+                (Some(_), Some(_)) => {
+                    bail!("rewind accepts either `index` or `checkpoint`, not both")
+                }
+                (Some(index), None) => pi_coding::RewindTarget::Index(index),
+                (None, Some(checkpoint)) => pi_coding::RewindTarget::Checkpoint(checkpoint),
+                (None, None) => bail!(
+                    "rewind requires an `index` (entry index) or a `checkpoint` name; list rewind targets via get_entries"
+                ),
+            };
+            Ok(Some(serde_json::to_value(app.rewind(target).await?)?))
+        }
+        RpcCommand::Handoff { prose, .. } => {
+            let handoff = if prose {
+                app.generate_handoff_with_prose().await?
+            } else {
+                app.generate_handoff()
+            };
+            Ok(Some(json!({"text": handoff.render(), "prose": prose})))
+        }
+        RpcCommand::QueueList { .. } => {
+            let (steering, follow_up) = app.queued_messages().await;
+            let steering = queued_message_texts(steering);
+            let follow_up = queued_message_texts(follow_up);
+            Ok(Some(json!({
+                "steering": steering,
+                "followUp": follow_up,
+                "total": steering.len() + follow_up.len(),
+            })))
+        }
+        RpcCommand::QueueCancel { .. } => {
+            let (steering, follow_up) = app.drain_queued_messages().await;
+            Ok(Some(json!({"cancelled": steering.len() + follow_up.len()})))
+        }
+        RpcCommand::JobList { .. } => {
+            let Some(runtime) = app.orchestration_runtime() else {
+                return Ok(Some(json!({
+                    "enabled": false,
+                    "jobs": [],
+                    "agents": [],
+                    "messages": [],
+                    "catalog": [],
+                })));
+            };
+            let jobs = runtime.jobs(None);
+            let agents = runtime.list(runtime.main_agent_id());
+            let messages = runtime.delivered_messages();
+            let catalog = runtime
+                .enabled_agents()
+                .into_iter()
+                .map(|agent| {
+                    json!({
+                        "name": agent.name,
+                        "description": agent.description,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(Some(json!({
+                "enabled": true,
+                "jobs": jobs,
+                "agents": agents,
+                "messages": messages,
+                "catalog": catalog,
+            })))
+        }
+        RpcCommand::TaskSpawn { args, .. } => {
+            let runtime = app
+                .orchestration_runtime()
+                .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
+            let parameters: pi_coding::TaskParameters = serde_json::from_value(args)?;
+            let items = parameters.into_items(&runtime)?;
+            let parent = runtime.main_agent_id().to_owned();
+            let spawns = runtime.spawn_tasks(&parent, 0, items)?;
+            Ok(Some(json!({"spawns": spawns})))
+        }
+        RpcCommand::JobCancel { job_ids, .. } => {
+            let runtime = app
+                .orchestration_runtime()
+                .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
+            let cancelled = runtime.cancel_jobs_result(&job_ids)?;
+            Ok(Some(json!({"cancelled": cancelled})))
+        }
+        RpcCommand::HubSend {
+            to, body, reply_to, ..
+        } => {
+            let runtime = app
+                .orchestration_runtime()
+                .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
+            let from = runtime.main_agent_id().to_owned();
+            let receipts = runtime.send(&from, &to, &body, reply_to);
+            Ok(Some(json!({"receipts": receipts})))
+        }
+        RpcCommand::JobOutput { job_id, .. } => {
+            let runtime = app
+                .orchestration_runtime()
+                .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
+            let job = runtime
+                .jobs(Some(std::slice::from_ref(&job_id)))
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no orchestration job with id {job_id:?}"))?;
+            Ok(Some(json!({"job": job})))
+        }
+        // Side-chat commands never reach the settings/workflows handler:
+        // RpcDispatcher::dispatch_inner routes them to
+        // handle_side_chat_command with the RPC-owned tab container.
+        RpcCommand::SideChatNew { .. }
+        | RpcCommand::SideChatSwitch { .. }
+        | RpcCommand::SideChatClose { .. }
+        | RpcCommand::SideChatPrompt { .. }
+        | RpcCommand::SideChatList { .. } => {
+            unreachable!("side_chat_* commands must be routed by dispatch_inner")
+        }
+        // The listen transport intercepts collaboration lifecycle commands;
+        // stdio RPC has no room registry or reachable listener origin.
+        RpcCommand::CollabStart { .. }
+        | RpcCommand::CollabStatus { .. }
+        | RpcCommand::CollabStop { .. } => {
+            bail!("collaboration room commands require the listen control plane")
+        }
+        // The Web control plane's session runtime manager intercepts
+        // close_session before any dispatcher sees it; stdio RPC has one
+        // Application and nothing to close.
+        RpcCommand::CloseSession { .. } => {
+            bail!("close_session is only supported on the Web control plane")
+        }
     }
 }
-fn public_message(message: Message) -> Message {
+pub(crate) fn public_message(message: Message) -> Message {
     let Message::Custom(custom) = message else {
         return message;
     };
@@ -1725,6 +2554,28 @@ fn public_message(message: Message) -> Message {
 fn public_model(mut model: Model) -> Model {
     model.headers = None;
     model
+}
+
+/// Text of queued user prompts for the `/queue` view. Steering and follow-up
+/// messages are always user messages; other message kinds are skipped,
+/// mirroring the TUI's `message_text` projection.
+fn queued_message_texts(messages: Vec<Message>) -> Vec<String> {
+    messages
+        .into_iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(
+                user.content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .collect()
 }
 async fn available_models() -> Result<Vec<Model>> {
     crate::models_config::load_custom_models()?;
@@ -1802,6 +2653,7 @@ fn available_thinking_levels(model: &Model) -> Vec<ThinkingLevel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt as _;
     fn settings_state() -> crate::settings_rpc::SettingsRpcState {
         crate::settings_rpc::SettingsRpcState::default()
     }
@@ -1859,6 +2711,7 @@ mod tests {
             json!({"type":"bash","command":"pwd","excludeFromContext":true}),
             json!({"type":"abort_bash"}),
             json!({"type":"get_session_stats"}),
+            json!({"type":"session_list"}),
             json!({"type":"export_html","outputPath":"o"}),
             json!({"type":"switch_session","sessionPath":"s"}),
             json!({"type":"fork","entryId":"e"}),
@@ -1871,6 +2724,9 @@ mod tests {
             json!({"type":"get_messages"}),
             json!({"type":"get_commands"}),
             json!({"type":"set_todos","workflowId":"wf-1","phases":[]}),
+            json!({"type":"todo_op","op":"append","phase":"Plan","items":["ship it"]}),
+            json!({"type":"todo_op","op":"done","task":"task-x"}),
+            json!({"type":"todo_op","op":"update_dependencies","task":"task-x","dependsOn":["task-y"]}),
             json!({"type":"loop_create","interval":"5m","prompt":"check","fireImmediately":true,"durable":false}),
             json!({"type":"loop_update","taskId":"loop-1","interval":"10m","prompt":"check again"}),
             json!({"type":"loop_list"}),
@@ -1906,17 +2762,38 @@ mod tests {
             json!({"type":"workflow_list"}),
             json!({"type":"workflow_get","workflowId":"wf-1"}),
             json!({"type":"workflow_get","name":"ship"}),
+            json!({"type":"workflow_detail","workflowId":"wf-1"}),
+            json!({"type":"workflow_detail","name":"ship"}),
             json!({"type":"workflow_pause","workflowId":"wf-1"}),
             json!({"type":"workflow_resume","workflowId":"wf-1"}),
             json!({"type":"workflow_cancel","workflowId":"wf-1"}),
             json!({"type":"workflow_integrate","workflowId":"wf-1"}),
             json!({"type":"workflow_remove","workflowId":"wf-1"}),
+            json!({"type":"side_chat_new","name":"research"}),
+            json!({"type":"side_chat_switch","name":"research"}),
+            json!({"type":"side_chat_close"}),
+            json!({"type":"side_chat_close","name":"research"}),
+            json!({"type":"side_chat_prompt","message":"summarize"}),
+            json!({"type":"side_chat_list"}),
+            json!({"type":"snapcompact"}),
+            json!({"type":"rewind","index":4}),
+            json!({"type":"rewind","checkpoint":"milestone"}),
+            json!({"type":"handoff"}),
+            json!({"type":"handoff","prose":true}),
+            json!({"type":"queue_list"}),
+            json!({"type":"queue_cancel"}),
+            json!({"type":"job_list"}),
+            json!({"type":"task_spawn","args":{"task":"inspect source"}}),
+            json!({"type":"task_spawn","args":{"context":"shared","tasks":[{"task":"one"}]}}),
+            json!({"type":"job_cancel","jobIds":["job-1"]}),
+            json!({"type":"hub_send","to":"writer","body":"ping"}),
+            json!({"type":"job_output","jobId":"job-1"}),
         ];
         for f in fixtures {
             assert!(
                 matches!(
                     parse_input(&serde_json::to_vec(&f).unwrap()),
-                    Ok(RpcInput::Command(_))
+                    Ok(RpcInput::Command { .. })
                 ),
                 "{f}"
             );
@@ -1930,7 +2807,7 @@ mod tests {
         )
         .expect("parse command fixture")
         {
-            RpcInput::Command(command) => command,
+            RpcInput::Command { command, .. } => command,
             RpcInput::ExtensionUiResponse(_) => panic!("expected RPC command"),
         };
 
@@ -2027,6 +2904,7 @@ mod tests {
         let e = RpcExtensionUiRequest {
             record_type: "extension_ui_request",
             id: "u".into(),
+            session_id: None,
             request: json!({"method":"confirm"}),
         };
         assert!(serde_json::from_str::<Value>(&serde_json::to_string(&e).unwrap()).is_ok());
@@ -2206,7 +3084,7 @@ mod tests {
         let JsonlFrame::Line(second) = rx.recv().await.unwrap() else {
             panic!()
         };
-        let Ok(RpcInput::Command(c)) = parse_input(&second) else {
+        let Ok(RpcInput::Command { command: c, .. }) = parse_input(&second) else {
             panic!()
         };
         assert_eq!(c.id().as_deref(), Some("ok"));
@@ -2223,7 +3101,7 @@ mod tests {
         let JsonlFrame::Line(first) = rx.recv().await.unwrap() else {
             panic!()
         };
-        let Ok(RpcInput::Command(RpcCommand::SetTodos { phases, .. })) = parse_input(&first) else {
+        let Ok(RpcInput::Command { command: RpcCommand::SetTodos { phases, .. }, .. }) = parse_input(&first) else {
             panic!("first frame must parse to SetTodos")
         };
         assert!(phases.is_empty());
@@ -2255,7 +3133,7 @@ mod tests {
         let Some(JsonlFrame::Line(valid)) = rx.recv().await else {
             panic!()
         };
-        let Ok(RpcInput::Command(command)) = parse_input(&valid) else {
+        let Ok(RpcInput::Command { command, .. }) = parse_input(&valid) else {
             panic!()
         };
         assert_eq!(command.id().as_deref(), Some("after-limit"));
@@ -2284,6 +3162,7 @@ mod tests {
                 depends_on: Vec::new(),
                 ready: true,
                 blocked_by: Vec::new(),
+                agent: None,
             }],
         }];
         let updated = pi_coding::ApplicationEvent::TodoUpdated {
@@ -2393,6 +3272,7 @@ mod tests {
                 enabled: true,
                 reserve_tokens: 20,
                 keep_recent_tokens: 4,
+                snap_keep_turns: 10,
             }),
             stream_options: Default::default(),
             tools: Some(Vec::new()),
@@ -2761,6 +3641,128 @@ mod tests {
         app.cleanup().await;
     }
     #[tokio::test]
+    async fn session_list_rpc_lists_cwd_scoped_native_sessions_and_round_trips_rename() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session_dir = tempfile::tempdir().expect("session dir");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.set_session_dir(session_dir.path().to_path_buf());
+        let recorder = pi_coding::start_session_in(
+            cwd.path(),
+            None,
+            None,
+            Some(session_dir.path()),
+            None,
+            None,
+        )
+        .expect("record session");
+        recorder
+            .record_message(&Message::user_text("hello session list", 1))
+            .expect("record message");
+        recorder.persist_now().expect("persist session");
+        session.record(recorder).expect("attach recorder");
+        let app = Application::new(session).await;
+
+        // A second recorder under a different cwd must be excluded by the
+        // catalog's cwd scope (mirrors the TUI `/sessions` panel).
+        let other_cwd = tempfile::tempdir().expect("other cwd");
+        let other_session_dir = tempfile::tempdir().expect("other session dir");
+        let other = pi_coding::start_session_in(
+            other_cwd.path(),
+            None,
+            None,
+            Some(other_session_dir.path()),
+            None,
+            None,
+        )
+        .expect("other recorder");
+        other
+            .record_message(&Message::user_text("other cwd", 1))
+            .expect("record other");
+        other.persist_now().expect("persist other");
+
+        let state = app.state().await;
+        let session_id = state.session_id.expect("session id");
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::SessionList { id: Some("list".into()) },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.id.as_deref(), Some("list"));
+        assert_eq!(response.command, "session_list");
+        let data = response.data.expect("session list data");
+        let sessions = data["sessions"].as_array().expect("sessions array");
+        let row = sessions
+            .iter()
+            .find(|row| row["sessionId"].as_str() == Some(session_id.as_str()))
+            .expect("current session row");
+        assert_eq!(row["source"], "pi");
+        assert_eq!(row["status"], "native");
+        assert_eq!(row["cwd"], cwd.path().to_string_lossy().as_ref());
+        assert_eq!(row["messageCount"], 1);
+        assert!(row["summary"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(row["modifiedEpoch"].is_f64());
+        assert!(row["displayTime"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(
+            row["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with(".jsonl")),
+            "{row:?}"
+        );
+        assert!(row["name"].is_null());
+        assert!(
+            !sessions
+                .iter()
+                .any(|row| row["cwd"] == other_cwd.path().to_string_lossy().as_ref()),
+            "other-cwd session must be invisible: {sessions:?}"
+        );
+
+        // Rename round-trips into the catalog so the web panel can re-list.
+        let renamed = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::SetSessionName { id: Some("rename".into()), name: "web demo".into() },
+        )
+        .await;
+        assert!(renamed.success, "{renamed:?}");
+        let relisted = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::SessionList { id: Some("list2".into()) },
+        )
+        .await;
+        assert!(relisted.success, "{relisted:?}");
+        let sessions = relisted.data.expect("session list")["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .clone();
+        let renamed_row = sessions
+            .iter()
+            .find(|row| row["sessionId"].as_str() == Some(session_id.as_str()))
+            .expect("renamed row");
+        assert_eq!(renamed_row["name"], "web demo");
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn goal_rpc_mutations_and_malformed_recovery_share_application_state() {
         let app = build_todo_app("faux-rpc-goal", "faux-rpc-goal-api").await;
         let settings = settings_state();
@@ -2822,6 +3824,173 @@ mod tests {
             after_malformed.data.expect("application state")["goal"]["current"]["usage"]["tokensUsed"],
             10
         );
+    }
+
+    #[tokio::test]
+    async fn goal_pin_unpin_and_journal_rpc_replay_recorder_backed_session() {
+        let cwd = tempfile::tempdir().expect("goal journal cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".into(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("goal journal session");
+        let recorder = pi_coding::start_session_in(
+            cwd.path(),
+            None,
+            None,
+            Some(cwd.path()),
+            Some("goal-rpc-journal"),
+            None,
+        )
+        .expect("record goal journal session");
+        session.record(recorder).expect("attach recorder");
+        let app = Application::new(session).await;
+        let settings = settings_state();
+
+        let created = handle_command(
+            &app,
+            &settings,
+            &workflows_state(),
+            RpcCommand::GoalCreate {
+                id: Some("create".into()),
+                objective: "ship cleanly".into(),
+                token_budget: Some(20),
+            },
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+
+        let pinned = handle_command(
+            &app,
+            &settings,
+            &workflows_state(),
+            RpcCommand::GoalPin {
+                id: Some("pin".into()),
+                text: "stay calm".into(),
+            },
+        )
+        .await;
+        assert!(pinned.success, "{pinned:?}");
+        assert_eq!(pinned.data.expect("goal")["pins"][0], "stay calm");
+
+        let malformed = parse_input(br#"{"type":"goal_pin","text":7}"#)
+            .expect_err("malformed goal_pin");
+        assert!(!malformed.success);
+        assert_eq!(malformed.command, "goal_pin");
+
+        let pinned_again = handle_command(
+            &app,
+            &settings,
+            &workflows_state(),
+            RpcCommand::GoalPin {
+                id: Some("pin2".into()),
+                text: "double-check".into(),
+            },
+        )
+        .await;
+        assert!(pinned_again.success, "{pinned_again:?}");
+
+        let unpinned = handle_command(
+            &app,
+            &settings,
+            &workflows_state(),
+            RpcCommand::GoalUnpin {
+                id: Some("unpin".into()),
+                index: 0,
+            },
+        )
+        .await;
+        assert!(unpinned.success, "{unpinned:?}");
+        assert_eq!(unpinned.data.expect("goal")["pins"], json!(["double-check"]));
+
+        let bad_unpin = handle_command(
+            &app,
+            &settings,
+            &workflows_state(),
+            RpcCommand::GoalUnpin {
+                id: Some("bad-unpin".into()),
+                index: 9,
+            },
+        )
+        .await;
+        assert!(!bad_unpin.success, "out-of-range unpin must fail cleanly");
+
+        let paused = handle_command(
+            &app,
+            &settings,
+            &workflows_state(),
+            RpcCommand::GoalPause {
+                id: Some("pause".into()),
+            },
+        )
+        .await;
+        assert!(paused.success, "{paused:?}");
+        assert_eq!(paused.data.expect("goal")["lifecycle"], "paused");
+
+        let journal = handle_command(
+            &app,
+            &settings,
+            &workflows_state(),
+            RpcCommand::GoalJournal {
+                id: Some("journal".into()),
+            },
+        )
+        .await;
+        assert!(journal.success, "{journal:?}");
+        let entries = journal.data.expect("goal journal");
+        let kinds: Vec<&str> = entries
+            .as_array()
+            .expect("journal array")
+            .iter()
+            .map(|entry| entry["kind"]["type"].as_str().expect("kind type"))
+            .collect();
+        assert_eq!(
+            kinds,
+            ["created", "pins_updated", "pins_updated", "pins_updated", "paused"]
+        );
+        assert_eq!(entries[1]["kind"]["pins"], json!(["stay calm"]));
+        assert_eq!(
+            entries[2]["kind"]["pins"],
+            json!(["stay calm", "double-check"])
+        );
+        assert_eq!(entries[3]["kind"]["pins"], json!(["double-check"]));
+        assert_eq!(entries[4]["kind"]["reason"], "manual");
+        // Every journal entry carries the resulting goal snapshot.
+        assert_eq!(entries[4]["goal"]["objective"], "ship cleanly");
+        assert_eq!(entries[4]["goal"]["usage"]["tokensUsed"], 0);
+        assert_eq!(entries[4]["goal"]["pins"], json!(["double-check"]));
+
+        let state = handle_command(
+            &app,
+            &settings,
+            &workflows_state(),
+            RpcCommand::GetState {
+                id: Some("state".into()),
+            },
+        )
+        .await;
+        assert!(state.success);
+        let state_data = state.data.as_ref().expect("state");
+        assert_eq!(
+            state_data["goal"]["current"]["lifecycle"],
+            "paused"
+        );
+        assert_eq!(
+            state_data["goal"]["current"]["pins"],
+            json!(["double-check"])
+        );
+
+        app.cleanup().await;
     }
 
     async fn build_settings_app() -> (tempfile::TempDir, Application) {
@@ -2938,7 +4107,7 @@ mod tests {
         assert_eq!(malformed.command, "settings_set");
         assert!(matches!(
             parse_input(br#"{"type":"settings_inspect","id":"after"}"#),
-            Ok(RpcInput::Command(RpcCommand::SettingsInspect { id })) if id.as_deref() == Some("after")
+            Ok(RpcInput::Command { command: RpcCommand::SettingsInspect { id }, .. }) if id.as_deref() == Some("after")
         ));
     }
 
@@ -2949,8 +4118,8 @@ mod tests {
         let phases = vec![TodoPhase {
             name: "Plan".into(),
             tasks: vec![
-                TodoItem { id: "task-root".into(), content: "root".into(), status: TodoStatus::InProgress, depends_on: Vec::new(), ready: true, blocked_by: Vec::new() },
-                TodoItem { id: "task-do".into(), content: "do".into(), status: TodoStatus::Pending, depends_on: vec!["task-root".into()], ready: false, blocked_by: Vec::new() },
+                TodoItem { id: "task-root".into(), content: "root".into(), status: TodoStatus::InProgress, depends_on: Vec::new(), ready: true, blocked_by: Vec::new(), agent: None },
+                TodoItem { id: "task-do".into(), content: "do".into(), status: TodoStatus::Pending, depends_on: vec!["task-root".into()], ready: false, blocked_by: Vec::new(), agent: None },
             ],
         }];
         let r = handle_command(
@@ -2977,13 +4146,132 @@ mod tests {
         assert_eq!(d["phases"][0]["tasks"][1]["blockedBy"][0]["taskId"], "task-root");
     }
     #[tokio::test]
+    async fn todo_op_rpc_appends_completes_and_reopens_through_application() {
+        let app = build_todo_app("faux-rpc-todo-op", "faux-rpc-todo-op-api").await;
+        let append = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::TodoOp {
+                id: Some("t1".into()),
+                op: pi_coding::TodoOp::Append {
+                    phase: "Plan".into(),
+                    items: vec!["wire task".into()],
+                },
+            },
+        )
+        .await;
+        assert!(append.success, "append must succeed: {:?}", append.error);
+        assert_eq!(append.id.as_deref(), Some("t1"));
+        assert_eq!(append.command, "todo_op");
+        let d = append.data.expect("todo_op returns data");
+        assert_eq!(d["phases"][0]["name"], "Plan");
+        assert_eq!(d["phases"][0]["tasks"][0]["content"], "wire task");
+        assert_eq!(d["phases"][0]["tasks"][0]["status"], "in_progress");
+        let task_id = d["phases"][0]["tasks"][0]["id"]
+            .as_str()
+            .expect("assigned task id")
+            .to_owned();
+        assert!(task_id.starts_with("task-"), "append assigns a task id: {task_id}");
+
+        // Complete by id; the response carries the transition and new status.
+        let done = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::TodoOp {
+                id: Some("t2".into()),
+                op: pi_coding::TodoOp::Done {
+                    task: Some(task_id.clone()),
+                    phase: None,
+                },
+            },
+        )
+        .await;
+        assert!(done.success, "done must succeed: {:?}", done.error);
+        let done_data = done.data.expect("done data");
+        assert_eq!(done_data["phases"][0]["tasks"][0]["status"], "completed");
+        assert_eq!(done_data["completedTasks"][0]["content"], "wire task");
+
+        // Reopen via start (resets to in_progress when unblocked).
+        let reopen = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::TodoOp {
+                id: Some("t3".into()),
+                op: pi_coding::TodoOp::Start {
+                    task: task_id.clone(),
+                },
+            },
+        )
+        .await;
+        assert!(reopen.success, "start must succeed: {:?}", reopen.error);
+        let reopen_data = reopen.data.expect("reopen data");
+        assert_eq!(reopen_data["phases"][0]["tasks"][0]["status"], "in_progress");
+
+        // A blocked start is rejected and the application state is untouched:
+        // append a second task, wire it as a dependency of the first (which is
+        // still in_progress), then try to start it.
+        let other = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::TodoOp {
+                id: Some("t4".into()),
+                op: pi_coding::TodoOp::Append {
+                    phase: "Plan".into(),
+                    items: vec!["dependent".into()],
+                },
+            },
+        )
+        .await;
+        assert!(other.success);
+        let dependent_id = other.data.expect("other data")["phases"][0]["tasks"][1]["id"]
+            .as_str()
+            .expect("dependent id")
+            .to_owned();
+        let link = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::TodoOp {
+                id: Some("t5".into()),
+                op: pi_coding::TodoOp::AddDependency {
+                    task: dependent_id.clone(),
+                    depends_on: vec![task_id],
+                },
+            },
+        )
+        .await;
+        assert!(link.success, "add_dependency must succeed: {:?}", link.error);
+        let blocked = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::TodoOp {
+                id: Some("t6".into()),
+                op: pi_coding::TodoOp::Start { task: dependent_id },
+            },
+        )
+        .await;
+        assert!(!blocked.success, "start on a blocked task must fail");
+        assert!(blocked.error.as_deref().is_some_and(|e| e.contains("blocked")));
+        let state = app.todo_state();
+        assert_eq!(
+            state.phases[0].tasks[1].status,
+            pi_coding::TodoStatus::Pending,
+            "failed op must not mutate application todo state"
+        );
+    }
+    #[tokio::test]
     async fn set_todos_with_workflow_id_fails_without_mutating_parent_when_missing() {
         let app = build_todo_app("faux-rpc-workflow-todo-missing", "faux-rpc-workflow-todo-missing-api").await;
         let phases = vec![pi_coding::TodoPhase {
             name: "Workflow".into(),
             tasks: vec![pi_coding::TodoItem {
                 id: "scoped".into(), content: "scoped".into(), status: pi_coding::TodoStatus::Pending,
-                depends_on: Vec::new(), ready: true, blocked_by: Vec::new(),
+                depends_on: Vec::new(), ready: true, blocked_by: Vec::new(), agent: None,
             }],
         }];
         let response = handle_command(
@@ -3009,6 +4297,7 @@ mod tests {
                 depends_on: Vec::new(),
                 ready: true,
                 blocked_by: Vec::new(),
+                agent: None,
             }],
         }])
         .expect("set_todos");
@@ -3137,6 +4426,186 @@ mod tests {
         for line in lines {
             let _: Value = serde_json::from_str(line).expect("JSON object per LF");
         }
+
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn workflow_rpc_full_lifecycle_dispatches_pause_resume_cancel_and_remove() {
+        let app = build_todo_app("faux-rpc-workflow-lifecycle", "faux-rpc-workflow-lifecycle-api")
+            .await;
+        let settings = settings_state();
+        let workflows = workflows_state();
+        let handle =
+            |command: RpcCommand| handle_command(&app, &settings, &workflows, command);
+
+        // create -> queued
+        let created = handle(RpcCommand::WorkflowCreate {
+            id: Some("lifecycle-create".into()),
+            name: "ship".into(),
+            objective: "land multi-workflow lifecycle".into(),
+        })
+        .await;
+        assert!(created.success, "{created:?}");
+        let workflow_id = created
+            .data
+            .as_ref()
+            .expect("create data")["workflowId"]
+            .as_str()
+            .expect("workflowId")
+            .to_owned();
+
+        // queued -> paused -> resumed (running) -> cancelled -> removed
+        let paused = handle(RpcCommand::WorkflowPause {
+            id: Some("lifecycle-pause".into()),
+            workflow_id: workflow_id.clone(),
+        })
+        .await;
+        assert!(paused.success, "{paused:?}");
+        assert_eq!(paused.data.as_ref().unwrap()["status"], "paused");
+        assert!(
+            paused.data.as_ref().unwrap()["generation"].as_u64().unwrap() >= 2,
+            "pause must bump the generation"
+        );
+
+        let resumed = handle(RpcCommand::WorkflowResume {
+            id: Some("lifecycle-resume".into()),
+            workflow_id: workflow_id.clone(),
+        })
+        .await;
+        assert!(resumed.success, "{resumed:?}");
+        assert_eq!(resumed.data.as_ref().unwrap()["status"], "running");
+
+        // integrate is only legal on terminal/conflicted workflows; on a live
+        // workflow the RPC layer reports the structured failure.
+        let integrate = handle(RpcCommand::WorkflowIntegrate {
+            id: Some("lifecycle-integrate".into()),
+            workflow_id: workflow_id.clone(),
+        })
+        .await;
+        assert!(!integrate.success);
+        assert_eq!(integrate.command, "workflow_integrate");
+        assert_eq!(integrate.id.as_deref(), Some("lifecycle-integrate"));
+        assert!(
+            integrate
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cannot integrate")),
+            "{integrate:?}"
+        );
+
+        let cancelled = handle(RpcCommand::WorkflowCancel {
+            id: Some("lifecycle-cancel".into()),
+            workflow_id: workflow_id.clone(),
+        })
+        .await;
+        assert!(cancelled.success, "{cancelled:?}");
+        assert_eq!(cancelled.data.as_ref().unwrap()["status"], "cancelled");
+
+        let removed = handle(RpcCommand::WorkflowRemove {
+            id: Some("lifecycle-remove".into()),
+            workflow_id: workflow_id.clone(),
+        })
+        .await;
+        assert!(removed.success, "{removed:?}");
+        assert_eq!(removed.data.as_ref().unwrap()["workflowId"], workflow_id);
+
+        let listed = handle(RpcCommand::WorkflowList {
+            id: Some("lifecycle-list".into()),
+        })
+        .await;
+        assert!(listed.success, "{listed:?}");
+        assert!(
+            listed
+                .data
+                .as_ref()
+                .unwrap()["workflows"]
+                .as_array()
+                .expect("workflows array")
+                .is_empty(),
+            "removed workflow must be gone from the list"
+        );
+
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn workflow_detail_dispatches_panel_projection_through_rpc() {
+        let app = build_todo_app("faux-rpc-workflow-detail", "faux-rpc-workflow-detail-api")
+            .await;
+        let settings = settings_state();
+        let workflows = workflows_state();
+
+        let created = handle_command(
+            &app,
+            &settings,
+            &workflows,
+            RpcCommand::WorkflowCreate {
+                id: Some("detail-create".into()),
+                name: "ship".into(),
+                objective: "land the detail projection".into(),
+            },
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        let workflow_id = created
+            .data
+            .as_ref()
+            .expect("create data")["workflowId"]
+            .as_str()
+            .expect("workflowId")
+            .to_owned();
+
+        let detail = handle_command(
+            &app,
+            &settings,
+            &workflows,
+            RpcCommand::WorkflowDetail {
+                id: Some("detail-get".into()),
+                workflow_id: Some(workflow_id.clone()),
+                name: None,
+            },
+        )
+        .await;
+        assert!(detail.success, "{detail:?}");
+        assert_eq!(detail.command, "workflow_detail");
+        let data = detail.data.as_ref().expect("detail data");
+        assert_eq!(data["id"], workflow_id);
+        assert_eq!(data["name"], "ship");
+        assert_eq!(data["objective"], "land the detail projection");
+        assert_eq!(data["status"], "queued");
+        let worktree = data["worktree"]["label"].as_str().expect("worktree label");
+        assert!(
+            !Path::new(worktree).is_absolute(),
+            "worktree must not be absolute: {worktree}"
+        );
+        let encoded = serde_json::to_string(data).unwrap();
+        assert!(
+            !crate::workflow_rpc::wire_json_leaks_absolute_path(&encoded),
+            "absolute path leaked: {encoded}"
+        );
+
+        // A missing selector fails closed with the command name intact.
+        let missing = handle_command(
+            &app,
+            &settings,
+            &workflows,
+            RpcCommand::WorkflowDetail {
+                id: Some("detail-missing".into()),
+                workflow_id: None,
+                name: None,
+            },
+        )
+        .await;
+        assert!(!missing.success, "{missing:?}");
+        assert_eq!(missing.command, "workflow_detail");
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("workflowId or name")),
+            "{missing:?}"
+        );
 
         app.cleanup().await;
     }
@@ -3404,6 +4873,844 @@ mod tests {
             commands.iter().any(|c| c["source"] == "builtin"),
             "expected at least one builtin command in {commands:?}"
         );
+        app.cleanup().await;
+    }
+
+    /// Session whose provider stream replies with a fixed assistant message —
+    /// used for the side-chat round trip (the fork inherits this stream).
+    fn reply_stream(reply: &'static str) -> pi_agent::StreamFn {
+        Arc::new(move |model, _context, _options| {
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(ContentBlock::text(reply));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    async fn build_side_chat_app(model_id: &str) -> Application {
+        let mut model = Model::default();
+        model.id = model_id.into();
+        model.name = model_id.into();
+        model.api = format!("{model_id}-api");
+        model.provider = "faux".into();
+        model.base_url = "http://localhost:0".into();
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model,
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "faux".into(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(reply_stream("side reply")),
+            auth_resolver: None,
+        })
+        .expect("session");
+        Application::new(session).await
+    }
+
+    #[tokio::test]
+    async fn side_chat_rpc_round_trip_creates_prompts_switches_and_closes_tabs() {
+        let app = build_side_chat_app("faux-rpc-side").await;
+        let side_chat = SideChatRpcState::default();
+        let dispatch =
+            |command: RpcCommand| handle_side_chat_command(&app, &side_chat, command);
+
+        let listed = dispatch(RpcCommand::SideChatList {
+            id: Some("list-1".into()),
+        })
+        .await;
+        assert!(listed.success, "{listed:?}");
+        assert_eq!(listed.command, "side_chat_list");
+        let data = listed.data.expect("snapshot");
+        assert_eq!(data["active"], "default", "{data}");
+        assert_eq!(data["tabs"].as_array().expect("tabs").len(), 1);
+
+        let created = dispatch(RpcCommand::SideChatNew {
+            id: Some("new-1".into()),
+            name: "research".into(),
+        })
+        .await;
+        assert!(created.success, "{created:?}");
+        assert_eq!(created.data.expect("snapshot")["active"], "research");
+
+        let prompted = dispatch(RpcCommand::SideChatPrompt {
+            id: Some("prompt-1".into()),
+            message: "side hello".into(),
+        })
+        .await;
+        assert!(prompted.success, "{prompted:?}");
+        let data = prompted.data.expect("snapshot");
+        assert_eq!(data["accepted"], json!(true), "{data}");
+        assert_eq!(data["busy"], json!(false));
+
+        // Poll until the assistant reply lands (the prompt task runs in the
+        // background; snapshots drain controller events before serializing).
+        let mut saw_reply = false;
+        for _ in 0..100 {
+            let listed = dispatch(RpcCommand::SideChatList { id: None }).await;
+            let data = listed.data.expect("snapshot");
+            let active = data["tabs"]
+                .as_array()
+                .expect("tabs")
+                .iter()
+                .find(|tab| tab["name"] == "research")
+                .expect("research tab");
+            if active["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| {
+                    entry["role"] == "assistant"
+                        && entry["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("side reply"))
+                })
+            {
+                saw_reply = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(saw_reply, "side-chat assistant reply must appear in the snapshot");
+
+        // The side transcript must not have leaked into the main session.
+        assert!(
+            app.messages()
+                .iter()
+                .all(|message| !format!("{message:?}").contains("side hello")),
+            "side-chat prompt must never enter the main transcript"
+        );
+
+        let switched = dispatch(RpcCommand::SideChatSwitch {
+            id: None,
+            name: "default".into(),
+        })
+        .await;
+        assert!(switched.success, "{switched:?}");
+        assert_eq!(switched.data.expect("snapshot")["active"], "default");
+
+        let closed = dispatch(RpcCommand::SideChatClose {
+            id: None,
+            name: Some("research".into()),
+        })
+        .await;
+        assert!(closed.success, "{closed:?}");
+        let data = closed.data.expect("snapshot");
+        assert_eq!(data["active"], "default");
+        let names = data["tabs"]
+            .as_array()
+            .expect("tabs")
+            .iter()
+            .map(|tab| tab["name"].as_str().expect("tab name"))
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"research"), "{names:?}");
+
+        side_chat.shutdown().await;
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn side_chat_rpc_rejects_busy_prompt_and_unknown_switch() {
+        let app = build_side_chat_app("faux-rpc-side-busy").await;
+        let side_chat = SideChatRpcState::default();
+        let dispatch =
+            |command: RpcCommand| handle_side_chat_command(&app, &side_chat, command);
+
+        let switched = dispatch(RpcCommand::SideChatSwitch {
+            id: None,
+            name: "nope".into(),
+        })
+        .await;
+        assert!(!switched.success);
+        assert!(switched.error.as_deref().is_some_and(|e| e.contains("nope")));
+
+        let invalid = dispatch(RpcCommand::SideChatNew {
+            id: None,
+            name: "new".into(), // reserved /btw word
+        })
+        .await;
+        assert!(!invalid.success, "{invalid:?}");
+        assert!(invalid
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("reserved")));
+
+        side_chat.shutdown().await;
+        app.cleanup().await;
+    }
+
+    /// Session with dense history so snap compact has something to archive
+    /// (mirrors the pi-coding snap_compact_tests fixture: 12 large turns,
+    /// keep 2, never calls the provider).
+    async fn build_snapcompact_app(model_id: &str) -> Application {
+        let mut model = Model::default();
+        model.id = model_id.into();
+        model.name = model_id.into();
+        model.api = format!("{model_id}-api");
+        model.provider = "faux".into();
+        model.base_url = "http://localhost:0".into();
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model,
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "faux".into(),
+            compaction: Some(pi_coding::CompactionSettings {
+                enabled: true,
+                reserve_tokens: 20,
+                keep_recent_tokens: 4,
+                snap_keep_turns: 2,
+            }),
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(reply_stream("unused snap reply")),
+            auth_resolver: None,
+        })
+        .expect("session");
+        let padding = "x".repeat(200);
+        let mut history = Vec::new();
+        for turn in 0..12 {
+            history.push(Message::user_text(
+                format!("ask number {turn}: {padding}"),
+                turn as i64 * 2,
+            ));
+            let mut assistant = pi_ai::AssistantMessage::pending(&Model::default());
+            assistant.content = vec![ContentBlock::text(format!("answer {turn}: {padding}"))];
+            assistant.stop_reason = pi_ai::StopReason::Stop;
+            assistant.timestamp = turn as i64 * 2 + 1;
+            history.push(Message::Assistant(assistant));
+        }
+        session
+            .load_history(history)
+            .await
+            .expect("load dense history");
+        Application::new(session).await
+    }
+
+    #[tokio::test]
+    async fn snapcompact_rpc_reports_a_to_b_tokens_without_provider() {
+        let app = build_snapcompact_app("faux-rpc-snapcompact").await;
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::SnapCompact {
+                id: Some("snap-1".into()),
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.command, "snapcompact");
+        let data = response.data.expect("compaction result");
+        let before = data["tokensBefore"].as_i64().expect("tokensBefore");
+        let after = data["estimatedTokensAfter"]
+            .as_i64()
+            .expect("estimatedTokensAfter");
+        assert!(
+            after < before,
+            "snapcompact must shrink the context: {before} -> {after}"
+        );
+        assert!(
+            data["firstKeptEntryId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "snapcompact must report the first kept entry: {data}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn rewind_rpc_lists_requires_one_target_and_rolls_back() {
+        let app = build_todo_app("faux-rpc-rewind", "faux-rpc-rewind-api").await;
+        let session_dir = tempfile::tempdir().expect("session dir");
+        let recorder = pi_coding::start_session_in(
+            session_dir.path(),
+            None,
+            None,
+            Some(session_dir.path()),
+            None,
+            None,
+        )
+        .expect("start recorded session");
+        for (index, text) in ["first", "second", "third", "fourth", "fifth"]
+            .iter()
+            .enumerate()
+        {
+            recorder
+                .record_message(&Message::user_text(*text, index as i64))
+                .expect("record message");
+        }
+        recorder.persist_now().expect("persist");
+        app.session().record(recorder).expect("attach recorder");
+
+        let settings = settings_state();
+        let workflows = workflows_state();
+        let handle = |command: RpcCommand| handle_command(&app, &settings, &workflows, command);
+
+        // Bare rewind must refuse and point at get_entries.
+        let bare = handle(RpcCommand::Rewind {
+            id: Some("rewind-bare".into()),
+            index: None,
+            checkpoint: None,
+        })
+        .await;
+        assert!(!bare.success, "{bare:?}");
+        assert!(bare
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("get_entries") && e.contains("index")));
+
+        // Both targets must be rejected.
+        let both = handle(RpcCommand::Rewind {
+            id: Some("rewind-both".into()),
+            index: Some(2),
+            checkpoint: Some("c".into()),
+        })
+        .await;
+        assert!(!both.success);
+
+        // The web flow: list entries via get_entries, then rewind to a target.
+        let entries = handle(RpcCommand::GetEntries {
+            id: Some("entries-1".into()),
+            since: None,
+        })
+        .await;
+        assert!(entries.success, "{entries:?}");
+        let count = entries.data.expect("entries")["entries"]
+            .as_array()
+            .expect("entries array")
+            .len();
+        assert!(count >= 3, "fixture must have history to rewind: {count}");
+
+        let rewinded = handle(RpcCommand::Rewind {
+            id: Some("rewind-1".into()),
+            index: Some(count - 1),
+            checkpoint: None,
+        })
+        .await;
+        assert!(rewinded.success, "{rewinded:?}");
+        let data = rewinded.data.expect("rewind outcome");
+        assert_eq!(data["retainedEntries"], count - 1);
+        assert_eq!(data["droppedEntries"], 1);
+        assert!(
+            data["archivePath"]
+                .as_str()
+                .is_some_and(|path| path.contains(".rewind-")),
+            "{data}"
+        );
+
+        // A checkpoint rewind reports the resolved name.
+        app.set_checkpoint("milestone").expect("checkpoint");
+        let checkpointed = handle(RpcCommand::Rewind {
+            id: Some("rewind-ckpt".into()),
+            index: None,
+            checkpoint: Some("milestone".into()),
+        })
+        .await;
+        assert!(checkpointed.success, "{checkpointed:?}");
+        assert_eq!(checkpointed.data.expect("rewind")["checkpoint"], "milestone");
+
+        // Out-of-range index must fail cleanly.
+        let out_of_range = handle(RpcCommand::Rewind {
+            id: Some("rewind-oob".into()),
+            index: Some(count + 1000),
+            checkpoint: None,
+        })
+        .await;
+        assert!(!out_of_range.success, "{out_of_range:?}");
+
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn handoff_rpc_renders_envelope_without_provider_call() {
+        let app = build_todo_app("faux-rpc-handoff", "faux-rpc-handoff-api").await;
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::Handoff {
+                id: Some("handoff-1".into()),
+                prose: false,
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.command, "handoff");
+        let data = response.data.expect("handoff");
+        assert_eq!(data["prose"], json!(false));
+        assert!(
+            data["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("# Handoff")),
+            "{data}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn queue_rpc_lists_and_cancels_pending_prompts() {
+        let app = build_todo_app("faux-rpc-queue", "faux-rpc-queue-api").await;
+        app.set_steering_mode(QueueMode::All).await;
+        app.set_follow_up_mode(QueueMode::All).await;
+        app.steer("first steer".to_owned(), Vec::new()).await;
+        app.follow_up("second follow".to_owned(), Vec::new()).await;
+
+        let listed = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::QueueList {
+                id: Some("queue-1".into()),
+            },
+        )
+        .await;
+        assert!(listed.success, "{listed:?}");
+        let data = listed.data.expect("queue");
+        assert_eq!(data["total"], 2);
+        assert_eq!(data["steering"][0], "first steer");
+        assert_eq!(data["followUp"][0], "second follow");
+
+        let cancelled = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::QueueCancel {
+                id: Some("queue-2".into()),
+            },
+        )
+        .await;
+        assert!(cancelled.success, "{cancelled:?}");
+        assert_eq!(cancelled.data.expect("cancelled")["cancelled"], 2);
+        let (steering, follow_up) = app.queued_messages().await;
+        assert!(
+            steering.is_empty() && follow_up.is_empty(),
+            "queue must be fully drained after queue_cancel"
+        );
+
+        let empty = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::QueueList {
+                id: Some("queue-3".into()),
+            },
+        )
+        .await;
+        assert!(empty.success, "{empty:?}");
+        assert_eq!(empty.data.expect("queue")["total"], 0);
+        app.cleanup().await;
+    }
+
+    // ------------------------------------------------------------------
+    // D93: Subagents panel RPC — job_list / task_spawn / job_cancel /
+    // hub_send / job_output.
+    // ------------------------------------------------------------------
+
+    /// Session wired to an instantly-settling faux stream (one empty turn).
+    fn subagents_session() -> pi_coding::Session {
+        use pi_ai::{AssistantMessage, AssistantMessageEvent, StopReason};
+        let stream_fn: pi_agent::StreamFn = Arc::new(|model, _context, _options| {
+            async move {
+                let events = pi_ai::new_assistant_message_event_stream();
+                let writer = events.clone();
+                tokio::spawn(async move {
+                    let mut message = AssistantMessage::pending(&model);
+                    message.stop_reason = StopReason::Stop;
+                    writer
+                        .push(AssistantMessageEvent::Done {
+                            reason: StopReason::Stop,
+                            message: message.clone(),
+                        })
+                        .await;
+                    writer.end(Some(message)).await;
+                });
+                events
+            }
+            .boxed()
+        });
+        pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: std::env::current_dir().expect("cwd"),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "subagents".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+        })
+        .expect("subagents session")
+    }
+
+    /// Application with orchestration attached and two trusted agents.
+    async fn subagents_app() -> (tempfile::TempDir, Application) {
+        use pi_coding::{AgentCatalog, AgentDefinition, AgentDefinitionSource, OrchestrationConfig};
+        let root = tempfile::tempdir().expect("tempdir");
+        let agent = |name: &str, description: &str| AgentDefinition { name: name.to_owned(),
+        description: description.to_owned(),
+        system_prompt: "prompt".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None };
+        let factory: pi_coding::ChildSessionFactory = Arc::new(|request| {
+            let stream_fn: pi_agent::StreamFn = Arc::new(|model, _context, _options| {
+                use pi_ai::{AssistantMessage, AssistantMessageEvent, StopReason};
+                async move {
+                    let events = pi_ai::new_assistant_message_event_stream();
+                    let writer = events.clone();
+                    tokio::spawn(async move {
+                        let mut message = AssistantMessage::pending(&model);
+                        message.stop_reason = StopReason::Stop;
+                        writer
+                            .push(AssistantMessageEvent::Done {
+                                reason: StopReason::Stop,
+                                message: message.clone(),
+                            })
+                            .await;
+                        writer.end(Some(message)).await;
+                    });
+                    events
+                }
+                .boxed()
+            });
+            Box::pin(async move {
+                pi_coding::Session::new(pi_coding::SessionOptions {
+                    model: request.model,
+                    cwd: std::env::current_dir().expect("cwd"),
+                    system_prompt: request.system_prompt,
+                    thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
+                    api_key: "subagents-child".to_owned(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(request.orchestration_tools),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(stream_fn),
+                    auth_resolver: None,
+                })
+            })
+        });
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![
+                agent("writer", "Write assigned content"),
+                agent("researcher", "Research and study assigned topics"),
+            ]),
+            root.path(),
+        );
+        config.default_agent = "writer".to_owned();
+        config.parent_model = Model::default();
+        let runtime =
+            pi_coding::OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
+        let application =
+            Application::new_with_orchestration(subagents_session(), runtime).await;
+        (root, application)
+    }
+
+    async fn subagents_handle(
+        app: &Application,
+        command: RpcCommand,
+    ) -> RpcResponse {
+        handle_command(app, &settings_state(), &workflows_state(), command).await
+    }
+
+    #[tokio::test]
+    async fn job_list_reports_disabled_without_orchestration() {
+        let app = build_todo_app("faux-rpc-jobs", "faux-rpc-jobs-api").await;
+        let response = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
+        assert!(response.success, "{response:?}");
+        let data = response.data.expect("job list");
+        assert_eq!(data["enabled"], false);
+        assert_eq!(data["jobs"], json!([]));
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn task_spawn_job_list_cancel_output_and_hub_round_trip() {
+        let (_root, app) = subagents_app().await;
+
+        // job_list before any spawn: enabled with an empty job list and the
+        // agent catalog exposed for the spawn form.
+        let listed = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
+        assert!(listed.success, "{listed:?}");
+        let list_data = listed.data.expect("job list");
+        assert_eq!(list_data["enabled"], true);
+        assert_eq!(list_data["jobs"], json!([]));
+        let catalog = list_data["catalog"]
+            .as_array()
+            .expect("catalog")
+            .iter()
+            .filter_map(|agent| agent.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            catalog.iter().any(|name| *name == "writer"),
+            "catalog must include the writer agent: {catalog:?}"
+        );
+
+        // task_spawn single-spawn wire shape mirrors the `task` tool.
+        let spawned = subagents_handle(
+            &app,
+            RpcCommand::TaskSpawn {
+                id: None,
+                args: json!({"task": "write the release notes", "agent": "writer"}),
+            },
+        )
+        .await;
+        assert!(spawned.success, "{spawned:?}");
+        let spawns = spawned
+            .data
+            .expect("spawns")["spawns"]
+            .as_array()
+            .expect("spawns array")
+            .clone();
+        assert_eq!(spawns.len(), 1);
+        let job_id = spawns[0]["jobId"].as_str().expect("job id").to_owned();
+        let agent_id = spawns[0]["agentId"].as_str().expect("agent id").to_owned();
+        assert!(!job_id.is_empty() && !agent_id.is_empty());
+
+        // job_list now exposes the queued job with its description.
+        let listed_after = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
+        let jobs = listed_after.data.expect("job list")["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .clone();
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0]["id"], json!(job_id));
+        assert_eq!(jobs[0]["agentId"], json!(agent_id));
+        assert_eq!(jobs[0]["agent"], json!("writer"));
+        assert_eq!(jobs[0]["status"], json!("queued"));
+        assert_eq!(jobs[0]["description"], json!("write the release notes"));
+
+        // job_output returns the settled job snapshot (the child run settles
+        // instantly on the faux stream; status may already be completed).
+        let output = subagents_handle(
+            &app,
+            RpcCommand::JobOutput {
+                id: None,
+                job_id: job_id.clone(),
+            },
+        )
+        .await;
+        assert!(output.success, "{output:?}");
+        assert_eq!(output.data.expect("job")["job"]["id"], json!(job_id));
+
+        // Unknown job ids fail structurally with a clear error.
+        let missing = subagents_handle(
+            &app,
+            RpcCommand::JobOutput {
+                id: None,
+                job_id: "no-such-job".to_owned(),
+            },
+        )
+        .await;
+        assert!(!missing.success);
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("no orchestration job")),
+            "{missing:?}"
+        );
+
+        // hub_send delivers to the spawned agent (receipt reports the outcome).
+        let sent = subagents_handle(
+            &app,
+            RpcCommand::HubSend {
+                id: None,
+                to: agent_id.clone(),
+                body: "status report?".to_owned(),
+                reply_to: None,
+            },
+        )
+        .await;
+        assert!(sent.success, "{sent:?}");
+        let receipts = sent.data.expect("receipts")["receipts"]
+            .as_array()
+            .expect("receipts array")
+            .clone();
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        assert_eq!(receipts[0]["to"], json!(agent_id));
+        assert!(
+            receipts[0]["outcome"]
+                .as_str()
+                .is_some_and(|outcome| matches!(outcome, "queued" | "woken" | "revived")),
+            "delivery must succeed: {receipts:?}"
+        );
+
+        // job_cancel cancels by job id. The job settles asynchronously in the
+        // run loop (it may already have completed on the faux stream), so
+        // poll the wire until the snapshot reaches a settled status.
+        let cancelled = subagents_handle(
+            &app,
+            RpcCommand::JobCancel {
+                id: None,
+                job_ids: vec![job_id.clone()],
+            },
+        )
+        .await;
+        assert!(cancelled.success, "{cancelled:?}");
+        let settled = loop {
+            let snapshot = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
+            let jobs = snapshot.data.expect("job list")["jobs"]
+                .as_array()
+                .expect("jobs array")
+                .clone();
+            assert_eq!(jobs.len(), 1, "{jobs:?}");
+            let status = jobs[0]["status"].as_str().unwrap_or("");
+            if matches!(status, "completed" | "failed" | "cancelled") {
+                break jobs[0].clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(settled["id"], json!(job_id));
+        assert!(
+            matches!(settled["status"].as_str(), Some("cancelled" | "completed")),
+            "job must settle to cancelled or completed: {settled:?}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn task_spawn_batch_requires_context_and_rejects_unknown_agents() {
+        let (_root, app) = subagents_app().await;
+
+        // Batch without context is a caller error (mirrors the task tool).
+        let no_context = subagents_handle(
+            &app,
+            RpcCommand::TaskSpawn {
+                id: None,
+                args: json!({"tasks": [{"task": "one"}]}),
+            },
+        )
+        .await;
+        assert!(!no_context.success, "{no_context:?}");
+        assert!(
+            no_context
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("context")),
+            "{no_context:?}"
+        );
+
+        // Batch with context fans out one job per item.
+        let batch = subagents_handle(
+            &app,
+            RpcCommand::TaskSpawn {
+                id: None,
+                args: json!({
+                    "context": "ship the release",
+                    "tasks": [
+                        {"name": "A", "agent": "writer", "task": "draft notes"},
+                        {"name": "B", "agent": "researcher", "task": "verify claims"},
+                    ],
+                }),
+            },
+        )
+        .await;
+        assert!(batch.success, "{batch:?}");
+        let spawns = batch.data.expect("spawns")["spawns"]
+            .as_array()
+            .expect("spawns array")
+            .clone();
+        assert_eq!(spawns.len(), 2, "{spawns:?}");
+        let listed = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
+        let jobs = listed.data.expect("job list")["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .clone();
+        assert_eq!(jobs.len(), 2, "{jobs:?}");
+
+        // Unknown agent names fail the spawn with an actionable error.
+        let unknown = subagents_handle(
+            &app,
+            RpcCommand::TaskSpawn {
+                id: None,
+                args: json!({"task": "inspect", "agent": "ghost"}),
+            },
+        )
+        .await;
+        assert!(!unknown.success, "{unknown:?}");
+        assert!(
+            unknown
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("ghost")),
+            "{unknown:?}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn orchestration_mutations_fail_cleanly_without_runtime() {
+        let app = build_todo_app("faux-rpc-jobs2", "faux-rpc-jobs2-api").await;
+        for (command, needle) in [
+            (
+                RpcCommand::TaskSpawn {
+                    id: None,
+                    args: json!({"task": "x"}),
+                },
+                "orchestration is not enabled",
+            ),
+            (
+                RpcCommand::JobCancel {
+                    id: None,
+                    job_ids: vec!["j".into()],
+                },
+                "orchestration is not enabled",
+            ),
+            (
+                RpcCommand::HubSend {
+                    id: None,
+                    to: "writer".into(),
+                    body: "hi".into(),
+                    reply_to: None,
+                },
+                "orchestration is not enabled",
+            ),
+            (
+                RpcCommand::JobOutput {
+                    id: None,
+                    job_id: "j".into(),
+                },
+                "orchestration is not enabled",
+            ),
+        ] {
+            let response = subagents_handle(&app, command).await;
+            assert!(!response.success, "{response:?}");
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(needle)),
+                "{response:?}"
+            );
+        }
         app.cleanup().await;
     }
 }

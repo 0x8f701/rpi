@@ -16,6 +16,7 @@ fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
         .env("USERPROFILE", agent_dir)
         .env("PI_SKIP_VERSION_CHECK", "1")
         .env_remove("PI_OFFLINE")
+        .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("DEEPSEEK_API_KEY")

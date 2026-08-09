@@ -358,11 +358,33 @@ impl WorkflowManager {
         let mut next = current.clone(); apply_runtime_projection(&mut next, update); next.updated_at_ms = now_ms();
         self.persist_replace(&current, &next)?;
         if current.status != next.status { let _ = self.inner.events.send(WorkflowEvent::StatusChanged { workflow_id: next.workflow_id.clone(), generation: next.generation, status: next.status }); }
-        let _ = self.inner.events.send(WorkflowEvent::Updated { snapshot: next.clone() }); Ok(Some(next))
+        let _ = self.inner.events.send(WorkflowEvent::Updated { snapshot: next.clone() });
+        // Auto-integrate: when the Todo DAG settles into Completed the
+        // workflow merges its worktree back to the source branch through the
+        // same lifecycle path as `/workflow integrate`. Gated so the merge
+        // never re-runs on a repeated Completed projection (e.g. a straggler
+        // event after a manual integrate already applied/conflicted the
+        // worktree) and never runs while Paused (a Paused runtime can never
+        // project a status change, so this projection cannot originate from
+        // one). A merge conflict lands the workflow in Conflicted for manual
+        // resolution, exactly like the manual integrate path.
+        if next.status == WorkflowStatus::Completed
+            && current.status != WorkflowStatus::Completed
+            && next.integration == WorkflowIntegration::None
+        {
+            drop(_operation);
+            return self.lifecycle(id, generation, WorkflowAction::Integrate).await.map(Some);
+        }
+        Ok(Some(next))
     }
+    /// Remove a workflow. Non-terminal workflows are cancelled first; a cancellation
+    /// failure aborts removal and leaves the workflow in place.
     pub async fn remove(&self, id: &WorkflowId, generation: u64) -> Result<WorkflowSnapshot> {
         let gate = self.operation_gate(id); let _operation = gate.lock().await;
-        let snapshot = self.checked(id, generation)?; if !snapshot.status.is_terminal() { bail!("workflow must be terminal before removal"); }
+        let snapshot = self.checked(id, generation)?;
+        let snapshot = if snapshot.status.is_terminal() { snapshot } else {
+            self.lifecycle(id, generation, WorkflowAction::Cancel).await.map_err(|error| anyhow!("workflow could not be cancelled before removal: {error:#}"))?
+        };
         self.inner.factory.remove(&snapshot).await.map_err(|_| anyhow!("workflow runtime removal failed"))?;
         let selection = self.inner.selection_gate.lock();
         let prior_selection = self.inner.state.read().selected.clone();
@@ -405,7 +427,22 @@ impl WorkflowManager {
         let mut next = current.clone(); next.status = update.status; next.todo = update.todo; next.supervisor_agent_id = update.supervisor_agent_id; next.supervisor_job_id = update.supervisor_job_id; next.failure = update.failure; next.integration = update.integration; next.updated_at_ms = now_ms();
         self.persist_replace(&current, &next)?;
         if current.status != next.status { let _ = self.inner.events.send(WorkflowEvent::StatusChanged { workflow_id: next.workflow_id.clone(), generation: next.generation, status: next.status }); }
-        let _ = self.inner.events.send(WorkflowEvent::Updated { snapshot: next.clone() }); Ok(next)
+        let _ = self.inner.events.send(WorkflowEvent::Updated { snapshot: next.clone() });
+        // A Resume that settles the Todo DAG into Completed (the DAG finished
+        // while the workflow was Paused) cannot project that settle through
+        // the Paused record — the runtime projection is rejected — so the
+        // settled-complete state arrives here. Run the same auto-integrate
+        // merge the projection path would have run once the workflow is no
+        // longer Paused. A workflow that already integrated (manual or auto)
+        // carries a recorded integration and is never re-merged.
+        if action == WorkflowAction::Resume
+            && next.status == WorkflowStatus::Completed
+            && next.integration == WorkflowIntegration::None
+        {
+            // Async recursion (see E0733).
+            return Box::pin(self.lifecycle(id, generation, WorkflowAction::Integrate)).await;
+        }
+        Ok(next)
     }
     fn operation_gate(&self, id: &WorkflowId) -> Arc<AsyncMutex<()>> {
         self.inner.reservations.lock().operations.entry(id.clone()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
@@ -466,7 +503,7 @@ impl WorkflowManager {
     const fn take_failpoint(&self, _: WorkflowManagerFailpoint) -> bool { false }
 }
 
-#[derive(Clone, Copy)] enum WorkflowAction { Pause, Resume, Cancel, Integrate }
+#[derive(Clone, Copy, PartialEq, Eq)] enum WorkflowAction { Pause, Resume, Cancel, Integrate }
 impl WorkflowAction {
     const fn factory_error(self) -> &'static str {
         match self {
@@ -478,7 +515,7 @@ impl WorkflowAction {
     }
 }
 fn ensure_allowed(status: WorkflowStatus, action: WorkflowAction) -> Result<()> {
-    let ok = match action { WorkflowAction::Pause => matches!(status, WorkflowStatus::Queued | WorkflowStatus::Planning | WorkflowStatus::Running), WorkflowAction::Resume => status == WorkflowStatus::Paused, WorkflowAction::Cancel => !status.is_terminal(), WorkflowAction::Integrate => matches!(status, WorkflowStatus::Completed | WorkflowStatus::Paused | WorkflowStatus::Conflicted) }; if ok { Ok(()) } else { bail!("workflow lifecycle transition is not allowed") }
+    let ok = match action { WorkflowAction::Pause => matches!(status, WorkflowStatus::Queued | WorkflowStatus::Planning | WorkflowStatus::Running), WorkflowAction::Resume => matches!(status, WorkflowStatus::Paused | WorkflowStatus::Planning | WorkflowStatus::Running), WorkflowAction::Cancel => !status.is_terminal(), WorkflowAction::Integrate => matches!(status, WorkflowStatus::Completed | WorkflowStatus::Paused | WorkflowStatus::Conflicted) }; if ok { Ok(()) } else { bail!("workflow lifecycle transition is not allowed") }
 }
 fn validate_status(action: WorkflowAction, status: WorkflowStatus) -> Result<()> {
     let ok = match action { WorkflowAction::Pause => status == WorkflowStatus::Paused, WorkflowAction::Resume => matches!(status, WorkflowStatus::Planning | WorkflowStatus::Running | WorkflowStatus::Completed | WorkflowStatus::Failed), WorkflowAction::Cancel => status == WorkflowStatus::Cancelled, WorkflowAction::Integrate => matches!(status, WorkflowStatus::Completed | WorkflowStatus::Conflicted | WorkflowStatus::Failed) }; if ok { Ok(()) } else { bail!("workflow runtime returned an invalid lifecycle status") }
@@ -530,6 +567,7 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()), failures: Mutex::new(HashMap::new()), pause_started: Notify::new(), pause_release: Notify::new(),
                 block_pause: AtomicUsize::new(0), projection_sink: Mutex::new(None), create_projection: Mutex::new(Vec::new()),
+                integrate_outcome: Mutex::new(None), resume_outcome: Mutex::new(None),
             }
         }
     }
@@ -542,6 +580,10 @@ mod tests {
         block_pause: AtomicUsize,
         projection_sink: Mutex<Option<WorkflowRuntimeProjectionSink>>,
         create_projection: Mutex<Vec<WorkflowRuntimeUpdate>>,
+        /// Overrides the status the fake integrate returns (default: Conflicted).
+        integrate_outcome: Mutex<Option<WorkflowStatus>>,
+        /// Overrides the status the fake resume returns (default: Running).
+        resume_outcome: Mutex<Option<WorkflowStatus>>,
     }
     impl FakeFactory {
         fn identity() -> WorkflowRuntimeIdentity {
@@ -591,15 +633,22 @@ mod tests {
             Ok(Self::update(WorkflowStatus::Paused))
         }
         async fn resume(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
-            self.record(FactoryCall::Resume, &snapshot.workflow_id)?; Ok(Self::update(WorkflowStatus::Running))
+            self.record(FactoryCall::Resume, &snapshot.workflow_id)?;
+            let status = self.resume_outcome.lock().unwrap_or(WorkflowStatus::Running);
+            Ok(Self::update(status))
         }
         async fn cancel(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
             self.record(FactoryCall::Cancel, &snapshot.workflow_id)?; Ok(Self::update(WorkflowStatus::Cancelled))
         }
         async fn integrate(&self, snapshot: &WorkflowSnapshot) -> Result<WorkflowRuntimeUpdate> {
             self.record(FactoryCall::Integrate, &snapshot.workflow_id)?;
-            let mut update = Self::update(WorkflowStatus::Conflicted);
-            update.integration = WorkflowIntegration::Conflicted { conflicts: vec!["private/path".to_owned()] };
+            let status = self.integrate_outcome.lock().unwrap_or(WorkflowStatus::Conflicted);
+            let mut update = Self::update(status);
+            update.integration = match status {
+                WorkflowStatus::Completed => WorkflowIntegration::Applied { result_commit: "private-result-commit".to_owned() },
+                WorkflowStatus::Conflicted => WorkflowIntegration::Conflicted { conflicts: vec!["private/path".to_owned()] },
+                _ => WorkflowIntegration::None,
+            };
             Ok(update)
         }
         async fn remove(&self, snapshot: &WorkflowSnapshot) -> Result<()> { self.record(FactoryCall::Remove, &snapshot.workflow_id) }
@@ -662,6 +711,49 @@ mod tests {
         assert_eq!(error.to_string(), "workflow removal could not be committed"); assert_eq!(factory.count(FactoryCall::Restore), 1);
         assert_eq!(manager.get(&snapshot.workflow_id).expect("memory restored"), snapshot); assert_eq!(manager.selected(), Some(snapshot.clone()));
         let reopened = reload(&directory, factory); assert_eq!(reopened.get(&snapshot.workflow_id).expect("record restored"), snapshot); assert_eq!(reopened.selected(), Some(snapshot));
+    }
+
+    #[tokio::test]
+    async fn remove_non_terminal_auto_cancels_then_removes() {
+        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "auto-cancel").await;
+        let planning = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Planning)).await.expect("project planning").expect("existing snapshot");
+        assert_eq!(planning.status, WorkflowStatus::Planning);
+        let removed = manager.remove(&planning.workflow_id, planning.generation).await.expect("remove auto-cancels");
+        assert_eq!(removed.status, WorkflowStatus::Cancelled);
+        assert_eq!(factory.calls.lock().clone(), vec![
+            (FactoryCall::Create, planning.workflow_id.clone()),
+            (FactoryCall::Cancel, planning.workflow_id.clone()),
+            (FactoryCall::Remove, planning.workflow_id.clone()),
+        ]);
+        assert!(manager.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_terminal_skips_cancel() {
+        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
+        let snapshot = cancelled(&manager, "terminal-remove").await;
+        let removed = manager.remove(&snapshot.workflow_id, snapshot.generation).await.expect("remove terminal");
+        assert_eq!(removed, snapshot);
+        assert_eq!(factory.calls.lock().clone(), vec![
+            (FactoryCall::Create, snapshot.workflow_id.clone()),
+            (FactoryCall::Cancel, snapshot.workflow_id.clone()),
+            (FactoryCall::Remove, snapshot.workflow_id.clone()),
+        ]);
+        assert!(manager.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_non_terminal_cancel_failure_is_actionable() {
+        let secret = "private cancellation failure /secret/path";
+        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "cancel-failure").await;
+        factory.fail(FactoryCall::Cancel, secret);
+        let error = manager.remove(&snapshot.workflow_id, snapshot.generation).await.expect_err("cancel failure must surface");
+        assert_eq!(error.to_string(), "workflow could not be cancelled before removal: workflow runtime cancellation failed");
+        assert!(!error.to_string().contains(secret));
+        assert_eq!(factory.count(FactoryCall::Remove), 0);
+        assert_eq!(manager.get(&snapshot.workflow_id).expect("workflow remains"), snapshot);
     }
 
     #[tokio::test]
@@ -755,9 +847,67 @@ mod tests {
         let factory = Arc::new(FakeFactory::default()); let (directory, manager) = manager(factory.clone()); let snapshot = created(&manager, "projection").await; let mut events = manager.subscribe();
         let running = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Running)).await.expect("project running").expect("existing snapshot"); assert_eq!(running.status, WorkflowStatus::Running);
         assert!(matches!(events.recv().await.expect("status"), WorkflowEvent::StatusChanged { status: WorkflowStatus::Running, .. })); assert!(matches!(events.recv().await.expect("updated"), WorkflowEvent::Updated { snapshot } if snapshot.status == WorkflowStatus::Running));
-        let completed = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Completed)).await.expect("project completed").expect("existing snapshot"); assert_eq!(reload(&directory, factory).get(&snapshot.workflow_id).expect("durable projection"), completed);
+        let completed = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Completed)).await.expect("project completed").expect("existing snapshot");
+        // The settled DAG auto-integrates through the same lifecycle as
+        // `/workflow integrate`: the fake runtime merge conflicts, so the
+        // workflow lands Conflicted with the merge recorded.
+        assert_eq!(completed.status, WorkflowStatus::Conflicted);
+        assert!(matches!(&completed.integration, WorkflowIntegration::Conflicted { conflicts } if conflicts.as_slice() == ["private/path"]));
+        assert_eq!(factory.count(FactoryCall::Integrate), 1);
+        assert!(matches!(events.recv().await.expect("status"), WorkflowEvent::StatusChanged { status: WorkflowStatus::Completed, .. }));
+        assert!(matches!(events.recv().await.expect("updated"), WorkflowEvent::Updated { snapshot } if snapshot.status == WorkflowStatus::Completed && snapshot.integration == WorkflowIntegration::None));
+        assert!(matches!(events.recv().await.expect("status"), WorkflowEvent::StatusChanged { status: WorkflowStatus::Conflicted, .. }));
+        assert!(matches!(events.recv().await.expect("updated"), WorkflowEvent::Updated { snapshot } if snapshot.status == WorkflowStatus::Conflicted));
+        assert_eq!(reload(&directory, factory).get(&snapshot.workflow_id).expect("durable projection"), completed);
         assert_eq!(manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation + 1, FakeFactory::update(WorkflowStatus::Completed)).await.expect_err("stale").to_string(), "workflow generation is stale");
         assert_eq!(manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Running)).await.expect_err("terminal regression").to_string(), "workflow runtime projection is invalid");
+    }
+    #[tokio::test]
+    async fn dag_settle_auto_integrates_once_and_repeat_completed_is_noop() {
+        let factory = Arc::new(FakeFactory::default());
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "auto-integrate-once").await;
+        manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Running)).await.expect("project running").expect("existing snapshot");
+        let integrated = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Completed)).await.expect("project completed").expect("existing snapshot");
+        assert_eq!(integrated.status, WorkflowStatus::Completed);
+        assert!(matches!(integrated.integration, WorkflowIntegration::Applied { ref result_commit } if result_commit == "private-result-commit"));
+        assert_eq!(factory.count(FactoryCall::Integrate), 1);
+        // A repeated Completed projection (e.g. a straggler event after the
+        // merge applied) never re-runs the merge.
+        let again = manager.project_runtime_update(&snapshot.workflow_id, snapshot.generation, FakeFactory::update(WorkflowStatus::Completed)).await.expect("repeat completed").expect("existing snapshot");
+        assert_eq!(again.status, WorkflowStatus::Completed);
+        assert!(matches!(again.integration, WorkflowIntegration::Applied { .. }));
+        assert_eq!(factory.count(FactoryCall::Integrate), 1);
+    }
+    #[tokio::test]
+    async fn paused_workflow_projection_cannot_settle_or_auto_integrate() {
+        let factory = Arc::new(FakeFactory::default()); let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "paused-settle").await;
+        let paused = manager.pause(&snapshot.workflow_id, snapshot.generation).await.expect("pause");
+        assert_eq!(paused.status, WorkflowStatus::Paused);
+        // A Paused runtime never projects a status change; even a forged
+        // Completed projection is rejected, so the merge can never run while
+        // the workflow is paused.
+        let error = manager.project_runtime_update(&paused.workflow_id, paused.generation, FakeFactory::update(WorkflowStatus::Completed)).await.expect_err("paused settle must be rejected");
+        assert_eq!(error.to_string(), "workflow runtime projection is invalid");
+        assert_eq!(factory.count(FactoryCall::Integrate), 0);
+        assert_eq!(manager.get(&paused.workflow_id).expect("paused record").status, WorkflowStatus::Paused);
+    }
+    #[tokio::test]
+    async fn resume_settling_completed_dag_auto_integrates() {
+        let factory = Arc::new(FakeFactory::default());
+        *factory.integrate_outcome.lock() = Some(WorkflowStatus::Completed);
+        *factory.resume_outcome.lock() = Some(WorkflowStatus::Completed);
+        let (_directory, manager) = manager(factory.clone());
+        let snapshot = created(&manager, "resume-settle").await;
+        let paused = manager.pause(&snapshot.workflow_id, snapshot.generation).await.expect("pause");
+        // The DAG settles while paused; resume returns Completed and the
+        // manager auto-integrates through the same lifecycle path.
+        let integrated = manager.resume(&paused.workflow_id, paused.generation).await.expect("resume settle");
+        assert_eq!(integrated.status, WorkflowStatus::Completed);
+        assert!(matches!(integrated.integration, WorkflowIntegration::Applied { .. }));
+        assert_eq!(factory.count(FactoryCall::Integrate), 1);
     }
     #[tokio::test]
     async fn create_folds_latest_synchronous_projection_without_deadlock() {

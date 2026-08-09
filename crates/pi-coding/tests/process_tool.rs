@@ -12,7 +12,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use pi_agent::{AbortController, AgentTool, AgentToolResult, ToolCallContext, ToolUpdateFn};
 use pi_ai::ContentBlock;
-use pi_coding::{ProcessManager, ProcessManagerConfig, ProcessOwnerId, process_tool};
+use pi_coding::{ProcessManager, ProcessManagerConfig, ProcessOwnerId, ProcessState, process_tool};
 use serde_json::{Value, json};
 
 fn noop_update() -> ToolUpdateFn {
@@ -548,6 +548,55 @@ async fn process_tool_pre_abort_does_not_spawn() {
         manager.list(&owner).is_empty(),
         "pre-aborted start must not leave a running process"
     );
+}
+
+#[tokio::test]
+async fn process_tool_aborted_wait_bails_without_killing_supervised_process() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = fixture_manager();
+    let owner = ProcessOwnerId::new("abort-wait-owner");
+    let tool = process_tool(directory.path(), manager.clone(), owner.clone());
+
+    let started = call(
+        &tool,
+        json!({
+            "op": "start",
+            "argv": ["/bin/sh", "-c", "sleep 30"],
+            "pty": false,
+        }),
+    )
+    .await;
+    let id = process_id(&started.details);
+
+    // Task interrupt while the agent is blocked in `process wait`: the tool
+    // call observes the abort signal (Application::abort → agent.abort) and
+    // must return "Operation aborted" WITHOUT signalling the supervised child.
+    let error = (tool.execute)(make_aborted_ctx(json!({
+        "op": "wait",
+        "id": id,
+        "timeoutMs": 10_000,
+    })))
+    .await
+    .expect_err("aborted wait must return immediately")
+    .to_string();
+    assert_eq!(error, "Operation aborted");
+
+    let listed = manager.list(&owner);
+    assert_eq!(listed.len(), 1, "aborted wait must keep the process listed");
+    assert_eq!(listed[0].state, ProcessState::Running);
+    let pid = listed[0].pid.expect("managed pid") as i32;
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+        .expect("supervised process must survive an aborted in-flight wait");
+
+    // Only an explicit stop terminates it.
+    let _ = call(&tool, json!({ "op": "stop", "id": id, "timeoutMs": 3000 })).await;
+    for _ in 0..100 {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("supervised process survived an explicit stop");
 }
 
 #[tokio::test]

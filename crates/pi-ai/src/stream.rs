@@ -1,7 +1,9 @@
 use crate::{
-    AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Context, Model,
-    SimpleStreamOptions, StopReason, StreamOptions, new_assistant_message_event_stream,
+    AiError, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Context,
+    ImageGenerationOptions, ImageGenerationResult, Model, SimpleStreamOptions, StopReason,
+    StreamOptions, new_assistant_message_event_stream,
 };
+use anyhow::anyhow;
 use std::collections::HashMap;
 
 pub const ANTHROPIC_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
@@ -62,7 +64,33 @@ pub async fn complete_simple(
     stream_simple(model, context, options).await.result().await
 }
 
-/// Prefer an explicit non-empty option key; otherwise resolve from env.
+/// Generates images through the provider registered for `model.api`
+/// (`imagegen` or `openrouter-images` route to the OpenAI-compatible
+/// `images/generations` client). Base URL and auth resolve exactly like
+/// streaming: the model's `base_url` (optionally overridden by
+/// `options.base_url`) and the caller-supplied api key, falling back to env.
+/// The model must route to a provider with an image-generation capability;
+/// chat-only providers error clearly.
+pub async fn generate_image(
+    model: Model,
+    mut options: ImageGenerationOptions,
+) -> anyhow::Result<ImageGenerationResult> {
+    crate::providers::register_builtins();
+    if options.api_key.as_ref().is_none_or(|k| k.trim().is_empty()) {
+        options.api_key = get_env_api_key(&model.provider, Some(&options.env));
+    }
+    match crate::get_api_provider(&model.api) {
+        Some(provider) => match provider.generate_image {
+            Some(generate) => generate(model, options).await,
+            None => Err(anyhow!(
+                "API {} does not support image generation",
+                model.api
+            )),
+        },
+        None => Err(AiError::UnknownApi(model.api).into()),
+    }
+}
+
 fn resolve_api_key(model: &Model, options: &mut StreamOptions) {
     if options.api_key.as_ref().is_none_or(|k| k.trim().is_empty()) {
         options.api_key = get_env_api_key(&model.provider, Some(&options.env));
@@ -102,7 +130,7 @@ fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "cerebras" => &["CEREBRAS_API_KEY"],
         "xai" => &["XAI_API_KEY"],
         "radius" => &["RADIUS_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
+        "openrouter" | "openrouter-images" => &["OPENROUTER_API_KEY"],
         "vercel-ai-gateway" => &["AI_GATEWAY_API_KEY"],
         "zai" => &["ZAI_API_KEY"],
         "zai-coding-cn" => &["ZAI_CODING_CN_API_KEY"],
@@ -190,7 +218,7 @@ pub fn get_env_api_key(provider: &str, env: Option<&HashMap<String, String>>) ->
     None
 }
 
-async fn error_stream(model: &Model, message: String) -> AssistantMessageEventStream {
+pub(crate) async fn error_stream(model: &Model, message: String) -> AssistantMessageEventStream {
     let s = new_assistant_message_event_stream();
     let mut m = AssistantMessage::pending(model);
     m.stop_reason = StopReason::Error;

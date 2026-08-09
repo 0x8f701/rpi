@@ -1,8 +1,8 @@
-// Empirical performance measurements for the process-hosted bun extension path.
-// Run: PI_BUN_EXECUTABLE=<bun-path> cargo test -p pi-coding --release --test extension_perf -- --nocapture
+// Empirical performance measurements for the in-process QuickJS extension
+// path. Run: cargo test -p pi-coding --release --test extension_perf -- --nocapture
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use pi_coding::extensions::{
@@ -21,19 +21,6 @@ const N_TOOL: usize = 2000;
 const N_STARTUP_EXTENSIONS: usize = 5;
 const N_EVENT: usize = 2000;
 
-fn bun_executable() -> Option<PathBuf> {
-    if let Some(configured) = std::env::var_os("PI_BUN_EXECUTABLE") {
-        let configured = PathBuf::from(configured);
-        if configured.is_file() {
-            return Some(configured);
-        }
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join(if cfg!(windows) { "bun.exe" } else { "bun" }))
-        .find(|candidate| candidate.is_file())
-}
-
 fn options() -> ExtensionRuntimeOptions {
     ExtensionRuntimeOptions {
         mode: ExtensionMode::Tui,
@@ -47,11 +34,11 @@ fn options() -> ExtensionRuntimeOptions {
     }
 }
 
-fn bun_spec(bun: &Path) -> ExtensionSpec {
-    let entry = PathBuf::from(FIXTURES).join("perf-bench.ts");
-    let mut spec = ExtensionSpec::new_runtime(
+fn quickjs_spec() -> ExtensionSpec {
+    let entry = PathBuf::from(FIXTURES).join("quickjs-perf-bench.mjs");
+    ExtensionSpec::new_runtime(
         "perf-bench",
-        ExtensionSpecRuntime::Bun { entry },
+        ExtensionSpecRuntime::QuickJs { entry },
         PathBuf::from(FIXTURES),
         ExtensionOrigin::Project,
         true,
@@ -63,12 +50,7 @@ fn bun_spec(bun: &Path) -> ExtensionSpec {
             ]),
             ui_capabilities: BTreeSet::new(),
         },
-    );
-    spec.environment.insert(
-        "PI_BUN_EXECUTABLE".to_owned(),
-        bun.to_string_lossy().into_owned(),
-    );
-    spec
+    )
 }
 
 fn percentile(mut samples: Vec<f64>, p: f64) -> f64 {
@@ -78,25 +60,20 @@ fn percentile(mut samples: Vec<f64>, p: f64) -> f64 {
 }
 
 #[tokio::test]
-async fn perf_bun_extension_paths() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(bun) = bun_executable() else {
-        eprintln!("bun not found; skipping");
-        return Ok(());
-    };
-
-    // --- 1. load (spawn + handshake + load + initialize) ---
+async fn perf_quickjs_extension_paths() -> Result<(), Box<dyn std::error::Error>> {
+    // --- 1. load (runtime + context + bootstrap + load + initialize) ---
     let mut load_times: Vec<f64> = Vec::new();
     for _ in 0..N_LOAD {
         let runtime = ExtensionRuntime::process(None, options());
         let start = Instant::now();
-        let report = runtime.load(vec![bun_spec(&bun)]).await;
+        let report = runtime.load(vec![quickjs_spec()]).await;
         let elapsed = start.elapsed();
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         load_times.push(elapsed.as_secs_f64() * 1000.0);
         runtime.shutdown().await;
     }
     eprintln!(
-        "load(spawn+handshake+load+init): n={} avg={:.2}ms min={:.2}ms max={:.2}ms",
+        "load(runtime+bootstrap+load+init): n={} avg={:.2}ms min={:.2}ms max={:.2}ms",
         load_times.len(),
         load_times.iter().sum::<f64>() / load_times.len() as f64,
         load_times.iter().cloned().fold(f64::INFINITY, f64::min),
@@ -105,7 +82,7 @@ async fn perf_bun_extension_paths() -> Result<(), Box<dyn std::error::Error>> {
 
     let startup_specs = (0..N_STARTUP_EXTENSIONS)
         .map(|index| {
-            let mut spec = bun_spec(&bun);
+            let mut spec = quickjs_spec();
             spec.id = format!("perf-bench-{index}");
             spec
         })
@@ -123,7 +100,7 @@ async fn perf_bun_extension_paths() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- steady-state runtime for invoke benchmarks ---
     let runtime = ExtensionRuntime::process(None, options());
-    let report = runtime.load(vec![bun_spec(&bun)]).await;
+    let report = runtime.load(vec![quickjs_spec()]).await;
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     // --- 2. command invocation round trip ---

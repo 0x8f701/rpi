@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use anyhow::Result;
 use pi_ai::{
@@ -357,6 +357,149 @@ impl AgentTool {
             description: self.description.clone(),
             parameters: self.parameters.clone(),
             constrained_sampling: self.constrained_sampling.clone(),
+        }
+    }
+}
+
+/// Executor for the interactive `ask` tool: given the parsed `question`,
+/// performs the user round trip (publish the prompt, await the answer) and
+/// returns the tool result. The `abort` signal fires when the surrounding run
+/// is cancelled, so the round trip must observe it instead of hanging. Hosts
+/// wire the actual UI; a non-interactive host must surface an actionable
+/// error from the executor.
+pub type AskToolExecutorFn =
+    Arc<dyn Fn(String, AbortSignal) -> BoxFuture<Result<AgentToolResult>> + Send + Sync>;
+
+/// The JSON schema for the interactive `ask` tool: a single required
+/// `question` string property.
+#[must_use]
+pub fn ask_tool_schema() -> Schema {
+    Schema {
+        schema_type: Some(serde_json::json!("object")),
+        properties: HashMap::from([(
+            "question".to_owned(),
+            Schema {
+                schema_type: Some(serde_json::json!("string")),
+                description: Some(
+                    "The question to ask the user; answer is returned verbatim as the tool result"
+                        .to_owned(),
+                ),
+                ..Schema::default()
+            },
+        )]),
+        property_order: vec!["question".to_owned()],
+        required: vec!["question".to_owned()],
+        additional_properties: Some(Value::Bool(false)),
+        ..Schema::default()
+    }
+}
+
+/// The interactive `ask` tool: lets the model ask the user a question mid-task
+/// and receives the typed answer as the tool result. Marked `Read` capability
+/// because the tool reads user input — it must never itself trigger the
+/// approval dialog. The user round trip is delegated to `executor` so hosts
+/// can wire their own frontend (interactive TUI prompt, test harness, ...).
+#[must_use]
+pub fn create_ask_tool(executor: AskToolExecutorFn) -> AgentTool {
+    AgentTool::new(
+        "ask",
+        "Ask the user a question and wait for their answer. Use sparingly to confirm ambiguous requirements, choices, or risky actions the user should decide on before you proceed.",
+        ask_tool_schema(),
+        move |context: ToolCallContext| {
+            let executor = executor.clone();
+            async move {
+                let question = context
+                    .arguments
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Invalid question: ask requires a string `question` argument")
+                    })?;
+                executor(question, context.abort).await
+            }
+        },
+    )
+    .with_capability(ToolCapability::Read)
+    .with_prompt_guidelines(vec![
+        "Use ask only when the user's decision materially changes the next step; \
+         prefer proceeding with a documented assumption when the question is trivial."
+            .to_owned(),
+        "Ask one focused question per call; the answer arrives as plain text."
+            .to_owned(),
+    ])
+}
+
+#[cfg(test)]
+mod ask_tool_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::AbortController;
+
+    #[test]
+    fn ask_tool_schema_requires_single_question_string() {
+        let schema = ask_tool_schema();
+        assert_eq!(schema.schema_type, Some(serde_json::json!("object")));
+        assert_eq!(schema.required, vec!["question".to_owned()]);
+        assert_eq!(schema.property_order, vec!["question".to_owned()]);
+        assert_eq!(schema.properties.len(), 1);
+        let question = schema.properties.get("question").expect("question property");
+        assert_eq!(question.schema_type, Some(serde_json::json!("string")));
+        assert!(question.description.is_some());
+    }
+
+    #[tokio::test]
+    async fn ask_tool_routes_question_to_executor_and_returns_answer() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_abort = observed.clone();
+        let tool = create_ask_tool(Arc::new(move |question, abort| {
+            let observed = observed_abort.clone();
+            Box::pin(async move {
+                assert_eq!(question, "proceed?");
+                assert!(!abort.is_aborted());
+                observed.store(true, Ordering::SeqCst);
+                Ok(AgentToolResult::text("the answer"))
+            })
+        }));
+        assert_eq!(tool.name, "ask");
+        assert_eq!(tool.label, "ask");
+        assert_eq!(tool.capability, ToolCapability::Read);
+        assert_eq!(tool.execution_mode, ToolExecutionMode::Default);
+        let (_, abort) = AbortController::new();
+        let result = (tool.execute)(ToolCallContext {
+            tool_call_id: "call-1".to_owned(),
+            arguments: serde_json::json!({ "question": "proceed?" }),
+            on_update: Arc::new(|_| {}),
+            abort,
+            model: None,
+        })
+        .await
+        .expect("execute");
+        assert!(observed.load(Ordering::SeqCst));
+        assert_eq!(result.content, vec![ContentBlock::text("the answer")]);
+    }
+
+    #[tokio::test]
+    async fn ask_tool_rejects_missing_or_non_string_question() {
+        let tool = create_ask_tool(Arc::new(|_, _| {
+            Box::pin(async { unreachable!("executor must not run for a bad schema") })
+        }));
+        for arguments in [serde_json::json!({}), serde_json::json!({ "question": 42 })] {
+            let (_, abort) = AbortController::new();
+            let result = (tool.execute)(ToolCallContext {
+                tool_call_id: "call-1".to_owned(),
+                arguments: arguments.clone(),
+                on_update: Arc::new(|_| {}),
+                abort,
+                model: None,
+            })
+            .await
+            .expect_err("missing question must reject");
+            assert!(
+                result.to_string().contains("question"),
+                "rejection names the argument: {result}"
+            );
         }
     }
 }

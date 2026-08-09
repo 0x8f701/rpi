@@ -104,6 +104,7 @@ pub fn register_faux_provider(options: FauxProviderOptions) -> FauxProviderRegis
                 async move { native(m, c, o.into()).await }.boxed()
             }),
             stream_simple: simple,
+            generate_image: None,
         },
         Some(source_id),
     );

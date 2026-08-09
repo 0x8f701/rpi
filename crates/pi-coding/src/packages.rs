@@ -35,7 +35,6 @@ const MAX_PACKAGE_METADATA_BYTES: u64 = 8 * 1024 * 1024;
 static PROCESS_PACKAGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static UNIQUE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A settings/install scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PackageScope {
@@ -53,7 +52,6 @@ impl PackageScope {
     }
 }
 
-/// Versioned source record stored in package state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedPackageSource {
@@ -135,7 +133,6 @@ impl ManagedPackageSource {
     }
 }
 
-/// Versioned `package.json#pi` manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageManifest {
@@ -192,7 +189,6 @@ impl PackageManifest {
     }
 }
 
-/// Resource category supplied by a package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PackageResourceKind {
@@ -202,7 +198,6 @@ pub enum PackageResourceKind {
     Theme,
 }
 
-/// An absolute resource path with package origin and trust information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageResourceSpec {
@@ -213,7 +208,6 @@ pub struct PackageResourceSpec {
     pub trusted: bool,
 }
 
-/// All resources supplied by one package.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageResources {
@@ -270,7 +264,6 @@ impl PackageResources {
     }
 }
 
-/// A package checkout/path recorded in a scope state file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledPackage {
@@ -335,7 +328,6 @@ impl PackageState {
     }
 }
 
-/// One settings entry shown by `rpi list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredPackage {
     pub source: String,
@@ -345,7 +337,6 @@ pub struct ConfiguredPackage {
     pub supported: bool,
 }
 
-/// Result of an install/update operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageOperation {
     pub source: String,
@@ -355,7 +346,6 @@ pub struct PackageOperation {
     pub revision: Option<String>,
 }
 
-/// Kind of package change reported by [`PackageManager::check_available_updates`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageUpdateType {
@@ -365,7 +355,6 @@ pub enum PackageUpdateType {
     LocalChanged,
 }
 
-/// A read-only preview of one configured package update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageUpdate {
@@ -389,7 +378,6 @@ pub struct ScopePackage {
     pub resources: PackageResources,
 }
 
-/// Package service for one working directory.
 #[derive(Debug, Clone)]
 pub struct PackageManager {
     cwd: PathBuf,
@@ -410,7 +398,6 @@ impl PackageManager {
         })
     }
 
-    /// Construct with an explicit global agent directory.
     pub fn with_agent_dir(
         cwd: impl AsRef<Path>,
         agent_dir: impl AsRef<Path>,
@@ -471,7 +458,6 @@ impl PackageManager {
         Ok(Some(path))
     }
 
-    /// Install a local or git package and persist it to the selected settings.
     pub fn install(&self, source: &str, scope: PackageScope) -> Result<PackageOperation> {
         self.assert_scope_trusted(scope)?;
         let _operation_lock = self.lock_operations()?;
@@ -480,7 +466,6 @@ impl PackageManager {
         self.install_locked(parsed, settings_source, scope, true)
     }
 
-    /// Remove a configured package from one scope.
     pub fn remove(&self, source: &str, scope: PackageScope) -> Result<bool> {
         self.assert_scope_trusted(scope)?;
         let _operation_lock = self.lock_operations()?;
@@ -500,7 +485,6 @@ impl PackageManager {
         Ok(true)
     }
 
-    /// List configured global packages and trusted project packages.
     pub fn list(&self) -> Result<Vec<ConfiguredPackage>> {
         let mut result = Vec::new();
         self.append_configured_packages(PackageScope::Global, &mut result)?;
@@ -547,7 +531,6 @@ impl PackageManager {
         Ok(operations)
     }
 
-    /// Reconcile one configured package by identity, across its configured scopes.
     pub fn update_one(&self, source: &str) -> Result<Vec<PackageOperation>> {
         let _operation_lock = self.lock_operations()?;
         let identities = input_identity_candidates(source, &self.cwd)?;
@@ -948,7 +931,6 @@ impl PackageManager {
     }
 }
 
-/// Parse a supported source relative to `base_dir`.
 pub fn parse_package_source(source: &str, base_dir: &Path) -> Result<ManagedPackageSource> {
     let trimmed = source.trim();
     if trimmed.is_empty() {

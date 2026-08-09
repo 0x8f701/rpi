@@ -229,22 +229,30 @@ impl ApplicationInner {
             owned
         };
         if job.status == JobStatus::Completed {
-            let state = active.session.todo_state();
-            let status = state
-                .phases
-                .iter()
-                .flat_map(|phase| &phase.tasks)
-                .find(|task| task.id == ownership.task_id)
-                .map(|task| task.status);
-            if matches!(status, Some(TodoStatus::Pending | TodoStatus::InProgress)) {
-                let result = active.session.apply_todo_raw(TodoOp::Done {
-                    task: Some(ownership.task_id),
-                    phase: None,
-                })?;
-                self.publish(ApplicationEvent::TodoUpdated {
-                    phases: result.phases,
-                    completed_tasks: result.completed_tasks,
-                });
+            // Workflow-scoped jobs (workflow children) must never forge Todo
+            // completion: the supervisor owns the canonical Todo DAG and marks
+            // tasks Done through the todo tool after verifying the delegated
+            // work. Auto-Done here diverged the supervisor's belief (and let
+            // dependents appear completed before their real jobs ran — BUG-3).
+            // Non-workflow applications keep the automatic transition.
+            if job.workflow_id.is_none() {
+                let state = active.session.todo_state();
+                let status = state
+                    .phases
+                    .iter()
+                    .flat_map(|phase| &phase.tasks)
+                    .find(|task| task.id == ownership.task_id)
+                    .map(|task| task.status);
+                if matches!(status, Some(TodoStatus::Pending | TodoStatus::InProgress)) {
+                    let result = active.session.apply_todo_raw(TodoOp::Done {
+                        task: Some(ownership.task_id),
+                        phase: None,
+                    })?;
+                    self.publish(ApplicationEvent::TodoUpdated {
+                        phases: result.phases,
+                        completed_tasks: result.completed_tasks,
+                    });
+                }
             }
         }
         active.todo_dag_changed.notify_waiters();
@@ -317,7 +325,7 @@ impl ApplicationInner {
                     && task.ready
                     && !coordinator.attempted_task_ids.contains(&task.id)
             })
-            .map(|(index, task)| (index, task.id.clone(), task.content.clone()))
+            .map(|(index, task)| (index, task.id.clone(), task.content.clone(), task.agent.clone()))
             .collect::<Vec<_>>();
         let active_job_count = jobs
             .iter()
@@ -334,7 +342,7 @@ impl ApplicationInner {
             let previous_phases = state.phases.clone();
             let selected_ids = selected
                 .iter()
-                .map(|(_, task_id, _)| task_id.as_str())
+                .map(|(_, task_id, _, _)| task_id.as_str())
                 .collect::<HashSet<_>>();
             let mut started_phases = state.phases;
             for task in started_phases
@@ -345,18 +353,35 @@ impl ApplicationInner {
                 task.status = TodoStatus::InProgress;
             }
             let started = active.session.set_todos_raw(started_phases)?;
-            let items = selected
-                .iter()
-                .enumerate()
-                .map(|(batch_index, (todo_index, task_id, content))| TaskItem {
-                    index: batch_index,
-                    id: format!("Todo{}", todo_index + 1),
-                    agent: runtime.select_agent(content, None),
-                    assignment: content.to_owned(),
-                    todo_task_id: Some(task_id.clone()),
-                })
-                .collect::<Vec<_>>();
-            let spawns = match runtime.spawn_tasks(runtime.main_agent_id(), 0, items) {
+            // Typed agent routing: the Todo item's explicit `agent` field wins,
+            // then exact mentions in the task content, then ranked selection.
+            // A missing/disabled/ambiguous explicit agent fails actionably
+            // (never a silent fallback to the default `task` agent) and rolls
+            // the Todo state back.
+            let spawns = (|| -> Result<Vec<TaskSpawn>> {
+                let mut items = Vec::with_capacity(selected.len());
+                for (batch_index, (todo_index, task_id, content, agent)) in
+                    selected.iter().enumerate()
+                {
+                    let resolved = runtime
+                        .resolve_task_agent(content, agent.as_deref())
+                        .map_err(|error| {
+                            anyhow!(
+                                "workflow Todo task {todo_index:?} ({content:?}) cannot route to an agent: {error:#}"
+                            )
+                        })?;
+                    items.push(TaskItem {
+                        index: batch_index,
+                        id: format!("Todo{}", todo_index + 1),
+                        agent: resolved,
+                        assignment: content.to_owned(),
+                        todo_task_id: Some(task_id.clone()),
+                        ..TaskItem::default()
+                    });
+                }
+                runtime.spawn_tasks(runtime.main_agent_id(), 0, items)
+            })();
+            let spawns = match spawns {
                 Ok(spawns) => spawns,
                 Err(error) => {
                     return match active.session.set_todos_raw(previous_phases) {
@@ -368,7 +393,7 @@ impl ApplicationInner {
                 }
             };
             let generation = coordinator.generation;
-            for ((_, task_id, _), spawn) in selected.iter().zip(&spawns) {
+            for ((_, task_id, _, _), spawn) in selected.iter().zip(&spawns) {
                 coordinator.attempted_task_ids.insert(task_id.clone());
                 coordinator.owned_jobs.insert(
                     spawn.job_id.clone(),
@@ -403,6 +428,13 @@ impl ApplicationInner {
             || (!candidates.is_empty() && (!allow_spawn || slots == 0))
         {
             TodoDagExecutionStatus::Active
+        } else if runtime.workflow_scope().is_some() {
+            // Workflow children hand DAG control back to their supervisor
+            // instead of reporting the parent-app "stuck" Blocked state: open
+            // tasks with no spawnable candidates are waiting on the
+            // supervisor agent (which marks tasks Done / re-delegates), not a
+            // hard failure.
+            TodoDagExecutionStatus::Dormant
         } else {
             TodoDagExecutionStatus::Blocked
         };

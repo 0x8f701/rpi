@@ -77,6 +77,20 @@ pub struct ExtensionUiSnapshot {
     pub active_theme: Option<String>,
     #[serde(default)]
     pub tools_expanded: bool,
+    /// Latest sanitized content rows per `(instance, overlay id)`, as pushed
+    /// by `ctx.overlay.setRows`. The TUI reads these when opening an overlay.
+    #[serde(default)]
+    pub overlay_rows: Vec<ExtensionOverlayRowItem>,
+}
+
+/// One overlay's sanitized content rows, keyed by owning instance + overlay
+/// id. Serialized for RPC snapshots; the TUI consumes it directly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionOverlayRowItem {
+    pub instance: ExtensionInstanceId,
+    pub id: String,
+    pub rows: Vec<pi_coding::OverlayRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +148,28 @@ pub enum ExtensionUiEvent {
         instance: ExtensionInstanceId,
         expanded: bool,
     },
+    /// `ctx.overlay.open(id, { nonCapturing? })` succeeded: the host UI
+    /// should open the overlay panel with the given (sanitized) content rows
+    /// and the registered title. `nonCapturing` opens the overlay unfocused
+    /// (drawn but not capturing keys; the focus-toggle action flips focus to
+    /// it). `input` is the registration-time static editor declaration.
+    OverlayOpenRequested {
+        instance: ExtensionInstanceId,
+        id: String,
+        title: String,
+        rows: Vec<pi_coding::OverlayRow>,
+        non_capturing: bool,
+        input: Option<pi_coding::OverlayInputDeclaration>,
+    },
+    /// `ctx.overlay.setRows(id, rows)` published the sanitized content rows
+    /// for `(instance, id)`. The TUI applies them to the currently open
+    /// overlay with the same `(instance, id)` (live repaint) and ignores them
+    /// otherwise; the rows also land in the adapter state for the next open.
+    OverlayRowsChanged {
+        instance: ExtensionInstanceId,
+        id: String,
+        rows: Vec<pi_coding::OverlayRow>,
+    },
     ExtensionCleared {
         instance: ExtensionInstanceId,
     },
@@ -177,6 +213,7 @@ struct AdapterState {
     themes: Vec<ExtensionThemeDescriptor>,
     active_theme: Option<(ExtensionInstanceId, String)>,
     tools_expanded: Option<(ExtensionInstanceId, bool)>,
+    overlay_rows: BTreeMap<(ExtensionInstanceId, String), Vec<pi_coding::OverlayRow>>,
     canonical_queries_supported: bool,
 }
 
@@ -266,6 +303,15 @@ impl ExtensionUiAdapter {
                 .tools_expanded
                 .as_ref()
                 .is_some_and(|(_, expanded)| *expanded),
+            overlay_rows: state
+                .overlay_rows
+                .iter()
+                .map(|((instance, id), rows)| ExtensionOverlayRowItem {
+                    instance: instance.clone(),
+                    id: id.clone(),
+                    rows: rows.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -551,6 +597,7 @@ impl ExtensionUiHost for ExtensionUiAdapter {
                 clear_if_owned(&mut state.hidden_thinking_label, &instance);
                 clear_if_owned(&mut state.active_theme, &instance);
                 clear_if_owned(&mut state.tools_expanded, &instance);
+                state.overlay_rows.retain(|(owner, _), _| owner != &instance);
             }
             publish_event(&inner, ExtensionUiEvent::ExtensionCleared { instance });
             Ok(())
@@ -822,6 +869,57 @@ fn apply_action(
                     title,
                 },
             );
+        }
+        ExtensionUiRequest::OverlaySetRows { id, rows } => {
+            // Sanitize at the host boundary: bounds + redaction before the
+            // rows become displayable anywhere.
+            let rows = pi_coding::sanitize_overlay_rows(rows);
+            inner
+                .state
+                .lock()
+                .overlay_rows
+                .insert((context.instance.clone(), id.clone()), rows.clone());
+            // Publish the live rows so an open overlay with the same
+            // (instance, id) repaints without a close/reopen cycle.
+            publish_event(
+                inner,
+                ExtensionUiEvent::OverlayRowsChanged {
+                    instance: context.instance,
+                    id,
+                    rows,
+                },
+            );
+        }
+        ExtensionUiRequest::OverlayOpen {
+            id,
+            title,
+            non_capturing,
+            input,
+        } => {
+            // The overlay must be registered by a loaded extension; the
+            // adapter cannot know the registry, so the runtime resolves the
+            // id (and the registered title/input declaration) before issuing
+            // this request. The host UI opens the panel with the overlay's
+            // current rows.
+            let rows = inner
+                .state
+                .lock()
+                .overlay_rows
+                .get(&(context.instance.clone(), id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            publish_event(
+                inner,
+                ExtensionUiEvent::OverlayOpenRequested {
+                    instance: context.instance,
+                    id,
+                    title: title.unwrap_or_default(),
+                    rows,
+                    non_capturing,
+                    input,
+                },
+            );
+            return Ok(ExtensionUiResponse::OverlayOpened);
         }
         ExtensionUiRequest::Select { .. }
         | ExtensionUiRequest::Confirm { .. }

@@ -9,6 +9,7 @@ fn command_fixtures_deserialize_and_reject_unknown_fields() {
         json!({"type":"workflow_list"}),
         json!({"type":"workflow_get","workflowId":"wf-1"}),
         json!({"type":"workflow_get","name":"ship"}),
+        json!({"type":"workflow_detail","workflowId":"wf-1"}),
         json!({"type":"workflow_pause","workflowId":"wf-1"}),
         json!({"type":"workflow_resume","workflowId":"wf-1"}),
         json!({"type":"workflow_cancel","workflowId":"wf-1"}),
@@ -176,6 +177,7 @@ fn snapshot_projects_exact_composite_todo_ownership_without_content() {
                             depends_on: Vec::new(),
                             ready: false,
                             blocked_by: Vec::new(),
+                            agent: None,
                         },
                         pi_coding::TodoItem {
                             id: "task-b".into(),
@@ -184,6 +186,7 @@ fn snapshot_projects_exact_composite_todo_ownership_without_content() {
                             depends_on: Vec::new(),
                             ready: true,
                             blocked_by: Vec::new(),
+                            agent: None,
                         },
                     ],
                 },
@@ -196,6 +199,7 @@ fn snapshot_projects_exact_composite_todo_ownership_without_content() {
                         depends_on: Vec::new(),
                         ready: true,
                         blocked_by: Vec::new(),
+                        agent: None,
                     }],
                 },
             ],
@@ -286,6 +290,124 @@ fn empty_todo_skips_ownership_on_the_wire() {
         value.get("ownership").is_none(),
         "empty ownership must be skipped: {value}"
     );
+}
+
+#[tokio::test]
+async fn workflow_detail_returns_panel_snapshot_with_redacted_worktree() {
+    let host = MemoryWorkflowRpcHost::new();
+    let created = dispatch_workflow_command(
+        &host,
+        WorkflowRpcCommand::WorkflowCreate {
+            id: Some("d1".into()),
+            name: "ship".into(),
+            objective: "land detail".into(),
+        },
+    )
+    .await
+    .expect("create");
+    let workflow_id = created["workflowId"].as_str().unwrap().to_owned();
+
+    let detail = dispatch_workflow_command(
+        &host,
+        WorkflowRpcCommand::WorkflowDetail {
+            id: Some("detail-1".into()),
+            workflow_id: Some(workflow_id.clone()),
+            name: None,
+        },
+    )
+    .await
+    .expect("detail");
+    // Panel projection: identity, objective, and the queued status.
+    assert_eq!(detail["id"], workflow_id);
+    assert_eq!(detail["name"], "ship");
+    assert_eq!(detail["objective"], "land detail");
+    assert_eq!(detail["status"], "queued");
+    assert_eq!(detail["generation"], 1);
+    // Empty live sections project as defaults, not errors.
+    assert_eq!(detail["activeTasks"], json!([]));
+    assert_eq!(detail["subagents"], json!([]));
+    // The memory host stores an absolute worktree path; the wire label must
+    // be redacted to a display-safe basename.
+    let worktree = detail["worktree"]["label"].as_str().expect("worktree label");
+    assert!(!Path::new(worktree).is_absolute(), "worktree must not be absolute: {worktree}");
+    let encoded = serde_json::to_string(&detail).unwrap();
+    assert!(
+        !wire_json_leaks_absolute_path(&encoded),
+        "absolute path leaked: {encoded}"
+    );
+
+    // By-name lookup works the same way.
+    let by_name = dispatch_workflow_command(
+        &host,
+        WorkflowRpcCommand::WorkflowDetail {
+            id: None,
+            workflow_id: None,
+            name: Some("ship".into()),
+        },
+    )
+    .await
+    .expect("detail by name");
+    assert_eq!(by_name["id"], workflow_id);
+
+    // A missing selector fails closed.
+    let err = dispatch_workflow_command(
+        &host,
+        WorkflowRpcCommand::WorkflowDetail {
+            id: None,
+            workflow_id: None,
+            name: None,
+        },
+    )
+    .await
+    .expect_err("selector required");
+    assert!(
+        err.to_string().contains("workflowId or name"),
+        "{err}"
+    );
+    // An unknown workflow fails too.
+    let err = dispatch_workflow_command(
+        &host,
+        WorkflowRpcCommand::WorkflowDetail {
+            id: None,
+            workflow_id: Some("missing".into()),
+            name: None,
+        },
+    )
+    .await
+    .expect_err("unknown workflow");
+    assert!(err.to_string().contains("missing"), "{err}");
+}
+
+#[tokio::test]
+async fn workflow_detail_round_trips_through_rpc_state() {
+    let state = WorkflowRpcState::new();
+    state.set_memory_host();
+    state
+        .dispatch(WorkflowRpcCommand::WorkflowCreate {
+            id: Some("state-d".into()),
+            name: "detail-state".into(),
+            objective: "check state dispatch".into(),
+        })
+        .await
+        .expect("create");
+    let listed = state
+        .dispatch(WorkflowRpcCommand::WorkflowList { id: None })
+        .await
+        .expect("list");
+    let workflow_id = listed["workflows"][0]["workflowId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let detail = state
+        .dispatch(WorkflowRpcCommand::WorkflowDetail {
+            id: Some("state-detail".into()),
+            workflow_id: Some(workflow_id.clone()),
+            name: None,
+        })
+        .await
+        .expect("detail");
+    assert_eq!(detail["id"], workflow_id);
+    assert_eq!(detail["name"], "detail-state");
 }
 
 #[tokio::test]

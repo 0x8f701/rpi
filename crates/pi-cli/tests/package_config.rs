@@ -27,6 +27,7 @@ fn run(agent_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String, String) {
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("HOME", agent_dir)
         .env("USERPROFILE", agent_dir)
+        .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("DEEPSEEK_API_KEY")

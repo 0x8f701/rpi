@@ -567,7 +567,9 @@ pub async fn config_command(
     run_selector(model).await
 }
 
-fn resolve_trust(
+/// Resolve project trust for a headless/config subcommand using the same
+/// store, defaults, and one-run overrides as the package-resource selector.
+pub(crate) fn resolve_trust(
     cwd: &Path,
     agent_dir: &Path,
     approve: bool,
@@ -753,6 +755,9 @@ fn flatten(model: &PackageConfigModel) -> Vec<FlatRow> {
 }
 
 async fn run_selector(mut model: PackageConfigModel) -> Result<()> {
+    // Same NO_COLOR override as the main TUI: this interactive editor renders
+    // in full color on capable terminals regardless of NO_COLOR.
+    crate::force_tui_color();
     let mut guard = TerminalGuard::enter()?;
     let mut input = EventStream::new();
     let mut list_state = ListState::default();

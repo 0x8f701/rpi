@@ -1,0 +1,5 @@
+# Project toolchain: rpi builds on stable 1.88.0 (MSRV). rustup reads this
+# file automatically, so `cargo` (without +<version>) and CI both resolve to
+# the pinned toolchain. Keep in sync with .github/workflows/*.yml.
+[toolchain]
+channel = "1.88.0"

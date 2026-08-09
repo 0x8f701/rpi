@@ -12,6 +12,7 @@
 
 mod catalog;
 mod git;
+pub(crate) mod overlay;
 
 #[cfg(test)]
 mod tests;
@@ -24,6 +25,8 @@ use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::settings::WorkflowIsolationSetting;
+
 use catalog::{acquire_repo_lock, WorktreeCatalog};
 use git::{
     allocate_branch_name, branch_exists, canonicalize_no_symlink, canonicalize_or_create_dir,
@@ -32,6 +35,9 @@ use git::{
     resolve_commit, rev_parse, run_git, run_git_allow_fail, sanitize_path_segment,
     validate_workflow_id, verify_identity_ownership, verify_worktree_registration,
     worktree_is_registered,
+};
+pub use overlay::{
+    NoopWorkflowIsolation, OverlayWorkflowManager, OVERLAY_BRANCH_PREFIX, OVERLAY_ROOT_DIR_NAME,
 };
 
 /// Branch namespace prefix for every workflow worktree branch.
@@ -320,6 +326,22 @@ impl WorkflowWorktreeManager {
             let _ = write!(namespace, "{byte:02x}");
         }
         Ok(namespace)
+    }
+
+    /// Per-session namespace for durable workflow state: the repository digest
+    /// scoped by the owning session id. A resumed session (same session id)
+    /// resolves to the same namespace, so it restores its workflows; every
+    /// distinct session id gets its own namespace, so a new session in the
+    /// same repository starts with an empty workflow list. Non-git directories
+    /// fall back to the session id alone. The session id is encoded
+    /// filesystem-safely (separators mapped to `-`), because resumed headers
+    /// may originate from foreign session files.
+    pub fn session_namespace(&self, session_id: &str) -> String {
+        let encoded = encode_session_id(session_id);
+        match self.repository_namespace() {
+            Ok(repo) => format!("{repo}/{encoded}"),
+            Err(_) => encoded,
+        }
     }
 
     /// Create an isolated worktree + branch for `workflow_id`.
@@ -769,4 +791,135 @@ impl WorkflowWorktreeManager {
         let path = self.catalog_path(discovery);
         catalog::with_catalog_mut(&path, f)
     }
+}
+
+/// Isolation backend behind workflow working copies.
+///
+/// The git worktree backend ([`WorkflowWorktreeManager`]) is the default;
+/// [`OverlayWorkflowManager`] materializes each workflow in an overlayfs
+/// (source repo as the read-only lower layer) with the same lifecycle, and
+/// [`NoopWorkflowIsolation`] disables isolation entirely. The workflow runtime
+/// factory owns an `Arc<dyn WorkflowIsolation>` selected from
+/// `settings.orchestration.isolation`, so every backend shares the same
+/// create/verify/integrate/remove contract.
+pub trait WorkflowIsolation: Send + Sync {
+    /// Create an isolated working copy for `workflow_id`.
+    fn create(
+        &self,
+        workflow_id: &str,
+        options: CreateWorktreeOptions,
+    ) -> Result<WorkflowWorktreeIdentity, WorktreeError>;
+
+    /// Verify exact ownership of `identity` and mint an opaque capability for
+    /// trusted runtime use of the checkout.
+    fn verify_owned(
+        &self,
+        identity: &WorkflowWorktreeIdentity,
+    ) -> Result<TrustedWorkflowCwd, WorktreeError>;
+
+    /// Refresh an owned checkout after committed workflow progress and mint a
+    /// trusted checkout capability.
+    fn verify_owned_current(
+        &self,
+        workflow_id: &str,
+    ) -> Result<(WorkflowWorktreeIdentity, TrustedWorkflowCwd), WorktreeError>;
+
+    /// Integrate workflow changes back into the source.
+    fn integrate(
+        &self,
+        workflow_id: &str,
+        options: IntegrateOptions,
+    ) -> Result<IntegrateOutcome, WorktreeError>;
+
+    /// Remove a manager-owned checkout. Foreign identities fail closed.
+    fn remove(&self, identity: &WorkflowWorktreeIdentity) -> Result<(), WorktreeError>;
+
+    /// Inspect a registered checkout: dirty state, ahead commits, changed files.
+    fn inspect(&self, workflow_id: &str) -> Result<WorkflowWorktreeStatus, WorktreeError>;
+
+    /// List identities currently recorded in the catalog.
+    fn list(&self) -> Result<Vec<WorkflowWorktreeIdentity>, WorktreeError>;
+
+    /// Drop catalog entries whose checkout no longer exists.
+    fn prune_stale(&self) -> Result<Vec<String>, WorktreeError>;
+
+    /// The isolation kind this backend implements.
+    #[must_use]
+    fn kind(&self) -> WorkflowIsolationSetting;
+}
+
+impl WorkflowIsolation for WorkflowWorktreeManager {
+    fn create(
+        &self,
+        workflow_id: &str,
+        options: CreateWorktreeOptions,
+    ) -> Result<WorkflowWorktreeIdentity, WorktreeError> {
+        self.create(workflow_id, options)
+    }
+
+    fn verify_owned(
+        &self,
+        identity: &WorkflowWorktreeIdentity,
+    ) -> Result<TrustedWorkflowCwd, WorktreeError> {
+        self.verify_owned(identity)
+    }
+
+    fn verify_owned_current(
+        &self,
+        workflow_id: &str,
+    ) -> Result<(WorkflowWorktreeIdentity, TrustedWorkflowCwd), WorktreeError> {
+        self.verify_owned_current(workflow_id)
+    }
+
+    fn integrate(
+        &self,
+        workflow_id: &str,
+        options: IntegrateOptions,
+    ) -> Result<IntegrateOutcome, WorktreeError> {
+        self.integrate(workflow_id, options)
+    }
+
+    fn remove(&self, identity: &WorkflowWorktreeIdentity) -> Result<(), WorktreeError> {
+        self.remove(identity)
+    }
+
+    fn inspect(&self, workflow_id: &str) -> Result<WorkflowWorktreeStatus, WorktreeError> {
+        self.inspect(workflow_id)
+    }
+
+    fn list(&self) -> Result<Vec<WorkflowWorktreeIdentity>, WorktreeError> {
+        self.list()
+    }
+
+    fn prune_stale(&self) -> Result<Vec<String>, WorktreeError> {
+        self.prune_stale()
+    }
+
+    fn kind(&self) -> WorkflowIsolationSetting {
+        WorkflowIsolationSetting::Worktree
+    }
+}
+
+/// Filesystem-safe, collision-free encoding of a session id into a single
+/// namespace path segment. Native ids without separators (UUIDs) pass through
+/// unchanged. Ids containing path separators map `/\:` to `-` and append a
+/// short digest of the raw id, so distinct ids can never collapse onto the
+/// same segment (`proj/abc` and `proj-abc` both map to `proj-abc` today).
+fn encode_session_id(session_id: &str) -> String {
+    if session_id.is_empty() {
+        return "session".to_owned();
+    }
+    if !session_id.contains(['/', '\\', ':']) {
+        return session_id.to_owned();
+    }
+    let encoded = session_id.replace(['/', '\\', ':'], "-");
+    // 3 digest bytes (6 hex chars) disambiguate the mapped form; the digest
+    // is derived from the raw id, never from the lossy mapped form.
+    use sha2::{Digest, Sha256};
+    let mut disambiguator = String::with_capacity(6);
+    for byte in Sha256::digest(session_id.as_bytes()).iter().take(3) {
+        use std::fmt::Write as _;
+        let _ = write!(disambiguator, "{byte:02x}");
+    }
+    format!("{encoded}-{disambiguator}")
 }

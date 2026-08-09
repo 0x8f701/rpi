@@ -124,10 +124,39 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mermaid_returns_visible_source_and_diagnostic() {
-        let source = "sequenceDiagram\nAlice->>Bob: hello";
+    fn sequence_diagram_mermaid_golden() {
+        let output = render(
+            "```mermaid\nsequenceDiagram\nparticipant A as Alice\nactor B as Bob\nA ->> B: hello\nB -->> A: ack\nA -) B: ping\nB --> A: pong\nA -x B: quit\nnote over A, B: working\nA => B: hmm\n```",
+            48,
+        );
+        assert_eq!(
+            output.plain_text(),
+            "┌─ mermaid · sequenceDiagram\n│ sequenceDiagram\n│ Alice ── Bob\n│ ────────────\n│ │ Alice │──▶│ Bob : hello │\n│ │ Bob   │···▶│ Alice : ack │\n│ │ Alice │──○│ Bob : ping │\n│ │ Bob   │···│ Alice : pong │\n│ │ Alice │──✕│ Bob : quit │\n│ │ [note over A, B: working] │\n│ │ A => B: hmm │\n└─"
+        );
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn sequence_diagram_streaming_matches_full_render() {
+        let source = "```mermaid\nsequenceDiagram\nA ->> B: hello\nB -->> A: ack\n```";
+        let full = render(source, 40);
+        let streamed = render_markdown_streaming(
+            source,
+            &MarkdownRenderOptions {
+                width: 40,
+                ..MarkdownRenderOptions::default()
+            },
+        );
+        assert_eq!(streamed.plain_text(), full.plain_text());
+        assert!(streamed.plain_text().contains("┌─ mermaid · sequenceDiagram"));
+    }
+
+    #[test]
+    fn unsupported_mermaid_kind_returns_visible_source_and_diagnostic() {
+        let source = "gantt\ntitle A Gantt Diagram";
         let output = render(&format!("```mermaid\n{source}\n```"), 40);
-        assert!(output.plain_text().contains("sequenceDiagram\n│ Alice->>Bob: hello"));
+        assert!(output.plain_text().contains("┌─ mermaid · source fallback"));
+        assert!(output.plain_text().contains("title A Gantt Diagram"));
         assert!(output.plain_text().contains("Only flowchart/graph"));
         assert!(matches!(
             output.diagnostics.as_slice(),
@@ -335,13 +364,19 @@ mod tests {
 
     #[test]
     fn code_fences_preserve_leading_indentation() {
-        // Contract: fenced code is layout-verbatim; collapsing whitespace would
-        // destroy Python/Makefile samples and hide indentation bugs.
+        // Contract: fenced code is layout-verbatim inside the frame; collapsing
+        // whitespace would destroy Python/Makefile samples and hide indentation
+        // bugs.
         let output = render("```\n    indented\n\ttabbed\n  two\n```", 30);
-        assert_eq!(
-            output.plain_text(),
-            "┌─ code\n     indented\n     tabbed\n   two\n└─"
+        let expected = format!(
+            "╭── code ──{}╮\n│     indented{} │\n│     tabbed{} │\n│   two{} │\n╰{}╯",
+            "─".repeat(18),
+            " ".repeat(14),
+            " ".repeat(16),
+            " ".repeat(21),
+            "─".repeat(28),
         );
+        assert_eq!(output.plain_text(), expected);
         assert!(output.diagnostics.is_empty());
     }
 
@@ -472,8 +507,9 @@ mod tests {
 
     #[test]
     fn mermaid_edge_and_output_cell_limits_are_enforced() {
-        // Contract: complexity budgets must fail closed with source fallback,
-        // not silently drop edges or allocate unbounded art.
+        // Contract: complexity budgets fail closed with source fallback rather
+        // than silently dropping edges; output-cell budgets never fall back —
+        // supported flowcharts split into bounded numbered panels instead.
         let edges = render_markdown(
             "```mermaid\nflowchart TD\nA --> B\n```",
             &MarkdownRenderOptions {
@@ -509,17 +545,20 @@ mod tests {
                 ..MarkdownRenderOptions::default()
             },
         );
-        assert!(cells.plain_text().contains("source fallback"));
-        assert!(matches!(
-            cells.diagnostics.as_slice(),
-            [RenderDiagnostic::Mermaid {
-                diagnostic: MermaidDiagnostic {
-                    kind: MermaidDiagnosticKind::OutputLimit,
-                    ..
-                },
-                ..
-            }]
-        ));
+        assert!(!cells.plain_text().contains("source fallback"));
+        assert!(cells.diagnostics.is_empty(), "{:?}", cells.diagnostics);
+        assert_eq!(
+            cells
+                .plain_text()
+                .lines()
+                .filter(|line| line.starts_with("┌─ mermaid · flowchart"))
+                .count(),
+            2,
+            "a two-node graph under a 1-cell budget must render two panels: {}",
+            cells.plain_text()
+        );
+        assert!(cells.plain_text().contains("[part 1/2]"), "{}", cells.plain_text());
+        assert!(cells.plain_text().contains("[part 2/2]"), "{}", cells.plain_text());
     }
 
     #[test]
@@ -530,7 +569,7 @@ mod tests {
             "````markdown\n```mermaid\nflowchart TD\nA --> B\n```\n````",
             40,
         );
-        assert!(output.plain_text().contains("┌─ code · markdown"));
+        assert!(output.plain_text().contains("╭── code · markdown"));
         assert!(output.plain_text().contains("```mermaid"));
         assert!(output.plain_text().contains("A --> B"));
         assert!(!output.plain_text().contains("mermaid · flowchart"));
@@ -553,7 +592,7 @@ mod tests {
             .any(|line| line.role == LineRole::MermaidEdge && line.text.contains('▶')));
 
         let rejected = render("```notmermaid\nflowchart TD\nA --> B\n```", 40);
-        assert!(rejected.plain_text().contains("┌─ code · notmermaid"));
+        assert!(rejected.plain_text().contains("╭── code · notmermaid"));
         assert!(!rejected.plain_text().contains("mermaid · flowchart"));
         assert!(rejected.diagnostics.is_empty());
     }

@@ -317,8 +317,8 @@ fn apply_exif_orientation_from_bytes(img: &DynamicImage, data: &[u8]) -> Dynamic
 }
 
 /// Reads the EXIF orientation (1-8) from JPEG or WebP bytes. Returns 1 when
-/// absent.
-fn exif_orientation_from_bytes(data: &[u8]) -> u32 {
+/// absent. Shared with the `inspect_image` tool.
+pub(crate) fn exif_orientation_from_bytes(data: &[u8]) -> u32 {
     if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
         return jpeg_orientation(data);
     }

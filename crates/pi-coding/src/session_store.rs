@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -15,6 +16,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::resources::agent_dir;
+use crate::session_catalog::{expand_tilde, make_absolute};
 use crate::TodoState;
 use crate::import::{
     OpenedSource, open_native_session_for_append_direct,
@@ -155,6 +157,15 @@ pub enum SessionRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    Checkpoint {
+        id: String,
+        #[serde(rename = "parentId")]
+        parent_id: Option<String>,
+        timestamp: String,
+        name: String,
+        #[serde(rename = "targetId")]
+        target_id: String,
+    },
 }
 
 
@@ -251,6 +262,20 @@ pub struct SessionTreeResult {
     pub tree: Vec<SessionTreeNode>,
     pub leaf_id: Option<String>,
     pub active_leaf_id: Option<String>,
+}
+
+/// Outcome of a store-level rewind: the dropped record tail is archived to a
+/// sidecar before the session file is truncated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRewindOutcome {
+    /// Sidecar JSONL file holding the truncated tail records (same record
+    /// serialization as the session file, header excluded).
+    pub archive_path: PathBuf,
+    /// Number of records dropped by the truncation.
+    pub dropped_entries: usize,
+    /// Number of records retained after the truncation.
+    pub retained_entries: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -715,6 +740,34 @@ impl SessionRecorder {
         result
     }
 
+    /// Mark the current position as a named rewind target.
+    ///
+    /// Appends a `checkpoint` record pointing at the current leaf and then
+    /// restores the leaf pointers, so the marker (like a label) is a side
+    /// record that never joins the linear record chain and never appears in
+    /// the reconstructed transcript. A later `/rewind <name>` rolls the
+    /// session back to the marked entry. Recording a checkpoint with an
+    /// existing name shadows the older marker (the newest wins on resolve).
+    pub fn record_checkpoint(&self, name: &str) -> Result<String> {
+        let normalized = normalize_checkpoint_name(name)?;
+        let mut state = self.inner.lock();
+        let target_id = state
+            .last_id
+            .clone()
+            .ok_or_else(|| anyhow!("cannot checkpoint an empty session"))?;
+        let previous_last_id = state.last_id.clone();
+        let previous_active_leaf_id = state.active_leaf_id.clone();
+        let mut fields = Map::new();
+        fields.insert("name".to_owned(), Value::String(normalized));
+        fields.insert("targetId".to_owned(), Value::String(target_id));
+        let result = append_entry(&mut state, "checkpoint", Value::Object(fields));
+        if result.is_ok() {
+            state.last_id = previous_last_id;
+            state.active_leaf_id = previous_active_leaf_id;
+        }
+        result
+    }
+
     pub fn fork_from(&self, entry_id: Option<&str>) {
         let mut state = self.inner.lock();
         let entry_id = entry_id.map(str::to_owned);
@@ -793,9 +846,15 @@ impl SessionRecorder {
         append_entry(&mut state, "custom_message", fields)
     }
 
+    /// Record the complete Todo state and make it crash-durable before returning.
+    ///
+    /// Todo mutations can happen before the first assistant message, while the
+    /// ordinary transcript writer is still lazy. A snapshot must not remain in
+    /// that in-memory queue: after a successful Todo operation, resume must see
+    /// the same state even if the process is terminated without a clean close.
     pub fn record_todo_snapshot(&self, state: &TodoState) -> Result<String> {
         let mut recorder = self.inner.lock();
-        append_entry(&mut recorder, "todo_snapshot", json!({ "state": state }))
+        append_entry_durable(&mut recorder, "todo_snapshot", json!({ "state": state }))
     }
 
     pub fn latest_todo_state(&self) -> Result<Option<TodoState>> {
@@ -899,6 +958,98 @@ impl SessionRecorder {
         Ok((tree, append_token_from_state(&state)))
     }
 
+    /// Roll the session file back to the first `keep` records.
+    ///
+    /// Records at index `keep` and beyond are dropped: the tail is first
+    /// archived verbatim to a `.rewind-<timestamp>.jsonl` sidecar next to the
+    /// session file (safety net — the truncated records are recoverable), then
+    /// the file is truncated and synced, and the recorder's in-memory leaf,
+    /// id set, assistant flag, and session name are rebuilt from the retained
+    /// records. The recorder remains open and appendable at the new end.
+    ///
+    /// Safety bounds are enforced here too (not only by callers): rewinding
+    /// past the first record (`keep == 0`) or to the end (`keep >= total`)
+    /// is refused so a rewind can never leave an empty or unchanged journal.
+    pub fn rewind_to(&self, keep: usize) -> Result<SessionRewindOutcome> {
+        let mut state = self.inner.lock();
+        // Flush pending records so the on-disk file holds the full record set
+        // before the cut is located and the tail is archived.
+        let previous_has_assistant = state.has_assistant;
+        state.has_assistant = true;
+        let flush = persist(&mut state);
+        state.has_assistant = previous_has_assistant;
+        flush?;
+        let tree = session_tree_from_state(&state)?;
+        let total = tree.entries.len();
+        anyhow::ensure!(
+            keep >= 1,
+            "rewind refused: cannot rewind past the first entry (entry index 0 is the earliest record)"
+        );
+        anyhow::ensure!(
+            keep < total,
+            "nothing to rewind: the session has {total} record(s); entry index {keep} is at or beyond the end"
+        );
+        // Locate the byte offset of the first dropped record by scanning the
+        // file bytes for its record id — robust to separators and formatting
+        // quirks that a line count would misread. Read through `fs::read`
+        // rather than the shared write handle: the append-mode handle's file
+        // position sits at EOF after the last flush, and a clone would inherit
+        // it and scan nothing.
+        let cut_id = tree.entries[keep].id.clone();
+        let session_path = state.path.clone();
+        let bytes = fs::read(&session_path)
+            .with_context(|| format!("reading session {} for rewind scan", session_path.display()))?;
+        let mut offset = 0u64;
+        let mut cut_offset = None;
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if let Ok(value) = serde_json::from_slice::<Value>(trim_ascii_whitespace(line))
+                && value.get("id").and_then(Value::as_str) == Some(cut_id.as_str())
+            {
+                cut_offset = Some(offset);
+                break;
+            }
+            offset = offset.saturating_add((line.len() + 1) as u64);
+        }
+        let cut_offset = cut_offset.ok_or_else(|| {
+            anyhow!("rewind cut record {cut_id} was not found in the session file")
+        })?;
+        // Archive the dropped tail verbatim before truncating.
+        let tail = bytes[(cut_offset as usize)..].to_vec();
+        let archive_path = archive_rewind_tail(&session_path, &tail)?;
+        // Truncate and sync; the file was opened append-mode, so subsequent
+        // record writes land at the new end automatically.
+        let file = state
+            .file
+            .as_mut()
+            .ok_or_else(|| anyhow!("session file is unavailable for rewind"))?;
+        file.set_len(cut_offset)
+            .with_context(|| format!("truncating session at rewind cut {cut_offset}"))?;
+        file.sync_all()
+            .with_context(|| format!("syncing truncated session {}", session_path.display()))?;
+        // Rebuild the in-memory recorder state from the retained records.
+        let kept = &tree.entries[..keep];
+        state.pending.clear();
+        state.last_id = kept.last().map(|entry| entry.id.clone());
+        state.active_leaf_id = kept.last().map(|entry| entry.id.clone());
+        state.used_ids = kept.iter().map(|entry| entry.id.clone()).collect();
+        state.revision = state.revision.saturating_add(1);
+        state.has_assistant = kept
+            .iter()
+            .any(|entry| matches!(entry.message, Some(Message::Assistant(_))));
+        state.session_name = kept
+            .iter()
+            .rev()
+            .find(|entry| entry.entry_type == "session_info")
+            .and_then(|entry| entry.name.as_deref())
+            .and_then(normalize_session_name);
+        state.flushed = true;
+        Ok(SessionRewindOutcome {
+            archive_path,
+            dropped_entries: total - keep,
+            retained_entries: keep,
+        })
+    }
+
     pub fn persist_now(&self) -> Result<()> {
         let mut state = self.inner.lock();
         let previous_has_assistant = state.has_assistant;
@@ -942,11 +1093,84 @@ impl SessionRecorder {
     }
 }
 
+/// Resolve the `.pi/agent` base used for the native session store.
+///
+/// Precedence matches `SessionCatalog::from_env`'s `native_agent_dir`:
+/// `PI_CODING_AGENT_DIR` > `SESSIONS_HOME/.pi/agent` > `HOME/.pi/agent`.
+/// `SESSIONS_HOME` and `PI_CODING_AGENT_DIR` undergo the same tilde expansion
+/// and absolute-path normalization as the catalog so the writer and the
+/// catalog agree on the session root. Only the session subtree relocates
+/// under `SESSIONS_HOME`; agent config, skills, and router.json continue to
+/// resolve through `agent_dir()`. An active config profile relocates the
+/// resolved base under `profiles/<name>` (exactly once, matching `agent_dir`).
+fn session_store_agent_base() -> PathBuf {
+    let user_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::resources::agent_dir_base);
+    crate::resources::apply_profile(resolve_agent_base(
+        std::env::var_os("PI_CODING_AGENT_DIR").as_deref(),
+        std::env::var_os("SESSIONS_HOME").as_deref(),
+        &user_home,
+        crate::resources::agent_dir_base(),
+    ))
+}
+
+/// Pure precedence resolver for [`session_store_agent_base`], factored out so
+/// the `PI_CODING_AGENT_DIR` > `SESSIONS_HOME/.pi/agent` > home fallback order
+/// is unit-testable without mutating process environment. Both environment
+/// roots are normalized the way `SessionCatalog::from_env_paths` normalizes
+/// them: `~` expands against `user_home` and relative values are made
+/// absolute against the current directory.
+fn resolve_agent_base(
+    configured: Option<&std::ffi::OsStr>,
+    sessions_home: Option<&std::ffi::OsStr>,
+    user_home: &Path,
+    fallback: PathBuf,
+) -> PathBuf {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        return make_absolute(expand_tilde(PathBuf::from(configured), user_home));
+    }
+    if let Some(sessions_home) = sessions_home.filter(|value| !value.is_empty()) {
+        return make_absolute(expand_tilde(PathBuf::from(sessions_home), user_home))
+            .join(".pi")
+            .join("agent");
+    }
+    fallback
+}
+
 pub fn default_session_dir(cwd: impl AsRef<Path>) -> PathBuf {
     let cwd = absolute_path(cwd.as_ref());
-    PathBuf::from(agent_dir())
+    session_store_agent_base()
         .join("sessions")
         .join(format!("--{}--", encode_cwd_safe_path(&cwd)))
+}
+
+/// Default age after which an untouched native session file is pruned at
+/// startup. Overridable per-install via the `sessionTtlDays` setting
+/// (`Settings::session_ttl_days`); a value there replaces this default.
+pub const DEFAULT_SESSION_TTL_DAYS: u64 = 30;
+
+/// Sessions modified within this window are treated as possibly active and are
+/// never pruned, regardless of TTL. The native store has no per-session lock
+/// or `.active` marker, so recency is the conservative active-session guard.
+pub const SESSION_ACTIVE_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// Earliest plausible last-modified time for a native session file
+/// (2000-01-01T00:00:00Z). The native v3 store did not exist before the
+/// 2020s, so an mtime older than this is a planted fixture, a restored
+/// archive, or clock-skewed data — never a live session. Such files are
+/// skipped exactly like future mtimes: the implausible is never pruned.
+const PRUNE_MTIME_FLOOR_SECS: u64 = 946_684_800;
+
+/// Absolute root of the native sessions tree (`<agent base>/sessions`), the
+/// parent of every per-cwd `--<encoded-cwd>--` directory and the `children/`
+/// subtree holding durable child sessions. Matches the catalog's native root
+/// (`SessionCatalog::root_for(SessionSourceKind::NativePi)`).
+#[must_use]
+pub fn native_sessions_root() -> PathBuf {
+    session_store_agent_base().join("sessions")
 }
 
 fn new_session_path(directory: &Path, timestamp: &str, id: &str, has_explicit_id: bool) -> PathBuf {
@@ -1177,6 +1401,78 @@ mod session_directory_compat_tests {
         assert_eq!(
             branch.tree().expect("branch tree").header.parent_session.as_deref(),
             Some(source_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn session_store_agent_base_precedence_honors_sessions_home() {
+        use std::ffi::OsStr;
+        let home_dir = tempfile::tempdir().expect("user home");
+        let user_home = home_dir.path();
+        let fallback = user_home.join(".pi/agent");
+        // PI_CODING_AGENT_DIR wins over SESSIONS_HOME.
+        assert_eq!(
+            resolve_agent_base(
+                Some(OsStr::new("/custom/agent")),
+                Some(OsStr::new("/sessions")),
+                user_home,
+                fallback.clone(),
+            ),
+            PathBuf::from("/custom/agent"),
+        );
+        // SESSIONS_HOME relocates the session subtree when PI_CODING_AGENT_DIR is unset.
+        assert_eq!(
+            resolve_agent_base(None, Some(OsStr::new("/sessions")), user_home, fallback.clone()),
+            PathBuf::from("/sessions/.pi/agent"),
+        );
+        // Empty SESSIONS_HOME falls through to the home-based fallback.
+        assert_eq!(
+            resolve_agent_base(None, Some(OsStr::new("")), user_home, fallback.clone()),
+            fallback,
+        );
+        // Empty PI_CODING_AGENT_DIR falls through to SESSIONS_HOME.
+        assert_eq!(
+            resolve_agent_base(
+                Some(OsStr::new("")),
+                Some(OsStr::new("/sessions")),
+                user_home,
+                fallback.clone(),
+            ),
+            PathBuf::from("/sessions/.pi/agent"),
+        );
+        // Both unset -> home fallback.
+        assert_eq!(resolve_agent_base(None, None, user_home, fallback.clone()), fallback);
+        // Tilde expansion mirrors SessionCatalog::with_homes: `~` and `~/child`
+        // resolve beneath the user home instead of a literal `~` directory.
+        assert_eq!(
+            resolve_agent_base(None, Some(OsStr::new("~")), user_home, fallback.clone()),
+            user_home.join(".pi/agent"),
+        );
+        assert_eq!(
+            resolve_agent_base(
+                None,
+                Some(OsStr::new("~/relocated")),
+                user_home,
+                fallback.clone(),
+            ),
+            user_home.join("relocated/.pi/agent"),
+        );
+        // Relative SESSIONS_HOME is made absolute like the catalog does.
+        assert_eq!(
+            resolve_agent_base(None, Some(OsStr::new("relocated")), user_home, fallback.clone()),
+            std::env::current_dir()
+                .expect("current dir")
+                .join("relocated/.pi/agent"),
+        );
+        // PI_CODING_AGENT_DIR also gets tilde-expanded like the catalog.
+        assert_eq!(
+            resolve_agent_base(
+                Some(OsStr::new("~/custom")),
+                Some(OsStr::new("/sessions")),
+                user_home,
+                fallback.clone(),
+            ),
+            user_home.join("custom"),
         );
     }
 }
@@ -1499,6 +1795,16 @@ fn session_tree_from_values(path: &Path, values: &[Value]) -> Result<SessionTree
             continue;
         };
         let entry_type = nonempty_string(object, "type").unwrap_or_default();
+        let is_todo_snapshot = entry_type == "todo_snapshot";
+        let todo_state = match object.get("state") {
+            Some(state) if is_todo_snapshot => Some(
+                serde_json::from_value(state.clone()).with_context(|| {
+                    format!("decoding todo_snapshot {id} in {}", path.display())
+                })?,
+            ),
+            Some(state) => serde_json::from_value(state.clone()).ok(),
+            None => None,
+        };
         let message = object
             .get("message")
             .and_then(|message| serde_json::from_value::<Message>(message.clone()).ok());
@@ -1562,12 +1868,9 @@ fn session_tree_from_values(path: &Path, values: &[Value]) -> Result<SessionTree
             name: object.get("name").and_then(Value::as_str).map(str::to_owned),
             label: nonempty_string(object, "label"),
             target_id: nonempty_string(object, "targetId"),
+            todo_state,
             from_id: nonempty_string(object, "fromId"),
             custom_type: nonempty_string(object, "customType"),
-            todo_state: object
-                .get("state")
-                .cloned()
-                .and_then(|state| serde_json::from_value(state).ok()),
         };
         by_id.insert(id, entries.len());
         entries.push(entry);
@@ -1575,7 +1878,7 @@ fn session_tree_from_values(path: &Path, values: &[Value]) -> Result<SessionTree
     let leaf_id = entries
         .iter()
         .rev()
-        .find(|entry| entry.entry_type != "label")
+        .find(|entry| entry.entry_type != "label" && entry.entry_type != "checkpoint")
         .map(|entry| entry.id.clone());
     let (children_by_parent, labels) = build_tree_indexes(&entries, &by_id);
     Ok(SessionTree {
@@ -1719,6 +2022,122 @@ pub fn latest_session(cwd: impl AsRef<Path>) -> Option<SessionInfo> {
     list_sessions_in(cwd, None).into_iter().next()
 }
 
+/// Best-effort TTL cleanup of native session files.
+///
+/// Walks each root in `roots` (typically [`native_sessions_root`] and/or the
+/// resolved session directory) and deletes every `*.jsonl` session file whose
+/// last-modified time is older than `ttl`. Only the native pi session tree is
+/// touched: foreign sources (codex/claude/grok) live in separate roots and are
+/// never walked here. Deletion is scoped to regular files directly in a root,
+/// one directory deep (per-cwd `--<encoded-cwd>--` directories), or two deep
+/// (durable children under `children/<parent-id>/`); symlinks and symlinked
+/// directories are never followed, and non-`.jsonl` files (e.g. loop-scheduler
+/// `.loops.json` sidecars) are left alone. After deleting, now-empty
+/// subdirectories are removed best-effort.
+///
+/// Never pruned: files modified within [`SESSION_ACTIVE_GRACE`] of `now`
+/// (the conservative active/locked-session guard — the native store has no
+/// lock files), files listed in `skip` (the current session's file, whether
+/// freshly started or resumed from an old mtime), directories listed in
+/// `dir_skip` (the live run's session directory root and the parent of its
+/// session file — never removed even when empty, since a just-started
+/// recorder may not have flushed its first file yet), and files with a future
+/// mtime or unreadable metadata.
+///
+/// I/O errors are swallowed so the call can never fail startup. Returns the
+/// number of deleted session files.
+#[must_use]
+pub fn prune_expired_sessions(
+    roots: &[PathBuf],
+    now: SystemTime,
+    ttl: Duration,
+    skip: &[PathBuf],
+    dir_skip: &[PathBuf],
+) -> usize {
+    let skip = skip.iter().map(|path| absolute_path(path)).collect::<HashSet<_>>();
+    let dir_skip = dir_skip
+        .iter()
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| absolute_path(path)))
+        .collect::<HashSet<_>>();
+    let mut deleted = 0;
+    let mut seen_roots = HashSet::new();
+    for root in roots {
+        let root = absolute_path(root);
+        if !seen_roots.insert(root.clone()) {
+            continue;
+        }
+        deleted += prune_expired_in_dir(&root, 0, now, ttl, &skip, &dir_skip);
+    }
+    deleted
+}
+
+/// Recursively delete expired session files under `dir` (files at up to two
+/// directory levels below a root), then best-effort remove emptied dirs.
+/// Directories in `dir_skip` are never removed, even when empty: the current
+/// run's session directory may hold a recorder whose first file is not on
+/// disk yet, and deleting it would make the next flush fail with ENOENT.
+fn prune_expired_in_dir(
+    dir: &Path,
+    depth: usize,
+    now: SystemTime,
+    ttl: Duration,
+    skip: &HashSet<PathBuf>,
+    dir_skip: &HashSet<PathBuf>,
+) -> usize {
+    let Ok(read_dir) = fs::read_dir(dir) else { return 0; };
+    let mut deleted = 0;
+    let mut subdirs = Vec::new();
+    for entry in read_dir.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else { continue; };
+        if file_type.is_dir() {
+            subdirs.push(path);
+            continue;
+        }
+        if !file_type.is_file()
+            || path.extension().is_none_or(|extension| extension != "jsonl")
+            || skip.contains(&absolute_path(&path))
+        {
+            continue;
+        }
+        if session_file_expired(&path, now, ttl) && fs::remove_file(&path).is_ok() {
+            deleted += 1;
+        }
+    }
+    if depth < 2 {
+        for subdir in subdirs {
+            deleted += prune_expired_in_dir(&subdir, depth + 1, now, ttl, skip, dir_skip);
+            // Best-effort: drop per-cwd / child dirs (and the `children`
+            // root) once they no longer hold any files. Fails safely when the
+            // dir still contains sidecars or fresh sessions. The live run's
+            // session directory (and the parent of its session file) is
+            // compared canonically so symlinked roots still match.
+            let protected = dir_skip.contains(&subdir)
+                || fs::canonicalize(&subdir)
+                    .map(|canonical| dir_skip.contains(&canonical))
+                    .unwrap_or(false);
+            if !protected {
+                let _ = fs::remove_dir(&subdir);
+            }
+        }
+    }
+    deleted
+}
+
+fn session_file_expired(path: &Path, now: SystemTime, ttl: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path) else { return false; };
+    let Ok(modified) = metadata.modified() else { return false; };
+    // Implausible mtimes are never "old": future mtimes (clock skew) and
+    // mtimes predating the sessions store itself (planted fixtures, restored
+    // archives) are both skipped.
+    let floor = std::time::UNIX_EPOCH + Duration::from_secs(PRUNE_MTIME_FLOOR_SECS);
+    if modified < floor {
+        return false;
+    }
+    let Ok(age) = now.duration_since(modified) else { return false; };
+    age >= SESSION_ACTIVE_GRACE && age > ttl
+}
+
 /// Rename a saved session after proving the target is a regular JSONL file
 /// directly inside the session root for `cwd`.
 pub fn rename_saved_session(
@@ -1785,6 +2204,67 @@ pub(crate) fn normalize_session_name(name: &str) -> Option<String> {
     }
     let normalized = normalized.trim();
     (!normalized.is_empty()).then(|| normalized.to_owned())
+}
+
+/// Validate a `/checkpoint <name>` marker name.
+///
+/// A checkpoint name is a single whitespace-free word (the CLI splits slash
+/// arguments on whitespace, so anything else would be unreachable) and must
+/// not look like an entry index, because `/rewind 5` always resolves to an
+/// index and never to a checkpoint.
+fn normalize_checkpoint_name(name: &str) -> Result<String> {
+    let normalized = name.trim();
+    anyhow::ensure!(
+        !normalized.is_empty(),
+        "checkpoint name must not be empty"
+    );
+    anyhow::ensure!(
+        !normalized.chars().any(char::is_whitespace),
+        "checkpoint name must be a single word (no whitespace)"
+    );
+    anyhow::ensure!(
+        normalized.parse::<usize>().is_err(),
+        "checkpoint name must not be a plain number (use /rewind <index> for entry indices)"
+    );
+    Ok(normalized.to_owned())
+}
+
+/// Write the truncated record tail to a `.rewind-<timestamp>.jsonl` sidecar
+/// next to the session file (same directory, same record serialization, no
+/// header). Writes with `create_new` and bumps a numeric suffix on collision
+/// so an archive can never overwrite an earlier one. fsyncs before returning.
+fn archive_rewind_tail(session_path: &Path, tail: &[u8]) -> Result<PathBuf> {
+    let directory = session_path
+        .parent()
+        .ok_or_else(|| anyhow!("session path {} has no parent directory", session_path.display()))?;
+    fs::create_dir_all(directory)
+        .with_context(|| format!("creating session directory {}", directory.display()))?;
+    let file_name = session_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session");
+    let timestamp = iso_now().replace([':', '.'], "-");
+    let mut candidate = directory.join(format!("{file_name}.rewind-{timestamp}.jsonl"));
+    let mut attempt = 0;
+    while candidate.exists() {
+        attempt += 1;
+        candidate = directory.join(format!("{file_name}.rewind-{timestamp}-{attempt}.jsonl"));
+    }
+    let mut archive = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&candidate)
+        .with_context(|| format!("creating rewind archive {}", candidate.display()))?;
+    archive
+        .write_all(tail)
+        .with_context(|| format!("writing rewind archive {}", candidate.display()))?;
+    archive
+        .flush()
+        .with_context(|| format!("flushing rewind archive {}", candidate.display()))?;
+    archive
+        .sync_all()
+        .with_context(|| format!("syncing rewind archive {}", candidate.display()))?;
+    Ok(candidate)
 }
 
 fn append_token_from_state(state: &RecorderState) -> SessionAppendToken {
@@ -1906,8 +2386,24 @@ fn prepare_entry(state: &mut RecorderState, entry_type: &str, fields: Value) -> 
 }
 
 
+/// Recreate the recorder's session directory if a prune (or manual cleanup)
+/// removed it while the recorder was still holding its first write in memory.
+/// The auto-id startup path keeps the file unwritten until the first flush, so
+/// the directory can legitimately be empty on disk; this makes the first flush
+/// succeed regardless. No-op when the parent already exists.
+fn ensure_session_parent(state: &RecorderState) -> Result<()> {
+    let Some(parent) = state.path.parent() else { return Ok(()) };
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating session directory {}", parent.display()))
+}
+
 fn persist_durable(state: &mut RecorderState) -> Result<()> {
     if !state.flushed {
+        // Self-heal: the startup TTL prune may have removed this recorder's
+        // (still empty) per-cwd directory before the first flush. Recreate it
+        // so the first write cannot fail with ENOENT. Idempotent when the
+        // parent already exists.
+        ensure_session_parent(state)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1939,6 +2435,11 @@ fn persist(state: &mut RecorderState) -> Result<()> {
         return Ok(());
     }
     if !state.flushed {
+        // Self-heal: the startup TTL prune may have removed this recorder's
+        // (still empty) per-cwd directory before the first flush. Recreate it
+        // so the first write cannot fail with ENOENT. Idempotent when the
+        // parent already exists.
+        ensure_session_parent(state)?;
         let mut file = OpenOptions::new()
             .write(true)
             .read(true)
@@ -2826,6 +3327,46 @@ mod tests {
     }
 
     #[test]
+    fn malformed_todo_snapshot_fails_load_and_resume() {
+        let directory =
+            std::env::temp_dir().join(format!("pi-session-corrupt-todo-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let path = directory.join("session.jsonl");
+        let lines = [
+            json!({
+                "type": "session",
+                "version": CURRENT_SESSION_VERSION,
+                "id": "corrupt-todo-session",
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "cwd": directory,
+            }),
+            json!({
+                "type": "todo_snapshot",
+                "id": "bad-todo",
+                "parentId": null,
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "state": { "phases": "not-an-array", "storage": "session" },
+            }),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| serde_json::to_string(line).expect("serialize record"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write malformed todo snapshot");
+
+        let load_error = load_session_tree(&path).expect_err("reject malformed todo snapshot");
+        assert!(load_error.to_string().contains("decoding todo_snapshot bad-todo"));
+        let resume_error = resume_session(&path).expect_err("reject malformed todo resume");
+        assert!(resume_error.to_string().contains("decoding todo_snapshot bad-todo"));
+
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn resume_separates_final_records_without_newline() {
         for suffix in ["", "\r"] {
             let directory = std::env::temp_dir().join(format!("pi-session-newline-{}", Uuid::new_v4()));
@@ -3383,6 +3924,7 @@ mod tests {
                     depends_on: Vec::new(),
                     ready: true,
                     blocked_by: Vec::new(),
+                    agent: None,
                 }, crate::TodoItem {
                     id: "task-test".to_owned(),
                     content: "test".to_owned(),
@@ -3394,6 +3936,7 @@ mod tests {
                         content: "compile".to_owned(),
                         status: crate::TodoStatus::InProgress,
                     }],
+                    agent: None,
                 }],
             }],
             storage: crate::TodoStorage::Session,
@@ -3475,6 +4018,460 @@ mod tests {
         let roots = tree.tree();
         assert_eq!(roots.iter().map(|node| node.entry.id.as_str()).collect::<Vec<_>>(), ["early", "late"]);
         assert_eq!(roots[1].children.iter().map(|node| node.entry.id.as_str()).collect::<Vec<_>>(), ["child-early", "child-late"]);
+    }
+
+    fn set_modified_epoch(path: &Path, epoch: u64) {
+        let file = File::options().write(true).open(path).expect("open");
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(epoch)),
+        )
+        .expect("set mtime");
+    }
+
+    fn write_session_file(path: &Path, id: &str) {
+        fs::write(path, native_session_body(path.parent().expect("parent"), id, id))
+            .expect("write session");
+    }
+
+    const PRUNE_NOW_EPOCH: u64 = 1_800_000_000;
+    const PRUNE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+    const OLD_EPOCH: u64 = PRUNE_NOW_EPOCH - 40 * 24 * 60 * 60; // 40 days ago
+    const FRESH_EPOCH: u64 = PRUNE_NOW_EPOCH - 24 * 60 * 60; // 1 day ago
+
+    #[test]
+    fn prune_removes_only_old_native_sessions_keeps_new_foreign_current_and_sidecars() {
+        let tree = tempfile::tempdir().expect("native tree");
+        let per_cwd = tree.path().join("--proj--");
+        let parent_dir = tree.path().join("children").join("parent-1");
+        let gone_dir = tree.path().join("--gone--");
+        let sidecar_dir = tree.path().join("--sidecar-only--");
+        fs::create_dir_all(&per_cwd).expect("per-cwd dir");
+        fs::create_dir_all(&parent_dir).expect("child dir");
+        fs::create_dir_all(&gone_dir).expect("gone dir");
+        fs::create_dir_all(&sidecar_dir).expect("sidecar dir");
+
+        let old = per_cwd.join("old.jsonl");
+        let child_old = parent_dir.join("child-old.jsonl");
+        let direct = tree.path().join("direct.jsonl");
+        let only_old = gone_dir.join("only-old.jsonl");
+        let sidecar_only = sidecar_dir.join("sidecar-only.jsonl");
+        let fresh = per_cwd.join("fresh.jsonl");
+        let current = per_cwd.join("current.jsonl");
+        let child_new = parent_dir.join("child-new.jsonl");
+        let notes = per_cwd.join("notes.txt");
+        let sidecar = per_cwd.join("old.jsonl.loops.json");
+        let kept_sidecar = sidecar_dir.join("sidecar-only.jsonl.loops.json");
+        for path in [&old, &child_old, &direct, &only_old, &sidecar_only, &fresh, &current, &child_new] {
+            write_session_file(path, "s");
+        }
+        fs::write(&notes, "not a session").expect("notes");
+        fs::write(&sidecar, "{}").expect("sidecar");
+        fs::write(&kept_sidecar, "{}").expect("kept sidecar");
+
+        // Foreign tree: old sessions outside the pruned roots must survive.
+        let foreign = tempfile::tempdir().expect("foreign tree");
+        let foreign_old = foreign.path().join("rollout-old.jsonl");
+        write_session_file(&foreign_old, "foreign");
+
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(PRUNE_NOW_EPOCH);
+        for path in [&old, &child_old, &direct, &only_old, &sidecar_only, &current, &notes, &sidecar, &kept_sidecar, &foreign_old] {
+            set_modified_epoch(path, OLD_EPOCH);
+        }
+        set_modified_epoch(&fresh, FRESH_EPOCH);
+        set_modified_epoch(&child_new, FRESH_EPOCH);
+
+        let deleted = prune_expired_sessions(
+            &[tree.path().to_path_buf(), tree.path().to_path_buf()], // duplicate roots must dedupe
+            now,
+            PRUNE_TTL,
+            &[current.clone()],
+            &[],
+        );
+        assert_eq!(deleted, 5, "old per-cwd, old child, direct-in-root, only-old, and sidecar-only files go");
+        for path in [&old, &child_old, &direct, &only_old, &sidecar_only] {
+            assert!(!path.exists(), "{} must be pruned", path.display());
+        }
+        assert!(!gone_dir.exists(), "emptied per-cwd dir must be removed");
+        for path in [&fresh, &current, &child_new, &notes, &sidecar, &kept_sidecar] {
+            assert!(path.exists(), "{} must survive", path.display());
+        }
+        assert!(per_cwd.exists(), "dir with surviving sessions/sidecar stays");
+        assert!(tree.path().join("children").exists(), "children root stays while parent-1 is non-empty");
+        assert!(parent_dir.exists(), "child dir with a fresh session stays");
+        assert!(sidecar_dir.exists(), "dir holding a loop sidecar stays after its session file is pruned");
+        assert!(foreign_old.exists(), "foreign tree is never touched");
+    }
+
+    #[test]
+    fn prune_skips_recent_files_within_grace_even_when_older_than_ttl() {
+        let tree = tempfile::tempdir().expect("tree");
+        let within_grace = tree.path().join("recent.jsonl");
+        let truly_old = tree.path().join("old.jsonl");
+        write_session_file(&within_grace, "recent");
+        write_session_file(&truly_old, "old");
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(PRUNE_NOW_EPOCH);
+        set_modified_epoch(&within_grace, PRUNE_NOW_EPOCH - 30 * 60); // 30 min ago
+        set_modified_epoch(&truly_old, PRUNE_NOW_EPOCH - 2 * 60 * 60); // 2 h ago
+        let ttl = Duration::from_secs(10 * 60); // smaller than the grace window
+        let deleted = prune_expired_sessions(&[tree.path().to_path_buf()], now, ttl, &[], &[]);
+        assert_eq!(deleted, 1);
+        assert!(within_grace.exists(), "grace window must override TTL");
+        assert!(!truly_old.exists(), "past both grace and TTL must be pruned");
+    }
+
+    #[test]
+    fn prune_is_idempotent_and_missing_roots_are_harmless() {
+        let tree = tempfile::tempdir().expect("tree");
+        let old = tree.path().join("old.jsonl");
+        write_session_file(&old, "old");
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(PRUNE_NOW_EPOCH);
+        set_modified_epoch(&old, OLD_EPOCH);
+        let missing = tree.path().join("does-not-exist");
+
+        assert_eq!(prune_expired_sessions(&[missing], now, PRUNE_TTL, &[], &[]), 0, "missing root is a no-op");
+        assert_eq!(prune_expired_sessions(&[tree.path().to_path_buf()], now, PRUNE_TTL, &[], &[]), 1);
+        assert!(!old.exists(), "expired file must be gone after the first pass");
+        assert_eq!(prune_expired_sessions(&[tree.path().to_path_buf()], now, PRUNE_TTL, &[], &[]), 0, "second pass deletes nothing");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_never_follows_or_deletes_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tree = tempfile::tempdir().expect("tree");
+        let target = tree.path().join("target.jsonl");
+        write_session_file(&target, "target");
+        let link = tree.path().join("link.jsonl");
+        symlink(&target, &link).expect("symlink");
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(PRUNE_NOW_EPOCH);
+        set_modified_epoch(&target, OLD_EPOCH);
+
+        let deleted = prune_expired_sessions(&[tree.path().to_path_buf()], now, PRUNE_TTL, &[], &[]);
+        assert_eq!(deleted, 1);
+        assert!(!target.exists(), "the real file expires");
+        // `Path::exists` follows the link, so probe the link itself.
+        assert!(
+            fs::symlink_metadata(&link).is_ok(),
+            "the symlink entry itself is never deleted"
+        );
+    }
+
+    #[test]
+    fn prune_skips_future_mtimes() {
+        let tree = tempfile::tempdir().expect("tree");
+        let future = tree.path().join("future.jsonl");
+        write_session_file(&future, "future");
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(PRUNE_NOW_EPOCH);
+        set_modified_epoch(&future, PRUNE_NOW_EPOCH + 60 * 60); // 1 h in the future
+
+        let deleted = prune_expired_sessions(&[tree.path().to_path_buf()], now, PRUNE_TTL, &[], &[]);
+        assert_eq!(deleted, 0, "clock-skewed future mtimes must never be pruned");
+        assert!(future.exists());
+    }
+
+    #[test]
+    fn prune_never_removes_live_recorder_directory() {
+        let tree = tempfile::tempdir().expect("native tree");
+        let live_dir = tree.path().join("--live--");
+        let stale_dir = tree.path().join("--stale--");
+        fs::create_dir_all(&live_dir).expect("live per-cwd dir");
+        fs::create_dir_all(&stale_dir).expect("stale per-cwd dir");
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(PRUNE_NOW_EPOCH);
+
+        // A just-started recorder holds its header in memory, so its per-cwd
+        // directory is EMPTY on disk at startup-prune time. The live run's
+        // directory must survive the prune even though it holds no file yet;
+        // other empty dirs are still best-effort removed.
+        let deleted = prune_expired_sessions(
+            &[tree.path().to_path_buf()],
+            now,
+            PRUNE_TTL,
+            &[],
+            &[live_dir.clone()],
+        );
+        assert_eq!(deleted, 0);
+        assert!(
+            live_dir.exists(),
+            "live recorder directory must never be pruned while empty"
+        );
+        assert!(!stale_dir.exists(), "empty stale dir is still best-effort removed");
+    }
+
+    #[test]
+    fn persist_recreates_directory_removed_by_prune() {
+        // Regular flush path (`persist`): the auto-id recorder starts with no
+        // file on disk; a TTL prune can remove its (empty) directory before
+        // the first assistant persist. The first persist must recreate it.
+        let directory = tempfile::tempdir().expect("directory");
+        let recorder = start_session_in(
+            directory.path(),
+            None,
+            None,
+            Some(directory.path()),
+            None,
+            None,
+        )
+        .expect("start session");
+        assert!(!recorder.path().exists(), "auto-id recorder starts unwritten");
+        fs::remove_dir_all(directory.path()).expect("simulate prune removing the session dir");
+        recorder.persist_now().expect("persist must recreate the removed directory");
+        assert!(recorder.path().exists(), "first persist recreates the session directory");
+        assert!(
+            load_session_tree(recorder.path()).is_ok(),
+            "recreated file holds a readable session"
+        );
+
+        // Durable path (`persist_durable`, the goal journal's first write):
+        // same self-healing, exercised through the goal's durable append.
+        let directory = tempfile::tempdir().expect("durable directory");
+        let recorder = start_session_in(
+            directory.path(),
+            None,
+            None,
+            Some(directory.path()),
+            None,
+            None,
+        )
+        .expect("start durable session");
+        fs::remove_dir_all(directory.path()).expect("simulate prune removing the durable session dir");
+        recorder
+            .persist_now_durable()
+            .expect("durable persist must recreate the removed directory");
+        assert!(
+            recorder.path().exists(),
+            "first durable persist recreates the session directory"
+        );
+        assert!(
+            load_session_tree(recorder.path()).is_ok(),
+            "recreated durable file holds a readable session"
+        );
+    }
+
+    #[test]
+    fn native_sessions_root_matches_catalog_native_root() {
+        // Both resolve PI_CODING_AGENT_DIR > SESSIONS_HOME/.pi/agent > home;
+        // when the environment can't yield a home the catalog comparison is
+        // skipped rather than made flaky.
+        let Ok(catalog) = crate::SessionCatalog::from_env() else { return; };
+        let catalog_root = catalog.root_for(crate::SessionSourceKind::NativePi).path;
+        assert_eq!(native_sessions_root(), catalog_root);
+    }
+
+    #[test]
+    fn rewind_truncates_archives_tail_and_rebuilds_recorder_state() {
+        let directory = tempfile::tempdir().expect("directory");
+        let recorder = start_session_in(
+            directory.path(),
+            None,
+            None,
+            Some(directory.path()),
+            Some("rewind-store"),
+            None,
+        )
+        .expect("start session");
+        let mut ids = Vec::new();
+        for text in ["one", "two", "three", "four"] {
+            ids.push(
+                recorder
+                    .record_message(&Message::user_text(text, 0))
+                    .expect("record message"),
+            );
+        }
+        recorder.persist_now().expect("persist");
+        let path = recorder.path();
+        assert_eq!(load_session_tree(&path).expect("load before").entries.len(), 4);
+
+        let outcome = recorder.rewind_to(2).expect("rewind");
+        assert_eq!(outcome.retained_entries, 2);
+        assert_eq!(outcome.dropped_entries, 2);
+        assert!(outcome.archive_path.exists(), "archive sidecar must exist");
+
+        // The session file is truncated to the retained records.
+        let after = load_session_tree(&path).expect("load after");
+        assert_eq!(after.entries.len(), 2);
+        assert_eq!(after.entries[0].id, ids[0]);
+        assert_eq!(after.entries[1].id, ids[1]);
+        assert_eq!(after.leaf_id.as_deref(), Some(ids[1].as_str()));
+
+        // The archive holds the dropped tail with the same record
+        // serialization (plain JSONL, no header).
+        let archive = fs::read_to_string(&outcome.archive_path).expect("read archive");
+        let tail_ids = archive
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| {
+                value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tail_ids, vec![ids[2].clone(), ids[3].clone()]);
+
+        // The recorder stays appendable from the new leaf.
+        let next = recorder
+            .record_message(&Message::user_text("five", 0))
+            .expect("append after rewind");
+        let tree = recorder.tree().expect("tree after rewind");
+        let appended = tree
+            .entries
+            .iter()
+            .find(|entry| entry.id == next)
+            .expect("appended entry");
+        assert_eq!(appended.parent_id.as_deref(), Some(ids[1].as_str()));
+        assert_eq!(recorder.last_entry_id().as_deref(), Some(next.as_str()));
+    }
+
+    #[test]
+    fn rewind_refuses_past_first_entry_and_at_end() {
+        let directory = tempfile::tempdir().expect("directory");
+        let recorder = start_session_in(
+            directory.path(),
+            None,
+            None,
+            Some(directory.path()),
+            Some("rewind-bounds"),
+            None,
+        )
+        .expect("start session");
+        recorder
+            .record_message(&Message::user_text("only", 0))
+            .expect("record");
+        recorder.persist_now().expect("persist");
+
+        let error = recorder
+            .rewind_to(0)
+            .expect_err("rewinding past the first entry must be refused");
+        assert!(format!("{error:#}").contains("past the first entry"));
+        let error = recorder
+            .rewind_to(1)
+            .expect_err("rewinding to the end is a no-op and must be refused");
+        assert!(format!("{error:#}").contains("nothing to rewind"));
+
+        // An empty (header-only) session has nothing to rewind either.
+        let empty = start_session_in(
+            directory.path(),
+            None,
+            None,
+            Some(directory.path()),
+            Some("rewind-empty"),
+            None,
+        )
+        .expect("empty session");
+        empty.persist_now().expect("persist");
+        let error = empty
+            .rewind_to(1)
+            .expect_err("empty session must refuse rewinds");
+        assert!(format!("{error:#}").contains("nothing to rewind"));
+    }
+
+    #[test]
+    fn record_checkpoint_marks_position_without_joining_the_chain() {
+        let directory = tempfile::tempdir().expect("directory");
+        let recorder = start_session_in(
+            directory.path(),
+            None,
+            None,
+            Some(directory.path()),
+            Some("checkpoint-store"),
+            None,
+        )
+        .expect("start session");
+        let first = recorder
+            .record_message(&Message::user_text("one", 0))
+            .expect("record one");
+        let second = recorder
+            .record_message(&Message::user_text("two", 0))
+            .expect("record two");
+        recorder.persist_now().expect("persist");
+
+        let marker = recorder.record_checkpoint("mid").expect("mark checkpoint");
+        assert_eq!(
+            recorder.last_entry_id().as_deref(),
+            Some(second.as_str()),
+            "checkpoint must not become the leaf"
+        );
+
+        let tree = recorder.tree().expect("tree");
+        let checkpoint = tree
+            .entries
+            .iter()
+            .find(|entry| entry.id == marker)
+            .expect("checkpoint entry");
+        assert_eq!(checkpoint.entry_type, "checkpoint");
+        assert_eq!(checkpoint.name.as_deref(), Some("mid"));
+        assert_eq!(checkpoint.target_id.as_deref(), Some(second.as_str()));
+
+        // A fresh file load also treats the marker as a side record, not the
+        // active leaf.
+        let loaded = load_session_tree(recorder.path()).expect("fresh load");
+        assert_eq!(loaded.leaf_id.as_deref(), Some(second.as_str()));
+
+        // The next append parents from the marked entry, never the marker.
+        let third = recorder
+            .record_message(&Message::user_text("three", 0))
+            .expect("record three");
+        let tree = recorder.tree().expect("tree after append");
+        let appended = tree
+            .entries
+            .iter()
+            .find(|entry| entry.id == third)
+            .expect("appended entry");
+        assert_eq!(appended.parent_id.as_deref(), Some(second.as_str()));
+
+        // Re-marking a name appends a second marker (newest wins on resolve).
+        recorder.record_checkpoint("mid").expect("re-mark");
+        let tree = recorder.tree().expect("tree after re-mark");
+        let markers = tree
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.entry_type == "checkpoint" && entry.name.as_deref() == Some("mid")
+            })
+            .count();
+        assert_eq!(markers, 2);
+    }
+
+    #[test]
+    fn checkpoint_names_are_single_words_never_numeric_and_require_entries() {
+        let directory = tempfile::tempdir().expect("directory");
+        let recorder = start_session_in(
+            directory.path(),
+            None,
+            None,
+            Some(directory.path()),
+            Some("checkpoint-names"),
+            None,
+        )
+        .expect("start session");
+        recorder
+            .record_message(&Message::user_text("one", 0))
+            .expect("record");
+        for name in ["", "   ", "two words", "7"] {
+            recorder
+                .record_checkpoint(name)
+                .expect_err("invalid checkpoint name must be refused");
+        }
+        recorder
+            .record_checkpoint("ok-name")
+            .expect("single word name is accepted");
+
+        // An empty session cannot checkpoint: there is no position to mark.
+        let empty = start_session_in(
+            directory.path(),
+            None,
+            None,
+            Some(directory.path()),
+            Some("checkpoint-empty"),
+            None,
+        )
+        .expect("empty session");
+        empty.persist_now().expect("persist");
+        let error = empty
+            .record_checkpoint("mark")
+            .expect_err("empty session cannot checkpoint");
+        assert!(format!("{error:#}").contains("empty"));
     }
 
 

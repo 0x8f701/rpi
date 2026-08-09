@@ -1,4 +1,4 @@
-//! End-to-end wire contracts for the `rpi-rpc` binary.
+//! End-to-end wire contracts for `rpi rpc` (the JSONL RPC control plane).
 //!
 //! These tests drive the real binary over stdin/stdout with a temporary HOME
 //! and the built-in faux model. Every assertion checks JSON objects on the
@@ -7,17 +7,55 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn rpc_bin() -> String {
-    env!("CARGO_BIN_EXE_rpi-rpc").to_owned()
+/// Spawn the real `rpi` binary with the `rpc` subcommand first — the
+/// successor of the removed `rpi-rpc` companion binary (≡ `--mode rpc`).
+fn rpc_cmd() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rpi"));
+    command.arg("rpc");
+    command
+}
+
+/// One record pumped from the child's stdout by the reader thread.
+enum RpcLine {
+    Line(String),
+    Eof,
+    Error(std::io::Error),
+}
+
+/// Pump the child's stdout into the channel so every reader can apply a real
+/// deadline: `BufReader::read_line` blocks without a timeout, which would let
+/// a missing record hang the test instead of failing it.
+fn pump_stdout(mut stdout: ChildStdout, tx: &mpsc::Sender<RpcLine>) {
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                let _ = tx.send(RpcLine::Eof);
+                return;
+            }
+            Ok(_) => {
+                if tx.send(RpcLine::Line(std::mem::take(&mut line))).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(RpcLine::Error(error));
+                return;
+            }
+        }
+    }
 }
 
 struct RpcSession {
     child: Child,
-    stdout: BufReader<ChildStdout>,
+    lines: mpsc::Receiver<RpcLine>,
     /// Keeps the temp HOME alive for the process lifetime.
     _home: tempfile::TempDir,
 }
@@ -25,7 +63,7 @@ struct RpcSession {
 impl RpcSession {
     fn spawn() -> Self {
         let home = tempfile::tempdir().expect("temporary HOME");
-        let mut child = Command::new(rpc_bin())
+        let mut child = rpc_cmd()
             .args(["--offline", "--model", "faux/faux-1"])
             .env("HOME", home.path())
             .env("PI_OFFLINE", "1")
@@ -36,11 +74,13 @@ impl RpcSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn rpi-rpc");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout pipe"));
+            .expect("spawn rpi rpc");
+        let (tx, rx) = mpsc::channel();
+        let stdout = child.stdout.take().expect("stdout pipe");
+        std::thread::spawn(move || pump_stdout(stdout, &tx));
         Self {
             child,
-            stdout,
+            lines: rx,
             _home: home,
         }
     }
@@ -67,27 +107,17 @@ impl RpcSession {
     }
 
     /// Read the next non-empty JSONL record, failing if the deadline elapses.
+    /// The pump thread converts the blocking pipe read into channel records, so
+    /// `recv_timeout` enforces the deadline even when the server stays silent.
     fn read_json_deadline(&mut self, deadline: Instant) -> Value {
-        let mut line = String::new();
         loop {
-            line.clear();
-            // BufReader::read_line blocks; poll child exit if we already closed stdin.
-            // Use a short timed approach via try_wait + blocking read is unavoidable
-            // without threads — spawn a helper thread only when needed by callers that
-            // already closed stdin. Here we rely on the server always answering.
-            if Instant::now() > deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 let _ = self.child.kill();
-                panic!("timed out waiting for next JSONL record from rpi-rpc");
+                panic!("timed out waiting for next JSONL record from rpi rpc");
             }
-            match self.stdout.read_line(&mut line) {
-                Ok(0) => {
-                    // EOF — collect status for diagnostics.
-                    let status = self.child.try_wait().ok().flatten();
-                    panic!(
-                        "rpi-rpc stdout closed before next JSONL record (status={status:?})"
-                    );
-                }
-                Ok(_) => {
+            match self.lines.recv_timeout(remaining) {
+                Ok(RpcLine::Line(line)) => {
                     let trimmed = line.trim_end_matches(['\r', '\n']);
                     if trimmed.is_empty() {
                         continue;
@@ -105,7 +135,18 @@ impl RpcSession {
                     );
                     return value;
                 }
-                Err(error) => panic!("reading rpi-rpc stdout: {error}"),
+                Ok(RpcLine::Eof) => {
+                    // EOF — collect status for diagnostics.
+                    let status = self.child.try_wait().ok().flatten();
+                    panic!(
+                        "rpi rpc stdout closed before next JSONL record (status={status:?})"
+                    );
+                }
+                Ok(RpcLine::Error(error)) => panic!("reading rpi rpc stdout: {error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("rpi rpc stdout reader thread stopped")
+                }
             }
         }
     }
@@ -129,12 +170,25 @@ impl RpcSession {
         self.close_stdin();
         // Drain remaining stdout so the child is not blocked on a full pipe.
         let mut stdout = Vec::new();
-        let _ = self.stdout.read_to_end(&mut stdout);
+        let drain_deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = self.child.kill();
+                panic!("timed out draining rpi rpc stdout");
+            }
+            match self.lines.recv_timeout(remaining) {
+                Ok(RpcLine::Line(line)) => stdout.extend_from_slice(line.as_bytes()),
+                Ok(RpcLine::Eof) | Ok(RpcLine::Error(_)) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
         let mut stderr = Vec::new();
         if let Some(mut err) = self.child.stderr.take() {
             let _ = err.read_to_end(&mut stderr);
         }
-        let status = self.child.wait().expect("wait rpi-rpc");
+        let status = self.child.wait().expect("wait rpi rpc");
         Output {
             status,
             stdout,
@@ -153,10 +207,11 @@ fn run_rpc(stdin: &[u8]) -> (Vec<Value>, Output) {
     let mut lines = Vec::new();
     let mut raw = Vec::new();
     loop {
-        if Instant::now() > deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             let _ = session.child.kill();
             panic!(
-                "rpi-rpc exceeded deadline; partial lines={lines:?} stderr={}",
+                "rpi rpc exceeded deadline; partial lines={lines:?} stderr={}",
                 // best-effort
                 String::from_utf8_lossy(
                     &session
@@ -172,10 +227,8 @@ fn run_rpc(stdin: &[u8]) -> (Vec<Value>, Output) {
                 )
             );
         }
-        let mut line = String::new();
-        match session.stdout.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
+        match session.lines.recv_timeout(remaining) {
+            Ok(RpcLine::Line(line)) => {
                 raw.extend_from_slice(line.as_bytes());
                 let trimmed = line.trim_end_matches(['\r', '\n']);
                 if trimmed.is_empty() {
@@ -198,7 +251,11 @@ fn run_rpc(stdin: &[u8]) -> (Vec<Value>, Output) {
                 );
                 lines.push(value);
             }
-            Err(error) => panic!("reading rpi-rpc stdout: {error}"),
+            Ok(RpcLine::Eof) | Ok(RpcLine::Error(_)) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("rpi rpc stdout reader thread stopped")
+            }
         }
     }
 
@@ -206,7 +263,7 @@ fn run_rpc(stdin: &[u8]) -> (Vec<Value>, Output) {
     if let Some(mut err) = session.child.stderr.take() {
         let _ = err.read_to_end(&mut stderr);
     }
-    let status = session.child.wait().expect("wait rpi-rpc");
+    let status = session.child.wait().expect("wait rpi rpc");
     // Keep home alive until wait returns.
     drop(session._home);
     (
@@ -275,20 +332,19 @@ fn assert_success(line: &Value, command: &str, id: &str) {
 
 #[test]
 fn help_and_version_use_standalone_name() {
-    let help = Command::new(rpc_bin())
+    let help = rpc_cmd()
         .arg("--help")
         .output()
-        .expect("rpi-rpc --help");
+        .expect("rpi rpc --help");
     assert!(help.status.success());
     assert!(
-        String::from_utf8_lossy(&help.stdout)
-            .contains("rpi-rpc - rpi headless RPC server")
+        String::from_utf8_lossy(&help.stdout).contains("rpi headless RPC server")
     );
 
-    let version = Command::new(rpc_bin())
+    let version = rpc_cmd()
         .arg("--version")
         .output()
-        .expect("rpi-rpc --version");
+        .expect("rpi rpc --version");
     assert!(version.status.success());
     assert!(String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")));
 }
@@ -833,16 +889,33 @@ fn loop_crud_events_and_malformed_recovery_share_one_rpc_connection() {
     session.write_line(&format!(
         r#"{{"type":"loop_update","id":"loop-update","taskId":"{task_id}","interval":"2h","prompt":"rpc updated"}}"#
     ));
-    let (update_events, updated) = session.read_until(deadline, |line| {
-        is_response(line) && line.get("id").and_then(Value::as_str) == Some("loop-update")
-    });
+    // The `loop_updated` event and the command response are written by
+    // different tasks (`modes/rpc.rs` runs commands in spawned tasks while the
+    // main loop projects application events), so their wire order is not
+    // guaranteed. Read until both arrive, like the create phase above.
+    let update_deadline = Instant::now() + Duration::from_secs(20);
+    let mut updated = None;
+    let mut updated_event = None;
+    while updated.is_none() || updated_event.is_none() {
+        let line = session.read_json_deadline(update_deadline);
+        if is_response(&line)
+            && line.get("id").and_then(Value::as_str) == Some("loop-update")
+        {
+            updated = Some(line);
+            continue;
+        }
+        if line.get("type").and_then(Value::as_str) == Some("loop_updated")
+            && line["task"]["id"] == task_id
+        {
+            updated_event = Some(line);
+        }
+    }
+    let updated = updated.expect("loop update response");
     assert_success(&updated, "loop_update", "loop-update");
     assert_eq!(updated["data"]["intervalSecs"], 7_200);
     assert_eq!(updated["data"]["prompt"], "rpc updated");
-    assert!(update_events.iter().any(|line| {
-        line.get("type").and_then(Value::as_str) == Some("loop_updated")
-            && line["task"]["id"] == task_id
-    }));
+    let updated_event = updated_event.expect("loop_updated event");
+    assert_eq!(updated_event["task"]["id"], task_id);
 
     session.write_line(r#"{"type":"loop_list","id":"loop-list"}"#);
     let (_events, listed) = session.read_until(deadline, |line| {

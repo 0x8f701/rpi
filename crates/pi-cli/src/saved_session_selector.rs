@@ -223,7 +223,7 @@ impl SavedSessionSelector {
             self.selected = 0;
             return;
         }
-        self.selected = self.selected.saturating_add_signed(delta).min(count - 1);
+        self.selected = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
         if !self.query.is_empty() {
             self.query_selection = self.selected_row().map(SessionSelectionKey::from_row);
         }
@@ -400,7 +400,7 @@ fn row_matches(row: &ResumeSelectorRow, query: &str) -> bool {
             row.summary.as_str(),
             cwd.as_ref(),
             path.as_ref(),
-            row.search_text.as_str(),
+            row.message_blob.as_str(),
         ]
         .into_iter()
         .any(|candidate| fuzzy_match(candidate, token))
@@ -468,6 +468,7 @@ mod tests {
         modified_epoch: f64,
         status: CatalogRowStatus,
         search_text: &str,
+        message_blob: &str,
     ) -> ResumeSelectorRow {
         ResumeSelectorRow {
             source,
@@ -483,6 +484,7 @@ mod tests {
             name: name.map(str::to_owned),
             status,
             search_text: search_text.to_owned(),
+            message_blob: message_blob.to_owned(),
         }
     }
 
@@ -498,6 +500,7 @@ mod tests {
                 30.0,
                 CatalogRowStatus::Native,
                 "pi-id Zulu Native pi summary /work/pi /sessions/pi.jsonl",
+                "pi summary",
             ),
             row(
                 SessionSourceKind::Codex,
@@ -509,6 +512,7 @@ mod tests {
                 20.0,
                 CatalogRowStatus::Foreign,
                 "codex-id Codex summary deeply buried needle",
+                "deeply buried needle",
             ),
             row(
                 SessionSourceKind::Claude,
@@ -523,6 +527,7 @@ mod tests {
                     native_path: PathBuf::from("/sessions/imported-claude.jsonl"),
                 },
                 "claude-id Alpha Imported Claude summary imported transcript",
+                "imported transcript",
             ),
         ]
     }
@@ -578,6 +583,36 @@ mod tests {
     }
 
     #[test]
+    fn row_matches_does_not_bridge_filter_through_search_text() {
+        // `search_text` concatenates every field (including cwd/path), so
+        // matching against it let a query span field boundaries the selector
+        // should not see. row_matches now matches the isolated message_blob,
+        // so a token present only in search_text must not match — while tokens
+        // in message_blob and the explicit cwd candidate still do.
+        let rows = vec![row(
+            SessionSourceKind::Codex,
+            "codex-id",
+            None,
+            "Codex summary",
+            "/work/codex",
+            "/foreign/codex.jsonl",
+            20.0,
+            CatalogRowStatus::Foreign,
+            "codex-id Codex summary zxqvbridge-only-in-search /work/codex /foreign/codex.jsonl",
+            "actual message content",
+        )];
+        // Token present ONLY in search_text -> must not match after the fix.
+        assert!(
+            ids_for_query(&rows, "zxqvbridge").is_empty(),
+            "row_matches must not bridge via search_text; only message_blob and explicit fields are matchable"
+        );
+        // Sanity: message_blob content still matches.
+        assert_eq!(ids_for_query(&rows, "actual"), vec!["codex-id"]);
+        // Sanity: cwd remains an explicit matchable candidate.
+        assert_eq!(ids_for_query(&rows, "wrkcdx"), vec!["codex-id"]);
+    }
+
+    #[test]
     fn sorting_filtering_and_reload_preserve_stable_target_or_native_path() {
         let rows = mixed_rows();
         let mut selector = SavedSessionSelector::new(rows.clone(), None);
@@ -609,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn window_and_last_row_navigation_use_bounded_views() {
+    fn window_views_are_bounded_and_navigation_wraps() {
         let rows = (0..32)
             .map(|index| {
                 let id = format!("session-{index:02}");
@@ -623,6 +658,7 @@ mod tests {
                     &path,
                     f64::from(u32::try_from(index).expect("fixture index")),
                     CatalogRowStatus::Native,
+                    &id,
                     &id,
                 )
             })
@@ -648,10 +684,58 @@ mod tests {
             selector
                 .selected(), 31);
         assert_eq!(selector.selected_row().unwrap().session_id, "session-00");
+        // Wrapping down from the last row returns to the first.
         selector.move_selection(1);
         assert_eq!(
             selector
-                .selected(), 31);
+                .selected(), 0);
+        assert_eq!(selector.selected_row().unwrap().session_id, "session-31");
+    }
+
+    #[test]
+    fn move_selection_wraps_around_visible_sessions() {
+        let mut selector = SavedSessionSelector::new(mixed_rows(), None);
+        // Visible order (newest first): pi-id, codex-id, claude-id.
+        // Down past the end returns to the first row.
+        selector.move_selection(3);
+        assert_eq!(selector.selected(), 0);
+        assert_eq!(selector.selected_row().unwrap().session_id, "pi-id");
+        selector.move_selection(2);
+        assert_eq!(selector.selected(), 2);
+        selector.move_selection(1);
+        assert_eq!(selector.selected(), 0);
+        // Up from the first row wraps to the last.
+        selector.move_selection(-1);
+        assert_eq!(selector.selected(), 2);
+        assert_eq!(selector.selected_row().unwrap().session_id, "claude-id");
+        // A single-row list stays put in both directions.
+        let mut single = SavedSessionSelector::new(vec![mixed_rows().remove(0)], None);
+        single.move_selection(5);
+        assert_eq!(single.selected(), 0);
+        single.move_selection(-5);
+        assert_eq!(single.selected(), 0);
+    }
+
+    #[test]
+    fn move_selection_wraps_within_filtered_visible_sessions() {
+        let mut selector = SavedSessionSelector::new(mixed_rows(), None);
+        selector.push_query('c');
+        // Filtered visible (newest first): codex-id, claude-id.
+        assert_eq!(
+            selector
+                .visible_window(0, selector.visible_count())
+                .map(|(_, row)| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex-id", "claude-id"]
+        );
+        selector.move_selection(1);
+        assert_eq!(selector.selected_row().unwrap().session_id, "claude-id");
+        // Down past the end of the filtered list wraps back to its first row.
+        selector.move_selection(1);
+        assert_eq!(selector.selected_row().unwrap().session_id, "codex-id");
+        // Up from the filtered list's first row wraps to its last row.
+        selector.move_selection(-1);
+        assert_eq!(selector.selected_row().unwrap().session_id, "claude-id");
     }
 
     #[test]

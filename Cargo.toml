@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/pi-ai", "crates/pi-agent", "crates/pi-coding", "crates/pi-cli"]
+members = ["crates/pi-ai", "crates/pi-agent", "crates/pi-coding", "crates/pi-cli", "crates/pi-sandbox"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -18,22 +18,38 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 futures-util = "0.3"
 similar = "3.1"
+# Linux Codex sandbox library primitives: bubblewrap policy planning and
+# seccomp/no-new-privileges enforcement. Apache-2.0/BSD-3-Clause; no helper C.
+libc = "0.2"
+seccompiler = "0.5"
 globset = "0.4"
+# Plugin marketplace tarball installs (`rpi plugin install <source>.tgz`).
+tar = "0.4"
+flate2 = "1"
 ignore = "0.4"
 pi-ai = { path = "crates/pi-ai" }
 pi-agent = { path = "crates/pi-agent" }
 pi-coding = { path = "crates/pi-coding" }
-nix = { version = "0.29", default-features = false, features = ["signal", "process", "term"] }
+pi-sandbox = { path = "crates/pi-sandbox" }
+nix = { version = "0.29", default-features = false, features = ["signal", "process", "term", "resource", "poll"] }
 regex = "1.11"
 portable-pty = "0.9"
+# AES-256-GCM for passphrase-encrypted session shares (`/share --encrypt`).
+# ring is already in the dependency tree via rustls (reqwest) — reusing the
+# locked version adds no new downloads.
+ring = "0.17"
 ratatui = { version = "0.29", default-features = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 semver = "1.0"
 sha2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# TOML settings files (`settings.toml`) for Grok-config parity: parse (and,
+# when the settings file is TOML, serialize) via the toml data model.
+toml = "0.9"
 tempfile = "3"
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
@@ -41,8 +57,27 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 url = "2.5"
+# Typed LSP JSON-RPC message types for the `lsp` tool (hover/definition/
+# references/diagnostics/symbols/rename/code actions over a per-language
+# stdio language server). serde + fluent-uri only; MIT/Apache-2.0.
+lsp-types = "0.97"
+ast-grep-core = { version = "0.45", default-features = false, features = ["tree-sitter"] }
+# Structural code search/rewrite via ast-grep (tree-sitter). Curated grammar
+# subset keeps the build lean; disabled languages are rejected at the tool layer.
+ast-grep-language = { version = "0.45", default-features = false, features = [
+    "tree-sitter-rust", "tree-sitter-typescript", "tree-sitter-javascript",
+    "tree-sitter-python", "tree-sitter-go", "tree-sitter-c", "tree-sitter-cpp",
+    "tree-sitter-java", "tree-sitter-json", "tree-sitter-html", "tree-sitter-css",
+    "tree-sitter-bash", "tree-sitter-md", "tree-sitter-yaml",
+] }
 uuid = { version = "1.16", features = ["serde", "v4", "v7"] }
 walkdir = "2.5"
+# In-process QuickJS extension runtime (rquickjs, MIT). QuickJS-NG C sources are
+# vendored inside rquickjs-sys and compiled via `cc` at build time. The `futures`
+# feature provides AsyncRuntime/AsyncContext; `loader` provides set_loader for
+# ESM module resolution. `rust-alloc` is deliberately NOT enabled so that
+# set_memory_limit is enforced by the libc allocator.
+rquickjs = { version = "0.12", default-features = false, features = ["std", "futures", "loader"] }
 http = "1.3"
 # Image decode/encode/resize for the read tool's image pipeline (faithful port of
 # pi's processImage/resizeImage). BMP/WebP/PNG/JPEG/GIF decode + Lanczos3 resize.
@@ -55,6 +90,14 @@ unicode-normalization = "0.1"
 parking_lot = "0.12"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
+# Cross-platform microphone capture for /live hold-to-talk voice (optional:
+# only built with the `live-capture` feature, which needs ALSA dev headers on
+# Linux).
+cpal = { version = "0.15", default-features = false }
+# Embedded POSIX/bash shell engine (earendil-works/brush). OMP/pi parity: the
+# bash tool executes commands in-process via brush_core::Shell instead of a
+# /bin/bash subprocess (sandboxed invocations keep the subprocess path).
+brush-core = "0.5"
 
 [profile.release-dist]
 inherits = "release"

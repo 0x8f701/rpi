@@ -4,10 +4,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use pi_coding::{
     AgentCatalog, ApplicationRuntimeCandidate, ApplicationRuntimeFactory, ApplicationRuntimeFuture,
-    ExtensionMode, ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeOptions,
-    ExtensionUiHost, GoalToolBinding, InternalUriResolverFn, OrchestrationConfig,
-    OrchestrationRuntime, OrchestrationSkill, ResourceManager, ResourceManagerOptions, Session,
-    SessionOptions, ToolSelection, WorkspaceRoots,
+    DefaultProjectTrust, ExtensionMode, ExtensionPermissionSet, ExtensionRuntime,
+    ExtensionRuntimeOptions, ExtensionUiHost, GoalToolBinding, HostHooks, InternalUriResolverFn,
+    OrchestrationConfig, OrchestrationRuntime, OrchestrationSkill, ResourceManager,
+    ResourceManagerOptions, Session, SessionOptions, ToolSelection, TrustResolution, WorkspaceRoots,
+    apply_trust_hook_outcomes, resolve_project_trust_with_observation,
 };
 
 use crate::args::Cli;
@@ -27,6 +28,10 @@ pub(super) struct RunSessionBlueprint {
     extension_permissions: ExtensionPermissionSet,
     explicit_api_key: Option<String>,
     session_dir: Option<PathBuf>,
+    /// ACP approval bridge (agent mode). When set, sessions built from this
+    /// blueprint route host tool approval through ACP `session/request_permission`
+    /// reverse requests instead of the extension-UI confirmation adapter.
+    acp_approval: Option<crate::modes::acp::AcpApprovalFactory>,
 }
 
 #[derive(Clone)]
@@ -69,11 +74,25 @@ impl RunSessionBlueprint {
             extension_permissions: ExtensionPermissionSet::allow_all(),
             explicit_api_key: cli.api_key.clone(),
             session_dir: None,
+            acp_approval: None,
         }
     }
 
     pub(super) fn extension_ui(&self) -> Option<ExtensionUiAdapter> {
         self.extension_ui.clone()
+    }
+
+    /// Override the extension UI mode (e.g. `ExtensionMode::Json` for the
+    /// headless ACP agent mode, where the CLI-mode inference would otherwise
+    /// pick the interactive TUI).
+    pub(super) fn set_extension_mode(&mut self, mode: ExtensionMode) {
+        self.extension_mode = mode;
+    }
+
+    /// Route host tool approval through the ACP reverse-request bridge for
+    /// every session built from this blueprint (agent mode).
+    pub(super) fn set_acp_approval(&mut self, factory: crate::modes::acp::AcpApprovalFactory) {
+        self.acp_approval = Some(factory);
     }
 
     fn approval_mode(&self, settings: &pi_coding::Settings) -> pi_agent::ApprovalMode {
@@ -94,9 +113,10 @@ impl RunSessionBlueprint {
         let cwd = workspace.cwd().to_path_buf();
         let resources = ResourceManager::new(self.resource_options_for_startup(&cwd)?)
             .context("loading settings and resources")?;
+        self.apply_host_trust_gate(&resources).await?;
         let settings = resources.snapshot().settings.clone();
         let permissions = self.extension_permissions.clone();
-        let runtime = self.extension_runtime();
+        let runtime = self.extension_runtime_with_sandbox(&cwd, &resources);
         let specs = resources
             .extension_specs(&permissions)
             .context("validating configured extensions")?;
@@ -142,9 +162,13 @@ impl RunSessionBlueprint {
         let cwd = workspace.cwd().to_path_buf();
         let resources = ResourceManager::new(self.resource_options_for_startup(&cwd)?)
             .context("loading settings and resources")?;
+        // Same pre-load host trust gate as `build`; the workflow override
+        // (`project_trust_override = Some(true)`) means no stored decision is
+        // consulted, so the gate normally observes nothing and is a no-op.
+        self.apply_host_trust_gate(&resources).await?;
         let settings = resources.snapshot().settings.clone();
         let permissions = self.extension_permissions.clone();
-        let runtime = self.extension_runtime();
+        let runtime = self.extension_runtime_with_sandbox(&cwd, &resources);
         let specs = resources.extension_specs(&permissions)
             .context("validating configured extensions")?;
         let report = runtime.load(specs).await;
@@ -224,6 +248,121 @@ impl RunSessionBlueprint {
         )
     }
 
+    /// [`Self::extension_runtime`] with the live `settings.sandbox` resolver
+    /// attached, so process extensions run inside the filesystem sandbox when
+    /// `sandbox.enabled` is set (same allowed/denied semantics as the bash
+    /// tool; the extension's own working directory is always visible). The
+    /// resolver reads live settings per launch, so a reload applies to the
+    /// next extension spawn. QuickJS in-process extensions are unaffected
+    /// (they share the host process by design).
+    fn extension_runtime_with_sandbox(
+        &self,
+        cwd: &Path,
+        resources: &ResourceManager,
+    ) -> ExtensionRuntime {
+        let runtime = self.extension_runtime();
+        let resources = resources.clone();
+        let cwd = cwd.to_path_buf();
+        let agent_dir = pi_coding::agent_dir_path();
+        let resolver: pi_coding::SandboxConfigFn = Arc::new(move || {
+            let settings = &resources.snapshot().settings;
+            if !settings.sandbox.as_ref().and_then(|sandbox| sandbox.enabled).unwrap_or(false) {
+                return None;
+            }
+            let mut config = pi_coding::sandbox::resolve(
+                settings.sandbox.as_ref(),
+                &cwd,
+                &agent_dir,
+            )
+            .unwrap_or_else(|| pi_coding::SandboxConfig::default_for(&cwd, &agent_dir));
+            config.enabled = true;
+            Some(config)
+        });
+        runtime.set_process_sandbox(Some(resolver));
+        runtime
+    }
+
+    /// Fire the host `pre_trust_decision` hook for the project and re-stage
+    /// the resources with the composed decision BEFORE any project-trusted
+    /// extension is discovered or loaded (P0). The composed decision is
+    /// recorded so the Application's startup trust resolution does not
+    /// re-fire the hook.
+    async fn apply_host_trust_gate(&self, resources: &ResourceManager) -> Result<()> {
+        let Some(composed) = self.resolve_host_trust_pre_load(resources).await? else {
+            return Ok(());
+        };
+        if composed.decision != resources.snapshot().trust.decision {
+            resources.set_composed_trust(Some(composed.clone()));
+            let candidate = resources
+                .stage_reload()
+                .context("re-staging resources with the host-composed startup trust")?;
+            resources.commit_reload(candidate)?;
+        }
+        resources.set_startup_composed_trust(Some(composed));
+        Ok(())
+    }
+
+    /// Resolve the project trust decision through the host `pre_trust_decision`
+    /// hook BEFORE any project-trusted extension is discovered or loaded (P0:
+    /// a failClosed blocking hook must be able to prevent a project extension
+    /// from executing at startup).
+    ///
+    /// Returns `Some(composed)` when a stored decision was consulted and the
+    /// host hook fired — the decision composed with the hook outcome, without
+    /// consulting any extension's `trust_decision` reducer, because the
+    /// extension has not passed the host boundary yet. Returns `None` when no
+    /// observation fires (a one-run override or a project with no trust-gated
+    /// resources), in which case the Application resolves startup trust
+    /// exactly as before.
+    async fn resolve_host_trust_pre_load(
+        &self,
+        resources: &ResourceManager,
+    ) -> Result<Option<TrustResolution>> {
+        let snapshot = resources.snapshot();
+        let options = resources.options();
+        let default_trust = snapshot
+            .settings
+            .default_project_trust
+            .unwrap_or(DefaultProjectTrust::Ask);
+        let (mut resolution, observation) = resolve_project_trust_with_observation(
+            &resources.trust_store(),
+            &options.cwd,
+            options.project_trust_override,
+            default_trust,
+            options.headless,
+        )?;
+        let Some(observation) = observation else {
+            // Override or resource-less project: no stored decision is
+            // consulted, so no hook observation fires.
+            return Ok(None);
+        };
+        let host_blocked = if snapshot
+            .settings
+            .hooks
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+        {
+            false
+        } else {
+            let hooks = HostHooks::new(
+                snapshot.settings.hooks.clone().unwrap_or_default(),
+                options.cwd,
+                "startup-trust-gate",
+            );
+            hooks
+                .fire_trust_decision(
+                    &observation.path.to_string_lossy(),
+                    observation.decision.as_str(),
+                    observation.is_new,
+                )
+                .await
+                .block
+        };
+        resolution.decision =
+            apply_trust_hook_outcomes(observation.decision, host_blocked, false);
+        Ok(Some(resolution))
+    }
+
     async fn build_session(
         &self,
         cwd: PathBuf,
@@ -239,12 +378,32 @@ impl RunSessionBlueprint {
         options.auth_resolver = Some(models_config::session_auth_resolver(self.explicit_api_key.clone()));
         settings.apply_session_options(&mut options)?;
         let approval_mode = self.approval_mode(&settings);
-        options.before_tool_call = Some(crate::approval::host_approval_before_tool_call(
-            approval_mode,
-            self.extension_mode,
-            self.extension_ui.clone(),
-            options.before_tool_call.take(),
-        ));
+        // Permission rules are read live from the resource manager so
+        // `permissionRules` changes apply on reload without a session restart.
+        let permission_rules: crate::approval::PermissionRulesSource = {
+            let resources = resources.clone();
+            Arc::new(move || resources.settings_manager().permission_rules())
+        };
+        // Keep a clone for orchestration children: they inherit the same live
+        // source so their lsp rename preflight obeys current permissionRules.
+        let child_permission_rules = permission_rules.clone();
+        options.before_tool_call = Some(match &self.acp_approval {
+            Some(factory) => crate::modes::acp::acp_approval_before_tool_call(
+                approval_mode,
+                factory.clone(),
+                options.before_tool_call.take(),
+                cwd.clone(),
+                permission_rules,
+            ),
+            None => crate::approval::host_approval_before_tool_call(
+                approval_mode,
+                self.extension_mode,
+                self.extension_ui.clone(),
+                options.before_tool_call.take(),
+                cwd.clone(),
+                permission_rules,
+            ),
+        });
         let mut gates = self.tool_gates(&settings);
         if force_workflow_runtime {
             gates.orchestration = true;
@@ -273,6 +432,51 @@ impl RunSessionBlueprint {
                         .clone()
                         .unwrap_or_else(|| pi_agent::AgentOptions::default().stream_fn),
                     auth_resolver: options.auth_resolver.clone(),
+                    memory: {
+                        let resources = resources.clone();
+                        let resolver: pi_coding::MemoryConfigFn = Arc::new(move || {
+                            Some(resources.snapshot().settings.memory_config())
+                        });
+                        Some(resolver)
+                    },
+                    // The same live source the host approval hook consults, so
+                    // child lsp rename preflight obeys current permissionRules.
+                    permission_rules: Some(child_permission_rules.clone()),
+                    // Same semantics as `Session::child_sandbox_resolver`: read
+                    // live settings per spawn; `orchestration.sandboxed` gates
+                    // child confinement, `settings.sandbox` supplies the paths.
+                    sandbox: {
+                        let resources = resources.clone();
+                        let cwd = cwd.clone();
+                        let agent_dir = pi_coding::agent_dir_path();
+                        let resolver: pi_coding::SandboxConfigFn = Arc::new(move || {
+                            let settings = &resources.snapshot().settings;
+                            let orchestration = settings.orchestration.as_ref()?;
+                            if !orchestration.sandboxed.unwrap_or(false) {
+                                return None;
+                            }
+                            let mut config = pi_coding::sandbox::resolve(
+                                settings.sandbox.as_ref(),
+                                &cwd,
+                                &agent_dir,
+                            )
+                            .unwrap_or_else(|| {
+                                pi_coding::SandboxConfig::default_for(&cwd, &agent_dir)
+                            });
+                            for path in [&cwd, &agent_dir] {
+                                if !config
+                                    .allowed_paths
+                                    .iter()
+                                    .any(|allowed| allowed == path)
+                                {
+                                    config.allowed_paths.push(path.clone());
+                                }
+                            }
+                            config.enabled = true;
+                            Some(config)
+                        });
+                        Some(resolver)
+                    },
                 },
                 Some(uri_resolver.clone()),
             );
@@ -459,7 +663,7 @@ impl RunSessionBlueprint {
 }
 
 #[cfg(test)]
-pub(super) fn test_orchestration_config(
+pub(crate) fn test_orchestration_config(
     snapshot: &pi_coding::ResourceSnapshot,
     settings: &pi_coding::Settings,
     parent_model: &pi_ai::Model,
@@ -503,6 +707,19 @@ fn orchestration_config(
         }
         if let Some(value) = orchestration.max_tools_per_agent {
             config.max_tools_per_agent = value;
+        }
+        if let Some(value) = orchestration.soft_budget.as_ref() {
+            config.soft_budget = pi_coding::JobSoftBudget {
+                max_requests: value.max_requests,
+                max_tokens: value.max_tokens,
+                yield_after: value.yield_after,
+            };
+        }
+        if let Some(value) = orchestration.preferred_agent.as_ref() {
+            // Missing/disabled selections are ignored at spawn time; the runtime
+            // falls back to ranked/default agent selection when the name is not
+            // an enabled catalog entry.
+            config.preferred_agent = Some(value.clone());
         }
     }
     config = config.with_selector_settings(settings.selector.clone().unwrap_or_default());
@@ -776,5 +993,199 @@ mod tests {
         );
         assert!(!config.artifact_dir.starts_with(&snapshot.cwd));
         assert!(config.artifact_dir.ends_with("workflow-artifacts"));
+    }
+
+    /// Write an executable `pre_trust_decision` hook that appends the stdin
+    /// payload to `capture` and answers with `response`.
+    fn write_trust_hook(dir: &Path, capture: &Path, response: &str) -> PathBuf {
+        let hook = dir.join("hook.sh");
+        let capture_text = capture.to_string_lossy().into_owned();
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nread -r payload\nprintf '%s\\n' \"$payload\" >> \"{capture_text}\"\necho '{response}'\n"
+            ),
+        )
+        .expect("hook script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&hook).expect("hook meta").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&hook, permissions).expect("hook mode");
+        }
+        hook
+    }
+
+    /// A project-local explicit QuickJS extension whose top level throws:
+    /// executing it at startup fails the extension load, so a startup that
+    /// succeeds proves the extension was never executed.
+    fn write_throwing_project_extension(root: &Path) -> PathBuf {
+        let ext = root.join("ext");
+        fs::create_dir_all(&ext).expect("extension dir");
+        fs::write(ext.join("entry.mjs"), "throw new Error('boom at top level');\n")
+            .expect("extension entry");
+        fs::write(
+            ext.join("pi-extension.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 1,
+                "id": "boom-ext",
+                "runtime": "quickjs",
+                "entry": "entry.mjs",
+                "capabilities": [],
+                "uiCapabilities": []
+            }))
+            .expect("manifest json"),
+        )
+        .expect("extension manifest");
+        ext
+    }
+
+    #[tokio::test]
+    async fn blocking_pre_trust_hook_prevents_project_extension_startup_execution() {
+        let agent = tempfile::tempdir().expect("agent root");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let hook_dir = tempfile::tempdir().expect("hook dir");
+        let cwd_path = cwd.path().canonicalize().expect("canonical cwd");
+        let capture = hook_dir.path().join("payloads.jsonl");
+        let model = Model {
+            reasoning: true,
+            provider: "launch-provider".to_owned(),
+            id: "launch-model".to_owned(),
+            ..Model::default()
+        };
+
+        let ext = write_throwing_project_extension(&cwd_path);
+        // Trust-gated project resources (a non-empty `.pi` directory): their
+        // presence makes the trust store consulted, so the hook observation
+        // fires.
+        fs::create_dir_all(cwd_path.join(".pi")).expect(".pi dir");
+        fs::write(cwd_path.join(".pi").join("marker"), "gated").expect(".pi marker");
+        // The store decision is Trusted so the explicit project extension
+        // enters the resource snapshot; only the host hook can stop it.
+        pi_coding::TrustStore::new(agent.path())
+            .set(&cwd_path, pi_coding::TrustDecision::Trusted)
+            .expect("trusted store");
+        let hook = write_trust_hook(
+            hook_dir.path(),
+            &capture,
+            r#"{"decision":"block","reason":"denied by policy"}"#,
+        );
+        fs::write(
+            agent.path().join("settings.json"),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": [{
+                    "event": "pre_trust_decision",
+                    "command": [hook.to_string_lossy()],
+                    "timeoutMs": 2_000,
+                    "failClosed": true,
+                }],
+            }))
+            .expect("settings json"),
+        )
+        .expect("agent settings");
+
+        let cli = Cli::try_parse_from(["rpi", "--api-key", "launch-secret"]).expect("cli");
+        let mut resource_options = ResourceManagerOptions::new(cwd.path());
+        resource_options.agent_dir = agent.path().to_path_buf();
+        resource_options.headless = true;
+        resource_options.explicit_extension_paths = vec![ext];
+        let blueprint = RunSessionBlueprint::from_cli(&cli, resource_options, None);
+
+        // The host hook fires BEFORE the extension runtime loads and blocks:
+        // startup succeeds and the throwing project extension is never
+        // executed (had it run, the top-level throw would fail the load).
+        let candidate = blueprint
+            .build(cwd.path(), options(&cwd_path, &model))
+            .await
+            .expect("startup with a blocking host hook must succeed");
+        let payload = fs::read_to_string(&capture).expect("captured payload");
+        let captured: serde_json::Value =
+            serde_json::from_str(payload.lines().last().expect("one payload")).expect("json");
+        assert_eq!(captured["event"], "pre_trust_decision");
+        assert_eq!(captured["path"], cwd_path.to_string_lossy().as_ref());
+        assert_eq!(captured["decision"], "trusted");
+        assert_eq!(captured["isNew"], false);
+        assert_eq!(
+            payload.lines().count(),
+            1,
+            "the host hook must fire exactly once at startup (pre-load)"
+        );
+        assert!(
+            candidate.extension_runtime.agent_tools().is_empty(),
+            "the blocked project extension must not be loaded"
+        );
+        assert_eq!(
+            candidate
+                .session
+                .resource_manager()
+                .expect("resources")
+                .snapshot()
+                .trust
+                .decision,
+            pi_coding::TrustDecision::Untrusted,
+            "the snapshot must record the host-composed denial"
+        );
+        candidate.extension_runtime.shutdown().await;
+
+        // Without the blocking hook the same project extension runs and its
+        // top-level throw fails the load: startup errors with the extension
+        // id in the failure, proving the extension was executed.
+        let agent2 = tempfile::tempdir().expect("agent root 2");
+        pi_coding::TrustStore::new(agent2.path())
+            .set(&cwd_path, pi_coding::TrustDecision::Trusted)
+            .expect("trusted store 2");
+        let mut resource_options = ResourceManagerOptions::new(cwd.path());
+        resource_options.agent_dir = agent2.path().to_path_buf();
+        resource_options.headless = true;
+        resource_options.explicit_extension_paths = vec![cwd_path.join("ext")];
+        let blueprint = RunSessionBlueprint::from_cli(&cli, resource_options, None);
+        let error = match blueprint.build(cwd.path(), options(&cwd_path, &model)).await {
+            Ok(_) => panic!("the throwing project extension must fail startup when not host-blocked"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("boom-ext"),
+            "extension startup failure must name the extension: {error:#}"
+        );
+    }
+
+    #[test]
+    fn orchestration_config_carries_preference_and_soft_budget_from_settings() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent = tempfile::tempdir().expect("agent");
+        write_project(cwd.path(), "alpha", 128);
+        let mut resource_options = ResourceManagerOptions::new(cwd.path());
+        resource_options.agent_dir = agent.path().to_path_buf();
+        resource_options.project_trust_override = Some(true);
+        let resources = ResourceManager::new(resource_options).expect("resources");
+        let snapshot = resources.snapshot();
+        let mut settings = pi_coding::Settings::default();
+        settings.orchestration = Some(pi_coding::OrchestrationSettings {
+            preferred_agent: Some("alpha".to_owned()),
+            soft_budget: Some(pi_coding::SoftBudgetSettings {
+                max_requests: Some(3),
+                max_tokens: Some(400),
+                yield_after: Some(2),
+            }),
+            ..pi_coding::OrchestrationSettings::default()
+        });
+        let model = Model {
+            id: "pref".into(),
+            name: "pref".into(),
+            api: "pref".into(),
+            provider: "test".into(),
+            ..Model::default()
+        };
+        let config = test_orchestration_config(&snapshot, &settings, &model);
+        assert_eq!(config.preferred_agent.as_deref(), Some("alpha"));
+        assert_eq!(config.soft_budget.max_requests, Some(3));
+        assert_eq!(config.soft_budget.max_tokens, Some(400));
+        assert_eq!(config.soft_budget.yield_after, Some(2));
+
+        let default_config =
+            test_orchestration_config(&snapshot, &pi_coding::Settings::default(), &model);
+        assert!(default_config.preferred_agent.is_none());
+        assert_eq!(default_config.soft_budget, pi_coding::JobSoftBudget::default());
     }
 }

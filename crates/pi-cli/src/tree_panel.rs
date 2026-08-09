@@ -3,6 +3,12 @@ use pi_ai::{ContentBlock, Message};
 use pi_coding::{SessionEntry, SessionTreeNode, SessionTreeResult};
 use std::collections::{HashMap, HashSet};
 
+/// Maximum width (in characters) of a node label in the session tree.
+/// Labels longer than this are truncated with an ellipsis; the renderer
+/// additionally truncates the composed row to the panel's inner width so
+/// a row can never wrap or overflow the panel.
+const NODE_LABEL_MAX: usize = 60;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TreePanelMode {
     Navigate,
@@ -65,7 +71,8 @@ pub(crate) struct VisibleTreeNode {
     pub(crate) folded: bool,
     pub(crate) label: Option<String>,
     pub(crate) label_timestamp: Option<String>,
-    pub(crate) text: String,
+    /// Single-line, width-bounded display label derived from the entry.
+    pub(crate) label_text: String,
 }
 pub(crate) struct TreePanel {
     pub(crate) title: String,
@@ -330,7 +337,7 @@ impl TreePanel {
                     folded: self.folded.contains(id),
                     label: n.label.clone(),
                     label_timestamp: n.label_timestamp.clone(),
-                    text: entry_text(&n.entry),
+                    label_text: node_label(&n.entry),
                 }
             })
             .collect();
@@ -427,35 +434,96 @@ fn active_path(leaf: Option<&str>, nodes: &HashMap<String, Node>) -> HashSet<Str
 fn is_user(entry: &SessionEntry) -> bool {
     matches!(entry.message.as_ref(), Some(Message::User(_)))
 }
-fn entry_text(e: &SessionEntry) -> String {
+/// The type prefix and full (possibly multi-line) body of an entry.
+/// The body carries the exact separator the prefix expects, so
+/// `format!("{prefix}{body}")` reproduces the full entry text verbatim.
+fn entry_parts(e: &SessionEntry) -> (String, String) {
     match e.entry_type.as_str() {
         "message" => match e.message.as_ref() {
-            Some(Message::User(m)) => format!("user: {}", text(&m.content)),
-            Some(Message::Assistant(m)) => format!("assistant: {}", m.text()),
-            Some(Message::ToolResult(m)) => format!("[tool: {}] {}", m.tool_name, text(&m.content)),
-            Some(Message::BashExecution(m)) => format!("[bash] {}", m.command),
-            Some(Message::Custom(m)) => format!("custom: {}", text(&m.content.to_blocks())),
-            Some(Message::BranchSummary(m)) => format!("[branch summary] {}", m.summary),
-            Some(Message::CompactionSummary(m)) => format!("[compaction] {}", m.summary),
-            None => "message".into(),
+            Some(Message::User(m)) => ("user: ".into(), text(&m.content)),
+            Some(Message::Assistant(m)) => ("assistant: ".into(), m.text()),
+            Some(Message::ToolResult(m)) => (
+                format!("[tool: {}]", m.tool_name),
+                format!(" {}", text(&m.content)),
+            ),
+            Some(Message::BashExecution(m)) => ("[bash] ".into(), m.command.clone()),
+            Some(Message::Custom(m)) => ("custom: ".into(), text(&m.content.to_blocks())),
+            Some(Message::BranchSummary(m)) => ("[branch summary] ".into(), m.summary.clone()),
+            Some(Message::CompactionSummary(m)) => ("[compaction] ".into(), m.summary.clone()),
+            None => ("message".into(), String::new()),
         },
-        "branch_summary" => format!(
-            "[branch summary] {}",
-            e.summary.as_deref().unwrap_or_default()
+        "branch_summary" => (
+            "[branch summary] ".into(),
+            e.summary.clone().unwrap_or_default(),
         ),
-        "compaction" => format!("[compaction] {}", e.summary.as_deref().unwrap_or_default()),
-        "model_change" => format!(
-            "[model: {}/{}]",
-            e.provider.as_deref().unwrap_or_default(),
-            e.model_id.as_deref().unwrap_or_default()
+        "compaction" => ("[compaction] ".into(), e.summary.clone().unwrap_or_default()),
+        "model_change" => (
+            format!(
+                "[model: {}/{}]",
+                e.provider.as_deref().unwrap_or_default(),
+                e.model_id.as_deref().unwrap_or_default()
+            ),
+            String::new(),
         ),
-        "thinking_level_change" => format!(
-            "[thinking: {}]",
-            e.thinking_level.as_deref().unwrap_or_default()
+        "thinking_level_change" => (
+            format!(
+                "[thinking: {}]",
+                e.thinking_level.as_deref().unwrap_or_default()
+            ),
+            String::new(),
         ),
-        "session_info" => format!("[title: {}]", e.name.as_deref().unwrap_or_default()),
-        other => format!("[{other}]"),
+        "session_info" => (
+            format!("[title: {}]", e.name.as_deref().unwrap_or_default()),
+            String::new(),
+        ),
+        other => (format!("[{other}]"), String::new()),
     }
+}
+
+/// Full text of an entry (type prefix + complete body, possibly multi-line).
+/// Used only for search matching; never displayed directly.
+fn entry_text(e: &SessionEntry) -> String {
+    let (prefix, body) = entry_parts(e);
+    format!("{prefix}{body}")
+}
+
+/// Single-line, width-bounded label used for tree display: the entry type
+/// (user/assistant/tool/custom/...) plus a preview of the first line,
+/// truncated to `NODE_LABEL_MAX` characters with an ellipsis. Tool results
+/// render as just the short `[tool: <name>]` tag so their output never
+/// floods the tree.
+fn node_label(e: &SessionEntry) -> String {
+    let (prefix, body) = entry_parts(e);
+    let preview = if matches!(e.message.as_ref(), Some(Message::ToolResult(_))) {
+        ""
+    } else {
+        first_line(&body)
+    };
+    let composed = if preview.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}{preview}")
+    };
+    truncate_label(composed.trim_end())
+}
+
+/// The first line of `s` (everything before the first CR or LF).
+fn first_line(s: &str) -> &str {
+    match s.find(['\r', '\n']) {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
+/// Truncate `s` to `NODE_LABEL_MAX` characters, appending an ellipsis when
+/// content was cut.
+fn truncate_label(s: &str) -> String {
+    if s.chars().count() <= NODE_LABEL_MAX {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(NODE_LABEL_MAX - 1).collect();
+    out.push('…');
+    out
 }
 fn text(c: &[ContentBlock]) -> String {
     c.iter()
@@ -607,5 +675,103 @@ mod tests {
         assert_eq!(p.visible().len(), 1);
         p.apply_action(Action::EditorRight, 10);
         assert_eq!(p.visible().len(), 2)
+    }
+
+    #[test]
+    fn long_multi_line_assistant_message_renders_as_single_truncated_label() {
+        let mut assistant = e("1", None, "short");
+        let long_first_line = "the quick brown fox jumps over the lazy dog and then some more words ".repeat(3);
+        assistant.message = Some(Message::Assistant(
+            pi_ai::AssistantMessage::pending(&pi_ai::Model::default()),
+        ));
+        if let Some(Message::Assistant(m)) = &mut assistant.message {
+            m.content = vec![pi_ai::ContentBlock::text(format!(
+                "{long_first_line}\nsecond line that must never appear"
+            ))];
+        }
+        let panel = TreePanel::new(
+            SessionTreeResult {
+                tree: vec![n(assistant, vec![])],
+                leaf_id: None,
+                active_leaf_id: None,
+            },
+            TreePanelMode::Navigate,
+        );
+        let label = &panel.visible()[0].label_text;
+        assert!(label.starts_with("assistant: "), "label must keep its type prefix: {label:?}");
+        assert!(!label.contains('\n'), "label must be a single line: {label:?}");
+        assert!(
+            label.chars().count() <= NODE_LABEL_MAX,
+            "label must respect the cap: {label:?}"
+        );
+        assert!(label.ends_with('…'), "truncated label must end with an ellipsis: {label:?}");
+        assert!(
+            !label.contains("second line"),
+            "only the first line may be shown: {label:?}"
+        );
+    }
+
+    #[test]
+    fn tool_nodes_render_short_name_tag_only() {
+        let mut tool = e("1", None, "tool");
+        tool.message = Some(Message::ToolResult(pi_ai::ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "bash".into(),
+            content: vec![pi_ai::ContentBlock::text(
+                "FOO=bar\nBAZ=qux\nsome long ls output line that would wrap",
+            )],
+            usage: None,
+            details: None,
+            added_tool_names: vec![],
+            is_error: false,
+            timestamp: 0,
+        }));
+        let panel = TreePanel::new(
+            SessionTreeResult {
+                tree: vec![n(tool, vec![])],
+                leaf_id: None,
+                active_leaf_id: None,
+            },
+            TreePanelMode::Navigate,
+        );
+        assert_eq!(panel.visible()[0].label_text, "[tool: bash]");
+    }
+
+    #[test]
+    fn long_single_line_labels_truncate_to_the_cap() {
+        let user = e("1", None, &"x".repeat(200));
+        let panel = TreePanel::new(
+            SessionTreeResult {
+                tree: vec![n(user, vec![])],
+                leaf_id: None,
+                active_leaf_id: None,
+            },
+            TreePanelMode::Navigate,
+        );
+        let label = &panel.visible()[0].label_text;
+        assert!(label.starts_with("user: "), "label must keep its type prefix: {label:?}");
+        assert!(!label.contains('\n'), "label must be a single line: {label:?}");
+        assert_eq!(label.chars().count(), NODE_LABEL_MAX);
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn search_still_matches_content_beyond_the_first_line() {
+        let mut p = TreePanel::new(
+            SessionTreeResult {
+                tree: vec![n(e("1", None, "first line\nneedle deep"), vec![])],
+                leaf_id: None,
+                active_leaf_id: None,
+            },
+            TreePanelMode::Navigate,
+        );
+        assert_eq!(p.visible()[0].label_text, "user: first line");
+        p.insert_search_char('n');
+        p.insert_search_char('d');
+        assert_eq!(
+            p.visible().len(),
+            1,
+            "search must match full content, not just the truncated label"
+        );
     }
 }

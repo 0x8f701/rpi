@@ -36,6 +36,9 @@ pub struct SideChatFork {
     pub session_id: Option<String>,
     /// Main session file path (informational only).
     pub session_file: Option<PathBuf>,
+    /// The main session's live path-permission-rule source, so the side
+    /// chat's `lsp` rename preflight obeys the same rules as host approval.
+    pub permission_rules: Option<crate::PermissionRulesSource>,
 }
 
 /// Read-only view of main session history for the side-chat `peek_main` tool.
@@ -83,6 +86,7 @@ impl Application {
             leaf_id,
             session_id,
             session_file,
+            permission_rules: session.permission_rules_source(),
         })
     }
 

@@ -49,6 +49,7 @@ async fn enabled_compaction_summarizes_after_completed_prompt() {
             enabled: true,
             reserve_tokens: 10,
             keep_recent_tokens: 4,
+            snap_keep_turns: 10,
         }),
         stream_options: Default::default(),
         tools: None,
@@ -203,6 +204,7 @@ async fn compaction_activity_is_set_only_while_summary_runs() {
             enabled: true,
             reserve_tokens: 10,
             keep_recent_tokens: 4,
+            snap_keep_turns: 10,
         }),
         stream_options: Default::default(),
         tools: Some(Vec::new()),
@@ -246,7 +248,7 @@ async fn manual_compaction_emits_paired_success_events() {
     let cwd = tempfile::tempdir().expect("temporary working directory");
     let session = Session::new(SessionOptions {
         model, cwd: cwd.path().to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off,
-        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4 }),
+        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
         stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None,
         stream_fn: None, auth_resolver: None,
     }).expect("build session");
@@ -287,7 +289,7 @@ async fn hook_compaction_persists_details_usage_and_source() {
         system_prompt: String::new(),
         thinking_level: ThinkingLevel::Off,
         api_key: String::new(),
-        compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4 }),
+        compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
         stream_options: Default::default(),
         tools: Some(Vec::new()),
         before_tool_call: None,
@@ -353,7 +355,7 @@ async fn overflow_compacts_once_then_retries_without_duplicate_user_turn() {
     registration.set_responses(vec![FauxResponse::error("input exceeds the context window"), FauxResponse::text("overflow checkpoint"), FauxResponse::text("recovered answer")]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
     let session = Session::new(SessionOptions { model, cwd: cwd.path().to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off,
-        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4 }),
+        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
         stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None, stream_fn: None, auth_resolver: None }).expect("build session");
     session.load_history(vec![Message::user_text("older context ".repeat(30), 1)]).await.expect("load history");
     let mut events = session.subscribe_session_events();
@@ -379,7 +381,7 @@ async fn second_overflow_stops_with_actionable_error() {
     registration.set_responses(vec![FauxResponse::error("input exceeds the context window"), FauxResponse::text("overflow checkpoint"), FauxResponse::error("input exceeds the context window")]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
     let session = Session::new(SessionOptions { model, cwd: cwd.path().to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off,
-        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4 }),
+        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
         stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None, stream_fn: None, auth_resolver: None }).expect("build session");
     session.load_history(vec![Message::user_text("older context ".repeat(30), 1)]).await.expect("load history");
     let error = session.run("one user turn", Vec::new()).await.expect_err("second overflow stops");
@@ -443,6 +445,7 @@ async fn compaction_resolves_auth_into_request_options_without_mutating_model() 
             enabled: true,
             reserve_tokens: 20,
             keep_recent_tokens: 4,
+            snap_keep_turns: 10,
         }),
         stream_options: Default::default(),
         tools: Some(Vec::new()),
@@ -490,7 +493,7 @@ async fn manual_compaction_retries_transient_summary_and_emits_ordered_events() 
     registration.set_responses(vec![FauxResponse::error("503 Service unavailable"), FauxResponse::text("retried checkpoint")]);
     let cwd = tempfile::tempdir().expect("temporary working directory");
     let session = Session::new(SessionOptions { model, cwd: cwd.path().to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off,
-        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4 }),
+        api_key: "faux".into(), compaction: Some(CompactionSettings { enabled: true, reserve_tokens: 20, keep_recent_tokens: 4, snap_keep_turns: 10 }),
         stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None, stream_fn: None, auth_resolver: None }).expect("build session");
     session.set_retry_settings(RetrySettings { enabled: true, max_retries: 1, base_delay_ms: 1 , ..Default::default() });
     session.load_history(vec![Message::user_text("older request ".repeat(20), 1), Message::Assistant({ let mut message = AssistantMessage::pending(&session.model().expect("model")); message.content = vec![ContentBlock::text("older response ".repeat(20))]; message.stop_reason = StopReason::Stop; message.timestamp = 2; message }), Message::user_text("recent", 3)]).await.expect("load");

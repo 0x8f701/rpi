@@ -55,6 +55,7 @@ pub fn register_azure_openai_responses() {
             stream_simple: Arc::new(|model, context, options| {
                 async move { stream_simple_azure_openai_responses(model, context, options) }.boxed()
             }),
+            generate_image: None,
         },
         None,
     );
@@ -71,6 +72,7 @@ pub fn stream_simple_azure_openai_responses(
         reasoning_summary,
         service_tier,
         tool_choice,
+        ..
     } = build_simple_responses_options(&model, &context, options);
     stream_azure_openai_responses(
         model,
@@ -117,6 +119,7 @@ pub fn stream_azure_openai_responses(
             reasoning_summary: options.reasoning_summary.clone(),
             service_tier: options.service_tier.clone(),
             tool_choice: options.tool_choice.clone(),
+            responses_stateful_chain: false,
         };
         let grammar_input_properties = match grammar_tool_input_properties(
             &context.tools,

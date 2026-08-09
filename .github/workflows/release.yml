@@ -21,11 +21,33 @@ env:
   MAX_RELEASE_BINARY_BYTES: "67108864"
 
 jobs:
+  verify-tag-commit:
+    name: verify exact tag commit
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
   validate-release:
     name: validate release tag
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      # Regression guard for the embedded web client: crates/pi-cli/build.rs
+      # embeds crates/pi-cli/web/dist/index.html (vite-plugin-singlefile output)
+      # so cargo builds never require node. The artifact MUST be present and
+      # tracked in the checkout — a clean checkout missing it makes build.rs
+      # panic — and it must be the ONLY file versioned under web/dist. This
+      # mirrors the test workflow guard: release builds only ever consume the
+      # committed artifact, never a rebuilt one.
+      - name: Verify embedded web client artifact is versioned
+        shell: bash
+        run: |
+          test -f crates/pi-cli/web/dist/index.html
+          test "$(git ls-files crates/pi-cli/web/dist)" = "crates/pi-cli/web/dist/index.html"
+
       - name: Validate semantic version tag and workspace version
         shell: bash
         run: |
@@ -42,7 +64,7 @@ jobs:
 
   build-linux:
     name: build (${{ matrix.target }})
-    needs: [validate-release]
+    needs: [validate-release, verify-tag-commit]
     strategy:
       fail-fast: false
       matrix:
@@ -93,6 +115,8 @@ jobs:
           fi
 
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
 
 
       - name: Install Rust 1.88.0
@@ -203,9 +227,11 @@ jobs:
             expected_arch: AMD64
             rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.os }}
-    needs: [validate-release]
+    needs: [validate-release, verify-tag-commit]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
 
       - name: Verify native runner architecture
         shell: bash
@@ -324,7 +350,7 @@ jobs:
 
   release:
     name: publish GitHub Release
-    needs: [build-linux, build-native]
+    needs: [verify-tag-commit, build-linux, build-native]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -428,18 +454,13 @@ jobs:
             ### Install
 
             ```sh
-            # macOS / Linux
-            curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/${{ github.ref_name }}/install.sh | sh
+            # macOS / Linux — installer source and candidate are pinned to this release
+            curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/${{ github.ref_name }}/install.sh | bash -s -- --version ${{ github.ref_name }}
             ```
 
             ```powershell
-            # Windows PowerShell
-            irm https://raw.githubusercontent.com/0x8f701/rpi/${{ github.ref_name }}/install.ps1 | iex
-            ```
-
-            Pin a release:
-            ```sh
-            curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/${{ github.ref_name }}/install.sh | bash -s -- --version ${{ github.ref_name }}
+            # Windows PowerShell — installer source and candidate are pinned to this release
+            & ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/${{ github.ref_name }}/install.ps1))) -Version ${{ github.ref_name }}
             ```
 
       - name: Verify remote draft inventory

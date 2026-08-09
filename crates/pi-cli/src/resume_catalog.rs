@@ -82,6 +82,9 @@ pub struct ResumeSelectorRow {
     pub status: CatalogRowStatus,
     /// Catalog-built corpus for local fuzzy filtering without rescanning files.
     pub search_text: String,
+    /// Isolated message corpus matched by the selector without crossing into
+    /// cwd/path; `search_text` remains for stable identity ordering.
+    pub message_blob: String,
 }
 
 impl From<CatalogRow> for ResumeSelectorRow {
@@ -100,6 +103,7 @@ impl From<CatalogRow> for ResumeSelectorRow {
             name: row.name,
             status: row.status,
             search_text: row.search_text,
+            message_blob: row.message_blob,
         }
     }
 }
@@ -260,6 +264,14 @@ pub async fn switch_resume_selection(
         .switch_session(&result.path)
         .await
         .with_context(|| format!("switching to session {}", result.path.display()))?;
+    if !outcome.cancelled {
+        // The resumed session owns its recorder id: rebind workflow storage
+        // so its own workflows restore (and the previous session's do not
+        // leak into the resumed view — T43 session scoping).
+        crate::session_run::rebind_workflows_for_active_session(application)
+            .await
+            .context("rebinding workflow storage after session switch")?;
+    }
     Ok(ResumeSelectionResult { cancelled: outcome.cancelled, ..result })
 }
 

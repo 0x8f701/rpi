@@ -6,16 +6,16 @@ use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use crossterm::{
-    cursor::{Hide, Show},
+    cursor::{Hide, MoveTo, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, EventStream, KeyCode, KeyEvent,
         KeyEventKind, KeyModifiers, MouseEvent,
     },
-    execute,
+    execute, queue,
     terminal::{DisableLineWrap, EnableLineWrap, disable_raw_mode, enable_raw_mode, window_size},
 };
 use futures_util::{FutureExt, StreamExt};
@@ -23,16 +23,25 @@ use pi_agent::{AgentEvent, ThinkingLevel};
 use pi_ai::{AssistantMessageEvent, ContentBlock, Message, Model};
 use pi_coding::{
     Application, ApplicationEvent, CONFIG_DIR_NAME, DoubleEscapeAction, ExtensionUiRequest,
-    GoalLifecycle, GoalState, LoopEvent, LoopTask, ProcessEvent, ProcessId, ProcessKey,
-    ProcessLogs, ProcessState, Session, SessionContextUsage, StreamingBehavior, TodoItem,
-    TodoPhase, TodoStatus, ToolCallViewStatus, UiNotificationLevel, UiSelectOption,
-    UiWidgetPlacement,
+    GoalLifecycle, GoalState, JobStatus, LiveRuntimeSettings, LoopEvent, LoopTask, ProcessEvent,
+    ProcessId, ProcessKey, ProcessLogs, ProcessState, Session, SessionContextUsage,
+    SessionTokenStats, SettingApplyBehavior, SettingSource, SettingsScope, StreamingBehavior,
+    TodoItem, TodoPhase, TodoStatus, ToolCallViewStatus, UiNotificationLevel, UiSelectOption,
+    UiWidgetPlacement, WorkflowStatus,
 };
+use pi_coding::live::{
+    NO_SPEECH_TIMEOUT, PttControl, PttSessionEvent, SttClient, is_delegation_candidate,
+    open_capture, run_ptt_session, validate_live_settings,
+};
+use pi_coding::markdown::{
+    display_width as grapheme_display_width, fit_text, wrap_verbatim,
+};
+use pi_coding::redact::redact_secrets;
 use ratatui::{
-    Terminal,
-    TerminalOptions, Viewport,
-    backend::{Backend, ClearType, CrosstermBackend},
-    layout::{Constraint, Direction, Layout, Rect},
+    Terminal, TerminalOptions, Viewport,
+    backend::{Backend, ClearType, CrosstermBackend, WindowSize},
+    buffer::Cell as BufferCell,
+    layout::{Constraint, Direction, Layout, Position, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::Widget,
@@ -42,7 +51,8 @@ use ratatui::{
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agents_panel::{AgentsPanel, AgentsPanelAction};
 use crate::clipboard::{self, ClipboardContent};
@@ -59,7 +69,8 @@ use crate::interactive_commands::{
     usage, visible_catalog,
 };
 use crate::job_card_adapter::{
-    JobCardPresentationAdapter, JobCardRowRole, JobCardRows, TaskCardRows,
+    JobCardPresentationAdapter, JobCardRowRole, JobCardRows, JobEventKind, TaskCardRows,
+    progress_row_text,
 };
 use crate::keybindings::{Action, KeyBindingsManager};
 use crate::markdown::ratatui::{
@@ -78,7 +89,7 @@ use crate::resume_catalog::{
 use crate::saved_session_selector::{
     SavedSessionSelector, SessionSelectorMode, SessionSelectorRequest, session_display_name,
 };
-use crate::scoped_model_selector::{ScopedModelSelection, ScopedModelSelector};
+use crate::scoped_model_selector::{ModelColumn, ScopedModelSelection, ScopedModelSelector};
 use crate::terminal_images::{
     ImageDisplayConfig, ImageFrameIdentity, ImageLayout, ImagePlacement, TerminalCellSize,
     TerminalImageRenderer,
@@ -92,10 +103,10 @@ use crate::tool_card_adapter::{
 };
 use crate::tree_panel::{TreePanel, TreePanelMode};
 
-use crate::settings_panel::{SettingsControl, SettingsPanel};
-use crate::side_chat::{SideChatAction, SideChatAsyncRequest, SideChatController};
+use crate::settings_panel::{SettingsControl, SettingsPanel, SettingsPanelRow};
+use crate::side_chat::{SideChatAction, SideChatAsyncRequest, SideChatTabs};
 use crate::side_chat_panel::render_side_chat_panel;
-use crate::workflow_panel::{WorkflowIntentKind, WorkflowPanel, WorkflowPanelResult, WorkflowPanelSnapshot, compact_workflow_status, render_workflow_panel,
+use crate::workflow_panel::{WorkflowIntentKind, WorkflowPanel, WorkflowPanelResult, WorkflowPanelSnapshot, planning_activity_label, render_workflow_panel,
 };
 
 const MAX_TRANSCRIPT_LINES: usize = 4_000;
@@ -181,6 +192,115 @@ struct ExtensionDialog {
     interaction: ExtensionUiInteraction,
     title: String,
     kind: ExtensionDialogKind,
+}
+
+/// Merged interactive editor config for an open overlay: the static
+/// registration declaration (`placeholder`/`multiline`) plus the open-time
+/// initial draft from the render result. The value seeds the host editor ONCE
+/// at open; live `setRows` updates replace rows only and never touch the
+/// draft or cursor.
+struct OverlayInput {
+    value: String,
+    placeholder: Option<String>,
+    multiline: bool,
+}
+
+/// An open extension-rendered overlay panel. The extension supplies content
+/// rows and an optional declarative input section; the host draws the
+/// bordered panel and owns focus/key routing and the editor/cursor. Exclusive
+/// overlays (the default) are always focused and consume every key; a
+/// non-capturing overlay stays drawn while unfocused and routes keys to the
+/// composer (single-focused-owner rule), with the focus-toggle action
+/// (default Alt+/) flipping focus.
+struct ExtensionOverlay {
+    instance: pi_coding::ExtensionInstanceId,
+    id: String,
+    title: String,
+    rows: Vec<pi_coding::OverlayRow>,
+    /// First visible row index (scroll offset).
+    scroll: usize,
+    /// Merged interactive editor config for the overlay: the static
+    /// registration declaration (placeholder/multiline) plus the open-time
+    /// initial draft from the render result. `None` for content-only
+    /// overlays. The host owns the editor/cursor state below.
+    input: Option<OverlayInput>,
+    /// Host-owned editor/cursor for the input section.
+    editor: EditorState,
+    /// Input ownership: exclusive overlays are always focused; non-capturing
+    /// overlays flip between focused and the composer via Alt+/ (the overlay
+    /// stays drawn while unfocused).
+    focused: bool,
+    /// Non-capturing overlays route keys to the composer while unfocused.
+    non_capturing: bool,
+    /// Overlay-local callback status (submit/onKey failures, in-flight
+    /// notices). Rendered in the overlay's hint area — never the shared
+    /// composer error slot — so a slow or failing JS handler cannot freeze
+    /// terminal input or clobber composer state.
+    local_status: Option<String>,
+    /// True while a submit dispatch is in flight; duplicate submits are
+    /// rejected (consumed) until the bounded callback settles.
+    submit_in_flight: bool,
+}
+
+impl ExtensionOverlay {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        instance: pi_coding::ExtensionInstanceId,
+        id: String,
+        title: String,
+        rows: Vec<pi_coding::OverlayRow>,
+        input: Option<OverlayInput>,
+        non_capturing: bool,
+    ) -> Self {
+        let mut editor = EditorState::new();
+        if let Some(input) = &input {
+            editor.set_text(&input.value);
+        }
+        Self {
+            instance,
+            id,
+            title,
+            rows,
+            scroll: 0,
+            input,
+            editor,
+            // Opening an exclusive overlay gives it input ownership
+            // immediately; a non-capturing overlay opens unfocused so the
+            // composer keeps accepting input until the user Alt+/'s to it.
+            focused: !non_capturing,
+            non_capturing,
+            local_status: None,
+            submit_in_flight: false,
+        }
+    }
+
+    /// Replace the content rows (already sanitized host-side) and clamp the
+    /// scroll offset so the view never dangles past the new content.
+    fn set_rows(&mut self, rows: Vec<pi_coding::OverlayRow>) {
+        self.rows = rows;
+        self.clamp_scroll();
+    }
+
+    fn clamp_scroll(&mut self) {
+        let max = self.rows.len().saturating_sub(1);
+        self.scroll = self.scroll.min(max);
+    }
+
+    fn scroll_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(1);
+    }
+
+    fn scroll_down(&mut self) {
+        self.scroll = (self.scroll + 1).min(self.rows.len().saturating_sub(1));
+    }
+}
+
+/// An in-flight interactive `ask` from the model: the question is rendered on
+/// the composer status line and the next submitted line is routed back as the
+/// answer (Esc cancels). At most one is ever pending per session.
+struct PendingAsk {
+    id: String,
+    prompt: String,
 }
 
 impl ExtensionDialog {
@@ -344,6 +464,11 @@ struct FooterRefreshResult {
     key: FooterRefreshKey,
     git: Option<FooterGitStatus>,
     context: Option<SessionContextUsage>,
+    /// Session cost total from `session_stats()`; the composer status line
+    /// renders it only while non-zero.
+    cost: f64,
+    /// Session token totals from `session_stats()`.
+    tokens: SessionTokenStats,
 }
 
 /// Parse `git status --porcelain=v1 -z --branch` output into a footer summary.
@@ -513,9 +638,11 @@ fn collect_footer_git_status(cwd: &Path) -> Option<FooterGitStatus> {
 }
 
 /// Spawn one bounded background refresh of the composer footer's git
-/// branch/dirty counts and context-window utilization. The caller enforces
-/// single-flight admission; the complete request identity is returned with the
-/// result so a runtime or cwd change cannot be overwritten by late work.
+/// branch/dirty counts and context-window utilization plus the session
+/// cost/token totals projected onto the composer status line. The caller
+/// enforces single-flight admission; the complete request identity is returned
+/// with the result so a runtime or cwd change cannot be overwritten by late
+/// work.
 fn spawn_footer_refresh(
     request: FooterRefreshRequest,
     tx: mpsc::UnboundedSender<BackgroundEvent>,
@@ -525,15 +652,16 @@ fn spawn_footer_refresh(
         // `session_stats()` traverses message history (synchronous CPU), so it
         // stays off the async runtime thread alongside the git collection. The
         // captured Session belongs to the runtime identity in `request.key`.
-        let context = request
-            .session
-            .session_stats()
+        let stats = request.session.session_stats();
+        let context = stats
             .context_usage
             .filter(|usage| usage.context_window > 0);
         let _ = tx.send(BackgroundEvent::FooterRefresh(FooterRefreshResult {
             key: request.key,
             git,
             context,
+            cost: stats.cost,
+            tokens: stats.tokens,
         }));
     });
 }
@@ -571,6 +699,10 @@ enum BackgroundEvent {
     },
     ClipboardRead(std::result::Result<Option<ClipboardContent>, String>),
     ClipboardWrite(std::result::Result<(), String>),
+    /// Completion of a backgrounded `/handoff` clipboard write. Separate from
+    /// [`BackgroundEvent::ClipboardWrite`] so the success status can name the
+    /// handoff (the shared `clipboard_write_busy` latch stays consistent).
+    ClipboardHandoffWrite(std::result::Result<(), String>),
     ExtensionCommandFinished {
         command: String,
         result: std::result::Result<serde_json::Value, String>,
@@ -588,6 +720,53 @@ enum BackgroundEvent {
         label: &'static str,
         result: std::result::Result<crate::workflow_commands::WorkflowCommandEffect, String>,
     },
+    /// Completion of a backgrounded overlay callback dispatch (`onSubmit` /
+    /// `onKey`). Mirrors the `/run` admission convention: the key handler
+    /// spawns the bounded runtime invocation so a slow or failing JS handler
+    /// never freezes terminal input; the result arrives here and lands in
+    /// the overlay's local status area (never the shared composer error
+    /// slot). A failed submit restores the captured draft.
+    OverlayCallbackFinished {
+        overlay_id: String,
+        event: pi_coding::OverlayEvent,
+        result: std::result::Result<serde_json::Value, String>,
+    },
+    /// Completion of a backgrounded `/compact`. Mirrors the `/workflow`
+    /// admission convention: the slash dispatch spawns the compaction on a
+    /// background task so the provider summarization call (which can take tens
+    /// of seconds or stall) never freezes the TUI event loop; the final result
+    /// arrives here. Progress (spinner, "Compacting context" status) and the
+    /// terminal abort/error states flow through the `SessionEvent::Compaction
+    /// {Start, End}` broadcasts.
+    CompactionFinished {
+        result: std::result::Result<pi_coding::CompactionResult, String>,
+    },
+}
+
+fn admit_compact_background(application: &Application, state: &mut TuiState, arg: Option<&str>) {
+    // Visible admission status first: `application.compact` performs a
+    // provider summarization call that can take tens of seconds (or stall, in
+    // which case the pi-coding side enforces its own deadline). Awaiting it
+    // inline froze the TUI event loop — no spinner, no Escape — the same
+    // freeze `/workflow` used to cause before it was backgrounded. The
+    // `CompactionStart` session event upgrades this to the animated
+    // "compacting" indicator; Escape/Ctrl-C route to `Application::abort`.
+    // `--snap` selects the deterministic archive (no provider call), still
+    // backgrounded for a consistent status/abort contract.
+    state.status = "Compacting context".to_owned();
+    let application = application.clone();
+    let tx = state.background_tx.clone();
+    let (snap, instructions) = crate::interactive_commands::parse_compact_arguments(arg.unwrap_or(""));
+    let instructions = instructions.map(str::to_owned);
+    tokio::spawn(async move {
+        let result = if snap {
+            application.compact_snap().await
+        } else {
+            application.compact(instructions.as_deref()).await
+        }
+        .map_err(|error| format!("{error:#}"));
+        let _ = tx.send(BackgroundEvent::CompactionFinished { result });
+    });
 }
 
 fn spawn_extension_command(
@@ -635,8 +814,14 @@ pub async fn interactive(
     initial_scoped_models: Option<Vec<Model>>,
     initial_prompts: Vec<String>,
     startup_warnings: Vec<String>,
+    collab_host: Option<crate::collab_commands::CollabHost>,
 ) -> Result<()> {
     install_panic_hook();
+    // Override crossterm's NO_COLOR gate before the first frame is drawn: the
+    // TUI renders its full truecolor theme even when the environment exports
+    // NO_COLOR (omp behavior), as long as the terminal supports color. Print
+    // mode never reaches this path.
+    crate::force_tui_color();
     // Install the shutdown-signal streams before entering the terminal so a
     // SIGTERM/SIGHUP delivered during setup is recorded by tokio's signal
     // registry and drains on the first select! poll.
@@ -650,6 +835,9 @@ pub async fn interactive(
     let mut events = application.subscribe();
     let mut extension_events = _extension_ui.subscribe();
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
+    // The TUI can answer the model's `ask` questions; print/JSON/RPC/REPL
+    // never arm this and the tool rejects up front instead of hanging.
+    application.set_ask_interactive(true);
     let mut state = TuiState::new(
         &application,
         _extension_ui,
@@ -678,6 +866,11 @@ pub async fn interactive(
     let mut theme_watch = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut animation = tokio::time::interval(std::time::Duration::from_millis(120));
     let mut footer_refresh = tokio::time::interval(FOOTER_REFRESH_INTERVAL);
+    // Live `ctx.overlay.setRows` flush rate: queued rows are applied to the
+    // open overlay at most every ~33ms (latest-wins), so a streaming
+    // extension cannot force one repaint per setRows call.
+    let mut overlay_rows = tokio::time::interval(std::time::Duration::from_millis(33));
+    overlay_rows.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let run_result: Result<()> = async {
     loop {
@@ -701,6 +894,10 @@ pub async fn interactive(
             }
         }
         terminal.draw(&state, |frame, images| render(frame, &state, images))?;
+        // Live Ptt session events (transcript/error/watchdog) are processed
+        // here each iteration; the loop also wakes on its timers so results
+        // land promptly even without input.
+        state.drain_live_events();
         tokio::select! {
             terminal_event = input.next() => {
                 let Some(terminal_event) = terminal_event else {
@@ -711,8 +908,17 @@ pub async fn interactive(
                     return Ok(());
                 };
                 match terminal_event? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        if state.pty_attachment.is_none() && is_raw_multiline_paste_start(key) {
+                    Event::Key(key) if key.kind != KeyEventKind::Press => {
+                        // Release/Repeat events: only the hold-to-talk key is
+                        // lifecycle-sensitive. Release ends the recording;
+                        // auto-repeat presses must NOT supersede it.
+                        if state.keybindings.resolve(&key) == Some(Action::LivePtt) {
+                            if key.kind == KeyEventKind::Release {
+                                state.live_ptt_released();
+                            }
+                        }
+                    }
+                    Event::Key(key) if state.pty_attachment.is_none() && is_raw_multiline_paste_start(key) => {
                             // Ordinary printable keys never wait. Only an unmodified Enter
                             // probes events already buffered by the terminal, which is enough
                             // to recognize an unmarked multiline paste without a timer.
@@ -778,6 +984,7 @@ pub async fn interactive(
                                                 &mut state,
                                                 replay,
                                                 &mut terminal,
+                                                collab_host.as_ref(),
                                             )
                                             .await?
                                             {
@@ -799,6 +1006,7 @@ pub async fn interactive(
                                             &mut state,
                                             next,
                                             &mut terminal,
+                                            collab_host.as_ref(),
                                         )
                                         .await?
                                         {
@@ -820,7 +1028,9 @@ pub async fn interactive(
                                 state.shutdown_code_review().await;
                                 return Ok(());
                             }
-                        } else if handle_key(&application, &mut state, key, &mut terminal).await? {
+                    }
+                    Event::Key(key) => {
+                        if handle_key(&application, &mut state, key, &mut terminal, collab_host.as_ref()).await? {
                             terminal.set_code_review_mouse_capture(false)?;
                             state.cancel_extension_dialogs();
                             state.shutdown_side_chat().await;
@@ -850,6 +1060,7 @@ pub async fn interactive(
                         // repository, so the loaded snapshot, controller, and mouse
                         // capture must not survive into the new generation.
                         state.close_code_review_panel(&mut terminal)?;
+                        state.pending_ask.take();
                         state.replace_transcript_from_application(&application);
                         state.refresh_job_projection(&application);
                         state.todo_phases = application.todo_state().phases;
@@ -910,7 +1121,7 @@ pub async fn interactive(
                             panel.update_workflows(TuiState::todo_workflow_snapshots(&application));
                         }
                         state.push_status(format!("UI skipped {count} stale events"), true);
-                        state.reconcile_activity_from_application(&application);
+                        state.reconcile_activity_from_application(&application).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         terminal.set_code_review_mouse_capture(false)?;
@@ -963,9 +1174,34 @@ pub async fn interactive(
                     state.push_status(notice, false);
                 }
             }
+            _ = overlay_rows.tick(), if state.pending_overlay_rows.is_some() => {
+                // Apply the latest live `ctx.overlay.setRows` payload to the
+                // open overlay at the bounded coalescing rate; the loop's
+                // draw after this iteration renders the new rows.
+                state.flush_pending_overlay_rows();
+            }
             _ = animation.tick(), if state.has_active_animation() => {
+                // Only advance the animation frame here. The busy/streaming
+                // indicator is owned by the agent-event reducer (`AgentStart`
+                // arms it, `AgentSettled`/`RunFailed` clear it). Polling the
+                // application's `is_streaming()` from the animation tick clears
+                // the indicator the moment the runtime settles, which can race
+                // ahead of the still-queued `AgentSettled` broadcast: an inline
+                // observer keying off the `⟲` activity separator (e.g. a PTY
+                // lifecycle test waiting for an idle composer) would then signal
+                // idle before the turn's `MessageEnd`/`AgentSettled` events are
+                // processed, so the next prompt is submitted out of order and the
+                // pending-user-echo reconciliation scrambles the transcript.
+                // Missed broadcasts surface as `RecvError::Lagged`, whose handler
+                // still calls `reconcile_activity_from_application` for repair.
                 state.animation_frame = state.animation_frame.wrapping_add(1);
-                state.reconcile_activity_from_application(&application);
+                // Live elapsed on the job cards needs a wall clock; the tick
+                // fires while any job is active, so this stays fresh enough.
+                let tick_now = u64::try_from(pi_ai::now_millis().max(0)).unwrap_or(0);
+                state.job_cards.set_now(tick_now);
+                if let Some(panel) = &mut state.workflow_panel {
+                    panel.set_now(tick_now);
+                }
             }
             _ = theme_watch.tick() => {
                 let changed = state.poll_theme_reload() | state.reconcile_extension_dialog();
@@ -995,6 +1231,7 @@ pub async fn interactive(
     };
     let _ = terminal.set_code_review_mouse_capture(false);
     state.cancel_extension_dialogs();
+    state.cancel_pending_ask_unchecked(&application);
     state.shutdown_side_chat().await;
     state.shutdown_code_review().await;
     run_result
@@ -1016,11 +1253,6 @@ fn release_terminal(writer: &mut impl Write) -> io::Result<()> {
 fn restore_terminal() {
     if TUI_ACTIVE.swap(false, Ordering::SeqCst) {
         let mut stdout = io::stdout();
-        if crate::terminal_images::detect_protocol(
-            &crate::terminal_images::TerminalEnvironment::current(),
-        ) == Some(crate::terminal_images::TerminalImageProtocol::Kitty) {
-            let _ = stdout.write_all(crate::terminal_images::KITTY_DELETE_ALL);
-        }
         // Best-effort: code-review may have left mouse capture enabled.
         let _ = execute!(stdout, DisableMouseCapture);
         let _ = disable_raw_mode();
@@ -1029,16 +1261,37 @@ fn restore_terminal() {
     }
 }
 
-/// Install a process-wide panic hook that restores cooked mode and the cursor
-/// before the panic is printed. The normal-screen transcript is left intact.
+/// Render the panic report (payload + backtrace) with CRLF line endings so
+/// it stays readable when the pty is still in raw mode (OPOST off ⇒ a bare
+/// `\n` does not return the carriage).
+fn format_panic_report(info: &dyn std::fmt::Display, backtrace: &std::backtrace::Backtrace) -> String {
+    let info = info.to_string().replace('\n', "\r\n");
+    let backtrace = backtrace.to_string().replace('\n', "\r\n");
+    format!("\r\n{info}\r\n\r\nstack backtrace:\r\n{backtrace}\r\n")
+}
+
+/// Install a process-wide panic hook that prints the panic to stderr and
+/// restores cooked mode and the cursor. The normal-screen transcript is left
+/// intact.
+///
+/// The report is printed BEFORE the terminal is restored: restoring the
+/// terminal emits a tmux passthrough DCS (`wrap_tmux_passthrough` of the
+/// kitty delete-all escape) that leaves tmux's screen parser unable to
+/// render anything written after it, so a report printed after the restore
+/// is invisible in a tmux pane — a crash that kills the session with exit
+/// 101 and zero visible output. Printing first guarantees the payload and
+/// backtrace always reach the user.
 pub fn install_panic_hook() {
     if INSTALLED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let report = format_panic_report(info, &backtrace);
+        let mut stderr = io::stderr();
+        let _ = stderr.write_all(report.as_bytes());
+        let _ = stderr.flush();
         restore_terminal();
-        prev(info);
     }));
 }
 
@@ -1063,8 +1316,173 @@ trait CodeReviewMouseController {
     fn set_code_review_mouse_capture(&mut self, enable: bool) -> Result<()>;
 }
 
+/// Crossterm backend wrapper with width-aware cursor tracking.
+///
+/// Ratatui 0.29 tracks the previous update's buffer coordinate rather than
+/// the terminal cursor after printing the cell. For adjacent width-2 CJK
+/// glyphs that emits a `MoveTo` before every glyph, reproducing the reported
+/// inter-character spacing on affected terminals. Keep the upstream backend
+/// for all non-draw operations, but render diffs using the physical display
+/// width of the last symbol.
+#[derive(Debug)]
+struct WideCellCrosstermBackend<W: Write> {
+    inner: CrosstermBackend<W>,
+}
+
+impl<W: Write> WideCellCrosstermBackend<W> {
+    const fn new(writer: W) -> Self {
+        Self {
+            inner: CrosstermBackend::new(writer),
+        }
+    }
+}
+
+impl<W: Write> Write for WideCellCrosstermBackend<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(&mut self.inner)
+    }
+}
+fn crossterm_color(color: Color) -> crossterm::style::Color {
+    match color {
+        Color::Reset => crossterm::style::Color::Reset,
+        Color::Black => crossterm::style::Color::Black,
+        Color::Red => crossterm::style::Color::DarkRed,
+        Color::Green => crossterm::style::Color::DarkGreen,
+        Color::Yellow => crossterm::style::Color::DarkYellow,
+        Color::Blue => crossterm::style::Color::DarkBlue,
+        Color::Magenta => crossterm::style::Color::DarkMagenta,
+        Color::Cyan => crossterm::style::Color::DarkCyan,
+        Color::Gray => crossterm::style::Color::Grey,
+        Color::DarkGray => crossterm::style::Color::DarkGrey,
+        Color::LightRed => crossterm::style::Color::Red,
+        Color::LightGreen => crossterm::style::Color::Green,
+        Color::LightYellow => crossterm::style::Color::Yellow,
+        Color::LightBlue => crossterm::style::Color::Blue,
+        Color::LightMagenta => crossterm::style::Color::Magenta,
+        Color::LightCyan => crossterm::style::Color::Cyan,
+        Color::White => crossterm::style::Color::White,
+        Color::Indexed(value) => crossterm::style::Color::AnsiValue(value),
+        Color::Rgb(red, green, blue) => crossterm::style::Color::Rgb {
+            r: red,
+            g: green,
+            b: blue,
+        },
+    }
+}
+
+fn crossterm_attributes(modifier: Modifier) -> crossterm::style::Attributes {
+    use crossterm::style::Attribute;
+
+    let mut attributes = crossterm::style::Attributes::default();
+    for (flag, attribute) in [
+        (Modifier::BOLD, Attribute::Bold),
+        (Modifier::DIM, Attribute::Dim),
+        (Modifier::ITALIC, Attribute::Italic),
+        (Modifier::UNDERLINED, Attribute::Underlined),
+        (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+        (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+        (Modifier::REVERSED, Attribute::Reverse),
+        (Modifier::HIDDEN, Attribute::Hidden),
+        (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+    ] {
+        if modifier.contains(flag) {
+            attributes.set(attribute);
+        }
+    }
+    attributes
+}
+
+
+impl<W: Write> Backend for WideCellCrosstermBackend<W> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a BufferCell)>,
+    {
+        let mut next_position = None;
+        // Same-style runs are printed without repeating the SGR sequence
+        // (upstream ratatui dedups against the previous cell); emitting a
+        // SetStyle per cell interleaves `\x1b[m` between every glyph, which
+        // breaks the raw-output byte contiguity other tools and PTY-driven
+        // tests rely on and multiplies the render stream several-fold.
+        let mut last_style = crossterm::style::ContentStyle::default();
+        for (x, y, cell) in content {
+            let position = Position { x, y };
+            if next_position != Some(position) {
+                queue!(self.inner, MoveTo(x, y))?;
+            }
+            let style = cell.style();
+            let content_style = crossterm::style::ContentStyle {
+                foreground_color: style.fg.map(crossterm_color),
+                background_color: style.bg.map(crossterm_color),
+                underline_color: None,
+                attributes: crossterm_attributes(cell.modifier),
+            };
+            if content_style != last_style {
+                queue!(self.inner, crossterm::style::SetStyle(content_style))?;
+                last_style = content_style;
+            }
+            queue!(self.inner, crossterm::style::Print(cell.symbol()))?;
+            let symbol_width = UnicodeWidthStr::width(cell.symbol()).max(1);
+            next_position = Some(Position {
+                x: x.saturating_add(u16::try_from(symbol_width).unwrap_or(u16::MAX)),
+                y,
+            });
+        }
+        queue!(
+            self.inner,
+            crossterm::style::SetForegroundColor(crossterm::style::Color::Reset),
+            crossterm::style::SetBackgroundColor(crossterm::style::Color::Reset),
+            crossterm::style::SetAttribute(crossterm::style::Attribute::Reset)
+        )
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn append_lines(&mut self, count: u16) -> io::Result<()> {
+        self.inner.append_lines(count)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
+}
+
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<WideCellCrosstermBackend<Stdout>>,
     images: TerminalImageRenderer,
     /// Previous `page_overlay_open` sample. Used to clear the live region exactly
     /// once on overlay dismiss so transient page pixels cannot later be promoted
@@ -1084,6 +1502,9 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
+        // Capability detection is environment/version based here. An active
+        // terminal query would share stdin with the event loop and could
+        // consume keystrokes typed during startup.
         // Stable full-terminal inline height. Ratatui bakes `Viewport::Inline`
         // height at construction and reconstructing mid-session issues a CPR
         // that fails on bare PTYs ("cursor position could not be read").
@@ -1093,7 +1514,7 @@ impl TerminalGuard {
             .map(|(_, rows)| rows.max(Self::MIN_VIEWPORT_HEIGHT))
             .unwrap_or(24);
         let terminal = match Terminal::with_options(
-            CrosstermBackend::new(stdout),
+            WideCellCrosstermBackend::new(stdout),
             TerminalOptions {
                 viewport: Viewport::Inline(height),
             },
@@ -1193,9 +1614,13 @@ impl TerminalGuard {
                 content_width.min(buffer.area.width),
                 buffer.area.height,
             );
+            // Same contract as the live transcript paragraph above: the batch
+            // is pre-wrapped to `content_width`, so re-wrapping must be
+            // disabled or the whitespace-only user-card padding rows are
+            // split into an extra blank row each (doubled card edges in the
+            // committed scrollback).
             Paragraph::new(Text::from(lines))
                 .style(Style::default().fg(theme.text))
-                .wrap(Wrap { trim: false })
                 .render(area, buffer);
         })?;
         state.finish_commit(entries.len());
@@ -1242,14 +1667,6 @@ impl TerminalGuard {
         self.set_code_review_mouse_capture(false)?;
         self.clear_live_viewport()?;
         self.images.cleanup(self.terminal.backend_mut())?;
-        if crate::terminal_images::detect_protocol(
-            &crate::terminal_images::TerminalEnvironment::current(),
-        ) == Some(crate::terminal_images::TerminalImageProtocol::Kitty) {
-            let _ = self
-                .terminal
-                .backend_mut()
-                .write_all(crate::terminal_images::KITTY_DELETE_ALL);
-        }
         disable_raw_mode()?;
         release_terminal(self.terminal.backend_mut())?;
         TUI_ACTIVE.store(false, Ordering::SeqCst);
@@ -1301,6 +1718,9 @@ impl Drop for TerminalGuard {
         // normal transition paths release it synchronously; drop is the final
         // fallback for panics, terminal errors, and partially completed exits.
         let _ = self.set_code_review_mouse_capture(false);
+        // Ownership-scoped image deletion must run while this renderer still
+        // knows its randomized image ids. Never issue a global Kitty clear.
+        let _ = self.images.cleanup(self.terminal.backend_mut());
         // Row-clear the mutable composer/status/overlay frame before the inline
         // ED reset. tmux may retain a home-positioned ED surface in history;
         // blanking each row first keeps normal-screen scrollback transcript-only.
@@ -2101,6 +2521,76 @@ struct SettingsValueInput {
     replace_on_type: bool,
 }
 
+/// Arrow-key picker for enum settings. `options` come straight from the
+/// settings catalog so every entry is a valid draft value; Enter confirms the
+/// highlighted option, Esc drops the picker without touching the draft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SettingsEnumPicker {
+    key: String,
+    options: Vec<String>,
+    selected: usize,
+}
+
+/// Arrow-key picker for boolean settings. Mirrors [`SettingsEnumPicker`] with
+/// a fixed two-option true/false list; Enter applies the highlighted value via
+/// `set_boolean`, Esc drops the picker without touching the draft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SettingsBooleanPicker {
+    key: String,
+    selected: bool,
+}
+
+/// Whether `/live` hold-to-talk voice mode is armed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LiveMode {
+    #[default]
+    Off,
+    On,
+}
+
+/// Hold-to-talk voice UI state (`/live`): mode, active capture, and the event
+/// channel from the spawned Ptt session task. The api key never lives here in
+/// a displayable form — only inside [`LiveRuntimeSettings`], whose `Debug`
+/// redacts it.
+struct LiveUiState {
+    mode: LiveMode,
+    /// True while a capture is recording (Ptt held); drives the `Recording…`
+    /// activity row and the recording glyph.
+    recording: bool,
+    /// Session-task events (Started/Transcript/Stopped/Error). Drained each
+    /// loop iteration; the sender is cloned into spawned sessions.
+    events_tx: mpsc::UnboundedSender<PttSessionEvent>,
+    events_rx: mpsc::UnboundedReceiver<PttSessionEvent>,
+    /// Control channel of the active session, if any. Dropped (take) on
+    /// release/abort/supersede; a superseding press aborts the old session so
+    /// its transcript can never land in the new target.
+    control_tx: Option<mpsc::UnboundedSender<PttControl>>,
+    /// Effective live settings from the last runtime snapshot.
+    settings: Option<LiveRuntimeSettings>,
+    /// Lazily built STT HTTP client (shared by sessions via cheap clone).
+    stt: Option<SttClient>,
+    /// True while a delegated (spoken) coding task runs in the bound agent:
+    /// the draft was submitted through the standard prompt path and the turn
+    /// has not settled yet. Cleared on settle/failure/session switch/live
+    /// disarm. Invariant: `delegating` implies `mode == LiveMode::On`.
+    delegating: bool,
+    /// Wall clock when the delegation was submitted; renders the
+    /// `⟦delegating⟧ <elapsed>` status while the turn runs.
+    delegation_started: Option<std::time::Instant>,
+}
+
+impl LiveUiState {
+    fn start_delegation(&mut self) {
+        self.delegating = true;
+        self.delegation_started = Some(std::time::Instant::now());
+    }
+
+    fn clear_delegation(&mut self) {
+        self.delegating = false;
+        self.delegation_started = None;
+    }
+}
+
 struct TuiState {
     transcript: Vec<TranscriptEntry>,
     tool_cards: ToolCardPresentationAdapter,
@@ -2116,6 +2606,13 @@ struct TuiState {
     prompt_history_draft: Option<String>,
     streaming_text: String,
     streaming_thinking: String,
+    /// True while the model is currently emitting thinking deltas: set on
+    /// `ThinkingDelta`, cleared as soon as text or a tool call follows (the
+    /// model committed to acting), and at turn boundaries. The status line
+    /// shows `thinking…` only during that window — the accumulated
+    /// `streaming_thinking` buffer alone would read as "still thinking" long
+    /// after the model moved on.
+    thinking_streaming: bool,
     thinking_level: ThinkingLevel,
     is_streaming: bool,
     animation_frame: usize,
@@ -2135,7 +2632,28 @@ struct TuiState {
     /// armed the OMP double-press exit ladder. Cleared on unrelated input.
     last_ctrl_c: Option<std::time::Instant>,
     expand_tools: bool,
-    transcript_scroll: usize,
+    /// Scroll state for the transcript window. `None` = following the live
+    /// tail (the window sits at the bottom and new content pushes it along).
+    /// `Some(top)` = the window's top row in the *last rendered layout*,
+    /// moved by PageUp/PageDown and re-anchored every frame through
+    /// [`TuiState::scroll_anchor`]. Anchoring to a transcript entry instead
+    /// of the bottom keeps the user's reading position fixed while content
+    /// below the window changes height (streaming growth, mermaid
+    /// source↔diagram settle flips, resize reflow) — a bottom-anchored row
+    /// offset drifts by exactly the height delta and rows appear to vanish.
+    transcript_top_row: Cell<Option<usize>>,
+    /// `(transcript entry index, row offset within that entry)` of the
+    /// window's top row in the last rendered layout. Re-maps
+    /// [`TuiState::transcript_top_row`] through the current frame's entry
+    /// row starts when the layout changed between frames.
+    scroll_anchor: Cell<(usize, usize)>,
+    /// True between a PageUp/PageDown keypress and the next render: the
+    /// stored top row was moved deliberately, so the next render must use it
+    /// verbatim instead of re-anchoring through the (pre-move) anchor.
+    scroll_moved: Cell<bool>,
+    /// The last rendered `bottom` (total rows minus viewport height): the
+    /// follow point for PageDown and the reference for PageUp leaving follow.
+    transcript_scroll_bottom: Cell<usize>,
     transcript_page_rows: Cell<usize>,
     show_images: bool,
     image_width_cells: u16,
@@ -2154,6 +2672,14 @@ struct TuiState {
     composer_error: Option<String>,
     /// Whether the current bounded composer notice is a warning rather than an error.
     composer_error_is_warning: bool,
+    /// A live workflow status line parked while a page overlay owns the page
+    /// (the workflow panel in practice). Closing the workflow panel discards
+    /// ONLY this deferred line: it must never surface as an
+    /// "Error: Workflow … · running" toast after the panel closes. Other
+    /// deferred notices (failed `/run` results, paste-consume notices,
+    /// `WorkflowCommandFinished` errors, `push_warning` warnings) live in
+    /// [`Self::composer_error`] and keep surfacing after close.
+    deferred_workflow_status: Option<String>,
     model: String,
     cwd: String,
     completions: CompletionState,
@@ -2164,6 +2690,19 @@ struct TuiState {
     pending_attachments: Vec<PendingAttachment>,
     extension_ui: ExtensionUiAdapter,
     extension_dialog: Option<ExtensionDialog>,
+    /// Extension-rendered overlay panel (SAFE surface): the extension
+    /// supplies content rows (and an optional declarative input section); the
+    /// host draws the border and owns focus/key routing and the editor.
+    extension_overlay: Option<ExtensionOverlay>,
+    /// Latest live rows queued by `OverlayRowsChanged` for the open overlay,
+    /// coalesced (latest-wins) and applied by the overlay-rows tick at a
+    /// bounded rate so a streaming extension cannot force one repaint per
+    /// `ctx.overlay.setRows` call.
+    pending_overlay_rows: Option<(
+        pi_coding::ExtensionInstanceId,
+        String,
+        Vec<pi_coding::OverlayRow>,
+    )>,
     background_tx: mpsc::UnboundedSender<BackgroundEvent>,
     completion_generation: u64,
     completion_query: Option<(usize, AtPrefix)>,
@@ -2174,6 +2713,14 @@ struct TuiState {
     panel: Option<SelectorPanel>,
     settings_panel: Option<SettingsPanel>,
     settings_value_input: Option<SettingsValueInput>,
+    settings_enum_picker: Option<SettingsEnumPicker>,
+    settings_boolean_picker: Option<SettingsBooleanPicker>,
+    /// Entered settings subsection (two-level hierarchy leaf view). `None`
+    /// browses the full category list; `Some(section)` filters the value list
+    /// to that key-prefix-derived subsection until Esc pops back out.
+    settings_section: Option<String>,
+    /// Row cursor inside the active settings subsection.
+    settings_leaf_cursor: usize,
     tree_panel: Option<TreePanel>,
     process_panel: Option<ProcessPanel>,
     pty_attachment: Option<PtyAttachment>,
@@ -2186,8 +2733,8 @@ struct TuiState {
     code_review_load_generation: u64,
     code_review_load_in_flight: Option<(u64, u64, PathBuf)>,
     code_review_scope: ReviewScope,
-    /// Persistent side-chat controller. Survives overlay close; cleaned on TUI exit.
-    side_chat: Option<SideChatController>,
+    /// Multi-tab side-chat container. Survives overlay close; cleaned on TUI exit.
+    side_chat: Option<SideChatTabs>,
     /// Whether the side-chat overlay is currently visible.
     side_chat_open: bool,
     agents_panel: Option<AgentsPanel>,
@@ -2205,12 +2752,31 @@ struct TuiState {
     active_loops: std::collections::BTreeMap<String, LoopTask>,
     /// Dedupes live MessageDelivered projections and session CustomMessage IRC.
     seen_irc_message_ids: std::collections::HashSet<String>,
+    /// Queued steering message texts (first-queued first), projected from
+    /// `SessionEvent::QueueUpdate`. Drives the `⟦steering⟧` status line above
+    /// the input and the `⚙ N` pending count in the composer header. Never
+    /// mutated from render; updated only by queue lifecycle events.
+    queued_steering: Vec<String>,
+    /// Queued follow-up message count from `SessionEvent::QueueUpdate`;
+    /// contributes to the `⚙ N` pending count alongside `queued_steering`.
+    queued_follow_up: usize,
+    /// The model's pending interactive question (`ask` tool), rendered on the
+    /// composer status line and answered by the next submitted line.
+    pending_ask: Option<PendingAsk>,
     /// Cached git branch/dirty counts for the composer footer, refreshed by a
     /// bounded background task (never collected in render).
     git_status: Option<FooterGitStatus>,
     /// Cached context-window utilization for the composer footer, sourced from
     /// `session_stats()` off the render path.
     context_usage: Option<SessionContextUsage>,
+    /// Cached session cost total for the composer status line, sourced from
+    /// `session_stats()` in the footer refresh worker. Zero (free session / no
+    /// usage yet) renders nothing.
+    session_cost: f64,
+    /// Cached session token totals for the composer status line, sourced from
+    /// `session_stats()` in the footer refresh worker. `None` until the first
+    /// refresh completes; a zero `total` renders nothing.
+    session_tokens: Option<SessionTokenStats>,
     /// Monotonic clock of the last footer refresh spawn. Same-runtime refreshes
     /// remain throttled to `FOOTER_REFRESH_INTERVAL`.
     last_footer_refresh: Option<std::time::Instant>,
@@ -2220,6 +2786,17 @@ struct TuiState {
     footer_refresh_pending: Option<FooterRefreshRequest>,
     /// Latest runtime/cwd identity requested by the live TUI.
     footer_refresh_current: Option<FooterRefreshKey>,
+    /// Hold-to-talk voice (`/live`) UI state.
+    live: LiveUiState,
+}
+
+impl Drop for TuiState {
+    /// Aborts any live microphone capture when the TUI state is dropped
+    /// (normal exit, error return, or teardown), so the mic never stays open
+    /// after the UI is gone. The session task then stops and sends nothing.
+    fn drop(&mut self) {
+        self.live_abort_recording();
+    }
 }
 
 const MAX_RECENT_SESSIONS: usize = 3;
@@ -2304,6 +2881,11 @@ impl TuiState {
             .resource_snapshot()
             .map(|snapshot| snapshot.settings.tui_runtime())
             .unwrap_or_else(|| pi_coding::Settings::default().tui_runtime());
+        let live_settings = application
+            .resource_snapshot()
+            .map(|snapshot| snapshot.settings.live_runtime())
+            .unwrap_or_else(|| pi_coding::Settings::default().live_runtime());
+        let (live_events_tx, live_events_rx) = mpsc::unbounded_channel();
         let mut themes = ThemeManager::load_sources(theme_dirs, explicit_themes);
         if let Some(theme) = runtime_settings.theme.as_deref() {
             let _ = themes.switch_by_name(theme);
@@ -2323,6 +2905,7 @@ impl TuiState {
             thinking_level: session.thinking_level(),
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            thinking_streaming: false,
             is_streaming: false,
             animation_frame: 0,
             is_compacting: false,
@@ -2332,7 +2915,10 @@ impl TuiState {
             last_escape: None,
             last_ctrl_c: None,
             expand_tools: false,
-            transcript_scroll: 0,
+            transcript_top_row: Cell::new(None),
+            scroll_anchor: Cell::new((0, 0)),
+            scroll_moved: Cell::new(false),
+            transcript_scroll_bottom: Cell::new(0),
             transcript_page_rows: Cell::new(1),
             show_images: runtime_settings.show_images,
             image_width_cells: runtime_settings.image_width_cells,
@@ -2340,6 +2926,7 @@ impl TuiState {
             extension_status_key: None,
             composer_error: None,
             composer_error_is_warning: false,
+            deferred_workflow_status: None,
             model,
             cwd: cwd.display().to_string(),
             completions: CompletionState::default(),
@@ -2350,6 +2937,8 @@ impl TuiState {
             pending_attachments: Vec::new(),
             extension_ui,
             extension_dialog: None,
+            extension_overlay: None,
+            pending_overlay_rows: None,
             background_tx,
             completion_generation: 0,
             completion_query: None,
@@ -2360,6 +2949,10 @@ impl TuiState {
             panel: None,
             settings_panel: None,
             settings_value_input: None,
+            settings_enum_picker: None,
+            settings_boolean_picker: None,
+            settings_section: None,
+            settings_leaf_cursor: 0,
             tree_panel: None,
             process_panel: None,
             pty_attachment: None,
@@ -2386,13 +2979,29 @@ impl TuiState {
             extension_title: None,
             active_loops: std::collections::BTreeMap::new(),
             seen_irc_message_ids: std::collections::HashSet::new(),
+            queued_steering: Vec::new(),
+            queued_follow_up: 0,
+            pending_ask: None,
             git_status: None,
             context_usage: None,
+            session_cost: 0.0,
+            session_tokens: None,
             last_footer_refresh: None,
             footer_refresh_in_flight: None,
             footer_refresh_pending: None,
             footer_refresh_current: None,
             goal_state: application.goal_state(),
+            live: LiveUiState {
+                mode: LiveMode::Off,
+                recording: false,
+                events_tx: live_events_tx,
+                events_rx: live_events_rx,
+                control_tx: None,
+                settings: Some(live_settings),
+                stt: None,
+                delegating: false,
+                delegation_started: None,
+            },
         };
         state.sync_extension_host_bindings();
         for message in session.history() {
@@ -2485,6 +3094,10 @@ impl TuiState {
             },
             None => None,
         };
+        // Refresh the effective /live configuration (endpoint/key/model) so a
+        // settings change is picked up without restart. A session already
+        // recording keeps its snapshot; the next press validates the new one.
+        self.live.settings = Some(settings.live.clone());
         self.sync_extension_host_bindings();
         if let Err(error) = self.refresh_recent_sessions(application) {
             self.push_status(format!("Could not refresh recent sessions: {error:#}"), true);
@@ -2503,10 +3116,14 @@ impl TuiState {
     fn apply_extension_ui(&mut self, event: ExtensionUiEvent) {
         match event {
             ExtensionUiEvent::InteractionRequested { interaction } => {
-                // `page_overlay_owner` is the authoritative exclusive-page
-                // predicate: any modal page owner defers the interaction, not
-                // only code-review/side-chat/PTY.
-                if let Some(owner) = page_overlay_owner(self) {
+                // `page_overlay_capturing` is the authoritative input-ownership
+                // predicate: any modal page owner that captures keys defers
+                // the interaction (not only code-review/side-chat/PTY). A
+                // visible non-capturing extension overlay that is unfocused
+                // does NOT capture, so the interaction proceeds — the
+                // composer is the single input owner.
+                if page_overlay_capturing(self) {
+                    let owner = page_overlay_owner(self).unwrap_or("an extension overlay");
                     let _ = self.extension_ui.cancel(&interaction.id);
                     self.extension_status_key = None;
                     self.status = format!(
@@ -2576,7 +3193,14 @@ impl TuiState {
                     .as_ref()
                     .is_some_and(|dialog| dialog.instance() == &instance)
                 {
-                    self.extension_dialog = None;
+                    self.finish_extension_dialog(true);
+                }
+                if self
+                    .extension_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.instance == instance)
+                {
+                    self.close_extension_overlay();
                 }
                 // Retire keyed ownership for the unloaded extension. Clear the
                 // live status only while it still equals that owner's text;
@@ -2637,8 +3261,111 @@ impl TuiState {
             }
             ExtensionUiEvent::WidgetChanged { .. }
             | ExtensionUiEvent::WidgetCleared { .. } => {}
+            ExtensionUiEvent::OverlayOpenRequested {
+                instance,
+                id,
+                title,
+                rows,
+                non_capturing,
+                input,
+            } => {
+                // Auto-open from `ctx.overlay.open(id, { nonCapturing? })`:
+                // open the overlay panel with the sanitized rows the
+                // extension pushed (or the empty initial set). The overlay id
+                // and the static input declaration were resolved against the
+                // runtime registry before this event fired. The auto-open
+                // path has no render result, so the initial draft is empty;
+                // a non-capturing open starts unfocused so the composer keeps
+                // accepting input until the focus-toggle action flips focus.
+                let input = input.map(|declaration| OverlayInput {
+                    value: String::new(),
+                    placeholder: declaration.placeholder,
+                    multiline: declaration.multiline,
+                });
+                self.open_extension_overlay(
+                    &instance,
+                    &id,
+                    &title,
+                    rows,
+                    input,
+                    non_capturing,
+                );
+            }
+            ExtensionUiEvent::OverlayRowsChanged {
+                instance,
+                id,
+                rows,
+            } => {
+                // Live `ctx.overlay.setRows`: queue the latest rows for the
+                // open overlay with the same `(instance, id)`. The rows are
+                // coalesced (latest-wins) and applied by the overlay-rows
+                // tick so a streaming extension cannot force one repaint per
+                // setRows call; the event loop draws after every iteration,
+                // so the applied rows render immediately.
+                if self
+                    .extension_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.instance == instance && overlay.id == id)
+                {
+                    self.pending_overlay_rows = Some((instance, id, rows));
+                }
+            }
         }
         self.sync_extension_host_bindings();
+    }
+
+    /// Open the extension overlay panel for `(instance, id)` with the given
+    /// (already sanitized) content rows, the optional merged input config,
+    /// and the focus mode. The overlay id must have been resolved against
+    /// the runtime registry by the caller. A fresh open is authoritative:
+    /// any queued live rows from a previous instance of the same overlay are
+    /// discarded so a stale update cannot overwrite the new render.
+    fn open_extension_overlay(
+        &mut self,
+        instance: &pi_coding::ExtensionInstanceId,
+        id: &str,
+        title: &str,
+        rows: Vec<pi_coding::OverlayRow>,
+        input: Option<OverlayInput>,
+        non_capturing: bool,
+    ) {
+        self.pending_overlay_rows = None;
+        self.extension_overlay = Some(ExtensionOverlay::new(
+            instance.clone(),
+            id.to_owned(),
+            title.to_owned(),
+            rows,
+            input,
+            non_capturing,
+        ));
+        self.status = if non_capturing {
+            format!("Overlay {id} · Alt+/ focuses · Esc closes")
+        } else {
+            format!("Overlay {id} · Esc closes")
+        };
+    }
+
+    /// Apply the coalesced live rows to the open overlay (the `OverlayRowsChanged`
+    /// queue slot) at the bounded flush rate. Returns whether rows were applied.
+    fn flush_pending_overlay_rows(&mut self) -> bool {
+        let Some((instance, id, rows)) = self.pending_overlay_rows.take() else {
+            return false;
+        };
+        let Some(overlay) = self.extension_overlay.as_mut() else {
+            return false;
+        };
+        if overlay.instance != instance || overlay.id != id {
+            return false;
+        }
+        overlay.set_rows(rows);
+        true
+    }
+
+    /// Close the extension overlay panel, returning focus to the composer.
+    fn close_extension_overlay(&mut self) {
+        if self.extension_overlay.take().is_some() {
+            self.status = "Ready".to_owned();
+        }
     }
 
     /// Publishes live editor/theme/tools state into the extension adapter so
@@ -2684,6 +3411,22 @@ impl TuiState {
         for interaction in self.extension_ui.pending_interactions() {
             let _ = self.extension_ui.cancel(&interaction.id);
         }
+    }
+
+    /// Cancel the model's pending interactive `ask` (Esc, shutdown). Resolves
+    /// the awaiting tool call with a cancelled error so the turn can continue.
+    async fn cancel_pending_ask(&mut self, application: &Application) {
+        if let Some(ask) = self.pending_ask.take() {
+            let _ = application.cancel_ask(&ask.id);
+            self.editor.clear();
+            self.status = "Ask cancelled".to_owned();
+        }
+    }
+
+    /// Cancel any pending ask regardless of id (TUI shutdown paths).
+    fn cancel_pending_ask_unchecked(&mut self, application: &Application) {
+        self.pending_ask.take();
+        application.cancel_pending_ask();
     }
 
     fn finish_extension_dialog(&mut self, cancelled: bool) {
@@ -2798,7 +3541,19 @@ impl TuiState {
     }
 
     fn has_active_animation(&self) -> bool {
-        self.is_streaming || self.is_compacting || self.job_cards.running_count() > 0
+        self.is_streaming
+            || self.is_compacting
+            || self.job_cards.running_count() > 0
+            || running_tool_activity(self).is_some()
+            || running_subagent_activity(self).is_some()
+            || live_wave_activity(self).is_some()
+            // A mid-planning workflow keeps the tick alive so the workflow
+            // page's planning elapsed and inactivity notice stay live even
+            // while the main session is idle.
+            || self
+                .workflow_panel
+                .as_ref()
+                .is_some_and(WorkflowPanel::has_active_planning)
     }
 
     fn apply_orchestration_event(&mut self, event: pi_coding::OrchestrationEvent) {
@@ -2839,13 +3594,21 @@ impl TuiState {
     /// is required after receiver lag because `AgentStart` or `AgentSettled`
     /// may be among the skipped broadcast events; it also lets the animation
     /// tick repair a stale busy indicator if settling raced that recovery.
-    fn reconcile_activity_from_application(&mut self, application: &Application) {
+    /// The queued steering/follow-up projection is repaired here as well: a
+    /// dropped `QueueUpdate` would otherwise leave the `⚙ N` count and the
+    /// `⟦steering⟧` status line stale until the next queue lifecycle event.
+    async fn reconcile_activity_from_application(&mut self, application: &Application) {
+        let (steering, follow_up) = application.queued_messages().await;
+        self.queued_follow_up = follow_up.len();
+        self.queued_steering = steering.into_iter().filter_map(message_text).collect();
         self.is_streaming = application.is_streaming();
         if self.is_streaming {
             return;
         }
         self.streaming_text.clear();
         self.streaming_thinking.clear();
+        self.thinking_streaming = false;
+        self.live.clear_delegation();
         self.status = "Ready".to_owned();
     }
 
@@ -2881,6 +3644,7 @@ impl TuiState {
                 self.is_streaming = true;
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
+                self.thinking_streaming = false;
                 self.follow_transcript();
                 self.status = "Working".to_owned();
             }
@@ -2889,6 +3653,9 @@ impl TuiState {
                 ..
             }) => {
                 self.streaming_text.push_str(&delta);
+                // The model switched from reasoning to composing the reply:
+                // the `thinking…` status indicator must not linger.
+                self.thinking_streaming = false;
                 self.follow_transcript();
             }
             ApplicationEvent::Agent(AgentEvent::MessageUpdate {
@@ -2896,17 +3663,24 @@ impl TuiState {
                 ..
             }) => {
                 self.streaming_thinking.push_str(&delta);
+                self.thinking_streaming = true;
                 self.follow_transcript();
             }
+            ApplicationEvent::Agent(AgentEvent::ToolExecutionStart { .. }) => {
+                // The model committed to a tool call: pre-call thinking is
+                // over, so the status line's `thinking…` indicator (driven by
+                // the streaming flag) must not linger while the tool runs or
+                // after it settles.
+                self.thinking_streaming = false;
+            }
             ApplicationEvent::Agent(
-                AgentEvent::ToolExecutionStart { .. }
-                | AgentEvent::ToolExecutionUpdate { .. }
-                | AgentEvent::ToolExecutionEnd { .. },
+                AgentEvent::ToolExecutionUpdate { .. } | AgentEvent::ToolExecutionEnd { .. },
             ) => {}
             ApplicationEvent::Agent(AgentEvent::MessageEnd { message }) => {
                 if matches!(message, Message::Assistant(_)) {
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
+                    self.thinking_streaming = false;
                 }
                 if let Message::Custom(custom) = &message
                     && (pi_coding::loop_message_view(custom).is_some()
@@ -2978,14 +3752,41 @@ impl TuiState {
                     "Compaction complete".to_owned()
                 };
             }
+            // Project the steering/follow-up queues for the composer header
+            // counts and the `⟦steering⟧` status line. Published after every
+            // steer/follow-up/enqueue and by `drain_queued_messages` (with
+            // empty vectors), so the projection always tracks the live queue.
+            ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+                steering,
+                follow_up,
+            }) => {
+                self.queued_follow_up = follow_up.len();
+                self.queued_steering = steering.into_iter().filter_map(message_text).collect();
+            }
+            // The model asked the user a question mid-task: show it on the
+            // composer status line and route the next submitted line back as
+            // the answer (Esc cancels).
+            ApplicationEvent::Session(pi_coding::SessionEvent::AskUser { id, prompt }) => {
+                self.pending_ask = Some(PendingAsk { id, prompt });
+            }
+            // The question was answered, cancelled, or timed out; retire the
+            // rendered `⟦ask⟧` row (only if it still belongs to this id so a
+            // stale resolution can't clear a newer question).
+            ApplicationEvent::Session(pi_coding::SessionEvent::AskUserResolved { id }) => {
+                if self.pending_ask.as_ref().is_some_and(|ask| ask.id == id) {
+                    self.pending_ask.take();
+                }
+            }
             ApplicationEvent::AgentSettled => {
                 self.is_streaming = false;
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
+                self.live.clear_delegation();
                 self.status = "Ready".to_owned();
             }
             ApplicationEvent::RunFailed { message } => {
                 self.is_streaming = false;
+                self.live.clear_delegation();
                 self.push_status(message, true);
             }
             ApplicationEvent::Exported { path } => {
@@ -3018,6 +3819,11 @@ impl TuiState {
                 self.goal_state = state;
             }
             ApplicationEvent::Loop(event) => self.apply_loop_event(event),
+            // Auto-mode classifier status hint ("Detected: code task — /todo
+            // to plan"), shown after the prompt when the classifier fires.
+            ApplicationEvent::ModeDetected { hint, .. } => {
+                self.push_status(hint, false);
+            }
             _ => {}
         }
     }
@@ -3054,7 +3860,7 @@ impl TuiState {
                         current.name.clone()
                     })
                 {
-                    self.set_bounded_status(format!("Workflow {name} · {status}"));
+                    self.set_deferred_workflow_status(format!("Workflow {name} · {status}"));
                 }
             }
             pi_coding::WorkflowEvent::Removed { workflow_id, generation,
@@ -3088,8 +3894,9 @@ impl TuiState {
             !matches!(
                 command,
                 crate::workflow_commands::InteractiveWorkflowCommand::OpenPage
+                    | crate::workflow_commands::InteractiveWorkflowCommand::List
             ),
-            "OpenPage is admitted inline by dispatch_workflow_command",
+            "OpenPage and List are admitted inline by dispatch_workflow_command",
         );
         let label = workflow_command_admission_label(&command);
         self.status = format!("{label}…");
@@ -3163,12 +3970,17 @@ impl TuiState {
         self.transcript.clear();
         self.seen_irc_message_ids.clear();
         self.committed_entries = 0;
-        self.transcript_scroll = 0;
+        self.transcript_top_row.set(None);
+        self.scroll_anchor.set((0, 0));
+        self.scroll_moved.set(false);
+        self.transcript_scroll_bottom.set(0);
         self.transcript_page_rows.set(1);
         self.streaming_text.clear();
         self.streaming_thinking.clear();
         self.is_streaming = false;
+        self.live.clear_delegation();
         self.pending_user_echo = false;
+        self.pending_ask.take();
         self.rebuild_prompt_history_from_messages(application.messages());
         self.reset_tool_projection();
         self.job_cards.clear();
@@ -3301,12 +4113,30 @@ impl TuiState {
     }
 
     /// Surface a background-result status line without preempting an active
-    /// exclusive overlay. When no overlay owns the status line, the message
-    /// becomes the live status; otherwise it degrades to the bounded composer
+    /// input-owning overlay. When no overlay captures the status line (a
+    /// visible unfocused non-capturing overlay leaves the composer in
+    /// charge), the message becomes the live status; otherwise it degrades to
+    /// the bounded composer toast.
     fn set_bounded_status(&mut self, text: String) {
-        if page_overlay_open(self) {
+        if page_overlay_capturing(self) {
             self.composer_error = Some(text);
             self.composer_error_is_warning = false;
+        } else {
+            self.set_live_status(text);
+        }
+    }
+
+    /// Defer a live workflow status line while a page overlay owns the page.
+    /// The line parks in [`Self::deferred_workflow_status`] (rendered as a
+    /// bounded toast via the composer-error fallback) and is discarded when
+    /// the workflow panel closes — closing must never surface an
+    /// "Error: Workflow … · running" toast. It deliberately bypasses
+    /// [`Self::composer_error`] so unrelated deferred notices (failed `/run`
+    /// results, paste-consume notices, `WorkflowCommandFinished` errors,
+    /// `push_warning` warnings) survive the close untouched.
+    fn set_deferred_workflow_status(&mut self, text: String) {
+        if page_overlay_capturing(self) {
+            self.deferred_workflow_status = Some(text);
         } else {
             self.set_live_status(text);
         }
@@ -3492,19 +4322,45 @@ impl TuiState {
             let excess = self.transcript.len() - MAX_TRANSCRIPT_LINES;
             self.transcript.drain(..excess);
             self.committed_entries = self.committed_entries.saturating_sub(excess);
+            // Draining the front shifts every entry index; the scroll anchor
+            // follows so the window keeps pointing at the same content.
+            let (entry, offset) = self.scroll_anchor.get();
+            self.scroll_anchor.set((entry.saturating_sub(excess), offset));
         }
     }
 
     fn follow_transcript(&mut self) {
-        self.transcript_scroll = 0;
+        self.transcript_top_row.set(None);
+        self.scroll_moved.set(false);
     }
 
     fn page_transcript(&mut self, direction: i32) {
         let page = self.transcript_page_rows.get().max(1);
-        if direction < 0 {
-            self.transcript_scroll = self.transcript_scroll.saturating_add(page);
-        } else {
-            self.transcript_scroll = self.transcript_scroll.saturating_sub(page);
+        match self.transcript_top_row.get() {
+            None => {
+                // Leaving follow mode: anchor one page above the bottom of the
+                // last rendered layout. The render re-anchors through entries
+                // on its next frame, so this raw row is only a starting point.
+                if direction < 0 {
+                    self.transcript_top_row.set(Some(self.transcript_scroll_bottom.get().saturating_sub(page)));
+                    self.scroll_moved.set(true);
+                }
+            }
+            Some(top) => {
+                if direction < 0 {
+                    self.transcript_top_row.set(Some(top.saturating_sub(page)));
+                } else {
+                    let new_top = top.saturating_add(page);
+                    if new_top >= self.transcript_scroll_bottom.get() {
+                        // Scrolled past the bottom: resume following.
+                        self.transcript_top_row.set(None);
+                        self.scroll_moved.set(false);
+                    } else {
+                        self.transcript_top_row.set(Some(new_top));
+                    }
+                }
+                self.scroll_moved.set(true);
+            }
         }
     }
 
@@ -3716,25 +4572,45 @@ impl TuiState {
             self.completions.clear();
             return;
         }
-        let commands = if prefix.starts_with("skill:") {
-            self.commands
-                .iter()
-                .filter(|command| command.source == CommandSource::Skill)
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            visible_catalog()
-        };
-        let items = commands
-            .into_iter()
+        // Skill commands (`/skill:<name>`, CommandSource::Skill) are always
+        // candidates so the default surface stays discoverable, matching the
+        // richer omp listing. Ordering is deterministic:
+        // - A `ski`/`skill:` prefix keeps the T23 narrowing: only the
+        //   skill-defined dynamic commands are listed, fuzzy-narrowed as the
+        //   user types.
+        // - Every other prefix (bare `/` included) lists the builtin primary
+        //   catalog first, then every matching skill command sorted by
+        //   `/skill:<name>`. The popup windows to MAX_COMPLETIONS rows only at
+        //   render time, so keeping every match selectable stays cheap.
+        let mut skills = self
+            .commands
+            .iter()
+            .filter(|command| command.source == CommandSource::Skill)
             .filter(|command| fuzzy_match(&command.name, prefix))
             .map(|command| CompletionItem {
                 value: format!("/{}", command.name),
-                label: format!("/{}", command.name),
+                label: slash_completion_label(&command.name),
                 description: command.description.clone(),
                 is_directory: false,
             })
             .collect::<Vec<_>>();
+        skills.sort_by(|left, right| left.value.cmp(&right.value));
+        let items = if prefix.starts_with("ski") {
+            skills
+        } else {
+            let mut items = visible_catalog()
+                .into_iter()
+                .filter(|command| fuzzy_match(&command.name, prefix))
+                .map(|command| CompletionItem {
+                    value: format!("/{}", command.name),
+                    label: slash_completion_label(&command.name),
+                    description: command.description.clone(),
+                    is_directory: false,
+                })
+                .collect::<Vec<_>>();
+            items.extend(skills);
+            items
+        };
         // Keep every fuzzy match so `/settings` (and anything past the first
         // MAX_COMPLETIONS alphabetical hits) remains selectable. The popup
         // windows to MAX_COMPLETIONS rows only at render time.
@@ -3874,10 +4750,46 @@ impl TuiState {
                     Err(error) => self.push_status(format!("Clipboard copy failed: {error}"), true),
                 }
             }
+            BackgroundEvent::ClipboardHandoffWrite(result) => {
+                self.clipboard_write_busy = false;
+                match result {
+                    Ok(()) => self.status = "Copied handoff to clipboard".to_owned(),
+                    Err(error) => self.push_status(format!("Clipboard copy failed: {error}"), true),
+                }
+            }
+            BackgroundEvent::OverlayCallbackFinished {
+                overlay_id,
+                event,
+                result,
+            } => {
+                // Overlay-local callback outcome: failures land in the
+                // overlay's local status area (never the shared composer
+                // error slot), and a failed submit restores the captured
+                // draft if the user has not typed anything new. Late results
+                // for a closed/replaced overlay are dropped.
+                let Some(overlay) = self.extension_overlay.as_mut() else {
+                    return;
+                };
+                if overlay.id != overlay_id {
+                    return;
+                }
+                overlay.submit_in_flight = false;
+                match result {
+                    Ok(_) => overlay.local_status = None,
+                    Err(error) => {
+                        overlay.local_status = Some(error);
+                        if let pi_coding::OverlayEvent::Submit { text } = &event
+                            && overlay.editor.is_empty()
+                        {
+                            overlay.editor.set_text(text);
+                        }
+                    }
+                }
+            }
             BackgroundEvent::ExtensionCommandFinished { command, result } => match result {
                 Ok(value) if !value.is_null() => self.push_status(value.to_string(), false),
                 Ok(_) => self.set_bounded_status(format!("Ran /{command}")),
-                Err(error) => self.set_bounded_status(format!("/run {command} failed: {error}")),
+                Err(error) => self.push_status(format!("/run {command} failed: {error}"), true),
             },
             BackgroundEvent::WorkflowCommandFinished { label, result } => match result {
                 Ok(crate::workflow_commands::WorkflowCommandEffect::OpenPage) => {
@@ -3896,6 +4808,29 @@ impl TuiState {
                 }
                 Err(error) => {
                     self.push_status(format!("Workflow command failed: {error}"), true);
+                }
+            },
+            BackgroundEvent::CompactionFinished { result } => {
+                // `SessionEvent::CompactionEnd` (published before the background
+                // task reported back) already surfaced the abort/error terminal
+                // states; keep this handler idempotent so the two event orders
+                // converge on the same final status. Only the success path adds
+                // the token-count summary the session event lacks.
+                self.is_compacting = false;
+                match result {
+                    Ok(result) => {
+                        self.status = format!(
+                            "Compacted {} → {} estimated tokens",
+                            result.tokens_before,
+                            result.estimated_tokens_after.unwrap_or_default()
+                        );
+                    }
+                    Err(error) if error == "Compaction cancelled" => {
+                        self.status = "Compaction aborted".to_owned();
+                    }
+                    Err(error) => {
+                        self.status = format!("Compaction failed: {error}");
+                    }
                 }
             },
             BackgroundEvent::FooterRefresh(result) => {
@@ -3929,6 +4864,8 @@ impl TuiState {
             self.footer_refresh_current = Some(request.key.clone());
             self.git_status = None;
             self.context_usage = None;
+            self.session_cost = 0.0;
+            self.session_tokens = None;
         }
         let due = identity_changed
             || self
@@ -3965,6 +4902,8 @@ impl TuiState {
             self.context_usage = result
                 .context
                 .filter(|usage| usage.context_window > 0);
+            self.session_cost = result.cost;
+            self.session_tokens = Some(result.tokens);
         }
 
         // Completion hands the one coalesced latest request the slot without
@@ -3985,6 +4924,8 @@ impl TuiState {
     fn invalidate_footer_refresh(&mut self, application: &Application) {
         self.git_status = None;
         self.context_usage = None;
+        self.session_cost = 0.0;
+        self.session_tokens = None;
         self.request_footer_refresh(application);
     }
 
@@ -4022,7 +4963,9 @@ impl TuiState {
             return;
         }
         self.editor.insert_text(payload);
-        self.status = format!("Pasted {} bytes", payload.len());
+        // Pasting is silent by design: the payload landing in the editor is
+        // the only visible effect, and the status line must not churn with
+        // "Pasted N bytes" feedback.
         self.refresh_completions();
     }
 
@@ -4043,23 +4986,41 @@ impl TuiState {
     }
 
     fn start_copy(&mut self, application: &Application) {
-        if self.clipboard_write_busy {
-            self.status = "Clipboard copy already in progress".to_owned();
-            return;
-        }
         let text = application.last_assistant_text().unwrap_or_default();
         if text.is_empty() {
             self.push_status("No assistant message to copy".to_owned(), true);
             return;
         }
-        self.clipboard_write_busy = true;
         self.status = "Copying last assistant message".to_owned();
+        self.spawn_clipboard_text_write(text, BackgroundEvent::ClipboardWrite);
+    }
+
+    /// Copies the rendered `/handoff` block to the clipboard in the
+    /// background; the transcript block itself is already on screen.
+    fn start_handoff_copy(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.status = "Copying handoff to clipboard".to_owned();
+        self.spawn_clipboard_text_write(text, BackgroundEvent::ClipboardHandoffWrite);
+    }
+
+    fn spawn_clipboard_text_write(
+        &mut self,
+        text: String,
+        event: fn(std::result::Result<(), String>) -> BackgroundEvent,
+    ) {
+        if self.clipboard_write_busy {
+            self.status = "Clipboard copy already in progress".to_owned();
+            return;
+        }
+        self.clipboard_write_busy = true;
         let tx = self.background_tx.clone();
         tokio::spawn(async move {
             let result = clipboard::write_text(&text)
                 .await
                 .map_err(|error| error.to_string());
-            let _ = tx.send(BackgroundEvent::ClipboardWrite(result));
+            let _ = tx.send(event(result));
         });
     }
 
@@ -4228,6 +5189,11 @@ impl TuiState {
         self.side_chat_open = false;
         self.session_selector = None;
         self.scoped_model_selector = None;
+        self.settings_value_input = None;
+        self.settings_enum_picker = None;
+        self.settings_boolean_picker = None;
+        self.settings_section = None;
+        self.settings_leaf_cursor = 0;
         match SettingsPanel::from_application(application, pi_coding::SettingsScope::Global) {
             Ok(panel) => self.settings_panel = Some(panel),
             Err(error) => self.push_status(format!("Cannot open settings: {error:#}"), true),
@@ -4257,8 +5223,14 @@ impl TuiState {
         self.scoped_model_selector = None;
         self.cancel_file_completion();
         self.editor.clear();
-        let workflows = application.workflow_list().iter().map(|snapshot| Self::project_workflow_snapshot(application, snapshot)).collect();
+        let workflows: Vec<WorkflowPanelSnapshot> = application.workflow_list().iter().map(|snapshot| Self::project_workflow_snapshot(application, snapshot)).collect();
+        self.workflow_snapshots = workflows.clone();
         self.workflow_panel = Some(WorkflowPanel::new(workflows));
+        if let Some(selected) = application.workflow_selected() {
+            if let Some(panel) = self.workflow_panel.as_mut() {
+                panel.select_id(selected.workflow_id.as_str());
+            }
+        }
         Ok(())
     }
 
@@ -4324,6 +5296,8 @@ impl TuiState {
         self.panel = None;
         self.settings_panel = None;
         self.settings_value_input = None;
+        self.settings_enum_picker = None;
+        self.settings_boolean_picker = None;
         self.tree_panel = None;
         self.process_panel = None;
         self.workflow_panel = None;
@@ -4335,7 +5309,9 @@ impl TuiState {
         Ok(())
     }
 
-    /// Open `/btw` overlay. Reuses an existing side session when present.
+    /// Open `/btw` overlay on the active tab, creating the default container
+    /// (legacy single-session tab) on first use. Submits `initial_prompt` to
+    /// the active tab when given.
     async fn open_side_chat(
         &mut self,
         application: &Application,
@@ -4343,26 +5319,165 @@ impl TuiState {
         mouse: &mut impl CodeReviewMouseController,
     ) -> Result<()> {
         self.dismiss_page_overlays_for_side_chat(mouse)?;
-        if self.side_chat.is_none() {
-            match SideChatController::fork_from(application).await {
-                Ok(controller) => self.side_chat = Some(controller),
-                Err(error) => {
-                    self.push_status(format!("Cannot open side chat: {error:#}"), true);
-                    return Ok(());
-                }
-            }
-        }
+        self.ensure_side_chat_container(application).await?;
         self.side_chat_open = true;
         if let Some(prompt) = initial_prompt
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
-            if let Some(side) = self.side_chat.as_mut() {
-                side.submit_prompt(prompt);
+            if let Some(tabs) = self.side_chat.as_mut() {
+                tabs.submit_prompt(prompt);
             }
             self.status = "Side chat · submitted".to_owned();
         } else {
-            self.status = "Side chat open · Esc closes overlay (session kept)".to_owned();
+            let tab = self
+                .side_chat
+                .as_ref()
+                .map(SideChatTabs::active_name)
+                .unwrap_or(crate::side_chat::DEFAULT_SIDE_CHAT_TAB);
+            self.status = format!("Side chat open · tab {tab} · Esc closes overlay (session kept)");
+        }
+        Ok(())
+    }
+
+    /// Create the multi-tab container on first use. Errors surface as status
+    /// messages and never propagate (matching legacy `/btw` open behavior).
+    async fn ensure_side_chat_container(&mut self, application: &Application) -> Result<()> {
+        if self.side_chat.is_some() {
+            return Ok(());
+        }
+        match SideChatTabs::new_default(application).await {
+            Ok(tabs) => self.side_chat = Some(tabs),
+            Err(error) => {
+                self.push_status(format!("Cannot open side chat: {error:#}"), true);
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle `/btw` subcommands and the legacy open-or-prompt form:
+    ///
+    /// - `/btw` — open the overlay on the active tab.
+    /// - `/btw <prompt>` — open the overlay and submit a prompt (legacy).
+    /// - `/btw new <name>` — create a named tab and switch to it.
+    /// - `/btw <name>` — switch to an existing tab (instant, no model call).
+    /// - `/btw list` — list open tabs (active marked with ▸).
+    /// - `/btw close [<name>]` — close a tab (defaults to the active tab).
+    ///
+    /// The main session is never a tab; tabs are parallel conversations only.
+    async fn handle_btw_command(
+        &mut self,
+        application: &Application,
+        arg: Option<&str>,
+        mouse: &mut impl CodeReviewMouseController,
+    ) -> Result<()> {
+        let Some(trimmed) = arg.map(str::trim).filter(|text| !text.is_empty()) else {
+            return self.open_side_chat(application, None, mouse).await;
+        };
+        let (word, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((word, rest)) => (word, Some(rest.trim())),
+            None => (trimmed, None),
+        };
+        match word {
+            "new" => {
+                let Some(name) = rest else {
+                    self.push_status(
+                        "Usage: /btw new <name> — letters/digits/underscore, at most 32 chars"
+                            .to_owned(),
+                        true,
+                    );
+                    return Ok(());
+                };
+                if let Err(error) = SideChatTabs::validate_tab_name(name) {
+                    self.push_status(format!("Cannot create tab: {error:#}"), true);
+                    return Ok(());
+                }
+                self.dismiss_page_overlays_for_side_chat(mouse)?;
+                self.ensure_side_chat_container(application).await?;
+                let Some(tabs) = self.side_chat.as_mut() else {
+                    return Ok(());
+                };
+                match tabs.new_tab(application, name).await {
+                    Ok(()) => {
+                        self.side_chat_open = true;
+                        self.status = format!(
+                            "Side chat · tab {name} created · {} of {} tabs open",
+                            tabs.len(),
+                            SideChatTabs::max_tabs()
+                        );
+                    }
+                    Err(error) => {
+                        self.push_status(format!("Cannot create tab {name}: {error:#}"), true);
+                    }
+                }
+            }
+            "list" => {
+                self.dismiss_page_overlays_for_side_chat(mouse)?;
+                self.ensure_side_chat_container(application).await?;
+                if let Some(tabs) = self.side_chat.as_ref() {
+                    let active = tabs.active_name();
+                    let names = tabs
+                        .tab_names()
+                        .into_iter()
+                        .map(|name| {
+                            if name == active {
+                                format!("▸{name}")
+                            } else {
+                                name.to_owned()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    self.push_status(
+                        format!(
+                            "Side tabs ({} of {}): {names}",
+                            tabs.len(),
+                            SideChatTabs::max_tabs()
+                        ),
+                        false,
+                    );
+                }
+            }
+            "close" => {
+                if self.side_chat.is_none() {
+                    self.push_status("No side chat open".to_owned(), true);
+                    return Ok(());
+                }
+                self.dismiss_page_overlays_for_side_chat(mouse)?;
+                let Some(tabs) = self.side_chat.as_mut() else {
+                    return Ok(());
+                };
+                let name = rest
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| tabs.active_name().to_owned());
+                match tabs.close_tab(application, &name).await {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Closed side tab {name} · {} of {} tabs open",
+                            tabs.len(),
+                            SideChatTabs::max_tabs()
+                        );
+                    }
+                    Err(error) => {
+                        self.push_status(format!("Cannot close tab {name}: {error:#}"), true);
+                    }
+                }
+            }
+            _ => {
+                // Exact-name match wins (names are single words): instant switch.
+                self.dismiss_page_overlays_for_side_chat(mouse)?;
+                self.ensure_side_chat_container(application).await?;
+                if let Some(tabs) = self.side_chat.as_mut()
+                    && tabs.contains(trimmed)
+                {
+                    tabs.switch_to(trimmed)?;
+                    self.side_chat_open = true;
+                    self.status = format!("Side chat · tab {trimmed}");
+                    return Ok(());
+                }
+                // Otherwise the whole argument is a prompt (legacy behavior).
+                self.open_side_chat(application, Some(trimmed), mouse).await?;
+            }
         }
         Ok(())
     }
@@ -4374,10 +5489,169 @@ impl TuiState {
     }
 
     async fn shutdown_side_chat(&mut self) {
-        if let Some(mut side) = self.side_chat.take() {
-            side.shutdown().await;
+        if let Some(mut tabs) = self.side_chat.take() {
+            tabs.shutdown().await;
         }
         self.side_chat_open = false;
+    }
+
+    /// Aborts any active live capture (Esc, TUI teardown, Enter while
+    /// recording) so the mic closes and no transcript is produced.
+    fn live_abort_recording(&mut self) {
+        if let Some(control) = self.live.control_tx.take() {
+            let _ = control.send(PttControl::Abort);
+            self.live.recording = false;
+        }
+    }
+
+    /// Hold-to-talk press: starts (or supersedes) a recording session.
+    fn live_ptt_pressed(&mut self) {
+        if self.live.mode == LiveMode::Off {
+            self.push_status(
+                "Live voice is off — type /live to enable hold-to-talk voice".to_owned(),
+                false,
+            );
+            return;
+        }
+        // A new press supersedes the previous session: abort its capture so
+        // the old transcript can never land in the new target.
+        self.live_abort_recording();
+        let Some(settings) = self.live.settings.clone() else {
+            self.push_status(
+                "Live voice is not configured — set `Settings.live.sttBaseUrl` and `Settings.live.sttApiKey`".to_owned(),
+                true,
+            );
+            return;
+        };
+        if let Err(error) = validate_live_settings(&settings) {
+            self.push_status(format!("{error:#}"), true);
+            return;
+        }
+        let capture = match open_capture() {
+            Ok(capture) => capture,
+            Err(error) => {
+                self.push_status(format!("{error:#}"), true);
+                return;
+            }
+        };
+        if self.live.stt.is_none() {
+            match SttClient::new() {
+                Ok(client) => self.live.stt = Some(client),
+                Err(error) => {
+                    self.push_status(format!("{error:#}"), true);
+                    return;
+                }
+            }
+        }
+        let stt = self.live.stt.clone().expect("stt client built above");
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let events = self.live.events_tx.clone();
+        let watchdog = NO_SPEECH_TIMEOUT;
+        tokio::spawn(run_ptt_session(settings, stt, capture, control_rx, events, watchdog));
+        self.live.control_tx = Some(control_tx);
+        self.live.recording = true;
+        self.status = "Recording…".to_owned();
+    }
+
+    /// Hold-to-talk release: stops capture and transcribes the utterance.
+    fn live_ptt_released(&mut self) {
+        if let Some(control) = self.live.control_tx.take() {
+            let _ = control.send(PttControl::Release);
+            self.live.recording = false;
+        }
+    }
+
+    /// Delegation bridge: tracks a submitted draft as a live delegation when
+    /// live mode is armed and the text reads like a coding task. The agent
+    /// turn runs through the exact same prompt path as any other submission —
+    /// no separate task queue — and the status row shows `⟦delegating⟧
+    /// <elapsed>` until the turn settles ([`LiveUiState::delegating`]).
+    ///
+    /// This is the rpi substitute for Hyper's server-side
+    /// `delegation.created` event: the transcribed instruction is detected
+    /// client-side (see [`is_delegation_candidate`]) and the existing turn
+    /// machinery executes it. Returns true when the submission became a
+    /// tracked delegation. A running delegation is never re-tracked (the
+    /// Hyper occupancy check); plain chat while live is armed is not a
+    /// delegation.
+    fn track_live_delegation(&mut self, prompt: &str) -> bool {
+        if self.live.mode == LiveMode::On
+            && !self.live.delegating
+            && !self.is_streaming
+            && is_delegation_candidate(prompt)
+        {
+            self.live.start_delegation();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `/live` toggle: arm/disarm hold-to-talk mode. Refuses to arm while a
+    /// turn is running (mutual exclusion with the ordinary turn flow) or
+    /// while live is unconfigured.
+    fn toggle_live_mode(&mut self, application: &Application) {
+        if self.live.mode == LiveMode::On {
+            self.live_abort_recording();
+            self.live.mode = LiveMode::Off;
+            self.live.clear_delegation();
+            self.status = "Live voice off".to_owned();
+            return;
+        }
+        if self.is_streaming || self.is_compacting || application.is_bash_running() {
+            self.push_status(
+                "/live is unavailable while a turn is running — wait for it to finish".to_owned(),
+                true,
+            );
+            return;
+        }
+        let settings = application.runtime_settings().live.clone();
+        if let Err(error) = validate_live_settings(&settings) {
+            self.push_status(format!("{error:#}"), true);
+            return;
+        }
+        self.live.settings = Some(settings);
+        self.live.mode = LiveMode::On;
+        self.status = "Live voice on — hold Ctrl+Space to talk".to_owned();
+    }
+
+    /// Drains Ptt session events into the composer (transcript lands in the
+    /// draft; errors surface redacted). Called once per loop iteration.
+    fn drain_live_events(&mut self) {
+        while let Ok(event) = self.live.events_rx.try_recv() {
+            match event {
+                PttSessionEvent::Started => {
+                    self.live.recording = true;
+                    self.status = "Recording…".to_owned();
+                }
+                PttSessionEvent::Stopped { reason } => {
+                    self.live.recording = false;
+                    self.push_status(reason, false);
+                }
+                PttSessionEvent::Transcript { text } => {
+                    self.live.recording = false;
+                    self.append_live_transcript(&text);
+                }
+                PttSessionEvent::Error { message } => {
+                    self.live.recording = false;
+                    self.push_status(message, true);
+                }
+            }
+        }
+    }
+
+    /// Appends a transcript to the composer draft. Never auto-submits: the
+    /// user reviews the text and presses Enter.
+    fn append_live_transcript(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.editor.move_end();
+        let draft = self.editor.text();
+        let separator = if draft.trim().is_empty() { "" } else { " " };
+        self.editor.insert_text(&format!("{separator}{text}"));
+        self.refresh_completions();
+        self.status = "Transcript ready — press Enter to submit".to_owned();
     }
 
     fn request_code_review_snapshot(&mut self) {
@@ -4434,6 +5708,8 @@ impl TuiState {
         self.panel = None;
         self.settings_panel = None;
         self.settings_value_input = None;
+        self.settings_enum_picker = None;
+        self.settings_boolean_picker = None;
         self.tree_panel = None;
         self.process_panel = None;
         self.workflow_panel = None;
@@ -4527,10 +5803,20 @@ impl TuiState {
         match application.session_tree() {
             Ok(tree) => {
                 self.close_code_review_panel(mouse)?;
+                // Dismiss every other page overlay so the tree panel is the
+                // single visible owner (mirrors `open_workflow_panel` and
+                // `dismiss_page_overlays_for_side_chat`). A non-capturing
+                // overlay can leave keys reachable, so this must be
+                // exhaustive: without it a hidden orphan owner survives.
                 self.panel = None;
                 self.agents_panel = None;
                 self.process_panel = None;
                 self.side_chat_open = false;
+                self.workflow_panel = None;
+                self.todo_dag_panel = None;
+                self.settings_panel = None;
+                self.extension_overlay = None;
+                self.pending_overlay_rows = None;
                 self.tree_panel = Some(TreePanel::new(tree, mode));
             }
             Err(error) => self.push_status(format!("Cannot load session tree: {error:#}"), true),
@@ -4806,6 +6092,17 @@ async fn handle_tree_panel_key(
                             state.status = "Session fork cancelled".to_owned();
                         }
                         Ok(outcome) => {
+                            if let Err(error) =
+                                crate::session_run::rebind_workflows_for_active_session(
+                                    application,
+                                )
+                                .await
+                            {
+                                state.push_status(
+                                    format!("Workflow storage rebind failed: {error:#}"),
+                                    true,
+                                );
+                            }
                             state.replace_transcript_from_application(application);
                             state.editor.set_text(&outcome.text);
                             state.status =
@@ -5071,6 +6368,8 @@ fn handle_scoped_model_selector_key(
             }
             KeyCode::Up => selector.move_selection(-1),
             KeyCode::Down => selector.move_selection(1),
+            KeyCode::Right => selector.focus_models(),
+            KeyCode::Left => selector.focus_providers(),
             KeyCode::Backspace => selector.pop_query(),
             KeyCode::Enter => {
                 selector.toggle_selected();
@@ -5104,6 +6403,73 @@ fn handle_scoped_model_selector_key(
 async fn handle_settings_panel_key(application: &Application, state: &mut TuiState, key: KeyEvent,
 ) -> Result<Option<bool>> {
     let Some(mut panel) = state.settings_panel.take() else { return Ok(None); };
+    if let Some(mut picker) = state.settings_boolean_picker.take() {
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up | KeyCode::Char('k')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                picker.selected = !picker.selected;
+                state.settings_boolean_picker = Some(picker);
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                picker.selected = !picker.selected;
+                state.settings_boolean_picker = Some(picker);
+            }
+            KeyCode::Enter => match panel.set_boolean(&picker.key, picker.selected) {
+                Ok(()) => {
+                    state.status = "Setting added to pending changes; Ctrl-S to apply".to_owned();
+                }
+                Err(error) => {
+                    state.status = format!("Cannot set {}: {error:#}", picker.key);
+                    state.settings_boolean_picker = Some(picker);
+                }
+            },
+            _ => state.settings_boolean_picker = Some(picker),
+        }
+        state.settings_panel = Some(panel);
+        return Ok(Some(false));
+    }
+    if let Some(mut picker) = state.settings_enum_picker.take() {
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up | KeyCode::Char('k')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                picker.selected =
+                    picker.selected.checked_sub(1).unwrap_or(picker.options.len().saturating_sub(1));
+                state.settings_enum_picker = Some(picker);
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if !picker.options.is_empty() {
+                    picker.selected = (picker.selected + 1) % picker.options.len();
+                }
+                state.settings_enum_picker = Some(picker);
+            }
+            KeyCode::Enter => {
+                if let Some(option) = picker.options.get(picker.selected) {
+                    match panel.set_enum(&picker.key, option.clone()) {
+                        Ok(()) => {
+                            state.status = "Setting added to pending changes; Ctrl-S to apply".to_owned();
+                        }
+                        Err(error) => {
+                            state.status = format!("Cannot set {}: {error:#}", picker.key);
+                            state.settings_enum_picker = Some(picker);
+                        }
+                    }
+                } else {
+                    state.settings_enum_picker = Some(picker);
+                }
+            }
+            _ => state.settings_enum_picker = Some(picker),
+        }
+        state.settings_panel = Some(panel);
+        return Ok(Some(false));
+    }
     if let Some(mut input) = state.settings_value_input.take() {
         match key.code {
             KeyCode::Esc => {}
@@ -5179,14 +6545,74 @@ async fn handle_settings_panel_key(application: &Application, state: &mut TuiSta
         state.settings_panel = Some(panel);
         return Ok(Some(false));
     }
+    // A non-empty search is a global filter that supersedes the subsection
+    // drill-down; clear any stale entered section so the panel behaves flat.
+    if !panel.search().trim().is_empty() {
+        state.settings_section = None;
+        state.settings_leaf_cursor = 0;
+    }
     match key.code {
-        KeyCode::Esc => { panel.cancel()?; return Ok(Some(false)); }
-        KeyCode::Up => panel.move_previous()?, KeyCode::Down => panel.move_next()?,
-        KeyCode::Left => panel.previous_category(), KeyCode::Right | KeyCode::Tab => panel.next_category(), KeyCode::BackTab => panel.previous_category(),
-        KeyCode::Backspace => { let mut search = panel.search().to_owned(); search.pop(); panel.set_search(search); }
+        KeyCode::Esc => {
+            if state.settings_section.take().is_some() {
+                state.settings_leaf_cursor = 0;
+                state.settings_panel = Some(panel);
+                return Ok(Some(false));
+            }
+            panel.cancel()?;
+            return Ok(Some(false));
+        }
+        KeyCode::Up => {
+            if let Some(section) = state.settings_section.as_deref() {
+                let count = settings_section_rows(&panel.snapshot()?.rows, section).len();
+                if count > 0 {
+                    state.settings_leaf_cursor =
+                        state.settings_leaf_cursor.checked_sub(1).unwrap_or(count - 1);
+                }
+            } else {
+                panel.move_previous()?;
+            }
+        }
+        KeyCode::Down => {
+            if let Some(section) = state.settings_section.as_deref() {
+                let count = settings_section_rows(&panel.snapshot()?.rows, section).len();
+                if count > 0 {
+                    state.settings_leaf_cursor = (state.settings_leaf_cursor + 1) % count;
+                }
+            } else {
+                panel.move_next()?;
+            }
+        }
+        KeyCode::Left => {
+            panel.previous_category();
+            state.settings_section = None;
+            state.settings_leaf_cursor = 0;
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            panel.next_category();
+            state.settings_section = None;
+            state.settings_leaf_cursor = 0;
+        }
+        KeyCode::BackTab => {
+            panel.previous_category();
+            state.settings_section = None;
+            state.settings_leaf_cursor = 0;
+        }
+        KeyCode::Backspace => {
+            let mut search = panel.search().to_owned();
+            search.pop();
+            panel.set_search(search);
+            state.settings_section = None;
+            state.settings_leaf_cursor = 0;
+        }
         KeyCode::Delete => {
-            if let Some(row) = panel.selected()?
-                && let Err(error) = panel.reset(&row.key) { state.status = format!("Cannot reset setting: {error:#}"); } }
+            if let Some(section) = state.settings_section.as_deref() {
+                let snapshot = panel.snapshot()?;
+                let leaf_rows = settings_section_rows(&snapshot.rows, section);
+                if let Some(row) = leaf_rows.get(state.settings_leaf_cursor)
+                    && let Err(error) = panel.reset(&row.key) { state.status = format!("Cannot reset setting: {error:#}"); }
+            } else if let Some(row) = panel.selected()?
+                && let Err(error) = panel.reset(&row.key) { state.status = format!("Cannot reset setting: {error:#}"); }
+        }
         KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Err(error) = panel.set_scope(pi_coding::SettingsScope::Global) { state.status = format!("Cannot change settings scope: {error:#}"); }
         }
@@ -5203,36 +6629,109 @@ async fn handle_settings_panel_key(application: &Application, state: &mut TuiSta
         }
         }
         KeyCode::Enter => {
-            if let Some(row) = panel.selected()?
-                && row.writable && row.blocked_reason.is_none() {
-                if matches!(row.control, SettingsControl::Secret { .. }) {
-                    state.status = "Secret settings are managed through auth storage".to_owned();
-                } else {
-                    let value = panel.input_value(&row.key)?;
-                    let cursor = value.len();
-                    let hint = panel.input_hint(&row.key)?;
-                    state.settings_value_input = Some(SettingsValueInput {
-                        key: row.key,
-                        value,
-                        cursor,
-                        hint,
-                        error: None,
-                        replace_on_type: true,
-                    });
+            if let Some(section) = state.settings_section.clone() {
+                // Inside a subsection: Enter opens the typed control at the leaf.
+                let snapshot = panel.snapshot()?;
+                let leaf_rows = settings_section_rows(&snapshot.rows, &section);
+                if let Some(row) = leaf_rows.get(state.settings_leaf_cursor)
+                    && row.writable && row.blocked_reason.is_none() {
+                    open_settings_row_control(state, &panel, row)?;
                 }
+            } else if panel.search().trim().is_empty() {
+                // Browsing (no search): Enter drills into the subsection of the
+                // selected row; the leaf cursor stays on that row.
+                if let Some(row) = panel.selected()? {
+                    let snapshot = panel.snapshot()?;
+                    let section = row.section();
+                    let run_start = snapshot
+                        .rows
+                        .iter()
+                        .position(|candidate| candidate.section() == section)
+                        .unwrap_or(0);
+                    state.settings_leaf_cursor = snapshot.cursor.saturating_sub(run_start);
+                    state.settings_section = Some(section);
+                }
+            } else if let Some(row) = panel.selected()?
+                && row.writable && row.blocked_reason.is_none() {
+                // Search browse stays flat: the typed control opens directly.
+                open_settings_row_control(state, &panel, &row)?;
             }
         }
-        KeyCode::Char(character) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => { let mut search = panel.search().to_owned(); search.push(character); panel.set_search(search); }
+        KeyCode::Char(character) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            let mut search = panel.search().to_owned();
+            search.push(character);
+            panel.set_search(search);
+            state.settings_section = None;
+            state.settings_leaf_cursor = 0;
+        }
         _ => {}
     }
     state.settings_panel = Some(panel); Ok(Some(false))
+}
+
+/// Open the typed editor or picker for a writable settings row — the leaf of
+/// the two-level hierarchy. Every control kind derived from `SettingValueType`
+/// gets its native widget, unchanged from the pre-hierarchy behavior.
+fn open_settings_row_control(
+    state: &mut TuiState,
+    panel: &SettingsPanel,
+    row: &SettingsPanelRow,
+) -> Result<()> {
+    match &row.control {
+        SettingsControl::Secret { .. } => {
+            state.status = "Secret settings are managed through auth storage".to_owned();
+        }
+        SettingsControl::Boolean { value } => {
+            state.settings_boolean_picker = Some(SettingsBooleanPicker {
+                key: row.key.clone(),
+                selected: *value == Some(true),
+            });
+        }
+        SettingsControl::Enum { value, options } => {
+            let selected = options
+                .iter()
+                .position(|option| Some(option.as_str()) == value.as_deref())
+                .unwrap_or(0);
+            state.settings_enum_picker = Some(SettingsEnumPicker {
+                key: row.key.clone(),
+                options: options.clone(),
+                selected,
+            });
+        }
+        _ => {
+            let value = panel.input_value(&row.key)?;
+            let cursor = value.len();
+            let hint = panel.input_hint(&row.key)?;
+            state.settings_value_input = Some(SettingsValueInput {
+                key: row.key.clone(),
+                value,
+                cursor,
+                hint,
+                error: None,
+                replace_on_type: true,
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn handle_workflow_panel_key(application: &Application, state: &mut TuiState, key: KeyEvent,
 ) -> Result<Option<bool>> {
     let Some(panel) = state.workflow_panel.as_mut() else { return Ok(None); };
     match panel.handle_key(key) {
-        WorkflowPanelResult::Close => { state.workflow_panel = None; state.status = "Ready".to_owned(); }
+        WorkflowPanelResult::Close => {
+            state.workflow_panel = None;
+            state.status = "Ready".to_owned();
+            // A live workflow status change while the panel owned the page is
+            // parked in the dedicated deferred slot
+            // (`set_deferred_workflow_status`); closing discards ONLY that
+            // line so it never surfaces as an "Error: Workflow … · running"
+            // toast after the panel closes. Other deferred notices (failed
+            // /run results, paste-consume notices, WorkflowCommandFinished
+            // errors, push_warning warnings) live in composer_error and keep
+            // surfacing after close.
+            state.deferred_workflow_status = None;
+        }
         WorkflowPanelResult::Intent { workflow_id, kind } => {
             let id = pi_coding::WorkflowId::new(workflow_id);
             let snapshot = application.workflow_get(&id)?;
@@ -5245,7 +6744,12 @@ async fn handle_workflow_panel_key(application: &Application, state: &mut TuiSta
             match result {
                 Ok(snapshot) => {
                     state.status = format!("Workflow {}: {}", snapshot.name, snapshot.status.as_str());
-                    panel.replace(application.workflow_list().iter().map(WorkflowPanelSnapshot::from).collect());
+                    state.workflow_snapshots = application
+                        .workflow_list()
+                        .iter()
+                        .map(|snapshot| TuiState::project_workflow_snapshot(application, snapshot))
+                        .collect();
+                    panel.replace(state.workflow_snapshots.clone());
                 }
                 Err(error) => state.push_status(format!("Workflow action failed: {error:#}"), true),
             }
@@ -5683,6 +7187,276 @@ fn handle_extension_dialog_key(state: &mut TuiState, key: KeyEvent) -> bool {
     true
 }
 
+/// Routes keys while an extension overlay panel is open. Exclusive overlays
+/// (the default) always own input: Esc closes, ↑/↓ scroll when the rows
+/// overflow the panel height, and every other key is consumed so it cannot
+/// fall through to the hidden main composer. A non-capturing overlay that is
+/// unfocused returns `None` (NotConsumed) so keys route to the composer —
+/// except Esc, which still closes the overlay (focused Esc unfocuses first).
+/// While focused, the host-owned editor consumes typing/cursor keys; Enter
+/// submits the draft through the overlay's `onSubmit` callback, and keys the
+/// editor does not consume (scroll keys, Ctrl+T) forward to `onKey` as
+/// limited action ids.
+async fn handle_extension_overlay_key(
+    application: &Application,
+    state: &mut TuiState,
+    key: KeyEvent,
+) -> Option<bool> {
+    // Non-capturing overlays route EVERY key (including Esc) to the composer
+    // while unfocused (single-focused-owner rule; the overlay stays drawn).
+    // Esc only closes a FOCUSED overlay; the toggle action is what blurs.
+    if state
+        .extension_overlay
+        .as_ref()
+        .is_some_and(|overlay| overlay.non_capturing && !overlay.focused)
+    {
+        return None;
+    }
+
+    enum Route {
+        Consumed,
+        Close,
+        Submit(String),
+        Key(pi_coding::OverlayKeyAction),
+    }
+    let action = state.keybindings.resolve(&key);
+    let (route, overlay_id) = {
+        let overlay = state.extension_overlay.as_mut()?;
+        let has_input = overlay.input.is_some();
+        let multiline = overlay.input.as_ref().is_some_and(|input| input.multiline);
+        let route = match key.code {
+            KeyCode::Esc => {
+                // Shared Esc semantics: a focused overlay closes (the idle
+                // default) and the extension learns Esc happened through
+                // `onKey(abort)` so it can abort streaming before the close
+                // lands. Unfocused Esc never reaches here — it belongs to
+                // the composer.
+                Route::Close
+            }
+            KeyCode::Char('k') => {
+                overlay.scroll_up();
+                Route::Key(pi_coding::OverlayKeyAction::ScrollUp)
+            }
+            KeyCode::Char('j') => {
+                overlay.scroll_down();
+                Route::Key(pi_coding::OverlayKeyAction::ScrollDown)
+            }
+            KeyCode::Up => {
+                if multiline {
+                    overlay.editor.move_up();
+                    Route::Consumed
+                } else {
+                    overlay.scroll_up();
+                    Route::Key(pi_coding::OverlayKeyAction::ScrollUp)
+                }
+            }
+            KeyCode::Down => {
+                if multiline {
+                    overlay.editor.move_down();
+                    Route::Consumed
+                } else {
+                    overlay.scroll_down();
+                    Route::Key(pi_coding::OverlayKeyAction::ScrollDown)
+                }
+            }
+            KeyCode::PageUp => {
+                overlay.scroll = overlay.scroll.saturating_sub(10);
+                Route::Key(pi_coding::OverlayKeyAction::PageUp)
+            }
+            KeyCode::PageDown => {
+                overlay.scroll = (overlay.scroll + 10).min(overlay.rows.len().saturating_sub(1));
+                Route::Key(pi_coding::OverlayKeyAction::PageDown)
+            }
+            KeyCode::Home => {
+                if has_input {
+                    overlay.editor.move_home();
+                    Route::Consumed
+                } else {
+                    overlay.scroll = 0;
+                    Route::Key(pi_coding::OverlayKeyAction::Home)
+                }
+            }
+            KeyCode::End => {
+                if has_input {
+                    overlay.editor.move_end();
+                    Route::Consumed
+                } else {
+                    overlay.scroll = overlay.rows.len().saturating_sub(1);
+                    Route::Key(pi_coding::OverlayKeyAction::End)
+                }
+            }
+            KeyCode::Enter => match &overlay.input {
+                Some(input) if input.multiline && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    overlay.editor.insert_newline();
+                    Route::Consumed
+                }
+                Some(_) if overlay.submit_in_flight => {
+                    // One submit at a time: consume until the bounded
+                    // callback settles (overlay-local notice).
+                    overlay.local_status = Some("Submit in progress…".to_owned());
+                    Route::Consumed
+                }
+                Some(_) => {
+                    let text = overlay.editor.text();
+                    if text.trim().is_empty() {
+                        // Empty drafts are not submitted.
+                        Route::Consumed
+                    } else {
+                        // Capture the draft, clear the host editor, and
+                        // enqueue the bounded callback off the key path; a
+                        // failure restores the draft (see
+                        // `BackgroundEvent::OverlayCallbackFinished`).
+                        overlay.editor.clear();
+                        overlay.submit_in_flight = true;
+                        Route::Submit(text)
+                    }
+                }
+                // No editor: Enter stays consumed (exclusive content-only
+                // contract unchanged; submit has exactly one channel).
+                None => Route::Consumed,
+            },
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Route::Key(pi_coding::OverlayKeyAction::ToggleMode)
+            }
+            _ => match action {
+                Some(Action::EditorBackspace) if has_input => {
+                    overlay.editor.backspace();
+                    Route::Consumed
+                }
+                Some(Action::EditorDelete) if has_input => {
+                    overlay.editor.delete();
+                    Route::Consumed
+                }
+                Some(Action::EditorLeft) if has_input => {
+                    overlay.editor.move_left();
+                    Route::Consumed
+                }
+                Some(Action::EditorRight) if has_input => {
+                    overlay.editor.move_right();
+                    Route::Consumed
+                }
+                Some(Action::EditorWordLeft) if has_input => {
+                    overlay.editor.move_word_left();
+                    Route::Consumed
+                }
+                Some(Action::EditorWordRight) if has_input => {
+                    overlay.editor.move_word_right();
+                    Route::Consumed
+                }
+                Some(Action::EditorDeleteWordBackward) if has_input => {
+                    overlay.editor.delete_word_backward();
+                    Route::Consumed
+                }
+                Some(Action::EditorDeleteWordForward) if has_input => {
+                    overlay.editor.delete_word_forward();
+                    Route::Consumed
+                }
+                Some(Action::EditorDeleteToLineStart) if has_input => {
+                    overlay.editor.delete_to_line_start();
+                    Route::Consumed
+                }
+                Some(Action::EditorDeleteToLineEnd) if has_input => {
+                    overlay.editor.delete_to_line_end();
+                    Route::Consumed
+                }
+                Some(Action::EditorClear) if has_input => {
+                    overlay.editor.clear();
+                    Route::Consumed
+                }
+                Some(Action::EditorYank) if has_input => {
+                    overlay.editor.yank();
+                    Route::Consumed
+                }
+                Some(Action::EditorYankPop) if has_input => {
+                    overlay.editor.yank_pop();
+                    Route::Consumed
+                }
+                Some(Action::EditorUndo) if has_input => {
+                    overlay.editor.undo();
+                    Route::Consumed
+                }
+                _ => {
+                    if has_input
+                        && let KeyCode::Char(character) = key.code
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    {
+                        overlay.editor.insert_char(character);
+                    }
+                    Route::Consumed
+                }
+            },
+        };
+        (route, overlay.id.clone())
+    };
+
+    match route {
+        Route::Consumed => {}
+        Route::Close => {
+            // Shared Esc semantics: closing a focused overlay first notifies
+            // the extension (`onKey(abort)`) so it can abort streaming; the
+            // close lands immediately after the dispatch is enqueued.
+            dispatch_overlay_event(
+                application,
+                state,
+                &overlay_id,
+                pi_coding::OverlayEvent::Key {
+                    action: pi_coding::OverlayKeyAction::Abort,
+                },
+            );
+            state.close_extension_overlay();
+        }
+        Route::Submit(text) => {
+            dispatch_overlay_event(
+                application,
+                state,
+                &overlay_id,
+                pi_coding::OverlayEvent::Submit { text },
+            );
+        }
+        Route::Key(action) => {
+            dispatch_overlay_event(
+                application,
+                state,
+                &overlay_id,
+                pi_coding::OverlayEvent::Key { action },
+            );
+        }
+    }
+    Some(false)
+}
+
+/// Fire-and-forget delivery of an interactive overlay event to the owning
+/// extension's `onSubmit`/`onKey` callback. The bounded runtime invocation
+/// runs OFF the terminal key path: completion (including failure) arrives
+/// through [`BackgroundEvent::OverlayCallbackFinished`], so a slow or failing
+/// JS handler can never freeze terminal input. Failures surface in the
+/// overlay's local status area, never the shared composer error slot.
+fn dispatch_overlay_event(
+    application: &Application,
+    state: &TuiState,
+    overlay_id: &str,
+    event: pi_coding::OverlayEvent,
+) {
+    let Some(runtime) = application.extension_runtime() else {
+        return;
+    };
+    let tx = state.background_tx.clone();
+    let overlay_id = overlay_id.to_owned();
+    tokio::spawn(async move {
+        let result = runtime
+            .invoke_overlay_event(&overlay_id, event.clone())
+            .await
+            .map_err(|error| format!("{error:#}"));
+        let _ = tx.send(BackgroundEvent::OverlayCallbackFinished {
+            overlay_id,
+            event,
+            result,
+        });
+    });
+}
+
 fn process_key_for_terminal_event(key: KeyEvent) -> Option<ProcessKey> {
     match key.code {
         KeyCode::Enter => Some(ProcessKey::Enter),
@@ -6002,6 +7776,7 @@ async fn refresh_agents_panel_from_application(application: &Application, panel:
             &snapshot.settings.agents,
             Some(models),
         );
+        panel.set_preferred(crate::agents_panel::preferred_agent(application));
     } else {
         panel.set_model_choices(models);
     }
@@ -6096,6 +7871,16 @@ fn apply_classified_burst(state: &mut TuiState, payload: &str) {
 
 
 
+/// Popup label for a slash completion item: `/name` plus the catalog argument
+/// hint when the command has one, so multi-subcommand commands (`/loop`,
+/// `/workflow`, `/settings`, `/goal`, …) surface their subcommands in the
+/// completion popup. The insertion `value` stays the bare `/name`.
+fn slash_completion_label(name: &str) -> String {
+    builtin(name)
+        .and_then(|command| command.argument_hint)
+        .map_or_else(|| format!("/{name}"), |hint| format!("/{name} {hint}"))
+}
+
 fn exact_completion_index(items: &[CompletionItem], text: &str) -> Option<usize> {
     items.iter().position(|item| item.value == text)
 }
@@ -6181,12 +7966,13 @@ fn handle_paste(state: &mut TuiState, payload: &str) {
         }
         return;
     }
-    // Any other page-overlay owner (tree/process/settings/workflow/todo/agents/
-    // session/model selector, PTY attachment, or a side-chat open without a
-    // live controller) consumes the paste without touching the main composer.
-    // A bounded visible status surfaces the consume; `set_bounded_status`
-    // routes to the composer-error toast while an overlay owns the status line.
-    if page_overlay_open(state) {
+    // Any other input-owning page overlay (tree/process/settings/workflow/
+    // todo/agents/session/model selector, PTY attachment, a focused extension
+    // overlay, or a side-chat open without a live controller) consumes the
+    // paste without touching the main composer. A visible unfocused
+    // non-capturing extension overlay does NOT capture: the paste reaches the
+    // composer, the single input owner.
+    if page_overlay_capturing(state) {
         state.set_bounded_status("Paste consumed by active overlay".to_owned());
         return;
     }
@@ -6232,7 +8018,9 @@ async fn handle_terminal_paste(application: &Application, state: &mut TuiState, 
 }
 
 fn dismiss_composer_error_on_escape(state: &mut TuiState, code: KeyCode, busy: bool) -> bool {
-    if code != KeyCode::Esc || state.composer_error.is_none() {
+    if code != KeyCode::Esc
+        || (state.composer_error.is_none() && state.deferred_workflow_status.is_none())
+    {
         return false;
     }
     // A stale composer-error toast (e.g. the backpressure "UI skipped N stale
@@ -6244,13 +8032,43 @@ fn dismiss_composer_error_on_escape(state: &mut TuiState, code: KeyCode, busy: b
     // and let Esc fall through to the abort dispatch. When idle, preserve
     // the historical dismiss-on-Esc behavior. Visible overlays (panels and
     // comment editors) are handled earlier in `handle_key` and never reach
-    // here.
+    // here. The deferred workflow status line is dismissed the same way: it
+    // is a parked toast, not a live status.
     let taken = state.composer_error.take();
+    state.deferred_workflow_status = None;
     state.last_escape = None;
     if busy {
         return false;
     }
     taken.is_some()
+}
+
+/// The shared focus-toggle action (`app.extensions.overlayToggleFocus`,
+/// default chord Alt+/) resolved at the top of key routing: flips focus
+/// between a non-capturing extension overlay and the composer
+/// (single-focused-owner rule; the overlay stays drawn while unfocused). The
+/// workflow panel shares the same action under the same model — its
+/// non-capturing round owns the `workflow_panel` branch below — and the
+/// chord is consumed whenever a panel owns the page so it never falls
+/// through to the composer. Users can rebind the chord through
+/// `keybindings.json` like any other stable action.
+fn resolve_focus_toggle_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    if state.keybindings.resolve(&key) != Some(Action::ExtensionOverlayToggleFocus) {
+        return false;
+    }
+    if let Some(overlay) = state.extension_overlay.as_mut()
+        && overlay.non_capturing
+    {
+        overlay.focused = !overlay.focused;
+        return true;
+    }
+    if state.workflow_panel.is_some() {
+        // Reserved for the workflow panel's non-capturing focus toggle
+        // (same action, same single-focused-owner rule): consumed so it
+        // cannot reach the composer while the panel owns the page.
+        return true;
+    }
+    false
 }
 
 /// Routes an incoming key through the configured keybindings to a stable action
@@ -6259,12 +8077,22 @@ async fn handle_key(
     state: &mut TuiState,
     key: KeyEvent,
     terminal: &mut TerminalGuard,
+    collab_host: Option<&crate::collab_commands::CollabHost>,
 ) -> Result<bool> {
+    // Resolve the shared focus-toggle chord before any panel owns the key:
+    // Alt+/ flips focus between the extension overlay and the composer (and
+    // later, the workflow panel under the same model).
+    if resolve_focus_toggle_key(state, key) {
+        return Ok(false);
+    }
     if handle_pty_attachment_key(application, state, key).await? {
         return Ok(false);
     }
     if handle_extension_dialog_key(state, key) {
         return Ok(false);
+    }
+    if let Some(exit) = handle_extension_overlay_key(application, state, key).await {
+        return Ok(exit);
     }
     if handle_process_panel_key(application, state, key).await? {
         return Ok(false);
@@ -6317,6 +8145,7 @@ async fn handle_key(
     }
     if key.code == KeyCode::Esc
         && !state.is_streaming
+        && !state.is_compacting
         && !application.is_bash_running()
         && state.editor.is_empty()
         && state.pending_attachments.is_empty()
@@ -6394,7 +8223,7 @@ async fn handle_key(
                     state.cancel_file_completion();
                     state.completion_query = None;
                     state.completions.clear();
-                    if state.is_streaming || application.is_bash_running() {
+                    if state.is_streaming || state.is_compacting || application.is_bash_running() {
                         // Fall through to dispatch_action for the real abort.
                     } else {
                         return Ok(false);
@@ -6429,18 +8258,18 @@ async fn handle_key(
         }
         return Ok(false);
     };
-    dispatch_action(application, state, action, terminal).await
+    dispatch_action(application, state, action, terminal, collab_host).await
 }
-
 async fn dispatch_action(
     application: &Application,
     state: &mut TuiState,
     action: Action,
     terminal: &mut TerminalGuard,
+    collab_host: Option<&crate::collab_commands::CollabHost>,
 ) -> Result<bool> {
     match action {
         Action::EditorSubmit => {
-            if submit(application, state, terminal).await? {
+            if submit(application, state, terminal, collab_host).await? {
                 return Ok(true);
             }
         }
@@ -6468,12 +8297,25 @@ async fn dispatch_action(
         Action::EditorYankPop => state.editor.yank_pop(),
         Action::EditorUndo => state.editor.undo(),
         Action::Abort => {
-            if application.is_bash_running() {
+            if state.live.recording {
+                // Esc drops the in-progress capture (mic closes, buffer
+                // discarded) without clearing the composer draft.
+                state.live_abort_recording();
+                state.status = "Capture dropped".to_owned();
+            } else if state.pending_ask.is_some() {
+                // Esc cancels the model's question, not the whole turn.
+                state.cancel_pending_ask(application).await;
+            } else if application.is_bash_running() {
                 application.abort_bash();
                 state.status = "Aborting bash command".to_owned();
             } else if state.is_streaming {
                 application.abort().await;
                 state.status = "Aborting".to_owned();
+            } else if state.is_compacting {
+                // Compaction runs on a background task; Escape cancels it via
+                // the compaction controller (abort_compaction inside abort()).
+                application.abort().await;
+                state.status = "Aborting compaction".to_owned();
             } else if state.editor.is_empty() && !state.pending_attachments.is_empty() {
                 state.pending_attachments.clear();
                 state.status = "Removed pending image attachments".to_owned();
@@ -6483,10 +8325,13 @@ async fn dispatch_action(
         }
         Action::ClearEditor => {
             // OMP-compatible Ctrl-C ladder:
-            // 1) bash / streaming still abort on first press
+            // 1) pending ask / bash / streaming still abort on first press
             // 2) nonempty editor or pending attachments clear on first press
             // 3) idle second press within 500ms exits cleanly via normal return
-            if application.is_bash_running() {
+            if state.pending_ask.is_some() {
+                state.cancel_pending_ask(application).await;
+                state.last_ctrl_c = None;
+            } else if application.is_bash_running() {
                 application.abort_bash();
                 state.last_ctrl_c = None;
                 state.status = "Aborting bash command".to_owned();
@@ -6494,6 +8339,10 @@ async fn dispatch_action(
                 application.abort().await;
                 state.last_ctrl_c = None;
                 state.status = "Aborting".to_owned();
+            } else if state.is_compacting {
+                application.abort().await;
+                state.last_ctrl_c = None;
+                state.status = "Aborting compaction".to_owned();
             } else if handle_ctrl_c_clear_or_exit(state, std::time::Instant::now()) {
                 terminal.set_code_review_mouse_capture(false)?;
                 return Ok(true);
@@ -6596,6 +8445,19 @@ async fn dispatch_action(
                         state.status = "New session cancelled".to_owned();
                     }
                     Ok(_) => {
+                        // The new session owns a fresh recorder id: rebind
+                        // workflow storage so it starts with an empty
+                        // workflow list instead of leaking the previous
+                        // session's workflows (T43 session scoping).
+                        if let Err(error) =
+                            crate::session_run::rebind_workflows_for_active_session(application)
+                                .await
+                        {
+                            state.push_status(
+                                format!("Workflow storage rebind failed: {error:#}"),
+                                true,
+                            );
+                        }
                         state.replace_transcript_from_application(application);
                         state.status = "Started a new session".to_owned();
                     }
@@ -6633,6 +8495,11 @@ async fn dispatch_action(
         | Action::TreeFilterCycleBackward => {
             unreachable!("contextual action bypassed its active selector")
         }
+        Action::LivePtt => state.live_ptt_pressed(),
+        // The focus toggle is resolved at the top of `handle_key` (before
+        // any panel owns the chord); reaching dispatch_action means no
+        // toggleable overlay is open, so the action is a no-op.
+        Action::ExtensionOverlayToggleFocus => {}
     }
     if !matches!(action, Action::ClipboardPaste | Action::CopyLastAssistant) {
         state.refresh_completions();
@@ -6745,6 +8612,41 @@ async fn open_external_editor(
     }
     let _ = std::fs::remove_dir_all(directory);
     Ok(())
+}
+
+/// Run the external editor for `/persona new`/`/persona edit`, suspending the
+/// TUI around the editor, then validate and atomically commit the result.
+async fn run_persona_editor(
+    application: &Application,
+    terminal: &mut TerminalGuard,
+    name: &str,
+    kind: crate::interactive_commands::PersonaEditKind,
+) -> Result<String> {
+    use crate::interactive_commands::{
+        commit_persona_definition, persona_editor_command, persona_editor_seed, spawn_editor_on,
+    };
+    let seed = persona_editor_seed(application, name, kind)?;
+    let editor = persona_editor_command(application);
+    let dir = std::env::temp_dir().join(format!("pi-persona-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).context("creating persona editor workspace")?;
+    let path = dir.join("persona.md");
+    std::fs::write(&path, &seed).context("writing persona editor seed")?;
+    let edited = path.clone();
+    let suspended = terminal
+        .suspend(|| async {
+            eprintln!(
+                "Launching editor for persona {name}: {editor}\nPi will resume when the editor exits."
+            );
+            spawn_editor_on(&editor, &edited).await
+        })
+        .await;
+    let outcome = match suspended {
+        Ok(()) => std::fs::read_to_string(&path).context("reading persona editor result"),
+        Err(error) => Err(error),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    let content = outcome?;
+    commit_persona_definition(application, name, &content, kind).await
 }
 
 #[cfg(unix)]
@@ -6898,6 +8800,134 @@ fn reject_missing_required_arguments(state: &mut TuiState, name: &str, arg: Opti
     true
 }
 
+/// `/todo list` (and bare `/todo`) open the TodoDagPanel page; any other
+/// argument is parsed as todo markdown and applied to the session. The TUI
+/// keeps the text list path for non-TUI callers (REPL/print/RPC).
+fn dispatch_todo_command(
+    application: &Application,
+    state: &mut TuiState,
+    mouse: &mut impl CodeReviewMouseController,
+    argument: Option<&str>,
+) -> Result<bool> {
+    let opens_page = argument.is_none() || argument.is_some_and(|value| value.eq_ignore_ascii_case("list"));
+    if opens_page {
+        state.open_todo_dag_panel(application, mouse)?;
+        return Ok(true);
+    }
+    let markdown = argument.expect("non-list todo argument");
+    match pi_coding::parse_todo_markdown(markdown) {
+        Ok(phases) => match application.set_todos(phases) {
+            Ok(result) => {
+                state.todo_phases = result.phases;
+                state.push_status(format!("Todo: {}", result.summary), false);
+                Ok(true)
+            }
+            Err(error) => {
+                state.push_status(format!("Failed to set todos: {error:#}"), true);
+                Ok(true)
+            }
+        },
+        Err(error) => {
+            state.push_status(format!("Invalid todo markdown: {error:#}"), true);
+            Ok(true)
+        }
+    }
+}
+
+/// `/queue` — surface the pending steering/follow-up queue and (with
+/// `cancel`) discard it. The queue holds the user's own queued prompts, so
+/// the view renders live from the application and `cancel` drops them
+/// outright (unlike the Dequeue keybinding, which restores them into the
+/// editor). Safe while a turn streams: the queue is exactly what the user
+/// wants to inspect or clear mid-turn.
+async fn dispatch_queue_command(
+    application: &Application,
+    state: &mut TuiState,
+    arg: Option<&str>,
+) {
+    let (steering, follow_up) = application.queued_messages().await;
+    match arg {
+        None => {
+            let total = steering.len() + follow_up.len();
+            if total == 0 {
+                state.status = "Queue is empty".to_owned();
+                return;
+            }
+            let mut lines = Vec::new();
+            lines.push(format!(
+                "Pending prompts: {} steering, {} follow-up — /queue cancel clears them",
+                steering.len(),
+                follow_up.len()
+            ));
+            for (kind, messages) in [("steering", steering), ("follow-up", follow_up)] {
+                for message in messages {
+                    if let Some(text) = message_text(message) {
+                        lines.push(format!("{kind}: {}", steering_preview(&text)));
+                    }
+                }
+            }
+            state.push_lines("Queue", lines.join("\n"), state.themes.theme().accent);
+        }
+        Some("cancel") => {
+            let total = steering.len() + follow_up.len();
+            if total == 0 {
+                state.status = "Queue is empty".to_owned();
+                return;
+            }
+            // Discarding (not restoring) is the point of `/queue cancel`: the
+            // drain publishes the empty QueueUpdate, so the header ⚙ count
+            // and the ⟦steering⟧ status line clear with it.
+            application.drain_queued_messages().await;
+            state.status = format!(
+                "Cancelled {} queued prompt{}",
+                total,
+                if total == 1 { "" } else { "s" }
+            );
+        }
+        Some(other) => {
+            state.push_status(
+                format!("Usage: /queue [cancel] (unknown action {other:?})"),
+                true,
+            );
+        }
+    }
+}
+
+/// `/handoff` for the TUI: always the deterministic envelope — the event loop
+/// must never block on a provider call. `--prose` is accepted for surface
+/// parity with the REPL/CLI but stays envelope-only here; the summarizer call
+/// belongs to line-oriented sessions (`rpi --mode text`), surfaced as a status
+/// hint instead. The clipboard copy still runs in the background.
+fn dispatch_handoff_command(
+    application: &Application,
+    state: &mut TuiState,
+    argument: Option<&str>,
+) {
+    use crate::interactive_commands::{parse_handoff_invocation, HandoffInvocation};
+    let prose_requested = match argument {
+        None => false,
+        Some(argument) => match parse_handoff_invocation(argument) {
+            Ok(HandoffInvocation::Prose) => true,
+            Ok(HandoffInvocation::Envelope) => false,
+            Err(error) => {
+                state.push_status(format!("{error:#}"), true);
+                return;
+            }
+        },
+    };
+    let handoff = application.generate_handoff();
+    let text = handoff.render();
+    state.push_lines("Handoff", text.clone(), state.themes.theme().accent);
+    if prose_requested {
+        state.push_status(
+            "/handoff --prose renders prose only in the REPL/CLI (--mode text); the TUI keeps the envelope so the provider call never blocks the interface"
+                .to_owned(),
+            false,
+        );
+    }
+    state.start_handoff_copy(text);
+}
+
 async fn dispatch_goal_command(
     application: &Application,
     state: &mut TuiState,
@@ -6950,31 +8980,42 @@ async fn dispatch_workflow_command(
             return Ok(false);
         }
     };
-    if matches!(
+    let opens_page = matches!(
         command,
         crate::workflow_commands::InteractiveWorkflowCommand::OpenPage
-    ) {
-        // Bare `/workflow` is a pure local UI action: it opens the workflows
-        // page in the same frame. The effect path performs no async I/O, so it
-        // is safe to await inline — the only work is port resolution (a lock
-        // and clone) plus the OpenPage effect itself.
+            | crate::workflow_commands::InteractiveWorkflowCommand::List
+    );
+    if opens_page {
+        // Bare `/workflow` and `/workflow list` are pure local UI actions:
+        // they open the workflows page in the same frame. The effect path
+        // performs no async I/O, so it is safe to await inline — the only work
+        // is port resolution (a lock and clone) plus the OpenPage/List effect
+        // itself. Non-TUI callers (REPL/print/RPC) still receive the text list
+        // via `execute_interactive_workflow_on_application`.
+        let is_list = matches!(
+            command,
+            crate::workflow_commands::InteractiveWorkflowCommand::List
+        );
         return match crate::workflow_commands::execute_interactive_workflow_on_application(
             application, command,
         )
         .await
         {
-            Ok(crate::workflow_commands::WorkflowCommandEffect::OpenPage) => {
+            Ok(crate::workflow_commands::WorkflowCommandEffect::OpenPage)
+            | Ok(crate::workflow_commands::WorkflowCommandEffect::Message(_)) => {
                 state.open_workflow_panel(application, terminal)?;
+                if is_list {
+                    state.status = "Workflows".to_owned();
+                }
                 Ok(true)
             }
-            Ok(crate::workflow_commands::WorkflowCommandEffect::Message(_)) => Ok(true),
             Err(error) => {
                 state.push_status(format!("Workflow command failed: {error:#}"), true);
                 Ok(false)
             }
         };
     }
-    // All other subcommands (`create`, `list`, `show`, `pause`, `resume`,
+    // All other subcommands (`create`, `show`, `pause`, `resume`,
     // `cancel`, `integrate`, `remove`) may perform durable worktree, model, and
     // supervisor operations. Awaiting them inline froze the TUI event loop on
     // `WorkflowManager::create` -> `factory.create(...).await` (the exact
@@ -6991,8 +9032,8 @@ async fn dispatch_workflow_command(
 
 /// Visible admission label for a backgrounded `/workflow` subcommand. Returned
 /// to the background completion so a stale "Creating…" status never survives a
-/// later panel open. `OpenPage` is never admitted in the background; its label
-/// is unused but kept total for exhaustiveness.
+/// later panel open. `OpenPage` and `List` are never admitted in the background;
+/// their labels are unused but kept total for exhaustiveness.
 fn workflow_command_admission_label(
     command: &crate::workflow_commands::InteractiveWorkflowCommand,
 ) -> &'static str {
@@ -7011,16 +9052,52 @@ fn workflow_command_admission_label(
     }
 }
 
+/// Routes the composer text to the pending interactive `ask` when one is
+/// active. Returns `true` when the submission was consumed by the ask (the
+/// caller must not treat the text as a prompt/command). An empty submission
+/// keeps the question pending so the user can keep typing.
+async fn submit_pending_ask(application: &Application, state: &mut TuiState) -> bool {
+    let Some(ask) = state.pending_ask.take() else {
+        return false;
+    };
+    let answer = state.editor.text().trim().to_owned();
+    if answer.is_empty() {
+        state.pending_ask = Some(ask);
+        return true;
+    }
+    state.editor.clear();
+    state.completions.clear();
+    state.completion_query = None;
+    match application.answer_ask(&ask.id, answer) {
+        Ok(()) => state.status = "Answered".to_owned(),
+        Err(error) => {
+            state.push_status(format!("Ask failed: {error}"), true);
+        }
+    }
+    true
+}
+
 async fn submit(
     application: &Application,
     state: &mut TuiState,
     terminal: &mut TerminalGuard,
+    collab_host: Option<&crate::collab_commands::CollabHost>,
 ) -> Result<bool> {
     if state.pending_attachments.is_empty() && state.accept_unambiguous_command_prefix() {
         return Ok(false);
     }
+    // Enter while holding the talk key: stop the capture (and discard the
+    // buffer) so a half-edited draft cannot race the in-flight transcript.
+    if state.live.recording {
+        state.live_abort_recording();
+    }
     let prompt = state.editor.text();
     if prompt.trim().is_empty() && state.pending_attachments.is_empty() {
+        return Ok(false);
+    }
+    // While the model awaits an answer, the next submitted line IS the
+    // answer — even if it looks like a slash command or bash input.
+    if submit_pending_ask(application, state).await {
         return Ok(false);
     }
     if state.pending_attachments.is_empty()
@@ -7063,12 +9140,22 @@ async fn submit(
                 terminal.set_code_review_mouse_capture(false)?;
                 return Ok(true);
             }
+            "live" => state.toggle_live_mode(application),
             "copy" => state.start_copy(application),
-            "new" if !state.is_streaming => match application.new_session().await {
+            "new" | "fresh" if !state.is_streaming => match application.new_session().await {
                 Ok(outcome) if outcome.cancelled => {
                     state.status = "New session cancelled".to_owned();
                 }
                 Ok(_) => {
+                    if let Err(error) =
+                        crate::session_run::rebind_workflows_for_active_session(application)
+                            .await
+                    {
+                        state.push_status(
+                            format!("Workflow storage rebind failed: {error:#}"),
+                            true,
+                        );
+                    }
                     state.replace_transcript_from_application(application);
                     state.status = "Started a new session".to_owned();
                 }
@@ -7164,49 +9251,88 @@ async fn submit(
                     state.push_status(format!("Failed to clone session: {error:#}"), true)
                 }
             },
-            "loop" | "loop-update" if state.is_streaming => {
-                state.push_status(
-                    format!("/{name} is unavailable while another turn is running"),
-                    true,
-                );
-                return Ok(false);
-            }
             "loop" | "loops" | "loop-update" | "loop-delete" | "loop-cancel" => {
-                match crate::loop_commands::parse_interactive_loop_command(name, arg) {
-                    Ok(Some(command)) => {
-                        match crate::loop_commands::execute_interactive_loop_command(
-                            application,
-                            command,
-                        )
-                        .await
-                        {
-                            Ok(output) if name == "loops" => {
-                                state.push_lines("Loops", output, state.themes.theme().accent);
-                            }
-                            Ok(output) => state.status = output,
-                            Err(error) => {
-                                state.push_status(format!("Loop command failed: {error:#}"), true);
-                                return Ok(false);
-                            }
-                        }
-                    }
+                let command = match crate::loop_commands::parse_interactive_loop_command(name, arg)
+                {
+                    Ok(Some(command)) => command,
                     Ok(None) => unreachable!("loop command name was matched"),
                     Err(error) => {
                         state.push_status(format!("{error:#}"), true);
                         return Ok(false);
                     }
+                };
+                if state.is_streaming
+                    && matches!(
+                        &command,
+                        crate::loop_commands::InteractiveLoopCommand::Create { .. }
+                            | crate::loop_commands::InteractiveLoopCommand::Update { .. }
+                    )
+                {
+                    state.push_status(
+                        format!("/{name} is unavailable while another turn is running"),
+                        true,
+                    );
+                    return Ok(false);
+                }
+                let lists_loops = matches!(
+                    &command,
+                    crate::loop_commands::InteractiveLoopCommand::List
+                );
+                match crate::loop_commands::execute_interactive_loop_command(
+                    application,
+                    command,
+                )
+                .await
+                {
+                    Ok(output) if lists_loops => {
+                        state.push_lines("Loops", output, state.themes.theme().accent);
+                    }
+                    Ok(output) => state.status = output,
+                    Err(error) => {
+                        state.push_status(format!("Loop command failed: {error:#}"), true);
+                        return Ok(false);
+                    }
                 }
             }
-            "compact" if !state.is_streaming => match application.compact(arg).await {
-                Ok(result) => {
-                    state.status = format!(
-                        "Compacted {} → {} estimated tokens",
-                        result.tokens_before,
-                        result.estimated_tokens_after.unwrap_or_default()
-                    )
+            "compact" if !state.is_streaming && !state.is_compacting => {
+                // Backgrounded so the provider summarization call never freezes
+                // the event loop: the spinner + Escape-abort stay live, and a
+                // stalled provider fails with the pi-coding deadline instead of
+                // wedging the TUI. Result arrives via CompactionFinished.
+                admit_compact_background(application, state, arg);
+            }
+            "snapcompact" if !state.is_streaming && !state.is_compacting => {
+                // Hidden alias for `/compact --snap`: deterministic archive,
+                // no provider call. Same backgrounded admission as /compact.
+                admit_compact_background(application, state, Some("--snap"));
+            }
+            "rewind" if !state.is_streaming && !application.is_bash_running() => {
+                let invocation = crate::interactive_commands::parse_rewind_invocation(arg);
+                match crate::interactive_commands::execute_rewind(application, invocation).await {
+                    Ok(output) => {
+                        if arg.is_none() {
+                            state.push_lines("Rewind", output, state.themes.theme().accent);
+                        } else {
+                            state.replace_transcript_from_application(application);
+                            state.status = output;
+                        }
+                    }
+                    Err(error) => state.push_status(format!("Rewind failed: {error:#}"), true),
                 }
-                Err(error) => state.push_status(format!("Compaction failed: {error:#}"), true),
-            },
+            }
+            "checkpoint" => {
+                match arg {
+                    Some(name) => {
+                        match crate::interactive_commands::execute_checkpoint(application, name) {
+                            Ok(output) => state.status = output,
+                            Err(error) => {
+                                state.push_status(format!("Checkpoint failed: {error:#}"), true)
+                            }
+                        }
+                    }
+                    None => state.push_status("Usage: /checkpoint <name>".to_owned(), true),
+                }
+            }
             "name" => match arg {
                 Some(name) => match application.set_session_name(name) {
                     Ok(()) => state.status = format!("Session name: {name}"),
@@ -7235,30 +9361,94 @@ async fn submit(
                     false,
                 );
             }
-            "todo" => match arg {
-                Some(markdown) => match pi_coding::parse_todo_markdown(markdown) {
-                    Ok(phases) => match application.set_todos(phases) {
-                        Ok(result) => {
-                            state.todo_phases = result.phases;
-                            state.push_status(format!("Todo: {}", result.summary), false);
-                        }
-                        Err(error) => {
-                            state.push_status(format!("Failed to set todos: {error:#}"), true)
-                        }
-                    },
-                    Err(error) => {
-                        state.push_status(format!("Invalid todo markdown: {error:#}"), true)
-                    }
-                },
-                None => state.open_todo_dag_panel(application, terminal)?,
-            },
+            // Deterministic envelope — no provider call — so the transcript
+            // block renders instantly; the clipboard copy runs in the
+            // background (ClipboardHandoffWrite reports completion). Prose
+            // stays a REPL/CLI feature (`--prose` is a status hint here).
+            "handoff" => dispatch_handoff_command(application, state, arg),
+            "todo" => {
+                if !dispatch_todo_command(application, state, terminal, arg)? {
+                    return Ok(false);
+                }
+            }
             "code-review" => match ReviewScope::parse(arg) {
                 Ok(scope) => state.open_code_review_panel(application, scope, terminal).await?,
                 Err(error) => state.push_status(error, true),
             },
             "btw" => {
-                state.open_side_chat(application, arg, terminal).await?;
+                state.handle_btw_command(application, arg, terminal).await?;
             }
+            "overlay" => {
+                let Some(id) = arg else {
+                    state.push_status("Usage: /overlay <id>".to_owned(), true);
+                    return Ok(false);
+                };
+                let runtime = match application.extension_runtime() {
+                    Some(runtime) => runtime,
+                    None => {
+                        state.push_status(
+                            "No extension runtime is loaded; /overlay needs a registered extension overlay".to_owned(),
+                            true,
+                        );
+                        return Ok(false);
+                    }
+                };
+                let registered = runtime.overlays();
+                let Some(descriptor) = registered.iter().find(|overlay| overlay.id == id) else {
+                    let available = registered
+                        .iter()
+                        .map(|overlay| overlay.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    state.push_status(
+                        format!(
+                            "Unknown extension overlay {id:?}; registered overlays: {}",
+                            if available.is_empty() {
+                                "(none)".to_owned()
+                            } else {
+                                available
+                            }
+                        ),
+                        true,
+                    );
+                    return Ok(false);
+                };
+                let descriptor = descriptor.clone();
+                let instance = runtime
+                    .overlay_instance(&descriptor.id)
+                    .unwrap_or_else(|| pi_coding::ExtensionInstanceId {
+                        extension_id: descriptor.id.clone(),
+                        generation: 0,
+                    });
+                match runtime.invoke_overlay_render(&descriptor.id).await {
+                    Ok(output) => {
+                        // Merge the static registration declaration
+                        // (placeholder/multiline) with the render result's
+                        // open-time initial draft; the exclusive default
+                        // keeps the historical content-only contract.
+                        let input = descriptor.input.as_ref().map(|declaration| OverlayInput {
+                            value: output
+                                .input
+                                .as_ref()
+                                .map_or_else(String::new, |input| input.value.clone()),
+                            placeholder: declaration.placeholder.clone(),
+                            multiline: declaration.multiline,
+                        });
+                        state.open_extension_overlay(
+                            &instance,
+                            &descriptor.id,
+                            &descriptor.title,
+                            output.rows,
+                            input,
+                            false,
+                        );
+                    }
+                    Err(error) => {
+                        state.push_status(format!("Overlay {id} failed to render: {error:#}"), true);
+                    }
+                }
+            }
+            "queue" => dispatch_queue_command(application, state, arg).await,
             "changelog" => state.push_lines(
                 "Changelog",
                 include_str!("../../../CHANGELOG.md").to_owned(),
@@ -7295,6 +9485,17 @@ async fn submit(
                     Err(error) => state.push_status(format!("Export failed: {error:#}"), true),
                 }
             }
+            "dump" if !state.is_streaming => {
+                match crate::interactive_commands::execute_dump(
+                    application,
+                    crate::interactive_commands::parse_dump_invocation(arg.unwrap_or_default()),
+                )
+                .await
+                {
+                    Ok(path) => state.push_status(format!("Dumped {}", path.display()), false),
+                    Err(error) => state.push_status(format!("Dump failed: {error:#}"), true),
+                }
+            }
             "import" if !state.is_streaming => match arg {
                 Some(input) => match pi_coding::import_session(pi_coding::SourceSessionFormat::Pi, Path::new(input),
                 ) {
@@ -7303,6 +9504,17 @@ async fn submit(
                             state.status = "Session resume cancelled".to_owned();
                         }
                         Ok(_) => {
+                            if let Err(error) =
+                                crate::session_run::rebind_workflows_for_active_session(
+                                    application,
+                                )
+                                .await
+                            {
+                                state.push_status(
+                                    format!("Workflow storage rebind failed: {error:#}"),
+                                    true,
+                                );
+                            }
                             state.replace_transcript_from_application(application);
                             state.status = format!("Imported and resumed {}", imported.path.display());
                         }
@@ -7314,8 +9526,53 @@ async fn submit(
                 None => state.push_status("Usage: /import <path.jsonl>".to_owned(), true),
             },
             "share" if !state.is_streaming => {
-                application.share_session();
-                state.status = "Sharing...".to_owned();
+                match crate::interactive_commands::parse_share_invocation(arg.unwrap_or_default()) {
+                    Ok(request) if request.encrypt => {
+                        let passphrase = match request.passphrase {
+                            Some(passphrase) => passphrase,
+                            None => match terminal
+                                .suspend(|| async {
+                                    crate::interactive_commands::prompt_passphrase(
+                                        "Enter share passphrase",
+                                    )
+                                })
+                                .await
+                            {
+                                Ok(passphrase) => passphrase,
+                                Err(error) => {
+                                    state.push_status(
+                                        format!("Encrypted share cancelled: {error:#}"),
+                                        true,
+                                    );
+                                    return Ok(false);
+                                }
+                            },
+                        };
+                        match crate::interactive_commands::execute_encrypted_share(
+                            application,
+                            &passphrase,
+                        )
+                        .await
+                        {
+                            Ok(message) => state.push_lines(
+                                "Encrypted share",
+                                message,
+                                state.themes.theme().accent,
+                            ),
+                            Err(error) => {
+                                state.push_status(
+                                    format!("Encrypted share failed: {error:#}"),
+                                    true,
+                                )
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        application.share_session();
+                        state.status = "Sharing...".to_owned();
+                    }
+                    Err(error) => state.push_status(format!("{error:#}"), true),
+                }
             }
             "llama" if !state.is_streaming => {
                 let command = arg.unwrap_or("status").to_owned();
@@ -7325,6 +9582,87 @@ async fn submit(
                 }
             }
             "agents" => state.open_agents_panel(application, terminal).await?,
+            "role" => {
+                let command = match crate::interactive_commands::parse_interactive_role_command(arg)
+                {
+                    Ok(command) => command,
+                    Err(error) => {
+                        state.push_status(format!("{error:#}"), true);
+                        return Ok(false);
+                    }
+                };
+                match crate::interactive_commands::execute_interactive_role_command(
+                    application,
+                    command,
+                ) {
+                    Ok(output) => {
+                        state.push_lines("Roles", output, state.themes.theme().accent);
+                    }
+                    Err(error) => state.push_status(format!("{error:#}"), true),
+                }
+            }
+            "collab" => {
+                let invocation = match crate::interactive_commands::parse_collab_invocation(
+                    arg.unwrap_or_default(),
+                ) {
+                    Ok(invocation) => invocation,
+                    Err(error) => {
+                        state.push_status(format!("{error:#}"), true);
+                        return Ok(false);
+                    }
+                };
+                match crate::collab_commands::execute(collab_host, invocation).await {
+                    Ok(output) => state.push_lines(
+                        "Collaboration",
+                        output,
+                        state.themes.theme().accent,
+                    ),
+                    Err(error) => state.push_status(format!("{error:#}"), true),
+                }
+            }
+            "persona" => {
+                let command =
+                    match crate::interactive_commands::parse_interactive_persona_command(arg) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            state.push_status(format!("{error:#}"), true);
+                            return Ok(false);
+                        }
+                    };
+                let result = match command {
+                    crate::interactive_commands::InteractivePersonaCommand::New { name } => {
+                        run_persona_editor(
+                            application,
+                            terminal,
+                            &name,
+                            crate::interactive_commands::PersonaEditKind::New,
+                        )
+                        .await
+                    }
+                    crate::interactive_commands::InteractivePersonaCommand::Edit { name } => {
+                        run_persona_editor(
+                            application,
+                            terminal,
+                            &name,
+                            crate::interactive_commands::PersonaEditKind::Edit,
+                        )
+                        .await
+                    }
+                    other => {
+                        crate::interactive_commands::execute_interactive_persona_command(
+                            application,
+                            other,
+                        )
+                        .await
+                    }
+                };
+                match result {
+                    Ok(output) => {
+                        state.push_lines("Personas", output, state.themes.theme().accent);
+                    }
+                    Err(error) => state.push_status(format!("{error:#}"), true),
+                }
+            }
             "ps" if arg.is_none() => {
                 state.close_code_review_panel(terminal)?;
                 state.panel = None;
@@ -7352,7 +9690,7 @@ async fn submit(
             }
             "login" if !state.is_streaming => {
                 let result = terminal
-                    .suspend(|| crate::auth_commands::login(arg, true))
+                    .suspend(|| crate::auth_commands::login(arg, None, true))
                     .await;
                 match result {
                     Ok(info) => state.push_status(
@@ -7368,7 +9706,7 @@ async fn submit(
             }
             "logout" if !state.is_streaming => {
                 let result = terminal
-                    .suspend(|| crate::auth_commands::logout(arg, true))
+                    .suspend(|| crate::auth_commands::logout(arg, None, true))
                     .await;
                 match result {
                     Ok(info) => {
@@ -7380,7 +9718,12 @@ async fn submit(
             "help" => {
                 let help = visible_catalog()
                     .into_iter()
-                    .map(|command| format!("/{:<18} {}", command.name, command.description))
+                    .map(|command| {
+                        let command_usage = builtin(&command.name)
+                            .map(usage)
+                            .unwrap_or_else(|| format!("/{}", command.name));
+                        format!("{command_usage:<24} {}", command.description)
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 state.push_lines("Commands", help, state.themes.theme().accent);
@@ -7470,6 +9813,26 @@ async fn submit(
                     Err(error) => state.push_status(format!("{error:#}"), true),
                 }
             }
+            "skill" => {
+                let Some(name) = arg else {
+                    let usage = crate::interactive_commands::builtin("skill")
+                        .map(crate::interactive_commands::usage)
+                        .unwrap_or_else(|| "/skill <name>".to_owned());
+                    state.push_status(format!("Usage: {usage}"), true);
+                    return Ok(false);
+                };
+                match crate::interactive_commands::skill_frontmatter_summary(application, name) {
+                    Some(summary) => {
+                        state.push_lines("Skill", summary, state.themes.theme().accent);
+                    }
+                    None => {
+                        state.push_status(
+                            format!("Unknown skill {name:?}; loaded skills complete via /skill:<name>"),
+                            true,
+                        );
+                    }
+                }
+            }
             "" => {}
             command => {
                 let source = state.commands.iter().find(|candidate| candidate.name == command).map(|candidate| candidate.source);
@@ -7539,6 +9902,11 @@ async fn submit(
         state.push_status(format!("Prompt was not accepted: {error}"), true);
         return Ok(false);
     }
+    // Delegation bridge: a live-mode draft that reads like a coding task is
+    // submitted through this same standard prompt path (the delegation *is*
+    // a normal agent turn) and tracked so the status row shows
+    // `⟦delegating⟧ <elapsed>` until the turn settles.
+    state.track_live_delegation(&prompt);
     let display_prompt = if attachment_count == 0 {
         prompt.clone()
     } else {
@@ -7587,6 +9955,8 @@ fn page_overlay_owner(state: &TuiState) -> Option<&'static str> {
         Some("the model selector")
     } else if state.extension_dialog.is_some() {
         Some("another extension dialog")
+    } else if state.extension_overlay.is_some() {
+        Some("an extension overlay")
     } else if state.pty_attachment.is_some() {
         Some("a PTY attachment")
     } else {
@@ -7599,6 +9969,20 @@ fn page_overlay_owner(state: &TuiState) -> Option<&'static str> {
 /// committed through `insert_before` into native/tmux scrollback.
 fn page_overlay_open(state: &TuiState) -> bool {
     page_overlay_owner(state).is_some()
+}
+
+/// True while the current page owner actually captures input (keys and
+/// paste). Exclusive owners always capture; a non-capturing extension overlay
+/// captures only while focused — when unfocused the composer is the single
+/// input owner and the overlay just stays drawn. Input-ownership decisions
+/// (paste routing, bounded-status placement, extension-interaction
+/// rejection) use this; [`page_overlay_open`] remains the visibility
+/// predicate for the draw/scrollback gates.
+fn page_overlay_capturing(state: &TuiState) -> bool {
+    if let Some(overlay) = &state.extension_overlay {
+        return !overlay.non_capturing || overlay.focused;
+    }
+    page_overlay_open(state)
 }
 
 fn code_review_page_active(state: &TuiState) -> bool {
@@ -7614,6 +9998,7 @@ fn code_review_page_active(state: &TuiState) -> bool {
         && state.session_selector.is_none()
         && state.scoped_model_selector.is_none()
         && state.extension_dialog.is_none()
+        && state.extension_overlay.is_none()
         && state.pty_attachment.is_none()
 }
 
@@ -7626,8 +10011,10 @@ struct TuiLayoutHeights {
     transcript: u16,
     todo: u16,
     above: u16,
-    composer: u16,
     error: u16,
+    /// Always-reserved OMP-style status row directly above the composer.
+    status: u16,
+    composer: u16,
     completions: u16,
     below: u16,
 }
@@ -7675,6 +10062,25 @@ fn tui_layout_heights(
     let mut optional_budget = terminal_height
         .saturating_sub(composer)
         .saturating_sub(1);
+    // The OMP-style status row directly above the composer is always reserved
+    // so the input box never sits flush against content above: transient
+    // activity renders there while idle leaves it blank. When the status line
+    // carries visible text it reserves a blank row above the text AND one
+    // below it (mirroring OMP's `working` row: gap · text · gap), so the
+    // status never sits flush against content above or the composer border;
+    // idle keeps just the single reserved blank row.
+    let status = if optional_budget > 0 {
+        let text_active =
+            !composer_status_line(state, width, state.themes.theme()).spans.is_empty();
+        if text_active {
+            optional_budget.min(3)
+        } else {
+            1
+        }
+    } else {
+        0
+    };
+    optional_budget = optional_budget.saturating_sub(status);
     let notice = composer_error_toast_height(state, width).min(optional_budget);
     let notice_gap = u16::from(notice > 0 && optional_budget > notice);
     let error = notice.saturating_add(notice_gap);
@@ -7690,6 +10096,7 @@ fn tui_layout_heights(
     let below = below_height.min(optional_budget);
     let transcript = terminal_height
         .saturating_sub(composer)
+        .saturating_sub(status)
         .saturating_sub(todo)
         .saturating_sub(above)
         .saturating_sub(error)
@@ -7700,6 +10107,7 @@ fn tui_layout_heights(
         todo,
         above,
         error,
+        status,
         composer,
         completions,
         below,
@@ -7724,6 +10132,7 @@ fn live_viewport_height(state: &TuiState, width: u16, terminal_height: u16) -> u
     let todo_height = u16::try_from(render_todo_panel_lines(
         &state.todo_phases,
         &state.job_cards.cards_in_source_order(),
+        &state.workflow_snapshots,
         theme,
         width.max(1),
     ).len(),
@@ -7750,6 +10159,7 @@ fn live_viewport_height(state: &TuiState, width: u16, terminal_height: u16) -> u
     let chrome = layout.todo
         .saturating_add(layout.above)
         .saturating_add(layout.error)
+        .saturating_add(layout.status)
         .saturating_add(layout.composer)
         .saturating_add(layout.completions)
         .saturating_add(layout.below)
@@ -7788,6 +10198,7 @@ fn transcript_region_height(state: &TuiState, width: u16, terminal_height: u16) 
     let todo_height = u16::try_from(render_todo_panel_lines(
         &state.todo_phases,
         &state.job_cards.cards_in_source_order(),
+        &state.workflow_snapshots,
         theme,
         width.max(1),
     ).len(),
@@ -8041,52 +10452,67 @@ fn footer_context_text(usage: &SessionContextUsage) -> Option<String> {
     ))
 }
 
-/// Build the one-line composer header (the footer/status row) with model,
-/// thinking, cwd, git branch/dirty, context utilization, and an optional
-/// activity indicator. Lower-priority metadata drops on narrow terminals so
-/// the row never overlaps; idle/default status leaves the activity segment out.
+/// Build the one-line composer header (the footer row) with model, thinking,
+/// cwd, git branch/dirty, context utilization, live OMP-style counts
+/// (`👥` active subagents, `⚙` pending queued messages), and an optional goal
+/// chip. Lower-priority metadata drops on narrow terminals so the row never
+/// overlaps. Transient activity no longer lives here — it renders on the
+/// OMP-style status line directly above the input box (see
+/// [`composer_status_line`]), keeping this row compact and static.
 fn composer_header_line(
     state: &TuiState,
     inner: usize,
     theme: Theme,
     border_style: Style,
 ) -> Line<'static> {
-    let status = composer_status_display(state, theme);
     let model = clean_terminal_text(&state.model);
     let cwd = compact_cwd(&state.cwd);
     let thinking = composer_thinking_label(state);
+    let goal = goal_status_summary(&state.goal_state);
     let logo_width = usize::from(display_width("── π"));
     let available = inner.saturating_sub(logo_width);
-    let status_sep = " > ⟲ ";
-    let status_sep_w = status
+    let goal_sep = " > ";
+    let goal_sep_w = goal
         .as_ref()
-        .map_or(0, |_| usize::from(display_width(status_sep)));
+        .map_or(0, |_| usize::from(display_width(goal_sep)));
     // Render order; drop_priority ascending is dropped first on narrow widths.
+    // Segment colors come from the OMP `statusLine*` role family where a
+    // distinct role exists (model/path/git/context/subagents); the thinking
+    // level is metadata, not chrome, so it renders dim like OMP's footer.
     let mut fields: Vec<FooterField> = vec![
         FooterField {
             sep: "  > ⬢ ",
             value: model,
-            fg: theme.accent,
+            fg: theme.status_line_model,
             drop_priority: 5,
         },
         FooterField {
             sep: " · ◑ ",
             value: thinking,
-            fg: theme.accent,
+            fg: theme.dim,
             drop_priority: 4,
         },
         FooterField {
             sep: " > 📁 ",
             value: cwd,
-            fg: theme.syntax_variable,
+            fg: theme.status_line_path,
             drop_priority: 3,
         },
     ];
-    if let Some(git) = state.git_status.as_ref().and_then(footer_git_text) {
+    if let Some(status) = state.git_status.as_ref()
+        && let Some(git) = footer_git_text(status)
+    {
+        // OMP paints the git segment green when the tree is clean and amber
+        // when any bucket (staged/modified/untracked) is non-empty.
+        let dirty = status.staged > 0 || status.modified > 0 || status.untracked > 0;
         fields.push(FooterField {
             sep: " > ⑂ ",
             value: git,
-            fg: theme.accent,
+            fg: if dirty {
+                theme.status_line_git_dirty
+            } else {
+                theme.status_line_git_clean
+            },
             drop_priority: 2,
         });
     }
@@ -8094,17 +10520,57 @@ fn composer_header_line(
         fields.push(FooterField {
             sep: " > ◫ ",
             value: ctx,
-            fg: theme.accent,
+            fg: theme.status_line_context,
             drop_priority: 1,
         });
     }
+    // OMP-style live counts, appended after the model/thinking/cwd/git/context
+    // segments and omitted while zero. `👥 N` is the total number of live
+    // subagents across every orchestration scope: active/queued main-session
+    // subagent jobs (orchestration jobs with status Queued|Running) plus the
+    // sum of every workflow's subagent roster (`workflow_snapshots[].subagents`,
+    // projected from each workflow child runtime's agent list with the
+    // supervisor excluded). A workflow whose live runtime detail is unavailable
+    // projects an empty subagent list, so the total degrades to the main-session
+    // job count rather than inventing work; `⚙ N` is the pending count —
+    // queued steering plus follow-up user messages awaiting processing, the
+    // pi-rs analogue of OMP's pending-settings counter.
+    let subagents = state.job_cards.running_count()
+        + state
+            .workflow_snapshots
+            .iter()
+            .map(|workflow| workflow.subagents.len())
+            .sum::<usize>();
+    if subagents > 0 {
+        fields.push(FooterField {
+            sep: " > 👥 ",
+            value: subagents.to_string(),
+            fg: theme.status_line_subagents,
+            drop_priority: 1,
+        });
+    }
+    // The pending count is the user's own queued prompts — an actionable
+    // state, not passive metadata — so it outranks the context-usage, git,
+    // cwd, and thinking segments (drop_priority ascending is dropped first;
+    // only the model identity survives it). Without this, a long cwd plus a
+    // goal chip silently drops the `⚙ N` acknowledgment exactly while a
+    // follow-up waits in the queue.
+    let pending = state.queued_steering.len() + state.queued_follow_up;
+    if pending > 0 {
+        fields.push(FooterField {
+            sep: " > ⚙ ",
+            value: pending.to_string(),
+            fg: theme.accent,
+            drop_priority: 4,
+        });
+    }
     // Drop the lowest-priority field until all kept metadata and, when present,
-    // at least one activity column fit.
+    // at least one goal chip column fit.
     loop {
         let kept: usize = fields.iter().map(FooterField::width).sum();
-        let remaining = available.saturating_sub(kept).saturating_sub(status_sep_w);
-        let fits = kept.saturating_add(status_sep_w) <= available
-            && (status.is_none() || remaining > 0);
+        let remaining = available.saturating_sub(kept).saturating_sub(goal_sep_w);
+        let fits = kept.saturating_add(goal_sep_w) <= available
+            && (goal.is_none() || remaining > 0);
         if fits || fields.is_empty() {
             break;
         }
@@ -8126,13 +10592,14 @@ fn composer_header_line(
         spans.push(Span::styled(field.value.clone(), composer_style(theme, field.fg)));
     }
     let remaining = available.saturating_sub(kept);
-    if let Some((raw_status, status_color)) = status {
-        if remaining > status_sep_w {
-            let budget = remaining.saturating_sub(status_sep_w);
-            let status_text = truncate_status_text(&raw_status, budget);
-            let fill = "─".repeat(budget.saturating_sub(usize::from(display_width(&status_text))));
-            spans.push(Span::styled(status_sep, border_style));
-            spans.push(Span::styled(status_text, composer_style(theme, status_color)));
+    if let Some(goal) = goal {
+        let raw = format!("{goal} ▶──");
+        if remaining > goal_sep_w {
+            let budget = remaining.saturating_sub(goal_sep_w);
+            let goal_text = truncate_status_text(&raw, budget);
+            let fill = "─".repeat(budget.saturating_sub(usize::from(display_width(&goal_text))));
+            spans.push(Span::styled(goal_sep, border_style));
+            spans.push(Span::styled(goal_text, composer_style(theme, theme.accent)));
             spans.push(Span::styled(fill, border_style));
         } else {
             spans.push(Span::styled("─".repeat(remaining), border_style));
@@ -8144,39 +10611,462 @@ fn composer_header_line(
     Line::from(spans)
 }
 
-/// Compose the optional inline status segment for the OMP-style composer header.
-/// Busy states keep the activity animation; default idle labels are omitted.
-fn composer_status_display(state: &TuiState, theme: Theme) -> Option<(String, Color)> {
+/// Activity line for the most recently started tool call that is still
+/// executing: `<tool> <bounded argument fragment>` (`read src/lib.rs`,
+/// `bash cargo test --lib...`). Cards with a terminal status
+/// (succeeded/failed/cancelled/repaired) are ignored, so completed calls
+/// never read as live activity. The fragment is the same bounded,
+/// credential-redacted compact the tool cards use
+/// (`pi_coding::compact_tool_arguments`), so the status line never leaks
+/// secret-shaped arguments. `task` delegations never reach the tool
+/// projection (`apply_tool_event` routes them to the job cards), so they
+/// surface as subagent activity instead.
+fn running_tool_activity(state: &TuiState) -> Option<String> {
+    state
+        .tool_cards
+        .projection()
+        .cards_in_source_order()
+        .into_iter()
+        .rev()
+        .find(|card| !card.status.is_terminal())
+        .filter(|card| !card.tool_name.is_empty())
+        .map(|card| {
+            let fragment = pi_coding::compact_tool_arguments(&card.arguments);
+            let fragment = fragment.trim();
+            if fragment.is_empty() {
+                card.tool_name.clone()
+            } else {
+                format!("{} {fragment}", card.tool_name)
+            }
+        })
+}
+
+/// Most specific live activity of the delegated subagent jobs:
+/// `<display name> <live progress one-liner>` (`kimi read tools.rs · 12s`),
+/// degrading to the coarse stage when no progress message arrived yet
+/// (`kimi running` / `kimi queued`). The progress text is bounded and
+/// credential-redacted by the job-card adapter. When several jobs are active
+/// the one reporting live progress wins (newest activity first); otherwise a
+/// running job beats one still queued, with the most recently started job
+/// breaking ties — so the row never fabricates a generic wait label or a
+/// count.
+fn running_subagent_activity(state: &TuiState) -> Option<String> {
+    let active: Vec<_> = state
+        .job_cards
+        .cards_in_source_order()
+        .into_iter()
+        .filter(|card| matches!(card.job_status, JobStatus::Queued | JobStatus::Running))
+        .collect();
+    if active.is_empty() {
+        return None;
+    }
+    let reporting = active.iter().filter(|card| {
+        card.progress
+            .as_ref()
+            .and_then(|progress| progress.activity.as_deref())
+            .is_some_and(|activity| !activity.trim().is_empty())
+    });
+    let card = reporting
+        .max_by_key(|card| {
+            card.progress
+                .as_ref()
+                .and_then(|progress| progress.activity_at)
+                .unwrap_or(0)
+        })
+        .or_else(|| {
+            // No live progress anywhere: a job already running is more
+            // informative than one still queued; within equal status the
+            // most recently started job wins.
+            active.iter().max_by_key(|card| match card.job_status {
+                JobStatus::Running => 1,
+                JobStatus::Queued => 0,
+                _ => 0,
+            })
+        });
+    card.map(|card| {
+        let name = if card.display_name.trim().is_empty() {
+            card.agent_id.clone()
+        } else {
+            card.display_name.clone()
+        };
+        let progress = card
+            .progress
+            .as_ref()
+            .map(progress_row_text)
+            .unwrap_or_default();
+        let progress = progress.trim();
+        if progress.is_empty() {
+            format!("{name} working")
+        } else {
+            format!("{name} {progress}")
+        }
+    })
+}
+
+/// Live activity of the most advanced non-terminal workflow, mirroring the
+/// workflow page's own precedence: the supervisor's planning feed while the
+/// workflow plans (`GLM tool · bash · cargo test --lib...`,
+/// `kimi thinking · weigh options`), `planning` before the feed starts, and
+/// the first active worker-task summary while the wave executes (Running /
+/// Integrating). Queued and paused waves show nothing specific. The feed
+/// text is bounded and credential-redacted by the runtime forwarder; the
+/// whole line is truncated to the row width by the status line. The feed
+/// belongs to the Planning phase, so it is never shown as stale while the
+/// wave executes.
+fn live_wave_activity(state: &TuiState) -> Option<String> {
+    state.workflow_snapshots.iter().find_map(|workflow| {
+        if workflow.status.is_terminal() {
+            return None;
+        }
+        let agent = workflow
+            .supervisor
+            .as_ref()
+            .map(|supervisor| supervisor.name.clone())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| workflow.name.clone());
+        if workflow.status == WorkflowStatus::Planning {
+            let activity = workflow.planning_activity.last().map_or_else(
+                || "planning".to_owned(),
+                |entry| format!("{}{}", planning_activity_label(entry.kind), entry.text),
+            );
+            return Some(format!("{agent} {activity}"));
+        }
+        // Only an executing wave (workers running / integrating) carries a
+        // live task summary; queued or paused waves show nothing specific.
+        if !matches!(
+            workflow.status,
+            WorkflowStatus::Running | WorkflowStatus::Integrating
+        ) {
+            return None;
+        }
+        workflow
+            .active_tasks
+            .first()
+            .filter(|task| !task.summary.trim().is_empty())
+            .map(|task| format!("{agent} {}", task.summary))
+    })
+}
+
+/// Status texts that mean "nothing specific to report": the row hides them
+/// when idle and degrades them to the generic `Working…` fallback while a
+/// turn is streaming, so the concrete sources (subagents, tools, compaction,
+/// workflow/loop/goal text) always beat the generic busy label.
+fn is_idle_status_text(text: &str) -> bool {
+    matches!(
+        text,
+        "Ready"
+            | "Working"
+            | "Enter submit · Shift+Enter/Ctrl+J newline · Esc abort · Ctrl+D quit"
+    )
+}
+
+/// Which transient activity (if any) owns the OMP-style status line above the
+/// composer, and whether Esc can abort it. Concrete sources win over generic
+/// work, most specific first:
+/// 1. an extension-owned working message (the extension reports exactly what
+///    it is doing),
+/// 2. a live workflow wave — `<agent> <what it is doing>` from the
+///    supervisor's bounded activity feed or the wave's active worker task
+///    (`GLM tool · bash · cargo test --lib...`, `kimi thinking · weigh
+///    options`), so a wave never reads as a generic busy label,
+/// 3. a delegated subagent job — `<display name> <live progress>`
+///    (`kimi read tools.rs · 12s`) from the job-card projection,
+/// 4. a tool call still executing — `<tool> <bounded argument fragment>`
+///    (`read src/lib.rs`), both bounded and credential-redacted,
+/// 5. context compaction — `Compacting context…`,
+/// 6. the main agent thinking — `thinking…` while thinking deltas stream
+///    (static label; the deltas themselves would flood the row, the spinner
+///    carries the liveness),
+/// 7. any other concrete status text (workflow snapshots, loop events, todo
+///    reminders, retries, …), which beats the generic busy label,
+/// 8. the generic busy fallback `Working…` (capitalized like OMP) while a
+///    turn streams.
+/// Idle renders nothing. All activity text is single-row: each source is
+/// already bounded and redacted (compact tool arguments, job-card progress,
+/// the supervisor feed), and the row truncates at the width regardless. The
+/// sources only change on real events (tool starts/ends, job progress
+/// messages, coalesced supervisor feed flushes), so the row never floods.
+/// Esc hints track what `Action::Abort` can cancel: the streaming turn, a
+/// running tool/bash call, or the compaction task.
+fn composer_status_activity(state: &TuiState, theme: Theme) -> Option<(String, Color, bool)> {
+    // Hold-to-talk capture owns the row while the talk key is held.
+    if state.live.recording {
+        return Some(("Recording…".to_owned(), theme.accent, false));
+    }
+    let extension_working = state
+        .extension_working_message
+        .as_deref()
+        .filter(|message| !message.is_empty())
+        .filter(|_| state.extension_working_visible);
+    if let Some(message) = extension_working {
+        return Some((message.to_owned(), theme.muted, state.is_streaming));
+    }
+    if let Some(wave) = live_wave_activity(state) {
+        return Some((wave, theme.muted, state.is_streaming));
+    }
+    if let Some(subagent) = running_subagent_activity(state) {
+        return Some((subagent, theme.muted, state.is_streaming));
+    }
+    if let Some(tool) = running_tool_activity(state) {
+        return Some((tool, theme.muted, true));
+    }
     if state.is_compacting {
-        return Some((
-            format!(
-                "compacting {} ▶──",
-                ACTIVE_ANIMATION_FRAMES[state.animation_frame % ACTIVE_ANIMATION_FRAMES.len()]
-            ),
-            theme.muted,
-        ));
+        return Some(("Compacting context…".to_owned(), theme.muted, true));
     }
-    if state.is_streaming {
-        return Some((
-            format!(
-                "working {} ▶──",
-                ACTIVE_ANIMATION_FRAMES[state.animation_frame % ACTIVE_ANIMATION_FRAMES.len()]
-            ),
-            theme.muted,
-        ));
-    }
-    if let Some(goal) = goal_status_summary(&state.goal_state) {
-        return Some((format!("{goal} ▶──"), theme.accent));
+    if state.thinking_streaming && state.is_streaming {
+        return Some(("thinking…".to_owned(), theme.muted, true));
     }
     let text = state.status.trim();
-    if text.is_empty()
-        || text == "Ready"
-        || text == "Enter submit · Shift+Enter/Ctrl+J newline · Esc abort · Ctrl+D quit"
-    {
-        None
-    } else {
-        Some((format!("{text} ▶──"), theme.dim))
+    if !text.is_empty() && !is_idle_status_text(text) {
+        return Some((text.to_owned(), theme.dim, state.is_streaming));
     }
+    if state.is_streaming {
+        return Some(("Working…".to_owned(), theme.muted, true));
+    }
+    None
+}
+
+/// Collapse a queued steering message into a single-line preview for the
+/// OMP-style status line: control/escape sequences stripped, whitespace runs
+/// collapsed to a single space, and the text capped at a fixed column budget
+/// so rendering stays cheap even for very long queued prompts. The row's own
+/// width truncation applies afterwards.
+fn steering_preview(text: &str) -> String {
+    let collapsed = clean_terminal_text(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_status_text(&collapsed, 120)
+}
+
+/// Deterministic idle-state suggestion line, rendered dim on the composer
+/// status row when nothing else is active. Derived purely from the current
+/// UI state — no model calls — so it is stable and testable:
+///
+/// - pending follow-up prompts → `/queue` (inspect or cancel them),
+/// - an active session goal → `/goal`,
+/// - live workflows → `/workflow list`.
+///
+/// Returns `None` when nothing applies so the idle row stays blank.
+fn next_suggestion(state: &TuiState) -> Option<String> {
+    let mut parts = Vec::new();
+    if state.queued_follow_up > 0 {
+        parts.push("/queue");
+    }
+    if state
+        .goal_state
+        .current
+        .as_ref()
+        .is_some_and(|goal| goal.lifecycle == GoalLifecycle::Active)
+    {
+        parts.push("/goal");
+    }
+    if state
+        .workflow_snapshots
+        .iter()
+        .any(|workflow| !workflow.status.is_terminal())
+    {
+        parts.push("/workflow list");
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("Next: {}", parts.join(" · ")))
+}
+
+/// Session cost/usage totals plus the live background-task count for the
+/// composer status line, projected from application state — the footer
+/// refresh worker's `session_stats()` result (`session_cost`/`session_tokens`)
+/// and the orchestration job cards (`running_count()`) — never computed in the
+/// render path. Every part renders only while non-zero, so a fresh free
+/// session with no background work yields `None` and the row is unchanged.
+fn composer_metadata(state: &TuiState) -> Option<String> {
+    let mut parts = Vec::with_capacity(2);
+    if let Some(cost) = composer_session_cost(state.session_cost) {
+        parts.push(cost);
+    }
+    let tasks = state.job_cards.running_count();
+    if tasks > 0 {
+        parts.push(format!("⟦{tasks} bg⟧"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Session cost for the composer status line. Zero (no usage yet / free
+/// provider) renders nothing; positive totals use two decimals, with four
+/// decimals for sub-cent amounts so a real but tiny cost never shows as
+/// `$0.00`.
+fn composer_session_cost(cost: f64) -> Option<String> {
+    if cost <= 0.0 {
+        return None;
+    }
+    Some(if cost >= 0.01 {
+        format!("${:.2}", cost)
+    } else {
+        format!("${:.4}", cost)
+    })
+}
+
+/// Compact a session token total into a status-line-friendly width with one
+/// decimal of precision (`12.4k`), dropping the decimal when the thousands are
+/// exact and rounding to integer thousands above 100k so the segment stays
+/// bounded.
+fn composer_token_k(n: i64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let k = n as f64 / 1000.0;
+    if k >= 100.0 {
+        format!("{}k", k.round() as i64)
+    } else {
+        let tenths = (k * 10.0).round() as i64;
+        if tenths % 10 == 0 {
+            format!("{}k", tenths / 10)
+        } else {
+            format!("{}.{}k", tenths / 10, tenths % 10)
+        }
+    }
+}
+
+/// Build the OMP-style transient status line rendered directly above the
+/// composer. A pending interactive `ask` owns the row while the model waits
+/// for the user's answer (`⟦ask⟧ <question> ⟦esc⟧`). Otherwise a queued
+/// steering message takes precedence over every transient activity: while the
+/// steering queue is non-empty it renders
+/// `⟦steering⟧ <preview of the first queued message>` — a static glyph, no
+/// spinner — above the input awaiting processing (OMP's "user message shows
+/// above the input box"), and the ordinary activity/status text returns once
+/// the queue drains. Otherwise the row shows the most specific activity from
+/// [`composer_status_activity`]: `<agent> <what it is doing>` for a live
+/// workflow wave (`GLM tool · bash · cargo test --lib...`) and for delegated
+/// subagent jobs (`kimi read tools.rs · 12s`), `<tool> <argument fragment>`
+/// (`read src/lib.rs`) while a tool call executes, `Compacting context…`,
+/// `thinking…` while the main agent streams thinking, then any concrete
+/// status text (workflow/loop/goal), and finally the generic `Working…`
+/// fallback while a turn streams — so specific activity never degrades to a
+/// generic "working" label. Active work
+/// shows a spinner glyph (rotating while busy, static otherwise — Phase 1),
+/// the activity text truncated to the row width, and a `⟦esc⟧` hint when the
+/// activity can be aborted with Esc. Idle renders a subtle deterministic
+/// `Next:` suggestion ([`next_suggestion`] — dim, one line, no spinner,
+/// derived from state: pending follow-ups, an active goal, or live
+/// workflows) when one applies, otherwise an empty line: the row is always
+/// always reserved by the layout so the input box never sits flush against content
+/// above it. Visible status text reserves a second row beneath it so the text
+/// never sits flush against the composer border either. Projected session
+/// cost/usage totals (`$0.12 · 12.4k tok`) and the live background-task count
+/// (`⟦2 bg⟧`) append to whatever the row carries, each part only while
+/// non-zero, so a free idle session with no background work leaves the row
+/// exactly as before.
+fn composer_status_line(state: &TuiState, width: u16, theme: Theme) -> Line<'static> {
+    let metadata = composer_metadata(state);
+    // `/live` hold-to-talk mode marker. Renders on the left edge of every
+    // row (steering, activity, idle) so the armed state is always visible.
+    let live_indicator = if state.live.mode == LiveMode::On {
+        "⟦live⟧ "
+    } else {
+        ""
+    };
+    // A pending interactive `ask` outranks everything: the user must answer
+    // before the turn can continue, so the question owns the row (with an
+    // `⟦esc⟧` hint because Esc cancels the question).
+    if let Some(ask) = &state.pending_ask {
+        let mut raw = format!("⟦ask⟧ {}", steering_preview(&ask.prompt));
+        if let Some(meta) = &metadata {
+            raw.push_str(" · ");
+            raw.push_str(meta);
+        }
+        raw.push_str(" ⟦esc⟧");
+        let text = truncate_status_text(&raw, usize::from(width));
+        return Line::from(Span::styled(text, composer_style(theme, theme.accent)));
+    }
+    if let Some(steering) = state.queued_steering.first() {
+        let mut raw = format!("{live_indicator}⟦steering⟧ {}", steering_preview(steering));
+        if let Some(meta) = &metadata {
+            raw.push_str(" · ");
+            raw.push_str(meta);
+        }
+        let text = truncate_status_text(&raw, usize::from(width));
+        return Line::from(Span::styled(text, composer_style(theme, theme.warning)));
+    }
+    // An in-flight live delegation owns the row: `⟦live⟧ ⟦delegating⟧
+    // <elapsed>` until the delegated agent turn settles. rpi's settle is the
+    // ordinary `AgentSettled`/`RunFailed` — Hyper's exactly-once
+    // CompleteDelegation terminal has no separate shape here, because the
+    // delegation runs as a normal agent turn.
+    if state.live.delegating {
+        let elapsed = state
+            .live
+            .delegation_started
+            .map(|started| started.elapsed())
+            .map(live_elapsed_label)
+            .unwrap_or_default();
+        let mut raw = format!("{live_indicator}⟦delegating⟧ {elapsed}");
+        if let Some(meta) = &metadata {
+            raw.push_str(" · ");
+            raw.push_str(meta);
+        }
+        let text = truncate_status_text(&raw, usize::from(width));
+        return Line::from(Span::styled(text, composer_style(theme, theme.accent)));
+    }
+    let Some((text, color, esc_hint)) = composer_status_activity(state, theme) else {
+        // Idle: a subtle, deterministic "Next:" suggestion keeps the reserved
+        // row informative (dim, one line, no spinner); projected session
+        // cost/usage and background-task totals append when present. Nothing
+        // applies → blank.
+        let mut raw = String::new();
+        // While live is armed and the draft reads like a coding task, the
+        // row offers the delegation affordance: Enter submits the text
+        // through the standard prompt path as a tracked delegation
+        // (`⟦delegating⟧ <elapsed>` while the turn runs). This concerns the
+        // live draft, so it outranks the generic Next: suggestion.
+        if state.live.mode == LiveMode::On
+            && !state.live.delegating
+            && is_delegation_candidate(&state.editor.text())
+        {
+            raw = "⟦delegate⟧ Enter submits as a tracked delegation".to_owned();
+        } else if let Some(suggestion) = next_suggestion(state) {
+            raw = suggestion;
+        }
+        if let Some(meta) = &metadata {
+            if raw.is_empty() {
+                raw = meta.clone();
+            } else {
+                raw.push_str(" · ");
+                raw.push_str(meta);
+            }
+        }
+        if raw.is_empty() {
+            if live_indicator.is_empty() {
+                return Line::default();
+            }
+            raw = live_indicator.trim_end().to_owned();
+        } else {
+            raw.insert_str(0, live_indicator);
+        }
+        let text = truncate_status_text(&raw, usize::from(width));
+        return Line::from(Span::styled(text, composer_style(theme, theme.dim)));
+    };
+    let spinner = if state.has_active_animation() {
+        ACTIVE_ANIMATION_FRAMES[state.animation_frame % ACTIVE_ANIMATION_FRAMES.len()]
+    } else {
+        "⟲"
+    };
+    let hint = if esc_hint { " ⟦esc⟧" } else { "" };
+    let mut raw = format!("{live_indicator}{spinner} {text}");
+    if let Some(meta) = &metadata {
+        raw.push_str(" · ");
+        raw.push_str(meta);
+    }
+    raw.push_str(hint);
+    let text = truncate_status_text(&raw, usize::from(width));
+    Line::from(Span::styled(text, composer_style(theme, color)))
+}
+
+/// Compact elapsed label for the `⟦delegating⟧` status: whole seconds, the
+/// same unit the job-card and workflow elapsed renderers use.
+fn live_elapsed_label(elapsed: std::time::Duration) -> String {
+    format!("{}s", elapsed.as_secs())
 }
 
 fn truncate_status_text(text: &str, max_cols: usize) -> String {
@@ -8210,8 +11100,21 @@ fn strip_notice_prefix<'a>(text: &'a str, prefix: &str) -> &'a str {
 
 const MAX_COMPOSER_ERROR_HEIGHT: usize = 2;
 
+/// The bounded composer-notice source: the parked error/warning text first,
+/// then the workflow status line deferred while a page overlay owns the page.
+/// The deferred workflow line renders as a bounded toast while the overlay is
+/// open (the workflow panel still shows live status movement) and is
+/// discarded on close — it must never surface as an "Error: Workflow …"
+/// toast afterwards.
+fn composer_error_toast_source(state: &TuiState) -> Option<&str> {
+    state
+        .composer_error
+        .as_deref()
+        .or(state.deferred_workflow_status.as_deref())
+}
+
 fn composer_error_toast_height(state: &TuiState, width: u16) -> u16 {
-    let Some(error) = state.composer_error.as_deref() else {
+    let Some(error) = composer_error_toast_source(state) else {
         return 0;
     };
     if width == 0 {
@@ -8220,7 +11123,11 @@ fn composer_error_toast_height(state: &TuiState, width: u16) -> u16 {
     if width < 5 {
         return 1;
     }
-    let label = if state.composer_error_is_warning { "Warning: " } else { "Error: " };
+    let label = if state.composer_error.is_some() && state.composer_error_is_warning {
+        "Warning: "
+    } else {
+        "Error: "
+    };
     let message = clean_terminal_text(error).lines().collect::<Vec<_>>().join(" ");
     let clean = format!("{label}{message}");
     u16::try_from(wrapped_row_count(&clean, usize::from(width)).clamp(1, 2))
@@ -8234,15 +11141,15 @@ fn composer_error_toast_lines(
     width: u16,
     theme: Theme,
 ) -> Vec<Line<'static>> {
-    let Some(error) = state.composer_error.as_deref() else {
+    let Some(error) = composer_error_toast_source(state) else {
         return Vec::new();
     };
-    let notice_color = if state.composer_error_is_warning {
+    let notice_color = if state.composer_error.is_some() && state.composer_error_is_warning {
         theme.warning
     } else {
         theme.error
     };
-    let notice_background = if state.composer_error_is_warning {
+    let notice_background = if state.composer_error.is_some() && state.composer_error_is_warning {
         theme.custom_message_bg
     } else {
         theme.tool_error_bg
@@ -8252,7 +11159,11 @@ fn composer_error_toast_lines(
     if width == 0 {
         return Vec::new();
     }
-    let label = if state.composer_error_is_warning { "Warning: " } else { "Error: " };
+    let label = if state.composer_error.is_some() && state.composer_error_is_warning {
+        "Warning: "
+    } else {
+        "Error: "
+    };
     let message = clean_terminal_text(error).lines().collect::<Vec<_>>().join(" ");
     let clean = format!("{label}{message}");
     let max_rows = usize::from(composer_error_toast_height(state, width as u16));
@@ -8345,30 +11256,191 @@ fn composer_border_lines_with_editor(
     lines
 }
 
-fn render_welcome_lines(state: &TuiState, theme: Theme) -> Vec<Line<'static>> {
+/// Width (columns) below which the bordered welcome panel degrades to the
+/// compact text welcome, so narrow terminals never see clipped columns.
+const WELCOME_PANEL_MIN_WIDTH: u16 = 72;
+/// Fixed rows of the bordered welcome panel (borders, logo block, model
+/// block, hint line) before recent-session rows are added. The panel only
+/// renders when the transcript area can hold the whole panel, so short
+/// terminals never show a clipped box.
+const WELCOME_PANEL_BASE_ROWS: usize = 14;
+/// Cap on recent-session rows rendered inside the welcome panel; the resume
+/// selector remains the home for the full list.
+const WELCOME_MAX_RECENT_SESSIONS: usize = 2;
+
+/// ASCII-art "rpi" wordmark rendered as the welcome logo, one row per element.
+const WELCOME_LOGO: [&str; 5] = [
+    " _ __   _ __   _ ",
+    "| '__| | '_ \\ (_)",
+    "| |    | |_) | | |",
+    "|_|    | .__/  |_|",
+    "       |_|        ",
+];
+
+/// One-line feature tips for the welcome panel's Tips column, adapted to
+/// rpi's real surface: slash commands, file attachment, image paste, and the
+/// workflow/goal planning commands.
+const WELCOME_TIPS: [&str; 4] = [
+    "/help       List slash commands",
+    "@file       Attach context files",
+    "Alt+V       Paste image",
+    "/workflow   Plan work with todos",
+];
+
+/// Rotating tip line under the welcome panel, cycled on a fixed cadence so it
+/// varies across time without any TUI state. Tests assert membership rather
+/// than a specific pick, keeping them deterministic.
+const WELCOME_HINTS: [&str; 4] = [
+    "Tip: /help lists every slash command · @file attaches context",
+    "Tip: Alt+V pastes a clipboard image into the composer",
+    "Tip: /goal sets the working goal · /workflow plans work",
+    "Tip: Shift+Enter submits · Esc aborts a running turn",
+];
+
+fn rotating_welcome_hint() -> &'static str {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    WELCOME_HINTS[(seconds / 60) as usize % WELCOME_HINTS.len()]
+}
+
+/// OMP-style bordered welcome: ASCII "rpi" logo + version, a model/thinking
+/// block, a Tips column, recent sessions, and a rotating hint line. Every row
+/// is truncated/padded to exactly `width` columns, and terminals too narrow
+/// or too short for the panel degrade to the compact text welcome.
+fn render_welcome_lines(state: &TuiState, theme: Theme, width: u16, height: u16) -> Vec<Line<'static>> {
     if !state.transcript.is_empty() || !state.streaming_text.is_empty() || !state.streaming_thinking.is_empty() { return Vec::new(); }
+    let sessions = state.recent_sessions.len().min(WELCOME_MAX_RECENT_SESSIONS);
+    let panel_rows = WELCOME_PANEL_BASE_ROWS
+        + usize::from(!state.recent_sessions.is_empty()) * (sessions + 2);
+    if width < WELCOME_PANEL_MIN_WIDTH || usize::from(height) < panel_rows {
+        return render_compact_welcome_lines(state, theme, width);
+    }
+    let inner = usize::from(width.saturating_sub(2));
+    let budget = inner.saturating_sub(1);
+    let border_style = Style::default().fg(theme.border);
+    let accent_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let muted_style = Style::default().fg(theme.muted);
+    let muted_bold = muted_style.add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(theme.text);
+    let dim_style = Style::default().fg(theme.dim);
+    let row = |content: String, style: Style| -> Line<'static> {
+        let content = truncate_status_text(&content, budget);
+        let fill = budget.saturating_sub(usize::from(display_width(&content)));
+        Line::from(vec![
+            Span::styled("│ ", border_style),
+            Span::styled(content, style),
+            Span::styled(" ".repeat(fill), style),
+            Span::styled("│", border_style),
+        ])
+    };
+    let mut lines = Vec::new();
+    let version = env!("CARGO_PKG_VERSION");
+    let title = format!(" rpi v{version} ");
+    let title_width = usize::from(display_width(&title));
+    let top = format!(
+        "╭─{title}{}╮",
+        "─".repeat(inner.saturating_sub(title_width.saturating_add(1)))
+    );
+    lines.push(Line::from(Span::styled(top, border_style)));
+    // The logo column (left) shares its rows with the Tips column (right) so
+    // the panel stays compact; both sides truncate independently to the width.
+    let left_total = 22;
+    let right_budget = budget.saturating_sub(left_total);
+    for (index, logo_row) in WELCOME_LOGO.iter().enumerate() {
+        let left = format!("  {logo_row:<18}");
+        let right = if index == 0 {
+            "Tips".to_owned()
+        } else {
+            WELCOME_TIPS[index - 1].to_owned()
+        };
+        let right = truncate_status_text(&format!("  {right}"), right_budget);
+        let content = format!("{left}{right}");
+        let fill = budget.saturating_sub(usize::from(display_width(&content)));
+        let right_style = if index == 0 { muted_bold } else { muted_style };
+        lines.push(Line::from(vec![
+            Span::styled("│ ", border_style),
+            Span::styled(left, accent_style),
+            Span::styled(right, right_style),
+            Span::styled(" ".repeat(fill), text_style),
+            Span::styled("│", border_style),
+        ]));
+    }
+    lines.push(row(String::new(), text_style));
+    lines.push(row("  Welcome back!".to_owned(), accent_style));
+    let model = clean_terminal_text(&state.model).replace('\n', " ");
+    let label_row = |label: &str, value: String| -> Line<'static> {
+        let prefix = format!("  {label:<9}");
+        let value =
+            truncate_status_text(&value, budget.saturating_sub(usize::from(display_width(&prefix))));
+        let content = format!("{prefix}{value}");
+        let fill = budget.saturating_sub(usize::from(display_width(&content)));
+        Line::from(vec![
+            Span::styled("│ ", border_style),
+            Span::styled(prefix, muted_style),
+            Span::styled(value, text_style),
+            Span::styled(" ".repeat(fill), text_style),
+            Span::styled("│", border_style),
+        ])
+    };
+    lines.push(label_row("Model", model));
+    lines.push(label_row("Thinking", composer_thinking_label(state)));
+    if !state.recent_sessions.is_empty() {
+        lines.push(row(String::new(), text_style));
+        lines.push(row("  Recent sessions".to_owned(), muted_bold));
+        for session in state.recent_sessions.iter().take(WELCOME_MAX_RECENT_SESSIONS) {
+            let badge = clean_terminal_text(session.source_badge).replace('\n', " ");
+            let label = clean_terminal_text(session_display_name(session)).replace('\n', " ");
+            let imported = matches!(
+                &session.status,
+                pi_coding::CatalogRowStatus::AlreadyImported { .. }
+            )
+            .then_some(" · imported")
+            .unwrap_or_default();
+            lines.push(row(format!("    • [{badge}] {label}{imported}"), text_style));
+        }
+    }
+    lines.push(row(String::new(), text_style));
+    lines.push(row(rotating_welcome_hint().to_owned(), dim_style));
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner)),
+        border_style,
+    )));
+    lines
+}
+
+/// Compact text welcome for terminals too narrow or too short for the
+/// bordered panel. Mirrors the pre-panel welcome: concise branding, the
+/// current model, one hint line, and recent sessions, all width-truncated.
+fn render_compact_welcome_lines(state: &TuiState, theme: Theme, width: u16) -> Vec<Line<'static>> {
+    let limit = usize::from(width);
     let mut lines = vec![
         Line::default(),
         Line::from(Span::styled(
-            "rpi",
+            truncate_status_text("rpi", limit),
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            clean_terminal_text(&state.model),
+            truncate_status_text(&clean_terminal_text(&state.model), limit),
             Style::default().fg(theme.muted),
         )),
         Line::default(),
         Line::from(Span::styled(
-            "Start typing · Alt+V paste image · /help · @file to attach context",
+            truncate_status_text(
+                "Start typing · Alt+V paste image · /help · @file to attach context",
+                limit,
+            ),
             Style::default().fg(theme.text),
         )),
     ];
     if !state.recent_sessions.is_empty() {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            "Recent sessions",
+            truncate_status_text("Recent sessions", limit),
             Style::default()
                 .fg(theme.muted)
                 .add_modifier(Modifier::BOLD),
@@ -8383,7 +11455,7 @@ fn render_welcome_lines(state: &TuiState, theme: Theme) -> Vec<Line<'static>> {
             .then_some(" · imported")
             .unwrap_or_default();
             lines.push(Line::from(Span::styled(
-                format!("• [{badge}] {label}{imported}"),
+                truncate_status_text(&format!("• [{badge}] {label}{imported}"), limit),
                 Style::default().fg(theme.text),
             )));
         }
@@ -8419,21 +11491,13 @@ fn render(
     let completion_height = u16::try_from(state.completions.items.len())
         .unwrap_or(u16::MAX)
         .min(u16::try_from(MAX_COMPLETIONS).unwrap_or(u16::MAX));
-    let mut todo_lines = if state.workflow_snapshots.is_empty() {
-        render_todo_panel_lines(
-            &state.todo_phases,
-            &state.job_cards.cards_in_source_order(),
-            theme,
-            content_area.width.max(1),
-        )
-    } else {
-        vec![Line::from(Span::styled(
-            compact_workflow_status(&state.workflow_snapshots),
-            Style::default()
-                .fg(theme.muted)
-                .add_modifier(Modifier::BOLD),
-        ))]
-    };
+    let mut todo_lines = render_todo_panel_lines(
+        &state.todo_phases,
+        &state.job_cards.cards_in_source_order(),
+        &state.workflow_snapshots,
+        theme,
+        content_area.width.max(1),
+    );
     let layout = tui_layout_heights(
         state,
         content_area.width,
@@ -8460,6 +11524,7 @@ fn render(
             Constraint::Length(layout.todo),
             Constraint::Length(layout.above),
             Constraint::Length(layout.error),
+            Constraint::Length(layout.status),
             Constraint::Length(layout.composer),
             Constraint::Length(layout.completions),
             Constraint::Length(layout.below),
@@ -8469,12 +11534,16 @@ fn render(
     let cell_size = window_size()
         .ok()
         .and_then(|size| {
-            (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0).then_some(
+            // `then(|| …)` (NOT `then_some(…)`): the closure form evaluates
+            // the division lazily, only when the guard passes. `then_some`
+            // evaluates its argument eagerly, so a zero-column pty (no
+            // winsize) divided by zero and panicked on the first draw.
+            (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0).then(|| {
                 TerminalCellSize {
                     width_pixels: size.width / size.columns,
                     height_pixels: size.height / size.rows,
-                },
-            )
+                }
+            })
         })
         .unwrap_or_default();
     let mut image_candidates = Vec::new();
@@ -8489,7 +11558,7 @@ fn render(
         viewport_rows: sections[0].height,
         cell_size,
     };
-    let mut transcript =
+    let (mut transcript, mut entry_row_starts) =
         render_transcript_lines(state, theme, sections[0].width.max(1), &mut image_context);
     if !state.streaming_thinking.is_empty() || !state.streaming_text.is_empty() {
         let mut content = Vec::new();
@@ -8518,21 +11587,35 @@ fn render(
             None,
         );
     }
-    if transcript.is_empty() {
-        transcript = render_welcome_lines(state, theme);
+    if transcript.is_empty() && !page_overlay_open(state) {
+        // The welcome panel is a transient startup screen: when a page overlay
+        // (e.g. settings) is open it must not peek around the modal (D4).
+        transcript = render_welcome_lines(state, theme, sections[0].width.max(1), sections[0].height.max(1));
+        entry_row_starts = vec![0usize; entry_row_starts.len()];
     }
     let transcript_height = usize::from(sections[0].height);
     state.transcript_page_rows.set(transcript_height.max(1));
     let transcript_width = sections[0].width.max(1);
     let total_rows = wrapped_line_count(&transcript, transcript_width);
-    let bottom = total_rows.saturating_sub(transcript_height);
-    let scroll = bottom.saturating_sub(state.transcript_scroll.min(bottom));
+    let scroll = transcript_scroll_offset(
+        state,
+        &entry_row_starts,
+        total_rows,
+        transcript_height,
+    );
+    // The transcript is pre-wrapped to exactly `transcript_width` columns by
+    // the renderers above (markdown, user cards, tool/job cards), so the
+    // Paragraph must NOT re-wrap: ratatui's WordWrapper splits whitespace-only
+    // lines — the user card's blank padding rows — into an extra empty row
+    // each, doubling the blank rows around user messages ("extra line before
+    // thinking"). Without wrap every Line renders exactly as built, one row
+    // per Line, and any over-wide line (which the renderers never emit)
+    // truncates instead of being re-flowed.
     let paragraph = Paragraph::new(Text::from(transcript.clone()))
-        .style(Style::default().fg(theme.text))
-        .wrap(Wrap { trim: false });
+        .style(Style::default().fg(theme.text));
     let mut message_hasher = DefaultHasher::new();
     transcript.hash(&mut message_hasher);
-    state.transcript_scroll.hash(&mut message_hasher);
+    state.transcript_top_row.get().hash(&mut message_hasher);
     let message_hash = message_hasher.finish();
     let mut theme_hasher = DefaultHasher::new();
     state.themes.active_name().hash(&mut theme_hasher);
@@ -8581,13 +11664,25 @@ fn render(
         error_lines.truncate(usize::from(layout.error));
         frame.render_widget(Paragraph::new(error_lines), sections[3]);
     }
+    if layout.status > 0 {
+        let status_line = composer_status_line(state, sections[4].width, theme);
+        let status_rows: Vec<Line> = if status_line.spans.is_empty() {
+            // Idle: the single reserved row stays blank.
+            vec![Line::default()]
+        } else {
+            // Active: blank gap row above the text and one below it, matching
+            // OMP's working-row spacing (gap · text · gap).
+            vec![Line::default(), status_line, Line::default()]
+        };
+        frame.render_widget(Paragraph::new(status_rows), sections[4]);
+    }
     let composer_lines = composer_border_lines_bounded(
         state,
-        sections[4].width,
+        sections[5].width,
         theme,
-        usize::from(sections[4].height),
+        usize::from(sections[5].height),
     );
-    frame.render_widget(Paragraph::new(composer_lines), sections[4]);
+    frame.render_widget(Paragraph::new(composer_lines), sections[5]);
     if !state.completions.items.is_empty() {
         let (window_start, visible) = state.completions.visible_window(MAX_COMPLETIONS);
         let lines = visible
@@ -8617,15 +11712,15 @@ fn render(
                     ),
                 ])
             }).collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(lines), sections[5]);
+        frame.render_widget(Paragraph::new(lines), sections[6]);
     }
-    let editor_width = usize::from(sections[4].width.saturating_sub(5));
+    let editor_width = usize::from(sections[5].width.saturating_sub(5));
     let (_, cursor_column) = editor_wrapped_position(state, editor_width);
     let (_, visible_cursor_row) = visible_editor_lines(
         state,
-        editor_width, usize::from(sections[4].height.saturating_sub(2)).max(1),
+        editor_width, usize::from(sections[5].height.saturating_sub(2)).max(1),
     );
-    let cursor_x = sections[4]
+    let cursor_x = sections[5]
         .x
         .saturating_add(
             if state.completions.items.is_empty() && state.editor.lines.len() <= 1 {
@@ -8635,10 +11730,11 @@ fn render(
             },
         )
         .saturating_add(cursor_column);
-    let cursor_y = sections[4].y
+    let cursor_y = sections[5].y
         .saturating_add(1)
         .saturating_add(u16::try_from(visible_cursor_row).unwrap_or(u16::MAX));
     if state.extension_dialog.is_none()
+        && state.extension_overlay.is_none()
         && state.process_panel.is_none()
         && state.settings_panel.is_none()
         && state.pty_attachment.is_none()
@@ -8647,15 +11743,15 @@ fn render(
         && state.code_review_panel.is_none()
         && !state.side_chat_open
         && state.agents_panel.is_none()
-        && cursor_x < sections[4].right().saturating_sub(1)
-        && cursor_y < sections[4].bottom()
+        && cursor_x < sections[5].right().saturating_sub(1)
+        && cursor_y < sections[5].bottom()
     {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
     if layout.below > 0 {
-        frame.render_widget(Paragraph::new(below), sections[6]);
+        frame.render_widget(Paragraph::new(below), sections[7]);
     }
-    if let Some(panel) = &state.settings_panel { render_settings_panel(frame, panel, state.settings_value_input.as_ref(), theme); }
+    if let Some(panel) = &state.settings_panel { render_settings_panel(frame, panel, state.settings_value_input.as_ref(), state.settings_enum_picker.as_ref(), state.settings_boolean_picker.as_ref(), state.settings_section.as_deref(), state.settings_leaf_cursor, theme); }
     if let Some(panel) = &state.panel { render_selector_panel(frame, panel, theme); }
     if let Some(panel) = &state.tree_panel { render_tree_panel(frame, panel, theme); }
     if let Some(panel) = &state.process_panel { render_process_panel(frame, panel, theme); }
@@ -8675,6 +11771,9 @@ fn render(
     if let Some(selector) = &state.session_selector { render_saved_session_selector(frame, selector, theme); }
     if let Some(selector) = &state.scoped_model_selector { render_scoped_model_selector(frame, selector, theme); }
     if let Some(dialog) = &state.extension_dialog { render_extension_dialog(frame, dialog, theme);
+    }
+    if let Some(overlay) = &state.extension_overlay {
+        render_extension_overlay(frame, overlay, theme);
     }
     if let Some(attachment) = &state.pty_attachment {
         render_pty_attachment(frame, attachment, theme); }
@@ -8704,7 +11803,7 @@ fn render_pty_attachment(frame: &mut ratatui::Frame<'_>, attachment: &PtyAttachm
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
     let bytes = attachment.output.iter().copied().collect::<Vec<_>>();
-    let text = clean_terminal_text(&String::from_utf8_lossy(&bytes));
+    let text = clean_terminal_text(&redact_secrets(&String::from_utf8_lossy(&bytes)));
     let width = usize::from(sections[0].width).max(1);
     let viewport = usize::from(sections[0].height).max(1);
     let rows = text
@@ -8729,61 +11828,338 @@ fn render_pty_attachment(frame: &mut ratatui::Frame<'_>, attachment: &PtyAttachm
     );
 }
 
+/// Below this inner width the settings body degrades to a single pane: the
+/// sub-category column is dropped and the value list takes the full width.
+const TWO_PANE_SETTINGS_MIN_WIDTH: u16 = 72;
+
+fn settings_category_label(category: pi_coding::SettingCategory) -> &'static str {
+    match category {
+        pi_coding::SettingCategory::Models => "Models",
+        pi_coding::SettingCategory::Session => "Session",
+        pi_coding::SettingCategory::Compaction => "Compaction",
+        pi_coding::SettingCategory::RetryTransport => "Retry",
+        pi_coding::SettingCategory::TerminalUi => "Terminal",
+        pi_coding::SettingCategory::Orchestration => "Orchestration",
+        pi_coding::SettingCategory::Resources => "Resources",
+        pi_coding::SettingCategory::TrustSecurity => "Trust",
+        pi_coding::SettingCategory::Live => "Live",
+    }
+}
+
+fn settings_tab_span(label: &'static str, selected: bool, theme: Theme) -> Span<'static> {
+    let style = if selected {
+        Style::default()
+            .fg(theme.text)
+            .bg(theme.selected_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    Span::styled(format!(" {label} "), style)
+}
+
+fn render_settings_picker_overlay(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: String,
+    options: &[String],
+    selected: usize,
+    theme: Theme,
+) {
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent));
+    let picker_inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = Vec::with_capacity(options.len());
+    for (index, option) in options.iter().enumerate() {
+        let is_selected = index == selected;
+        let style = if is_selected {
+            Style::default().fg(theme.text).bg(theme.selected_bg)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(theme.accent),
+            ),
+            Span::styled(clean_terminal_text(option), style),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), picker_inner);
+}
+
+/// Ordered, deduplicated subsections for the visible rows. This is the
+/// grouping rule of the two-level hierarchy: rows are section-sorted (by the
+/// key-prefix-derived [`SettingsPanelRow::section`]), so equal sections form
+/// contiguous runs and the first of each run is the subsection label.
+fn settings_subsections(rows: &[SettingsPanelRow]) -> Vec<String> {
+    let mut sections = Vec::<String>::new();
+    for row in rows {
+        let section = row.section();
+        if sections.last().is_none_or(|last| last != &section) {
+            sections.push(section);
+        }
+    }
+    sections
+}
+
+/// Rows belonging to one subsection (a contiguous run of the section-sorted
+/// list), shared by leaf navigation and leaf rendering.
+fn settings_section_rows<'a>(rows: &'a [SettingsPanelRow], section: &str) -> Vec<&'a SettingsPanelRow> {
+    rows.iter().filter(|row| row.section() == section).collect()
+}
+
+fn settings_row_line(row: &SettingsPanelRow, selected: bool, theme: Theme) -> Line<'static> {
+    // Complex rows show a compact shape hint instead of a JSON blob in the
+    // list (S8); the full value is visible in the editor.
+    let value = if row.redacted {
+        "[redacted]".to_owned()
+    } else {
+        match &row.control {
+            SettingsControl::List { value } => format!("array ({} entries)", value.len()),
+            SettingsControl::Object { value } => format!("object ({} entries)", value.len()),
+            _ => row.effective_value.to_string(),
+        }
+    };
+    // One compact provenance chip (D3): source as a short lowercase tag,
+    // behavior only when it is not the Live norm, and "inherited" only when a
+    // project row inherits its effective value from the global layer.
+    let source = match row.source {
+        SettingSource::Default => "default",
+        SettingSource::Global => "global",
+        SettingSource::Project => "project",
+        SettingSource::SessionOverride => "session",
+        SettingSource::Runtime => "runtime",
+    };
+    let behavior = match row.behavior {
+        SettingApplyBehavior::Live => "",
+        SettingApplyBehavior::Reload => " · reload",
+        SettingApplyBehavior::Restart => " · restart",
+    };
+    let inherited = if row.scope == SettingsScope::Project && row.source == SettingSource::Global {
+        " · inherited"
+    } else {
+        ""
+    };
+    let metadata = format!("[{source}{behavior}{inherited}]");
+    let blocked = row.blocked_reason.as_deref().map_or(String::new(), |reason| format!(" · {reason}"));
+    // OMP's getSettingsListTheme highlights the hovered row with `selectedBg`;
+    // the selected settings row carries that background across every segment
+    // (marker, key, value) instead of a flat accent-only row.
+    let row_style = if selected {
+        Style::default().bg(theme.selected_bg)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(
+            if selected { "›  " } else { "   " },
+            Style::default().fg(theme.accent).patch(row_style),
+        ),
+        Span::styled(
+            clean_terminal_text(row.display_key()),
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() })
+                .patch(row_style),
+        ),
+        Span::styled(
+            format!(" = {value}  {metadata}{blocked}"),
+            Style::default()
+                .fg(if row.blocked_reason.is_some() { theme.warning } else { theme.muted })
+                .patch(row_style),
+        ),
+    ])
+}
+
 fn render_settings_panel(
     frame: &mut ratatui::Frame<'_>,
-    panel: &SettingsPanel, input: Option<&SettingsValueInput>, theme: Theme,
+    panel: &SettingsPanel,
+    input: Option<&SettingsValueInput>,
+    enum_picker: Option<&SettingsEnumPicker>,
+    boolean_picker: Option<&SettingsBooleanPicker>,
+    section: Option<&str>,
+    leaf_cursor: usize,
+    theme: Theme,
 ) {
     let Ok(snapshot) = panel.snapshot() else { return; };
     let area = centered_rect(frame.area().width.saturating_sub(4).min(140).max(40), frame.area().height.saturating_sub(4).max(12), frame.area(),
     );
     frame.render_widget(Clear, area);
-    let block = Block::default().title(format!(" Settings · {:?} scope{} ", snapshot.scope, if snapshot.dirty { " · modified" } else { "" })).borders(Borders::ALL).border_style(Style::default().fg(theme.border_accent));
+    let mut title = format!(
+        " Settings · {:?} scope{} ",
+        snapshot.scope,
+        if snapshot.dirty { " · modified" } else { "" }
+    );
+    if let Some(section) = section {
+        title = format!("{title}· {section} ");
+    }
+    let block = Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(theme.border_accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let enum_picker_height = enum_picker.map_or(0, |picker| {
+        u16::try_from(picker.options.len().saturating_add(2))
+            .unwrap_or(u16::MAX)
+            .clamp(4, 10)
+    });
+    let boolean_picker_height = u16::from(boolean_picker.is_some()) * 4;
+    let picker_height = enum_picker_height.max(boolean_picker_height);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(if input.is_some() { 4 } else { 0 }),
-            Constraint::Length(1),
+            Constraint::Length(1),  // category tabs
+            Constraint::Length(1),  // panel metadata (scope + trust)
+            Constraint::Min(1),     // body
+            Constraint::Length(1),  // selected-row description / search echo
+            Constraint::Length(if input.is_some() { 4 } else { picker_height }),
+            Constraint::Length(1),  // keybind footer
         ])
         .split(inner);
-    let category = snapshot.category.map_or_else(|| "All".to_owned(), |value| format!("{value:?}"));
-    frame.render_widget(Paragraph::new(vec![Line::from(vec![Span::styled("Category ", Style::default().fg(theme.dim)), Span::styled(category, Style::default().fg(theme.accent)), Span::styled("  ←/→ · Scope Ctrl-G/Ctrl-P · ", Style::default().fg(theme.dim),
-            ), Span::styled(if snapshot.project_trusted { "trusted" } else { "untrusted" }, Style::default().fg(if snapshot.project_trusted { theme.success } else { theme.warning }),
-            ),
-        ]), Line::from(vec![Span::styled("Search ", Style::default().fg(theme.dim)), Span::styled(if snapshot.search.is_empty() { "type to filter" } else { &snapshot.search }, Style::default().fg(theme.text),
-            ),
-        ])]), sections[0]);
+
+    // omp-style category tabs across the top; the active tab is highlighted.
+    // Tabs that do not fit the bar are dropped and replaced by an ellipsis.
+    let mut tab_candidates: Vec<(&'static str, bool)> =
+        Vec::with_capacity(SettingsPanel::categories().len() + 1);
+    tab_candidates.push(("All", snapshot.category.is_none()));
+    for category in SettingsPanel::categories() {
+        tab_candidates.push((
+            settings_category_label(*category),
+            snapshot.category == Some(*category),
+        ));
+    }
+    let mut tab_spans = Vec::with_capacity(tab_candidates.len());
+    let mut tab_width_used: u16 = 0;
+    let mut tab_width_full: u16 = 0;
+    for (label, selected) in tab_candidates {
+        let span = settings_tab_span(label, selected, theme);
+        let width = u16::try_from(display_width(span.content.as_ref())).unwrap_or(u16::MAX);
+        tab_width_full = tab_width_full.saturating_add(width);
+        if !tab_spans.is_empty() && tab_width_used.saturating_add(width) > inner.width {
+            continue;
+        }
+        tab_width_used = tab_width_used.saturating_add(width);
+        tab_spans.push(span);
+    }
+    if tab_width_full > inner.width {
+        tab_spans.push(Span::styled("…", Style::default().fg(theme.dim)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(tab_spans)), sections[0]);
+
+    // Active section (leaf view), else search, plus scope, trust state, and
+    // the selected setting's description.
+    let selected_row = match section {
+        Some(section) => {
+            let leaf_rows = settings_section_rows(&snapshot.rows, section);
+            leaf_rows
+                .get(leaf_cursor.min(leaf_rows.len().saturating_sub(1)))
+                .copied()
+        }
+        None => snapshot.rows.get(snapshot.cursor),
+    };
+    // Status line carries panel-level metadata only (scope + trust, D2); the
+    // active section is already shown as the bold body banner / left column
+    // and the search query is echoed on the description line below.
+    let mut status_spans = Vec::with_capacity(3);
+    status_spans.push(Span::styled(
+        format!("Scope {:?}", snapshot.scope),
+        Style::default().fg(theme.dim),
+    ));
+    status_spans.push(Span::styled("  ·  ", Style::default().fg(theme.dim)));
+    status_spans.push(Span::styled(
+        if snapshot.project_trusted { "trusted" } else { "untrusted" },
+        Style::default().fg(if snapshot.project_trusted { theme.success } else { theme.warning }),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(status_spans)), sections[1]);
+
+    // Dedicated line for the selected row's description (D2) — or the live
+    // search echo while filtering, since the status line is metadata only.
+    let context = if snapshot.search.is_empty() {
+        selected_row.map_or_else(String::new, |row| row.description.clone())
+    } else if let Some(row) = selected_row {
+        format!("search “{}” · {}", snapshot.search, row.description)
+    } else {
+        format!("search “{}” · no matching settings", snapshot.search)
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            clean_terminal_text(&context),
+            Style::default().fg(theme.muted),
+        )),
+        sections[3],
+    );
+
+    // Body: left sub-category column + right value list. Narrow terminals
+    // degrade to a single full-width value list; an entered subsection
+    // renders as a single leaf pane (the left column would be redundant).
+    let (left_area, right_area) = if section.is_some() {
+        (None, sections[2])
+    } else if inner.width >= TWO_PANE_SETTINGS_MIN_WIDTH {
+        let left_width = (inner.width / 5).clamp(16, 28);
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(left_width), Constraint::Min(1)])
+            .split(sections[2]);
+        (Some(body[0]), body[1])
+    } else {
+        (None, sections[2])
+    };
+    if let Some(left) = left_area {
+        let cursor_section = snapshot.rows.get(snapshot.cursor).map(|row| row.section());
+        let mut section_lines = Vec::new();
+        for section in settings_subsections(&snapshot.rows) {
+            let selected = cursor_section.as_deref() == Some(section.as_str());
+            section_lines.push(Line::from(Span::styled(
+                format!(" {}", clean_terminal_text(&section)),
+                if selected {
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.dim)
+                },
+            )));
+        }
+        frame.render_widget(Paragraph::new(section_lines), left);
+    }
 
     let mut rendered_rows = Vec::new();
     let mut selected_rendered_row = 0;
     let mut selected_header_row = 0;
     let mut current_header_row = 0;
-    let mut previous_section = None;
-    for (index, row) in snapshot.rows.iter().enumerate() {
-        let section = row.section();
-        if previous_section.as_deref() != Some(section.as_str()) {
-            current_header_row = rendered_rows.len();
-            rendered_rows.push(Line::from(Span::styled(section.clone(), Style::default().fg(theme.dim).add_modifier(Modifier::BOLD))));
-            previous_section = Some(section);
+    if let Some(active_section) = section {
+        // Leaf view: one emphasized banner plus that subsection's rows.
+        current_header_row = rendered_rows.len();
+        selected_header_row = current_header_row;
+        rendered_rows.push(Line::from(Span::styled(
+            format!(" {} ", active_section),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )));
+        let leaf_rows = settings_section_rows(&snapshot.rows, active_section);
+        let selected = leaf_cursor.min(leaf_rows.len().saturating_sub(1));
+        for (index, row) in leaf_rows.into_iter().enumerate() {
+            if index == selected {
+                selected_rendered_row = rendered_rows.len();
+            }
+            rendered_rows.push(settings_row_line(row, index == selected, theme));
         }
-        if index == snapshot.cursor {
-            selected_rendered_row = rendered_rows.len();
-            selected_header_row = current_header_row;
+    } else {
+        let mut previous_section = None;
+        for (index, row) in snapshot.rows.iter().enumerate() {
+            let section = row.section();
+            if previous_section.as_deref() != Some(section.as_str()) {
+                current_header_row = rendered_rows.len();
+                rendered_rows.push(Line::from(Span::styled(section.clone(), Style::default().fg(theme.dim).add_modifier(Modifier::BOLD))));
+                previous_section = Some(section);
+            }
+            if index == snapshot.cursor {
+                selected_rendered_row = rendered_rows.len();
+                selected_header_row = current_header_row;
+            }
+            rendered_rows.push(settings_row_line(row, index == snapshot.cursor, theme));
         }
-        let selected = index == snapshot.cursor;
-        let value = if row.redacted { "[redacted]".to_owned() } else { row.effective_value.to_string() };
-        let metadata = format!("{:?} · {:?}{}", row.source, row.behavior, if row.inherited { " · inherited" } else { "" });
-        let blocked = row.blocked_reason.as_deref().map_or(String::new(), |reason| format!(" · {reason}"));
-        rendered_rows.push(Line::from(vec![Span::styled(if selected { "›  " } else { "   " }, Style::default().fg(theme.accent),
-            ), Span::styled(clean_terminal_text(row.display_key()), Style::default().fg(if selected { theme.accent } else { theme.text }).add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
-            ), Span::styled(format!(" = {value}  [{metadata}]{blocked}"), Style::default().fg(if row.blocked_reason.is_some() { theme.warning } else { theme.muted }),
-            ),
-        ]));
     }
-    let visible_rows = usize::from(sections[1].height);
+    let visible_rows = usize::from(right_area.height);
     let start = selected_rendered_row.saturating_sub(visible_rows.saturating_sub(1));
     let visible = if start > selected_header_row && visible_rows > 1 {
         let body_start = selected_rendered_row.saturating_sub(visible_rows.saturating_sub(2));
@@ -8793,15 +12169,15 @@ fn render_settings_panel(
     } else {
         rendered_rows.into_iter().skip(start).take(visible_rows).collect::<Vec<_>>()
     };
-    frame.render_widget(Paragraph::new(visible), sections[1]);
+    frame.render_widget(Paragraph::new(visible), right_area);
 
     if let Some(input) = input {
         let editor = Block::default()
             .title(format!(" Edit {} · {} ", clean_terminal_text(&input.key), input.hint))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(if input.error.is_some() { theme.error } else { theme.accent }));
-        let editor_inner = editor.inner(sections[2]);
-        frame.render_widget(editor, sections[2]);
+        let editor_inner = editor.inner(sections[4]);
+        frame.render_widget(editor, sections[4]);
         let message = input.error.as_deref().unwrap_or("Enter confirm pending change · Esc cancel editor");
         frame.render_widget(Paragraph::new(vec![
             Line::from(Span::styled(input.value.clone(), Style::default().fg(theme.text))),
@@ -8810,13 +12186,36 @@ fn render_settings_panel(
         let cursor_width = display_width(&input.value[..input.cursor]);
         let x = editor_inner.x.saturating_add(cursor_width).min(editor_inner.right().saturating_sub(1));
         frame.set_cursor_position((x, editor_inner.y));
+    } else if let Some(picker) = enum_picker {
+        render_settings_picker_overlay(
+            frame,
+            sections[4],
+            format!(" Select {} · ↑/↓ or j/k navigate · Enter confirm · Esc cancel ", clean_terminal_text(&picker.key)),
+            &picker.options,
+            picker.selected,
+            theme,
+        );
+    } else if let Some(picker) = boolean_picker {
+        let options = ["true", "false"].into_iter().map(str::to_owned).collect::<Vec<_>>();
+        render_settings_picker_overlay(
+            frame,
+            sections[4],
+            format!(" Select {} · ↑/↓ or j/k navigate · Enter confirm · Esc cancel ", clean_terminal_text(&picker.key)),
+            &options,
+            if picker.selected { 0 } else { 1 },
+            theme,
+        );
     }
     let footer = if input.is_some() {
         "Editing value · Enter confirm · Esc cancel editor"
+    } else if enum_picker.is_some() || boolean_picker.is_some() {
+        "Selecting value · ↑/↓ navigate · Enter confirm · Esc cancel picker"
+    } else if section.is_some() {
+        "↑/↓ select · ←/→ category · Enter edit · Del reset · Esc exit section · Ctrl-S apply"
     } else {
-        "↑/↓ select · Enter edit · Del reset · Ctrl-S apply · Esc close"
+        "↑/↓ select · ←/→ category · Enter open section/edit · Del reset · Ctrl-G/P scope · Ctrl-S apply · Esc close"
     };
-    frame.render_widget(Paragraph::new(Span::styled(footer, Style::default().fg(theme.muted))), sections[3]);
+    frame.render_widget(Paragraph::new(Span::styled(footer, Style::default().fg(theme.muted))), sections[5]);
 }
 
 
@@ -8949,6 +12348,184 @@ fn render_extension_dialog(frame: &mut ratatui::Frame<'_>, dialog: &ExtensionDia
     }
 }
 
+/// Render an extension overlay panel: a host-drawn bordered box with the
+/// registered title, the visible row window (scrolled by ↑/↓ when the rows
+/// overflow), a scroll hint, and — when the render declared an input section
+/// — the host-owned editor line(s) with a live cursor. Rows are already
+/// sanitized host-side (≤100 rows × ≤200 chars, redacted); each row is
+/// truncated to the inner width so it can never wrap or overflow the panel.
+fn render_extension_overlay(frame: &mut ratatui::Frame<'_>, overlay: &ExtensionOverlay, theme: Theme) {
+    let width = frame.area().width.saturating_sub(4).min(110).max(30);
+    let height = frame.area().height.saturating_sub(4).min(30).max(8);
+    let area = centered_rect(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    let inner_width = usize::from(area.width.saturating_sub(2).max(1));
+    let inner_height = usize::from(area.height.saturating_sub(2).max(1));
+    let has_input = overlay.input.is_some();
+    let editor_visible_lines = match &overlay.input {
+        Some(input) if input.multiline => overlay.editor.lines.len().clamp(1, 3),
+        Some(_) => 1,
+        None => 0,
+    };
+    // The input editor owns the bottom `editor_visible_lines` lines plus the
+    // hint line; the row window renders above it.
+    let visible_rows = inner_height
+        .saturating_sub(editor_visible_lines + 1)
+        .max(1);
+    let total = overlay.rows.len();
+    let scroll = overlay.scroll.min(total.saturating_sub(1));
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for row in overlay.rows.iter().skip(scroll).take(visible_rows) {
+        let (text, style) = match row {
+            pi_coding::OverlayRow::Plain(text) => (text.as_str(), theme.text),
+            pi_coding::OverlayRow::Styled { text, style } => {
+                let color = match style.as_deref() {
+                    Some("bold") => theme.text,
+                    Some("dim") => theme.dim,
+                    Some("italic") => theme.text,
+                    Some("accent") => theme.accent,
+                    Some("error") => theme.error,
+                    Some("success") => theme.success,
+                    Some("warning") => theme.warning,
+                    _ => theme.text,
+                };
+                (text.as_str(), color)
+            }
+        };
+        let mut style = Style::default().fg(style);
+        if matches!(row, pi_coding::OverlayRow::Styled { style: Some(style), .. } if style == "bold")
+        {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if matches!(row, pi_coding::OverlayRow::Styled { style: Some(style), .. } if style == "italic")
+        {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        lines.push(Line::from(Span::styled(
+            truncate_to_width(clean_terminal_text(text), inner_width),
+            style,
+        )));
+    }
+    if total > visible_rows {
+        let hint = format!(
+            " {}-{} of {total} · ↑/↓ scroll · Esc close ",
+            scroll + 1,
+            (scroll + visible_rows).min(total)
+        );
+        lines.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme.dim),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " Esc close ",
+            Style::default().fg(theme.dim),
+        )));
+    }
+    // Overlay-local callback status (submit/onKey failures, in-flight
+    // notices) replaces the key hint so errors never clobber the composer.
+    if let Some(status) = &overlay.local_status {
+        lines.push(Line::from(Span::styled(
+            truncate_to_width(clean_terminal_text(status), inner_width),
+            Style::default().fg(theme.error),
+        )));
+    }
+    // Host-owned editor for the declarative input section: the draft lines
+    // (or the dim placeholder when empty) with the live cursor when the
+    // overlay is focused.
+    let mut cursor = None;
+    if has_input {
+        if overlay.editor.is_empty() {
+            let placeholder = overlay
+                .input
+                .as_ref()
+                .and_then(|input| input.placeholder.as_deref())
+                .unwrap_or("type a message");
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(clean_terminal_text(placeholder), inner_width),
+                Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+            )));
+        } else {
+            for (index, line) in overlay.editor.lines.iter().enumerate() {
+                if index >= editor_visible_lines {
+                    break;
+                }
+                lines.push(Line::from(Span::styled(
+                    truncate_to_width(clean_terminal_text(line), inner_width),
+                    Style::default().fg(theme.text),
+                )));
+            }
+        }
+        if overlay.focused {
+            cursor = Some((
+                lines.len() - 1,
+                overlay.editor.column,
+                overlay.editor.lines[overlay.editor.row].clone(),
+            ));
+        }
+        let multiline = overlay
+            .input
+            .as_ref()
+            .is_some_and(|input| input.multiline);
+        let key_hint = if multiline {
+            " Shift+Enter newline · Enter submit · Esc close "
+        } else {
+            " Enter submit · Esc close "
+        };
+        let focus_hint = if overlay.non_capturing && !overlay.focused {
+            " Alt+/ focus "
+        } else {
+            ""
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{key_hint}{focus_hint}"),
+            Style::default().fg(theme.dim),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border_accent))
+                    .title(format!(" {} ", clean_terminal_text(&overlay.title))),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+    if let Some((line_index, column, line)) = cursor {
+        let x = area
+            .x
+            .saturating_add(1)
+            .saturating_add(u16::try_from(display_width(&line[..column])).unwrap_or(u16::MAX));
+        let y = area
+            .y
+            .saturating_add(1)
+            .saturating_add(u16::try_from(line_index).unwrap_or(u16::MAX));
+        if x < area.right().saturating_sub(1) && y < area.bottom().saturating_sub(1) {
+            frame.set_cursor_position((x, y));
+        }
+    }
+}
+
+/// Truncate `text` to at most `max` display columns (character-boundary safe).
+fn truncate_to_width(text: String, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut width = 0usize;
+    let mut end = 0usize;
+    for (index, character) in text.char_indices() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + character_width > max {
+            break;
+        }
+        width += character_width;
+        end = index + character.len_utf8();
+    }
+    text[..end].to_owned()
+}
+
 
 fn transcript_entry_is_visible(entry: &TranscriptEntry, show_thinking: bool) -> bool {
     match entry.kind {
@@ -8968,6 +12545,18 @@ fn transcript_entry_is_visible(entry: &TranscriptEntry, show_thinking: bool) -> 
 
 fn is_unstyled_transcript_separator(line: &Line<'_>) -> bool {
     line == &Line::default()
+}
+
+/// A blank row belonging to the user card's background band (its top or
+/// bottom edge). The card's edges are the intended single blank between the
+/// user message and the next logical section, so an unstyled inter-entry
+/// separator must never be stacked on top of one.
+fn is_user_card_padding_row(line: &Line<'_>) -> bool {
+    line.spans.iter().any(|span| span.style.bg.is_some())
+        && line
+            .spans
+            .iter()
+            .all(|span| span.content.chars().all(char::is_whitespace))
 }
 
 fn append_transcript_separator(lines: &mut Vec<Line<'static>>) -> bool {
@@ -8995,7 +12584,16 @@ fn append_transcript_entry_inner(
     if !transcript_entry_is_visible(entry, show_thinking) {
         return;
     }
-    let inserted_separator = append_transcript_separator(lines);
+    let inserted_separator = if entry.kind != TranscriptKind::User
+        && lines.last().is_some_and(is_user_card_padding_row)
+    {
+        // The user card's bottom edge already separates it from the next
+        // logical section; stacking an unstyled separator on top would
+        // produce the double blank reported for user → thinking → reply.
+        false
+    } else {
+        append_transcript_separator(lines)
+    };
     let entry_start = lines.len();
     render_transcript_entry_inner(
         lines,
@@ -9042,25 +12640,33 @@ fn assemble_committed_transcript_entries(
     has_live_continuation: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = assemble_transcript_entries(entries, show_thinking, expand_tools, theme, width);
-    if has_live_continuation {
+    if has_live_continuation && !lines.last().is_some_and(is_user_card_padding_row) {
+        // A trailing user card supplies its own bottom edge, so the live
+        // continuation follows it directly instead of doubling the gap.
         append_transcript_separator(&mut lines);
     }
     lines
 }
 
+/// Render the visible transcript slice into lines, returning the lines plus
+/// the rendered start row of every transcript entry (absolute entry-index
+/// space, plus one trailing slot = the start of the streaming tail). Entries
+/// before `start` carry the sentinel 0 (not rendered this frame).
 fn render_transcript_lines(
     state: &TuiState,
     theme: Theme,
     width: u16,
     image_context: &mut TranscriptImageContext<'_>,
-) -> Vec<Line<'static>> {
-    let start = if state.transcript_scroll > 0 {
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let start = if state.transcript_top_row.get().is_some() {
         0
     } else {
         state.committed_entries.min(state.transcript.len())
     };
     let mut lines = Vec::new();
-    for entry in &state.transcript[start..] {
+    let mut entry_row_starts = vec![0usize; state.transcript.len() + 1];
+    for (absolute_index, entry) in state.transcript.iter().enumerate().skip(start) {
+        entry_row_starts[absolute_index] = lines.len();
         append_transcript_entry_inner(
             &mut lines,
             entry,
@@ -9072,7 +12678,8 @@ fn render_transcript_lines(
             Some(image_context),
         );
     }
-    lines
+    entry_row_starts[state.transcript.len()] = lines.len();
+    (lines, entry_row_starts)
 }
 
 fn render_job_card(lines: &mut Vec<Line<'static>>, card: &TaskCardRows, theme: Theme, animation_frame: usize, width: u16,
@@ -9184,6 +12791,11 @@ fn job_status_color(status: pi_coding::JobStatus, theme: Theme) -> Color {
 
 const TODO_HUD_TASK_LIMIT: usize = 5;
 const TODO_HUD_JOB_LIMIT: usize = 8;
+/// Maximum live workflows projected into the TodoHUD worker strip.
+const TODO_HUD_WORKFLOW_LIMIT: usize = 3;
+/// Maximum workers shown per workflow strip line (overflow collapses into
+/// `+N more`).
+const TODO_HUD_WORKFLOW_AGENT_LIMIT: usize = 4;
 
 fn selected_todo_hud_tasks<'a>(tasks: &[&'a TodoItem]) -> (Vec<&'a TodoItem>, usize, bool) {
     let open = tasks
@@ -9228,15 +12840,49 @@ fn todo_open_count(phases: &[TodoPhase]) -> usize {
 /// Build the compact OMP-style todo and active-subagent trees. This is a
 /// display-only projection: task readiness and blockers come directly from the
 /// canonical todo items, while job identity remains keyed by the adapter.
+///
+/// The block is a self-contained strip: one leading blank row separates it
+/// from the section above (the transcript / welcome panel) and one trailing
+/// blank row separates it from the section below (composer chrome), so it
+/// never renders flush against adjacent content.
 fn render_todo_panel_lines(
     phases: &[TodoPhase],
     job_cards: &[JobCardRows],
+    workflows: &[WorkflowPanelSnapshot],
     theme: Theme,
     width: u16,
 ) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
     let mut lines = Vec::new();
     let tasks = phases.iter().flat_map(|phase| &phase.tasks).collect::<Vec<_>>();
+    let active_jobs = job_cards
+        .iter()
+        .filter(|card| {
+            matches!(card.job_status, pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running)
+        })
+        .collect::<Vec<_>>();
+    // Live workflows whose child runtime has spawned workers (the supervisor
+    // is excluded from `subagents`), rendered as a compact strip so the main
+    // view shows who is executing without opening /workflow. Only Running
+    // workflows qualify: Planning has no workers yet and a Paused workflow's
+    // roster is not actively executing.
+    let live_workflows = workflows
+        .iter()
+        .filter(|workflow| {
+            workflow.status == pi_coding::WorkflowStatus::Running
+                && !workflow.subagents.is_empty()
+        })
+        .collect::<Vec<_>>();
+    // One blank row separates the block from the section above it (the
+    // transcript / welcome panel), mirroring the trailing gap below — the
+    // strip never renders flush against adjacent content.
+    // Any non-empty workflow snapshot set owns a compact count header
+    // (`Workflows · A active · T total`), including all-terminal / workerless
+    // sets, so normal conversation still surfaces workflow presence.
+    let has_workflows = !workflows.is_empty();
+    if !tasks.is_empty() || !active_jobs.is_empty() || has_workflows {
+        lines.push(Line::default());
+    }
     if !tasks.is_empty() {
         let completed = tasks.iter().filter(|task| task.status == TodoStatus::Completed).count();
         let active = tasks.iter().filter(|task| task.status == TodoStatus::InProgress).count();
@@ -9272,15 +12918,70 @@ fn render_todo_panel_lines(
         }
     }
 
-    let active_jobs = job_cards
-        .iter()
-        .filter(|card| {
-            matches!(card.job_status, pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running)
-        })
-        .collect::<Vec<_>>();
-    if !active_jobs.is_empty() {
-        if !lines.is_empty() {
+    // Compact workflow summary (`Workflows · A active · T total`) plus live
+    // worker strips (`◈ zig-agent · build parser | hub · design doc`). The
+    // header renders whenever any snapshot exists; worker rows stay limited to
+    // Running workflows that have spawned subagents. Placed between todo rows
+    // and the main-session job rows.
+    if has_workflows {
+        if !tasks.is_empty() {
             lines.push(Line::default());
+        }
+        let active = workflows
+            .iter()
+            .filter(|workflow| workflow.status.is_active())
+            .count();
+        lines.push(bounded_single_style_line(
+            crate::workflow_commands::format_workflows_header(active, workflows.len()),
+            width,
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ));
+        for workflow in live_workflows.iter().take(TODO_HUD_WORKFLOW_LIMIT) {
+            let mut parts = vec![format!("◈ {}", clean_terminal_text(&workflow.name))];
+            for agent in workflow.subagents.iter().take(TODO_HUD_WORKFLOW_AGENT_LIMIT) {
+                let name = clean_terminal_text(&agent.name);
+                let task = agent
+                    .task
+                    .as_deref()
+                    .map(clean_terminal_text)
+                    .filter(|text| !text.is_empty());
+                parts.push(match task {
+                    Some(task) => format!("{name} · {task}"),
+                    None => name,
+                });
+            }
+            let hidden_agents = workflow
+                .subagents
+                .len()
+                .saturating_sub(TODO_HUD_WORKFLOW_AGENT_LIMIT);
+            if hidden_agents > 0 {
+                parts.push(format!("+{hidden_agents} more"));
+            }
+            lines.push(bounded_single_style_line(
+                parts.join(" | "),
+                width,
+                Style::default().fg(theme.muted),
+            ));
+        }
+        let hidden_workflows = live_workflows.len().saturating_sub(TODO_HUD_WORKFLOW_LIMIT);
+        if hidden_workflows > 0 {
+            lines.push(bounded_single_style_line(
+                format!("  … {hidden_workflows} more workflows"),
+                width,
+                Style::default().fg(theme.dim),
+            ));
+        }
+    }
+
+    if !active_jobs.is_empty() {
+        if !tasks.is_empty() || has_workflows {
+            lines.push(Line::default());
+        }
+        // Compact live agent projection (`◑ 3 agents · read tools.rs · 12s |
+        // hub · 5s`), reusing the T92 progress fields. Rendered above the
+        // per-job rows so it survives the layout's todo cap on tight screens.
+        if let Some(agent_line) = todo_hud_agent_line(&active_jobs, theme, width) {
+            lines.push(agent_line);
         }
         lines.push(bounded_single_style_line(
             format!(" waiting on {} jobs", active_jobs.len()),
@@ -9299,7 +13000,12 @@ fn render_todo_panel_lines(
                 .iter()
                 .find(|row| row.role == JobCardRowRole::Description)
                 .map(|row| clean_terminal_text(&row.text));
-            let summary = assigned_task.or(description).unwrap_or_default();
+            let progress = card
+                .rows
+                .iter()
+                .find(|row| row.role == JobCardRowRole::Progress)
+                .map(|row| clean_terminal_text(&row.text));
+            let summary = assigned_task.or(description).or(progress).unwrap_or_default();
             let summary = if summary.is_empty() { String::new() } else { format!(" · {summary}") };
             lines.push(bounded_single_style_line(
                 format!("  {marker} {} · {status}{summary}", clean_terminal_text(&card.display_name)),
@@ -9320,6 +13026,59 @@ fn render_todo_panel_lines(
         lines.push(Line::default());
     }
     lines
+}
+
+/// Compact TodoHUD agent projection, rendered as one bounded line while
+/// orchestration jobs are active. Reuses the T92 progress fields: the latest
+/// live activity and elapsed per running job (`◑ 3 agents · read tools.rs ·
+/// 12s | hub · 5s`); running jobs without live detail yet and queued/idle
+/// jobs collapse into the agent count (the per-job rows below keep their
+/// coarse stage + elapsed fallback). A `⟦irc N · /workflow⟧` segment appears
+/// while recent child IRC messages (MessageDelivered entries in the job-card
+/// event logs, i.e. child → supervisor or child → child) exist, hinting at
+/// the full subagent/IRC panel.
+fn todo_hud_agent_line(
+    job_cards: &[&JobCardRows],
+    theme: Theme,
+    width: usize,
+) -> Option<Line<'static>> {
+    if job_cards.is_empty() {
+        return None;
+    }
+    let noun = if job_cards.len() == 1 { "agent" } else { "agents" };
+    let mut parts = vec![format!("◑ {} {noun}", job_cards.len())];
+    let mut segments = Vec::new();
+    let mut irc = 0usize;
+    for card in job_cards {
+        let Some(progress) = card.progress.as_ref() else {
+            continue;
+        };
+        irc += progress
+            .events
+            .iter()
+            .filter(|entry| entry.kind == JobEventKind::Message)
+            .count();
+        let has_activity = progress
+            .activity
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+        if card.job_status == pi_coding::JobStatus::Running && has_activity {
+            // Activity is already redacted and bounded by the adapter; strip
+            // any control sequences for the single-line HUD row.
+            segments.push(clean_terminal_text(&progress_row_text(progress)));
+        }
+    }
+    if !segments.is_empty() {
+        parts.push(segments.join(" | "));
+    }
+    if irc > 0 {
+        parts.push(format!("⟦irc {irc} · /workflow⟧"));
+    }
+    Some(bounded_single_style_line(
+        parts.join(" · "),
+        width,
+        Style::default().fg(theme.muted),
+    ))
 }
 
 
@@ -9465,32 +13224,89 @@ fn render_transcript_entry(
 fn render_tool_card(lines: &mut Vec<Line<'static>>, tool: &ToolTranscript, expanded: bool, theme: Theme, width: u16,
 ) {
     let card = if expanded { &tool.expanded } else { &tool.compact };
-    let border = match card.status {
-        ToolCallViewStatus::Failed | ToolCallViewStatus::Cancelled => theme.error,
-        ToolCallViewStatus::Running | ToolCallViewStatus::Streaming => theme.border_accent,
-        ToolCallViewStatus::Succeeded | ToolCallViewStatus::OrphanRepaired => theme.border_muted,
+    let is_bash = card.tool_name.eq_ignore_ascii_case("bash");
+    // Bash cards frame with the command text color (theme.bash_mode) so the
+    // border and content read as one unit (OMP style); failed/cancelled cards
+    // keep the error border for visibility. Succeeded/repair non-bash cards
+    // use the dedicated tool_card_border — a slightly-whiter gray than the
+    // shared border roles (which stay byte-for-byte OMP titanium), so
+    // read/edit/write/grep cards separate clearly from the #0f1216 background.
+    let border = if is_bash
+        && !matches!(
+            card.status,
+            ToolCallViewStatus::Failed | ToolCallViewStatus::Cancelled
+        ) {
+        theme.bash_mode
+    } else {
+        match card.status {
+            ToolCallViewStatus::Failed | ToolCallViewStatus::Cancelled => theme.error,
+            ToolCallViewStatus::Running | ToolCallViewStatus::Streaming => theme.border_accent,
+            ToolCallViewStatus::Succeeded | ToolCallViewStatus::OrphanRepaired => theme.tool_card_border,
+        }
     };
     let inner = usize::from(width.saturating_sub(2).max(1));
-    lines.push(Line::from(Span::styled(format!("╭{}╮", "─".repeat(inner)), Style::default().fg(border),
-    )));
-    let tool_title = card.rows.iter().find(|row| row.role == ToolCardRowRole::Command).map_or(card.tool_name.as_str(), |row| row.text.as_str());
-    if card.tool_name.eq_ignore_ascii_case("bash") {
-        push_tool_box_row(lines, tool_title, theme.tool_title, border, inner);
-        push_tool_box_row(lines, &format!("$ {}", card.arguments_summary), theme.bash_mode, border, inner,
-        );
+    // Render-time redaction: tool titles/arguments can carry inline tokens
+    // (e.g. `--token=…`); the raw text stays in the session record.
+    let tool_title = redact_secrets(
+        card.rows
+            .iter()
+            .find(|row| row.role == ToolCardRowRole::Command)
+            .map_or(card.tool_name.as_str(), |row| row.text.as_str()),
+    );
+    let marker = match card.status {
+        ToolCallViewStatus::Running | ToolCallViewStatus::Streaming | ToolCallViewStatus::Succeeded => {
+            if matches!(card.tool_name.as_str(), "edit" | "write") { "✎" } else { "•" }
+        }
+        ToolCallViewStatus::Failed | ToolCallViewStatus::Cancelled => "✘",
+        ToolCallViewStatus::OrphanRepaired => "↻",
+    };
+    if is_bash {
+        // Bash cards carry no tool-name title — the `$` prefix identifies the
+        // tool (OMP-style). Leading comment lines (`# …`) render on the card
+        // frame instead of the command area: the first becomes the top-border
+        // title, a second renders as a frame row above the command (deeper
+        // ones are dropped, keeping the card bounded), and the `$` row starts
+        // at the first real command line. Interior comments stay in the
+        // command body, which renders line-by-line (each line kept, `$ ` on
+        // the first row only), wraps, and is bounded to four rows with a `…`
+        // marker; the card stays within its row budget.
+        let command = clean_terminal_text(&redact_secrets(
+            card.bash_command.as_deref().unwrap_or(card.arguments_summary.as_str()),
+        ));
+        let (leading_comments, command_body) = split_leading_comments(&command);
+        if let Some(title) = leading_comments.first() {
+            push_bash_comment_top(lines, title, theme.bash_mode, border, inner);
+            if let Some(extra) = leading_comments.get(1) {
+                push_bash_comment_row(lines, extra, theme.bash_mode, border, inner);
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("╭{}╮", "─".repeat(inner)),
+                Style::default().fg(border),
+            )));
+        }
+        push_bash_command_lines(lines, command_body, theme.bash_mode, border, inner);
         if card.rows.iter().any(|row| row.role == ToolCardRowRole::Content) {
             push_tool_separator(lines, " Output ", border, inner);
         }
     } else {
-        let marker = match card.status {
-            ToolCallViewStatus::Running | ToolCallViewStatus::Streaming | ToolCallViewStatus::Succeeded => {
-                if matches!(card.tool_name.as_str(), "edit" | "write") { "✎" } else { "•" }
-            }
-            ToolCallViewStatus::Failed | ToolCallViewStatus::Cancelled => "✘",
-            ToolCallViewStatus::OrphanRepaired => "↻",
+        let title = if card.skill_name.is_some() {
+            // Skill cards title with the frontmatter name; the description is
+            // the first body paragraph below the separator.
+            format!("{marker} {tool_title}")
+        } else if card.arguments_summary.is_empty() {
+            format!("{marker} {tool_title}")
+        } else {
+            format!(
+                "{marker} {tool_title} {}",
+                redact_secrets(&card.arguments_summary)
+            )
         };
-        let title = if card.arguments_summary.is_empty() { format!("{marker} {tool_title}") } else { format!("{marker} {tool_title} {}", card.arguments_summary) };
-        push_tool_box_row(lines, &title, theme.tool_title, border, inner);
+        push_tool_card_top(lines, &title, theme.tool_title, border, inner);
+        if card.rows.iter().any(|row| row.role != ToolCardRowRole::Command) {
+            // Separator row between the title and the body.
+            push_tool_separator(lines, "", border, inner);
+        }
     }
     let code_styles = markdown_ratatui_styles(theme, theme.tool_output);
     for row in &card.rows {
@@ -9504,7 +13320,7 @@ fn render_tool_card(lines: &mut Vec<Line<'static>>, tool: &ToolTranscript, expan
             }
             ToolCardRowRole::Error => theme.error,
         };
-        for text in clean_terminal_text(&row.text).lines() {
+        for text in clean_terminal_text(&redact_secrets(&row.text)).lines() {
             if row.role == ToolCardRowRole::Content
                 && let Some(language) = card.code_language.as_deref()
             {
@@ -9524,6 +13340,163 @@ fn render_tool_card(lines: &mut Vec<Line<'static>>, tool: &ToolTranscript, expan
     lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), Style::default().fg(border),
     )));
     lines.push(Line::default());
+}
+
+/// Top border with the card title embedded, OMP-style (`╭── Bash ────╮`).
+/// Falls back to a plain top border plus a wrapped title row when the title
+/// does not fit on the border line.
+fn push_tool_card_top(lines: &mut Vec<Line<'static>>, title: &str, color: Color, border: Color, inner: usize,
+) {
+    let title = clean_terminal_text(title);
+    let title_width = usize::from(display_width(&title));
+    if title_width <= inner.saturating_sub(6) {
+        let fill = inner.saturating_sub(title_width.saturating_add(6));
+        lines.push(Line::from(vec![
+            Span::styled("╭── ", Style::default().fg(border)),
+            Span::styled(title, Style::default().fg(color)),
+            Span::styled(format!(" ──{}╮", "─".repeat(fill)), Style::default().fg(border)),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(format!("╭{}╮", "─".repeat(inner)), Style::default().fg(border),
+        )));
+        push_tool_box_row(lines, &title, color, border, inner);
+    }
+}
+
+/// Splits a bash command into its leading comment lines and the remaining
+/// body. A leading comment is a line whose trimmed first character is `#`
+/// and that appears before any other line; once the first non-comment line
+/// is reached, the rest of the command — interior comments included — stays
+/// in the body. Leading comments are trimmed and returned in order.
+fn split_leading_comments(command: &str) -> (Vec<String>, &str) {
+    let mut leading: Vec<String> = Vec::new();
+    let mut body_start = 0usize;
+    for chunk in command.split_inclusive('\n') {
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        if line.trim_start().starts_with('#') {
+            leading.push(line.trim().to_owned());
+            body_start += chunk.len();
+        } else {
+            break;
+        }
+    }
+    (leading, &command[body_start..])
+}
+
+/// Top border for a bash card carrying the first leading comment as the
+/// title, OMP-style (`╭── # comment ────╮`). The comment is truncated to
+/// the border width so the title always fits on the border line; when the
+/// card is so narrow that no title fits, a plain top border renders instead.
+fn push_bash_comment_top(
+    lines: &mut Vec<Line<'static>>,
+    comment: &str,
+    color: Color,
+    border: Color,
+    inner: usize,
+) {
+    let title = truncate_status_text(comment, inner.saturating_sub(6));
+    if title.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("╭{}╮", "─".repeat(inner)),
+            Style::default().fg(border),
+        )));
+        return;
+    }
+    let title_width = usize::from(display_width(&title));
+    let fill = inner.saturating_sub(title_width.saturating_add(6));
+    lines.push(Line::from(vec![
+        Span::styled("╭── ", Style::default().fg(border)),
+        Span::styled(title, Style::default().fg(color)),
+        Span::styled(format!(" ──{}╮", "─".repeat(fill)), Style::default().fg(border)),
+    ]));
+}
+
+/// One additional leading comment rendered as a frame row above the command
+/// (`│ # comment │`), truncated to the row width.
+fn push_bash_comment_row(
+    lines: &mut Vec<Line<'static>>,
+    comment: &str,
+    color: Color,
+    border: Color,
+    inner: usize,
+) {
+    let row = truncate_status_text(comment, inner.saturating_sub(2).max(1));
+    let used = usize::from(display_width(&row));
+    let fill = " ".repeat(inner.saturating_sub(used.saturating_add(2)));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", Style::default().fg(border)),
+        Span::styled(row, Style::default().fg(color)),
+        Span::raw(fill),
+        Span::styled(" │", Style::default().fg(border)),
+    ]));
+}
+
+/// `$ <command>` rendered line-by-line (OMP-style bash card layout). Embedded
+/// newlines become separate rows so a multi-line command keeps its original
+/// line structure — comment lines (`# …`) included — instead of riding one
+/// row as a raw line-feed control character. Leading comment lines are
+/// expected to have been extracted by the caller (they render on the card
+/// frame); the first row carries the `$` prefix, continuation rows do not,
+/// long lines wrap (the first row reserves two columns for `$ `), and a
+/// command longer than [`MAX_COMMAND_ROWS`] rows ends with a `…` marker. The
+/// card keeps its 20-row total budget.
+fn push_bash_command_lines(
+    lines: &mut Vec<Line<'static>>,
+    command: &str,
+    color: Color,
+    border: Color,
+    inner: usize,
+) {
+    const MAX_COMMAND_ROWS: usize = 4;
+    let inner_text = inner.saturating_sub(2).max(1);
+    // Reserve two columns for the `$ ` prefix on the first row only.
+    let first_width = inner_text.saturating_sub(2).max(1);
+    // Redact + strip terminal control sequences up front; the raw command
+    // (with its embedded newlines) stays in the session record.
+    let command = clean_terminal_text(&redact_secrets(command));
+    let mut rows: Vec<String> = Vec::new();
+    let mut truncated = false;
+    // Split on newlines first: each logical line wraps on its own, so a
+    // multi-line command renders as one row per line. `str::lines` keeps
+    // blank interior lines and drops only a single trailing terminator.
+    for (logical_index, logical) in command.lines().enumerate() {
+        let width = if logical_index == 0 { first_width } else { inner_text };
+        for (wrap_index, wrapped) in wrap_display_line(logical, width).into_iter().enumerate() {
+            if rows.len() >= MAX_COMMAND_ROWS {
+                truncated = true;
+                break;
+            }
+            let row = if logical_index == 0 && wrap_index == 0 {
+                format!("$ {wrapped}")
+            } else {
+                wrapped
+            };
+            rows.push(row);
+        }
+        if truncated {
+            break;
+        }
+    }
+    if rows.is_empty() {
+        // Empty command: keep the prompt row so the card still reads as a
+        // command card.
+        rows.push("$".to_owned());
+    } else if truncated {
+        // Bounded: keep the first rows and close with the `…` fold marker;
+        // the dropped tail stays in the session record.
+        rows.truncate(MAX_COMMAND_ROWS - 1);
+        rows.push("…".to_owned());
+    }
+    for row in rows {
+        let used = usize::from(display_width(&row));
+        let fill = " ".repeat(inner.saturating_sub(used.saturating_add(2)));
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(border)),
+            Span::styled(row, Style::default().fg(color)),
+            Span::raw(fill),
+            Span::styled(" │", Style::default().fg(border)),
+        ]));
+    }
 }
 
 fn push_tool_separator(lines: &mut Vec<Line<'static>>, label: &str, border: Color, inner: usize) {
@@ -9652,7 +13625,6 @@ fn render_transcript_entry_inner(
         lines.push(user_card_vertical_padding(width));
     }
     let mut visible_blocks = 0_usize;
-    let mut reasoning_labeled = false;
     let mut previous_was_thinking = false;
     for block in &entry.content {
         match block {
@@ -9690,7 +13662,7 @@ fn render_transcript_entry_inner(
                 };
                 let sanitized = clean_terminal_text(text);
                 let mut rendered = if entry.kind == TranscriptKind::User {
-                    render_markdown(&sanitized, theme, base)
+                    render_markdown(&sanitized, theme, base, width)
                 } else {
                     render_transcript_markdown(
                         &sanitized,
@@ -9712,15 +13684,6 @@ fn render_transcript_entry_inner(
                 if !show_thinking || *redacted || thinking.trim().is_empty() {
                     continue;
                 }
-                if !reasoning_labeled {
-                    lines.push(Line::from(Span::styled(
-                        "thinking ·",
-                        Style::default()
-                            .fg(theme.dim)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
-                    reasoning_labeled = true;
-                }
                 let mut rendered = render_transcript_markdown(
                     &clean_terminal_text(thinking),
                     theme,
@@ -9728,10 +13691,22 @@ fn render_transcript_entry_inner(
                     width,
                     entry.is_partial,
                 );
+                // OMP forces every span inside a thinking block through
+                // `thinkingText` (assistant-message.ts color transform): the
+                // markdown chrome colors (headings/links/list bullets/code)
+                // are suppressed so a numbered list or heading inside a
+                // thinking trace never renders in accent blue. Structural
+                // modifiers (bold/italic/underline) survive the transform.
                 for line in &mut rendered {
-                    line.style = line.style.add_modifier(Modifier::ITALIC);
+                    line.style = line
+                        .style
+                        .fg(theme.thinking_text)
+                        .add_modifier(Modifier::ITALIC);
                     for span in &mut line.spans {
-                        span.style = span.style.add_modifier(Modifier::ITALIC);
+                        span.style = span
+                            .style
+                            .fg(theme.thinking_text)
+                            .add_modifier(Modifier::ITALIC);
                     }
                 }
                 lines.extend(rendered);
@@ -9769,13 +13744,13 @@ fn render_transcript_entry_inner(
             ContentBlock::ToolCall(call) => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{} ", clean_terminal_text(&call.name)),
+                        format!("{} ", clean_terminal_text(&redact_secrets(&call.name))),
                         Style::default()
                             .fg(theme.tool_title)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        clean_terminal_text(&compact_arguments(&call.arguments)),
+                        clean_terminal_text(&redact_secrets(&compact_arguments(&call.arguments))),
                         Style::default().fg(theme.tool_output),
                     ),
                 ]));
@@ -9796,12 +13771,11 @@ fn render_transcript_entry_inner(
             }
         }
     }
-    // Assistant entries retain their producer-owned unstyled trailing row.
-    // The shared adjacency assembler reuses that exact row as the separator
-    // before the next visible entry without treating styled user padding as blank.
-    if entry.kind == TranscriptKind::Assistant {
-        lines.push(Line::default());
-    }
+    // Assistant replies must not emit a trailing blank row: the adjacency
+    // assembler inserts the single inter-entry separator between distinct
+    // entries (or reuses a user card's bottom edge as that separator), so
+    // the final reply ends flush on its last content line instead of
+    // leaving an empty row below it.
 }
 
 fn user_card_vertical_padding(width: u16) -> Line<'static> {
@@ -9816,12 +13790,28 @@ fn render_user_card_lines(rendered: Vec<Line<'static>>, width: u16) -> Vec<Line<
 
     for line in rendered {
         let line_style = line.style;
+        // A row that already fits the content band by display width is passed
+        // through untouched. Re-wrapping only wider rows keeps finished frame
+        // rows (code fences, tables) intact instead of splitting a correct
+        // frame row mid-frame.
+        let line_width = line
+            .spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>();
+        if line_width <= content_width {
+            push_user_card_row(&mut rows, line.spans, line_width, width, line_style);
+            continue;
+        }
+        // Wide rows are re-wrapped grapheme by grapheme; a cluster is never
+        // split, so multi-code-point graphemes (flags, ZWJ families) stay
+        // intact and count their true terminal width.
         let mut row_spans = Vec::<Span<'static>>::new();
         let mut row_width = 0_usize;
         for span in line.spans {
-            for character in span.content.chars() {
-                let character_width = character.width().unwrap_or(0);
-                if row_width > 0 && row_width.saturating_add(character_width) > content_width {
+            for grapheme in span.content.graphemes(true) {
+                let grapheme_width = UnicodeWidthStr::width(grapheme);
+                if row_width > 0 && row_width.saturating_add(grapheme_width) > content_width {
                     push_user_card_row(
                         &mut rows,
                         std::mem::take(&mut row_spans),
@@ -9832,11 +13822,11 @@ fn render_user_card_lines(rendered: Vec<Line<'static>>, width: u16) -> Vec<Line<
                     row_width = 0;
                 }
                 if let Some(last) = row_spans.last_mut().filter(|last| last.style == span.style) {
-                    last.content.to_mut().push(character);
+                    last.content.to_mut().push_str(grapheme);
                 } else {
-                    row_spans.push(Span::styled(character.to_string(), span.style));
+                    row_spans.push(Span::styled(grapheme.to_owned(), span.style));
                 }
-                row_width = row_width.saturating_add(character_width);
+                row_width = row_width.saturating_add(grapheme_width);
             }
         }
         push_user_card_row(
@@ -10231,17 +14221,117 @@ fn render_agents_panel(frame: &mut ratatui::Frame<'_>, panel: &AgentsPanel, them
     frame.render_widget(Paragraph::new(lines), content);
 }
 
+/// Compact context-window label (`1m`, `200k`, `4096`); `None` when unknown.
+fn format_context_window(window: i64) -> Option<String> {
+    if window <= 0 {
+        return None;
+    }
+    let value = if window >= 1_000_000 {
+        let millions = window as f64 / 1_000_000.0;
+        if (millions - millions.round()).abs() < 1e-9 {
+            format!("{}m", millions as i64)
+        } else {
+            format!("{:.1}m", millions)
+        }
+    } else if window >= 1_000 {
+        let thousands = window as f64 / 1_000.0;
+        if (thousands - thousands.round()).abs() < 1e-9 {
+            format!("{}k", thousands as i64)
+        } else {
+            format!("{:.1}k", thousands)
+        }
+    } else {
+        window.to_string()
+    };
+    Some(format!("{value} ◫"))
+}
+
+/// Per-1M-token price label (`free`, `$1/$5`). Never invents pricing: a
+/// `ModelCost::default()` (all zero) renders as `free`.
+fn format_model_cost(cost: &pi_ai::ModelCost) -> String {
+    let input = cost.input;
+    let output = cost.output;
+    if input <= 0.0 && output <= 0.0 {
+        return "free".to_owned();
+    }
+    let price = |value: f64| {
+        let rounded = (value * 100.0).round() / 100.0;
+        if rounded == rounded.trunc() && rounded.abs() < 1e12 {
+            format!("{}", rounded as i64)
+        } else {
+            format!("{rounded}")
+        }
+    };
+    match (input > 0.0, output > 0.0) {
+        (true, true) => format!("${}/${}", price(input), price(output)),
+        (true, false) => format!("${}", price(input)),
+        (false, true) => format!("${}", price(output)),
+        (false, false) => "free".to_owned(),
+    }
+}
+
+/// Right-pane meta columns: context window, price, reasoning flag. Values that
+/// are unavailable are omitted entirely rather than rendered blank.
+fn model_meta_text(model: &Model) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if let Some(context) = format_context_window(model.context_window) {
+        parts.push(context);
+    }
+    parts.push(format_model_cost(&model.cost));
+    if model.reasoning {
+        parts.push("reasoning".to_owned());
+    }
+    parts.join("  ")
+}
+
+/// Row label for the right pane: display name when the catalog has a distinct
+/// one, otherwise the raw model id.
+fn model_row_label(model: Option<&Model>, id: &str) -> String {
+    match model {
+        Some(model) if !model.name.is_empty() && model.name != model.id => model.name.clone(),
+        _ => id.to_owned(),
+    }
+}
+
 fn render_scoped_model_selector(
     frame: &mut ratatui::Frame<'_>,
     selector: &ScopedModelSelector,
     theme: Theme,
 ) {
-    let visible = selector.visible_ids();
-    let height = u16::try_from(visible.len().saturating_add(6))
+    let providers = selector.providers();
+    let model_ids = selector
+        .current_provider()
+        .map_or_else(Vec::new, |provider| selector.models_for_provider(provider));
+    let provider_count = providers.len();
+    let model_count = model_ids.len();
+    let selected_provider = selector.provider_selected();
+    let selected_model = selector.model_selected();
+    let in_providers = selector.column() == ModelColumn::Providers;
+    let in_models = selector.column() == ModelColumn::Models;
+
+    let body_rows = provider_count.max(model_count);
+    let panel_width = frame.area().width.saturating_sub(4).min(104).max(30);
+    let inner_width = panel_width.saturating_sub(2);
+    let provider_chars = providers
+        .iter()
+        .map(|provider| display_width(provider))
+        .max()
+        .unwrap_or(0);
+    let left_width = (provider_chars.saturating_add(2)).min(32);
+    let right_width = inner_width.saturating_sub(left_width).saturating_sub(2);
+    let two_column = right_width >= 18;
+    // Content: title, hints, filter, footer, plus the column header (two-column
+    // mode) or the merged provider+model rows (single-column fallback).
+    let content_lines = if two_column {
+        body_rows.saturating_add(5)
+    } else {
+        provider_count.saturating_add(model_count).saturating_add(4)
+    };
+    let height = u16::try_from(content_lines.saturating_add(2))
         .unwrap_or(u16::MAX)
-        .clamp(8, 22);
+        .clamp(8, 26);
     let area = centered_rect(
-        frame.area().width.saturating_sub(4).min(90).max(30),
+        panel_width,
         height,
         frame.area(),
     );
@@ -10249,37 +14339,124 @@ fn render_scoped_model_selector(
     let dirty = if selector.dirty() { " · unsaved" } else { "" };
     let mut lines = vec![
         Line::from(Span::styled(
-            "Model Configuration",
+            truncate_todo_line(
+                &format!("Model Configuration{dirty}"),
+                usize::from(inner_width),
+            ),
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            scoped_model_key_hints().to_owned(),
+            truncate_todo_line(scoped_model_key_hints(), usize::from(inner_width)),
             Style::default().fg(theme.dim),
         )),
         Line::from(vec![
             Span::styled("Filter: ", Style::default().fg(theme.dim)),
             Span::styled(
-                clean_terminal_text(selector.query()),
+                truncate_todo_line(
+                    &clean_terminal_text(selector.query()),
+                    usize::from(inner_width.saturating_sub(8)),
+                ),
                 Style::default().fg(theme.text),
             ),
         ]),
     ];
-    for (index, id) in visible.into_iter().enumerate() {
-        let marker = if selector.is_enabled(&id) {
-            "✓"
-        } else {
-            "✗"
-        };
-        let style = if index == selector.selected() {
+
+    let highlight = |focused: bool, is_selected: bool| {
+        if focused && is_selected {
             Style::default().fg(theme.text).bg(theme.selected_bg)
+        } else if is_selected {
+            Style::default().fg(theme.accent)
         } else {
             Style::default().fg(theme.text)
-        };
+        }
+    };
+
+    if two_column {
+        // Two-column omp-style layout: providers left, models right.
         lines.push(Line::from(Span::styled(
-            format!("{marker} {}", clean_terminal_text(&id)),
-            style,
+            format!("{:<width$}  Models", "Providers", width = usize::from(left_width)),
+            Style::default().fg(theme.dim).add_modifier(Modifier::BOLD),
         )));
+        for row in 0..body_rows {
+            let mut spans = Vec::with_capacity(2);
+            if row < provider_count {
+                let bullet = if row == selected_provider { "●" } else { "○" };
+                let mut cell = format!("{bullet} {}", providers[row]);
+                let cell_width = display_width(&cell);
+                if cell_width < left_width {
+                    cell.push_str(&" ".repeat(usize::from(left_width - cell_width)));
+                } else {
+                    cell = truncate_todo_line(&cell, usize::from(left_width));
+                }
+                spans.push(Span::styled(
+                    cell,
+                    highlight(in_providers, row == selected_provider),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    " ".repeat(usize::from(left_width)),
+                    Style::default(),
+                ));
+            }
+            spans.push(Span::styled("  ", Style::default()));
+            if row < model_count {
+                let id = &model_ids[row];
+                let model = selector.model_for_id(id);
+                let marker = if selector.is_enabled(id) { "✓" } else { "✗" };
+                let meta = model.map_or_else(String::new, model_meta_text);
+                let meta_width = display_width(&meta);
+                let label_width = usize::from(right_width.saturating_sub(meta_width).saturating_sub(3)).max(1);
+                let label_text = truncate_todo_line(
+                    &format!(
+                        "{marker} {}",
+                        clean_terminal_text(&model_row_label(model, id))
+                    ),
+                    label_width,
+                );
+                let cell = if meta.is_empty() {
+                    label_text
+                } else {
+                    format!("{label_text}  {meta}")
+                };
+                spans.push(Span::styled(
+                    cell,
+                    highlight(in_models, row == selected_model),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        // Tiny-width fallback: providers and the selected provider's models in
+        // one column, keeping both panes reachable.
+        for (row, provider) in providers.iter().enumerate() {
+            let bullet = if row == selected_provider { "●" } else { "○" };
+            lines.push(Line::from(Span::styled(
+                format!("{bullet} {}", clean_terminal_text(provider)),
+                highlight(in_providers, row == selected_provider),
+            )));
+        }
+        for (row, id) in model_ids.iter().enumerate() {
+            let model = selector.model_for_id(id);
+            let marker = if selector.is_enabled(id) { "✓" } else { "✗" };
+            let meta = model.map_or_else(String::new, model_meta_text);
+            let cell = if meta.is_empty() {
+                format!(
+                    "  {marker} {}",
+                    clean_terminal_text(&model_row_label(model, id))
+                )
+            } else {
+                format!(
+                    "  {marker} {}  {meta}",
+                    clean_terminal_text(&model_row_label(model, id))
+                )
+            };
+            lines.push(Line::from(Span::styled(
+                truncate_todo_line(&cell, usize::from(inner_width)),
+                highlight(in_models, row == selected_model),
+            )));
+        }
     }
+
     lines.push(Line::from(Span::styled(
         format!(
             "{} enabled · {} unavailable",
@@ -10307,15 +14484,19 @@ fn render_transcript_markdown(
     width: u16,
     streaming: bool,
 ) -> Vec<Line<'static>> {
+    // Render-time redaction: the model's replies, thinking, and job context
+    // may echo tokens/keys. The session record keeps raw text; only what is
+    // drawn on screen is obfuscated.
+    let text = redact_secrets(text);
     let styles = markdown_ratatui_styles(theme, base);
     if streaming {
-        render_ratatui_markdown_streaming(text, width, styles).lines
+        render_ratatui_markdown_streaming(&text, width, styles).lines
     } else {
-        render_ratatui_markdown(text, width, styles).lines
+        render_ratatui_markdown(&text, width, styles).lines
     }
 }
 
-fn markdown_ratatui_styles(theme: Theme, base: Color) -> MarkdownRatatuiStyles {
+pub(crate) fn markdown_ratatui_styles(theme: Theme, base: Color) -> MarkdownRatatuiStyles {
     let text = Style::default().fg(base);
     let heading = Style::default()
         .fg(theme.md_heading)
@@ -10331,7 +14512,10 @@ fn markdown_ratatui_styles(theme: Theme, base: Color) -> MarkdownRatatuiStyles {
         list_marker: Style::default().fg(theme.md_list_bullet),
         quote: Style::default().fg(theme.md_quote),
         code: Style::default().fg(theme.md_code_block),
-        code_fence: Style::default().fg(theme.md_code_block_border),
+        // Code-block frames use the same gray-white border as tool-card
+        // frames: md_code_block_border (#2a3038) is too dim against the
+        // #0f1216 background to read as a full card border.
+        code_fence: Style::default().fg(theme.tool_card_border),
         inline_code: Style::default().fg(theme.md_code),
         syntax_comment: Style::default().fg(theme.syntax_comment),
         syntax_keyword: Style::default().fg(theme.syntax_keyword),
@@ -10342,7 +14526,10 @@ fn markdown_ratatui_styles(theme: Theme, base: Color) -> MarkdownRatatuiStyles {
         syntax_type: Style::default().fg(theme.syntax_type),
         syntax_operator: Style::default().fg(theme.syntax_operator),
         syntax_punctuation: Style::default().fg(theme.syntax_punctuation),
-        table_border: Style::default().fg(theme.md_code_block_border),
+        // Tables use the same frame role as code/tool-card frames:
+        // md_code_block_border (#2a3038) is too dim against the #0f1216
+        // background to read as a full card border.
+        table_border: Style::default().fg(theme.tool_card_border),
         table_header: Style::default()
             .fg(theme.md_heading)
             .add_modifier(Modifier::BOLD),
@@ -10366,7 +14553,9 @@ fn render_tool_text(text: &str, theme: Theme) -> Vec<Line<'static>> {
         .any(|line| line.starts_with('-') && !line.starts_with("---"));
     let is_diff = text.lines().any(|line| line.starts_with("@@")) || (has_added && has_removed);
     if !is_diff {
-        return render_markdown(text, theme, theme.tool_output);
+        // No caller supplies a width today; use the shared renderer default
+        // (callers wiring this up must thread the container width).
+        return render_markdown(text, theme, theme.tool_output, 80);
     }
     text.lines()
         .map(|line| {
@@ -10382,7 +14571,15 @@ fn render_tool_text(text: &str, theme: Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn render_markdown(text: &str, theme: Theme, base: Color) -> Vec<Line<'static>> {
+fn render_markdown(text: &str, theme: Theme, base: Color, width: u16) -> Vec<Line<'static>> {
+    // Render-time redaction for user/tool prose drawn without the shared
+    // ratatui markdown path; storage keeps the raw text.
+    let text = redact_secrets(text);
+    // The user bubble wraps content at `width - 1` (one trailing padding
+    // cell), so the code frame is built at that inner width.
+    let frame_width = usize::from(width.max(1)).saturating_sub(1).max(1);
+    let content_width = frame_width.saturating_sub(4).max(1);
+    let border_style = Style::default().fg(theme.tool_card_border);
     let mut lines = Vec::new();
     let mut fenced = false;
     let mut language = String::new();
@@ -10392,26 +14589,42 @@ fn render_markdown(text: &str, theme: Theme, base: Color) -> Vec<Line<'static>> 
             fenced = !fenced;
             if fenced {
                 language = info.trim().to_owned();
-            }
-            lines.push(Line::from(Span::styled(
-                if fenced {
-                    format!(
-                        "┌─ {}",
-                        if language.is_empty() {
-                            "code"
-                        } else {
-                            &language
-                        }
-                    )
+                let title = if language.is_empty() {
+                    "code".to_owned()
                 } else {
-                    "└─".to_owned()
-                },
-                Style::default().fg(theme.md_code_block_border),
-            )));
+                    format!("code · {language}")
+                };
+                push_code_frame_top(&mut lines, &title, border_style, frame_width);
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("╰{}╯", "─".repeat(frame_width.saturating_sub(2))),
+                    border_style,
+                )));
+            }
             continue;
         }
         if fenced {
-            lines.push(Line::from(syntax_spans(line, theme)));
+            // Sanitize before measuring/wrapping (tab → 4 spaces, control/CSI
+            // stripped) so the width math matches what the terminal paints.
+            // Wrapping reuses the shared grapheme-aware verbatim wrapper; a
+            // single cluster wider than the content band survives intact there
+            // (lossless overflow policy), so clamp those rows to content_width
+            // with an ellipsis — every body row is exactly frame_width.
+            let safe = clean_terminal_text(line);
+            for wrapped in wrap_verbatim(&safe, content_width) {
+                let fitted = if grapheme_display_width(&wrapped) > content_width {
+                    fit_text(&wrapped, content_width)
+                } else {
+                    wrapped
+                };
+                let used = grapheme_display_width(&fitted);
+                let pad = content_width.saturating_sub(used);
+                let mut spans = vec![Span::styled("│ ", border_style)];
+                spans.extend(syntax_spans(&fitted, theme));
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.push(Span::styled(" │", border_style));
+                lines.push(Line::from(spans));
+            }
             continue;
         }
         let trimmed = line.trim_start();
@@ -10450,10 +14663,88 @@ fn render_markdown(text: &str, theme: Theme, base: Color) -> Vec<Line<'static>> 
             lines.push(Line::from(inline_markdown_spans(line, theme, base)));
         }
     }
+    if fenced {
+        // The fence never closed: cap the frame with a temporary bottom that
+        // carries the unclosed marker, so the block never renders borderless
+        // and never fakes a closed end while the fence is still open.
+        push_code_frame_bottom(&mut lines, border_style, frame_width);
+    }
     if text.is_empty() {
         lines.push(Line::default());
     }
     lines
+}
+
+/// Top border with the language label embedded, tool-card style
+/// (`╭── code · lang ──╮`). Falls back to a plain top border plus a titled
+/// row when the label cannot fit on the border line, mirroring tool cards.
+fn push_code_frame_top(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    border_style: Style,
+    frame_width: usize,
+) {
+    let title_width = grapheme_display_width(title);
+    if title_width <= frame_width.saturating_sub(8) {
+        let fill = frame_width.saturating_sub(8) - title_width;
+        lines.push(Line::from(Span::styled(
+            format!("╭── {title} ──{}╮", "─".repeat(fill)),
+            border_style,
+        )));
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(frame_width.saturating_sub(2))),
+        border_style,
+    )));
+    let inner = frame_width.saturating_sub(4).max(1);
+    let fitted = truncate_status_text(title, inner);
+    let pad = inner.saturating_sub(grapheme_display_width(&fitted));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", border_style),
+        Span::styled(fitted, border_style),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(" │", border_style),
+    ]));
+}
+
+/// Text embedded in the temporary bottom border of a fence that is still
+/// open when the text ends (streaming output whose closing fence line has
+/// not arrived). Mirrors the shared renderer's marker so the frame reads as
+/// incomplete instead of pretending the block ended.
+const UNCLOSED_FENCE_MARKER: &str = "… (unclosed fence)";
+
+/// Temporary bottom border for a fence still open at end of text, carrying
+/// the unclosed marker (`╰── … (unclosed fence) ──╯`). Falls back to an
+/// inner marker row above a plain bottom border when the marker cannot fit
+/// the border line, mirroring the top border's overflow behavior.
+fn push_code_frame_bottom(
+    lines: &mut Vec<Line<'static>>,
+    border_style: Style,
+    frame_width: usize,
+) {
+    let marker_width = grapheme_display_width(UNCLOSED_FENCE_MARKER);
+    if marker_width <= frame_width.saturating_sub(8) {
+        let fill = frame_width.saturating_sub(8) - marker_width;
+        lines.push(Line::from(Span::styled(
+            format!("╰── {UNCLOSED_FENCE_MARKER} ──{}╯", "─".repeat(fill)),
+            border_style,
+        )));
+        return;
+    }
+    let inner = frame_width.saturating_sub(4).max(1);
+    let fitted = truncate_status_text(UNCLOSED_FENCE_MARKER, inner);
+    let pad = inner.saturating_sub(grapheme_display_width(&fitted));
+    lines.push(Line::from(vec![
+        Span::styled("│ ", border_style),
+        Span::styled(fitted, border_style),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(" │", border_style),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(frame_width.saturating_sub(2))),
+        border_style,
+    )));
 }
 
 fn inline_markdown_spans(text: &str, theme: Theme, base: Color) -> Vec<Span<'static>> {
@@ -10671,6 +14962,9 @@ fn render_tree_panel(frame: &mut ratatui::Frame<'_>, panel: &TreePanel, theme: T
         .unwrap_or(u16::MAX)
         .clamp(10, frame.area().height.saturating_sub(2).max(10));
     let area = centered_rect(width, height, frame.area());
+    // Borders take one column on each side; every node row is truncated to
+    // this inner width so it can never wrap or overflow the panel.
+    let row_budget = usize::from(area.width.saturating_sub(2).max(1));
     frame.render_widget(Clear, area);
     let mut lines = vec![Line::from(Span::styled(
         clean_terminal_text(&panel.title),
@@ -10701,14 +14995,17 @@ fn render_tree_panel(frame: &mut ratatui::Frame<'_>, panel: &TreePanel, theme: T
         for (index, node) in panel.visible().iter().enumerate() {
             if panel.mode == TreePanelMode::Fork {
                 let cursor = if node.selected { "› " } else { "  " };
-                let body = node.text.strip_prefix("user: ").unwrap_or(&node.text);
+                let body = node.label_text.strip_prefix("user: ").unwrap_or(&node.label_text);
                 let style = if node.selected {
                     Style::default().fg(theme.text).bg(theme.selected_bg).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.text)
                 };
-                lines.push(Line::from(Span::styled(clean_terminal_text(&format!("{cursor}{body}")), style,
-                )));
+                let row = truncate_status_text(
+                    &clean_terminal_text(&format!("{cursor}{body}")),
+                    row_budget,
+                );
+                lines.push(Line::from(Span::styled(row, style)));
                 lines.push(Line::from(Span::styled(
                     format!("  Message {} of {}", index + 1, panel.visible().len()),
                     Style::default().fg(theme.dim),
@@ -10736,10 +15033,11 @@ fn render_tree_panel(frame: &mut ratatui::Frame<'_>, panel: &TreePanel, theme: T
             } else {
                 Style::default().fg(theme.text)
             };
-            lines.push(Line::from(Span::styled(
-                clean_terminal_text(&format!("{cursor}{prefix}{active}{label}{}", node.text)),
-                style,
-            )));
+            let row = truncate_status_text(
+                &clean_terminal_text(&format!("{cursor}{prefix}{active}{label}{}", node.label_text)),
+                row_budget,
+            );
+            lines.push(Line::from(Span::styled(row, style)));
         }
     }
     if panel.mode == TreePanelMode::Navigate {
@@ -10812,7 +15110,7 @@ fn session_selector_key_hints(selector: &SavedSessionSelector) -> String {
 }
 
 fn scoped_model_key_hints() -> &'static str {
-    "↑/↓ · Enter toggle · Ctrl+A/X/P/S · Alt+↑/↓ reorder · type filter · Esc/q close"
+    "↑/↓ move · → models · ← providers · Enter toggle · Ctrl+A/X/P/S · Alt+↑/↓ reorder · type filter · Esc/q close"
 }
 
 fn selector_panel_key_hints(panel: &SelectorPanel) -> String {
@@ -10972,6 +15270,58 @@ fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
             columns.max(1).div_ceil(width)
         })
         .sum()
+}
+
+/// Compute the transcript Paragraph scroll offset for this frame and update
+/// the scroll bookkeeping for the next frame.
+///
+/// The window is anchored to a transcript **entry** (plus a row offset inside
+/// it) rather than to the bottom. Entries are stable across frames, so when
+/// content below the window changes height — streaming growth, a mermaid
+/// fence closing (source ↔ diagram settle flip, which can move tens of rows),
+/// or a resize reflow — the re-anchored window keeps showing the same
+/// content instead of drifting by the height delta. A bottom-anchored row
+/// offset (`bottom - transcript_scroll`) drifts by exactly that delta, which
+/// is the remaining scroll-up history loss after the F9 `.wrap()` fix: the
+/// `[scroll, scroll + height)` window lands at the wrong rows and content
+/// appears to vanish.
+///
+/// `entry_row_starts` maps absolute transcript entry index → rendered start
+/// row (length `transcript.len() + 1`; the trailing slot is the streaming
+/// tail). The returned `scroll` is what the Paragraph should be scrolled by;
+/// it is always clamped to `[0, bottom]`, so the tail is never skipped.
+fn transcript_scroll_offset(
+    state: &TuiState,
+    entry_row_starts: &[usize],
+    total_rows: usize,
+    transcript_height: usize,
+) -> usize {
+    let bottom = total_rows.saturating_sub(transcript_height);
+    let scroll = match state.transcript_top_row.get() {
+        None => bottom,
+        Some(_) if state.scroll_moved.get() => {
+            // The user just paged: use the moved row verbatim this frame;
+            // re-anchoring starts next frame.
+            state.transcript_top_row.get().unwrap_or(bottom).min(bottom)
+        }
+        Some(_) => {
+            // Layout may have changed since the top row was recorded
+            // (streaming growth, settle flips, resize): re-map the anchor.
+            let (entry, offset) = state.scroll_anchor.get();
+            let entry = entry.min(entry_row_starts.len().saturating_sub(1));
+            entry_row_starts[entry].saturating_add(offset).min(bottom)
+        }
+    };
+    // Re-derive the anchor for the next frame from the actual window top.
+    let top_entry = entry_row_starts
+        .iter()
+        .rposition(|&start| start <= scroll)
+        .unwrap_or(0);
+    state.scroll_anchor.set((top_entry, scroll.saturating_sub(entry_row_starts[top_entry])));
+    state.scroll_moved.set(false);
+    state.transcript_top_row.set((scroll < bottom).then_some(scroll));
+    state.transcript_scroll_bottom.set(bottom);
+    scroll
 }
 
 fn display_width(text: &str) -> u16 {
@@ -11166,6 +15516,40 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn panic_report_includes_payload_and_backtrace_with_crlf() {
+        // The report must carry the panic payload and a backtrace, and use
+        // CRLF line endings: it is printed while the pty is still in raw
+        // mode (OPOST off), where a bare `\n` would not return the carriage.
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let report =
+            format_panic_report(&"thread 'main' panicked at src/main.rs:1:1:\nboom", &backtrace);
+        assert!(report.contains("thread 'main' panicked"), "{report}");
+        assert!(report.contains("\r\nboom\r\n"), "{report:?}");
+        // `report.contains("\nboom")` would match the correct `\r\nboom`
+        // (substring), so assert globally instead: after stripping every
+        // CRLF pair, no bare LF may remain.
+        assert!(
+            !report.replace("\r\n", "").contains('\n'),
+            "every line break must be CRLF (no bare LF): {report:?}"
+        );
+        assert!(report.contains("stack backtrace:"), "{report}");
+        assert!(report.contains("\r\nstack backtrace:\r\n"), "{report:?}");
+        assert!(report.ends_with("\r\n"), "{report:?}");
+    }
+
+    #[test]
+    fn panic_hook_runs_without_panicking_and_restores_after_report() {
+        // The hook must survive a real panic: it prints the report and
+        // restores the terminal without re-entering the panic machinery
+        // (a double panic would abort the process instead of unwinding).
+        install_panic_hook();
+        let result = std::panic::catch_unwind(|| {
+            panic!("pi-test: hook smoke");
+        });
+        assert!(result.is_err(), "the panic must unwind to the catcher");
+    }
+
     #[tokio::test]
     async fn attachment_routes_printable_enter_ctrl_c_and_consumes_detach() {
         let cwd = tempfile::tempdir().expect("cwd");
@@ -11561,6 +15945,99 @@ mod tests {
     }
 
     #[test]
+    fn slash_typed_char_inserts_first_and_refresh_uses_new_draft() {
+        // Regression: `/goa` then `l` must insert the `l` before the completion
+        // window recomputes from the new draft. A swallowed first `l` would
+        // leave `/goa` on screen and only surface as `/goall` after the second
+        // press — the reported user symptom.
+        let mut state = todo_test_state(Vec::new());
+        state.commands = BUILTIN_COMMANDS
+            .iter()
+            .map(|command| InteractiveCommand {
+                name: command.name.to_owned(),
+                description: command.description.to_owned(),
+                source: CommandSource::Builtin,
+            })
+            .collect();
+
+        // Typing the partial prefix `/goa` with the popup open the whole time.
+        for character in "/goa".chars() {
+            apply_classified_burst(&mut state, &character.to_string());
+        }
+        assert_eq!(state.editor.text(), "/goa");
+        assert!(
+            state
+                .completions
+                .items
+                .iter()
+                .any(|item| item.value == "/goal"),
+            "partial /goa draft must keep the popup open with /goal as a candidate"
+        );
+
+        // The typed `l` must land first; refresh then recomputes from `/goal`.
+        apply_classified_burst(&mut state, "l");
+        assert_eq!(state.editor.text(), "/goal");
+        assert!(
+            state
+                .completions
+                .selected()
+                .is_some_and(|item| item.value == "/goal"),
+            "refresh must recompute from the new draft and select the exact match"
+        );
+
+        // A second `l` inserts exactly once; refresh narrows `/goall` to zero
+        // matches, which closes the popup instead of keeping a stale window.
+        apply_classified_burst(&mut state, "l");
+        assert_eq!(state.editor.text(), "/goall");
+        assert!(
+            state.completions.items.is_empty(),
+            "refresh from /goall must find no candidate and close the popup"
+        );
+    }
+
+    #[test]
+    fn slash_accept_fills_missing_suffix_without_duplicating_typed_char() {
+        // Regression: accept on a partial `/goa` draft must insert only the
+        // missing suffix; a re-accept on the exact `/goal` draft must never
+        // append the candidate tail again (`/goall`), and a subsequently typed
+        // character must land exactly once.
+        let mut state = todo_test_state(Vec::new());
+        state.commands = BUILTIN_COMMANDS
+            .iter()
+            .map(|command| InteractiveCommand {
+                name: command.name.to_owned(),
+                description: command.description.to_owned(),
+                source: CommandSource::Builtin,
+            })
+            .collect();
+        for character in "/goa".chars() {
+            apply_classified_burst(&mut state, &character.to_string());
+        }
+        assert_eq!(state.editor.text(), "/goa");
+
+        // Tab/Enter accept on the partial draft: only the missing `l` lands.
+        assert!(!completion_already_matches_editor(&state));
+        state.accept_completion();
+        assert_eq!(state.editor.text(), "/goal");
+        assert!(state.completions.items.is_empty());
+
+        // Re-accept on the exact draft consumes the menu without rewriting, so
+        // the editor never becomes `/goall` from a duplicated tail.
+        state.refresh_completions();
+        assert!(completion_already_matches_editor(&state));
+        state.accept_completion();
+        assert_eq!(
+            state.editor.text(),
+            "/goal",
+            "exact accept must not duplicate the accepted candidate's tail"
+        );
+
+        // The user's own typed character after accept lands exactly once.
+        state.editor.insert_char('l');
+        assert_eq!(state.editor.text(), "/goall");
+    }
+
+    #[test]
     fn slash_completion_uses_primary_catalog_only() {
         let mut state = todo_test_state(Vec::new());
         // Full executable catalog stays on state for dispatch/source resolution.
@@ -11611,6 +16088,41 @@ mod tests {
         state.accept_completion();
         assert_eq!(state.editor.text(), "/settings");
         assert!(state.completions.items.is_empty());
+    }
+
+    #[test]
+    fn loop_completion_surfaces_subcommand_hints() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("/loop");
+        state.refresh_completions();
+        let loop_item = state
+            .completions
+            .items
+            .iter()
+            .find(|item| item.value == "/loop")
+            .expect("/loop must be completable from the primary catalog");
+        for hint in [
+            "list",
+            "cancel <id>",
+            "delete <id>",
+            "update <id>",
+            "create <interval> <prompt>",
+        ] {
+            assert!(
+                loop_item.label.contains(hint),
+                "/loop completion label must surface `{hint}`: {}",
+                loop_item.label
+            );
+        }
+        assert_eq!(
+            loop_item.value, "/loop",
+            "completion value must stay the bare command for insertion"
+        );
+        assert!(
+            loop_item.description.contains("recurring interval"),
+            "description must stay the plain one-liner: {}",
+            loop_item.description
+        );
     }
 
 
@@ -11686,10 +16198,15 @@ mod tests {
     #[test]
     fn paste_event_normalizes_multiline_crlf_and_preserves_unicode() {
         let mut state = todo_test_state(Vec::new());
+        let status_before = state.status.clone();
         handle_paste(&mut state, "first\r\né🙂\rthird");
         assert_eq!(state.editor.text(), "first\né🙂\nthird");
         assert_eq!((state.editor.row, state.editor.column), (2, "third".len()));
         assert!(state.transcript.is_empty(), "pasting must not submit a message");
+        assert_eq!(
+            state.status, status_before,
+            "pasting must be silent: no status-line update"
+        );
     }
 
     #[test]
@@ -11871,6 +16388,7 @@ mod tests {
 
                         finished_at: None,
                         result: None,
+                        soft_budget_exhausted: false,
                     },
                 },
             ));
@@ -11894,12 +16412,23 @@ mod tests {
             command: "dialog-smoke".to_owned(),
             result: Err("extension failed".to_owned()),
         });
-        assert!(state.status.contains("extension failed"));
+        // /run failures must surface the full error through the composer error
+        // toast (composer_error), which renders the complete text into the live
+        // PTY buffer. Routing the error through set_bounded_status would instead
+        // park it in `status`, where it is truncated to the composer-header
+        // column budget and the full message never reaches scrollback.
+        assert_eq!(
+            state.composer_error.as_deref(),
+            Some("/run dialog-smoke failed: extension failed")
+        );
+        assert!(!state.composer_error_is_warning);
+        assert_eq!(state.status, "Ran /dialog-smoke");
     }
 
     #[test]
     fn slash_completion_fuzzy_matches_and_accepts_selection() {
         let (background_tx, _background_rx) = mpsc::unbounded_channel();
+        let (live_events_tx, live_events_rx) = mpsc::unbounded_channel();
         let mut state = TuiState {
             tool_cards: ToolCardPresentationAdapter::new(),
             pty_attachment: None,
@@ -11912,6 +16441,7 @@ mod tests {
             prompt_history_draft: None,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            thinking_streaming: false,
             thinking_level: ThinkingLevel::Off,
             is_streaming: false,
             animation_frame: 0,
@@ -11922,7 +16452,10 @@ mod tests {
             last_escape: None,
             last_ctrl_c: None,
             expand_tools: false,
-            transcript_scroll: 0,
+            transcript_top_row: Cell::new(None),
+            scroll_anchor: Cell::new((0, 0)),
+            scroll_moved: Cell::new(false),
+            transcript_scroll_bottom: Cell::new(0),
             transcript_page_rows: Cell::new(1),
             show_images: true,
             image_width_cells: 50,
@@ -11930,6 +16463,7 @@ mod tests {
             extension_status_key: None,
             composer_error: None,
             composer_error_is_warning: false,
+            deferred_workflow_status: None,
             model: String::new(),
             cwd: String::new(),
             completions: CompletionState::default(),
@@ -11940,6 +16474,8 @@ mod tests {
             pending_attachments: Vec::new(),
             extension_ui: ExtensionUiAdapter::default(),
             extension_dialog: None,
+            extension_overlay: None,
+            pending_overlay_rows: None,
             background_tx,
             completion_generation: 0,
             completion_query: None,
@@ -11968,6 +16504,10 @@ mod tests {
             side_chat: None,
             side_chat_open: false,
             settings_value_input: None,
+            settings_enum_picker: None,
+            settings_boolean_picker: None,
+            settings_section: None,
+            settings_leaf_cursor: 0,
             tree_panel: None,
             process_panel: None,
             agents_panel: None,
@@ -11983,12 +16523,28 @@ mod tests {
             goal_state: GoalState::default(),
             active_loops: std::collections::BTreeMap::new(),
             seen_irc_message_ids: std::collections::HashSet::new(),
+            queued_steering: Vec::new(),
+            queued_follow_up: 0,
+            pending_ask: None,
             git_status: None,
             context_usage: None,
+            session_cost: 0.0,
+            session_tokens: None,
             last_footer_refresh: None,
             footer_refresh_in_flight: None,
             footer_refresh_pending: None,
             footer_refresh_current: None,
+            live: LiveUiState {
+                mode: LiveMode::Off,
+                recording: false,
+                events_tx: live_events_tx,
+                events_rx: live_events_rx,
+                control_tx: None,
+                settings: None,
+                stt: None,
+                delegating: false,
+                delegation_started: None,
+            },
         };
         state.editor.insert_char('/');
         state.editor.insert_char('m');
@@ -12001,7 +16557,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinate_completion_is_skill_only_and_consumes_every_printable_once() {
+    fn coordinate_completion_surfaces_via_generic_and_skill_prefixes() {
         assert!(
             visible_catalog()
                 .iter()
@@ -12015,15 +16571,17 @@ mod tests {
             description: "Coordinate work across agents".to_owned(),
             source: CommandSource::Skill,
         }];
+        // A generic prefix surfaces the matching skill command alongside the
+        // primary catalog instead of hiding it.
         state.editor.insert_text("/coord");
         state.refresh_completions();
         assert!(
-            !state
+            state
                 .completions
                 .items
                 .iter()
                 .any(|item| item.value == "/skill:coordinate"),
-            "skills must not pollute core command completion"
+            "generic prefix must surface matching skill commands"
         );
 
         state.editor.clear();
@@ -12042,6 +16600,178 @@ mod tests {
         state.accept_completion();
         assert_eq!(state.editor.text(), "/skill:coordinate");
         assert!(state.completions.items.is_empty());
+    }
+
+    #[test]
+    fn slash_ski_completion_lists_all_skills_and_narrows_as_typed() {
+        let mut state = todo_test_state(Vec::new());
+        state.commands = vec![
+            InteractiveCommand {
+                name: "skill:coordinate".to_owned(),
+                description: "Coordinate work across agents".to_owned(),
+                source: CommandSource::Skill,
+            },
+            InteractiveCommand {
+                name: "skill:research".to_owned(),
+                description: "Deep-dive codebase research".to_owned(),
+                source: CommandSource::Skill,
+            },
+        ];
+
+        // `/ski` surfaces every skill command with a `/skill:<name>` label.
+        state.editor.insert_text("/ski");
+        state.refresh_completions();
+        let items = state.completions.items.clone();
+        let values = items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items.len(),
+            2,
+            "/ski must list every loaded skill command: {values:?}"
+        );
+        assert!(
+            values.contains(&"/skill:coordinate"),
+            "/ski must include skill:coordinate: {values:?}"
+        );
+        assert!(
+            values.contains(&"/skill:research"),
+            "/ski must include skill:research: {values:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| item.label == item.value && item.value.starts_with("/skill:")),
+            "skill completion labels must stay /skill:<name>"
+        );
+
+        // Continuing to `/skill:coor` narrows the same list via the fuzzy filter.
+        state.editor.insert_text("ll:coor");
+        state.refresh_completions();
+        assert_eq!(
+            state
+                .completions
+                .items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/skill:coordinate"],
+            "extended prefix must narrow to the matching skill command"
+        );
+        assert_eq!(
+            state.completions.selected().map(|item| item.value.as_str()),
+            Some("/skill:coordinate"),
+            "narrowed list must preselect the matching skill"
+        );
+        state.accept_completion();
+        assert_eq!(state.editor.text(), "/skill:coordinate");
+        assert!(state.completions.items.is_empty());
+    }
+
+    #[test]
+    fn slash_completion_bare_slash_lists_skills_after_commands_in_order() {
+        let mut state = todo_test_state(Vec::new());
+        // Deliberately out of catalog order: the assembly must sort skills.
+        state.commands = vec![
+            InteractiveCommand {
+                name: "skill:zeta".to_owned(),
+                description: "Last skill".to_owned(),
+                source: CommandSource::Skill,
+            },
+            InteractiveCommand {
+                name: "skill:core".to_owned(),
+                description: "Core agent-browser guide".to_owned(),
+                source: CommandSource::Skill,
+            },
+            InteractiveCommand {
+                name: "skill:coordinate".to_owned(),
+                description: "Coordinate work across agents".to_owned(),
+                source: CommandSource::Skill,
+            },
+        ];
+        state.editor.set_text("/");
+        state.refresh_completions();
+        let values = state
+            .completions
+            .items
+            .iter()
+            .map(|item| item.value.clone())
+            .collect::<Vec<_>>();
+        let mut expected = visible_catalog()
+            .into_iter()
+            .map(|command| format!("/{}", command.name))
+            .collect::<Vec<_>>();
+        expected.extend(
+            ["/skill:coordinate", "/skill:core", "/skill:zeta"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert_eq!(
+            values, expected,
+            "bare slash must list primary commands in catalog order, then skills sorted by /skill:<name>"
+        );
+        // Deterministic across refreshes.
+        state.refresh_completions();
+        assert_eq!(
+            state
+                .completions
+                .items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "repeated refresh must not reorder the completion list"
+        );
+    }
+
+    #[test]
+    fn slash_completion_generic_prefix_surfaces_matching_skills_after_commands() {
+        let mut state = todo_test_state(Vec::new());
+        state.commands = vec![
+            InteractiveCommand {
+                name: "skill:coordinate".to_owned(),
+                description: "Coordinate work across agents".to_owned(),
+                source: CommandSource::Skill,
+            },
+            InteractiveCommand {
+                name: "skill:core".to_owned(),
+                description: "Core agent-browser guide".to_owned(),
+                source: CommandSource::Skill,
+            },
+        ];
+        state.editor.set_text("/co");
+        state.refresh_completions();
+        let values = state
+            .completions
+            .items
+            .iter()
+            .map(|item| item.value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                "/compact",
+                "/checkpoint",
+                "/code-review",
+                "/skill:coordinate",
+                "/skill:core",
+            ],
+            "/co must list fuzzy command matches first, then matching skills sorted by name"
+        );
+        // Narrowing past the command matches still exposes the skill.
+        state.editor.set_text("/coor");
+        state.refresh_completions();
+        assert_eq!(
+            state
+                .completions
+                .items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/skill:coordinate"],
+            "skill-only match must remain reachable through a generic prefix"
+        );
     }
 
     #[test]
@@ -12110,7 +16840,7 @@ mod tests {
 
     #[test]
     fn assistant_markdown_matches_shared_neutral_output_for_rich_blocks() {
-        let source = "# Heading\n\n1. ordered\n   - [x] nested\n\n| Name | Stat |\n| --- | ---: |\n| Tokyo | ✅ |\n\n[docs](https://example.test)\n\n```rust\nlet place = \"Tokyo\";\n```\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: fallback\n```";
+        let source = "# Heading\n\n1. ordered\n   - [x] nested\n\n| Name | Stat |\n| --- | ---: |\n| Tokyo | ✅ |\n\n[docs](https://example.test)\n\n```rust\nlet place = \"Tokyo\";\n```\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\ngantt\ntitle A Gantt Diagram\n```";
         let width = 40;
         let expected = pi_coding::markdown::render_markdown(
             source,
@@ -12124,7 +16854,7 @@ mod tests {
         };
         let mut lines = Vec::new();
         render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, width);
-        let rendered = lines[..lines.len() - 1]
+        let rendered = lines
             .iter()
             .map(|line| {
                 line.spans
@@ -12146,12 +16876,12 @@ mod tests {
     }
 
     #[test]
-    fn assistant_mermaid_source_fallback_keeps_closing_row_before_separator() {
+    fn assistant_mermaid_source_fallback_keeps_closing_row_as_final_row() {
         // A Mermaid source-fallback block must keep its `└─` closure as the
-        // final content row. The assistant path appends one trailing
-        // separator row after the content, so stripping it must yield exactly
-        // the shared neutral line sequence (closure included).
-        let source = "```mermaid\nsequenceDiagram\nA->>B: fallback\n```";
+        // final content row. The assistant path appends no trailing separator
+        // row, so the rendered lines must equal the shared neutral line
+        // sequence exactly (closure included, no blank tail).
+        let source = "```mermaid\ngantt\ntitle A Gantt Diagram\n```";
         let width = 40;
         let expected = pi_coding::markdown::render_markdown(
             source,
@@ -12170,10 +16900,10 @@ mod tests {
         let mut lines = Vec::new();
         render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, width);
         assert!(
-            lines.last().is_some_and(|line| line.spans.is_empty()),
-            "assistant entry ends with a trailing separator row: {lines:?}"
+            lines.last().is_some_and(|line| !line.spans.is_empty()),
+            "assistant entry must end on content with no trailing blank row: {lines:?}"
         );
-        let rendered = lines[..lines.len() - 1]
+        let rendered = lines
             .iter()
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
             .collect::<Vec<_>>();
@@ -12302,6 +17032,83 @@ mod tests {
     }
 
     #[test]
+    fn table_frames_use_card_border_color_and_stay_bounded_in_transcript() {
+        // User-reported: markdown tables rendered with a weaker border than the
+        // surrounding code/tool-card frames. Tables must frame with the same
+        // box-drawing chrome AND the same theme role as the cards
+        // (theme.tool_card_border) — never the dim md_code_block_border that
+        // disappears against the #0f1216 background.
+        let theme = crate::theme::DARK;
+        let width = 52u16;
+        let source = "| Field | Value |\n\
+                      | --- | --- |\n\
+                      | Architecture decision record | Explains why committed conversation stays separate from transient composer frames |\n\
+                      | Contributor guide | Shows maintainers how to extend rendering without losing semantic styles |";
+        let lines = render_transcript_markdown(source, theme, theme.text, width, false);
+        let texts = lines.iter().map(rendered_line_text).collect::<Vec<_>>();
+
+        // Complete card-consistent frame: top border, header separator, bottom
+        // border, and every body row carries side borders.
+        assert!(texts.first().is_some_and(|line| line.starts_with('┌')), "{texts:?}");
+        assert!(texts.last().is_some_and(|line| line.starts_with('└')), "{texts:?}");
+        assert!(
+            texts.iter().any(|line| line.starts_with('├') && line.contains('┼')),
+            "header separator must render: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .filter(|line| line.starts_with('│') && line.ends_with('│'))
+                .count()
+                >= 4,
+            "side borders on every row: {texts:?}"
+        );
+
+        // All rows share one width and stay within the render budget.
+        assert!(!texts.is_empty(), "table must render at width {width}");
+        let frame_width = display_width(&texts[0]);
+        assert!(
+            frame_width <= width,
+            "frame must stay width-bounded: {frame_width} > {width}: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|line| display_width(line) == frame_width),
+            "every table row must share the frame width: {texts:?}"
+        );
+
+        // Every border glyph uses the card frame color — never the dim
+        // md_code_block_border, never Reset. The per-glyph equality assertion
+        // also proves the frame is a single color.
+        let glyphs = "┌┬┐├┼┤│└┴┘─";
+        let mut border_glyph_spans = 0usize;
+        for line in &lines {
+            for span in &line.spans {
+                if span.content.chars().any(|c| glyphs.contains(c)) {
+                    border_glyph_spans += 1;
+                    assert_eq!(
+                        span.style.fg,
+                        Some(theme.tool_card_border),
+                        "border glyph must use the card frame color: {span:?}"
+                    );
+                }
+            }
+        }
+        assert!(border_glyph_spans > 0, "table must render border glyphs: {texts:?}");
+
+        // Long cells wrap inside the frame instead of overflowing or vanishing.
+        // Wrapping can split a phrase across rows, so assert per-row tokens.
+        assert!(
+            texts.iter().any(|line| line.contains("Architecture"))
+                && texts.iter().any(|line| line.contains("decision record")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|line| line.contains("Contributor guide")),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
     fn user_card_has_one_internal_padding_row_per_edge_without_extra_separator() {
         let prompt = "Can you put it in the background?";
         let entry = TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text(prompt)], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
@@ -12383,12 +17190,13 @@ mod tests {
         let mut reasoning_lines = Vec::new();
         render_transcript_entry(&mut reasoning_lines, &reasoning, true, true, crate::theme::DARK, 80,
         );
-        let labels = reasoning_lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .filter(|span| span.content.as_ref() == "thinking ·")
-            .count();
-        assert_eq!(labels, 1);
+        assert!(
+            reasoning_lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.content.as_ref() != "thinking ·"),
+            "thinking block must render without a 'thinking ·' label: {reasoning_lines:?}"
+        );
         assert!(reasoning_lines.iter().flat_map(|line| &line.spans).all(|span| {
             span.content.as_ref() != "Reasoning"
                 && !span.content.contains("Reasoning hidden")
@@ -12403,6 +17211,221 @@ mod tests {
         let answer_row = plain.iter().position(|line| line == "answer").unwrap();
         assert_eq!(answer_row, thinking_row + 2);
         assert_eq!(plain[thinking_row + 1], "");
+    }
+
+    #[test]
+    fn thinking_code_fence_keeps_full_frame_with_unclosed_marker() {
+        // User-reported: a code block inside a THINKING block must render a
+        // complete frame. The thinking override (every span forced through
+        // theme.thinking_text + italic) must keep the top border, the
+        // side-bordered body rows, and the temporary unclosed bottom marker —
+        // never a borderless `│ … │` stack while the fence is still open.
+        let theme = crate::theme::DARK;
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::thinking(
+                "```rust\nimpl Foo {\n    fn bar() {\n        let x = 1;\n    }\n}",
+            )],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: true,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, theme, 60);
+        let plain: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        // Complete frame: tool-card top with the language, side rows with the
+        // verbatim indentation, temporary bottom carrying the marker.
+        assert!(
+            plain.iter().any(|row| row.contains("╭── code · rust")),
+            "thinking fence must keep the top border: {plain:#?}"
+        );
+        for needle in ["impl Foo {", "    fn bar() {", "        let x = 1;", "    }", "}"] {
+            assert!(
+                plain.iter().any(|row| row.contains(needle)),
+                "thinking fence must keep the side-bordered body row {needle:?}: {plain:#?}"
+            );
+        }
+        assert!(
+            plain.iter().any(|row| row.contains("… (unclosed fence)")),
+            "thinking fence must keep the unclosed bottom marker: {plain:#?}"
+        );
+        assert!(
+            plain
+                .iter()
+                .rev()
+                .find(|row| !row.trim().is_empty())
+                .is_some_and(|row| row.starts_with("╰")),
+            "thinking fence must end with a bottom border row: {plain:#?}"
+        );
+        // The thinking override recolors the frame chrome (borders included)
+        // to theme.thinking_text + italic — the override must keep the frame.
+        for line in &lines {
+            if line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("… (unclosed fence)"))
+            {
+                assert_eq!(line.style.fg, Some(theme.thinking_text));
+                assert!(line.style.add_modifier.contains(Modifier::ITALIC));
+                for span in &line.spans {
+                    assert_eq!(span.style.fg, Some(theme.thinking_text));
+                    assert!(span.style.add_modifier.contains(Modifier::ITALIC));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unclosed_fence_in_manual_markdown_gets_marker_bottom() {
+        // The manual render_markdown path (user messages / tool text) is
+        // line-driven: a fence still open at end of text must still cap the
+        // frame with the temporary unclosed bottom instead of leaving the
+        // side-bordered rows dangling.
+        let theme = crate::theme::DARK;
+        // frame_width = 40 - 1 = 39 (user bubbles inset one trailing cell).
+        let lines = render_markdown("```json\n{\"a\":1}", theme, theme.user_message_text, 40);
+        let plain: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        assert_eq!(
+            plain,
+            vec![
+                format!("╭── code · json ──{}╮", "─".repeat(20)),
+                format!("│ {{\"a\":1}}{} │", " ".repeat(28)),
+                format!("╰── … (unclosed fence) ──{}╯", "─".repeat(13)),
+            ]
+        );
+        assert!(
+            plain.iter().all(|row| display_width(row) <= 40),
+            "unclosed frame rows must stay width-bounded: {plain:#?}"
+        );
+        // A closed fence keeps the plain bottom border — unchanged.
+        let closed = render_markdown(
+            "```json\n{\"a\":1}\n```",
+            theme,
+            theme.user_message_text,
+            40,
+        );
+        let closed_plain: Vec<String> = closed.iter().map(rendered_line_text).collect();
+        assert!(
+            closed_plain
+                .last()
+                .is_some_and(|row| row.starts_with("╰") && !row.contains("unclosed")),
+            "closed fences keep the plain bottom border: {closed_plain:#?}"
+        );
+        // Every frame row — titled top, side-bordered body, plain bottom —
+        // shares the frame_width budget: the plain bottom must not overhang
+        // the content rows (it used to emit frame_width dashes + 2 corners).
+        assert_eq!(
+            closed_plain,
+            vec![
+                format!("╭── code · json ──{}╮", "─".repeat(20)),
+                format!("│ {{\"a\":1}}{} │", " ".repeat(28)),
+                format!("╰{}╯", "─".repeat(37)),
+            ],
+            "closed fence rows must all be {frame_width} wide: {closed_plain:#?}",
+            frame_width = 39,
+        );
+    }
+
+    #[test]
+    fn manual_render_markdown_tab_indented_fence_aligns() {
+        // A tab inside a fenced line must expand before wrapping/measuring
+        // (RC2): the shared verbatim wrapper expands tabs to four spaces, so
+        // every frame row is exactly frame_width instead of overflowing by
+        // the tab stop.
+        let theme = crate::theme::DARK;
+        let lines = render_markdown(
+            "```\n\tindented\n  two\n```",
+            theme,
+            theme.user_message_text,
+            30,
+        );
+        let plain: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        assert!(
+            plain.iter().any(|row| row.contains("    indented")),
+            "tab must expand to four spaces in the body: {plain:#?}"
+        );
+        for row in &plain {
+            assert_eq!(
+                display_width(row),
+                29,
+                "every frame row must be exactly frame_width=29: {plain:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_render_markdown_wide_char_narrow_no_overflow() {
+        // A single cluster wider than the content band must clamp to the
+        // ellipsis (RC1 on the tui.rs path) so the right border never lands
+        // past the bottom corner.
+        let theme = crate::theme::DARK;
+        let lines = render_markdown("```\n你\n```", theme, theme.user_message_text, 6);
+        let plain: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        assert!(
+            plain.iter().any(|row| row.contains('…')),
+            "overflow row must clamp to the ellipsis: {plain:#?}"
+        );
+        for row in &plain {
+            assert_eq!(
+                display_width(row),
+                5,
+                "every frame row must be exactly frame_width=5: {plain:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_card_frame_not_split_by_flag_rewrap() {
+        // A user message whose code fence contains a regional-flag grapheme
+        // must keep the finished frame intact: the card re-wrap passes rows
+        // that already fit through untouched and never splits a grapheme
+        // (RC3b) — exactly one top border, one bottom border, one body row,
+        // and the body row keeps its right `│`.
+        let theme = crate::theme::DARK;
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("```\n🇯🇵 flag\n```")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, theme, 30);
+        let plain: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        assert_eq!(
+            plain.iter().filter(|row| row.contains('╭')).count(),
+            1,
+            "exactly one top border: {plain:#?}"
+        );
+        assert_eq!(
+            plain.iter().filter(|row| row.contains('╰')).count(),
+            1,
+            "exactly one bottom border: {plain:#?}"
+        );
+        let body = plain
+            .iter()
+            .filter(|row| row.trim_start().starts_with("│ "))
+            .collect::<Vec<_>>();
+        assert_eq!(body.len(), 1, "exactly one body row: {plain:#?}");
+        assert!(
+            body[0].contains("🇯🇵"),
+            "flag must stay intact in the body row: {:?}",
+            body[0]
+        );
+        assert!(
+            body[0].trim_end().ends_with('│'),
+            "body row must keep its right border: {:?}",
+            body[0]
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(body[0].as_str()),
+            30,
+            "body row must be exactly 30 wide: {plain:#?}"
+        );
     }
 
     #[test]
@@ -12421,6 +17444,64 @@ mod tests {
             }));
         }
     }
+    #[test]
+    fn transcript_rendering_redacts_credential_shapes_but_keeps_plain_text() {
+        let ghp = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let sk = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let assistant = TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text(format!("deploy with {ghp}")), ContentBlock::thinking(format!("thinking about {sk}"))], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+        };
+        let user = TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text("login with token=abc123 please")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+        };
+        let plain = TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text("ordinary conversation prose")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+        };
+
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &assistant, true, true, crate::theme::DARK, 80);
+        render_transcript_entry(&mut lines, &user, true, true, crate::theme::DARK, 80);
+        render_transcript_entry(&mut lines, &plain, true, true, crate::theme::DARK, 80);
+        let text = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        for leaked in [ghp.as_str(), sk.as_str(), "abc123"] {
+            assert!(!text.contains(leaked), "{leaked:?} leaked into transcript render");
+        }
+        assert_eq!(text.matches("[REDACTED]").count(), 3);
+        assert!(text.contains("ordinary conversation prose"));
+    }
+
+    #[test]
+    fn tool_card_rendering_redacts_output_and_command_credentials() {
+        use pi_agent::AgentToolResult;
+        let ghp = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let sk = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash-secret".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({"command": format!("curl -H 'Authorization: Bearer xyz789' api")}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash-secret".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text(format!("output echoed {ghp} and {sk}")),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, true, crate::theme::DARK, 80,
+        );
+        let text = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        for leaked in [ghp.as_str(), sk.as_str(), "xyz789"] {
+            assert!(!text.contains(leaked), "{leaked:?} leaked into tool card render");
+        }
+        assert_eq!(text.matches("[REDACTED]").count(), 3);
+    }
+
     #[test]
     fn custom_transcript_uses_custom_theme_roles() {
         let entry = TranscriptEntry { kind: TranscriptKind::Custom, content: vec![ContentBlock::text("extension notice")], tool_name: Some("release-note".to_owned()), tool_card: None, job_card: None, is_error: false, is_partial: false,
@@ -12491,9 +17572,9 @@ mod tests {
                 line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
             }).collect::<Vec<_>>();
         let compact_text = compact_lines.concat();
-        assert_eq!(compact_lines.iter().filter(|line| line.contains("Bash")).count(), 1);
+        assert_eq!(compact_lines.iter().filter(|line| line.contains("Bash")).count(), 0, "bash cards carry no tool-name title");
         assert!(compact_text.contains("$ seq 1 30"));
-        assert!(compact_text.contains("… 11 more lines ⟦Ctrl+O: Expand⟧"));
+        assert!(compact_text.contains("… 20 more lines ⟦Ctrl+O: Expand⟧"));
         assert!(!compact_text.to_ascii_lowercase().contains("bash done"));
         assert!(!compact_lines.iter().any(|line| line.contains("bash")));
         let mut expanded = Vec::new();
@@ -12544,6 +17625,545 @@ mod tests {
         assert!(exact.contains("let count: usize = parse(42);"));
         let colors = code_line.spans.iter().filter_map(|span| span.style.fg).collect::<HashSet<_>>();
         assert!(colors.len() >= 4, "read output must retain semantic syntax differentiation");
+    }
+
+    #[test]
+    fn bash_card_renders_command_row_output_separator_and_fold_hint() {
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        let body = (1..=30).map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({"command": "seq 1 30"}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text(body),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        assert_eq!(rendered.iter().filter(|line| line.starts_with("╭── ")).count(), 0, "bash cards use a plain top border, no title");
+        assert!(rendered.iter().any(|line| line.starts_with('╭')), "plain top border must render");
+        assert!(!rendered.iter().any(|line| line.contains("Bash")), "no tool-name title on bash cards");
+        let command_index = rendered.iter().position(|line| line.contains("$ seq 1 30")).expect("command row");
+        let output_index = rendered.iter().position(|line| line.contains("Output")).expect("output separator");
+        let fold_index = rendered.iter().position(|line| line.contains("… 20 more lines ⟦Ctrl+O: Expand⟧")).expect("fold hint");
+        assert!(command_index < output_index && output_index < fold_index,
+            "expected $ command < Output < fold hint, got indices {command_index} {output_index} {fold_index}");
+    }
+
+    #[test]
+    fn read_card_file_truncation_and_collapse_shows_single_fold_notice() {
+        // User-reported duplicate: a truncated read card rendered both the
+        // file's "[N more lines in file. Use offset=…]" notice and the fold
+        // footer. The card drops the offset line, so the fold footer is the
+        // only "more lines" notice.
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        let body = (1..=10).map(|line| format!("line-{line}")).collect::<Vec<_>>().join("\n");
+        let content = format!("{body}\n\n[4320 more lines in file. Use offset=3885 to continue.]");
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "trunc-read".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({"path": "big.txt"}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "trunc-read".to_owned(),
+            tool_name: "read".to_owned(),
+            result: AgentToolResult::text(content),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        assert_eq!(
+            rendered.iter().filter(|row| row.contains("more lines")).count(),
+            1,
+            "exactly one more-lines notice: {rendered:#?}"
+        );
+        assert!(rendered.iter().any(|row| row.contains("… 5 more lines ⟦Ctrl+O: Expand⟧")),
+            "fold footer must be the single notice: {rendered:#?}");
+        assert!(!rendered.iter().any(|row| row.contains("Use offset=")),
+            "file offset notice must not render: {rendered:#?}");
+    }
+
+    #[test]
+    fn read_card_collapse_without_file_truncation_keeps_fold_footer() {
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        let body = (1..=10).map(|line| format!("line-{line}")).collect::<Vec<_>>().join("\n");
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "fold-read".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({"path": "mid.txt"}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "fold-read".to_owned(),
+            tool_name: "read".to_owned(),
+            result: AgentToolResult::text(body),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        assert!(rendered.iter().any(|row| row.contains("… 4 more lines ⟦Ctrl+O: Expand⟧")),
+            "fold footer must render for a plain collapse: {rendered:#?}");
+        assert!(!rendered.iter().any(|row| row.contains("Use offset=")),
+            "no file-level notice on a plain collapse: {rendered:#?}");
+    }
+
+    #[test]
+    fn read_card_file_truncation_without_collapse_shows_no_more_lines_notice() {
+        // A short read whose result ends with the offset notice but stays
+        // under the fold budget: the notice is dropped and nothing collapses,
+        // so no "more lines" wording renders at all.
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        let content = "line-1\nline-2\n\n[5 more lines in file. Use offset=3 to continue.]";
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "short-read".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({"path": "small-limit.txt"}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "short-read".to_owned(),
+            tool_name: "read".to_owned(),
+            result: AgentToolResult::text(content),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        assert!(!rendered.iter().any(|row| row.contains("more lines")),
+            "no more-lines notice when nothing is collapsed: {rendered:#?}");
+        assert!(!rendered.iter().any(|row| row.contains("Use offset=")),
+            "file offset notice must not render: {rendered:#?}");
+    }
+
+    #[test]
+    fn bash_card_multiline_command_renders_lines_intact_with_single_dollar() {
+        // Strips the `│ ` / ` │` card frame and fill padding from one
+        // rendered row, leaving its text content.
+        fn row_text(row: &str) -> &str {
+            row.strip_prefix("│ ").unwrap_or(row).strip_suffix(" │").unwrap_or(row).trim()
+        }
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({"command": "CA=/tmp/oh-my-pi\n# session-context\nbuildrg -n \"export fu\""}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text("match-1"),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        // User-reported flattening: a raw line feed must never survive inside
+        // a rendered row (it painted as a garbled control character).
+        assert!(!rendered.iter().any(|line| line.contains('\n')), "no raw LF may reach a rendered row: {rendered:?}");
+        let top = rendered.iter().position(|line| line.starts_with('╭')).expect("top border");
+        let output = rendered.iter().position(|line| line.contains("Output")).expect("output separator");
+        let command_rows = &rendered[top + 1..output];
+        assert_eq!(command_rows.len(), 3, "one row per command line: {rendered:?}");
+        assert!(row_text(&command_rows[0]).starts_with("$ CA=/tmp/oh-my-pi"), "env assignment on the first row: {command_rows:?}");
+        assert!(row_text(&command_rows[1]).starts_with("# session-context"), "comment line kept: {command_rows:?}");
+        assert!(row_text(&command_rows[2]).starts_with("buildrg -n \"export fu\""), "third line kept: {command_rows:?}");
+        // The `$ ` prefix appears on the first command row only.
+        assert!(!command_rows[1].contains('$'), "no $ prefix on continuation rows: {command_rows:?}");
+        assert!(!command_rows[2].contains('$'), "no $ prefix on continuation rows: {command_rows:?}");
+        let command_text = command_rows.concat();
+        assert!(command_text.contains("CA=/tmp/oh-my-pi"), "full command text renders: {command_text:?}");
+        assert!(command_text.contains("# session-context"), "comment renders: {command_text:?}");
+    }
+
+    #[test]
+    fn bash_card_leading_comments_render_on_frame_and_dollar_starts_command() {
+        // Strips the `│ ` / ` │` card frame and fill padding from one
+        // rendered row, leaving its text content.
+        fn row_text(row: &str) -> &str {
+            row.strip_prefix("│ ").unwrap_or(row).strip_suffix(" │").unwrap_or(row).trim()
+        }
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({"command": "# Key layering of sibling crates\n# cargo workspace first\n# third dropped\necho a\n# i1\necho b\necho c\necho d\necho e"}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text("ok"),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        // The first leading comment titles the top border; the second renders
+        // as a frame row above the command; deeper ones are dropped (bounded).
+        let top = rendered.iter().position(|line| line.starts_with('╭')).expect("top border");
+        assert!(rendered[top].contains("# Key layering of sibling crates"), "first comment on the top border: {:?}", rendered[top]);
+        assert!(!rendered[top].contains('$'), "no $ on the border: {:?}", rendered[top]);
+        let output = rendered.iter().position(|line| line.contains("Output")).expect("output separator");
+        let rows = &rendered[top + 1..output];
+        assert_eq!(rows.len(), 5, "one comment frame row + 4 bounded command rows: {rendered:?}");
+        assert!(row_text(&rows[0]).starts_with("# cargo workspace first"), "second comment as a frame row: {rows:?}");
+        assert!(!rows[0].contains('$'), "comment frame row has no $ prefix: {rows:?}");
+        assert!(row_text(&rows[1]).starts_with("$ echo a"), "$ starts the first real command: {rows:?}");
+        assert!(row_text(&rows[2]).starts_with("# i1"), "interior comment stays in the body: {rows:?}");
+        assert!(!rows[2].contains('$'), "interior comment has no $ prefix: {rows:?}");
+        assert!(row_text(&rows[3]).starts_with("echo b"), "body line kept: {rows:?}");
+        assert_eq!(row_text(&rows[4]), "…", "fold marker closes the body: {rows:?}");
+        let joined = rows.concat();
+        assert!(!joined.contains("$ #"), "a comment must never ride the $ row: {rows:?}");
+        assert!(!joined.contains("third dropped"), "comments past the second are dropped (bounded): {rows:?}");
+        assert!(!joined.contains("echo c"), "dropped body tail must not render: {rows:?}");
+    }
+
+    #[test]
+    fn bash_card_only_comment_command_titles_border_and_keeps_prompt() {
+        fn row_text(row: &str) -> &str {
+            row.strip_prefix("│ ").unwrap_or(row).strip_suffix(" │").unwrap_or(row).trim()
+        }
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({"command": "# just a comment"}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text("ok"),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        let top = rendered.iter().position(|line| line.starts_with('╭')).expect("top border");
+        assert!(rendered[top].contains("# just a comment"), "comment titles the border: {:?}", rendered[top]);
+        let output = rendered.iter().position(|line| line.contains("Output")).expect("output separator");
+        let rows = &rendered[top + 1..output];
+        assert_eq!(rows.len(), 1, "empty body keeps only the prompt row: {rendered:?}");
+        assert_eq!(row_text(&rows[0]), "$", "prompt row for a comment-only command: {rows:?}");
+    }
+
+    #[test]
+    fn bash_card_leading_comment_title_truncates_to_border_width() {
+        fn row_text(row: &str) -> &str {
+            row.strip_prefix("│ ").unwrap_or(row).strip_suffix(" │").unwrap_or(row).trim()
+        }
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        let comment = format!("# {}", "x".repeat(60));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({ "command": format!("{comment}\necho hi") }),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text("ok"),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 40,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        let top = rendered.iter().position(|line| line.starts_with('╭')).expect("top border");
+        assert_eq!(display_width(&rendered[top]), 40, "title border fills exactly one row: {:?}", rendered[top]);
+        assert!(rendered[top].starts_with("╭── # "), "title keeps the # marker: {:?}", rendered[top]);
+        assert!(rendered[top].contains('…'), "over-long comment truncates with an ellipsis: {:?}", rendered[top]);
+        assert!(rendered[top].ends_with("──╮"), "border frame intact: {:?}", rendered[top]);
+        assert!(rendered[top + 1].contains("$ echo hi"), "$ row starts the command: {:?}", rendered[top + 1]);
+    }
+
+    #[test]
+    fn bash_card_interior_comments_stay_in_body_with_plain_border() {
+        fn row_text(row: &str) -> &str {
+            row.strip_prefix("│ ").unwrap_or(row).strip_suffix(" │").unwrap_or(row).trim()
+        }
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({"command": "echo first\n# interior note\necho last"}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text("ok"),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        let top = rendered.iter().position(|line| line.starts_with('╭')).expect("top border");
+        assert!(!rendered[top].starts_with("╭── "), "no comment title: plain top border: {:?}", rendered[top]);
+        assert!(!rendered[top].contains('#'), "border carries no comment: {:?}", rendered[top]);
+        let output = rendered.iter().position(|line| line.contains("Output")).expect("output separator");
+        let rows = &rendered[top + 1..output];
+        assert_eq!(rows.len(), 3, "one row per body line: {rendered:?}");
+        assert!(row_text(&rows[0]).starts_with("$ echo first"), "first line with $: {rows:?}");
+        assert!(row_text(&rows[1]).starts_with("# interior note"), "interior comment stays in the body: {rows:?}");
+        assert!(!rows[1].contains('$'), "no $ on the interior comment: {rows:?}");
+        assert!(row_text(&rows[2]).starts_with("echo last"), "last line kept: {rows:?}");
+    }
+
+    #[test]
+    fn bash_card_long_multiline_command_folds_with_ellipsis_marker() {
+        fn row_text(row: &str) -> &str {
+            row.strip_prefix("│ ").unwrap_or(row).strip_suffix(" │").unwrap_or(row).trim()
+        }
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        let command = (1..=6).map(|n| format!("step-{n}")).collect::<Vec<_>>().join("\n");
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({ "command": command }),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text("out"),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        let top = rendered.iter().position(|line| line.starts_with('╭')).expect("top border");
+        let output = rendered.iter().position(|line| line.contains("Output")).expect("output separator");
+        let command_rows = &rendered[top + 1..output];
+        assert_eq!(command_rows.len(), 4, "bounded to 4 command rows: {rendered:?}");
+        assert!(row_text(&command_rows[0]).starts_with("$ step-1"), "first line with $: {command_rows:?}");
+        assert!(row_text(&command_rows[1]).starts_with("step-2"), "second line kept: {command_rows:?}");
+        assert!(row_text(&command_rows[2]).starts_with("step-3"), "third line kept: {command_rows:?}");
+        assert_eq!(row_text(&command_rows[3]), "…", "fold marker closes the command: {command_rows:?}");
+        // No raw LF anywhere, and the whole six-line command is not shown.
+        assert!(!rendered.iter().any(|line| line.contains('\n')), "no raw LF: {rendered:?}");
+        assert!(!command_rows.concat().contains("step-4"), "dropped tail must not render: {command_rows:?}");
+    }
+
+    #[test]
+    fn bash_card_long_single_line_command_still_wraps_and_folds() {
+        fn row_text(row: &str) -> &str {
+            row.strip_prefix("│ ").unwrap_or(row).strip_suffix(" │").unwrap_or(row).trim()
+        }
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        let command = (1..=60).map(|n| format!("arg{n}")).collect::<Vec<_>>().join(" ");
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({ "command": command }),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text("out"),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 40,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        assert!(!rendered.iter().any(|line| line.contains('\n')), "no raw LF: {rendered:?}");
+        let top = rendered.iter().position(|line| line.starts_with('╭')).expect("top border");
+        let output = rendered.iter().position(|line| line.contains("Output")).expect("output separator");
+        let command_rows = &rendered[top + 1..output];
+        assert_eq!(command_rows.len(), 4, "long single line bounded to 4 rows: {rendered:?}");
+        assert!(row_text(&command_rows[0]).starts_with("$ "), "first wrap row carries $: {command_rows:?}");
+        assert_eq!(row_text(&command_rows[3]), "…", "wrap tail folds with the marker: {command_rows:?}");
+        assert!(!command_rows[1].contains('$'), "no $ on continuation rows: {command_rows:?}");
+        assert!(!command_rows[2].contains('$'), "no $ on continuation rows: {command_rows:?}");
+    }
+
+    #[test]
+    fn bash_card_leading_comment_secret_redacted_in_frame_title() {
+        // A bash comment that carries a credential becomes the card's frame
+        // title, so it must be redacted like every other command text — the
+        // raw token must never leak onto the border or any frame row.
+        use pi_agent::AgentToolResult;
+        let secret = ["s", "k-test-", "secret-token-value"].concat();
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({
+                "command": format!(
+                    "# pull token {secret}\ncurl -H \"Authorization: Bearer {secret}\" /api"
+                ),
+            }),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text("ok"),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        assert!(
+            !rendered.iter().any(|row| row.contains(&secret)),
+            "raw secret must never render: {rendered:?}"
+        );
+        let top = rendered.iter().position(|row| row.starts_with('╭')).expect("top border");
+        assert!(
+            rendered[top].starts_with("╭── # pull token"),
+            "comment keeps its readable prefix on the border: {:?}",
+            rendered[top]
+        );
+        assert!(
+            rendered[top].contains("[REDACTED]"),
+            "frame title must carry the redacted comment: {:?}",
+            rendered[top]
+        );
+        let output = rendered.iter().position(|row| row.contains("Output")).expect("output separator");
+        let command_rows = &rendered[top + 1..output];
+        assert!(
+            command_rows.iter().any(|row| row.contains("$ curl")),
+            "$ row must render the redacted command: {command_rows:?}"
+        );
+        let joined = rendered.concat();
+        assert!(
+            !joined.contains(&secret),
+            "secret leaked into any frame row: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn bash_card_full_layout_stays_within_row_budget() {
+        // The bash card is bounded to a 20-row total: 1 top border + up to 4
+        // command rows + 1 " Output " separator + 10 content rows + 1 fold
+        // hint + 1 bottom border. A long command AND a long output together
+        // must never blow the budget — neither the adapter's content cap nor
+        // the renderer's command-row cap may be bypassed.
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        let command = (1..=6).map(|n| format!("step-{n}")).collect::<Vec<_>>().join("\n");
+        let body = (1..=30).map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({ "command": command }),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            result: AgentToolResult::text(body),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        let top = rendered.iter().position(|row| row.starts_with('╭')).expect("top border");
+        let bottom = rendered.iter().rposition(|row| row.starts_with('╰')).expect("bottom border");
+        let card_rows = &rendered[top..=bottom];
+        assert!(
+            card_rows.len() <= 20,
+            "bash card must stay within the 20-row budget, got {} rows: {card_rows:?}",
+            card_rows.len()
+        );
+        assert!(
+            card_rows.iter().any(|row| row.contains("… 20 more lines")),
+            "fold hint must render for the 20 omitted content lines: {card_rows:?}"
+        );
+        let hint = card_rows.iter().position(|row| row.contains("… 20 more lines")).expect("fold hint");
+        assert_eq!(
+            card_rows.len() - 1,
+            hint + 1,
+            "fold hint must be the last interior row before the bottom border: {card_rows:?}"
+        );
+    }
+
+    #[test]
+    fn skill_read_card_renders_name_title_and_description_prose() {
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "skill".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({"path": "skill://research"}),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "skill".to_owned(),
+            tool_name: "read".to_owned(),
+            result: AgentToolResult::text("---\nname: research\ndescription: \"Deep-dive codebase researcher.\"\n---\n# Research\n\nBody text."),
+            is_error: false,
+        }));
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, state.transcript.last().unwrap(), true, false, crate::theme::DARK, 80,
+        );
+        let rendered = lines.iter().map(|line| {
+                line.spans.iter().map(|span| span.content.as_ref()).collect::<String>()
+            }).collect::<Vec<_>>();
+        assert!(rendered.iter().any(|line| line.starts_with("╭── • research")), "skill name must be the card title: {rendered:?}");
+        let title_index = rendered.iter().position(|line| line.starts_with("╭── • research")).expect("skill title");
+        let separator_index = rendered.iter().position(|line| line.starts_with("├──")).expect("title/body separator");
+        let description_index = rendered.iter().position(|line| line.contains("Deep-dive codebase researcher.")).expect("description prose");
+        assert!(title_index < separator_index && separator_index < description_index,
+            "expected title < separator < description, got indices {title_index} {separator_index} {description_index}");
+        let text = rendered.concat();
+        assert!(!text.contains("name: research"), "raw frontmatter name must not render: {rendered:?}");
+        assert!(!text.contains("description:"), "raw frontmatter description must not render: {rendered:?}");
+        assert!(!text.contains("---"), "frontmatter delimiters must not render: {rendered:?}");
+        assert!(!rendered.iter().any(|line| line.starts_with("╰") && !line.ends_with("╯")));
+        // Body prose renders in the muted tool_output role, never the accent.
+        let body_span = lines.iter().flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("Deep-dive codebase researcher."))
+            .expect("description span");
+        assert_eq!(body_span.style.fg, Some(crate::theme::DARK.tool_output));
     }
 
     fn interaction(request: ExtensionUiRequest) -> ExtensionUiInteraction {
@@ -12626,6 +18246,487 @@ mod tests {
         let mut state = todo_test_state(Vec::new());
         state.extension_ui = adapter;
         state
+    }
+
+    fn overlay_test_state(rows: Vec<pi_coding::OverlayRow>) -> TuiState {
+        overlay_test_state_full(rows, None, false)
+    }
+
+    /// Overlay fixture with the interactive extras: an optional merged input
+    /// config and the non-capturing focus mode.
+    fn overlay_test_state_full(
+        rows: Vec<pi_coding::OverlayRow>,
+        input: Option<OverlayInput>,
+        non_capturing: bool,
+    ) -> TuiState {
+        let mut state = todo_test_state(Vec::new());
+        state.open_extension_overlay(
+            &pi_coding::ExtensionInstanceId {
+                extension_id: "demo".to_owned(),
+                generation: 3,
+            },
+            "chat",
+            "Side Chat",
+            rows,
+            input,
+            non_capturing,
+        );
+        state
+    }
+
+    /// Minimal application for key-routing tests: the overlay handlers need
+    /// an `&Application` to reach the extension runtime (absent here, so
+    /// submit/key dispatch is a no-op and the host-side routing is what the
+    /// tests observe).
+    async fn overlay_test_application() -> Application {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: cwd.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        }).expect("session");
+        Application::new(session).await
+    }
+
+    #[tokio::test]
+    async fn extension_overlay_esc_closes_and_returns_focus_to_composer() {
+        let application = overlay_test_application().await;
+        let mut state = overlay_test_state(vec![pi_coding::OverlayRow::Plain("row".to_owned())]);
+        assert!(page_overlay_open(&state), "an open overlay is a page overlay");
+        assert_eq!(
+            handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await,
+            Some(false),
+            "the exclusive overlay consumes Esc"
+        );
+        assert!(state.extension_overlay.is_none(), "Esc must close the overlay");
+        assert!(!page_overlay_open(&state), "focus returns to the composer");
+        assert_eq!(state.status, "Ready");
+    }
+
+    #[tokio::test]
+    async fn extension_overlay_scrolls_when_rows_overflow_and_consumes_other_keys() {
+        let application = overlay_test_application().await;
+        let rows = (0..50)
+            .map(|index| pi_coding::OverlayRow::Plain(format!("row-{index}")))
+            .collect::<Vec<_>>();
+        let mut state = overlay_test_state(rows);
+        let overlay = state.extension_overlay.as_ref().expect("overlay open");
+        assert_eq!(overlay.scroll, 0);
+        // ↑ at the top is a no-op.
+        assert_eq!(handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).await, Some(false));
+        assert_eq!(state.extension_overlay.as_ref().expect("overlay").scroll, 0);
+        // ↓ scrolls down; j/k are aliases.
+        assert_eq!(handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).await, Some(false));
+        assert_eq!(state.extension_overlay.as_ref().expect("overlay").scroll, 1);
+        assert_eq!(handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)).await, Some(false));
+        assert_eq!(state.extension_overlay.as_ref().expect("overlay").scroll, 2);
+        assert_eq!(handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)).await, Some(false));
+        assert_eq!(state.extension_overlay.as_ref().expect("overlay").scroll, 1);
+        // End jumps to the last row; further ↓ clamps.
+        assert_eq!(handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::End, KeyModifiers::NONE)).await, Some(false));
+        assert_eq!(state.extension_overlay.as_ref().expect("overlay").scroll, 49);
+        assert_eq!(handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).await, Some(false));
+        assert_eq!(state.extension_overlay.as_ref().expect("overlay").scroll, 49);
+        // A printable character is consumed by the overlay, never the composer.
+        assert_eq!(handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).await, Some(false));
+        assert!(state.editor.is_empty(), "overlay must consume printable input");
+    }
+
+    #[tokio::test]
+    async fn extension_overlay_live_set_rows_repaints_open_overlay_without_reopen() {
+        use pi_coding::{ExtensionCancellation, ExtensionUiHost};
+        let adapter = ExtensionUiAdapter::new();
+        let mut events = adapter.subscribe();
+        let mut state = dialog_test_state(adapter.clone());
+        // Open the overlay first (content-only fixture).
+        state.open_extension_overlay(
+            &pi_coding::ExtensionInstanceId {
+                extension_id: "demo".to_owned(),
+                generation: 3,
+            },
+            "chat",
+            "Side Chat",
+            vec![pi_coding::OverlayRow::Plain("initial".to_owned())],
+            None,
+            false,
+        );
+        // setRows publishes OverlayRowsChanged; the open overlay queues it.
+        adapter
+            .request(
+                tui_context(3),
+                ExtensionUiRequest::OverlaySetRows {
+                    id: "chat".to_owned(),
+                    rows: vec![pi_coding::OverlayRow::Plain("live-one".to_owned())],
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .expect("setRows succeeds");
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        assert!(
+            state.pending_overlay_rows.is_some(),
+            "rows for the open overlay must queue"
+        );
+        // A second setRows replaces the pending payload (latest-wins
+        // coalescing); nothing is applied until the flush.
+        adapter
+            .request(
+                tui_context(3),
+                ExtensionUiRequest::OverlaySetRows {
+                    id: "chat".to_owned(),
+                    rows: vec![pi_coding::OverlayRow::Plain("live-two".to_owned())],
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .expect("setRows succeeds");
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        assert_eq!(
+            state.extension_overlay.as_ref().expect("overlay").rows[0].text(),
+            "initial",
+            "queued rows must not apply before the coalescing flush"
+        );
+        assert!(state.flush_pending_overlay_rows(), "flush applies the latest rows");
+        let overlay = state.extension_overlay.as_ref().expect("overlay");
+        assert_eq!(
+            overlay.rows[0].text(),
+            "live-two",
+            "the open overlay must re-render with the new rows WITHOUT close/reopen"
+        );
+        // Rows for a different overlay id are ignored while 'chat' is open.
+        adapter
+            .request(
+                tui_context(3),
+                ExtensionUiRequest::OverlaySetRows {
+                    id: "other".to_owned(),
+                    rows: vec![pi_coding::OverlayRow::Plain("ignored".to_owned())],
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .expect("setRows succeeds");
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        assert!(
+            state.pending_overlay_rows.is_none(),
+            "rows for a non-open overlay id must be dropped"
+        );
+    }
+
+    #[test]
+    fn extension_overlay_set_rows_updates_content_and_clamps_scroll() {
+        let mut state = overlay_test_state(vec![pi_coding::OverlayRow::Plain("old".to_owned())]);
+        state.extension_overlay.as_mut().expect("overlay").scroll = 5;
+        state
+            .extension_overlay
+            .as_mut()
+            .expect("overlay")
+            .set_rows(vec![pi_coding::OverlayRow::Plain("new".to_owned())]);
+        let overlay = state.extension_overlay.as_ref().expect("overlay");
+        assert_eq!(overlay.rows[0].text(), "new");
+        assert_eq!(overlay.scroll, 0, "scroll must clamp to the new content");
+    }
+
+    #[tokio::test]
+    async fn extension_overlay_input_editor_typing_submit_and_scroll_actions() {
+        let application = overlay_test_application().await;
+        let mut state = overlay_test_state_full(
+            (0..20)
+                .map(|index| pi_coding::OverlayRow::Plain(format!("row-{index}")))
+                .collect(),
+            Some(OverlayInput {
+                value: String::new(),
+                placeholder: Some("Ask the side agent…".to_owned()),
+                multiline: false,
+            }),
+            false,
+        );
+        // Typing updates the host-owned draft; the composer stays untouched.
+        for character in ['h', 'i'] {
+            assert_eq!(
+                handle_extension_overlay_key(
+                    &application,
+                    &mut state,
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                )
+                .await,
+                Some(false),
+                "the focused overlay consumes printable input"
+            );
+        }
+        assert_eq!(
+            state.extension_overlay.as_ref().expect("overlay").editor.text(),
+            "hi"
+        );
+        assert!(state.editor.is_empty(), "composer must stay empty");
+        // In single-line mode ↑/↓ are scroll actions (routed to onKey) and
+        // the host scrolls the rows.
+        assert_eq!(
+            handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).await,
+            Some(false)
+        );
+        assert_eq!(state.extension_overlay.as_ref().expect("overlay").scroll, 1);
+        // Enter submits the draft: the host captures the text, clears the
+        // editor, and enqueues onSubmit (the bounded callback dispatch runs
+        // off the key path — no runtime here, so the queue is empty but the
+        // host-side submit contract holds).
+        assert_eq!(
+            handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await,
+            Some(false)
+        );
+        let overlay = state.extension_overlay.as_ref().expect("overlay");
+        assert!(overlay.editor.is_empty(), "submit clears the editor");
+        assert!(overlay.submit_in_flight, "a submit is in flight");
+        // An empty draft is never submitted.
+        let mut empty = overlay_test_state_full(
+            vec![],
+            Some(OverlayInput {
+                value: String::new(),
+                placeholder: None,
+                multiline: false,
+            }),
+            false,
+        );
+        assert_eq!(
+            handle_extension_overlay_key(&application, &mut empty, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await,
+            Some(false)
+        );
+        assert!(
+            !empty
+                .extension_overlay
+                .as_ref()
+                .expect("overlay")
+                .submit_in_flight,
+            "empty drafts must not dispatch onSubmit"
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_overlay_focus_toggle_non_capturing_and_escape_semantics() {
+        let application = overlay_test_application().await;
+        let toggle = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT);
+        assert_eq!(
+            KeyBindingsManager::default().resolve(&toggle),
+            Some(Action::ExtensionOverlayToggleFocus),
+            "Alt+/ must resolve to the stable focus-toggle action"
+        );
+        let mut state = overlay_test_state_full(Vec::new(), None, true);
+        // A non-capturing overlay opens UNFOCUSED: keys route to the composer
+        // (single-focused-owner rule; the overlay stays drawn).
+        assert!(!state.extension_overlay.as_ref().expect("overlay").focused);
+        assert_eq!(
+            handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).await,
+            None,
+            "unfocused non-capturing overlay must not capture"
+        );
+        assert_eq!(
+            state.editor.text(),
+            "",
+            "composer must accept typing while the overlay is visible"
+        );
+        // The toggle chord flips focus to the overlay; it then captures.
+        assert!(resolve_focus_toggle_key(&mut state, toggle), "toggle consumed");
+        assert!(state.extension_overlay.as_ref().expect("overlay").focused);
+        assert_eq!(
+            handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)).await,
+            Some(false),
+            "focused overlay captures input"
+        );
+        // A second toggle returns focus to the composer.
+        assert!(resolve_focus_toggle_key(&mut state, toggle));
+        assert!(!state.extension_overlay.as_ref().expect("overlay").focused);
+        assert_eq!(
+            handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)).await,
+            None
+        );
+        // Esc while unfocused belongs to the composer: NotConsumed, overlay
+        // survives.
+        assert_eq!(
+            handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await,
+            None,
+            "unfocused Esc must fall through to the composer"
+        );
+        assert!(state.extension_overlay.is_some(), "unfocused Esc must not close");
+        // Focused Esc closes the overlay (the idle default; the extension is
+        // notified via onKey(abort) off the key path).
+        assert!(resolve_focus_toggle_key(&mut state, toggle));
+        assert_eq!(
+            handle_extension_overlay_key(&application, &mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await,
+            Some(false),
+            "focused Esc closes the overlay"
+        );
+        assert!(state.extension_overlay.is_none());
+    }
+
+    #[test]
+    fn extension_overlay_cleared_when_owning_extension_unloads() {
+        let mut state = overlay_test_state(vec![pi_coding::OverlayRow::Plain("row".to_owned())]);
+        state.apply_extension_ui(ExtensionUiEvent::ExtensionCleared {
+            instance: pi_coding::ExtensionInstanceId {
+                extension_id: "demo".to_owned(),
+                generation: 3,
+            },
+        });
+        assert!(
+            state.extension_overlay.is_none(),
+            "unloading the owning extension must close its overlay"
+        );
+        // An unrelated extension's unload leaves the overlay open.
+        let mut other = overlay_test_state(vec![pi_coding::OverlayRow::Plain("row".to_owned())]);
+        other.apply_extension_ui(ExtensionUiEvent::ExtensionCleared {
+            instance: pi_coding::ExtensionInstanceId {
+                extension_id: "other".to_owned(),
+                generation: 1,
+            },
+        });
+        assert!(other.extension_overlay.is_some());
+    }
+
+    #[test]
+    fn extension_overlay_renders_bordered_panel_with_scroll_hint() {
+        use ratatui::backend::TestBackend;
+        let rows = (0..40)
+            .map(|index| pi_coding::OverlayRow::Plain(format!("row-{index}")))
+            .collect::<Vec<_>>();
+        let state = overlay_test_state(rows);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let theme = crate::theme::DARK;
+                let overlay = state.extension_overlay.as_ref().expect("overlay");
+                render_extension_overlay(frame, overlay, theme);
+            })
+            .expect("draw overlay");
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Side Chat"), "title must render: {text}");
+        assert!(text.contains("row-0"), "first row must render");
+        assert!(text.contains("of 40"), "scroll hint must render");
+        assert!(!text.contains("row-39"), "overflowing rows must be clipped");
+    }
+
+    #[tokio::test]
+    async fn extension_overlay_open_event_opens_panel_with_sanitized_rows() {
+        use pi_coding::ExtensionUiHost;
+        let adapter = ExtensionUiAdapter::new();
+        let credential = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let mut events = adapter.subscribe();
+        let mut state = dialog_test_state(adapter.clone());
+        adapter
+            .request(
+                tui_context(3),
+                ExtensionUiRequest::OverlaySetRows {
+                    id: "chat".to_owned(),
+                    rows: vec![
+                        pi_coding::OverlayRow::Plain("dynamic".to_owned()),
+                        pi_coding::OverlayRow::Styled {
+                            text: credential.clone(),
+                            style: Some("error".to_owned()),
+                        },
+                    ],
+                },
+                pi_coding::ExtensionCancellation::new(),
+            )
+            .await
+            .expect("setRows succeeds");
+        // setRows publishes a live OverlayRowsChanged event (the rows also
+        // land in the adapter state for the next open).
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        assert!(
+            state.pending_overlay_rows.is_none(),
+            "rows queued only for an already-open overlay"
+        );
+        adapter
+            .request(
+                tui_context(3),
+                ExtensionUiRequest::OverlayOpen {
+                    id: "chat".to_owned(),
+                    title: Some("Side Chat".to_owned()),
+                    non_capturing: false,
+                    input: None,
+                },
+                pi_coding::ExtensionCancellation::new(),
+            )
+            .await
+            .expect("open succeeds");
+        state.apply_extension_ui(next_interaction(&mut events).await);
+        let overlay = state.extension_overlay.as_ref().expect("overlay open");
+        assert_eq!(overlay.title, "Side Chat");
+        assert_eq!(overlay.rows.len(), 2);
+        assert_eq!(overlay.rows[0].text(), "dynamic");
+        assert!(
+            !overlay.rows[1].text().contains(&credential),
+            "rows must be redacted before display"
+        );
+        assert!(page_overlay_open(&state));
+    }
+
+    #[tokio::test]
+    async fn extension_overlay_set_rows_redacts_input_derived_rows() {
+        use pi_coding::{ExtensionCancellation, ExtensionUiHost};
+        let adapter = ExtensionUiAdapter::new();
+        let credential = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let mut events = adapter.subscribe();
+        // An extension echoing submitted text into rows goes through the same
+        // host sanitizer: secrets in echoed (input-derived) rows are redacted
+        // before they become displayable.
+        adapter
+            .request(
+                tui_context(3),
+                ExtensionUiRequest::OverlaySetRows {
+                    id: "chat".to_owned(),
+                    rows: vec![pi_coding::OverlayRow::Plain(format!(
+                        "user echoed {credential}"
+                    ))],
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+            .expect("setRows succeeds");
+        match next_interaction(&mut events).await {
+            ExtensionUiEvent::OverlayRowsChanged { rows, .. } => {
+                assert!(
+                    !rows[0].text().contains(&credential),
+                    "input-derived rows must be redacted before display"
+                );
+                assert!(rows[0].text().contains("[REDACTED]"), "{rows:#?}");
+            }
+            other => panic!("expected OverlayRowsChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_rows_are_sanitized_at_the_host_boundary() {
+        let credential = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let rows = pi_coding::sanitize_overlay_rows(vec![
+            pi_coding::OverlayRow::Plain(credential.clone()),
+            pi_coding::OverlayRow::Styled {
+                text: "x".repeat(300),
+                style: Some("unknown-style".to_owned()),
+            },
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].text().contains(&credential), "secret must be redacted");
+        assert_eq!(rows[1].text().chars().count(), pi_coding::OVERLAY_MAX_ROW_CHARS);
+        assert_eq!(
+            rows[1],
+            pi_coding::OverlayRow::Styled {
+                text: "x".repeat(pi_coding::OVERLAY_MAX_ROW_CHARS),
+                style: None,
+            },
+            "unknown styles are dropped"
+        );
+        let capped = pi_coding::sanitize_overlay_rows(
+            (0..150)
+                .map(|index| pi_coding::OverlayRow::Plain(format!("row-{index}")))
+                .collect(),
+        );
+        assert_eq!(capped.len(), pi_coding::OVERLAY_MAX_ROWS);
     }
 
     fn tui_context(generation: u64) -> pi_coding::ExtensionUiContext {
@@ -13322,6 +19423,456 @@ mod tests {
     }
 
     #[test]
+    fn user_card_padding_rows_are_symmetric_around_content_and_thinking_adjacent() {
+        // Regression for the reported "hgi shows padding above but not below"
+        // / "extra line before thinking": the user card must carry exactly one
+        // styled padding row above the content and one below, and the thinking
+        // block must follow the bottom padding directly — never an extra
+        // unstyled blank (ratatui's Paragraph WordWrapper used to split the
+        // whitespace-only padding rows into an empty row + a whitespace row).
+        // This test drives the REAL render() path (full Terminal draw) so the
+        // Paragraph widget behavior is exercised, not just the raw line list.
+        use ratatui::backend::TestBackend;
+        let mut state = todo_test_state(Vec::new());
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("hgi")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![
+                ContentBlock::thinking("reasoning trace here"),
+                ContentBlock::text("final answer here"),
+            ],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut images = TerminalImageRenderer::default();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .unwrap();
+        let cells = terminal.backend().buffer();
+        let width = 80;
+        let rows = cells
+            .content
+            .chunks(width)
+            .map(|row| {
+                (
+                    row.iter().map(|cell| cell.symbol()).collect::<String>(),
+                    row.iter().map(|cell| cell.bg).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let user_row = rows
+            .iter()
+            .position(|(row, _)| row.contains("hgi"))
+            .expect("user content row");
+        let thinking_row = rows
+            .iter()
+            .position(|(row, _)| row.contains("reasoning trace here"))
+            .expect("thinking text row");
+        let card_bg = crate::theme::DARK.user_message_bg;
+
+        // The live area is inset one cell on each side (live_content_rect), so
+        // card styling must be asserted on the region cells only.
+        let in_region = |bg: &[Color]| bg[1..width - 1].iter().all(|color| *color == card_bg);
+
+        // (a) Top padding: exactly one blank row directly above the content,
+        // styled with the card background.
+        let (above_text, above_bg) = &rows[user_row - 1];
+        assert!(
+            above_text.trim().is_empty(),
+            "row above user content must be blank: {rows:#?}"
+        );
+        assert!(
+            in_region(above_bg),
+            "top padding must carry the card background: {rows:#?}"
+        );
+        // The row above the top padding is NOT a card edge — the top padding
+        // must not be doubled by the Paragraph re-wrap.
+        let (_, above_above_bg) = &rows[user_row - 2];
+        assert!(
+            !in_region(above_above_bg),
+            "top padding must be a single row (no doubled blank above): {rows:#?}"
+        );
+
+        // (b) Exactly one blank row (the bottom padding) separates the user
+        // content from the thinking label, and it is the styled card edge.
+        assert_eq!(
+            thinking_row - user_row,
+            2,
+            "exactly one blank row between the user card and the thinking block: {rows:#?}"
+        );
+        let (between_text, between_bg) = &rows[user_row + 1];
+        assert!(
+            between_text.trim().is_empty() && in_region(between_bg),
+            "the single separator is the styled card bottom edge: {rows:#?}"
+        );
+
+        // (c) No extra blank between the bottom padding and the thinking text —
+        // the thinking block (no label) directly follows the padding row
+        // (asserted by (b)); and the thinking/answer separator stays a single
+        // unstyled blank.
+        let answer_row = rows
+            .iter()
+            .position(|(row, _)| row.contains("final answer here"))
+            .expect("answer row");
+        let (_, gap_bg) = &rows[thinking_row + 1];
+        assert_eq!(
+            answer_row - thinking_row,
+            2,
+            "exactly one blank between thinking text and the reply: {rows:#?}"
+        );
+        assert!(
+            gap_bg.iter().all(|color| *color == Color::Reset),
+            "thinking/answer separator is the unstyled blank: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn user_card_live_streaming_preserves_top_and_bottom_padding() {
+        // The streaming path (uncommitted user echo + live assistant thinking)
+        // must show the same symmetric padding and thinking adjacency as the
+        // committed path: padding above, content, padding below, thinking.
+        let mut state = todo_test_state(Vec::new());
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("hgi")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+        state.streaming_thinking = "reasoning trace here".to_owned();
+        let width = 40u16;
+        let mut renderer = TerminalImageRenderer::default();
+        let mut candidates = Vec::new();
+        let mut image_context = TranscriptImageContext {
+            renderer: &mut renderer,
+            candidates: &mut candidates,
+            config: ImageDisplayConfig {
+                show_images: false,
+                width_cells: 50,
+            },
+            viewport_columns: width,
+            viewport_rows: 40,
+            cell_size: TerminalCellSize::default(),
+        };
+        let (mut transcript, _entry_row_starts) =
+            render_transcript_lines(&state, crate::theme::DARK, width, &mut image_context);
+        let mut content = Vec::new();
+        content.push(ContentBlock::thinking(state.streaming_thinking.clone()));
+        append_transcript_entry_inner(
+            &mut transcript,
+            &TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                content,
+                tool_name: None,
+                tool_card: None,
+                job_card: None,
+                is_error: false,
+                is_partial: true,
+            },
+            state.show_thinking,
+            state.expand_tools,
+            crate::theme::DARK,
+            width,
+            state.animation_frame,
+            None,
+        );
+        let height = u16::try_from(transcript.len()).unwrap();
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        for (row, line) in transcript.into_iter().enumerate() {
+            line.render(Rect::new(0, u16::try_from(row).unwrap(), width, 1), &mut buffer);
+        }
+        let rows = (0..height)
+            .map(|y| {
+                let cells = (0..width).map(|x| &buffer[(x, y)]).collect::<Vec<_>>();
+                (
+                    cells.iter().map(|cell| cell.symbol()).collect::<String>(),
+                    cells.iter().map(|cell| cell.bg).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let card_bg = crate::theme::DARK.user_message_bg;
+        let user_row = rows
+            .iter()
+            .position(|(row, _)| row.contains("hgi"))
+            .expect("user content row");
+        let thinking_row = rows
+            .iter()
+            .position(|(row, _)| row.contains("reasoning trace here"))
+            .expect("thinking text row");
+        assert_eq!(
+            user_row, 1,
+            "live user card is: padding, content, padding, thinking: {rows:#?}"
+        );
+        assert!(rows[0].0.trim().is_empty() && rows[0].1.iter().all(|c| *c == card_bg));
+        assert_eq!(
+            thinking_row - user_row,
+            2,
+            "one blank (bottom padding) before the live thinking block: {rows:#?}"
+        );
+        assert!(rows[user_row + 1].0.trim().is_empty()
+            && rows[user_row + 1].1.iter().all(|c| *c == card_bg));
+    }
+
+    #[test]
+    fn cjk_text_lays_out_two_cells_per_char_without_inserted_gaps() {
+        // Regression for the reported inter-character gaps in Chinese text
+        // ("继 续 梳 理 …"): rpi must lay each CJK character out in exactly two
+        // terminal cells (glyph cell + blank continuation cell) with no
+        // rpi-inserted space between characters, and the display-width
+        // accounting must match the backend columns actually used. This pins
+        // the rpi-side contract; a terminal that still renders gaps is
+        // mis-rendering the wide-character cells on its side.
+        fn render_buffer(entries: &[TranscriptEntry], width: u16) -> Vec<String> {
+            let lines = assemble_transcript_entries(entries, true, true, crate::theme::DARK, width);
+            let height = u16::try_from(lines.len()).unwrap();
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            for (row, line) in lines.into_iter().enumerate() {
+                line.render(Rect::new(0, u16::try_from(row).unwrap(), width, 1), &mut buffer);
+            }
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol().to_owned())
+                        .collect::<String>()
+                })
+                .collect()
+        }
+        let text = "继续梳理核心类型与调用关系，好把图画准。";
+        let assistant = TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::text(text.to_owned())],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        // Width accounting: the renderer must wrap to exactly `width` cells and
+        // the sum of span display widths must equal the backend columns used.
+        for width in [30u16, 40] {
+            let lines = render_transcript_markdown(
+                text,
+                crate::theme::DARK,
+                crate::theme::DARK.text,
+                width,
+                false,
+            );
+            let rows = render_buffer(&[assistant.clone()], width);
+            for (index, line) in lines.iter().enumerate() {
+                let span_width: usize = line
+                    .spans
+                    .iter()
+                    .map(|span| usize::from(display_width(span.content.as_ref())))
+                    .sum();
+                assert!(
+                    span_width <= usize::from(width),
+                    "wrapped line {index} exceeds width {width}: {span_width}"
+                );
+                let row = &rows[index];
+                // The CJK glyphs must sit back-to-back: every even cell is a
+                // source character and every odd cell its blank continuation.
+                let glyphs = row
+                    .chars()
+                    .step_by(2)
+                    .take(span_width / 2)
+                    .collect::<String>();
+                assert!(
+                    !glyphs.contains(' '),
+                    "no gap may be inserted between CJK characters at width {width}, row {index}: {row:?}"
+                );
+                assert_eq!(
+                    glyphs.chars().count() * 2,
+                    span_width,
+                    "each CJK character must occupy exactly two cells at width {width}: {row:?}"
+                );
+                // Odd continuation cells are blank (wide-char second half).
+                assert!(
+                    row.chars().skip(1).step_by(2).take(span_width / 2).all(|ch| ch == ' '),
+                    "continuation cells must stay blank at width {width}: {row:?}"
+                );
+            }
+            assert_eq!(rows.len(), lines.len(), "one backend row per wrapped line");
+        }
+        // The exact reported sentence, single-line at a comfortable width:
+        // 20 characters -> 40 cells, no space between any pair of characters.
+        let rows = render_buffer(&[assistant], 40);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let glyphs = row.chars().step_by(2).collect::<String>();
+        assert_eq!(glyphs, text, "glyphs must appear in order with no gaps: {row:?}");
+        assert_eq!(glyphs.chars().count(), 20);
+        assert_eq!(usize::from(display_width(text)), 40);
+        assert!(
+            row.chars().skip(1).step_by(2).all(|ch| ch == ' '),
+            "wide-char continuation cells blank: {row:?}"
+        );
+    }
+    #[test]
+    fn mixed_cjk_transcript_keeps_payload_shape_at_multiple_widths() {
+        let source = "并且 tools.zig（或 tools/mod.zig）作为聚合入口。";
+
+        for width in [18_u16, 27, 40, 64] {
+            let lines = render_transcript_markdown(
+                source,
+                crate::theme::DARK,
+                crate::theme::DARK.text,
+                width,
+                false,
+            );
+            let rows = lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let rejoined = rows.concat();
+            let source_non_whitespace = source.chars().filter(|character| !character.is_whitespace());
+            let rendered_non_whitespace = rejoined.chars().filter(|character| !character.is_whitespace());
+            assert!(
+                source_non_whitespace.eq(rendered_non_whitespace),
+                "renderer changed non-whitespace payload at width {width}: {rows:?}"
+            );
+            if usize::from(display_width(source)) <= usize::from(width) {
+                assert_eq!(rejoined, source, "unwrapped payload changed at width {width}");
+            }
+            assert!(
+                rows.iter().all(|row| usize::from(display_width(row)) <= usize::from(width)),
+                "row exceeds width {width}: {rows:?}"
+            );
+            for inserted_gap in ["并 且", "（ 或", "） 作", "作 为", "聚 合", "入 口"] {
+                assert!(
+                    !rejoined.contains(inserted_gap),
+                    "renderer inserted CJK inter-character whitespace {inserted_gap:?} at width {width}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_cell_backend_does_not_reposition_between_adjacent_cjk_glyphs() {
+        fn cell(symbol: &str) -> BufferCell {
+            let mut cell = BufferCell::default();
+            cell.set_symbol(symbol);
+            cell
+        }
+
+        fn contains_move_to(bytes: &[u8], x: u16, y: u16) -> bool {
+            let mut sequence = Vec::new();
+            queue!(sequence, MoveTo(x, y)).unwrap();
+            bytes.windows(sequence.len()).any(|window| window == sequence)
+        }
+
+        let first = cell("并");
+        let second = cell("且");
+        let ascii = cell("t");
+        let mut bytes = Vec::new();
+        WideCellCrosstermBackend::new(&mut bytes)
+            .draw([(0, 0, &first), (2, 0, &second), (5, 0, &ascii)].into_iter())
+            .unwrap();
+
+        assert!(
+            !contains_move_to(&bytes, 2, 0),
+            "adjacent CJK glyph must use the cursor position left by the prior width-2 glyph"
+        );
+        assert!(
+            contains_move_to(&bytes, 5, 0),
+            "a real one-column payload gap must still reposition the cursor"
+        );
+    }
+
+
+    #[test]
+    fn cjk_user_card_keeps_two_cell_chars_and_padding_edges() {
+        // CJK user cards must keep the exact two-cell-per-character layout AND
+        // the symmetric card edges (padding above/below) through the real
+        // full-viewport render.
+        use ratatui::backend::TestBackend;
+        let mut state = todo_test_state(Vec::new());
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("继续梳理核心类型与调用关系")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::text("好，继续。")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut images = TerminalImageRenderer::default();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .unwrap();
+        let cells = terminal.backend().buffer();
+        let rows = cells
+            .content
+            .chunks(80)
+            .map(|row| {
+                (
+                    row.iter().map(|cell| cell.symbol()).collect::<String>(),
+                    row.iter().map(|cell| cell.bg).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let card_bg = crate::theme::DARK.user_message_bg;
+        let content_row = rows
+            .iter()
+            .position(|(row, _)| row.trim_start().starts_with('继'))
+            .expect("CJK user content row");
+        // The live area is inset one cell per side; assert card styling on the
+        // region cells.
+        let in_region = |bg: &[Color]| bg[1..80 - 1].iter().all(|c| *c == card_bg);
+        assert!(
+            rows[content_row - 1].0.trim().is_empty() && in_region(&rows[content_row - 1].1),
+            "top padding above the CJK card: {rows:#?}"
+        );
+        assert!(
+            rows[content_row + 1].0.trim().is_empty() && in_region(&rows[content_row + 1].1),
+            "bottom padding below the CJK card: {rows:#?}"
+        );
+        // The 13 CJK characters occupy the region cells (starting at x=1 after
+        // the frame inset) in pairs; nothing but the wide-char continuation
+        // blanks sits between them.
+        let region_row = &rows[content_row].0[1..];
+        let glyphs = region_row.chars().step_by(2).take(13).collect::<String>();
+        assert_eq!(glyphs, "继续梳理核心类型与调用关系");
+        assert!(region_row.chars().skip(1).step_by(2).take(13).all(|ch| ch == ' '));
+    }
+
+    #[test]
     fn transcript_entry_adjacency_is_cell_and_style_aware() {
         fn entry(kind: TranscriptKind, text: &str) -> TranscriptEntry {
             TranscriptEntry { kind, content: vec![ContentBlock::text(text)], tool_name: matches!(kind, TranscriptKind::System | TranscriptKind::Custom).then(|| format!("{kind:?}")), tool_card: None, job_card: None, is_error: false, is_partial: false }
@@ -13341,16 +19892,548 @@ mod tests {
         fn plain(row: &(String, Vec<Color>)) { assert!(row.0.trim().is_empty()); assert!(row.1.iter().all(|color| *color == Color::Reset)); }
 
         let rendered = rows(&[entry(TranscriptKind::User, "first user"), entry(TranscriptKind::User, "second user")]); let first = at(&rendered, "first user"); let second = at(&rendered, "second user"); assert_eq!(second - first, 4); assert!(rendered[first + 1].1.iter().all(|color| *color == crate::theme::DARK.user_message_bg)); plain(&rendered[first + 2]); assert!(rendered[first + 3].1.iter().all(|color| *color == crate::theme::DARK.user_message_bg));
-        let rendered = rows(&[entry(TranscriptKind::User, "user before"), entry(TranscriptKind::Assistant, "assistant after")]); let user = at(&rendered, "user before"); let assistant = at(&rendered, "assistant after"); assert_eq!(assistant - user, 3); assert!(rendered[user + 1].1.iter().all(|color| *color == crate::theme::DARK.user_message_bg)); plain(&rendered[user + 2]);
+        let rendered = rows(&[entry(TranscriptKind::User, "user before"), entry(TranscriptKind::Assistant, "assistant after")]); let user = at(&rendered, "user before"); let assistant = at(&rendered, "assistant after"); assert_eq!(assistant - user, 2, "the user card's bottom edge is the single blank before the reply"); assert!(rendered[user + 1].1.iter().all(|color| *color == crate::theme::DARK.user_message_bg)); assert!(rendered[user + 2].0.contains("assistant after"));
         let rendered = rows(&[entry(TranscriptKind::Assistant, "assistant before"), entry(TranscriptKind::User, "user after")]); let assistant = at(&rendered, "assistant before"); let user = at(&rendered, "user after"); assert_eq!(user - assistant, 3); plain(&rendered[assistant + 1]); assert!(rendered[assistant + 2].1.iter().all(|color| *color == crate::theme::DARK.user_message_bg));
         let rendered = rows(&[entry(TranscriptKind::System, "system body"), entry(TranscriptKind::Custom, "custom body")]); let system = at(&rendered, "system body"); plain(&rendered[system + 1]); assert!(rendered[system + 2].0.contains("Custom"));
+    }
+
+    #[test]
+    fn user_card_thinking_reply_share_one_blank_between_sections() {
+        // Regression for "h和下面的怎么相隔这么远": the user card, the thinking
+        // block, and the reply must read as a single turn. Exactly one blank
+        // row (the card's bottom edge) separates the user message from the
+        // thinking block, and exactly one separates the thinking text from
+        // the reply — never two, and never an unstyled separator stacked on
+        // top of the card edge.
+        fn render_rows(entries: &[TranscriptEntry]) -> Vec<(String, Vec<Color>)> {
+            let width = 40;
+            let lines = assemble_transcript_entries(entries, true, true, crate::theme::DARK, width);
+            let height = u16::try_from(lines.len()).unwrap();
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            for (row, line) in lines.into_iter().enumerate() {
+                line.render(Rect::new(0, u16::try_from(row).unwrap(), width, 1), &mut buffer);
+            }
+            (0..height)
+                .map(|y| {
+                    let cells = (0..width).map(|x| &buffer[(x, y)]).collect::<Vec<_>>();
+                    (
+                        cells.iter().map(|cell| cell.symbol()).collect::<String>(),
+                        cells.iter().map(|cell| cell.bg).collect(),
+                    )
+                })
+                .collect()
+        }
+        fn at(rows: &[(String, Vec<Color>)], text: &str) -> usize {
+            rows.iter().position(|(row, _)| row.contains(text)).unwrap()
+        }
+        fn is_unstyled_blank(row: &(String, Vec<Color>)) -> bool {
+            row.0.trim().is_empty() && row.1.iter().all(|color| *color == Color::Reset)
+        }
+
+        let user = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("h")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let reply = TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![
+                ContentBlock::thinking("The user just sent \"h\". This could be:"),
+                ContentBlock::text("Looks like that message got cut off — what do you need?"),
+            ],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = render_rows(&[user, reply]);
+        let user_row = at(&rows, "h");
+        let thinking_text_row = at(&rows, "This could be");
+        let reply_row = at(&rows, "Looks like that message got cut off");
+
+        // Symmetry contract (regression for "padding above but not below"): the
+        // card carries exactly one styled padding row above the content AND one
+        // below it; neither edge may be doubled or lost. In the raw line list
+        // the top padding is the very first row of the card.
+        assert_eq!(
+            user_row, 1,
+            "user content is directly preceded by exactly one padding row: {rows:?}"
+        );
+        let top_padding = &rows[user_row - 1];
+        assert!(
+            top_padding.0.trim().is_empty()
+                && top_padding
+                    .1
+                    .iter()
+                    .all(|color| *color == crate::theme::DARK.user_message_bg),
+            "top padding row is a styled card edge: {rows:?}"
+        );
+
+        // user card → thinking block: the card's bottom edge is the single blank.
+        assert_eq!(
+            thinking_text_row - user_row,
+            2,
+            "exactly one blank row between the user card and the thinking block: {rows:?}"
+        );
+        let separator_row = &rows[user_row + 1];
+        assert!(
+            separator_row.0.trim().is_empty()
+                && separator_row
+                    .1
+                    .iter()
+                    .all(|color| *color == crate::theme::DARK.user_message_bg),
+            "the single separator is the styled card edge: {rows:?}"
+        );
+        assert!(
+            !is_unstyled_blank(separator_row),
+            "no unstyled separator may stack on the card edge (double blank): {rows:?}"
+        );
+
+        // thinking text → reply: the in-entry separator stays exactly one blank.
+        assert_eq!(
+            reply_row - thinking_text_row,
+            2,
+            "exactly one blank row between the thinking text and the reply: {rows:?}"
+        );
+        assert!(is_unstyled_blank(&rows[thinking_text_row + 1]));
+    }
+
+    #[test]
+    fn thinking_block_forces_thinking_text_on_all_markdown_spans() {
+        // OMP renders every span inside a thinking block through
+        // `thinkingText` (assistant-message.ts color transform): the markdown
+        // chrome colors (accent headings, accent list bullets, green code,
+        // blue links) must not leak into a thinking trace. The K1 regression
+        // was ordered-list numbers rendering in electric blue; structure
+        // (bold/italic) survives the transform.
+        let theme = crate::theme::DARK;
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::thinking(
+                "# Trace heading\n\n1. first step\n2. second step\n\n**bold** and `code`",
+            )],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, theme, 80);
+        // Every span belongs to the thinking body (the standalone label was
+        // removed) and must render in theme.thinking_text + italic.
+        let body_spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| !span.content.is_empty())
+            .collect::<Vec<_>>();
+        assert!(!body_spans.is_empty(), "thinking body must render: {lines:?}");
+        for chrome in [
+            theme.accent,
+            theme.md_heading,
+            theme.md_list_bullet,
+            theme.md_code,
+            theme.md_link,
+            theme.md_link_url,
+        ] {
+            assert!(
+                body_spans
+                    .iter()
+                    .all(|span| span.style.fg != Some(chrome)),
+                "thinking spans must not carry markdown chrome color {chrome:?}: {body_spans:?}"
+            );
+        }
+        assert!(
+            body_spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.thinking_text)),
+            "every thinking span must use theme.thinking_text: {body_spans:?}"
+        );
+        assert!(
+            body_spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::ITALIC)),
+            "every thinking span must stay italic: {body_spans:?}"
+        );
+        // Structure survives the color transform: heading and bold keep BOLD.
+        let heading = body_spans
+            .iter()
+            .find(|span| span.content.contains("Trace heading"))
+            .expect("heading span");
+        assert!(
+            heading.style.add_modifier.contains(Modifier::BOLD),
+            "heading keeps bold: {heading:?}"
+        );
+        let bold = body_spans
+            .iter()
+            .find(|span| span.content.contains("bold"))
+            .expect("bold span");
+        assert!(
+            bold.style.add_modifier.contains(Modifier::BOLD),
+            "bold keeps bold: {bold:?}"
+        );
+        // The ordered-list row (marker + text) renders thinking_text, not
+        // accent — the exact "blue numbers inside thinking" regression. The
+        // body is tokenized per whitespace run, so match its first token.
+        let item = body_spans
+            .iter()
+            .find(|span| span.content.contains("first"))
+            .expect("ordered list item span");
+        assert_eq!(
+            item.style.fg, Some(theme.thinking_text),
+            "ordered list item must use thinking_text: {item:?}"
+        );
+        // Inline code keeps the thinking_text foreground too.
+        let code = body_spans
+            .iter()
+            .find(|span| span.content.as_ref() == "code")
+            .expect("inline code span");
+        assert_eq!(
+            code.style.fg, Some(theme.thinking_text),
+            "inline code must use thinking_text: {code:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_list_renders_marker_in_list_color_and_body_in_base_text() {
+        // The K1 regression: the assistant transcript path tagged the WHOLE
+        // list line as LineRole::ListMarker, so bullet AND item text rendered
+        // in md_list_bullet (#00b4ff). OMP colors only the bullet/number; the
+        // item body (and any nested indent) uses the base text color. This is
+        // the non-thinking guard mirror of the thinking test above.
+        let theme = crate::theme::DARK;
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::text(
+                "- 第一条要点\n- 第二条 **重点**\n1. 编号步骤\n  2. 嵌套项",
+            )],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, theme, 80);
+        assert!(lines.len() >= 4, "one row per item: {lines:?}");
+        let span_fg = |line: &Line<'static>, needle: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content.as_ref() == needle)
+                .and_then(|span| span.style.fg)
+        };
+        // Bullet list: marker span in md_list_bullet, body span in base text.
+        let bullet = &lines[0];
+        assert_eq!(span_fg(bullet, "•"), Some(theme.md_list_bullet));
+        assert_eq!(span_fg(bullet, "第一条要点"), Some(theme.text));
+        // Bold inside a list item keeps BOLD and the base foreground.
+        let bold = &lines[1];
+        let bold_span = bold
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "重点")
+            .expect("bold span");
+        assert_eq!(bold_span.style.fg, Some(theme.text));
+        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+        // Ordered list: number in md_list_bullet, body in base text.
+        assert_eq!(span_fg(&lines[2], "1."), Some(theme.md_list_bullet));
+        assert_eq!(span_fg(&lines[2], "编号步骤"), Some(theme.text));
+        // Nested list: leading indent stays base, only the marker is blue.
+        assert_eq!(span_fg(&lines[3], "  "), Some(theme.text));
+        assert_eq!(span_fg(&lines[3], "2."), Some(theme.md_list_bullet));
+        assert_eq!(span_fg(&lines[3], "嵌套项"), Some(theme.text));
+    }
+
+    #[test]
+    fn user_message_manual_list_path_keeps_bullet_color_and_base_text() {
+        // The manual render_markdown path (user messages) already implements
+        // the OMP contract: "• " in md_list_bullet, item text in base. Guard
+        // that it stays unchanged.
+        let theme = crate::theme::DARK;
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("- 用户要点 **重点**")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, theme, 80);
+        // User cards prepend a vertical-padding row of spaces; find the
+        // content row by its bullet span.
+        let line = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "• "))
+            .expect("user list row");
+        let bullet = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "• ")
+            .expect("bullet span");
+        assert_eq!(bullet.style.fg, Some(theme.md_list_bullet));
+        let item = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("用户要点"))
+            .expect("item span");
+        assert_eq!(item.style.fg, Some(theme.user_message_text));
+        let bold = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("重点"))
+            .expect("bold span");
+        assert_eq!(bold.style.fg, Some(theme.user_message_text));
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
     fn transcript_live_and_commit_assembly_are_identical() {
         let entries = vec![TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text("first")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false }, TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text("answer")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false }, TranscriptEntry { kind: TranscriptKind::User, content: vec![ContentBlock::text("second")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false }];
         let mut state = todo_test_state(Vec::new()); state.transcript = entries.clone(); let mut renderer = TerminalImageRenderer::default(); let mut candidates = Vec::new(); let mut image_context = TranscriptImageContext { renderer: &mut renderer, candidates: &mut candidates, config: ImageDisplayConfig { show_images: false, width_cells: 50 }, viewport_columns: 40, viewport_rows: 40, cell_size: TerminalCellSize::default() };
-        let live = render_transcript_lines(&state, crate::theme::DARK, 40, &mut image_context); let committed = assemble_transcript_entries(&entries, state.show_thinking, state.expand_tools, crate::theme::DARK, 40); assert_eq!(live, committed);
+        let (live, _entry_row_starts) = render_transcript_lines(&state, crate::theme::DARK, 40, &mut image_context); let committed = assemble_transcript_entries(&entries, state.show_thinking, state.expand_tools, crate::theme::DARK, 40); assert_eq!(live, committed);
+    }
+
+    #[test]
+    fn scroll_up_window_survives_mermaid_growth_and_resize() {
+        // Regression for the scroll-up history loss: the transcript window
+        // must stay anchored to the content the user is reading. A mermaid
+        // block at the bottom that GROWS between frames (fence closing:
+        // streaming code block → tall source-fallback diagram, or a resize
+        // reflow) must not drag the scrolled-up window down with it.
+        // Bottom-anchored row math (`scroll = bottom - transcript_scroll`)
+        // drifted by exactly the height delta, so the rows under/above the
+        // mermaid appeared to vanish when scrolling up. The window is now
+        // anchored to (entry, row-offset) and re-mapped each frame.
+        let mermaid_partial = "```mermaid\nflowchart TB\n    subgraph L0[\"pi-cli";
+        let mermaid_full = "```mermaid\nflowchart TB\n    subgraph L0[\"pi-cli — crates/pi-cli\"]\n        TUI[\"TUI 面板 / REPL<br/>tui.rs · repl.rs\"]\n        RPC[\"JSON-RPC / ACP 模式<br/>rpc.rs · acp.rs\"]\n        CMD[\"子命令 · 会话编排<br/>interactive_commands.rs · session_run.rs\"]\n    end\n    subgraph L1[\"pi-coding — crates/pi-coding（本图主体）\"]\n        APP[\"Application 状态机<br/>application.rs\"]\n        SESS[\"Session 回合执行<br/>session.rs\"]\n        SUB[\"工具 · 编排 · 工作流<br/>扩展 · 配置 · 持久化\"]\n    end\n    subgraph L2[\"pi-agent — crates/pi-agent\"]\n        AGENT[\"Agent 循环<br/>agent.rs · loop_runtime.rs\"]\n    end\n    subgraph L3[\"pi-ai — crates/pi-ai\"]\n        PROV[\"providers/<br/>anthropic · openai · responses · codex · gemini...\"]\n        CAT[\"模型目录 · 流式 · 重试 · 超时<br/>catalog.rs · stream.rs\"]\n    end\n    TUI --> APP\n    RPC --> APP\n    CMD --> APP\n    APP --> SESS\n    SESS --> AGENT\n    AGENT --> PROV\n    PROV --> CAT\n```";
+        let mut state = todo_test_state(Vec::new());
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("explain the architecture")],
+            tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+        });
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::text("short reply above the diagram")],
+            tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+        });
+        // Taller history so the scrolled-up window lands mid-transcript
+        // (not pinned to the top), like a real session with prior turns.
+        for turn in 0..5 {
+            state.push_entry(TranscriptEntry {
+                kind: TranscriptKind::User,
+                content: vec![ContentBlock::text(format!(
+                    "follow-up question {turn} with enough words to wrap across the width"
+                ))],
+                tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+            });
+            state.push_entry(TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                content: vec![ContentBlock::text(format!(
+                    "answer {turn} describing the layered design and the data flow through the components"
+                ))],
+                tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+            });
+        }
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::text(mermaid_partial)],
+            tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+        });
+        let mermaid_index = state.transcript.len() - 1;
+        let height = 15usize;
+        let render = |state: &mut TuiState, width: u16| -> (Vec<String>, usize, usize) {
+            let mut renderer = TerminalImageRenderer::default();
+            let mut candidates = Vec::new();
+            let mut image_context = TranscriptImageContext {
+                renderer: &mut renderer,
+                candidates: &mut candidates,
+                config: ImageDisplayConfig { show_images: false, width_cells: 50 },
+                viewport_columns: width,
+                viewport_rows: u16::try_from(height).unwrap(),
+                cell_size: TerminalCellSize::default(),
+            };
+            let (lines, starts) =
+                render_transcript_lines(state, crate::theme::DARK, width, &mut image_context);
+            let total_rows = wrapped_line_count(&lines, width);
+            let scroll = transcript_scroll_offset(state, &starts, total_rows, height);
+            let plain: Vec<String> = lines
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+                .collect();
+            (plain, scroll, total_rows)
+        };
+
+        // Following: window sits at the bottom (tail visible).
+        let (_, scroll_follow, total_rows) = render(&mut state, 80);
+        assert_eq!(scroll_follow, total_rows.saturating_sub(height), "follow shows the tail");
+
+        // Scroll up two pages.
+        state.page_transcript(-1);
+        state.page_transcript(-1);
+        let (plain_before, scroll_before, _) = render(&mut state, 80);
+        assert!(scroll_before < scroll_follow, "PageUp moved the window up");
+        let top_line_before = plain_before[scroll_before].clone();
+        let anchor_before = state.scroll_anchor.get();
+        let top_row_before = state.transcript_top_row.get();
+
+        // The mermaid entry settles/grows BELOW the window (fence closes:
+        // short code block → tall source-fallback diagram). The window must
+        // not drift: the old bottom-anchored math moved by exactly the delta.
+        state.transcript[mermaid_index].content = vec![ContentBlock::text(mermaid_full.to_owned())];
+        let (plain_after, scroll_after, total_after) = render(&mut state, 80);
+        assert!(
+            total_after > total_rows,
+            "the grown mermaid must make the transcript taller"
+        );
+        assert_eq!(
+            scroll_after, scroll_before,
+            "window top must stay put when content below the window grows"
+        );
+        assert_eq!(
+            plain_after[scroll_after], top_line_before,
+            "the window must keep showing the same content row"
+        );
+        assert_eq!(state.scroll_anchor.get(), anchor_before);
+        assert_eq!(state.transcript_top_row.get(), top_row_before);
+
+        // Resize: re-anchor keeps the window in the same transcript entry.
+        let (_, scroll_w100, _) = render(&mut state, 100);
+        assert_eq!(state.scroll_anchor.get().0, anchor_before.0, "resize keeps the entry");
+        let _ = scroll_w100;
+        let (_, scroll_w40, _) = render(&mut state, 40);
+        assert_eq!(state.scroll_anchor.get().0, anchor_before.0, "narrow resize keeps the entry");
+        let _ = scroll_w40;
+
+        // Every row of the grown transcript must be reachable at every width:
+        // sweep all window positions and union their coverage.
+        for width in [40u16, 80, 100, 140] {
+            let (plain, _, total) = render(&mut state, width);
+            let bottom = total.saturating_sub(height);
+            let mut covered = vec![false; total];
+            for top in 0..=bottom {
+                state.transcript_top_row.set(Some(top));
+                state.scroll_moved.set(true);
+                let (_, scroll, _) = render(&mut state, width);
+                assert_eq!(scroll, top.min(bottom), "raw top honored for the sweep");
+                for row in scroll..(scroll + height).min(total) {
+                    covered[row] = true;
+                }
+            }
+            let missing: Vec<usize> = covered
+                .iter()
+                .enumerate()
+                .filter_map(|(index, covered)| (!covered).then_some(index))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "width {width}: rows {missing:?} are unreachable by any scroll window"
+            );
+            let mermaid_start = plain.iter().position(|line| line.contains("┌─ mermaid"));
+            let mermaid_end = plain.iter().rposition(|line| line.contains("└─"));
+            assert!(
+                mermaid_start.is_some() && mermaid_end.is_some(),
+                "width {width}: mermaid frame must render (source fallback)"
+            );
+            assert!(
+                covered[mermaid_start.unwrap()] && covered[mermaid_end.unwrap()],
+                "width {width}: mermaid frame rows must be reachable"
+            );
+        }
+
+        // Scrolling back down resumes following with the tail visible.
+        loop {
+            state.page_transcript(1);
+            render(&mut state, 80);
+            if state.transcript_top_row.get().is_none() {
+                break;
+            }
+        }
+        let (plain, scroll_tail, total_tail) = render(&mut state, 80);
+        assert_eq!(scroll_tail, total_tail.saturating_sub(height));
+        assert!(plain[scroll_tail..].iter().any(|line| line.contains("└─")));
+    }
+
+    #[test]
+    fn mermaid_stays_reachable_scrolling_up_through_real_render() {
+        // Acceptance: build a transcript with a mermaid entry, scroll up
+        // through it at multiple widths + a resize, driving the REAL render()
+        // path (full Terminal draw). No rows vanish: the mermaid frame and
+        // the rows around it stay reachable at every width.
+        use ratatui::backend::TestBackend;
+        let mermaid = "```mermaid\nflowchart TD\nA[Start] --> B[Load data]\nB --> C{Ready?}\nC -->|yes| D[Go]\nC -->|no| E[Wait]\nD --> F[Done]\n```";
+        let mut state = todo_test_state(Vec::new());
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("draw the flow")],
+            tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+        });
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::text(mermaid)],
+            tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+        });
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::text("done")],
+            tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
+        });
+        let mut images = TerminalImageRenderer::default();
+        let mut draw = |terminal: &mut Terminal<TestBackend>, state: &TuiState| -> Vec<String> {
+            terminal
+                .draw(|frame| {
+                    let _ = render(frame, state, &mut images);
+                })
+                .unwrap();
+            let cells = terminal.backend().buffer();
+            let width = usize::from(terminal.backend().buffer().area.width);
+            cells
+                .content
+                .chunks(width)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect()
+        };
+        for width in [80u16, 60, 100] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let mut saw_header = false;
+            let mut saw_closer = false;
+            let mut saw_tail = false;
+            // Follow: the mermaid is visible at the bottom.
+            let rows = draw(&mut terminal, &state);
+            saw_header |= rows.iter().any(|row| row.contains("┌─ mermaid"));
+            saw_closer |= rows.iter().any(|row| row.trim() == "└─");
+            saw_tail |= rows.iter().any(|row| row.contains("done"));
+            // PageUp all the way to the top; the mermaid frame must be
+            // visible at some point and the surrounding text stay reachable.
+            for _ in 0..12 {
+                state.page_transcript(-1);
+                let rows = draw(&mut terminal, &state);
+                saw_header |= rows.iter().any(|row| row.contains("┌─ mermaid"));
+                saw_closer |= rows.iter().any(|row| row.trim() == "└─");
+                saw_tail |= rows.iter().any(|row| row.contains("done"));
+            }
+            assert!(saw_header, "width {width}: mermaid header must be reachable on scroll-up");
+            assert!(saw_closer, "width {width}: mermaid closer must be reachable on scroll-up");
+            assert!(saw_tail, "width {width}: trailing text must stay reachable");
+            // Scroll back down to follow.
+            for _ in 0..12 {
+                state.page_transcript(1);
+                draw(&mut terminal, &state);
+                if state.transcript_top_row.get().is_none() {
+                    break;
+                }
+            }
+            let rows = draw(&mut terminal, &state);
+            assert!(rows.iter().any(|row| row.trim() == "└─"), "width {width}: tail visible when following");
+        }
     }
 
     #[test]
@@ -13378,6 +20461,107 @@ mod tests {
         assert!(!state.has_visible_entry_after(1));
         state.show_thinking = true;
         assert!(state.has_visible_entry_after(1));
+    }
+
+    #[test]
+    fn assistant_reply_renders_without_trailing_blank_line() {
+        // Regression for "extra blank line below the assistant reply": a
+        // reply (thinking block + answer) must end flush on its last content
+        // row, with no empty row appended below it — committed or streaming.
+        // Inter-message spacing stays intact because the adjacency assembler
+        // emits the single unstyled separator between distinct entries.
+        fn render_rows(entries: &[TranscriptEntry]) -> Vec<(String, Vec<Color>)> {
+            let width = 40;
+            let lines = assemble_transcript_entries(entries, true, true, crate::theme::DARK, width);
+            let height = u16::try_from(lines.len()).unwrap();
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            for (row, line) in lines.into_iter().enumerate() {
+                line.render(Rect::new(0, u16::try_from(row).unwrap(), width, 1), &mut buffer);
+            }
+            (0..height)
+                .map(|y| {
+                    let cells = (0..width).map(|x| &buffer[(x, y)]).collect::<Vec<_>>();
+                    (
+                        cells.iter().map(|cell| cell.symbol()).collect::<String>(),
+                        cells.iter().map(|cell| cell.bg).collect(),
+                    )
+                })
+                .collect()
+        }
+        fn at(rows: &[(String, Vec<Color>)], text: &str) -> usize {
+            rows.iter().position(|(row, _)| row.contains(text)).unwrap()
+        }
+        fn is_unstyled_blank(row: &(String, Vec<Color>)) -> bool {
+            row.0.trim().is_empty() && row.1.iter().all(|color| *color == Color::Reset)
+        }
+
+        let reply = TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![
+                ContentBlock::thinking("reasoning trace"),
+                ContentBlock::text("hello world"),
+            ],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = render_rows(&[reply.clone()]);
+        let reply_row = at(&rows, "hello world");
+        assert_eq!(
+            reply_row,
+            rows.len() - 1,
+            "committed assistant reply must be the final row, no trailing blank: {rows:?}"
+        );
+        assert!(
+            is_unstyled_blank(&rows[reply_row - 1]),
+            "thinking/answer separator stays inside the entry: {rows:?}"
+        );
+
+        let partial = TranscriptEntry { is_partial: true, ..reply.clone() };
+        let rows = render_rows(&[partial]);
+        let reply_row = at(&rows, "hello world");
+        assert_eq!(
+            reply_row,
+            rows.len() - 1,
+            "streaming assistant reply must also end on content: {rows:?}"
+        );
+
+        // Inter-message spacing is preserved by the adjacency assembler: a
+        // user card's bottom edge is the single blank before the reply (no
+        // second, stacked separator), the reply still ends flush on its
+        // text, and the next turn is introduced by the unstyled separator.
+        let user = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("user greeting")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = render_rows(&[user.clone(), reply.clone()]);
+        let user_row = at(&rows, "user greeting");
+        let reply_row = at(&rows, "hello world");
+        assert!(
+            (user_row + 1..reply_row).any(|index| is_unstyled_blank(&rows[index])),
+            "one blank row must separate the user message from the reply: {rows:?}"
+        );
+        assert_eq!(reply_row, rows.len() - 1, "reply stays the final row: {rows:?}");
+
+        let rows = render_rows(&[reply, user]);
+        let reply_row = at(&rows, "hello world");
+        let user_row = at(&rows, "user greeting");
+        assert!(
+            is_unstyled_blank(&rows[reply_row + 1]) && reply_row + 2 < user_row,
+            "one blank row must separate the reply from the next user message: {rows:?}"
+        );
+        assert!(
+            !is_unstyled_blank(&rows[reply_row]),
+            "reply content row itself is not a blank separator: {rows:?}"
+        );
     }
 
     #[tokio::test]
@@ -13725,6 +20909,7 @@ mod tests {
             name: None,
             status: pi_coding::CatalogRowStatus::Foreign,
             search_text: preview.to_owned(),
+            message_blob: preview.to_owned(),
         }
     }
 
@@ -13797,7 +20982,7 @@ mod tests {
     fn saved_session_selector_scrolls_selection_to_last_row_with_selected_style() {
         let rows = saved_session_rows(40);
         let mut selector = SavedSessionSelector::new(rows, None);
-        selector.move_selection(isize::MAX);
+        selector.move_selection(39);
         let lines = saved_session_selector_lines(&selector, crate::theme::DARK, 8);
         let rendered = lines.iter().map(rendered_line_text).collect::<Vec<_>>();
 
@@ -13891,7 +21076,7 @@ mod tests {
             state.push_message(Message::user_text(format!("old {index}"), index as i64));
         }
         state.committed_entries = state.transcript.len();
-        state.transcript_scroll = 99;
+        state.transcript_top_row.set(Some(99));
         state.transcript_page_rows.set(42);
         state.streaming_text = "draft answer".to_owned();
         state.streaming_thinking = "draft reasoning".to_owned();
@@ -13902,7 +21087,7 @@ mod tests {
 
         assert_eq!(state.transcript.len(), 1);
         assert_eq!(state.committed_entries, 0);
-        assert_eq!(state.transcript_scroll, 0);
+        assert_eq!(state.transcript_top_row.get(), None);
         assert_eq!(state.transcript_page_rows.get(), 1);
         assert!(state.streaming_text.is_empty());
         assert!(state.streaming_thinking.is_empty());
@@ -13939,7 +21124,7 @@ mod tests {
         state.status = "Working".to_owned();
 
         assert!(!application.is_streaming());
-        state.reconcile_activity_from_application(&application);
+        state.reconcile_activity_from_application(&application).await;
 
         assert!(!state.is_streaming);
         assert!(state.streaming_text.is_empty());
@@ -13993,6 +21178,7 @@ mod tests {
                 depends_on: Vec::new(),
                 ready: true,
                 blocked_by: Vec::new(),
+                agent: None,
             }],
         }];
         let mut state = todo_test_state(stale);
@@ -14015,6 +21201,7 @@ mod tests {
                 started_at: Some(2),
                 finished_at: None,
                 result: None,
+                soft_budget_exhausted: false,
             },
         });
         assert_eq!(state.job_cards.cards_in_source_order().len(), 1);
@@ -14036,6 +21223,7 @@ mod tests {
             render_todo_panel_lines(
                 &state.todo_phases,
                 &state.job_cards.cards_in_source_order(),
+                &[],
                 crate::theme::DARK,
                 80,
             )
@@ -14062,11 +21250,13 @@ mod tests {
                 started_at: Some(2),
                 finished_at: None,
                 result: None,
+                soft_budget_exhausted: false,
             },
         });
         let subagent_rows = render_todo_panel_lines(
             &state.todo_phases,
             &state.job_cards.cards_in_source_order(),
+            &[],
             crate::theme::DARK,
             80,
         );
@@ -14089,6 +21279,7 @@ mod tests {
                     depends_on: Vec::new(),
                     ready: true,
                     blocked_by: Vec::new(),
+                    agent: None,
                 }],
             }])
             .expect("set_todos");
@@ -14138,6 +21329,7 @@ mod tests {
             themes: Vec::new(),
             active_theme: None,
             tools_expanded: false,
+            overlay_rows: Vec::new(),
         };
         let widgets = extension_widget_lines(
             &snapshot,
@@ -14167,6 +21359,7 @@ mod tests {
 
     fn todo_test_state(phases: Vec<TodoPhase>) -> TuiState {
         let (background_tx, _background_rx) = mpsc::unbounded_channel();
+        let (live_events_tx, live_events_rx) = mpsc::unbounded_channel();
         TuiState {
             tool_cards: ToolCardPresentationAdapter::new(),
             job_cards: JobCardPresentationAdapter::new(),
@@ -14178,6 +21371,7 @@ mod tests {
             prompt_history_draft: None,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            thinking_streaming: false,
             thinking_level: ThinkingLevel::Off,
             is_streaming: false,
             animation_frame: 0,
@@ -14188,7 +21382,10 @@ mod tests {
             last_escape: None,
             last_ctrl_c: None,
             expand_tools: false,
-            transcript_scroll: 0,
+            transcript_top_row: Cell::new(None),
+            scroll_anchor: Cell::new((0, 0)),
+            scroll_moved: Cell::new(false),
+            transcript_scroll_bottom: Cell::new(0),
             transcript_page_rows: Cell::new(1),
             show_images: true,
             image_width_cells: 50,
@@ -14196,6 +21393,7 @@ mod tests {
             extension_status_key: None,
             composer_error: None,
             composer_error_is_warning: false,
+            deferred_workflow_status: None,
             model: String::new(),
             cwd: String::new(),
             completions: CompletionState::default(),
@@ -14206,6 +21404,8 @@ mod tests {
             pending_attachments: Vec::new(),
             extension_ui: ExtensionUiAdapter::default(),
             extension_dialog: None,
+            extension_overlay: None,
+            pending_overlay_rows: None,
             background_tx,
             completion_generation: 0,
             completion_query: None,
@@ -14227,6 +21427,10 @@ mod tests {
             side_chat: None,
             side_chat_open: false,
             settings_value_input: None,
+            settings_enum_picker: None,
+            settings_boolean_picker: None,
+            settings_section: None,
+            settings_leaf_cursor: 0,
             tree_panel: None,
             process_panel: None,
             pty_attachment: None,
@@ -14241,14 +21445,30 @@ mod tests {
             extension_hidden_thinking_label: None,
             extension_title: None,
             seen_irc_message_ids: std::collections::HashSet::new(),
+            queued_steering: Vec::new(),
+            queued_follow_up: 0,
+            pending_ask: None,
             git_status: None,
             context_usage: None,
+            session_cost: 0.0,
+            session_tokens: None,
             last_footer_refresh: None,
             footer_refresh_in_flight: None,
             footer_refresh_pending: None,
             footer_refresh_current: None,
             goal_state: GoalState::default(),
             active_loops: std::collections::BTreeMap::new(),
+            live: LiveUiState {
+                mode: LiveMode::Off,
+                recording: false,
+                events_tx: live_events_tx,
+                events_rx: live_events_rx,
+                control_tx: None,
+                settings: None,
+                stt: None,
+                delegating: false,
+                delegation_started: None,
+            },
         }
     }
 
@@ -14273,6 +21493,29 @@ mod tests {
             failure: None,
             integration: pi_coding::WorkflowIntegration::None,
         }
+    }
+
+    /// Test fixture: a live workflow projection whose child runtime has
+    /// spawned the given workers (name + optional current task summary).
+    fn workflow_panel_with_workers(
+        name: &str,
+        status: pi_coding::WorkflowStatus,
+        workers: &[(&str, Option<&str>)],
+    ) -> WorkflowPanelSnapshot {
+        let mut panel = WorkflowPanelSnapshot::from(&workflow_snapshot(1, status));
+        panel.id = name.to_owned();
+        panel.name = name.to_owned();
+        panel.subagents = workers
+            .iter()
+            .map(|(name, task)| crate::workflow_panel::WorkflowActorSnapshot {
+                name: (*name).to_owned(),
+                status: "running".to_owned(),
+                task: task.map(|task| task.to_owned()),
+                task_id: None,
+                activity: Vec::new(),
+            })
+            .collect();
+        panel
     }
 
     #[tokio::test]
@@ -14313,6 +21556,183 @@ mod tests {
         },
         );
         assert_eq!(state.workflow_snapshots[0].status, pi_coding::WorkflowStatus::Paused);
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn closing_workflow_panel_is_silent_never_errors_the_running_status() {
+        // User-reported: closing the workflow panel surfaced an
+        // "Error: Workflow <name> · running" toast. A live status change while
+        // the panel owns the page is parked in the dedicated deferred slot
+        // (`set_deferred_workflow_status`); Esc/q close discards ONLY that
+        // deferred line instead of leaving it to render as an error above the
+        // composer. Unrelated deferred notices survive the close (covered by
+        // `closing_workflow_panel_keeps_non_workflow_deferred_notices`).
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: cwd.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        }).expect("session");
+        let application = Application::new(session).await;
+
+        // Open the workflow panel over a running workflow (fixture).
+        let mut state = todo_test_state(Vec::new());
+        let mut running = WorkflowPanelSnapshot::from(&workflow_snapshot(
+            1,
+            pi_coding::WorkflowStatus::Running,
+        ));
+        running.id = "wf-zig".to_owned();
+        running.name = "zig-agent".to_owned();
+        state.workflow_snapshots.push(running.clone());
+        state.workflow_panel = Some(WorkflowPanel::new(vec![running.clone()]));
+
+        for close_key in [KeyCode::Esc, KeyCode::Char('q')] {
+            state.apply_workflow_event(&application, pi_coding::WorkflowEvent::StatusChanged {
+                workflow_id: pi_coding::WorkflowId::new("wf-zig"),
+                generation: 1,
+                status: pi_coding::WorkflowStatus::Running,
+            });
+            assert_eq!(
+                state.deferred_workflow_status.as_deref(),
+                Some("Workflow zig-agent · running"),
+                "the running workflow's status must be deferred while the panel owns the page"
+            );
+            assert!(
+                state.composer_error.is_none(),
+                "the workflow line must not occupy the composer-error slot"
+            );
+            assert!(
+                !composer_error_toast_lines(&state, 120, crate::theme::DARK).is_empty(),
+                "the deferred workflow line must still render as a toast while the panel is open"
+            );
+
+            let closed = handle_workflow_panel_key(
+                &application,
+                &mut state,
+                KeyEvent::new(close_key, KeyModifiers::NONE),
+            )
+            .await
+            .expect("workflow panel close");
+            assert_eq!(closed, Some(false));
+            assert!(state.workflow_panel.is_none(), "close must drop the panel");
+            assert_eq!(state.status, "Ready", "close resets to the neutral status");
+            assert!(
+                state.deferred_workflow_status.is_none(),
+                "closing must discard ONLY the deferred workflow line"
+            );
+            assert!(
+                state.composer_error.is_none(),
+                "no unrelated composer notice may appear on close"
+            );
+            assert!(
+                composer_error_toast_lines(&state, 120, crate::theme::DARK).is_empty(),
+                "no error toast may render after closing"
+            );
+
+            // Re-open for the next close key.
+            state.workflow_panel = Some(WorkflowPanel::new(vec![running.clone()]));
+        }
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn closing_workflow_panel_keeps_non_workflow_deferred_notices() {
+        // A non-workflow deferred notice parked while the workflow panel owns
+        // the page must SURVIVE the close: closing discards only the deferred
+        // workflow status line, never unrelated composer notices (failed /run
+        // results, paste-consume notices, WorkflowCommandFinished errors,
+        // push_warning warnings).
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: cwd.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        }).expect("session");
+        let application = Application::new(session).await;
+
+        let mut state = todo_test_state(Vec::new());
+        let mut running = WorkflowPanelSnapshot::from(&workflow_snapshot(
+            1,
+            pi_coding::WorkflowStatus::Running,
+        ));
+        running.id = "wf-zig".to_owned();
+        running.name = "zig-agent".to_owned();
+        state.workflow_snapshots.push(running.clone());
+        state.workflow_panel = Some(WorkflowPanel::new(vec![running.clone()]));
+
+        // A failed /run lands in composer_error while the panel owns the page.
+        state.push_status("/run smoke-test failed: boom".to_owned(), true);
+        assert_eq!(
+            state.composer_error.as_deref(),
+            Some("/run smoke-test failed: boom"),
+            "the failed /run result must be a deferred composer notice"
+        );
+        // A workflow status change is parked in the separate deferred slot.
+        state.apply_workflow_event(&application, pi_coding::WorkflowEvent::StatusChanged {
+            workflow_id: pi_coding::WorkflowId::new("wf-zig"),
+            generation: 1,
+            status: pi_coding::WorkflowStatus::Running,
+        });
+        assert_eq!(
+            state.deferred_workflow_status.as_deref(),
+            Some("Workflow zig-agent · running")
+        );
+
+        // The /run failure wins the toast while the panel is open.
+        let toast = composer_error_toast_lines(&state, 120, crate::theme::DARK)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            toast.contains("/run smoke-test failed: boom"),
+            "the /run failure must be the visible toast: {toast}"
+        );
+
+        // Close: only the deferred workflow line is discarded; the /run
+        // failure keeps surfacing as a toast.
+        let closed = handle_workflow_panel_key(
+            &application,
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .expect("workflow panel close");
+        assert_eq!(closed, Some(false));
+        assert!(state.workflow_panel.is_none());
+        assert!(state.deferred_workflow_status.is_none());
+        assert_eq!(
+            state.composer_error.as_deref(),
+            Some("/run smoke-test failed: boom"),
+            "the non-workflow deferred notice must survive the close"
+        );
+        let after = composer_error_toast_lines(&state, 120, crate::theme::DARK)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            after.contains("/run smoke-test failed: boom"),
+            "the surviving notice must still render after close: {after}"
+        );
+        assert!(
+            !after.contains("Workflow zig-agent"),
+            "the deferred workflow line must not render after close: {after}"
+        );
+
         application.cleanup().await;
     }
 
@@ -14560,6 +21980,323 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_dispatch_runs_in_background_and_reports_token_counts() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let stream_fn: pi_agent::StreamFn = std::sync::Arc::new(|_model, _context, _options| {
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+                    message.content.push(ContentBlock::text("checkpoint summary"));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        });
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: Some(pi_coding::CompactionSettings {
+                enabled: true,
+                reserve_tokens: 10,
+                keep_recent_tokens: 4,
+                snap_keep_turns: 10,
+            }),
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+        })
+        .expect("session");
+        session
+            .load_history(vec![
+                Message::user_text("older context ".repeat(60), 1),
+                Message::user_text("middle context ".repeat(60), 2),
+                Message::user_text("recent context ".repeat(60), 3),
+            ])
+            .await
+            .expect("load history");
+        let application = Application::new(session).await;
+
+        let (background_tx, mut background_rx) = mpsc::unbounded_channel();
+        let mut state = todo_test_state(Vec::new());
+        state.background_tx = background_tx;
+
+        // Dispatch admits the compaction on a background task and returns
+        // synchronously (mirrors the `/workflow` admission): awaiting the
+        // provider summarization call inline froze the TUI event loop.
+        admit_compact_background(&application, &mut state, None);
+        assert_eq!(
+            state.status, "Compacting context",
+            "admission status must be visible immediately",
+        );
+
+        // The background completion arrives with the full result.
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), background_rx.recv())
+            .await
+            .expect("CompactionFinished must arrive promptly")
+            .expect("background channel open");
+        let BackgroundEvent::CompactionFinished { result } = finished else {
+            panic!("expected CompactionFinished");
+        };
+        let result = result.expect("compaction succeeded");
+        assert!(
+            result.summary.contains("checkpoint summary"),
+            "summary came from the provider stream: {}",
+            result.summary,
+        );
+        assert!(result.tokens_before > 0, "context was measurable");
+        assert!(
+            result
+                .estimated_tokens_after
+                .is_some_and(|after| after < result.tokens_before),
+            "compaction must shrink the context",
+        );
+
+        // The status must pair the pre-compaction count with the
+        // post-compaction estimate (A → B), not echo the same value twice.
+        let expected_status = format!(
+            "Compacted {} → {} estimated tokens",
+            result.tokens_before,
+            result.estimated_tokens_after.unwrap_or_default()
+        );
+        state.apply_background(BackgroundEvent::CompactionFinished {
+            result: Ok(result),
+        });
+        assert_eq!(
+            state.status, expected_status,
+            "final status shows the right token pair: {}",
+            state.status,
+        );
+        assert!(!state.is_compacting, "compaction indicator cleared");
+
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn handoff_dispatch_renders_envelope_only_and_hints_prose_for_tui() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cwd = tempfile::tempdir().expect("cwd");
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counting = calls.clone();
+        let stream_fn: pi_agent::StreamFn = std::sync::Arc::new(move |_model, _context, _options| {
+            counting.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+                    message.content.push(ContentBlock::text("tui handoff prose"));
+                    message.stop_reason = pi_ai::StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        });
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+        })
+        .expect("session");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        let transcript_text = |state: &TuiState| {
+            state
+                .transcript
+                .iter()
+                .map(|entry| content_text(&entry.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Bare `/handoff`: the envelope renders, no prose hint, and the
+        // summarizer is never invoked (the TUI must not block on a provider).
+        dispatch_handoff_command(&application, &mut state, None);
+        let block = transcript_text(&state);
+        assert!(
+            block.contains("# Handoff"),
+            "bare /handoff must render the envelope:\n{block}"
+        );
+        assert!(
+            !block.contains("--prose"),
+            "bare /handoff must not surface the prose hint:\n{block}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "TUI /handoff must never invoke the summarizer"
+        );
+
+        // `/handoff --prose`: still envelope-only (never a provider call on
+        // the event loop), but the REPL/CLI prose surface is hinted.
+        state.transcript.clear();
+        state.status = String::new();
+        dispatch_handoff_command(&application, &mut state, Some("--prose"));
+        let block = transcript_text(&state);
+        assert!(
+            block.contains("# Handoff"),
+            "--prose in the TUI must still render the envelope:\n{block}"
+        );
+        assert!(
+            block.contains("--prose") && block.contains("--mode text"),
+            "the TUI must hint that prose runs in the REPL/CLI:\n{block}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "TUI /handoff --prose must stay envelope-only"
+        );
+
+        // Unknown flag: a typed error, nothing rendered, no provider call.
+        state.transcript.clear();
+        state.composer_error = None;
+        dispatch_handoff_command(&application, &mut state, Some("--bogus"));
+        assert!(
+            state
+                .composer_error
+                .as_deref()
+                .is_some_and(|error| error.contains("/handoff [--prose]")),
+            "unknown /handoff flag must surface usage, got: {:?}",
+            state.composer_error
+        );
+        assert!(
+            !transcript_text(&state).contains("# Handoff"),
+            "a rejected flag must not render a handoff block"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a rejected /handoff flag must never reach the provider"
+        );
+
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn escape_aborts_background_compaction_instead_of_freezing() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        // The provider stalls until the compaction's abort token fires, then
+        // ends with StopReason::Aborted — the same shape as the live stalled
+        // SSE repro, but bounded so the test does not wait out the 300s
+        // summarization deadline.
+        let stream_fn: pi_agent::StreamFn = std::sync::Arc::new(|_model, _context, options| {
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                let token = options.stream.abort_signal.clone();
+                tokio::spawn(async move {
+                    if let Some(token) = token {
+                        token.cancelled().await;
+                    }
+                    let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+                    message.stop_reason = pi_ai::StopReason::Aborted;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        });
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: Some(pi_coding::CompactionSettings {
+                enabled: true,
+                reserve_tokens: 10,
+                keep_recent_tokens: 4,
+                snap_keep_turns: 10,
+            }),
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+        })
+        .expect("session");
+        session
+            .load_history(vec![
+                Message::user_text("older context ".repeat(60), 1),
+                Message::user_text("middle context ".repeat(60), 2),
+                Message::user_text("recent context ".repeat(60), 3),
+            ])
+            .await
+            .expect("load history");
+        let application = Application::new(session.clone()).await;
+
+        let (background_tx, mut background_rx) = mpsc::unbounded_channel();
+        let mut state = todo_test_state(Vec::new());
+        state.background_tx = background_tx;
+        let mut app_events = application.subscribe();
+
+        admit_compact_background(&application, &mut state, None);
+
+        // Wait until the compaction is actually in flight (CompactionStart
+        // broadcast), then drive the Escape path: `dispatch_action` routes
+        // `Action::Abort` to `application.abort()` while `is_compacting` is set.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), app_events.recv()).await {
+                Ok(Ok(pi_coding::ApplicationEvent::Session(
+                    pi_coding::SessionEvent::CompactionStart { .. },
+                ))) => break,
+                Ok(Ok(_)) | Err(_) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "CompactionStart never arrived",
+                    );
+                }
+                Ok(Err(_)) => panic!("application event channel closed"),
+            }
+        }
+        state.is_compacting = true;
+        application.abort().await;
+        state.status = "Aborting compaction".to_owned();
+
+        // The stalled provider observes the abort and the compaction reports
+        // cancellation promptly instead of hanging the session.
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), background_rx.recv())
+            .await
+            .expect("aborted compaction must report back promptly")
+            .expect("background channel open");
+        let BackgroundEvent::CompactionFinished { result } = finished else {
+            panic!("expected CompactionFinished");
+        };
+        assert_eq!(
+            result,
+            Err("Compaction cancelled".to_owned()),
+            "abort must cancel the compaction",
+        );
+        assert!(!session.is_compacting(), "compaction activity must be cleared");
+
+        state.apply_background(BackgroundEvent::CompactionFinished { result });
+        assert_eq!(
+            state.status, "Compaction aborted",
+            "Escape during compaction must surface the abort status",
+        );
+
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn todo_command_opens_real_page_for_empty_main_dag() {
         use ratatui::backend::TestBackend;
         let cwd = tempfile::tempdir().expect("cwd");
@@ -14630,6 +22367,39 @@ mod tests {
             Some(false)
         );
         assert!(state.todo_dag_panel.is_none());
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn todo_list_dispatch_opens_page_and_markdown_still_edits() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: cwd.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        })
+        .expect("session");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        let mut mouse = TestCodeReviewMouse::default();
+
+        // `/todo list` opens the TodoDagPanel page in the TUI.
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("list")).expect("dispatch list"));
+        assert!(state.todo_dag_panel.is_some(), "/todo list must open the TodoDagPanel page");
+        assert!(page_overlay_open(&state));
+
+        // Bare `/todo` keeps the same page semantics (alias).
+        state.todo_dag_panel = None;
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, None).expect("dispatch bare"));
+        assert!(state.todo_dag_panel.is_some(), "bare /todo must open the TodoDagPanel page");
+
+        // A real markdown argument still edits the todo list, never opens a page.
+        state.todo_dag_panel = None;
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("# Build\n- [ ] alpha")).expect("dispatch markdown"));
+        assert!(state.todo_dag_panel.is_none(), "markdown argument must not open the panel");
+        assert!(state.todo_phases.iter().flat_map(|phase| &phase.tasks).any(|task| task.content == "alpha"));
+
         application.cleanup().await;
     }
 
@@ -14953,6 +22723,142 @@ mod tests {
         state.shutdown_side_chat().await;
     }
 
+    #[tokio::test]
+    async fn btw_command_surface_creates_switches_lists_and_closes_tabs() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent = tempfile::tempdir().expect("agent");
+        std::fs::write(agent.path().join("settings.json"), "{}").expect("global settings");
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = pi_coding::ResourceManager::new(options).expect("resources");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.attach_resources(resources).await.expect("attach resources");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        let mut mouse = TestCodeReviewMouse::default();
+
+        // `/btw new alpha` → tab appears, becomes active, overlay opens.
+        state
+            .handle_btw_command(&application, Some("new alpha"), &mut mouse)
+            .await
+            .expect("new alpha");
+        assert!(state.side_chat_open, "creating a tab opens the overlay");
+        {
+            let tabs = state.side_chat.as_ref().expect("container");
+            assert_eq!(tabs.tab_names(), vec!["default", "alpha"]);
+            assert_eq!(tabs.active_name(), "alpha");
+            assert!(tabs.entries().is_empty(), "new tab transcript is empty");
+        }
+
+        // Write into alpha, then switch to the default tab via `/btw default`.
+        {
+            let tabs = state.side_chat.as_mut().expect("container");
+            tabs.submit_prompt("alpha draft");
+        }
+        state
+            .handle_btw_command(&application, Some("default"), &mut mouse)
+            .await
+            .expect("switch to default");
+        {
+            let tabs = state.side_chat.as_mut().expect("container");
+            assert_eq!(tabs.active_name(), "default");
+            assert!(tabs.entries().is_empty(), "default transcript stays empty");
+        }
+
+        // Back to alpha: transcript preserved in the right record.
+        state
+            .handle_btw_command(&application, Some("alpha"), &mut mouse)
+            .await
+            .expect("switch to alpha");
+        {
+            let tabs = state.side_chat.as_ref().expect("container");
+            assert_eq!(tabs.active_name(), "alpha");
+            assert_eq!(
+                tabs.entries()
+                    .iter()
+                    .map(|entry| entry.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["alpha draft"],
+                "alpha transcript must survive the switch round trip"
+            );
+        }
+
+        // `/btw list` surfaces the tabs in the live status.
+        state
+            .handle_btw_command(&application, Some("list"), &mut mouse)
+            .await
+            .expect("list");
+        assert!(
+            state.status.contains("default") && state.status.contains("alpha"),
+            "list status must name every tab: {}",
+            state.status
+        );
+
+        // `/btw close alpha` removes the tab; active falls back to default.
+        state
+            .handle_btw_command(&application, Some("close alpha"), &mut mouse)
+            .await
+            .expect("close alpha");
+        {
+            let tabs = state.side_chat.as_ref().expect("container");
+            assert_eq!(tabs.tab_names(), vec!["default"]);
+            assert_eq!(tabs.active_name(), "default");
+        }
+
+        // Invalid names and reserved words are rejected through the surface.
+        state
+            .handle_btw_command(&application, Some("new bad name"), &mut mouse)
+            .await
+            .expect("invalid name");
+        state
+            .handle_btw_command(&application, Some("new list"), &mut mouse)
+            .await
+            .expect("reserved name");
+        assert_eq!(
+            state.side_chat.as_ref().expect("container").len(),
+            1,
+            "rejected names must not create tabs"
+        );
+
+        // The max-tab bound is enforced through the command surface.
+        for index in 1..crate::side_chat::MAX_SIDE_CHAT_TABS {
+            state
+                .handle_btw_command(&application, Some(&format!("new t{index}")), &mut mouse)
+                .await
+                .expect("tab within bound");
+        }
+        assert_eq!(
+            state.side_chat.as_ref().expect("container").len(),
+            crate::side_chat::MAX_SIDE_CHAT_TABS
+        );
+        state
+            .handle_btw_command(&application, Some("new overflow"), &mut mouse)
+            .await
+            .expect("bound rejection");
+        assert_eq!(
+            state.side_chat.as_ref().expect("container").len(),
+            crate::side_chat::MAX_SIDE_CHAT_TABS,
+            "bound must not create an extra tab"
+        );
+
+        state.shutdown_side_chat().await;
+    }
+
     #[test]
     fn rejected_code_review_submit_keeps_editor_draft() {
         let mut state = todo_test_state(Vec::new());
@@ -15226,6 +23132,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             result: None,
+            soft_budget_exhausted: false,
         };
         let event = |job| pi_coding::OrchestrationEvent::JobUpdated {
             group_id: "group".to_owned(),
@@ -15301,7 +23208,7 @@ mod tests {
         ] {
             state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::JobUpdated {
                 group_id: "group".to_owned(),
-                job: pi_coding::JobSnapshot { id: id.to_owned(), agent_id: agent_id.to_owned(), agent: "task".to_owned(), parent_id: "Main".to_owned(), description: Some(format!("work for {agent_id}")), todo_task_id: None, workflow_id: None, workflow_generation: None, status, created_at: 1_000, started_at: None, finished_at: None, result: None,
+                job: pi_coding::JobSnapshot { id: id.to_owned(), agent_id: agent_id.to_owned(), agent: "task".to_owned(), parent_id: "Main".to_owned(), description: Some(format!("work for {agent_id}")), todo_task_id: None, workflow_id: None, workflow_generation: None, status, created_at: 1_000, started_at: None, finished_at: None, result: None, soft_budget_exhausted: false,
                     },
                 },
             ));
@@ -15323,6 +23230,52 @@ mod tests {
     }
 
     #[test]
+    fn running_job_card_renders_live_progress_one_liner() {
+        let mut state = todo_test_state(Vec::new());
+        state.job_cards.set_now(12_500);
+        state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: pi_coding::JobSnapshot {
+                id: "job-a".to_owned(),
+                agent_id: "Alpha".to_owned(),
+                agent: "task".to_owned(),
+                parent_id: "Main".to_owned(),
+                description: Some("map the workspace".to_owned()),
+                todo_task_id: None,
+                workflow_id: None,
+                workflow_generation: None,
+                status: pi_coding::JobStatus::Running,
+                created_at: 1_000,
+                started_at: Some(500),
+                finished_at: None,
+                result: None,
+                soft_budget_exhausted: false,
+            },
+        }));
+        state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::MessageDelivered {
+            group_id: "group".to_owned(),
+            message: pi_coding::MailboxMessage {
+                id: "m-1".to_owned(),
+                from: "Alpha".to_owned(),
+                to: "Main".to_owned(),
+                body: "read tools.rs".to_owned(),
+                timestamp: 12_100,
+                reply_to: None,
+            },
+        }));
+        let entries = state.transcript.iter().filter(|entry| entry.kind == TranscriptKind::Job).collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let card = entries[0].job_card.as_ref().expect("task card");
+        let progress = card.children[0].progress.as_ref().expect("progress");
+        assert_eq!(progress.activity.as_deref(), Some("read tools.rs"));
+        let mut rendered = Vec::new();
+        render_job_card(&mut rendered, card, crate::theme::DARK, 0, 80);
+        let text = rendered.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+        assert!(text.contains("read tools.rs · 12s"), "{text}");
+        assert!(rendered.iter().all(|line| line.width() <= 80));
+    }
+
+    #[test]
     fn todo_panel_renders_compact_active_summary() {
         use pi_coding::{TodoPhase, TodoStatus};
         let theme = crate::theme::DARK;
@@ -15335,21 +23288,103 @@ mod tests {
                 todo_item("p4", "dropped", TodoStatus::Abandoned, false, &[]),
             ],
         }];
-        let lines = render_todo_panel_lines(&phases, &[], theme, 80);
+        let lines = render_todo_panel_lines(&phases, &[], &[], theme, 80);
         let texts = todo_line_texts(&lines);
         assert_eq!(
             texts,
             vec![
+                "",
                 " Todos · 1 active · 1 next · 1/4",
                 "  ► active",
                 "  ○ pending",
                 "",
             ]
         );
-        assert_eq!(lines[0].spans[0].style.fg, Some(theme.accent));
+        assert_eq!(lines[0].spans.len(), 0, "leading blank separates the strip from the section above");
         assert_eq!(lines[1].spans[0].style.fg, Some(theme.accent));
-        assert!(lines[1].spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(lines[2].spans[0].style.fg, Some(theme.muted));
+        assert_eq!(lines[2].spans[0].style.fg, Some(theme.accent));
+        assert!(lines[2].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(lines[3].spans[0].style.fg, Some(theme.muted));
+    }
+
+    #[test]
+    fn todo_strip_renders_blank_row_between_transcript_and_todos() {
+        // Regression for "the todos strip sits flush against the section
+        // above": the committed transcript's last content row is followed by
+        // exactly one blank row before the " Todos" header — never by the
+        // header itself. The flush reply (T10: no trailing blank after
+        // replies) is what makes the separator visible.
+        use ratatui::backend::TestBackend;
+
+        let phases = vec![TodoPhase {
+            name: "Plan".to_owned(),
+            tasks: vec![
+                todo_item("t1", "first task", TodoStatus::InProgress, true, &[]),
+                todo_item("t2", "second task", TodoStatus::Pending, true, &[]),
+            ],
+        }];
+        let mut state = todo_test_state(phases);
+        state.editor.set_text("compose here");
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("user greeting")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+        // Long enough to overflow the short transcript region so the live
+        // view pins its tail (follow mode): the reply's last row then sits
+        // directly above the todo strip — exactly where the old flush
+        // layout used to put the " Todos" header.
+        let long_reply = (0..20)
+            .map(|index| format!("reply line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            content: vec![ContentBlock::text(long_reply)],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut images = TerminalImageRenderer::default();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &state, &mut images);
+            })
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let header = rows
+            .iter()
+            .position(|row| row.contains("Todos ·"))
+            .expect("todos header");
+        assert!(header > 2, "transcript content must render above the todos header");
+        assert!(
+            rows[header - 1].trim().is_empty(),
+            "exactly one blank row must separate the transcript from the todos block: {rows:?}"
+        );
+        assert!(
+            rows[header - 2].contains("reply line 19"),
+            "the pinned reply tail sits directly above the separator, then one blank, then Todos: {rows:?}"
+        );
+        // The strip keeps its trailing gap: a blank row follows the last task row.
+        assert!(
+            rows[header + 3].trim().is_empty(),
+            "the strip keeps its trailing gap below the todo block: {rows:?}"
+        );
     }
 
     #[test]
@@ -15378,13 +23413,14 @@ mod tests {
                         TodoBlockedReason { task_id: "root-b".to_owned(), content: "compile".to_owned(), status: TodoStatus::InProgress,
                         },
                     ],
+                    agent: None,
                 }],
             },
         ];
-        let narrow = render_todo_panel_lines(&phases, &[], theme, 24);
+        let narrow = render_todo_panel_lines(&phases, &[], &[], theme, 24);
         let texts = todo_line_texts(&narrow);
         assert!(texts.iter().all(|text| display_width(text) <= 24));
-        assert!(texts[0].ends_with('…'));
+        assert!(texts[1].ends_with('…'));
         assert!(texts.iter().any(|text| text.contains("fetch")));
         assert!(texts.iter().any(|text| text.contains("compile")));
         assert!(texts.iter().all(|text| !text.contains("ship a deliberately")));
@@ -15422,6 +23458,7 @@ mod tests {
                     started_at: (status == pi_coding::JobStatus::Running).then_some(1_100),
                     finished_at: None,
                     result: None,
+                    soft_budget_exhausted: false,
                 },
             });
         }
@@ -15456,25 +23493,32 @@ mod tests {
                 ),
             ],
         }];
-        let lines = render_todo_panel_lines(&phases, &adapter.cards_in_source_order(), theme, 80);
+        let lines = render_todo_panel_lines(&phases, &adapter.cards_in_source_order(), &[], theme, 80);
         let texts = todo_line_texts(&lines);
-        let divider = texts.iter().position(String::is_empty).expect("section divider");
-        assert!(texts[1].contains("implement correlation"));
-        assert!(!texts[1].contains("owner:"));
-        assert!(texts[2].contains("preserve DAG truth"));
-        assert_eq!(texts[divider + 1], " waiting on 3 jobs");
-        assert!(texts[divider + 2].contains("Mira · running · implement correlation"));
-        assert!(!texts[divider + 2].contains("task:"));
-        assert!(!texts[divider + 2].contains("map relevant files"));
-        assert!(texts[divider + 3].contains("Rowan · queued · apply focused edit"));
-        assert!(texts[divider + 4].contains("Sol · running · inspect without correlation"));
+        assert_eq!(texts[0], "", "leading blank separates the strip from the section above");
+        let divider = texts
+            .iter()
+            .skip(1)
+            .position(String::is_empty)
+            .expect("section divider")
+            .saturating_add(1);
+        assert!(texts[2].contains("implement correlation"));
+        assert!(!texts[2].contains("owner:"));
+        assert!(texts[3].contains("preserve DAG truth"));
+        assert_eq!(texts[divider + 1], "◑ 3 agents");
+        assert_eq!(texts[divider + 2], " waiting on 3 jobs");
+        assert!(texts[divider + 3].contains("Mira · running · implement correlation"));
+        assert!(!texts[divider + 3].contains("task:"));
+        assert!(!texts[divider + 3].contains("map relevant files"));
+        assert!(texts[divider + 4].contains("Rowan · queued · apply focused edit"));
+        assert!(texts[divider + 5].contains("Sol · running · inspect without correlation"));
         assert_eq!(texts.last().map(String::as_str), Some(""));
         let rendered = texts.join("\n");
         assert!(!rendered.contains("StableScoutId"));
         assert!(!rendered.contains("StableWriterId"));
         assert!(!rendered.contains("job-secret"));
-        assert_eq!(lines[divider + 2].spans[0].style.fg, Some(theme.accent));
-        assert_eq!(lines[divider + 3].spans[0].style.fg, Some(theme.dim));
+        assert_eq!(lines[divider + 3].spans[0].style.fg, Some(theme.accent));
+        assert_eq!(lines[divider + 4].spans[0].style.fg, Some(theme.dim));
         use ratatui::backend::TestBackend;
         let mut state = todo_test_state(phases);
         state.job_cards = adapter;
@@ -15487,7 +23531,8 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>();
         let jobs_row = rows.iter().position(|row| row.contains("waiting on 3 jobs")).expect("jobs row");
-        assert!(rows[jobs_row - 1].trim().is_empty());
+        assert!(rows[jobs_row - 1].contains("◑ 3 agents"), "agent line above the jobs heading: {:?}", rows[jobs_row - 1]);
+        assert!(rows[jobs_row - 2].trim().is_empty(), "blank divider before the agent line");
         let composer_row = rows.iter().position(|row| row.trim_start().starts_with("╭── π")).expect("composer row");
         assert!(rows[composer_row - 1].trim().is_empty());
     }
@@ -15509,11 +23554,350 @@ mod tests {
             name: "Delivery".to_owned(),
             tasks,
         }];
-        let lines = render_todo_panel_lines(&phases, &[], crate::theme::DARK, 80);
+        let lines = render_todo_panel_lines(&phases, &[], &[], crate::theme::DARK, 80);
         let text = todo_line_texts(&lines);
         assert_eq!(text.iter().filter(|line| line.contains("active task")).count(), TODO_HUD_TASK_LIMIT);
         assert!(text.iter().any(|line| line.contains("7 more active todos")));
     }
+
+    #[test]
+    fn todo_hud_agent_line_projects_activity_elapsed_and_count() {
+        // `◑ 3 agents · read tools.rs · 12s | hub · design doc · 5s`: the
+        // latest live activity + elapsed per running job (T92 progress
+        // fields); the queued agent collapses into the count, no IRC segment
+        // without MessageDelivered entries.
+        let theme = crate::theme::DARK;
+        let mut adapter = JobCardPresentationAdapter::new();
+        adapter.set_now(12_500);
+        let mut alpha = job_snapshot_fixture("job-a", "Alpha", pi_coding::JobStatus::Running);
+        alpha.started_at = Some(500);
+        adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: alpha,
+        });
+        adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
+            group_id: "group".to_owned(),
+            message: pi_coding::MailboxMessage {
+                id: "m-a".to_owned(),
+                from: "Alpha".to_owned(),
+                to: "Main".to_owned(),
+                body: "read tools.rs".to_owned(),
+                timestamp: 12_100,
+                reply_to: None,
+            },
+        });
+        let mut beta = job_snapshot_fixture("job-b", "Beta", pi_coding::JobStatus::Running);
+        beta.started_at = Some(7_500);
+        adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: beta,
+        });
+        adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
+            group_id: "group".to_owned(),
+            message: pi_coding::MailboxMessage {
+                id: "m-b".to_owned(),
+                from: "Beta".to_owned(),
+                to: "Main".to_owned(),
+                body: "hub · design doc".to_owned(),
+                timestamp: 12_100,
+                reply_to: None,
+            },
+        });
+        adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: job_snapshot_fixture("job-c", "Gamma", pi_coding::JobStatus::Queued),
+        });
+        let lines = render_todo_panel_lines(&[], &adapter.cards_in_source_order(), &[], theme, 80);
+        let texts = todo_line_texts(&lines);
+        let agent = texts.iter().find(|line| line.contains("◑ 3 agents")).expect("agent line");
+        assert!(agent.contains("read tools.rs · 12s"), "{agent}");
+        assert!(agent.contains("hub · design doc · 5s"), "{agent}");
+        assert!(!agent.contains("Gamma"), "idle agent collapses into the count: {agent}");
+        assert!(agent.contains("⟦irc 2 · /workflow⟧"), "both child messages counted: {agent}");
+        assert!(lines.iter().find(|line| line.spans.iter().any(|span| span.content.contains("◑ 3 agents"))).is_some_and(|line| line.spans[0].style.fg == Some(theme.muted)));
+    }
+
+    #[test]
+    fn todo_hud_single_agent_shows_activity_and_elapsed() {
+        let theme = crate::theme::DARK;
+        let mut adapter = JobCardPresentationAdapter::new();
+        adapter.set_now(12_500);
+        let mut snapshot = job_snapshot_fixture("job-a", "Alpha", pi_coding::JobStatus::Running);
+        snapshot.started_at = Some(500);
+        adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot,
+        });
+        adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
+            group_id: "group".to_owned(),
+            message: pi_coding::MailboxMessage {
+                id: "m-1".to_owned(),
+                from: "Alpha".to_owned(),
+                to: "Main".to_owned(),
+                body: "read tools.rs".to_owned(),
+                timestamp: 12_100,
+                reply_to: None,
+            },
+        });
+        let lines = render_todo_panel_lines(&[], &adapter.cards_in_source_order(), &[], theme, 80);
+        let texts = todo_line_texts(&lines);
+        assert!(texts.iter().any(|line| line.contains("◑ 1 agent · read tools.rs · 12s")), "{texts:?}");
+        assert!(!texts.iter().any(|line| line.contains("|")), "single agent has no job separators: {texts:?}");
+    }
+
+    #[test]
+    fn todo_hud_irc_indicator_counts_message_events_and_hides_without() {
+        // Child → supervisor AND child → child MessageDelivered entries are
+        // counted from the job-card event log and surface as `⟦irc N ·
+        // /workflow⟧`; with no messages the segment is absent while the agent
+        // line stays.
+        let theme = crate::theme::DARK;
+        let mut adapter = JobCardPresentationAdapter::new();
+        adapter.set_now(12_500);
+        let mut snapshot = job_snapshot_fixture("job-a", "Alpha", pi_coding::JobStatus::Running);
+        snapshot.started_at = Some(500);
+        adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: snapshot,
+        });
+        for (index, (from, to, body)) in [
+            ("Alpha", "Main", "first report"),
+            ("Alpha", "Scout", "child to child"),
+            ("Alpha", "Main", "second report"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
+                group_id: "group".to_owned(),
+                message: pi_coding::MailboxMessage {
+                    id: format!("m-{index}"),
+                    from: from.to_owned(),
+                    to: to.to_owned(),
+                    body: body.to_owned(),
+                    timestamp: 12_100,
+                    reply_to: None,
+                },
+            });
+        }
+        let lines = render_todo_panel_lines(&[], &adapter.cards_in_source_order(), &[], theme, 80);
+        let texts = todo_line_texts(&lines);
+        assert!(texts.iter().any(|line| line.contains("⟦irc 3 · /workflow⟧")), "{texts:?}");
+        let mut quiet = JobCardPresentationAdapter::new();
+        quiet.set_now(12_500);
+        let mut quiet_snapshot = job_snapshot_fixture("job-q", "Quiet", pi_coding::JobStatus::Running);
+        quiet_snapshot.started_at = Some(500);
+        quiet.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: quiet_snapshot,
+        });
+        let lines = render_todo_panel_lines(&[], &quiet.cards_in_source_order(), &[], theme, 80);
+        let texts = todo_line_texts(&lines);
+        assert!(texts.iter().any(|line| line.contains("◑ 1 agent")), "{texts:?}");
+        assert!(!texts.iter().any(|line| line.contains("⟦irc")), "no IRC segment without messages: {texts:?}");
+    }
+
+    #[test]
+    fn todo_hud_agent_line_truncates_at_narrow_widths_and_hides_when_idle() {
+        let theme = crate::theme::DARK;
+        // Idle: no orchestration jobs → no agent line at all.
+        let lines = render_todo_panel_lines(&[], &[], &[], theme, 80);
+        let texts = todo_line_texts(&lines);
+        assert!(!texts.iter().any(|line| line.contains("◑")));
+        // Narrow width: the agent line truncates and every row stays in budget.
+        let mut adapter = JobCardPresentationAdapter::new();
+        adapter.set_now(12_500);
+        for (id, agent_id, started, body) in [
+            ("job-a", "Alpha", 500u64, "read tools.rs"),
+            ("job-b", "Beta", 7_500u64, "hub · design doc"),
+        ] {
+            let mut snapshot = job_snapshot_fixture(id, agent_id, pi_coding::JobStatus::Running);
+            snapshot.started_at = Some(started);
+            adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: snapshot,
+            });
+            adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
+                group_id: "group".to_owned(),
+                message: pi_coding::MailboxMessage {
+                    id: format!("m-{id}"),
+                    from: agent_id.to_owned(),
+                    to: "Main".to_owned(),
+                    body: body.to_owned(),
+                    timestamp: 12_100,
+                    reply_to: None,
+                },
+            });
+        }
+        let narrow = render_todo_panel_lines(&[], &adapter.cards_in_source_order(), &[], theme, 24);
+        let texts = todo_line_texts(&narrow);
+        assert!(texts.iter().all(|text| display_width(text) <= 24), "{texts:?}");
+        let agent = texts.iter().find(|line| line.contains("◑ 2 agents")).expect("agent line at narrow width");
+        assert!(agent.ends_with('…'), "{agent}");
+    }
+
+    #[test]
+    fn todo_hud_workflow_strip_shows_live_workers_with_current_tasks() {
+        // Workflow workers must surface in the main view's TodoHUD without
+        // opening /workflow: one strip line per live workflow, with each
+        // worker's name + current task summary (the D12 projection), the
+        // supervisor excluded.
+        let theme = crate::theme::DARK;
+        let zig = workflow_panel_with_workers(
+            "zig-agent",
+            pi_coding::WorkflowStatus::Running,
+            &[("hub", Some("design doc")), ("researcher", Some("map files")), ("writer", None)],
+        );
+        let docs = workflow_panel_with_workers(
+            "docs",
+            pi_coding::WorkflowStatus::Running,
+            &[("scout", Some("read tui.rs"))],
+        );
+        let lines = render_todo_panel_lines(&[], &[], &[zig, docs], theme, 80);
+        let texts = todo_line_texts(&lines);
+        assert!(
+            texts.iter().any(|line| line == "Workflows · 2 active · 2 total"),
+            "compact header counts every live snapshot: {texts:?}"
+        );
+        let strip = texts.iter().find(|line| line.contains("◈ zig-agent")).expect("zig strip");
+        assert!(strip.contains("hub · design doc"), "{strip}");
+        assert!(strip.contains("researcher · map files"), "{strip}");
+        assert!(strip.contains("writer"), "worker without a task collapses to the bare name: {strip}");
+        let docs_strip = texts.iter().find(|line| line.contains("◈ docs")).expect("docs strip");
+        assert!(docs_strip.contains("scout · read tui.rs"), "{docs_strip}");
+        assert_eq!(texts[0], "", "leading blank separates the strip from the section above");
+        assert_eq!(*texts.last().unwrap(), "", "trailing blank separates the strip from the composer");
+    }
+
+    #[test]
+    fn todo_hud_workflow_strip_hides_terminal_and_workerless_workflows() {
+        // Completed/terminal workflows and live workflows whose child runtime
+        // has not spawned workers yet render no worker strip — the compact
+        // count header still surfaces their presence (A active · T total).
+        let theme = crate::theme::DARK;
+        let terminal = workflow_panel_with_workers(
+            "done",
+            pi_coding::WorkflowStatus::Completed,
+            &[("ghost", Some("stale"))],
+        );
+        let planning = workflow_panel_with_workers("queued", pi_coding::WorkflowStatus::Planning, &[]);
+        let lines = render_todo_panel_lines(&[], &[], &[terminal, planning], theme, 80);
+        let texts = todo_line_texts(&lines);
+        assert!(
+            texts.iter().any(|line| line == "Workflows · 1 active · 2 total"),
+            "header keeps terminal + workerless counts: {texts:?}"
+        );
+        assert!(!texts.iter().any(|line| line.contains("◈")), "terminal or workerless workflows render no strip: {texts:?}");
+        assert_eq!(texts[0], "", "leading blank still wraps header-only workflow blocks");
+        assert_eq!(*texts.last().unwrap(), "", "trailing blank still wraps header-only workflow blocks");
+    }
+
+    #[test]
+    fn todo_hud_workflow_strip_bounds_workers_and_truncates_narrow() {
+        let theme = crate::theme::DARK;
+        let wide = workflow_panel_with_workers(
+            "wide",
+            pi_coding::WorkflowStatus::Running,
+            &[
+                ("a", Some("one")),
+                ("b", Some("two")),
+                ("c", Some("three")),
+                ("d", Some("four")),
+                ("e", Some("five")),
+            ],
+        );
+        let lines = render_todo_panel_lines(&[], &[], &[wide.clone()], theme, 80);
+        let texts = todo_line_texts(&lines);
+        let strip = texts.iter().find(|line| line.contains("◈ wide")).expect("wide strip");
+        assert!(strip.contains("+1 more"), "overflowing workers collapse: {strip}");
+        let narrow = render_todo_panel_lines(&[], &[], &[wide], theme, 24);
+        let texts = todo_line_texts(&narrow);
+        assert!(texts.iter().all(|text| display_width(text) <= 24), "{texts:?}");
+        assert!(texts.iter().any(|line| line.contains("◈ wide")), "strip still present at narrow width: {texts:?}");
+    }
+
+    #[test]
+    fn todo_hud_workflow_header_absent_when_workflows_empty() {
+        let theme = crate::theme::DARK;
+        let lines = render_todo_panel_lines(&[], &[], &[], theme, 80);
+        let texts = todo_line_texts(&lines);
+        assert!(texts.is_empty(), "empty inputs render no todo panel rows: {texts:?}");
+        assert!(
+            !texts.iter().any(|line| line.contains("Workflows ·")),
+            "compact workflow header must not render without snapshots: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn todo_hud_workflow_header_counts_active_and_total() {
+        // Mixed active + terminal snapshots must report A from status.is_active()
+        // and T from the full snapshot set, matching workflow_commands::format_workflows_header.
+        let theme = crate::theme::DARK;
+        let running = workflow_panel_with_workers(
+            "ship",
+            pi_coding::WorkflowStatus::Running,
+            &[("worker", Some("land it"))],
+        );
+        let done = workflow_panel_with_workers(
+            "docs",
+            pi_coding::WorkflowStatus::Completed,
+            &[],
+        );
+        let lines = render_todo_panel_lines(&[], &[], &[running, done], theme, 80);
+        let texts = todo_line_texts(&lines);
+        assert_eq!(
+            texts.iter().filter(|line| line.starts_with("Workflows ·")).count(),
+            1,
+            "header renders exactly once: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|line| line == "Workflows · 1 active · 2 total"),
+            "mixed snapshots: {texts:?}"
+        );
+        assert!(texts.iter().any(|line| line.contains("◈ ship")), "live worker strip retained: {texts:?}");
+        assert!(!texts.iter().any(|line| line.contains("◈ docs")), "terminal workflows stay strip-less: {texts:?}");
+    }
+
+    #[test]
+    fn todo_hud_workflow_header_terminal_only_reports_zero_active() {
+        let theme = crate::theme::DARK;
+        let failed = workflow_panel_with_workers("fail", pi_coding::WorkflowStatus::Failed, &[]);
+        let cancelled = workflow_panel_with_workers(
+            "cancel",
+            pi_coding::WorkflowStatus::Cancelled,
+            &[("ghost", None)],
+        );
+        let lines = render_todo_panel_lines(&[], &[], &[failed, cancelled], theme, 80);
+        let texts = todo_line_texts(&lines);
+        assert!(
+            texts.iter().any(|line| line == "Workflows · 0 active · 2 total"),
+            "all-terminal snapshots still own the compact header: {texts:?}"
+        );
+        assert!(!texts.iter().any(|line| line.contains("◈")), "{texts:?}");
+        assert_eq!(texts[0], "");
+        assert_eq!(*texts.last().unwrap(), "");
+    }
+
+    #[test]
+    fn todo_hud_workflow_header_is_bounded_at_narrow_width() {
+        let theme = crate::theme::DARK;
+        let running = workflow_panel_with_workers(
+            "wide-name-workflow",
+            pi_coding::WorkflowStatus::Running,
+            &[("worker", Some("long task summary text"))],
+        );
+        let done = workflow_panel_with_workers("done", pi_coding::WorkflowStatus::Completed, &[]);
+        let narrow = render_todo_panel_lines(&[], &[], &[running, done], theme, 24);
+        let texts = todo_line_texts(&narrow);
+        assert!(texts.iter().all(|text| display_width(text) <= 24), "{texts:?}");
+        let header = texts
+            .iter()
+            .find(|line| line.contains("Workflows ·"))
+            .expect("bounded compact header");
+        assert!(header.starts_with("Workflows ·"), "{header}");
+        assert!(display_width(header) <= 24, "{header}");
+    }
+
     #[test]
     fn subagents_only_state_renders_above_composer_without_raw_ids() {
         use ratatui::backend::TestBackend;
@@ -15536,6 +23920,7 @@ mod tests {
                     started_at: Some(1_100),
                     finished_at: None,
                     result: None,
+                    soft_budget_exhausted: false,
                 },
             },
             pi_coding::OrchestrationEvent::AgentUpdated {
@@ -15639,6 +24024,7 @@ mod tests {
                         started_at: Some(2),
                         finished_at: None,
                         result: None,
+                        soft_budget_exhausted: false,
                     },
                 },
                 ));
@@ -15693,6 +24079,30 @@ mod tests {
                     status: *dep_status,
                 })
                 .collect(),
+            agent: None,
+        }
+    }
+
+    fn job_snapshot_fixture(
+        id: &str,
+        agent_id: &str,
+        status: pi_coding::JobStatus,
+    ) -> pi_coding::JobSnapshot {
+        pi_coding::JobSnapshot {
+            id: id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: Some(format!("work for {agent_id}")),
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status,
+            created_at: 1_000,
+            started_at: None,
+            finished_at: None,
+            result: None,
+            soft_budget_exhausted: false,
         }
     }
 
@@ -16116,10 +24526,12 @@ mod tests {
         let mut state = todo_test_state(Vec::new());
         state.model = "faux/faux-1".to_owned();
         state.cwd = "<workspace>/project".to_owned();
-        assert_eq!(live_viewport_height(&state, 80, 24), 4);
+        // One extra row: the always-reserved OMP-style status line above the
+        // composer (blank while idle) keeps the input box off the content.
+        assert_eq!(live_viewport_height(&state, 80, 24), 5);
 
         state.editor.set_text("one\ntwo");
-        assert_eq!(live_viewport_height(&state, 80, 24), 6);
+        assert_eq!(live_viewport_height(&state, 80, 24), 7);
 
         state.panel = Some(SelectorPanel {
             title: "Models".to_owned(),
@@ -16133,7 +24545,7 @@ mod tests {
 
         state.panel = None;
         assert!(!page_overlay_open(&state));
-        assert_eq!(live_viewport_height(&state, 80, 24), 6);
+        assert_eq!(live_viewport_height(&state, 80, 24), 7);
     }
 
     #[tokio::test]
@@ -16348,6 +24760,147 @@ mod tests {
             .await
             .expect("close settings");
         assert!(state.settings_panel.is_none(), "second Escape closes the page");
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn settings_enum_picker_selects_with_arrows_and_applies_like_typed_input() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent = tempfile::tempdir().expect("agent");
+        std::fs::write(
+            agent.path().join("settings.json"),
+            r#"{"transport":"web-socket-cached"}"#,
+        )
+        .expect("global settings");
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = pi_coding::ResourceManager::new(options).expect("resources");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.attach_resources(resources).await.expect("attach resources");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        let mut mouse = TestCodeReviewMouse::default();
+        state.open_settings_panel(&application, &mut mouse).expect("open settings");
+        let panel = state.settings_panel.as_mut().expect("settings panel");
+        panel.set_search("transport");
+        let expected_options = ["auto", "sse", "web-socket", "web-socket-cached"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            panel.selected().expect("selected row").expect("transport row").control,
+            SettingsControl::Enum {
+                value: Some("web-socket-cached".to_owned()),
+                options: expected_options.clone(),
+            }
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_settings_panel_key(&application, &mut state, enter)
+            .await
+            .expect("open picker");
+        assert_eq!(
+            state.settings_enum_picker.as_ref(),
+            Some(&SettingsEnumPicker {
+                key: "transport".to_owned(),
+                options: expected_options.clone(),
+                selected: 3,
+            })
+        );
+        assert!(
+            state.settings_value_input.is_none(),
+            "enum rows must open the picker, never the typed editor"
+        );
+
+        // Arrow keys and j/k navigate; selection wraps at both ends.
+        handle_settings_panel_key(&application, &mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .expect("down wraps");
+        assert_eq!(state.settings_enum_picker.as_ref().unwrap().selected, 0);
+        handle_settings_panel_key(
+            &application,
+            &mut state,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("j down");
+        assert_eq!(state.settings_enum_picker.as_ref().unwrap().selected, 1);
+        handle_settings_panel_key(
+            &application,
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("k up");
+        assert_eq!(state.settings_enum_picker.as_ref().unwrap().selected, 0);
+        handle_settings_panel_key(&application, &mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .expect("up wraps");
+        assert_eq!(state.settings_enum_picker.as_ref().unwrap().selected, 3);
+
+        // Esc cancels without staging a draft value.
+        handle_settings_panel_key(&application, &mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .expect("cancel picker");
+        assert!(state.settings_enum_picker.is_none());
+        assert!(state.settings_panel.is_some(), "first Escape cancels only the picker");
+        assert!(
+            !state.settings_panel.as_ref().unwrap().is_dirty(),
+            "cancelled picker must not stage a value"
+        );
+
+        // Reopen, walk to "auto", confirm into the draft like typed input.
+        handle_settings_panel_key(&application, &mut state, enter)
+            .await
+            .expect("reopen picker");
+        assert_eq!(state.settings_enum_picker.as_ref().unwrap().selected, 3);
+        handle_settings_panel_key(&application, &mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .expect("down to auto");
+        assert_eq!(state.settings_enum_picker.as_ref().unwrap().selected, 0);
+        handle_settings_panel_key(&application, &mut state, enter)
+            .await
+            .expect("confirm picker");
+        assert!(state.settings_enum_picker.is_none());
+        let panel = state.settings_panel.as_ref().expect("settings panel");
+        assert!(panel.is_dirty());
+        assert_eq!(
+            panel.selected().expect("selected row").expect("transport row").scope_value,
+            Some(serde_json::json!("auto"))
+        );
+        assert_eq!(
+            application.settings_manager().expect("manager").global_settings().transport,
+            Some(pi_ai::Transport::WebSocketCached),
+            "Enter must only update the pending row"
+        );
+
+        handle_settings_panel_key(
+            &application,
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .await
+        .expect("apply settings");
+        assert!(!state.settings_panel.as_ref().unwrap().is_dirty());
+        assert_eq!(
+            application.settings_manager().expect("manager").global_settings().transport,
+            Some(pi_ai::Transport::Auto)
+        );
         application.cleanup().await;
     }
 
@@ -16576,7 +25129,9 @@ mod tests {
         let backend = TestBackend::new(60, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_settings_panel(frame, &panel, Some(&input), crate::theme::DARK))
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, Some(&input), None, None, None, 0, crate::theme::DARK)
+            })
             .expect("draw settings editor");
         let rendered = terminal
             .backend()
@@ -16589,6 +25144,46 @@ mod tests {
         assert!(rendered.contains(r#"["alpha,beta","  padded  "]"#));
         assert!(rendered.contains("extensions must be a valid JSON array of strings"));
         assert!(!rendered.contains("overflowing the editor boundary"), "error text must be bounded to the editor width");
+    }
+
+    #[test]
+    fn settings_enum_picker_renders_option_list_with_selected_marker() {
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+        let picker = SettingsEnumPicker {
+            key: "transport".to_owned(),
+            options: ["auto", "sse", "web-socket", "web-socket-cached"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            selected: 2,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, None, Some(&picker), None, None, 0, crate::theme::DARK)
+            })
+            .expect("draw settings picker");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Select transport"), "picker title: {rendered}");
+        for option in ["auto", "sse", "web-socket", "web-socket-cached"] {
+            assert!(rendered.contains(option), "option {option}: {rendered}");
+        }
+        assert!(rendered.contains("› web-socket"), "selected option marker: {rendered}");
+        assert!(!rendered.contains("› auto"), "only the selected option is marked: {rendered}");
+        assert!(rendered.contains("Selecting value"), "picker footer: {rendered}");
     }
 
     #[test]
@@ -16612,7 +25207,9 @@ mod tests {
         let backend = TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_settings_panel(frame, &panel, Some(&input), crate::theme::DARK))
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, Some(&input), None, None, None, 0, crate::theme::DARK)
+            })
             .expect("draw settings editor");
         let buffer = terminal.backend().buffer();
         let rows = (0..buffer.area.height)
@@ -16649,7 +25246,7 @@ mod tests {
             let backend = TestBackend::new(100, height);
             let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
             terminal
-                .draw(|frame| render_settings_panel(frame, &panel, None, crate::theme::DARK))
+                .draw(|frame| render_settings_panel(frame, &panel, None, None, None, None, 0, crate::theme::DARK))
                 .expect("draw grouped settings");
             let buffer = terminal.backend().buffer();
             let rows = (0..buffer.area.height)
@@ -16659,10 +25256,87 @@ mod tests {
                         .collect::<String>()
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(rows.iter().filter(|row| row.contains("│Retry")).count(), 1, "height {height}: {rows:#?}");
+            assert_eq!(rows.iter().filter(|row| row.contains("│Retry")).count(), 0, "the value list no longer carries a left border, height {height}: {rows:#?}");
+            assert!(
+                rows.iter().filter(|row| row.contains("Retry")).count() >= 2,
+                "section must appear in the left sub-category column and the right header, height {height}: {rows:#?}"
+            );
             assert!(rows.iter().any(|row| row.contains(if height == 12 { "provider.timeoutMs" } else { "enabled = true" })), "height {height}: {rows:#?}");
             assert!(!rows.iter().any(|row| row.contains(if height == 12 { "retry.provider.timeoutMs" } else { "retry.enabled" })), "height {height}: {rows:#?}");
         }
+    }
+
+    #[test]
+    fn settings_selected_row_highlights_with_selected_bg() {
+        // OMP's getSettingsListTheme highlights the hovered row with
+        // `selectedBg`; the settings value list must carry that background
+        // across every content cell of the selected row (marker, key, value)
+        // while unselected rows stay flat.
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, None, None, None, None, 0, crate::theme::DARK)
+            })
+            .expect("draw settings");
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let selected = rows
+            .iter()
+            .find(|row| row.iter().any(|cell| cell.symbol() == "›"))
+            .expect("selected row carries the cursor marker");
+        // The buffer row also carries the panel borders and the left
+        // sub-category column, so check the cells from the `›` marker
+        // rightward (the value list row proper) only.
+        let marker = selected
+            .iter()
+            .position(|cell| cell.symbol() == "›")
+            .expect("marker cell");
+        assert!(
+            selected
+                .iter()
+                .enumerate()
+                .filter(|(index, cell)| {
+                    *index >= marker
+                        && !cell.symbol().is_empty()
+                        && cell.symbol() != " "
+                        && cell.symbol() != "│"
+                })
+                .all(|(_, cell)| cell.bg == crate::theme::DARK.selected_bg),
+            "every content cell of the selected settings row uses selected_bg: {:?}",
+            selected
+                .iter()
+                .map(|cell| (cell.symbol(), cell.bg))
+                .collect::<Vec<_>>()
+        );
+        let unselected = rows
+            .iter()
+            .filter(|row| !row.iter().any(|cell| cell.symbol() == "›"))
+            .find(|row| {
+                row.iter()
+                    .any(|cell| !cell.symbol().is_empty() && cell.symbol() != " ")
+            })
+            .expect("an unselected content row exists");
+        assert!(
+            unselected
+                .iter()
+                .filter(|cell| !cell.symbol().is_empty() && cell.symbol() != " ")
+                .all(|cell| cell.bg != crate::theme::DARK.selected_bg),
+            "unselected settings rows must stay flat"
+        );
     }
 
     #[test]
@@ -16686,7 +25360,7 @@ mod tests {
         .expect("inline terminal");
 
         terminal
-            .draw(|frame| render_settings_panel(frame, &panel, None, crate::theme::DARK))
+            .draw(|frame| render_settings_panel(frame, &panel, None, None, None, None, 0, crate::theme::DARK))
             .expect("draw open settings");
         let open = terminal
             .backend()
@@ -16735,6 +25409,945 @@ mod tests {
         // Overlay frames were never insert_before'd, so the native scrollback
         // ledger stays empty of settings content.
         terminal.backend().assert_scrollback_empty();
+    }
+
+    #[test]
+    fn settings_status_line_is_panel_metadata_only_and_description_gets_its_own_line() {
+        // D2: the status line carries scope+trust only — no "Section X" prefix
+        // duplicating the body banner, no search echo, no description crammed
+        // after the metadata. The selected row's description renders on its
+        // own dedicated line.
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let mut panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+        panel.set_category(Some(pi_coding::SettingCategory::RetryTransport));
+        let expected_description = panel
+            .selected()
+            .expect("selected row")
+            .expect("first row")
+            .description
+            .clone();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, None, None, None, None, 0, crate::theme::DARK)
+            })
+            .expect("draw settings");
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter().any(|row| row.contains("Scope Global") && row.contains("trusted")),
+            "status line must carry scope + trust: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("Section ") || row.contains("Search ")),
+            "status line must not duplicate the section banner or echo search: {rows:#?}"
+        );
+        let description_row = rows
+            .iter()
+            .position(|row| row.contains(&expected_description))
+            .expect("description must render on its own line");
+        assert!(
+            !rows[description_row].contains("Scope Global"),
+            "description must be on a separate line from the panel metadata: {}",
+            rows[description_row]
+        );
+        assert!(
+            !rows[description_row].contains("›"),
+            "description line must not carry the row marker: {}",
+            rows[description_row]
+        );
+
+        // The section name is still visible exactly once in the leaf banner
+        // (the body owns it), never on the status line.
+        let mut leaf = panel.clone();
+        leaf.set_category(Some(pi_coding::SettingCategory::RetryTransport));
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &leaf, None, None, None, Some("Retry"), 0, crate::theme::DARK)
+            })
+            .expect("draw settings leaf");
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter().any(|row| row.contains("enabled = true")),
+            "leaf rows render under the entered section: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("Section Retry")),
+            "status line must not duplicate the leaf banner: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn settings_row_chip_collapses_to_a_single_short_tag() {
+        // D3: one compact provenance chip per row — [default] / [global] /
+        // [project · inherited] / [session] — with behavior only when it is
+        // not the Live norm, never the stacked [Default · Live · inherited].
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let mut panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, None, None, None, None, 0, crate::theme::DARK)
+            })
+            .expect("draw settings");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("defaultProvider = null  [default · restart]"),
+            "unset restart-behavior row shows [default · restart]: {rendered}"
+        );
+        assert!(
+            !rendered.contains("[Default")
+                && !rendered.contains("· Live")
+                && !rendered.contains(" · inherited]"),
+            "the stacked [Default · Live · inherited] chip must be gone: {rendered}"
+        );
+
+        // A Live default row renders as a bare [default] chip (search makes
+        // the retry rows visible regardless of the browse fold).
+        panel.set_search("retry.enabled");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, None, None, None, None, 0, crate::theme::DARK)
+            })
+            .expect("draw searched settings");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("enabled = true  [default]"),
+            "Live default row shows a bare [default] chip: {rendered}"
+        );
+        assert!(
+            !rendered.contains("· Live") && !rendered.contains("inherited"),
+            "Live and inherited tags are noise on a global default row: {rendered}"
+        );
+
+        // A global value in project scope renders as [global · inherited].
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        manager
+            .update_global(|settings| settings.retry = Some(pi_coding::RetryConfig { enabled: Some(false), ..Default::default() }))
+            .expect("global retry");
+        manager.load_project(true).expect("project trust");
+        let mut project = SettingsPanel::new(manager, pi_coding::SettingsScope::Project)
+            .expect("project panel");
+        project.set_search("retry.enabled");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &project, None, None, None, None, 0, crate::theme::DARK)
+            })
+            .expect("draw project settings");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("enabled = false  [global · inherited]"),
+            "project row inheriting a global value shows [global · inherited]: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_open_from_welcome_screen_hides_welcome_behind_the_modal() {
+        // D4 (option B): the welcome panel is a transient startup screen. On a
+        // wide terminal the centered settings modal leaves columns free on
+        // each side — the welcome must not render around it, and it returns
+        // once settings closes.
+        use ratatui::backend::TestBackend;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent = tempfile::tempdir().expect("agent");
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = pi_coding::ResourceManager::new(options).expect("resources");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.attach_resources(resources).await.expect("attach resources");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        let mut mouse = TestCodeReviewMouse::default();
+
+        let backend = TestBackend::new(220, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut images = TerminalImageRenderer::default();
+        let mut render_text = |terminal: &mut ratatui::Terminal<TestBackend>, state: &TuiState| {
+            terminal
+                .draw(|frame| {
+                    let _ = render(frame, state, &mut images);
+                })
+                .expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        // Baseline: with no overlay the welcome panel renders.
+        let welcome = render_text(&mut terminal, &state);
+        assert!(
+            welcome.contains("Welcome back!"),
+            "baseline frame must render the welcome panel: {welcome}"
+        );
+
+        // Settings open from the welcome screen: no welcome content may peek
+        // around the modal.
+        state
+            .open_settings_panel(&application, &mut mouse)
+            .expect("open settings");
+        assert!(page_overlay_open(&state));
+        let overlay = render_text(&mut terminal, &state);
+        assert!(
+            overlay.contains(" Settings "),
+            "settings modal must render: {overlay}"
+        );
+        assert!(
+            !overlay.contains("Welcome back!"),
+            "welcome must not peek around the settings modal: {overlay}"
+        );
+
+        // Dismiss: the welcome returns.
+        state.settings_panel = None;
+        let dismissed = render_text(&mut terminal, &state);
+        assert!(
+            dismissed.contains("Welcome back!"),
+            "welcome returns after settings dismiss: {dismissed}"
+        );
+        application.cleanup().await;
+    }
+
+    #[test]
+    fn settings_two_pane_layout_renders_category_tabs_subcategories_and_values() {
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let mut panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+        panel.set_category(Some(pi_coding::SettingCategory::RetryTransport));
+        // 30 rows so every RetryTransport row (including the Transport
+        // subsection) fits below the tabs/status/description/footer chrome.
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, None, None, None, None, 0, crate::theme::DARK)
+            })
+            .expect("draw settings");
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let joined = rows.join("\n");
+
+        // omp-style category tabs across the top, including the All pseudo-tab.
+        for tab in [
+            "All",
+            "Models",
+            "Session",
+            "Compaction",
+            "Retry",
+            "Terminal",
+            "Orchestration",
+            "Resources",
+            "Trust",
+        ] {
+            assert!(joined.contains(&format!(" {tab} ")), "category tab {tab}: {joined}");
+        }
+
+        // The sub-category column and the right value list both surface the
+        // Retry section; value rows render under their display keys.
+        assert!(
+            rows.iter().filter(|row| row.contains("Retry")).count() >= 2,
+            "left column and right header must both show the section: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("enabled = true")),
+            "right pane boolean value row: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("maxRetries = 3")),
+            "right pane integer value row: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("transport") && row.contains("auto")),
+            "right pane enum value row: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("autoRetry")),
+            "right pane legacy alias row: {rows:#?}"
+        );
+        let expected_description = panel
+            .selected()
+            .expect("selected row")
+            .expect("first row")
+            .description;
+        assert!(
+            joined.contains(&expected_description),
+            "selected setting description must appear in the status row: {joined}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Ctrl-S apply")),
+            "settings footer retains apply help: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn settings_two_pane_degrades_to_single_pane_on_narrow_terminals() {
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+
+        // 60 columns: no room for the sub-category column, so the section
+        // header appears exactly once (in the value list) and the tab bar is
+        // truncated rather than overflowing.
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, None, None, None, None, 0, crate::theme::DARK)
+            })
+            .expect("draw settings");
+        let buffer = terminal.backend().buffer();
+        let narrow = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let joined = narrow.join("\n");
+        assert_eq!(
+            joined.matches("BranchSummary").count(),
+            1,
+            "single-pane mode must render the section header once: {joined}"
+        );
+        assert!(
+            joined.contains("reserveTokens = 16384"),
+            "value rows must stay visible in degraded mode: {joined}"
+        );
+        assert!(
+            !joined.contains(" Trust "),
+            "tabs that do not fit must be dropped: {joined}"
+        );
+        assert!(joined.contains('…'), "truncated tab bar shows an ellipsis: {joined}");
+
+        // 120 columns: the same panel gets the left sub-category column, so
+        // the section appears twice (left column + right header).
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, None, None, None, None, 0, crate::theme::DARK)
+            })
+            .expect("draw settings");
+        let buffer = terminal.backend().buffer();
+        let wide = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let joined = wide.join("\n");
+        assert_eq!(
+            joined.matches("BranchSummary").count(),
+            2,
+            "two-pane mode must show the section in both panes: {joined}"
+        );
+        assert!(joined.contains(" Trust "), "wide tab bar fits every tab: {joined}");
+    }
+
+    #[test]
+    fn settings_subsections_grouping_is_stable_per_catalog_category() {
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+        for category in SettingsPanel::categories() {
+            let mut filtered = panel.clone();
+            filtered.set_category(Some(*category));
+            let rows = filtered.rows().expect("rows");
+            let first = settings_subsections(&rows);
+            let second = settings_subsections(&rows);
+            assert_eq!(
+                first, second,
+                "subsection grouping must be deterministic per call: {category:?}"
+            );
+            assert!(!first.is_empty(), "every category has subsections: {category:?}");
+            let mut covered = 0;
+            for section in &first {
+                let rows_in_section = settings_section_rows(&rows, section);
+                assert!(
+                    !rows_in_section.is_empty(),
+                    "subsection {section:?} has rows: {category:?}"
+                );
+                assert!(
+                    rows_in_section.iter().all(|row| &row.section() == section),
+                    "subsection rows must share the section label: {category:?}"
+                );
+                covered += rows_in_section.len();
+            }
+            assert_eq!(
+                covered, rows.len(),
+                "subsections must partition every visible row: {category:?}"
+            );
+        }
+        // Fixture-catalog expectations: the key-prefix grouping rule maps
+        // `retry.*` prefixes to stable subsection labels; section overrides
+        // (D1/S1-S7) split the general buckets into named sections — the
+        // thinking-level picker collocates with its per-level caps under
+        // "Thinking", legacy aliases join their canonical keys, and the
+        // transport/timeout settings form "Transport".
+        let mut retry = panel.clone();
+        retry.set_category(Some(pi_coding::SettingCategory::RetryTransport));
+        let retry_rows = retry.rows().expect("retry rows");
+        assert_eq!(
+            settings_subsections(&retry_rows),
+            vec![
+                "Retry".to_owned(),
+                "Retry provider".to_owned(),
+                "Transport".to_owned(),
+            ]
+        );
+        let mut models = panel.clone();
+        models.set_category(Some(pi_coding::SettingCategory::Models));
+        let models_rows = models.rows().expect("models rows");
+        assert_eq!(
+            settings_subsections(&models_rows),
+            vec!["General".to_owned(), "Thinking".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_browse_enter_drills_into_subsection_and_escape_returns() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent = tempfile::tempdir().expect("agent");
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = pi_coding::ResourceManager::new(options).expect("resources");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.attach_resources(resources).await.expect("attach resources");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        let mut mouse = TestCodeReviewMouse::default();
+        state.open_settings_panel(&application, &mut mouse).expect("open settings");
+        state
+            .settings_panel
+            .as_mut()
+            .expect("settings panel")
+            .set_category(Some(pi_coding::SettingCategory::RetryTransport));
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+
+        // The first visible RetryTransport row is retry.enabled in the "Retry"
+        // subsection (legacy aliases now join their canonical keys there), so
+        // Enter drills into it.
+        let selected = state
+            .settings_panel
+            .as_ref()
+            .expect("settings panel")
+            .selected()
+            .expect("selected row")
+            .expect("first row");
+        assert_eq!(selected.section(), "Retry");
+        handle_settings_panel_key(&application, &mut state, enter)
+            .await
+            .expect("drill into Retry");
+        assert_eq!(state.settings_section.as_deref(), Some("Retry"));
+        assert!(state.settings_panel.is_some(), "drilling keeps the panel open");
+        assert!(
+            state.settings_value_input.is_none() && state.settings_boolean_picker.is_none(),
+            "drilling is navigation, not an editor or picker"
+        );
+        {
+            let panel = state.settings_panel.as_ref().expect("settings panel");
+            let rows = panel.snapshot().expect("snapshot").rows;
+            let leaf = settings_section_rows(&rows, "Retry");
+            assert!(leaf.iter().any(|row| row.key == "retry.enabled"));
+            assert!(
+                leaf.iter().any(|row| row.key == "autoRetry"),
+                "legacy aliases must render in their canonical section"
+            );
+            assert!(
+                !leaf.iter().any(|row| row.key == "transport"),
+                "leaf must be limited to the entered subsection"
+            );
+        }
+
+        // ↑/↓ move the leaf cursor; Enter at the leaf opens the typed control.
+        handle_settings_panel_key(&application, &mut state, enter)
+            .await
+            .expect("open control at leaf");
+        assert_eq!(
+            state.settings_boolean_picker.as_ref().expect("boolean picker").key,
+            "retry.enabled",
+            "leaf Enter opens the native control for the selected row"
+        );
+        handle_settings_panel_key(&application, &mut state, esc).await.expect("cancel picker");
+        handle_settings_panel_key(&application, &mut state, down).await.expect("leaf down");
+        assert_eq!(state.settings_leaf_cursor, 1);
+        handle_settings_panel_key(&application, &mut state, up).await.expect("leaf up");
+        assert_eq!(state.settings_leaf_cursor, 0, "leaf cursor wraps within the subsection");
+        handle_settings_panel_key(&application, &mut state, down).await.expect("leaf down again");
+        assert_eq!(state.settings_leaf_cursor, 1);
+        handle_settings_panel_key(&application, &mut state, enter).await.expect("open editor at leaf");
+        assert_eq!(
+            state.settings_value_input.as_ref().expect("value input").key,
+            "retry.maxRetries",
+            "leaf Enter opens the typed editor for numeric rows"
+        );
+        handle_settings_panel_key(&application, &mut state, esc).await.expect("cancel editor");
+        handle_settings_panel_key(&application, &mut state, esc).await.expect("exit section");
+        assert_eq!(state.settings_section, None);
+        assert!(state.settings_panel.is_some(), "first Escape only exits the subsection");
+
+        // Search browse stays flat: Enter opens the control directly, never
+        // drilling into a subsection.
+        state
+            .settings_panel
+            .as_mut()
+            .expect("settings panel")
+            .set_search("retry.enabled");
+        handle_settings_panel_key(&application, &mut state, enter)
+            .await
+            .expect("open picker from search");
+        assert!(state.settings_section.is_none(), "search browse must stay flat");
+        assert_eq!(
+            state.settings_boolean_picker.as_ref().expect("boolean picker").key,
+            "retry.enabled"
+        );
+        handle_settings_panel_key(&application, &mut state, esc).await.expect("cancel picker");
+
+        // A final Escape closes the page.
+        handle_settings_panel_key(&application, &mut state, esc).await.expect("close settings");
+        assert!(state.settings_panel.is_none(), "second Escape closes the page");
+        application.cleanup().await;
+    }
+
+    #[test]
+    fn settings_typed_controls_render_inside_subsection_leaf() {
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let mut panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+        panel.set_category(Some(pi_coding::SettingCategory::RetryTransport));
+        let input = SettingsValueInput {
+            key: "retry.baseDelayMs".to_owned(),
+            value: "2000".to_owned(),
+            cursor: 4,
+            hint: panel.input_hint("retry.baseDelayMs").expect("hint"),
+            error: None,
+            replace_on_type: true,
+        };
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(
+                    frame,
+                    &panel,
+                    Some(&input),
+                    None,
+                    None,
+                    Some("Retry"),
+                    0,
+                    crate::theme::DARK,
+                )
+            })
+            .expect("draw settings leaf");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Edit retry.baseDelayMs"),
+            "typed editor must render at the leaf: {rendered}"
+        );
+        assert!(rendered.contains("Editing value"), "editor footer at the leaf: {rendered}");
+        assert!(rendered.contains("Retry"), "section banner in the leaf: {rendered}");
+        assert!(
+            rendered.contains("enabled = true"),
+            "leaf rows render under the entered subsection: {rendered}"
+        );
+        assert!(
+            !rendered.contains("transport") && !rendered.contains("timeoutMs"),
+            "leaf must exclude rows from other subsections: {rendered}"
+        );
+
+        // The enum picker overlay renders identically at the leaf.
+        let picker = SettingsEnumPicker {
+            key: "transport".to_owned(),
+            options: ["auto", "sse", "web-socket", "web-socket-cached"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            selected: 1,
+        };
+        terminal
+            .draw(|frame| {
+                render_settings_panel(
+                    frame,
+                    &panel,
+                    None,
+                    Some(&picker),
+                    None,
+                    Some("Retry"),
+                    0,
+                    crate::theme::DARK,
+                )
+            })
+            .expect("draw settings leaf picker");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Select transport"), "picker title at leaf: {rendered}");
+        assert!(rendered.contains("› sse"), "selected picker option at leaf: {rendered}");
+        assert!(rendered.contains("Selecting value"), "picker footer at leaf: {rendered}");
+    }
+
+    #[test]
+    fn settings_narrow_terminal_collapses_subsections_to_a_flat_list() {
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let mut panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+        panel.set_category(Some(pi_coding::SettingCategory::Session));
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        // Browse mode on a narrow terminal: the sub-category column is dropped
+        // and subsections collapse into inline headers of one flat list.
+        terminal
+            .draw(|frame| {
+                render_settings_panel(
+                    frame,
+                    &panel,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    crate::theme::DARK,
+                )
+            })
+            .expect("draw narrow browse");
+        let buffer = terminal.backend().buffer();
+        let joined = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            joined.matches("BranchSummary").count(),
+            1,
+            "flat narrow list shows each subsection header exactly once: {joined}"
+        );
+        assert_eq!(
+            joined.matches("General").count(),
+            1,
+            "flat narrow list shows each subsection header exactly once: {joined}"
+        );
+        assert!(
+            joined.contains("reserveTokens = 16384"),
+            "flat narrow list keeps every value row: {joined}"
+        );
+
+        // The entered-subsection leaf renders on the same narrow width without
+        // inventing a second pane.
+        terminal
+            .draw(|frame| {
+                render_settings_panel(
+                    frame,
+                    &panel,
+                    None,
+                    None,
+                    None,
+                    Some("BranchSummary"),
+                    0,
+                    crate::theme::DARK,
+                )
+            })
+            .expect("draw narrow leaf");
+        let buffer = terminal.backend().buffer();
+        let joined = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("reserveTokens = 16384"),
+            "narrow leaf keeps the subsection rows: {joined}"
+        );
+        assert!(
+            !joined.contains("steeringMode"),
+            "narrow leaf excludes rows from other subsections: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_boolean_setting_opens_two_option_picker_and_applies() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent = tempfile::tempdir().expect("agent");
+        let mut options = pi_coding::ResourceManagerOptions::new(cwd.path());
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = pi_coding::ResourceManager::new(options).expect("resources");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.attach_resources(resources).await.expect("attach resources");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        let mut mouse = TestCodeReviewMouse::default();
+        state.open_settings_panel(&application, &mut mouse).expect("open settings");
+        let panel = state.settings_panel.as_mut().expect("settings panel");
+        panel.set_search("retry.enabled");
+        assert_eq!(
+            panel.selected().expect("selected row").expect("retry.enabled row").control,
+            SettingsControl::Boolean { value: Some(true) }
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_settings_panel_key(&application, &mut state, enter)
+            .await
+            .expect("open boolean picker");
+        assert_eq!(
+            state.settings_boolean_picker.as_ref(),
+            Some(&SettingsBooleanPicker {
+                key: "retry.enabled".to_owned(),
+                selected: true,
+            })
+        );
+        assert!(
+            state.settings_value_input.is_none(),
+            "boolean rows must open the picker, never the typed editor"
+        );
+        assert!(
+            state.settings_enum_picker.is_none(),
+            "boolean rows must open the boolean picker, never the enum picker"
+        );
+
+        // Arrow keys and j/k flip the highlighted option; Down wraps to false.
+        handle_settings_panel_key(&application, &mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .expect("flip to false");
+        assert_eq!(state.settings_boolean_picker.as_ref().unwrap().selected, false);
+        handle_settings_panel_key(
+            &application,
+            &mut state,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("j flips to true");
+        assert_eq!(state.settings_boolean_picker.as_ref().unwrap().selected, true);
+        handle_settings_panel_key(
+            &application,
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("k flips to false");
+        assert_eq!(state.settings_boolean_picker.as_ref().unwrap().selected, false);
+
+        // Esc cancels without staging a draft value.
+        handle_settings_panel_key(&application, &mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .expect("cancel picker");
+        assert!(state.settings_boolean_picker.is_none());
+        assert!(state.settings_panel.is_some(), "first Escape cancels only the picker");
+        assert!(
+            !state.settings_panel.as_ref().unwrap().is_dirty(),
+            "cancelled picker must not stage a value"
+        );
+
+        // Reopen, flip to false, confirm into the draft like an enum picker.
+        handle_settings_panel_key(&application, &mut state, enter)
+            .await
+            .expect("reopen picker");
+        assert_eq!(state.settings_boolean_picker.as_ref().unwrap().selected, true);
+        handle_settings_panel_key(&application, &mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .expect("flip to false");
+        handle_settings_panel_key(&application, &mut state, enter)
+            .await
+            .expect("confirm picker");
+        assert!(state.settings_boolean_picker.is_none());
+        let panel = state.settings_panel.as_ref().expect("settings panel");
+        assert!(panel.is_dirty());
+        assert_eq!(
+            panel.selected().expect("selected row").expect("retry.enabled row").scope_value,
+            Some(serde_json::json!(false))
+        );
+        assert_eq!(
+            application.settings_manager().expect("manager").global_settings()
+                .retry.as_ref().and_then(|retry| retry.enabled),
+            None,
+            "Enter must only update the pending row, never persist it"
+        );
+
+        handle_settings_panel_key(
+            &application,
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .await
+        .expect("apply settings");
+        assert!(!state.settings_panel.as_ref().unwrap().is_dirty());
+        assert_eq!(
+            application.settings_manager().expect("manager").global_settings()
+                .retry.as_ref().and_then(|retry| retry.enabled),
+            Some(false)
+        );
+        application.cleanup().await;
+    }
+
+    #[test]
+    fn settings_boolean_picker_renders_true_false_with_selected_marker() {
+        use ratatui::backend::TestBackend;
+
+        let agent = tempfile::tempdir().expect("agent");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let manager =
+            pi_coding::SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("manager");
+        let panel = SettingsPanel::new(manager, pi_coding::SettingsScope::Global).expect("panel");
+        let picker = SettingsBooleanPicker {
+            key: "retry.enabled".to_owned(),
+            selected: false,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_settings_panel(frame, &panel, None, None, Some(&picker), None, 0, crate::theme::DARK)
+            })
+            .expect("draw settings boolean picker");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Select retry.enabled"), "picker title: {rendered}");
+        assert!(rendered.contains(" true "), "true option: {rendered}");
+        assert!(rendered.contains("false"), "false option: {rendered}");
+        assert!(rendered.contains("› false"), "selected option marker: {rendered}");
+        assert!(!rendered.contains("› true"), "only the selected option is marked: {rendered}");
+        assert!(rendered.contains("Selecting value"), "picker footer: {rendered}");
     }
 
     #[test]
@@ -16851,6 +26464,7 @@ mod tests {
         let panel_rows = u16::try_from(render_todo_panel_lines(
             &state.todo_phases,
             &state.job_cards.cards_in_source_order(),
+            &[],
             crate::theme::DARK,
             live_content_width(80),
         ).len(),
@@ -16862,6 +26476,35 @@ mod tests {
         assert_eq!(transcript_region_height(&state, 80, 24), layout.transcript);
         assert!(live_viewport_height(&state, 80, 24) >= 3);
         assert!(live_viewport_height(&state, 80, 24) <= 24);
+    }
+
+    #[test]
+    fn active_status_reserves_blank_gap_row_above_composer() {
+        // Idle keeps the single reserved blank status row; visible status text
+        // grows the status section to three rows (blank gap · text · blank
+        // gap, OMP-style) so the text is never flush against content above or
+        // the composer border. On terminals with no spare row the active text
+        // degrades to a single row rather than shrinking the composer.
+        let mut state = todo_test_state(Vec::new());
+        let width = live_content_width(80);
+        let height = live_content_height(24);
+        let layout = |state: &TuiState| tui_layout_heights(state, width, height, 0, 0, 0, 0);
+        assert_eq!(layout(&state).status, 1, "idle reserves one blank status row");
+
+        state.status = "Workflow ship · planning".to_owned();
+        assert_eq!(layout(&state).status, 3, "active status adds blank gaps above and below");
+        let active = layout(&state);
+        assert!(active.transcript > 0, "transcript keeps room: {active:?}");
+        assert_eq!(active.composer, 2, "composer height is never shrunk");
+
+        // Tiny terminal: one optional row leaves no room for the gaps; the
+        // text row alone is kept and the composer still gets its two rows.
+        let small = tui_layout_heights(&state, width, 4, 0, 0, 0, 0);
+        assert_eq!(small.status, 1, "no budget for the gap rows: {small:?}");
+        assert_eq!(small.composer, 2, "composer survives on a tiny terminal: {small:?}");
+
+        state.status = String::new();
+        assert_eq!(layout(&state).status, 1, "cleared status returns to the reserved blank row");
     }
 
     #[test]
@@ -17071,25 +26714,46 @@ mod tests {
 
     #[test]
     fn working_and_compaction_animate_only_while_active() {
+        // Busy states animate the OMP-style status line above the input box;
+        // the static footer header never changes frame to frame.
+        fn header(state: &TuiState) -> String {
+            composer_border_lines(state, 90, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 90, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
         let mut state = todo_test_state(Vec::new());
         state.is_streaming = true;
-        let working_first = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let footer_first = header(&state);
+        let working_first = status(&state);
         state.animation_frame = 1;
-        let working_second = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
-        assert_ne!(working_first, working_second);
+        let working_second = status(&state);
+        assert_ne!(working_first, working_second, "working status must animate");
+        assert!(working_first.contains("Working"), "working label: {working_first}");
+        assert_eq!(footer_first, header(&state), "footer must stay static while streaming");
 
         state.is_streaming = false;
         state.is_compacting = true;
-        let compacting_first = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let compacting_first = status(&state);
         state.animation_frame = 2;
-        let compacting_second = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
-        assert_ne!(compacting_first, compacting_second);
+        let compacting_second = status(&state);
+        assert_ne!(compacting_first, compacting_second, "compacting status must animate");
+        assert!(compacting_first.contains("Compacting"), "compacting label: {compacting_first}");
 
         state.is_compacting = false;
-        let idle_first = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let idle_first = status(&state);
         state.animation_frame = 3;
-        let idle_second = composer_border_lines(&state, 90, crate::theme::DARK)[0].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
-        assert_eq!(idle_first, idle_second);
+        let idle_second = status(&state);
+        assert_eq!(idle_first, idle_second, "idle status line must be stable");
+        assert!(idle_first.is_empty(), "idle status line must be blank: {idle_first:?}");
         assert!(!state.has_active_animation());
     }
 
@@ -17110,6 +26774,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             result: None,
+            soft_budget_exhausted: false,
         };
         let event = |job| {
             ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::JobUpdated {
@@ -17156,7 +26821,7 @@ mod tests {
         state.push_entry(TranscriptEntry { kind: TranscriptKind::Assistant, content: vec![ContentBlock::text("recent answer")], tool_name: None, tool_card: None, job_card: None, is_error: false, is_partial: false,
         });
         state.finish_commit(1);
-        state.transcript_scroll = 1;
+        state.transcript_top_row.set(Some(1));
         assert_eq!(state.committed_entries, 1);
         assert_eq!(state.transcript.len(), 2);
         assert!(state.transcript.iter().any(|entry| content_text(&entry.content).contains("old prompt")));
@@ -17195,51 +26860,169 @@ mod tests {
         state.model = "faux/faux-1".to_owned();
         state.cwd = "<workspace>".to_owned();
 
+        fn header(state: &TuiState) -> String {
+            composer_border_lines(state, 120, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 120, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+
         for idle in [
             "",
             "Ready",
             "Enter submit · Shift+Enter/Ctrl+J newline · Esc abort · Ctrl+D quit",
         ] {
             state.status = idle.to_owned();
-            let top = composer_border_lines(&state, 120, crate::theme::DARK)[0]
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
+            let top = header(&state);
             assert!(top.contains("⬢ faux/faux-1"), "metadata must remain: {top}");
             assert!(top.contains("◑ off"), "thinking metadata must remain: {top}");
             assert!(top.contains("📁 <workspace>"), "cwd metadata must remain: {top}");
             assert!(!top.contains("Ready"), "default idle status must be hidden: {top}");
             assert!(!top.contains("Enter submit"), "key help belongs in welcome and /help: {top}");
-            assert!(!top.contains("⟲"), "idle activity segment must be omitted: {top}");
+            assert!(!top.contains("⟲"), "footer must never carry an activity segment: {top}");
             assert_eq!(display_width(&top), 120);
+            assert!(status(&state).is_empty(), "idle status line must be blank");
         }
 
+        // Meaningful transient status moves to the status line above the input
+        // box; the compact footer keeps only static metadata.
         state.status = "Usage: /import <path.jsonl>".to_owned();
-        let meaningful = composer_border_lines(&state, 120, crate::theme::DARK)[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(meaningful.contains("Usage: /import <path.jsonl>"), "{meaningful}");
-        assert!(meaningful.contains("▶──"), "meaningful status keeps activity glyph: {meaningful}");
+        let footer = header(&state);
+        let line = status(&state);
+        assert!(line.contains("Usage: /import <path.jsonl>"), "{line}");
+        assert!(line.contains("⟲"), "status keeps the static activity glyph: {line}");
+        assert!(!footer.contains("Usage: /import <path.jsonl>"), "footer must not carry status text: {footer}");
 
         state.status = "Ready".to_owned();
         state.is_streaming = true;
-        let first = composer_border_lines(&state, 120, crate::theme::DARK)[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
+        let first = status(&state);
         state.animation_frame = 1;
-        let second = composer_border_lines(&state, 120, crate::theme::DARK)[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(first.contains("working"), "streaming must render activity: {first}");
+        let second = status(&state);
+        assert!(first.contains("Working"), "streaming must render activity: {first}");
+        assert!(first.contains("⟦esc⟧"), "streaming is abortable and must hint Esc: {first}");
         assert!(!first.contains("Ready"), "busy activity replaces idle status: {first}");
         assert_ne!(first, second, "streaming activity must animate");
+        assert!(!header(&state).contains("working"), "footer stays static while streaming");
+    }
+
+    #[test]
+    fn transient_status_line_reserved_above_composer_even_when_idle() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "<workspace>/project".to_owned();
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(100, 24),
+            TerminalOptions {
+                viewport: Viewport::Inline(24),
+            },
+        )
+        .expect("inline terminal");
+        let mut images = TerminalImageRenderer::default();
+        let mut draw_rows = |terminal: &mut Terminal<TestBackend>, state: &TuiState| {
+            terminal
+                .draw(|frame| {
+                    let _ = render(frame, state, &mut images);
+                })
+                .expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(100)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let footer_index = |rows: &[String]| {
+            rows.iter()
+                .position(|row| row.contains("╭── π"))
+                .expect("footer row")
+        };
+
+        // Idle: the row directly above the composer border is reserved and
+        // blank, so the input box never sits flush against content above.
+        let idle = draw_rows(&mut terminal, &state);
+        let footer = footer_index(&idle);
+        assert!(footer > 0, "footer must never be the first live row: {idle:#?}");
+        assert!(
+            idle[footer - 1].trim().is_empty(),
+            "idle status row above footer must be blank: {:?}",
+            idle[footer - 1]
+        );
+
+        // Active transient status: the text renders on the status line above
+        // the footer, truncated to the row width, followed by a blank gap row
+        // before the composer border, and never in the footer row.
+        let session_root = tempfile::tempdir().expect("session root");
+        let session_path = session_root
+            .path()
+            .join(".pi/agent/sessions/workspace-session-000001");
+        let status_prefix = format!("Resumed {}", session_path.display());
+        state.status = format!(
+            "{status_prefix}{}",
+            "/with/a/much/longer/chain/of/directories/pushing/past/the/row/width/limit".repeat(3)
+        );
+        let active = draw_rows(&mut terminal, &state);
+        let footer = footer_index(&active);
+        let status_row = &active[footer - 2];
+        assert!(
+            status_row
+                .trim_start()
+                .starts_with(&format!("⟲ {status_prefix}")),
+            "{status_row}"
+        );
+        // OMP spacing: a blank gap row sits ABOVE the status text too, so the
+        // text never sits flush against content above (gap · text · gap).
+        assert!(
+            active[footer - 3].trim().is_empty(),
+            "gap row above active status must be blank: {:?}",
+            active[footer - 3]
+        );
+        assert_eq!(display_width(status_row), 100, "status line fills exactly one row");
+        assert!(status_row.contains('…'), "long status must truncate: {status_row}");
+        assert!(
+            active[footer - 1].trim().is_empty(),
+            "active status text must be followed by a blank gap row: {:?}",
+            active[footer - 1]
+        );
+        assert!(
+            !active[footer].contains("Resumed"),
+            "footer must not carry long activity text: {}",
+            active[footer]
+        );
+
+        // Abortable activity: spinner + working text + ⟦esc⟧ hint, footer static.
+        state.status = String::new();
+        state.extension_working_message = Some("Reading theme palette definition".to_owned());
+        state.extension_working_visible = true;
+        state.is_streaming = true;
+        let busy = draw_rows(&mut terminal, &state);
+        let footer = footer_index(&busy);
+        let busy_status = &busy[footer - 2];
+        assert!(
+            busy_status.contains("Reading theme palette definition"),
+            "{busy_status}"
+        );
+        assert!(busy_status.contains("⟦esc⟧"), "streaming must hint Esc: {busy_status}");
+        assert!(
+            busy[footer - 1].trim().is_empty(),
+            "busy status text must be followed by a blank gap row: {:?}",
+            busy[footer - 1]
+        );
+        assert!(
+            !busy[footer].contains("Reading theme"),
+            "footer stays static while busy: {}",
+            busy[footer]
+        );
     }
 
     #[test]
@@ -17251,7 +27034,7 @@ mod tests {
         state.cwd = "<workspace>/project".to_owned();
         state.thinking_level = ThinkingLevel::Medium;
         state.status = "Ready".to_owned();
-        let warning = "agent `legacy-reviewer` is unavailable because it requests unsupported child tools: browser, computer, imaginary_tool; remove those tools from the agent definition or settings.agents.legacy-reviewer.tools; supported child tools: read, bash, edit, write";
+        let warning = "agent `legacy-reviewer` declares unknown tools: computer, imaginary_tool; ignoring them (OMP-compatible — the declared tool is not injected); supported child tools: read, bash, edit, write";
         state.apply_startup_warnings(vec![format!("Warning: {warning}")]);
 
         assert_eq!(state.composer_error.as_deref(), Some(warning));
@@ -17298,8 +27081,8 @@ mod tests {
         let mut images = TerminalImageRenderer::default();
         terminal.draw(|frame| { let _ = render(frame, &state, &mut images); }).unwrap();
         let screen = terminal.backend().buffer().content.chunks(120).map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>()).collect::<Vec<_>>();
-        assert_eq!(screen.iter().filter(|row| row.contains("unsupported child tools")).count(), 1, "{screen:#?}");
-        let warning_row = screen.iter().position(|row| row.contains("unsupported child tools")).expect("warning row");
+        assert_eq!(screen.iter().filter(|row| row.contains("declares unknown tools")).count(), 1, "{screen:#?}");
+        let warning_row = screen.iter().position(|row| row.contains("declares unknown tools")).expect("warning row");
         let composer_row = screen.iter().position(|row| row.contains("π") && row.contains("faux/faux-1")).expect("composer row");
         assert!(warning_row < composer_row, "{screen:#?}");
 
@@ -17425,8 +27208,9 @@ mod tests {
             .iter()
             .position(|row| row.contains("π") && row.contains("faux/faux-1"))
             .expect("composer top row");
-        assert_eq!(error_row + 2, composer_row, "single-row notice keeps one blank row before composer: {rows:#?}");
+        assert_eq!(error_row + 3, composer_row, "single-row notice keeps one blank spacer plus the always-reserved status row before composer: {rows:#?}");
         assert!(rows[error_row + 1].trim().is_empty(), "notice/composer spacer must be blank: {rows:#?}");
+        assert!(rows[error_row + 2].trim().is_empty(), "reserved status row must be blank when idle: {rows:#?}");
         assert!(!rows[..composer_row].iter().any(|row| row.contains("Dismissed when")));
         assert!(!rows[..composer_row].iter().any(|row| {
             row.trim_start().starts_with('╭') || row.trim_start().starts_with('╰')
@@ -18020,13 +27804,17 @@ mod tests {
     #[test]
     fn nonempty_text_paste_does_not_start_clipboard_read() {
         let mut state = todo_test_state(Vec::new());
+        let status_before = state.status.clone();
         handle_paste(&mut state, "hello from bracketed paste");
         assert_eq!(state.editor.text(), "hello from bracketed paste");
         assert!(
             !state.clipboard_read_busy,
             "text paste must not start the image clipboard reader"
         );
-        assert!(state.status.contains("Pasted"));
+        assert_eq!(
+            state.status, status_before,
+            "text paste must be silent: no status-line update"
+        );
         assert!(state.pending_attachments.is_empty());
     }
 
@@ -18092,7 +27880,7 @@ mod tests {
     #[test]
     fn welcome_line_documents_alt_v_image_paste() {
         let state = todo_test_state(Vec::new());
-        let lines = render_welcome_lines(&state, crate::theme::DARK);
+        let lines = render_welcome_lines(&state, crate::theme::DARK, 120, 24);
         let rendered = lines
             .iter()
             .map(|line| {
@@ -18125,13 +27913,92 @@ mod tests {
             native_path: PathBuf::from("/sessions/native.jsonl"),
         };
         state.recent_sessions = vec![row];
-        let rendered = render_welcome_lines(&state, crate::theme::DARK)
+        let rendered = render_welcome_lines(&state, crate::theme::DARK, 120, 24)
             .iter().flat_map(|line| line.spans.iter()).map(|span| span.content.as_ref()).collect::<String>();
         assert!(
             rendered.contains("[codex] Imported session · imported"),
             "{rendered}"
         );
         assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+    }
+
+    #[test]
+    fn welcome_panel_renders_logo_tips_model_and_recent_sessions_at_exact_width() {
+        let mut state = todo_test_state(Vec::new());
+        state.model = "openai/gpt-4.1".to_owned();
+        state.thinking_level = ThinkingLevel::Medium;
+        state.recent_sessions = vec![resume_row_with_preview("Imported session")];
+        let lines = render_welcome_lines(&state, crate::theme::DARK, 120, 24);
+        let rendered = lines.iter().map(rendered_line_text).collect::<Vec<_>>();
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains("rpi v") && joined.contains(env!("CARGO_PKG_VERSION")),
+            "panel title must carry the versioned rpi logo: {joined}"
+        );
+        assert!(
+            joined.contains("openai/gpt-4.1") && joined.contains("Thinking"),
+            "model block must show the current model and thinking: {joined}"
+        );
+        for tip in ["Tips", "/help", "@file", "Alt+V", "/workflow"] {
+            assert!(joined.contains(tip), "tips column must advertise {tip:?}: {joined}");
+        }
+        assert!(
+            joined.contains("Recent sessions") && joined.contains("[codex] Imported session"),
+            "recent sessions must render from state: {joined}"
+        );
+        assert!(
+            WELCOME_HINTS.iter().any(|hint| joined.contains(hint)),
+            "one rotating hint line must render: {joined}"
+        );
+        assert!(
+            rendered.iter().all(|line| usize::from(display_width(line)) == 120),
+            "every panel row must fill the exact width: {rendered:?}"
+        );
+        assert!(
+            rendered[0].starts_with('╭') && rendered[0].ends_with('╮'),
+            "top border: {}",
+            rendered[0]
+        );
+        assert!(
+            rendered.last().unwrap().starts_with('╰') && rendered.last().unwrap().ends_with('╯'),
+            "bottom border: {}",
+            rendered.last().unwrap()
+        );
+        assert!(
+            rendered.iter().all(|line| line.starts_with('│') || line.starts_with('╭') || line.starts_with('╰')),
+            "every row must stay inside the bordered panel: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn welcome_degrades_gracefully_on_narrow_or_short_terminals() {
+        let mut state = todo_test_state(Vec::new());
+        state.recent_sessions = vec![resume_row_with_preview("Imported session")];
+        for (w, h) in [(40u16, 8u16), (40, 24), (120, 8), (120, 13), (71, 24)] {
+            let lines = render_welcome_lines(&state, crate::theme::DARK, w, h);
+            let rendered = lines.iter().map(rendered_line_text).collect::<Vec<_>>().join("\n");
+            assert!(
+                !rendered.contains('╭'),
+                "no panel border may render at {w}x{h}: {rendered}"
+            );
+            assert!(
+                rendered.contains("rpi") && rendered.contains("Start typing"),
+                "compact welcome must survive at {w}x{h}: {rendered}"
+            );
+            assert!(
+                !rendered.contains("Tips"),
+                "tips belong to the full panel only: {rendered}"
+            );
+        }
+        // Degenerate sizes must never panic and every row must stay within the width.
+        for (w, h) in [(0u16, 0u16), (1, 1), (2, 2), (5, 3)] {
+            let lines = render_welcome_lines(&state, crate::theme::DARK, w, h);
+            assert!(
+                lines.iter().all(|line| usize::from(display_width(&rendered_line_text(line))) <= usize::from(w)),
+                "row overflow at {w}x{h}: {:?}",
+                lines.iter().map(rendered_line_text).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -18449,6 +28316,8 @@ mod tests {
         let model_hints = scoped_model_key_hints();
         assert!(model_hints.contains("Esc/q"), "{model_hints}");
         assert!(model_hints.contains("Enter"), "{model_hints}");
+        assert!(model_hints.contains("→ models"), "{model_hints}");
+        assert!(model_hints.contains("← providers"), "{model_hints}");
 
         let panel = SelectorPanel {
             title: "Models".to_owned(),
@@ -18459,6 +28328,312 @@ mod tests {
         };
         let panel_hints = selector_panel_key_hints(&panel);
         assert!(panel_hints.contains("Esc"), "{panel_hints}");
+    }
+
+    fn scoped_model_fixture_model(
+        provider: &str,
+        id: &str,
+        name: &str,
+        context: i64,
+        input: f64,
+        output: f64,
+        reasoning: bool,
+    ) -> Model {
+        Model {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: name.to_owned(),
+            context_window: context,
+            max_tokens: context.max(4096),
+            cost: pi_ai::ModelCost {
+                input,
+                output,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                tiers: Vec::new(),
+            },
+            reasoning,
+            ..Model::default()
+        }
+    }
+
+    fn scoped_model_selector_screen(selector: &ScopedModelSelector, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_scoped_model_selector(frame, selector, crate::theme::DARK))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn scoped_model_selector_renders_two_columns_with_meta() {
+        let models = vec![
+            scoped_model_fixture_model(
+                "anthropic",
+                "claude-haiku-4-5",
+                "Claude Haiku 4.5",
+                200_000,
+                1.0,
+                5.0,
+                true,
+            ),
+            scoped_model_fixture_model(
+                "anthropic",
+                "claude-fable-5",
+                "Claude Fable 5",
+                1_000_000,
+                10.0,
+                50.0,
+                true,
+            ),
+            scoped_model_fixture_model(
+                "deepseek",
+                "deepseek-v4-flash",
+                "DeepSeek V4 Flash",
+                128_000,
+                0.0,
+                0.0,
+                false,
+            ),
+        ];
+        let mut selector = ScopedModelSelector::new(models, None);
+        let rendered = scoped_model_selector_screen(&selector, 100, 20);
+        assert!(rendered.contains("Model Configuration"), "{rendered}");
+        assert!(rendered.contains("Providers"), "{rendered}");
+        assert!(rendered.contains("Models"), "{rendered}");
+        // Radio bullets: the current provider is ●, others ○.
+        assert!(rendered.contains("● anthropic"), "{rendered}");
+        assert!(rendered.contains("○ deepseek"), "{rendered}");
+        // The models pane shows the selected provider's models with their
+        // display names, context window, price, and reasoning flag.
+        assert!(rendered.contains("✓ Claude Haiku 4.5"), "{rendered}");
+        assert!(rendered.contains("200k ◫"), "{rendered}");
+        assert!(rendered.contains("1m ◫"), "{rendered}");
+        assert!(rendered.contains("$1/$5"), "{rendered}");
+        assert!(rendered.contains("$10/$50"), "{rendered}");
+        assert!(rendered.contains("reasoning"), "{rendered}");
+        assert!(rendered.contains("3 enabled · 0 unavailable"), "{rendered}");
+        // Selecting the other provider swaps the models pane to its models.
+        selector.move_selection(1);
+        let rendered = scoped_model_selector_screen(&selector, 100, 20);
+        assert!(rendered.contains("● deepseek"), "{rendered}");
+        assert!(rendered.contains("○ anthropic"), "{rendered}");
+        // Zero-cost model renders as free, not a blank or invented price.
+        assert!(rendered.contains("✓ DeepSeek V4 Flash"), "{rendered}");
+        assert!(rendered.contains("free"), "{rendered}");
+    }
+
+    #[test]
+    fn scoped_model_selector_falls_back_to_single_column_at_tiny_width() {
+        let models = vec![
+            scoped_model_fixture_model(
+                "anthropic",
+                "claude-haiku-4-5",
+                "Claude Haiku 4.5",
+                0,
+                0.0,
+                0.0,
+                false,
+            ),
+            scoped_model_fixture_model(
+                "deepseek",
+                "deepseek-v4-flash",
+                "DeepSeek V4 Flash",
+                0,
+                0.0,
+                0.0,
+                false,
+            ),
+        ];
+        let selector = ScopedModelSelector::new(models, None);
+        let rendered = scoped_model_selector_screen(&selector, 34, 16);
+        // No two-column header: providers radio rows above the selected
+        // provider's indented model rows.
+        assert!(
+            !rendered.lines().any(|line| line.contains("Models")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("● anthropic"), "{rendered}");
+        assert!(rendered.contains("○ deepseek"), "{rendered}");
+        assert!(rendered.contains("✓ Claude Haiku 4.5"), "{rendered}");
+        assert!(rendered.contains("free"), "{rendered}");
+        // Unknown context window is omitted entirely (no ◫ anywhere).
+        assert!(!rendered.contains("◫"), "{rendered}");
+    }
+
+    #[test]
+    fn scoped_model_selector_highlight_follows_models_column_focus() {
+        use ratatui::backend::TestBackend;
+
+        let models = vec![
+            scoped_model_fixture_model(
+                "anthropic",
+                "claude-haiku-4-5",
+                "Claude Haiku 4.5",
+                200_000,
+                1.0,
+                5.0,
+                true,
+            ),
+            scoped_model_fixture_model(
+                "deepseek",
+                "deepseek-v4-flash",
+                "DeepSeek V4 Flash",
+                128_000,
+                0.0,
+                0.0,
+                false,
+            ),
+        ];
+        let selected_bg = crate::theme::DARK.selected_bg;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let draw = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+                    selector: &ScopedModelSelector| {
+            terminal
+                .draw(|frame| render_scoped_model_selector(frame, selector, crate::theme::DARK))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(100)
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| (cell.symbol().to_owned(), cell.style()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut selector = ScopedModelSelector::new(models, None);
+        // Providers column focus: the ● provider row carries the highlight.
+        let rows = draw(&mut terminal, &selector);
+        let provider_row = rows
+            .iter()
+            .find(|row| row.iter().any(|(symbol, _)| symbol == "●"))
+            .expect("provider radio row");
+        assert!(
+            provider_row
+                .iter()
+                .any(|(_, style)| style.bg == Some(selected_bg)),
+            "focused provider row must be highlighted"
+        );
+        // Models column focus: the highlight moves to the ✓ model row.
+        selector.focus_models();
+        let rows = draw(&mut terminal, &selector);
+        let model_row = rows
+            .iter()
+            .find(|row| row.iter().any(|(symbol, _)| symbol == "✓"))
+            .expect("model row");
+        assert!(
+            model_row
+                .iter()
+                .any(|(_, style)| style.bg == Some(selected_bg)),
+            "focused model row must be highlighted"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_model_selector_keys_switch_columns_and_move_within_them() {
+        use crossterm::event::KeyCode;
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        let application = Application::new(session).await;
+
+        let models = vec![
+            scoped_model_fixture_model(
+                "anthropic",
+                "claude-haiku-4-5",
+                "Claude Haiku 4.5",
+                200_000,
+                1.0,
+                5.0,
+                true,
+            ),
+            scoped_model_fixture_model(
+                "anthropic",
+                "claude-fable-5",
+                "Claude Fable 5",
+                1_000_000,
+                10.0,
+                50.0,
+                true,
+            ),
+            scoped_model_fixture_model(
+                "deepseek",
+                "deepseek-v4-flash",
+                "DeepSeek V4 Flash",
+                128_000,
+                0.0,
+                0.0,
+                false,
+            ),
+        ];
+        let mut state = todo_test_state(Vec::new());
+        state.scoped_model_selector = Some(ScopedModelSelector::new(models, None));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let handle = |state: &mut TuiState, code| {
+            handle_scoped_model_selector_key(&application, state, key(code)).unwrap();
+        };
+
+        // → enters the model column at the current provider's first model.
+        handle(&mut state, KeyCode::Right);
+        let selector = state.scoped_model_selector.as_ref().unwrap();
+        assert_eq!(selector.column(), ModelColumn::Models);
+        assert_eq!(
+            selector.selected_id(),
+            Some("anthropic/claude-haiku-4-5".to_owned())
+        );
+
+        // ↑/↓ move within the provider's models with wrap.
+        handle(&mut state, KeyCode::Down);
+        handle(&mut state, KeyCode::Down);
+        let selector = state.scoped_model_selector.as_ref().unwrap();
+        assert_eq!(
+            selector.selected_id(),
+            Some("anthropic/claude-haiku-4-5".to_owned())
+        );
+
+        // ← returns to the providers column.
+        handle(&mut state, KeyCode::Left);
+        let selector = state.scoped_model_selector.as_ref().unwrap();
+        assert_eq!(selector.column(), ModelColumn::Providers);
+        assert_eq!(selector.provider_selected(), 0);
+
+        // ↓ moves between providers; → enters the new provider's models.
+        handle(&mut state, KeyCode::Down);
+        let selector = state.scoped_model_selector.as_ref().unwrap();
+        assert_eq!(selector.provider_selected(), 1);
+        handle(&mut state, KeyCode::Right);
+        let selector = state.scoped_model_selector.as_ref().unwrap();
+        assert_eq!(selector.column(), ModelColumn::Models);
+        assert_eq!(
+            selector.selected_id(),
+            Some("deepseek/deepseek-v4-flash".to_owned())
+        );
     }
 
     #[test]
@@ -18545,21 +28720,137 @@ mod tests {
         assert!(rendered.contains("Enter") || rendered.contains("resume"), "{rendered}");
     }
 
+    #[test]
+    fn tree_panel_selected_row_uses_selected_bg_background() {
+        use ratatui::backend::TestBackend;
+
+        fn node(
+            id: &str,
+            parent: Option<&str>,
+            text: &str,
+            children: Vec<pi_coding::SessionTreeNode>,
+        ) -> pi_coding::SessionTreeNode {
+            pi_coding::SessionTreeNode {
+                entry: pi_coding::SessionEntry {
+                    entry_type: "message".to_owned(),
+                    id: id.to_owned(),
+                    parent_id: parent.map(str::to_owned),
+                    timestamp: id.to_owned(),
+                    message: Some(Message::user_text(text, 0)),
+                    provider: None,
+                    model_id: None,
+                    thinking_level: None,
+                    summary: None,
+                    first_kept_entry_id: None,
+                    tokens_before: None,
+                    retained_tail: Vec::new(),
+                    content: None,
+                    display: None,
+                    details: None,
+                    usage: None,
+                    from_hook: None,
+                    data: None,
+                    name: None,
+                    label: None,
+                    target_id: None,
+                    from_id: None,
+                    custom_type: None,
+                    todo_state: None,
+                },
+                children,
+                label: None,
+                label_timestamp: None,
+            }
+        }
+        // Navigate mode selects the active leaf; the row must paint its
+        // content cells with selected_bg like OMP's list hover.
+        let panel = TreePanel::new(
+            pi_coding::SessionTreeResult {
+                tree: vec![node(
+                    "1",
+                    None,
+                    "root",
+                    vec![node("2", Some("1"), "child", Vec::new())],
+                )],
+                leaf_id: Some("2".to_owned()),
+                active_leaf_id: Some("1".to_owned()),
+            },
+            TreePanelMode::Navigate,
+        );
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_tree_panel(frame, &panel, crate::theme::DARK))
+            .expect("draw tree panel");
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let selected = rows
+            .iter()
+            .find(|row| row.iter().any(|cell| cell.symbol() == "›"))
+            .expect("selected tree row carries the cursor marker");
+        // The buffer row also carries the panel borders, so check the cells
+        // from the `›` marker rightward (the node row proper) only.
+        let marker = selected
+            .iter()
+            .position(|cell| cell.symbol() == "›")
+            .expect("marker cell");
+        assert!(
+            selected
+                .iter()
+                .enumerate()
+                .filter(|(index, cell)| {
+                    *index >= marker
+                        && !cell.symbol().is_empty()
+                        && cell.symbol() != " "
+                        && cell.symbol() != "│"
+                })
+                .all(|(_, cell)| cell.bg == crate::theme::DARK.selected_bg),
+            "every content cell of the selected tree row uses selected_bg: {:?}",
+            selected
+                .iter()
+                .map(|cell| (cell.symbol(), cell.bg))
+                .collect::<Vec<_>>()
+        );
+        let unselected = rows
+            .iter()
+            .filter(|row| !row.iter().any(|cell| cell.symbol() == "›"))
+            .find(|row| {
+                row.iter()
+                    .any(|cell| !cell.symbol().is_empty() && cell.symbol() != " ")
+            })
+            .expect("an unselected tree row exists");
+        assert!(
+            unselected
+                .iter()
+                .filter(|cell| !cell.symbol().is_empty() && cell.symbol() != " ")
+                .all(|cell| cell.bg != crate::theme::DARK.selected_bg),
+            "unselected tree rows must stay flat"
+        );
+    }
+
     fn agents_panel_fixture() -> AgentsPanel {
         use pi_coding::{AgentDefinition, AgentDefinitionSource, AgentRuntimeSettings};
 
-        let definition = |name: &str, tools: Vec<&str>, skills: Vec<&str>| AgentDefinition {
-            name: name.to_owned(),
-            description: format!("{name} handles detailed orchestration diagnostics"),
-            system_prompt: "prompt".to_owned(),
-            tools: Some(tools.into_iter().map(str::to_owned).collect()),
-            autoload_skills: skills.into_iter().map(str::to_owned).collect(),
-            model: None,
-            thinking_level: Some(ThinkingLevel::Medium),
-            source: AgentDefinitionSource::User,
-            path: None,
-            trusted: true,
-        };
+        let definition = |name: &str, tools: Vec<&str>, skills: Vec<&str>| AgentDefinition { name: name.to_owned(),
+        description: format!("{name} handles detailed orchestration diagnostics"),
+        system_prompt: "prompt".to_owned(),
+        tools: Some(tools.into_iter().map(str::to_owned).collect()),
+        autoload_skills: skills.into_iter().map(str::to_owned).collect(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Medium),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::User,
+        path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None };
         let mut settings = std::collections::BTreeMap::new();
         settings.insert(
             "reviewer".to_owned(),
@@ -18630,23 +28921,25 @@ mod tests {
         use pi_coding::{AgentDefinition, AgentDefinitionSource};
 
         let definitions = (0..30)
-            .map(|index| AgentDefinition {
-                name: format!("agent-{index:02}"),
-                description: format!("agent-{index:02} selected description"),
-                system_prompt: "prompt".to_owned(),
-                tools: Some(vec![
-                    "read".to_owned(),
-                    "grep".to_owned(),
-                    "bash".to_owned(),
-                    "browser".to_owned(),
-                ]),
-                autoload_skills: vec!["rust".to_owned(), "research".to_owned()],
-                model: None,
-                thinking_level: Some(ThinkingLevel::Medium),
-                source: AgentDefinitionSource::User,
-                path: None,
-                trusted: true,
-            })
+            .map(|index| AgentDefinition { name: format!("agent-{index:02}"),
+            description: format!("agent-{index:02} selected description"),
+            system_prompt: "prompt".to_owned(),
+            tools: Some(vec![
+                "read".to_owned(),
+                "grep".to_owned(),
+                "bash".to_owned(),
+                "browser".to_owned(),
+            ]),
+            autoload_skills: vec!["rust".to_owned(), "research".to_owned()],
+            model: None,
+            thinking_level: Some(ThinkingLevel::Medium),
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
+            source: AgentDefinitionSource::User,
+            path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None })
             .collect();
         let mut panel = AgentsPanel::new(
             definitions,
@@ -18978,6 +29271,57 @@ mod tests {
     }
 
     #[test]
+    fn composer_header_segments_use_status_line_roles() {
+        // OMP's footer paints each header segment with its `statusLine*`
+        // role instead of all-accent: model = statusLineModel, path =
+        // statusLinePath, git clean green vs dirty amber, context =
+        // statusLineContext, subagents = statusLineSubagents. The thinking
+        // level is metadata and renders dim (OMP footer behavior).
+        let theme = crate::theme::DARK;
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "<workspace>/project".to_owned();
+        state.git_status = Some(FooterGitStatus {
+            branch: Some("main".to_owned()),
+            staged: 1,
+            modified: 2,
+            untracked: 3,
+        });
+        state.context_usage = Some(SessionContextUsage {
+            tokens: Some(84_000),
+            context_window: 200_000,
+            percent: Some(42.0),
+        });
+        let spans = composer_border_lines(&state, 120, theme)[0].spans.clone();
+        let fg_of = |needle: &str| {
+            spans
+                .iter()
+                .find(|span| span.content.contains(needle))
+                .map(|span| span.style.fg)
+                .expect("header segment present")
+        };
+        assert_eq!(fg_of("faux/faux-1"), Some(theme.status_line_model));
+        assert_eq!(fg_of("<workspace>/project"), Some(theme.status_line_path));
+        assert_eq!(fg_of("main*2+1?3"), Some(theme.status_line_git_dirty));
+        assert_eq!(fg_of("42% 84k/200k"), Some(theme.status_line_context));
+        assert_eq!(fg_of("off"), Some(theme.dim));
+
+        // A clean tree turns the git segment statusLineGitClean green.
+        state.git_status = Some(FooterGitStatus {
+            branch: Some("main".to_owned()),
+            staged: 0,
+            modified: 0,
+            untracked: 0,
+        });
+        let spans = composer_border_lines(&state, 120, theme)[0].spans.clone();
+        let git = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "main")
+            .expect("clean git segment");
+        assert_eq!(git.style.fg, Some(theme.status_line_git_clean));
+    }
+
+    #[test]
     fn footer_refresh_discards_stale_result_and_starts_coalesced_request() {
         let mut state = todo_test_state(Vec::new());
         let dir_one = tempfile::tempdir().expect("first cwd");
@@ -19059,6 +29403,14 @@ mod tests {
                     untracked: 9,
                 }),
                 context: None,
+                cost: 1.25,
+                tokens: SessionTokenStats {
+                    input: 1_000,
+                    output: 1_000,
+                    cache_read: 0,
+                    cache_write: 0,
+                    total: 2_000,
+                },
             },
             start,
         ).expect("coalesced request starts after completion");
@@ -19066,16 +29418,30 @@ mod tests {
         assert_eq!(state.footer_refresh_in_flight.as_ref(), Some(&third.key));
         assert!(state.footer_refresh_pending.is_none());
         assert_eq!(state.git_status.as_ref().and_then(|git| git.branch.as_deref()), Some("current"));
+        // The stale result's cost/token projection must not leak into the
+        // current-identity display.
+        assert_eq!(state.session_cost, 0.0);
+        assert!(state.session_tokens.is_none());
 
         assert!(state.finish_footer_refresh(
             FooterRefreshResult {
                 key: first.key,
                 git: None,
                 context: None,
+                cost: 99.0,
+                tokens: SessionTokenStats {
+                    input: 99,
+                    output: 99,
+                    cache_read: 0,
+                    cache_write: 0,
+                    total: 198,
+                },
             },
             start,
         ).is_none());
         assert_eq!(state.footer_refresh_in_flight.as_ref(), Some(&third.key));
+        assert_eq!(state.session_cost, 0.0, "rejected stale result must not project cost");
+        assert!(state.session_tokens.is_none(), "rejected stale result must not project tokens");
 
         assert!(state.finish_footer_refresh(
             FooterRefreshResult {
@@ -19091,12 +29457,26 @@ mod tests {
                     context_window: 8_000,
                     percent: Some(12.5),
                 }),
+                cost: 7.5,
+                tokens: SessionTokenStats {
+                    input: 6_000,
+                    output: 5_800,
+                    cache_read: 600,
+                    cache_write: 0,
+                    total: 12_400,
+                },
             },
             start,
         ).is_none());
         assert!(state.footer_refresh_in_flight.is_none());
         assert_eq!(state.git_status.as_ref().and_then(|git| git.branch.as_deref()), Some("fresh"));
         assert_eq!(state.context_usage.as_ref().map(|usage| usage.context_window), Some(8_000));
+        assert_eq!(state.session_cost, 7.5);
+        assert_eq!(
+            state.session_tokens.as_ref().map(|tokens| tokens.total),
+            Some(12_400),
+            "current-identity result projects its token totals"
+        );
     }
 
     #[test]
@@ -19133,17 +29513,32 @@ mod tests {
                     context_window: 0,
                     percent: None,
                 }),
+                cost: 0.0,
+                tokens: SessionTokenStats {
+                    input: 0,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    total: 0,
+                },
             },
             std::time::Instant::now(),
         ).is_none());
         assert!(state.context_usage.is_none());
         assert!(state.git_status.is_none());
+        assert_eq!(state.session_cost, 0.0);
+        assert_eq!(
+            state.session_tokens.as_ref().map(|tokens| tokens.total),
+            Some(0),
+            "a matching result still projects its (zero) token totals"
+        );
     }
 
     #[test]
     fn footer_segments_preserve_idle_and_working_activity() {
-        // Git/context segments must not perturb the activity indicator: while
-        // streaming the header advances the animation frame; idle it is stable.
+        // Git/context segments live in the static footer; the transient
+        // activity indicator animates on the OMP-style status line above the
+        // input box and must not perturb the footer row.
         let mut state = todo_test_state(Vec::new());
         state.model = "faux/faux-1".to_owned();
         state.git_status = Some(FooterGitStatus {
@@ -19157,37 +29552,1608 @@ mod tests {
             context_window: 8_000,
             percent: Some(12.5),
         });
+        fn header(state: &TuiState) -> String {
+            composer_border_lines(state, 100, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
         state.is_streaming = true;
-        let first = composer_border_lines(&state, 100, crate::theme::DARK)[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
+        let footer_first = header(&state);
+        let status_first = status(&state);
         state.animation_frame = 1;
-        let second = composer_border_lines(&state, 100, crate::theme::DARK)[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert_ne!(first, second, "working header must animate");
-        assert!(first.contains("working"), "working label: {first}");
-        // Idle: animation frame no longer changes the rendered header.
+        let footer_second = header(&state);
+        let status_second = status(&state);
+        assert_ne!(status_first, status_second, "working status must animate");
+        assert!(status_first.contains("Working"), "working label: {status_first}");
+        assert_eq!(footer_first, footer_second, "footer must stay static while streaming");
+        // Idle: the status line is blank and the footer keeps its segments.
         state.is_streaming = false;
         state.status = String::new();
-        let idle_a = composer_border_lines(&state, 100, crate::theme::DARK)[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
+        let idle_a = header(&state);
+        let idle_status_a = status(&state);
         state.animation_frame = 7;
-        let idle_b = composer_border_lines(&state, 100, crate::theme::DARK)[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert_eq!(idle_a, idle_b, "idle header must not animate");
+        let idle_b = header(&state);
+        let idle_status_b = status(&state);
+        assert_eq!(idle_a, idle_b, "idle footer must not animate");
+        assert_eq!(idle_status_a, idle_status_b, "idle status line must not animate");
+        assert!(idle_status_a.is_empty(), "idle status line must be blank: {idle_status_a:?}");
         assert!(idle_a.contains("⑂ main"), "git segment stable when idle: {idle_a}");
         assert!(!state.has_active_animation());
+    }
+
+    #[test]
+    fn header_shows_subagent_and_pending_counts_and_omits_at_zero() {
+        // The composer header carries OMP-style live counts appended after the
+        // git/context segments: `👥 N` for active/queued orchestration jobs and
+        // `⚙ N` for pending queued messages. Both render only while non-zero.
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "<workspace>/project".to_owned();
+        fn header(state: &TuiState) -> String {
+            composer_border_lines(state, 120, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        // Zero counts: neither segment renders.
+        let idle = header(&state);
+        assert!(!idle.contains("👥"), "no subagent count at zero: {idle}");
+        assert!(!idle.contains("⚙"), "no pending count at zero: {idle}");
+        let job = |id: &str, agent_id: &str, status: pi_coding::JobStatus| {
+            pi_coding::JobSnapshot {
+                id: id.to_owned(),
+                agent_id: agent_id.to_owned(),
+                agent: "deepseek".to_owned(),
+                parent_id: "Main".to_owned(),
+                description: Some("subagent".to_owned()),
+                todo_task_id: None,
+                workflow_id: None,
+                workflow_generation: None,
+                status,
+                created_at: 1,
+                started_at: Some(2),
+                finished_at: None,
+                result: None,
+                soft_budget_exhausted: false,
+            }
+        };
+        for (id, agent_id, status) in [
+            ("job-a", "Rowan", pi_coding::JobStatus::Running),
+            ("job-b", "Sol", pi_coding::JobStatus::Queued),
+        ] {
+            state.job_cards.apply_orchestration_event(
+                &pi_coding::OrchestrationEvent::JobUpdated {
+                    group_id: "group".to_owned(),
+                    job: job(id, agent_id, status),
+                },
+            );
+        }
+        // A completed job must not inflate the subagent count.
+        state.job_cards.apply_orchestration_event(
+            &pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: job("job-c", "Done", pi_coding::JobStatus::Completed),
+            },
+        );
+        let active = header(&state);
+        assert!(active.contains("👥 2"), "subagent count: {active}");
+        assert!(!active.contains("⚙"), "no pending count yet: {active}");
+        // Queued steering + follow-up messages surface as `⚙ N`.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+            steering: vec![
+                Message::user_text("steer me", 1),
+                Message::user_text("steer more", 2),
+            ],
+            follow_up: vec![Message::user_text("follow", 3)],
+        }));
+        let pending = header(&state);
+        assert!(pending.contains("⚙ 3"), "pending count: {pending}");
+        // Queue drains: ⚙ disappears, 👥 persists.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+            steering: Vec::new(),
+            follow_up: Vec::new(),
+        }));
+        let drained = header(&state);
+        assert!(!drained.contains("⚙"), "pending count cleared: {drained}");
+        assert!(drained.contains("👥 2"), "subagent count persists: {drained}");
+        // Counted rows stay truncation-safe at every width.
+        for width in [120u16, 90, 64, 52, 48, 40] {
+            let row = composer_border_lines(&state, width, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(display_width(&row), width, "counted footer row {width} must not overflow");
+        }
+    }
+
+    #[test]
+    fn header_keeps_pending_count_when_cwd_and_goal_squeeze_the_row() {
+        // The steering E2E runs at 140 cols from a deep workspace path with an
+        // active goal; the header cannot fit every segment, so the drop loop
+        // must discard the context-usage segment BEFORE the `⚙ N` pending
+        // count. Regression: ⚙ carried the lowest drop priority and was the
+        // first segment removed, silently hiding the queued-follow-up
+        // acknowledgment exactly while it mattered.
+        let mut state = todo_test_state(Vec::new());
+        state.model = "user-steering/mock".to_owned();
+        state.cwd = "/tmp/rpi-e2e-work/20260808T233451Z-1594574/steering-queue-handoff/workspace"
+            .to_owned();
+        state.context_usage = Some(SessionContextUsage {
+            tokens: Some(31_000),
+            context_window: 32_768,
+            percent: Some(94.6),
+        });
+        let goal: pi_coding::GoalState = serde_json::from_value(serde_json::json!({
+            "current": {
+                "id": "goal-1",
+                "objective": "steer the batch",
+                "tokenBudget": 100,
+                "lifecycle": "active",
+                "createdAt": "2026-08-09T00:00:00Z",
+                "updatedAt": "2026-08-09T00:00:00Z",
+                "usage": { "tokensUsed": 0, "activeTimeSeconds": 0 },
+                "pins": []
+            },
+            "revision": 1
+        }))
+        .expect("goal state json");
+        state.goal_state = goal;
+        fn header(state: &TuiState) -> String {
+            composer_border_lines(state, 140, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        let without_pending = header(&state);
+        assert!(!without_pending.contains("⚙"), "no pending count yet: {without_pending}");
+        assert!(without_pending.contains("◫"), "context usage present before queueing: {without_pending}");
+        // One queued follow-up (the E2E's mid-turn follow-up) must render even
+        // though the row is space-constrained.
+        state.queued_follow_up = 1;
+        let queued = header(&state);
+        assert!(queued.contains("⚙ 1"), "pending count must survive tight header: {queued}");
+        assert!(
+            !queued.contains("◫"),
+            "context-usage segment must drop before the pending count: {queued}"
+        );
+        assert_eq!(display_width(&queued), 140, "header must stay at pane width");
+        // Draining removes the segment again.
+        state.queued_follow_up = 0;
+        let drained = header(&state);
+        assert!(!drained.contains("⚙"), "pending count cleared: {drained}");
+    }
+
+    #[test]
+    fn header_subagent_count_sums_jobs_and_all_workflow_subagents() {
+        // `👥 N` totals live subagents across every orchestration scope:
+        // active/queued main-session jobs plus the subagent rosters of ALL
+        // workflows. A workflow whose live detail is unavailable projects an
+        // empty subagent list (no inflation), so the main-session job count is
+        // the floor when every workflow is detail-less.
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "<workspace>/project".to_owned();
+        fn header(state: &TuiState) -> String {
+            composer_border_lines(state, 120, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        fn panel_with_subagents(id: &str, subagent_count: usize) -> WorkflowPanelSnapshot {
+            let mut panel =
+                WorkflowPanelSnapshot::from(&workflow_snapshot(1, pi_coding::WorkflowStatus::Running));
+            panel.id = id.to_owned();
+            panel.subagents = (0..subagent_count)
+                .map(|i| crate::workflow_panel::WorkflowActorSnapshot {
+                    name: format!("{id}-worker-{i}"),
+                    status: "running".to_owned(),
+                    task: None,
+                    task_id: None,
+                    activity: Vec::new(),
+                })
+                .collect();
+            panel
+        }
+        let job = |id: &str, agent_id: &str, status: pi_coding::JobStatus| {
+            pi_coding::JobSnapshot {
+                id: id.to_owned(),
+                agent_id: agent_id.to_owned(),
+                agent: "deepseek".to_owned(),
+                parent_id: "Main".to_owned(),
+                description: Some("subagent".to_owned()),
+                todo_task_id: None,
+                workflow_id: None,
+                workflow_generation: None,
+                status,
+                created_at: 1,
+                started_at: Some(2),
+                finished_at: None,
+                result: None,
+                soft_budget_exhausted: false,
+            }
+        };
+        // Zero of everything: the segment does not render.
+        assert!(!header(&state).contains("👥"), "no subagent count at zero: {}", header(&state));
+        // Main-session jobs only, no workflows: the job count is the floor.
+        for (id, agent_id, status) in [
+            ("job-a", "Rowan", pi_coding::JobStatus::Running),
+            ("job-b", "Sol", pi_coding::JobStatus::Queued),
+        ] {
+            state.job_cards.apply_orchestration_event(
+                &pi_coding::OrchestrationEvent::JobUpdated {
+                    group_id: "group".to_owned(),
+                    job: job(id, agent_id, status),
+                },
+            );
+        }
+        assert!(header(&state).contains("👥 2"), "jobs-only floor: {}", header(&state));
+        // Workflows with empty subagent rosters (live detail unavailable) must
+        // not inflate the count.
+        state.workflow_snapshots = vec![
+            panel_with_subagents("wf-empty-a", 0),
+            panel_with_subagents("wf-empty-b", 0),
+        ];
+        assert!(header(&state).contains("👥 2"), "empty rosters do not inflate: {}", header(&state));
+        // Every workflow's subagents are summed on top of the running jobs:
+        // 2 jobs + (1 + 2) workflow subagents = 5.
+        state.workflow_snapshots = vec![
+            panel_with_subagents("wf-a", 1),
+            panel_with_subagents("wf-b", 2),
+        ];
+        let summed = header(&state);
+        assert!(summed.contains("👥 5"), "jobs + all workflow subagents: {summed}");
+        // Workflow subagents alone still render when no main-session job runs.
+        state.job_cards = JobCardPresentationAdapter::new();
+        let workflows_only = header(&state);
+        assert!(workflows_only.contains("👥 3"), "workflow subagents only: {workflows_only}");
+        // Counted rows stay truncation-safe at every width.
+        for width in [120u16, 90, 64, 52, 48, 40] {
+            let row = composer_border_lines(&state, width, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(display_width(&row), width, "counted footer row {width} must not overflow");
+        }
+    }
+
+    #[test]
+    fn status_line_shows_queued_steering_above_activity() {
+        // A queued steering message renders on the status line above the input
+        // with a static `⟦steering⟧` glyph, taking precedence over transient
+        // activity; ordinary activity returns once the queue drains.
+        let mut state = todo_test_state(Vec::new());
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        state.is_streaming = true;
+        state.status = "Working".to_owned();
+        assert!(status(&state).contains("Working"), "activity shows when idle queue");
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+            steering: vec![Message::user_text("update docs for implemented issues", 1)],
+            follow_up: Vec::new(),
+        }));
+        let steered = status(&state);
+        assert!(
+            steered.starts_with("⟦steering⟧"),
+            "steering glyph prefix: {steered}"
+        );
+        assert!(
+            steered.contains("update docs for implemented issues"),
+            "steering preview: {steered}"
+        );
+        assert!(!steered.contains("Working"), "steering replaces activity: {steered}");
+        // Multi-line queued text collapses to a single preview row.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+            steering: vec![Message::user_text("first line\nsecond line", 1)],
+            follow_up: Vec::new(),
+        }));
+        let collapsed = status(&state);
+        assert!(
+            collapsed.contains("first line second line"),
+            "whitespace collapsed: {collapsed}"
+        );
+        assert!(!collapsed.contains('\n'), "preview is a single row: {collapsed}");
+        // Narrow rows truncate the steering preview without overflowing.
+        let narrow = composer_status_line(&state, 24, crate::theme::DARK)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            display_width(&narrow) <= 24,
+            "narrow steering row fits: {narrow}"
+        );
+        // Queue drains: steering clears and activity returns.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+            steering: Vec::new(),
+            follow_up: Vec::new(),
+        }));
+        let restored = status(&state);
+        assert!(!restored.contains("⟦steering⟧"), "steering cleared: {restored}");
+        assert!(restored.contains("Working"), "activity restored: {restored}");
+    }
+
+    #[test]
+    fn idle_suggestion_derives_from_goal_workflow_and_queue() {
+        let mut state = todo_test_state(Vec::new());
+        assert_eq!(next_suggestion(&state), None, "empty state suggests nothing");
+
+        // Pending follow-up prompts (no steering text to render) suggest /queue.
+        state.queued_follow_up = 2;
+        assert_eq!(next_suggestion(&state), Some("Next: /queue".to_owned()));
+
+        // An active goal adds /goal.
+        let goal: pi_coding::GoalState = serde_json::from_value(serde_json::json!({
+            "current": {
+                "id": "goal-1",
+                "objective": "ship the release",
+                "lifecycle": "active",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "usage": { "tokensUsed": 0, "activeTimeSeconds": 0 }
+            },
+            "revision": 1
+        }))
+        .expect("goal state json");
+        state.goal_state = goal;
+        assert_eq!(
+            next_suggestion(&state),
+            Some("Next: /queue · /goal".to_owned())
+        );
+
+        // A paused goal is not an active directive and never suggests /goal.
+        let paused: pi_coding::GoalState = serde_json::from_value(serde_json::json!({
+            "current": {
+                "id": "goal-1",
+                "objective": "ship the release",
+                "lifecycle": "paused",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "usage": { "tokensUsed": 0, "activeTimeSeconds": 0 }
+            },
+            "revision": 2
+        }))
+        .expect("goal state json");
+        state.goal_state = paused;
+        assert_eq!(next_suggestion(&state), Some("Next: /queue".to_owned()));
+
+        // Live workflows add /workflow list; terminal ones do not.
+        state.workflow_snapshots.push(WorkflowPanelSnapshot::from(&workflow_snapshot(
+            1,
+            pi_coding::WorkflowStatus::Running,
+        )));
+        assert_eq!(
+            next_suggestion(&state),
+            Some("Next: /queue · /workflow list".to_owned())
+        );
+        state.workflow_snapshots[0].status = pi_coding::WorkflowStatus::Completed;
+        assert_eq!(next_suggestion(&state), Some("Next: /queue".to_owned()));
+
+        // All three conditions chain in a deterministic order.
+        state.workflow_snapshots[0].status = pi_coding::WorkflowStatus::Planning;
+        let goal: pi_coding::GoalState = serde_json::from_value(serde_json::json!({
+            "current": {
+                "id": "goal-1",
+                "objective": "ship the release",
+                "lifecycle": "active",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "usage": { "tokensUsed": 0, "activeTimeSeconds": 0 }
+            },
+            "revision": 3
+        }))
+        .expect("goal state json");
+        state.goal_state = goal;
+        assert_eq!(
+            next_suggestion(&state),
+            Some("Next: /queue · /goal · /workflow list".to_owned())
+        );
+    }
+
+    #[test]
+    fn composer_status_line_shows_suggestion_when_idle_only() {
+        let mut state = todo_test_state(Vec::new());
+        let goal: pi_coding::GoalState = serde_json::from_value(serde_json::json!({
+            "current": {
+                "id": "goal-1",
+                "objective": "ship the release",
+                "lifecycle": "active",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "usage": { "tokensUsed": 0, "activeTimeSeconds": 0 }
+            },
+            "revision": 1
+        }))
+        .expect("goal state json");
+        state.goal_state = goal;
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+
+        // Idle: the suggestion renders dim, one line, no spinner.
+        state.is_streaming = false;
+        state.status = "Ready".to_owned();
+        let line = composer_status_line(&state, 100, crate::theme::DARK);
+        let idle = status(&state);
+        assert_eq!(idle, "Next: /goal", "idle suggestion: {idle}");
+        assert_eq!(
+            line.spans[0].style.fg,
+            Some(crate::theme::DARK.dim),
+            "suggestion must be dim"
+        );
+
+        // Busy states never show the suggestion.
+        state.is_streaming = true;
+        let busy = status(&state);
+        assert!(!busy.contains("Next:"), "streaming hides the suggestion: {busy}");
+        assert!(busy.contains("Working"), "streaming activity: {busy}");
+        state.is_streaming = false;
+
+        // A queued steering message outranks the suggestion.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+            steering: vec![Message::user_text("steer me", 1)],
+            follow_up: Vec::new(),
+        }));
+        let steered = status(&state);
+        assert!(
+            steered.starts_with("⟦steering⟧"),
+            "steering beats the suggestion: {steered}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Live delegation bridge (spoken task → bound agent turn)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn live_delegation_tracks_code_task_until_settle() {
+        let mut state = todo_test_state(Vec::new());
+        state.live.mode = LiveMode::On;
+
+        // A transcribed coding task submitted while live is armed becomes a
+        // tracked delegation (Hyper's server-side `delegation.created` is
+        // detected client-side here); plain chat never does.
+        assert!(state.track_live_delegation("fix the bug in parser.rs"));
+        assert!(state.live.delegating);
+        assert!(state.live.delegation_started.is_some());
+        assert!(!state.track_live_delegation("hello world"));
+        assert!(
+            state.live.delegating,
+            "a plain-chat submit must not clear a running delegation"
+        );
+
+        // A running delegation is an occupancy: it is never re-tracked, so
+        // the original start time survives (Hyper's register_delegation
+        // duplicate rejection).
+        assert!(!state.track_live_delegation("add tests for the lexer"));
+        let started = state.live.delegation_started.expect("started once");
+
+        // The reply streams and lands through the ordinary transcript path —
+        // the delegation is a normal agent turn, so no delegation-specific
+        // entry shape exists.
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: {
+                let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+                message.content = vec![ContentBlock::text("Refactored src/lib.rs.")];
+                message.stop_reason = pi_ai::StopReason::Stop;
+                Message::Assistant(message)
+            },
+        }));
+        let assistant_entry = state
+            .transcript
+            .iter()
+            .find(|entry| entry.kind == TranscriptKind::Assistant)
+            .expect("assistant reply lands as a normal transcript entry");
+        let rendered = assistant_entry
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .collect::<String>();
+        assert!(rendered.contains("Refactored"), "{rendered}");
+        assert!(state.live.delegating, "marker persists until the turn settles");
+        assert_eq!(
+            state.live.delegation_started,
+            Some(started),
+            "start time unchanged by mid-turn submits"
+        );
+
+        // Settle clears the delegation and restores the ready status.
+        state.apply(ApplicationEvent::AgentSettled);
+        assert!(!state.is_streaming);
+        assert!(!state.live.delegating);
+        assert!(state.live.delegation_started.is_none());
+        assert_eq!(state.status, "Ready");
+    }
+
+    #[test]
+    fn live_delegation_status_line_shows_hint_then_elapsed() {
+        let mut state = todo_test_state(Vec::new());
+        state.live.mode = LiveMode::On;
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+
+        // Idle with a code-task draft: the row offers the delegation
+        // affordance (the `⟦delegate⟧` hint), even though no delegation is
+        // running yet.
+        state.editor.set_text("fix the bug in parser.rs");
+        let hinted = status(&state);
+        assert!(hinted.contains("⟦live⟧"), "live marker: {hinted}");
+        assert!(hinted.contains("⟦delegate⟧"), "delegate hint: {hinted}");
+        assert!(!hinted.contains("⟦delegating⟧"), "not running yet: {hinted}");
+
+        // Plain drafts and live-off never offer the affordance.
+        state.editor.set_text("hello world");
+        assert!(!status(&state).contains("⟦delegate⟧"), "plain draft");
+        state.editor.set_text("fix the bug in parser.rs");
+        state.live.mode = LiveMode::Off;
+        assert!(!status(&state).contains("⟦delegate⟧"), "live off");
+        state.live.mode = LiveMode::On;
+
+        // While the delegation runs, the row shows the elapsed marker.
+        state.editor.clear();
+        assert!(state.track_live_delegation("refactor the module in src/lib.rs"));
+        state.live.delegation_started = Some(
+            std::time::Instant::now() - std::time::Duration::from_secs(5),
+        );
+        let delegating = status(&state);
+        assert!(delegating.contains("⟦live⟧"), "{delegating}");
+        assert!(delegating.contains("⟦delegating⟧"), "{delegating}");
+        assert!(delegating.contains("5s"), "elapsed label: {delegating}");
+
+        // Settle restores the idle hint for the still-present draft.
+        state.editor.set_text("fix the bug in parser.rs");
+        state.apply(ApplicationEvent::AgentSettled);
+        let settled = status(&state);
+        assert!(!settled.contains("⟦delegating⟧"), "{settled}");
+        assert!(settled.contains("⟦delegate⟧"), "hint returns: {settled}");
+    }
+
+    #[tokio::test]
+    async fn live_delegation_clears_on_failure_reconcile_and_session_switch() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session
+            .load_history(vec![Message::user_text("replacement", 1)])
+            .await
+            .expect("history");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        state.live.mode = LiveMode::On;
+
+        // A failed turn clears the delegation marker.
+        assert!(state.track_live_delegation("implement the fetch function in api.rs"));
+        state.apply(ApplicationEvent::RunFailed {
+            message: "provider error".to_owned(),
+        });
+        assert!(!state.live.delegating);
+        assert!(state.live.delegation_started.is_none());
+
+        // Activity reconciliation after skipped events also clears it.
+        assert!(state.track_live_delegation("fix the bug in parser.rs"));
+        state.is_streaming = true;
+        assert!(!application.is_streaming());
+        state.reconcile_activity_from_application(&application).await;
+        assert!(!state.is_streaming);
+        assert!(!state.live.delegating);
+        assert!(state.live.delegation_started.is_none());
+
+        // A session switch (new/resume/clone) clears it too.
+        assert!(state.track_live_delegation("refactor the module in src/lib.rs"));
+        state.replace_transcript_from_application(&application);
+        assert!(!state.live.delegating);
+        assert!(state.live.delegation_started.is_none());
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn queue_dispatch_views_and_cancels_pending_prompts() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: cwd.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        }).expect("session");
+        let application = Application::new(session).await;
+        application.steer("steer me now".to_owned(), Vec::new()).await;
+        application.follow_up("follow up later".to_owned(), Vec::new()).await;
+        let mut state = todo_test_state(Vec::new());
+
+        // View: counts and previews land in the transcript; status untouched.
+        dispatch_queue_command(&application, &mut state, None).await;
+        let view = state
+            .transcript
+            .last()
+            .map(|entry| content_text(&entry.content))
+            .expect("queue view transcript entry");
+        assert!(view.contains("1 steering, 1 follow-up"), "{view}");
+        assert!(view.contains("steer me now"), "{view}");
+        assert!(view.contains("follow up later"), "{view}");
+        assert!(view.contains("/queue cancel"), "{view}");
+
+        // Cancel: the live queue drains and the status reports the count.
+        dispatch_queue_command(&application, &mut state, Some("cancel")).await;
+        assert_eq!(state.status, "Cancelled 2 queued prompts");
+        let (steering, follow_up) = application.queued_messages().await;
+        assert!(steering.is_empty() && follow_up.is_empty(), "queue must drain");
+
+        // Empty view after cancel.
+        dispatch_queue_command(&application, &mut state, None).await;
+        assert_eq!(state.status, "Queue is empty");
+
+        // Unknown actions surface usage, never touch the queue.
+        dispatch_queue_command(&application, &mut state, Some("nope")).await;
+        assert!(
+            state.composer_error.as_deref().is_some_and(|error| error.contains("Usage: /queue")),
+            "unknown action: {:?}",
+            state.composer_error
+        );
+        application.cleanup().await;
+    }
+
+    /// Apply application events into `state` until `predicate` holds. Bounds
+    /// the wait so a regression that never publishes the expected event fails
+    /// fast instead of hanging the test.
+    async fn drain_until<F: Fn(&TuiState) -> bool>(
+        events: &mut tokio::sync::broadcast::Receiver<ApplicationEvent>,
+        state: &mut TuiState,
+        predicate: F,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("application event channel must stay open");
+                state.apply(event);
+                if predicate(state) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("condition must be reached before timeout");
+    }
+
+    #[tokio::test]
+    async fn steering_consumption_clears_composer_preview_and_count() {
+        // End-to-end queue accounting: a steering message handed to the
+        // running turn leaves the pending queue immediately — the ⚙ count
+        // decrements, the ⟦steering⟧ preview moves to the next queued
+        // message, and an empty queue drops the indicator — instead of
+        // lingering until the turn settles.
+        let cwd = tempfile::tempdir().expect("cwd");
+        let gate_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate_release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let tool_started = gate_started.clone();
+        let tool_release = gate_release.clone();
+        // Turn 1 blocks on the gate tool until the test has queued its
+        // steering, making the steer deterministically land between the run's
+        // initial drain and the first turn boundary.
+        let gate = pi_agent::AgentTool::new(
+            "gate",
+            "gate",
+            pi_ai::Schema::default(),
+            move |_context| {
+                let started = tool_started.clone();
+                let release = tool_release.clone();
+                async move {
+                    started.notify_waiters();
+                    release.notified().await;
+                    Ok(pi_agent::AgentToolResult::text("gated"))
+                }
+            },
+        );
+        let scripted = vec![
+            {
+                let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+                message.content = vec![pi_ai::ContentBlock::ToolCall(pi_ai::ToolCall {
+                    id: "c1".to_owned(),
+                    name: "gate".to_owned(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                })];
+                message.stop_reason = pi_ai::StopReason::ToolUse;
+                message
+            },
+            {
+                let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+                message.content = vec![ContentBlock::text("two")];
+                message.stop_reason = pi_ai::StopReason::Stop;
+                message
+            },
+            {
+                let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+                message.content = vec![ContentBlock::text("three")];
+                message.stop_reason = pi_ai::StopReason::Stop;
+                message
+            },
+        ];
+        let queued_messages =
+            std::sync::Arc::new(std::sync::Mutex::new(VecDeque::from(scripted)));
+        let stream: pi_agent::StreamFn = std::sync::Arc::new(
+            move |model: Model, _context: pi_ai::Context, _options: pi_ai::SimpleStreamOptions| {
+                let queued_messages = queued_messages.clone();
+                Box::pin(async move {
+                    let message = queued_messages
+                        .lock()
+                        .expect("script lock")
+                        .pop_front()
+                        .unwrap_or_else(|| {
+                            let mut fallback = pi_ai::AssistantMessage::pending(&model);
+                            fallback.content = vec![ContentBlock::text("done")];
+                            fallback.stop_reason = pi_ai::StopReason::Stop;
+                            fallback
+                        });
+                    let stream = pi_ai::new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    let model = model.clone();
+                    tokio::spawn(async move {
+                        producer
+                            .push(pi_ai::AssistantMessageEvent::Start {
+                                partial: pi_ai::AssistantMessage::pending(&model),
+                            })
+                            .await;
+                        let terminal = if matches!(
+                            message.stop_reason,
+                            pi_ai::StopReason::Error | pi_ai::StopReason::Aborted
+                        ) {
+                            pi_ai::AssistantMessageEvent::Error {
+                                reason: message.stop_reason,
+                                error: message.clone(),
+                            }
+                        } else {
+                            pi_ai::AssistantMessageEvent::Done {
+                                reason: message.stop_reason,
+                                message: message.clone(),
+                            }
+                        };
+                        producer.push(terminal).await;
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            },
+        );
+        let session = Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(vec![gate]),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream),
+            auth_resolver: None,
+        })
+        .expect("session");
+        let application = Application::new(session).await;
+        let mut events = application.subscribe();
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "<workspace>/project".to_owned();
+        fn status_line(state: &TuiState) -> String {
+            rendered_line_text(&composer_status_line(state, 80, crate::theme::DARK))
+        }
+        fn header_line(state: &TuiState) -> String {
+            composer_border_lines(state, 120, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        }
+
+        application
+            .prompt("first".to_owned(), Vec::new(), None)
+            .await
+            .expect("prompt");
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate_started.notified())
+            .await
+            .expect("gate tool must start");
+        application.steer("steer one".to_owned(), Vec::new()).await;
+        application.steer("steer two".to_owned(), Vec::new()).await;
+
+        // Both queued messages project onto the composer: `⟦steering⟧` shows
+        // the first queued message and the header counts `⚙ 2`.
+        drain_until(&mut events, &mut state, |state| state.queued_steering.len() == 2).await;
+        let steered = status_line(&state);
+        assert!(steered.contains("⟦steering⟧"), "steering glyph: {steered}");
+        assert!(steered.contains("steer one"), "first queued preview: {steered}");
+        assert!(header_line(&state).contains("⚙ 2"), "pending count while queued");
+
+        gate_release.notify_waiters();
+
+        // First consumption: the count drops to the remaining message and the
+        // preview moves — while the turn is still running.
+        drain_until(&mut events, &mut state, |state| state.queued_steering.len() == 1).await;
+        assert_eq!(state.queued_steering, vec!["steer two".to_owned()]);
+        let partial = status_line(&state);
+        assert!(partial.contains("⟦steering⟧"), "remaining preview: {partial}");
+        assert!(partial.contains("steer two"), "remaining preview text: {partial}");
+        assert!(!partial.contains("steer one"), "consumed preview gone: {partial}");
+        assert!(header_line(&state).contains("⚙ 1"), "remaining count: {}", header_line(&state));
+
+        // Full consumption: the queue drains and the indicator disappears.
+        drain_until(&mut events, &mut state, |state| state.queued_steering.is_empty()).await;
+        let cleared = status_line(&state);
+        assert!(!cleared.contains("⟦steering⟧"), "steering cleared: {cleared}");
+        assert_eq!(state.queued_follow_up, 0);
+        assert!(
+            !header_line(&state).contains("⚙"),
+            "pending count cleared: {}",
+            header_line(&state)
+        );
+
+        application.wait_for_idle().await;
+        application.cleanup().await;
+    }
+
+    #[test]
+    fn status_line_shows_subagent_activity_when_jobs_pending() {
+        // Orchestration jobs queued or running surface as the specific
+        // `<display name> <live progress>` activity (`kimi read tools.rs ·
+        // 12s`), not a generic wait label — the OMP-style concrete detail —
+        // with an animated spinner and an Esc hint while the main turn is
+        // still streaming. Completed jobs never count.
+        let mut state = todo_test_state(Vec::new());
+        state.is_streaming = true;
+        state.status = "Working".to_owned();
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        let job = |id: &str, status: pi_coding::JobStatus| pi_coding::JobSnapshot {
+            id: id.to_owned(),
+            agent_id: id.to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: Some("subagent".to_owned()),
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status,
+            created_at: 1,
+            started_at: (status == pi_coding::JobStatus::Running).then_some(2),
+            finished_at: None,
+            result: None,
+            soft_budget_exhausted: false,
+        };
+        // No jobs: the streaming fallback still shows generic work.
+        assert!(status(&state).contains("Working"), "fallback: {}", status(&state));
+        // One queued job: the agent's display name plus its coarse stage —
+        // concrete detail wins over "Working…".
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: job("job-a", pi_coding::JobStatus::Queued),
+            },
+        ));
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::AgentUpdated {
+                group_id: "group".to_owned(),
+                agent: pi_coding::AgentSnapshot {
+                    id: "job-a".to_owned(),
+                    display_name: "kimi".to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: Some("Main".to_owned()),
+                    status: pi_coding::AgentStatus::Running,
+                    created_at: 1,
+                    last_activity: 2,
+                    unread: 0,
+                    artifact_ref: None,
+                    history_ref: None,
+                },
+            },
+        ));
+        let waiting = status(&state);
+        assert!(
+            waiting.contains("kimi queued"),
+            "subagent stage activity: {waiting}"
+        );
+        assert!(!waiting.contains("Working"), "subagent activity replaces generic work: {waiting}");
+        assert!(!waiting.contains("Waiting for"), "no generic wait label: {waiting}");
+        assert!(waiting.contains("⟦esc⟧"), "subagent while streaming is abortable: {waiting}");
+        let first = status(&state);
+        state.animation_frame = 1;
+        let second = status(&state);
+        assert_ne!(first, second, "subagent status must animate");
+        // Live progress beats the coarse stage: a child → Main IRC message
+        // becomes the activity one-liner with elapsed time.
+        state.job_cards.set_now(30_000);
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: job("job-b", pi_coding::JobStatus::Running),
+            },
+        ));
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::MessageDelivered {
+                group_id: "group".to_owned(),
+                message: pi_coding::MailboxMessage {
+                    id: "m-1".to_owned(),
+                    from: "job-b".to_owned(),
+                    to: "Main".to_owned(),
+                    body: "read tools.rs".to_owned(),
+                    timestamp: 30,
+                    reply_to: None,
+                },
+            },
+        ));
+        let progressing = status(&state);
+        assert!(
+            progressing.contains("read tools.rs"),
+            "live progress in status: {progressing}"
+        );
+        assert!(
+            progressing.contains("job-b read tools.rs"),
+            "display name + progress: {progressing}"
+        );
+        // A running tool is more specific than generic work but less specific
+        // than the subagent activity.
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-read".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        }));
+        let while_tooling = status(&state);
+        assert!(
+            while_tooling.contains("read tools.rs"),
+            "subagent activity beats running tool: {while_tooling}"
+        );
+        assert!(
+            !while_tooling.contains("read src/lib.rs"),
+            "main tool must not replace subagent: {while_tooling}"
+        );
+        // Steering outranks subagent activity too: the queued prompt owns
+        // the row.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+            steering: vec![Message::user_text("steer the batch", 1)],
+            follow_up: Vec::new(),
+        }));
+        let steered = status(&state);
+        assert!(
+            steered.starts_with("⟦steering⟧"),
+            "steering beats subagent activity: {steered}"
+        );
+        // All jobs settle: concrete activity returns to the streaming fallback.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+            steering: Vec::new(),
+            follow_up: Vec::new(),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-read".to_owned(),
+            tool_name: "read".to_owned(),
+            result: pi_agent::AgentToolResult::text("body"),
+            is_error: false,
+        }));
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: job("job-a", pi_coding::JobStatus::Completed),
+            },
+        ));
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: job("job-b", pi_coding::JobStatus::Completed),
+            },
+        ));
+        let settled = status(&state);
+        assert!(
+            settled.contains("Working"),
+            "fallback returns after settle: {settled}"
+        );
+    }
+
+    #[test]
+    fn composer_status_line_shows_session_cost_when_present() {
+        // Projected session cost renders on the composer status line (`$0.12`),
+        // sourced from the footer refresh worker's `session_stats()`
+        // projection — never computed in the render path. Token totals are
+        // deliberately not shown (context utilization lives in the footer).
+        let mut state = todo_test_state(Vec::new());
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        // No projection yet: the idle row stays blank rather than inventing
+        // usage.
+        assert_eq!(status(&state), "", "blank at zero cost");
+        // Cost surface together.
+        state.session_cost = 0.12;
+        let line = status(&state);
+        assert!(line.contains("$0.12"), "cost segment: {line}");
+        assert!(!line.contains("tok"), "token totals are not shown: {line}");
+        // Zero cost hides the dollar segment entirely.
+        state.session_cost = 0.0;
+        assert_eq!(status(&state), "", "blank at zero cost");
+    }
+
+    #[test]
+    fn composer_status_line_shows_background_task_count_when_running() {
+        // The composer status line carries a `⟦N bg⟧` background-task count
+        // while orchestration jobs are queued/running, projected from the job
+        // cards (the running-count floor of the footer's `👥` jobs+workflows
+        // total). Completed jobs never count.
+        let mut state = todo_test_state(Vec::new());
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        assert!(!status(&state).contains("bg"), "no task count at zero");
+        let job = |id: &str, status: pi_coding::JobStatus| pi_coding::JobSnapshot {
+            id: id.to_owned(),
+            agent_id: id.to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: Some("subagent".to_owned()),
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status,
+            created_at: 1,
+            started_at: (status == pi_coding::JobStatus::Running).then_some(2),
+            finished_at: None,
+            result: None,
+            soft_budget_exhausted: false,
+        };
+        for (id, status) in [
+            ("job-a", pi_coding::JobStatus::Running),
+            ("job-b", pi_coding::JobStatus::Queued),
+            ("job-c", pi_coding::JobStatus::Completed),
+        ] {
+            state.apply(ApplicationEvent::Orchestration(
+                pi_coding::OrchestrationEvent::JobUpdated {
+                    group_id: "group".to_owned(),
+                    job: job(id, status),
+                },
+            ));
+        }
+        let line = status(&state);
+        assert!(line.contains("⟦2 bg⟧"), "background task count: {line}");
+        assert!(!line.contains("⟦3 bg⟧"), "completed jobs must not count: {line}");
+        // The count renders alongside the activity text on the same single row.
+        assert_eq!(composer_status_line(&state, 100, crate::theme::DARK).spans.len(), 1);
+    }
+
+    #[test]
+    fn composer_status_line_metadata_stays_single_row_and_bounded() {
+        // Cost + task-count metadata appends to the existing single-row
+        // status line; the row truncates at every width and never wraps.
+        let mut state = todo_test_state(Vec::new());
+        state.is_streaming = true;
+        state.session_cost = 12.34;
+        state.job_cards.apply_orchestration_event(
+            &pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: pi_coding::JobSnapshot {
+                    id: "job-a".to_owned(),
+                    agent_id: "job-a".to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: Some("subagent".to_owned()),
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: pi_coding::JobStatus::Running,
+                    created_at: 1,
+                    started_at: Some(2),
+                    finished_at: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+            },
+        );
+        let wide = rendered_line_text(&composer_status_line(&state, 120, crate::theme::DARK));
+        assert!(wide.contains("$12.34"), "cost: {wide}");
+        assert!(!wide.contains("tok"), "no token totals: {wide}");
+        assert!(wide.contains("⟦1 bg⟧"), "tasks: {wide}");
+        assert!(!wide.contains('\n'), "single row: {wide}");
+        // Every width truncates to fit: exactly one row, never wider than the
+        // budget.
+        for width in [120u16, 80, 48, 32, 16, 8] {
+            let line = composer_status_line(&state, width, crate::theme::DARK);
+            assert_eq!(line.spans.len(), 1, "single span at {width}");
+            let text = rendered_line_text(&line);
+            assert!(!text.contains('\n'), "no wrap at {width}: {text}");
+            assert!(
+                usize::from(display_width(&text)) <= usize::from(width),
+                "bounded at {width}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_line_shows_running_tool_while_tool_executes() {
+        // A non-terminal tool card renders `<tool> <argument fragment>`; the
+        // label beats compaction and generic work, and disappears once the
+        // call ends.
+        let mut state = todo_test_state(Vec::new());
+        state.is_streaming = true;
+        state.status = "Working".to_owned();
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        }));
+        let running = status(&state);
+        assert!(running.contains("read a.rs"), "running tool activity: {running}");
+        assert!(!running.contains("Working"), "tool activity replaces generic work: {running}");
+        // A second tool starts: the newest executing call wins the label.
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-2".to_owned(),
+            tool_name: "grep".to_owned(),
+            arguments: serde_json::json!({"pattern": "todo"}),
+        }));
+        let newest = status(&state);
+        assert!(newest.contains("grep todo"), "newest tool wins: {newest}");
+        // Running tool outranks compaction…
+        state.is_compacting = true;
+        state.status = "Compacting context".to_owned();
+        let while_compacting = status(&state);
+        assert!(
+            while_compacting.contains("grep todo"),
+            "running tool beats compacting: {while_compacting}"
+        );
+        // …and compaction beats concrete workflow/status text.
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read".to_owned(),
+            result: pi_agent::AgentToolResult::text("body"),
+            is_error: false,
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-2".to_owned(),
+            tool_name: "grep".to_owned(),
+            result: pi_agent::AgentToolResult::text("match"),
+            is_error: false,
+        }));
+        state.status = "Workflow ship · planning".to_owned();
+        let compacting = status(&state);
+        assert!(
+            compacting.contains("Compacting context"),
+            "compacting label: {compacting}"
+        );
+        assert!(
+            !compacting.contains("grep todo"),
+            "ended tools are terminal: {compacting}"
+        );
+        // Compaction finishes: the concrete workflow status shows again.
+        state.is_compacting = false;
+        state.status = "Workflow ship · planning".to_owned();
+        let workflow = status(&state);
+        assert!(
+            workflow.contains("Workflow ship · planning"),
+            "concrete workflow status: {workflow}"
+        );
+    }
+
+    #[test]
+    fn status_line_shows_wave_supervisor_activity() {
+        // A non-terminal workflow planning shows the supervisor's live
+        // activity feed (`GLM tool · bash · cargo test --lib...`),
+        // OMP-style: agent + what it is doing — never the generic busy label.
+        let mut state = todo_test_state(Vec::new());
+        state.is_streaming = true;
+        state.status = "Working".to_owned();
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        let mut workflow = WorkflowPanelSnapshot::from(&workflow_snapshot(
+            1,
+            pi_coding::WorkflowStatus::Planning,
+        ));
+        workflow.supervisor = Some(crate::workflow_panel::WorkflowActorSnapshot {
+            name: "GLM".to_owned(),
+            status: "running".to_owned(),
+            task: None,
+            task_id: None,
+            activity: Vec::new(),
+        });
+        workflow.planning_activity = vec![crate::workflow_panel::WorkflowActivitySnapshot {
+            at_ms: 2,
+            kind: pi_coding::WorkflowSupervisorActivityKind::Tool,
+            text: "bash · cargo test --lib...".to_owned(),
+        }];
+        state.workflow_snapshots.push(workflow);
+        let line = status(&state);
+        assert!(
+            line.contains("GLM tool · bash · cargo test --lib..."),
+            "wave supervisor feed: {line}"
+        );
+        assert!(!line.contains("Working"), "wave activity replaces generic work: {line}");
+        assert!(line.contains("⟦esc⟧"), "wave while streaming is abortable: {line}");
+        let first = line.clone();
+        state.animation_frame = 1;
+        let second = status(&state);
+        assert_ne!(first, second, "wave status must animate");
+        // Thinking feed entries carry the same `thinking · ` prefix the
+        // workflow page uses.
+        state.workflow_snapshots[0].planning_activity =
+            vec![crate::workflow_panel::WorkflowActivitySnapshot {
+                at_ms: 3,
+                kind: pi_coding::WorkflowSupervisorActivityKind::Thinking,
+                text: "weigh options".to_owned(),
+            }];
+        let thinking = status(&state);
+        assert!(
+            thinking.contains("GLM thinking · weigh options"),
+            "wave thinking feed: {thinking}"
+        );
+        // Planning before any feed entry: the workflow name + phase.
+        state.workflow_snapshots[0].planning_activity.clear();
+        let pre_feed = status(&state);
+        assert!(pre_feed.contains("GLM planning"), "pre-feed planning label: {pre_feed}");
+        // Once the wave runs, the first active worker-task summary carries it.
+        let mut running = WorkflowPanelSnapshot::from(&workflow_snapshot(
+            1,
+            pi_coding::WorkflowStatus::Running,
+        ));
+        running.name = "ship".to_owned();
+        running.active_tasks = vec![crate::workflow_panel::WorkflowActiveTaskSnapshot {
+            task_id: Some("t-1".to_owned()),
+            summary: "read tools.rs".to_owned(),
+        }];
+        state.workflow_snapshots = vec![running];
+        let running_line = status(&state);
+        assert!(
+            running_line.contains("ship read tools.rs"),
+            "running wave active task: {running_line}"
+        );
+        // Terminal workflows never surface as wave activity.
+        state.workflow_snapshots[0].status = pi_coding::WorkflowStatus::Completed;
+        let settled = status(&state);
+        assert!(settled.contains("Working"), "terminal workflow falls back: {settled}");
+    }
+
+    #[test]
+    fn status_line_shows_thinking_while_thinking_deltas_stream() {
+        // While the model streams thinking (before any text or tool call),
+        // the row shows a static `thinking…` label — the deltas themselves
+        // would flood the row, the spinner carries the liveness. The label
+        // clears the moment text or a tool call follows.
+        let mut state = todo_test_state(Vec::new());
+        state.is_streaming = true;
+        state.status = "Working".to_owned();
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        // Not thinking yet: the generic fallback.
+        assert!(status(&state).contains("Working…"), "pre-thinking fallback");
+        let mut partial = pi_ai::AssistantMessage::pending(&Model::default());
+        partial.content = vec![ContentBlock::text("weigh options".to_owned())];
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "weigh options".to_owned(),
+                partial: partial.clone(),
+            },
+        }));
+        let thinking = status(&state);
+        assert!(thinking.contains("thinking…"), "thinking label: {thinking}");
+        assert!(!thinking.contains("Working"), "thinking beats generic work: {thinking}");
+        assert!(thinking.contains("⟦esc⟧"), "thinking turn is abortable: {thinking}");
+        let first = thinking.clone();
+        state.animation_frame = 1;
+        let second = status(&state);
+        assert_ne!(first, second, "thinking status must animate");
+        // Text deltas end the thinking window even though the accumulated
+        // thinking buffer is still non-empty.
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial.clone()),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "Let me check".to_owned(),
+                partial: partial.clone(),
+            },
+        }));
+        let composing = status(&state);
+        assert!(
+            !composing.contains("thinking"),
+            "text composition clears thinking: {composing}"
+        );
+        assert!(composing.contains("Working"), "fallback while composing: {composing}");
+        // A tool call beats the thinking label too.
+        state.apply(ApplicationEvent::Agent(AgentEvent::MessageUpdate {
+            message: Message::Assistant(partial),
+            assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "one more idea".to_owned(),
+                partial: pi_ai::AssistantMessage::pending(&Model::default()),
+            },
+        }));
+        assert!(status(&state).contains("thinking…"), "thinking resumes: {}", status(&state));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        }));
+        let tooling = status(&state);
+        assert!(tooling.contains("read a.rs"), "tool beats thinking: {tooling}");
+        assert!(!tooling.contains("thinking"), "tool clears the thinking label: {tooling}");
+    }
+
+    #[test]
+    fn status_line_subagent_progress_is_redacted_and_bounded() {
+        // The subagent activity fragment is credential-redacted and bounded
+        // by the job-card adapter before it ever reaches the status line,
+        // and the row truncates at every width.
+        let mut state = todo_test_state(Vec::new());
+        state.is_streaming = true;
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: pi_coding::JobSnapshot {
+                    id: "job-a".to_owned(),
+                    agent_id: "job-a".to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: "Main".to_owned(),
+                    description: Some("subagent".to_owned()),
+                    todo_task_id: None,
+                    workflow_id: None,
+                    workflow_generation: None,
+                    status: pi_coding::JobStatus::Running,
+                    created_at: 1,
+                    started_at: Some(2),
+                    finished_at: None,
+                    result: None,
+                    soft_budget_exhausted: false,
+                },
+            },
+        ));
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::AgentUpdated {
+                group_id: "group".to_owned(),
+                agent: pi_coding::AgentSnapshot {
+                    id: "job-a".to_owned(),
+                    display_name: "kimi".to_owned(),
+                    agent: "task".to_owned(),
+                    parent_id: Some("Main".to_owned()),
+                    status: pi_coding::AgentStatus::Running,
+                    created_at: 1,
+                    last_activity: 2,
+                    unread: 0,
+                    artifact_ref: None,
+                    history_ref: None,
+                },
+            },
+        ));
+        state.job_cards.set_now(30_000);
+        let secret = "credential-redaction-fixture-value";
+        state.apply(ApplicationEvent::Orchestration(
+            pi_coding::OrchestrationEvent::MessageDelivered {
+                group_id: "group".to_owned(),
+                message: pi_coding::MailboxMessage {
+                    id: "m-1".to_owned(),
+                    from: "job-a".to_owned(),
+                    to: "Main".to_owned(),
+                    body: format!("scanning token={secret} {}", "é".repeat(300)),
+                    timestamp: 30,
+                    reply_to: None,
+                },
+            },
+        ));
+        let line = rendered_line_text(&composer_status_line(&state, 120, crate::theme::DARK));
+        assert!(!line.contains(secret), "secret must be redacted: {line}");
+        assert!(line.contains("[REDACTED]"), "redaction marker visible: {line}");
+        assert!(line.contains("kimi"), "agent name still shown: {line}");
+        for width in [120u16, 60, 32, 16] {
+            let line = rendered_line_text(&composer_status_line(&state, width, crate::theme::DARK));
+            assert!(
+                usize::from(display_width(&line)) <= usize::from(width),
+                "bounded at {width}: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_line_tool_arguments_are_redacted_and_bounded() {
+        // The main-agent tool activity reuses the tool card's bounded,
+        // redacted argument compact: secret-shaped values never reach the
+        // row and long fragments truncate.
+        let mut state = todo_test_state(Vec::new());
+        state.is_streaming = true;
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-bash".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({
+                "command": format!("curl -H 'Authorization: Bearer {secret}' /api")
+            }),
+        }));
+        let line = status(&state);
+        assert!(
+            !line.contains(&secret),
+            "secret token must not leak: {line}"
+        );
+        assert!(line.contains("[REDACTED]"), "redaction marker visible: {line}");
+        assert!(line.contains("bash"), "tool name shown: {line}");
+        // A very long command is bounded to the 60-char compact fragment.
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-long".to_owned(),
+            tool_name: "bash".to_owned(),
+            arguments: serde_json::json!({ "command": format!("echo {}", "x".repeat(200)) }),
+        }));
+        let wide = status(&state);
+        let fragment = wide
+            .split("bash ")
+            .nth(1)
+            .map(|tail| tail.split(" ⟦esc⟧").next().unwrap_or(tail))
+            .unwrap_or_default();
+        assert!(
+            fragment.chars().count() <= 60,
+            "fragment bounded to 60 chars: {fragment:?}"
+        );
+        assert!(
+            !wide.contains(&"x".repeat(200)),
+            "long command must not appear whole: {wide}"
+        );
+    }
+
+    #[test]
+    fn status_line_concrete_workflow_status_beats_generic_working() {
+        // While a workflow is planning the status carries its own text; the
+        // generic streaming "Working…" must never hide it (the complaint:
+        // omp shows the specific detail, rpi showed only "working").
+        let mut state = todo_test_state(Vec::new());
+        state.is_streaming = true;
+        state.status = "Workflow wave · planning".to_owned();
+        fn status(state: &TuiState) -> String {
+            composer_status_line(state, 100, crate::theme::DARK)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        let line = status(&state);
+        assert!(line.contains("Workflow wave · planning"), "workflow text: {line}");
+        assert!(!line.contains("Working"), "concrete status beats generic: {line}");
+        assert!(line.contains("⟦esc⟧"), "streaming turn stays abortable: {line}");
+        // Loop activity wins over generic work the same way.
+        state.status = "Loop nightly running".to_owned();
+        let loop_line = status(&state);
+        assert!(loop_line.contains("Loop nightly running"), "loop text: {loop_line}");
+        // Plain "Working" degrades to the capitalized fallback, not the raw label.
+        state.status = "Working".to_owned();
+        let fallback = status(&state);
+        assert!(fallback.contains("Working…"), "fallback label: {fallback}");
+        assert!(fallback.contains("⟦esc⟧"), "fallback stays abortable: {fallback}");
+        let first = fallback.clone();
+        state.animation_frame = 1;
+        let second = status(&state);
+        assert_ne!(first, second, "fallback must animate");
+        // Idle (no streaming): the row hides default status text entirely.
+        state.is_streaming = false;
+        state.status = "Ready".to_owned();
+        assert!(status(&state).is_empty(), "idle row stays blank");
+    }
+
+    #[test]
+    fn composer_footer_shows_goal_chip_when_goal_active() {
+        // The footer goal chip renders `🎯 Goal N/M` (tokens used / budget)
+        // from goal_status_summary data; without a goal no chip appears.
+        let mut state = todo_test_state(Vec::new());
+        state.model = "faux/faux-1".to_owned();
+        state.cwd = "<workspace>".to_owned();
+        fn header(state: &TuiState) -> String {
+            composer_border_lines(state, 120, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        }
+        assert!(
+            !header(&state).contains("🎯"),
+            "no goal chip without a goal: {}",
+            header(&state)
+        );
+        let goal: pi_coding::GoalState = serde_json::from_value(serde_json::json!({
+            "current": {
+                "id": "goal-1",
+                "objective": "ship the release",
+                "tokenBudget": 10_000,
+                "lifecycle": "active",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "usage": { "tokensUsed": 1_234, "activeTimeSeconds": 0 }
+            },
+            "revision": 1
+        }))
+        .expect("goal state json");
+        state.goal_state = goal;
+        let chip = header(&state);
+        assert!(
+            chip.contains("🎯 Goal 1234/10000"),
+            "goal chip with budget: {chip}"
+        );
+        // Narrow widths truncate the goal chip without overflowing.
+        for width in [120u16, 100, 80, 64, 48] {
+            let row = composer_border_lines(&state, width, crate::theme::DARK)[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(display_width(&row), width, "goal footer row {width} must not overflow");
+        }
     }
 
     /// Initialize a hermetic git repo for footer collector tests. Uses an
@@ -19414,7 +31380,7 @@ mod tests {
             "system error text must use theme.error: {error_spans:?}"
         );
 
-        // Bash tool title -> theme.tool_title.
+        // Bash card command line -> theme.bash_mode (no tool-name title).
         let bash = pi_ai::BashExecutionMessage {
             command: "echo coherence-probe-tool".to_owned(),
             output: String::new(),
@@ -19430,15 +31396,664 @@ mod tests {
         let tool = tool_transcript_entry(compact, expanded);
         let mut lines = Vec::new();
         render_transcript_entry(&mut lines, &tool, true, true, theme, 80);
+        assert!(
+            !lines.iter().any(|line| line.spans.iter().any(|span| span.content.contains("Bash"))),
+            "bash cards must not render a tool-name title: {lines:?}"
+        );
         let bash_spans: Vec<_> = lines
             .iter()
             .flat_map(|line| line.spans.iter())
-            .filter(|span| span.content.contains("Bash"))
+            .filter(|span| span.content.contains("$ echo coherence-probe-tool"))
             .collect();
-        assert!(!bash_spans.is_empty(), "bash tool title must render: {lines:?}");
+        assert!(!bash_spans.is_empty(), "bash command line must render: {lines:?}");
         assert!(
-            bash_spans.iter().all(|span| span.style.fg == Some(theme.tool_title)),
-            "bash tool title must use theme.tool_title: {bash_spans:?}"
+            bash_spans.iter().all(|span| span.style.fg == Some(theme.bash_mode)),
+            "bash command line must use theme.bash_mode: {bash_spans:?}"
+        );
+    }
+
+    /// Border glyph spans of a rendered tool card (frame + separators).
+    fn tool_card_border_spans<'a>(lines: &'a [Line<'static>]) -> Vec<&'a Span<'static>> {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| {
+                span.content
+                    .chars()
+                    .any(|ch| matches!(ch, '╭' | '╮' | '╰' | '╯' | '│' | '├' | '┤'))
+            })
+            .collect()
+    }
+
+    fn succeeded_read_card() -> ToolCardRows {
+        use crate::tool_card_adapter::ToolCardRow;
+        ToolCardRows {
+            tool_call_id: "read-1".to_owned(),
+            tool_name: "read".to_owned(),
+            ordinal: 1,
+            arguments_summary: "src/main.rs".to_owned(),
+            code_language: None,
+            status: ToolCallViewStatus::Succeeded,
+            is_partial: false,
+            is_error: false,
+            cancelled: false,
+            truncated: false,
+            omitted_content_lines: 0,
+            rows: vec![
+                ToolCardRow {
+                    tool_call_id: "read-1".to_owned(),
+                    role: ToolCardRowRole::Command,
+                    text: "read src/main.rs".to_owned(),
+                },
+                ToolCardRow {
+                    tool_call_id: "read-1".to_owned(),
+                    role: ToolCardRowRole::Content,
+                    text: "fn main() {}".to_owned(),
+                },
+            ],
+            skill_name: None,
+            bash_command: None,
+        }
+    }
+
+    #[test]
+    fn succeeded_tool_card_frames_with_bright_tool_card_border() {
+        // User-reported: non-bash tool-card frames were invisible against the
+        // dark background. Succeeded cards now frame with the dedicated
+        // tool_card_border — DARK #3a4350, clearly lighter than the shared
+        // border_muted (#1f252d) on the #0f1216 background.
+        let theme = crate::theme::DARK;
+        assert_eq!(theme.tool_card_border, Color::Rgb(0x3a, 0x43, 0x50));
+        assert_ne!(theme.tool_card_border, theme.border_muted);
+        assert_ne!(theme.tool_card_border, theme.tool_success_bg);
+        let entry = tool_transcript_entry(succeeded_read_card(), succeeded_read_card());
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, theme, 60);
+        let borders = tool_card_border_spans(&lines);
+        assert!(!borders.is_empty(), "card borders must render: {lines:?}");
+        assert!(
+            borders
+                .iter()
+                .all(|span| span.style.fg == Some(theme.tool_card_border)),
+            "succeeded card borders must use theme.tool_card_border: {:?}",
+            borders
+                .iter()
+                .map(|span| (span.content.as_ref(), span.style.fg))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tool_card_borders_keep_bash_and_error_colors() {
+        let theme = crate::theme::DARK;
+        // Succeeded bash card keeps the bash_mode frame (green, one unit with
+        // the command text) — not the neutral tool_card_border.
+        let bash = pi_ai::BashExecutionMessage {
+            command: "echo keep-bash-border".to_owned(),
+            output: String::new(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            timestamp: 1,
+            exclude_from_context: None,
+        };
+        let compact = ToolCardPresentationAdapter::bash_execution_rows(&bash, false);
+        let expanded = ToolCardPresentationAdapter::bash_execution_rows(&bash, true);
+        let mut lines = Vec::new();
+        render_transcript_entry(
+            &mut lines,
+            &tool_transcript_entry(compact, expanded),
+            true,
+            true,
+            theme,
+            60,
+        );
+        let bash_borders = tool_card_border_spans(&lines);
+        assert!(!bash_borders.is_empty(), "bash card borders must render: {lines:?}");
+        assert!(
+            bash_borders
+                .iter()
+                .all(|span| span.style.fg == Some(theme.bash_mode)),
+            "bash card borders must stay theme.bash_mode: {bash_borders:?}"
+        );
+
+        // Failed card keeps the error frame regardless of tool name.
+        use pi_agent::AgentToolResult;
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "fail-1".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({ "path": "missing.rs" }),
+        }));
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "fail-1".to_owned(),
+            tool_name: "read".to_owned(),
+            result: AgentToolResult::text("no such file"),
+            is_error: true,
+        }));
+        let failed = state.transcript.last().expect("failed card entry");
+        assert_eq!(
+            failed.tool_card.as_ref().expect("tool card").compact.status,
+            ToolCallViewStatus::Failed
+        );
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, failed, true, true, theme, 60);
+        let error_borders = tool_card_border_spans(&lines);
+        assert!(!error_borders.is_empty(), "error card borders must render: {lines:?}");
+        assert!(
+            error_borders
+                .iter()
+                .all(|span| span.style.fg == Some(theme.error)),
+            "failed card borders must use theme.error: {error_borders:?}"
+        );
+    }
+
+    #[test]
+    fn consecutive_tool_cards_keep_a_visible_gap() {
+        // Two adjacent succeeded cards must not stack ╰──╯ directly onto
+        // ╭──╮: the trailing blank row of render_tool_card separates them, so
+        // the brighter frame reads as two distinct cards.
+        let theme = crate::theme::DARK;
+        let first = tool_transcript_entry(succeeded_read_card(), succeeded_read_card());
+        let second = tool_transcript_entry(succeeded_read_card(), succeeded_read_card());
+        let lines = assemble_transcript_entries(&[first, second], true, true, theme, 60);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        let tops: Vec<usize> = text
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.trim_start().starts_with('╭'))
+            .map(|(index, _)| index)
+            .collect();
+        let bottoms: Vec<usize> = text
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.trim_start().starts_with('╰'))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(tops.len(), 2, "two card top borders: {text:#?}");
+        assert_eq!(bottoms.len(), 2, "two card bottom borders: {text:#?}");
+        assert_eq!(
+            tops[1], bottoms[0] + 2,
+            "exactly one blank row between the two cards: {text:#?}"
+        );
+    }
+
+    #[test]
+    fn read_card_code_lines_keep_exact_source_indentation() {
+        use crate::tool_card_adapter::ToolCardRow;
+        let theme = crate::theme::DARK;
+        let card = ToolCardRows {
+            tool_call_id: "read-1".to_owned(),
+            tool_name: "read".to_owned(),
+            ordinal: 1,
+            arguments_summary: "src/main.rs".to_owned(),
+            code_language: Some("rust".to_owned()),
+            status: ToolCallViewStatus::Succeeded,
+            is_partial: false,
+            is_error: false,
+            cancelled: false,
+            truncated: false,
+            omitted_content_lines: 0,
+            rows: vec![
+                ToolCardRow {
+                    tool_call_id: "read-1".to_owned(),
+                    role: ToolCardRowRole::Command,
+                    text: "read src/main.rs".to_owned(),
+                },
+                ToolCardRow {
+                    tool_call_id: "read-1".to_owned(),
+                    role: ToolCardRowRole::Content,
+                    text: "  let x = 1;".to_owned(),
+                },
+                ToolCardRow {
+                    tool_call_id: "read-1".to_owned(),
+                    role: ToolCardRowRole::Content,
+                    text: "        let y = 2;".to_owned(),
+                },
+            ],
+            skill_name: None,
+            bash_command: None,
+        };
+        let entry = tool_transcript_entry(card.clone(), card);
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, theme, 60);
+        let rendered: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        // Card frame is exactly `│ ` + ` │`; the content spans between them
+        // must be the source line verbatim — 2 and 8 leading spaces, never
+        // more (no padding layer), never less (no dedent).
+        fn content_between_frame(line: &Line<'_>) -> (String, String, String) {
+            let spans = &line.spans;
+            assert!(
+                spans.len() >= 3,
+                "content line must carry frame + content spans: {spans:?}"
+            );
+            let prefix = spans[0].content.to_string();
+            let content: String = spans[1..spans.len() - 2]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let suffix = spans[spans.len() - 1].content.to_string();
+            (prefix, content, suffix)
+        }
+        let two = lines
+            .iter()
+            .find(|line| rendered_line_text(line).contains("let x = 1;"))
+            .unwrap_or_else(|| panic!("2-space row missing: {rendered:#?}"));
+        let (two_prefix, two_content, two_suffix) = content_between_frame(two);
+        assert_eq!(two_prefix, "│ ");
+        assert_eq!(two_content, "  let x = 1;", "2-space indent must be exact: {rendered:#?}");
+        assert_eq!(two_suffix, " │");
+        let eight = lines
+            .iter()
+            .find(|line| rendered_line_text(line).contains("let y = 2;"))
+            .unwrap_or_else(|| panic!("8-space row missing: {rendered:#?}"));
+        let (eight_prefix, eight_content, eight_suffix) = content_between_frame(eight);
+        assert_eq!(eight_prefix, "│ ");
+        assert_eq!(
+            eight_content,
+            "        let y = 2;",
+            "8-space indent must be exact: {rendered:#?}"
+        );
+        assert_eq!(eight_suffix, " │");
+        // The border/frame rows themselves are unchanged by content indentation.
+        assert!(rendered[0].starts_with("╭── "));
+        assert!(
+            rendered
+                .iter()
+                .rev()
+                .find(|row| !row.is_empty())
+                .is_some_and(|row| row.starts_with("╰──")),
+            "bottom border unchanged by content indentation: {rendered:#?}"
+        );
+    }
+
+    #[test]
+    fn read_card_impl_block_keeps_exact_source_indentation() {
+        // User-reported: the `read` tool card showed mysterious indentation
+        // lines on a Rust impl block. The card must render the file's lines
+        // verbatim after the `│ ` frame — the 0-indent `impl` header and the
+        // 4/8-space method body lines stay exactly as read, with no padding
+        // layer, no dedent, and no re-flowed continuation rows.
+        use crate::tool_card_adapter::ToolCardRow;
+        let theme = crate::theme::DARK;
+        let card = ToolCardRows {
+            tool_call_id: "read-impl".to_owned(),
+            tool_name: "read".to_owned(),
+            ordinal: 1,
+            arguments_summary: "src/lib.rs".to_owned(),
+            code_language: Some("rust".to_owned()),
+            status: ToolCallViewStatus::Succeeded,
+            is_partial: false,
+            is_error: false,
+            cancelled: false,
+            truncated: false,
+            omitted_content_lines: 0,
+            rows: vec![
+                ToolCardRow {
+                    tool_call_id: "read-impl".to_owned(),
+                    role: ToolCardRowRole::Command,
+                    text: "read src/lib.rs".to_owned(),
+                },
+                ToolCardRow {
+                    tool_call_id: "read-impl".to_owned(),
+                    role: ToolCardRowRole::Content,
+                    text: "impl Store {".to_owned(),
+                },
+                ToolCardRow {
+                    tool_call_id: "read-impl".to_owned(),
+                    role: ToolCardRowRole::Content,
+                    text: "    fn get(&self) -> u32 {".to_owned(),
+                },
+                ToolCardRow {
+                    tool_call_id: "read-impl".to_owned(),
+                    role: ToolCardRowRole::Content,
+                    text: "        self.value".to_owned(),
+                },
+                ToolCardRow {
+                    tool_call_id: "read-impl".to_owned(),
+                    role: ToolCardRowRole::Content,
+                    text: "    }".to_owned(),
+                },
+                ToolCardRow {
+                    tool_call_id: "read-impl".to_owned(),
+                    role: ToolCardRowRole::Content,
+                    text: "}".to_owned(),
+                },
+            ],
+            skill_name: None,
+            bash_command: None,
+        };
+        let entry = tool_transcript_entry(card.clone(), card);
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, theme, 60);
+        let rendered: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        for (needle, expected_indent) in [
+            ("impl Store {", 0),
+            ("fn get(&self) -> u32 {", 4),
+            ("self.value", 8),
+            ("}", 0),
+        ] {
+            let line = lines
+                .iter()
+                .find(|line| rendered_line_text(line).contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} row missing: {rendered:#?}"));
+            let spans = &line.spans;
+            let content: String = spans[1..spans.len() - 2]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let prefix = " ".repeat(expected_indent);
+            assert!(
+                content.starts_with(&prefix),
+                "{needle:?} must keep {expected_indent}-space indent, got {content:?}: {rendered:#?}"
+            );
+            assert_eq!(
+                content.trim_start(),
+                needle,
+                "{needle:?} content must be source-exact after the frame: {content:?}"
+            );
+        }
+        // The 0-indent impl header follows the frame directly — no leading
+        // padding row, no phantom indentation.
+        assert!(
+            rendered
+                .iter()
+                .find(|row| row.contains("impl Store {"))
+                .is_some_and(|row| row.starts_with("│ impl Store {")),
+            "impl header must follow the frame directly: {rendered:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_tool_result_renders_with_exact_source_indentation() {
+        // End-to-end: the `read` tool returns verbatim file content; the
+        // adapter carries it untouched; the card renders code with exactly
+        // the file's leading whitespace (spaces preserved, tabs expanded to
+        // four) after the `│ ` frame — no rendering-layer padding, no dedent.
+        use crate::tool_card_adapter::{ToolCardRow, ToolCardRowRole};
+        let dir = tempfile::tempdir().expect("cwd");
+        let file = dir.path().join("indented.rs");
+        // 2-space and 8-space indent + a tab-indented line (tab -> 4 spaces).
+        std::fs::write(&file, "  let x = 1;\n        let y = 2;\n\tlet z = 3;\n").unwrap();
+        let tool = pi_coding::create_tool("read", &dir.path().to_string_lossy()).expect("read tool");
+        let (_, abort) = pi_agent::AbortController::new();
+        let result = (tool.execute)(pi_agent::ToolCallContext {
+            tool_call_id: "read-e2e".to_owned(),
+            arguments: serde_json::json!({ "path": "indented.rs" }),
+            on_update: std::sync::Arc::new(|_| {}),
+            abort,
+            model: None,
+        })
+        .await
+        .expect("read succeeds");
+        // Drive the projection exactly as the TUI loop does.
+        let mut adapter = ToolCardPresentationAdapter::new();
+        adapter.apply_agent_event(&pi_agent::AgentEvent::ToolExecutionStart {
+            tool_call_id: "read-e2e".to_owned(),
+            tool_name: "read".to_owned(),
+            arguments: serde_json::json!({ "path": "indented.rs" }),
+        });
+        adapter.apply_agent_event(&pi_agent::AgentEvent::ToolExecutionEnd {
+            tool_call_id: "read-e2e".to_owned(),
+            tool_name: "read".to_owned(),
+            result,
+            is_error: false,
+        });
+        let rows = adapter.rows("read-e2e", true).expect("card rows");
+        // The adapter must hand the renderer the verbatim source lines.
+        let content_rows: Vec<&str> = rows
+            .rows
+            .iter()
+            .filter(|row| row.role == ToolCardRowRole::Content)
+            .map(|row| row.text.as_str())
+            .collect();
+        assert!(
+            content_rows.contains(&"  let x = 1;"),
+            "adapter preserves 2-space source line verbatim: {content_rows:?}"
+        );
+        assert!(
+            content_rows.contains(&"        let y = 2;"),
+            "adapter preserves 8-space source line verbatim: {content_rows:?}"
+        );
+        // The read tool returns raw bytes (tabs stay as `\t`); the renderer's
+        // clean_terminal_text expands tabs to four spaces at draw time, so the
+        // adapter content carries the raw tab while the rendered row shows 4.
+        assert!(
+            content_rows.contains(&"\tlet z = 3;"),
+            "adapter preserves the raw tab-indented source line: {content_rows:?}"
+        );
+        assert_eq!(rows.code_language.as_deref(), Some("rust"));
+        // Render and confirm the frame wraps the verbatim content with no
+        // extra indentation layer.
+        let entry = tool_transcript_entry(rows.clone(), rows);
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 60);
+        let rendered: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        let two = lines
+            .iter()
+            .find(|line| rendered_line_text(line).contains("let x = 1;"))
+            .expect("2-space row rendered");
+        let spans = &two.spans;
+        let content: String = spans[1..spans.len() - 2]
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        // 8-space line renders exact after the frame too.
+        let eight = lines
+            .iter()
+            .find(|line| rendered_line_text(line).contains("let y = 2;"))
+            .expect("8-space row rendered");
+        let eight_content: String = eight.spans[1..eight.spans.len() - 2]
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(eight_content, "        let y = 2;", "8-space indent exact after frame: {rendered:#?}");
+        // The tab-indented source line renders as four spaces (tab expansion
+        // in the renderer), never the raw tab and never extra padding.
+        let tab_row = rendered
+            .iter()
+            .find(|row| row.contains("let z = 3;"))
+            .expect("tab row rendered");
+        assert!(
+            tab_row.starts_with("│     let z = 3;"),
+            "tab expands to exactly four spaces after the `│ ` frame: {tab_row:?}"
+        );
+    }
+
+    /// Session whose ambient tool set includes the session-bound `ask` tool.
+    fn ask_session(cwd: &std::path::Path) -> pi_coding::Session {
+        pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session")
+    }
+
+    fn ask_tool(session: &pi_coding::Session) -> pi_agent::AgentTool {
+        session
+            .get_all_tools()
+            .into_iter()
+            .find(|tool| tool.name == "ask")
+            .expect("ambient tool set includes ask")
+    }
+
+    fn ask_tool_context(question: serde_json::Value) -> pi_agent::ToolCallContext {
+        let (_, abort) = pi_agent::AbortController::new();
+        pi_agent::ToolCallContext {
+            tool_call_id: "call-ask".to_owned(),
+            arguments: question,
+            on_update: std::sync::Arc::new(|_| {}),
+            abort,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn pending_ask_renders_on_composer_status_line() {
+        let mut state = todo_test_state(Vec::new());
+        assert!(state.pending_ask.is_none());
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::AskUser {
+            id: "ask-1".to_owned(),
+            prompt: "continue?".to_owned(),
+        }));
+        assert_eq!(
+            state.pending_ask.as_ref().map(|ask| ask.id.as_str()),
+            Some("ask-1")
+        );
+        let line = composer_status_line(&state, 80, crate::theme::DARK);
+        let text = rendered_line_text(&line);
+        assert!(
+            text.starts_with("⟦ask⟧") && text.contains("continue?") && text.contains("esc"),
+            "ask row owns the status line: {text}"
+        );
+        // The ask row outranks a queued steering message.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::QueueUpdate {
+            steering: vec![Message::user_text("steer me", 1)],
+            follow_up: Vec::new(),
+        }));
+        let text = rendered_line_text(&composer_status_line(&state, 80, crate::theme::DARK));
+        assert!(
+            text.starts_with("⟦ask⟧"),
+            "pending ask beats steering: {text}"
+        );
+    }
+
+    #[test]
+    fn pending_ask_clears_on_resolution_event() {
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::AskUser {
+            id: "ask-1".to_owned(),
+            prompt: "continue?".to_owned(),
+        }));
+        assert!(state.pending_ask.is_some());
+        // A stale resolution for a different question must not clear the row.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::AskUserResolved {
+            id: "ask-0".to_owned(),
+        }));
+        assert!(state.pending_ask.is_some());
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::AskUserResolved {
+            id: "ask-1".to_owned(),
+        }));
+        assert!(state.pending_ask.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_ask_submit_routes_answer_and_clears_composer() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = Application::new(session.clone()).await;
+        application.set_ask_interactive(true);
+        let mut events = application.subscribe();
+        let tool = ask_tool(&session);
+        let run = tokio::spawn(async move { (tool.execute)(ask_tool_context(serde_json::json!({ "question": "continue?" }))).await });
+        let (id, prompt) = loop {
+            match events.recv().await.expect("application events") {
+                ApplicationEvent::Session(pi_coding::SessionEvent::AskUser { id, prompt }) => {
+                    break (id, prompt);
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(prompt, "continue?");
+        let mut state = todo_test_state(Vec::new());
+        // The live event stream drives the display exactly as the TUI loop does.
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::AskUser {
+            id: id.clone(),
+            prompt,
+        }));
+        state.editor.set_text("  yes please  ");
+        assert!(submit_pending_ask(&application, &mut state).await, "ask consumed the submit");
+        assert!(state.pending_ask.is_none());
+        assert_eq!(state.editor.text(), "", "answer clears the composer");
+        assert_eq!(state.status, "Answered");
+        let result = run.await.expect("join").expect("ask succeeds");
+        assert_eq!(result.content, vec![ContentBlock::text("yes please")]);
+    }
+
+    #[tokio::test]
+    async fn pending_ask_empty_submit_keeps_question_pending() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = Application::new(session.clone()).await;
+        application.set_ask_interactive(true);
+        let mut state = todo_test_state(Vec::new());
+        state.pending_ask = Some(PendingAsk {
+            id: "ask-1".to_owned(),
+            prompt: "continue?".to_owned(),
+        });
+        state.editor.set_text("   ");
+        assert!(submit_pending_ask(&application, &mut state).await, "empty submit consumed");
+        assert_eq!(
+            state.pending_ask.as_ref().map(|ask| ask.id.as_str()),
+            Some("ask-1"),
+            "empty answer keeps the question pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_ask_escape_cancels_and_resolves_tool() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = Application::new(session.clone()).await;
+        application.set_ask_interactive(true);
+        let mut events = application.subscribe();
+        let tool = ask_tool(&session);
+        let run = tokio::spawn(async move { (tool.execute)(ask_tool_context(serde_json::json!({ "question": "continue?" }))).await });
+        let id = loop {
+            match events.recv().await.expect("application events") {
+                ApplicationEvent::Session(pi_coding::SessionEvent::AskUser { id, .. }) => break id,
+                _ => continue,
+            }
+        };
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Session(pi_coding::SessionEvent::AskUser {
+            id,
+            prompt: "continue?".to_owned(),
+        }));
+        state.cancel_pending_ask(&application).await;
+        assert!(state.pending_ask.is_none());
+        assert_eq!(state.status, "Ask cancelled");
+        let error = run.await.expect("join").expect_err("cancel must reject");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn pending_ask_failure_reports_status_without_panicking() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = Application::new(session.clone()).await;
+        application.set_ask_interactive(true);
+        let mut state = todo_test_state(Vec::new());
+        state.pending_ask = Some(PendingAsk {
+            id: "ask-1".to_owned(),
+            prompt: "continue?".to_owned(),
+        });
+        state.editor.set_text("answer to nothing");
+        // Wrong id: the application rejects the answer and the TUI surfaces it
+        // as an ephemeral composer error.
+        assert!(submit_pending_ask(&application, &mut state).await);
+        assert!(state.pending_ask.is_none());
+        assert!(
+            state
+                .composer_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Ask failed")),
+            "{}",
+            state.composer_error.as_deref().unwrap_or("no composer error")
         );
     }
 

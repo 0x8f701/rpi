@@ -182,6 +182,10 @@ fn styled_ranges(
                 InlineStyle::Bold => style = style.add_modifier(Modifier::BOLD),
                 InlineStyle::Italic => style = style.add_modifier(Modifier::ITALIC),
                 InlineStyle::Code => style = style.patch(styles.inline_code),
+                // The marker is chrome, not item content: the bullet/number
+                // prefix carries the list_marker theme while the item body
+                // keeps the base text style.
+                InlineStyle::ListMarker => style = styles.list_marker,
                 // Separators are chrome, not header/body content. Their explicit
                 // range makes the border theme authoritative without reparsing.
                 InlineStyle::TableBorder => style = styles.table_border,
@@ -218,14 +222,51 @@ fn syntax_spans(
     language: Option<&str>,
     styles: MarkdownRatatuiStyles,
 ) -> Vec<Span<'static>> {
-    // Shared fenced body rows carry one leading layout cell.
-    let (padding, source) = split_code_padding(line);
+    // Fenced body rows carry the frame chrome (`│ … │`). Lex only the code
+    // between the sides; the chrome is styled with the code-fence role so the
+    // per-line sides match the top/bottom border color.
+    let (prefix, source, suffix) = split_code_chrome(line);
     let mut spans = Vec::new();
-    if !padding.is_empty() {
-        spans.push(Span::styled(padding.to_owned(), styles.code));
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix.to_owned(), styles.code_fence));
     }
-    lex_code_source(source, language, styles, &mut spans);
+    // Separate trailing frame padding from the code source so comment lexers
+    // (which run to end-of-line) don't absorb it. The padding stays
+    // code-colored (invisible) and the joined spans still reproduce the row
+    // text exactly.
+    let content_len = source.trim_end().len();
+    let (content, tail) = source.split_at(content_len);
+    lex_code_source(content, language, styles, &mut spans);
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail.to_owned(), styles.code));
+    }
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix.to_owned(), styles.code_fence));
+    }
     spans
+}
+
+/// Split the frame chrome off a fenced body row: a leading `│ ` (or the
+/// legacy one-cell layout pad) and the trailing `│` with its preceding
+/// padding. Rows without a trailing side (e.g. Mermaid source-fallback
+/// lines) keep their whole body as code source.
+fn split_code_chrome(line: &str) -> (&str, &str, &str) {
+    let (prefix, rest) = if let Some(rest) = line.strip_prefix('│') {
+        if let Some(rest) = rest.strip_prefix(' ') {
+            ("│ ", rest)
+        } else {
+            ("│", rest)
+        }
+    } else if let Some(rest) = line.strip_prefix(' ') {
+        (" ", rest)
+    } else {
+        ("", line)
+    };
+    // The closing frame glyph is the last `│` in the row.
+    match rest.rfind('│') {
+        Some(index) => (prefix, &rest[..index], &rest[index..]),
+        None => (prefix, rest, ""),
+    }
 }
 
 pub(crate) fn syntax_spans_unpadded(
@@ -274,14 +315,6 @@ fn classify_language(language: Option<&str>) -> CodeLanguage {
             CodeLanguage::RustLike
         }
         _ => CodeLanguage::Plain,
-    }
-}
-
-fn split_code_padding(line: &str) -> (&str, &str) {
-    if let Some(rest) = line.strip_prefix(' ') {
-        (" ", rest)
-    } else {
-        ("", line)
     }
 }
 
@@ -918,7 +951,7 @@ mod tests {
 
     #[test]
     fn headings_tables_mermaid_and_fallback_match_neutral_text() {
-        let source = "# Heading\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: nope\n```";
+        let source = "# Heading\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\npie\n\"Breakfast\" 5\n```";
         let options = MarkdownRenderOptions {
             width: 32,
             ..MarkdownRenderOptions::default()
@@ -1022,6 +1055,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn list_marker_colors_only_the_prefix_and_item_text_keeps_base() {
+        let styles = MarkdownRatatuiStyles {
+            text: Style::default().fg(Color::White),
+            list_marker: Style::default().fg(Color::LightBlue),
+            ..MarkdownRatatuiStyles::default()
+        };
+        let output = render_ratatui_markdown(
+            "- 第一条要点\n- 第二条 **重点**\n1. 编号步骤\n  2. 嵌套项",
+            80,
+            styles,
+        );
+        let lines = &output.lines;
+        assert_eq!(lines.len(), 4, "one row per item: {lines:?}");
+        // Bullet list: marker span blue, body span base.
+        let bullet = &lines[0];
+        assert_eq!(span_fg(bullet, "•"), Some(Color::LightBlue));
+        assert_eq!(span_fg(bullet, "第一条要点"), Some(Color::White));
+        // Bold inside a list item keeps BOLD and the base foreground.
+        let bold = &lines[1];
+        let bold_span = bold
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "重点")
+            .expect("bold span");
+        assert_eq!(bold_span.style.fg, Some(Color::White));
+        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+        // Ordered list: number span blue, body span base.
+        let ordered = &lines[2];
+        assert_eq!(span_fg(ordered, "1."), Some(Color::LightBlue));
+        assert_eq!(span_fg(ordered, "编号步骤"), Some(Color::White));
+        // Nested list: leading indent stays base, only the marker is blue.
+        let nested = &lines[3];
+        assert_eq!(span_fg(nested, "  "), Some(Color::White));
+        assert_eq!(span_fg(nested, "2."), Some(Color::LightBlue));
+        assert_eq!(span_fg(nested, "嵌套项"), Some(Color::White));
+    }
+
     fn distinct_syntax_styles() -> MarkdownRatatuiStyles {
         MarkdownRatatuiStyles {
             code: Style::default().fg(Color::White),
@@ -1047,6 +1118,7 @@ mod tests {
         output.lines[1..total - 1].iter().collect()
     }
 
+
     fn span_fg(line: &Line<'_>, needle: &str) -> Option<Color> {
         line.spans.iter().find_map(|span| {
             (span.content.as_ref() == needle).then_some(span.style.fg).flatten()
@@ -1060,9 +1132,8 @@ mod tests {
         let width = 72u16;
         let output = render_ratatui_markdown(source, width, styles);
         let plain = output.lines.iter().map(line_text).collect::<Vec<_>>();
-
-        assert!(plain.iter().any(|line| line.contains("┌─ code · bash")));
-        assert!(plain.iter().any(|line| line.starts_with("└─")));
+        assert!(plain.iter().any(|line| line.contains("╭── code · bash")));
+        assert!(plain.iter().any(|line| line.starts_with("╰") && line.ends_with("╯")));
         assert!(output.lines.iter().all(|line| line.width() <= usize::from(width)));
 
         for line in &output.lines {
@@ -1071,7 +1142,7 @@ mod tests {
         }
 
         let body = code_body_lines(&output);
-        assert!(body.iter().all(|line| line_text(line).starts_with(' ')));
+        assert!(body.iter().all(|line| line_text(line).starts_with("│ ")));
 
         let comment = body
             .iter()
@@ -1083,10 +1154,9 @@ mod tests {
             .iter()
             .find(|line| line_text(line).contains("ls -la"))
             .expect("command line");
-        assert_eq!(
-            line_text(command),
-            " ls -la ./src | grep -E 'main' && echo \"done $HOME\""
-        );
+        let expected_command =
+            format!("│ ls -la ./src | grep -E 'main' && echo \"done $HOME\"{} │", " ".repeat(18));
+        assert_eq!(line_text(command), expected_command);
         assert_eq!(span_fg(command, "ls"), Some(Color::Green));
         assert_eq!(span_fg(command, "-la"), Some(Color::Blue));
         assert_eq!(span_fg(command, "./src"), Some(Color::Cyan));
@@ -1123,7 +1193,7 @@ mod tests {
         assert!(rust
             .lines
             .iter()
-            .any(|line| line_text(line).contains("┌─ code · rust")));
+            .any(|line| line_text(line).contains("╭── code · rust")));
         let rust_body = code_body_lines(&rust);
         let comment = rust_body
             .iter()
@@ -1134,7 +1204,9 @@ mod tests {
             .iter()
             .find(|line| line_text(line).contains("let count"))
             .expect("rust stmt");
-        assert_eq!(line_text(stmt), " let count: usize = parse(\"42\");");
+        let expected_stmt =
+            format!("│ let count: usize = parse(\"42\");{} │", " ".repeat(45));
+        assert_eq!(line_text(stmt), expected_stmt);
         assert_eq!(span_fg(stmt, "let"), Some(Color::Blue));
         assert_eq!(span_fg(stmt, "count"), Some(Color::LightCyan));
         assert_eq!(span_fg(stmt, "usize"), Some(Color::Cyan));
@@ -1150,15 +1222,14 @@ mod tests {
         assert!(json
             .lines
             .iter()
-            .any(|line| line_text(line).contains("┌─ code · json")));
+            .any(|line| line_text(line).contains("╭── code · json")));
         let json_line = code_body_lines(&json)
             .into_iter()
             .find(|line| line_text(line).contains("ready"))
             .expect("json body");
-        assert_eq!(
-            line_text(json_line),
-            " {\"ready\": true, \"count\": 42, \"msg\": \"hi\"}"
-        );
+        let expected_json =
+            format!("│ {{\"ready\": true, \"count\": 42, \"msg\": \"hi\"}}{} │", " ".repeat(35));
+        assert_eq!(line_text(json_line), expected_json);
         assert_eq!(span_fg(json_line, "\"ready\""), Some(Color::LightCyan));
         assert_eq!(span_fg(json_line, "true"), Some(Color::Blue));
         assert_eq!(span_fg(json_line, "42"), Some(Color::LightYellow));
@@ -1186,7 +1257,7 @@ mod tests {
         assert!(output
             .lines
             .iter()
-            .any(|line| line_text(line).contains("┌─ code · text")));
+            .any(|line| line_text(line).contains("╭── code · text")));
         assert!(output
             .lines
             .iter()
@@ -1210,18 +1281,78 @@ mod tests {
         let output =
             render_ratatui_markdown("```sh\necho hi\n```", 48, MarkdownRatatuiStyles::default());
         let plain = output.lines.iter().map(line_text).collect::<Vec<_>>();
-        assert_eq!(plain.first().map(String::as_str), Some("┌─ code · sh"));
-        assert!(plain.last().is_some_and(|line| line.starts_with("└─")));
+        let expected_top = format!("╭── code · sh ──{}╮", "─".repeat(31));
+        assert_eq!(plain.first().map(String::as_str), Some(expected_top.as_str()));
+        let expected_bottom = format!("╰{}╯", "─".repeat(46));
+        assert!(plain.last().is_some_and(|line| *line == expected_bottom));
+        let expected_body = format!("│ echo hi{} │", " ".repeat(37));
         assert_eq!(
             plain.iter().find(|line| line.contains("echo")).map(String::as_str),
-            Some(" echo hi")
+            Some(expected_body.as_str())
         );
         let empty = render_ratatui_markdown("```rust\n```", 32, MarkdownRatatuiStyles::default());
         let empty_plain = empty.lines.iter().map(line_text).collect::<Vec<_>>();
+        let expected_empty = format!(
+            "╭── code · rust ──{}╮",
+            "─".repeat(13)
+        );
         assert_eq!(
             empty_plain,
-            vec!["┌─ code · rust".to_owned(), " ".to_owned(), "└─".to_owned()]
+            vec![
+                expected_empty,
+                format!("│ {} │", " ".repeat(28)),
+                format!("╰{}╯", "─".repeat(30))
+            ]
         );
+    }
+
+    #[test]
+    fn unclosed_fence_renders_complete_frame_with_marker() {
+        // User-reported: a still-streaming code block must never render with
+        // only side borders. The streaming path emits the tool-card top, the
+        // side-bordered body rows, and a temporary bottom carrying the
+        // unclosed marker — while a closed fence keeps the plain bottom.
+        let styles = MarkdownRatatuiStyles::default();
+        let streaming =
+            render_ratatui_markdown_streaming("```json\n{\"a\":1}", 48, styles);
+        let plain = streaming.lines.iter().map(line_text).collect::<Vec<_>>();
+        assert!(
+            plain.iter().any(|line| line.starts_with("╭── code · json")),
+            "unclosed fence must keep the top border: {plain:?}"
+        );
+        assert!(
+            plain.iter().any(|line| line.starts_with("│ {")),
+            "unclosed fence must keep side-bordered body rows: {plain:?}"
+        );
+        assert!(
+            plain.iter().any(|line| line.contains("… (unclosed fence)")),
+            "unclosed fence must carry the marker on the bottom: {plain:?}"
+        );
+        assert!(
+            plain
+                .iter()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .is_some_and(|line| line.starts_with("╰")),
+            "unclosed fence must end with a bottom border row: {plain:?}"
+        );
+        assert!(
+            streaming
+                .diagnostics
+                .iter()
+                .any(|diag| matches!(diag, RenderDiagnostic::UnclosedFence { .. })),
+            "streaming unclosed fence must surface the diagnostic"
+        );
+
+        let closed = render_ratatui_markdown("```json\n{\"a\":1}\n```", 48, styles);
+        let closed_plain = closed.lines.iter().map(line_text).collect::<Vec<_>>();
+        assert!(
+            closed_plain
+                .last()
+                .is_some_and(|line| line.starts_with("╰") && !line.contains("unclosed")),
+            "closed fences keep the plain bottom border: {closed_plain:?}"
+        );
+        assert!(closed.diagnostics.is_empty());
     }
 
 
@@ -1381,15 +1512,22 @@ X[User] --> A\n\
     #[test]
     fn table_border_uses_one_theme_token_and_wraps_within_budget() {
         // Coherency contract: the live TUI maps every table chrome glyph to a
-        // single semantic theme token (theme.md_code_block_border), so all
-        // `─│┌┐└┘├┤┬┼┴` cells share one real-RGB color — never a mix of ANSI
-        // defaults, never Reset. Driven through the same public style map the
+        // single semantic theme token (theme.tool_card_border — the same
+        // visible frame role as code/tool-card frames), so all `─│┌┐└┘├┤┬┼┴`
+        // cells share one real-RGB color — never a mix of ANSI defaults, never
+        // Reset. md_code_block_border (#2a3038) sits too close to the #0f1216
+        // background to read as a card border, so the table must NOT fall back
+        // to that dim token. Driven through the same public style map the
         // transcript uses (table_border <- theme token), so a wiring regression
         // (hardcoded color, Reset, or per-glyph divergence) fails at the
         // rendered-span level rather than by grepping source.
         let theme = crate::theme::DARK;
-        let border = theme.md_code_block_border;
+        let border = theme.tool_card_border;
         assert_ne!(border, Color::Reset, "table border token must be a real RGB");
+        assert_ne!(
+            border, theme.md_code_block_border,
+            "table border must use the visible card frame color, not the dim md_code_block_border"
+        );
         let styles = MarkdownRatatuiStyles {
             text: Style::default().fg(theme.text),
             heading_2: Style::default().fg(theme.md_heading),

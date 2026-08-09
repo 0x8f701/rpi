@@ -93,6 +93,7 @@ fn command(home: &Path) -> Command {
         .env("HOME", home)
         .env("SESSIONS_HOME", home)
         .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("PI_PROFILE")
         .env_remove("CODEX_HOME")
         .env_remove("CLAUDE_CONFIG_DIR");
     command
@@ -164,11 +165,18 @@ fn encode_cwd_safe_path(path: &Path) -> String {
 
 /// Write a minimal native Pi v3 session under `HOME` for the given `cwd`.
 fn plant_session(home: &Path, cwd: &Path, id: &str, timestamp: &str) -> PathBuf {
-    let dir = home
-        .join(".pi")
-        .join("agent")
-        .join("sessions")
-        .join(format!("--{}--", encode_cwd_safe_path(cwd)));
+    plant_session_in(
+        &home.join(".pi").join("agent").join("sessions"),
+        cwd,
+        id,
+        timestamp,
+    )
+}
+
+/// Write a minimal native Pi v3 session under an explicit sessions root (used
+/// for profile-scoped fixtures).
+fn plant_session_in(sessions_root: &Path, cwd: &Path, id: &str, timestamp: &str) -> PathBuf {
+    let dir = sessions_root.join(format!("--{}--", encode_cwd_safe_path(cwd)));
     fs::create_dir_all(&dir).expect("create session dir");
     let path = dir.join(format!(
         "{}_{}.jsonl",
@@ -251,7 +259,7 @@ fn help_lists_flags_and_subcommands() {
     let home = TempDir::new().unwrap();
     let (ok, out, _) = run(home.path(), &["--help"]);
     assert!(ok, "--help must exit 0");
-    for flag in ["--provider", "--system-prompt", "--append-system-prompt", "--add-dir", "--session", "--session-id", "--models", "--tools", "--extension", "--list-models", "--offline"] {
+    for flag in ["--provider", "--system-prompt", "--append-system-prompt", "--add-dir", "--session", "--session-id", "--models", "--tools", "--extension", "--list-models", "--offline", "--profile"] {
         assert!(out.contains(flag), "help lists {flag}");
     }
     for command in ["import-session", "models", "sessions", "install", "remove", "update", "config"] {
@@ -885,5 +893,226 @@ fn continue_latest_selects_newest_session() {
     assert!(
         out.contains("faux/faux-1"),
         "REPL header restores the faux model: {out}"
+    );
+}
+
+/// Seed `auth.json` + empty `settings.json` in the agent dir of the given
+/// profile (`None` = default profile) with a distinctive provider name.
+fn seed_profile_auth(home: &Path, profile: Option<&str>, provider: &str) {
+    let agent_dir = match profile {
+        Some(name) => home.join(".pi/agent/profiles").join(name),
+        None => home.join(".pi/agent"),
+    };
+    fs::create_dir_all(&agent_dir).expect("create agent dir");
+    fs::write(
+        agent_dir.join("auth.json"),
+        serde_json::to_vec(&serde_json::json!({
+            provider: { "type": "api_key", "key": "test-key" },
+        }))
+        .expect("serialize auth"),
+    )
+    .expect("write auth");
+    fs::write(agent_dir.join("settings.json"), b"{}").expect("write settings");
+}
+
+/// Seed a user skill in the agent dir of the given profile (`None` = default
+/// profile).
+fn seed_profile_skill(home: &Path, profile: Option<&str>, name: &str) {
+    let agent_dir = match profile {
+        Some(name) => home.join(".pi/agent/profiles").join(name),
+        None => home.join(".pi/agent"),
+    };
+    let dir = agent_dir.join("skills").join(name);
+    fs::create_dir_all(&dir).expect("create skill dir");
+    fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: profile fixture skill\n---\n# body\n"),
+    )
+    .expect("write skill");
+}
+
+#[test]
+fn profile_relocates_agent_config_skills_and_sessions() {
+    let home = TempDir::new().unwrap();
+    seed_profile_auth(home.path(), None, "default-provider");
+    seed_profile_auth(home.path(), Some("work"), "work-provider");
+    seed_profile_skill(home.path(), None, "default-skill");
+    seed_profile_skill(home.path(), Some("work"), "work-skill");
+
+    // Named profile: doctor resolves the profile-scoped agent dir and auth.
+    let (ok, out, err) = run(home.path(), &["--profile", "work", "doctor", "--json"]);
+    assert!(ok, "doctor with profile exits 0: {err}");
+    assert!(out.contains("profiles/work"), "agent dir is profile-scoped: {out}");
+    assert!(out.contains("work-provider"), "auth read from the profile dir: {out}");
+    assert!(
+        !out.contains("default-provider"),
+        "profile must not read the default auth: {out}"
+    );
+    assert!(
+        !out.contains("default-skill"),
+        "profile must not load the default skill: {out}"
+    );
+
+    // Settings/resource snapshot loads from the profile dir.
+    let (ok, out, err) = run(home.path(), &["--profile", "work", "reload"]);
+    assert!(ok, "reload with profile exits 0: {err}");
+    assert!(out.contains("work-skill"), "profile snapshot lists profile skills: {out}");
+    assert!(
+        !out.contains("default-skill"),
+        "profile snapshot must not list default skills: {out}"
+    );
+
+    // Default profile: everything resolves to the unprofiled base.
+    let (ok, out, err) = run(home.path(), &["doctor", "--json"]);
+    assert!(ok, "doctor exits 0: {err}");
+    assert!(out.contains("default-provider"), "default auth read: {out}");
+    assert!(
+        !out.contains("work-provider"),
+        "default doctor must not see profile auth: {out}"
+    );
+    assert!(
+        !out.contains("profiles/"),
+        "default paths stay unprofiled: {out}"
+    );
+
+    let (ok, out, err) = run(home.path(), &["reload"]);
+    assert!(ok, "reload exits 0: {err}");
+    assert!(out.contains("default-skill"), "default snapshot lists default skills: {out}");
+    assert!(
+        !out.contains("work-skill"),
+        "default snapshot must not list profile skills: {out}"
+    );
+}
+
+#[test]
+fn profile_default_keeps_default_base() {
+    let home = TempDir::new().unwrap();
+    seed_profile_auth(home.path(), None, "default-provider");
+
+    let (ok, out, err) = run(home.path(), &["--profile", "default", "doctor", "--json"]);
+    assert!(ok, "doctor with --profile default exits 0: {err}");
+    assert!(
+        !out.contains("profiles/"),
+        "--profile default must not relocate: {out}"
+    );
+    assert!(
+        out.contains("default-provider"),
+        "--profile default keeps the default auth: {out}"
+    );
+}
+
+#[test]
+fn profile_env_honored_and_cli_flag_wins() {
+    let home = TempDir::new().unwrap();
+    seed_profile_auth(home.path(), Some("envwork"), "env-provider");
+    seed_profile_auth(home.path(), Some("cliwork"), "cli-provider");
+
+    // PI_PROFILE alone selects the profile.
+    let output = command(home.path())
+        .env("PI_PROFILE", "envwork")
+        .args(["doctor", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run rpi with PI_PROFILE");
+    assert!(output.status.success(), "PI_PROFILE doctor exits 0");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("profiles/envwork"), "PI_PROFILE relocates: {out}");
+    assert!(out.contains("env-provider"), "PI_PROFILE auth is read: {out}");
+
+    // The CLI flag wins over the environment.
+    let output = command(home.path())
+        .env("PI_PROFILE", "envwork")
+        .args(["--profile", "cliwork", "doctor", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run rpi with flag and env");
+    assert!(output.status.success(), "flag+env doctor exits 0");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("profiles/cliwork"), "CLI flag wins over env: {out}");
+    assert!(out.contains("cli-provider"), "CLI profile auth is read: {out}");
+    assert!(
+        !out.contains("env-provider"),
+        "env profile must lose to the flag: {out}"
+    );
+}
+
+#[test]
+fn profile_invalid_name_rejected_actionably() {
+    let home = TempDir::new().unwrap();
+
+    let (ok, _out, err) = run(home.path(), &["--profile", "bad/name", "doctor"]);
+    assert!(!ok, "invalid --profile must fail");
+    assert!(err.contains("--profile"), "error names the flag: {err}");
+    assert!(
+        err.contains("letters, digits"),
+        "error explains the allowed charset: {err}"
+    );
+
+    let output = command(home.path())
+        .env("PI_PROFILE", "bad/name")
+        .args(["doctor"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run rpi with invalid PI_PROFILE");
+    assert!(!output.status.success(), "invalid PI_PROFILE must fail");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("profile name"), "error names the profile: {err}");
+    assert!(
+        err.contains("letters, digits"),
+        "error explains the allowed charset: {err}"
+    );
+}
+
+#[test]
+fn profile_scoped_session_listing_is_isolated() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let profile_root = home.path().join(".pi/agent/profiles/work/sessions");
+    plant_session_in(
+        &profile_root,
+        cwd.path(),
+        "profiled-session",
+        "2026-02-02T02:02:02.000Z",
+    );
+    plant_session(
+        home.path(),
+        cwd.path(),
+        "default-session",
+        "2026-01-01T01:01:01.000Z",
+    );
+
+    // The named profile lists only its own sessions, under the profile root.
+    let (ok, out, err) = run(
+        home.path(),
+        &[
+            "--profile",
+            "work",
+            "--cwd",
+            cwd.path().to_str().unwrap(),
+            "sessions",
+        ],
+    );
+    assert!(ok, "profile sessions exits 0: {err}");
+    assert!(out.contains("profiled-session"), "profile lists its session: {out}");
+    assert!(out.contains("profiles/work"), "listed path is profile-scoped: {out}");
+    assert!(
+        !out.contains("default-session"),
+        "profile must not see default sessions: {out}"
+    );
+
+    // The default profile sees only its own sessions.
+    let (ok, out, err) = run(
+        home.path(),
+        &["--cwd", cwd.path().to_str().unwrap(), "sessions"],
+    );
+    assert!(ok, "default sessions exits 0: {err}");
+    assert!(out.contains("default-session"), "default lists its session: {out}");
+    assert!(
+        !out.contains("profiled-session"),
+        "default must not see profile sessions: {out}"
+    );
+    assert!(
+        !out.contains("profiles/"),
+        "default listing stays unprofiled: {out}"
     );
 }

@@ -15,9 +15,12 @@ pub struct CompactionSettings {
     pub enabled: bool,
     pub reserve_tokens: i64,
     pub keep_recent_tokens: i64,
+    /// Number of most recent user turns retained verbatim by `/compact --snap`
+    /// (deterministic archive). Everything older is replaced by a compacted
+    /// statistics block. `compaction.snapKeepTurns` in settings.
+    pub snap_keep_turns: i64,
 }
 
-/// File-operation metadata retained alongside a compaction checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionDetails {
@@ -25,7 +28,6 @@ pub struct CompactionDetails {
     pub modified_files: Vec<String>,
 }
 
-/// Result returned by an explicit manual compaction.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionResult {
@@ -40,12 +42,14 @@ pub struct CompactionResult {
     pub details: Option<CompactionDetails>,
 }
 
-/// pi's defaults (`DEFAULT_COMPACTION_SETTINGS`).
 pub const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = CompactionSettings {
     enabled: true,
     reserve_tokens: 16384,
     keep_recent_tokens: 20000,
+    snap_keep_turns: SNAPCOMPACT_KEEP_TURNS_DEFAULT,
 };
+
+pub const SNAPCOMPACT_KEEP_TURNS_DEFAULT: i64 = 10;
 
 /// Per-image char estimate used by the token heuristic (pi `ESTIMATED_IMAGE_CHARS`).
 pub const ESTIMATED_IMAGE_CHARS: i64 = 4800;
@@ -71,7 +75,13 @@ pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn
 /// Estimates the token cost of a message (pi `estimateTokens`: char count / 4,
 /// rounded up).
 pub fn estimate_message_tokens(m: &Message) -> i64 {
-    let chars = match m {
+    (message_chars(m) + 3) / 4 // ceil(chars / 4) for non-negative chars
+}
+
+/// Total UTF-16 character count of a message, mirroring pi's `estimateTokens`
+/// char accounting (inline images count as [`ESTIMATED_IMAGE_CHARS`]).
+fn message_chars(m: &Message) -> i64 {
+    match m {
         Message::User(um) => content_chars(&um.content),
         Message::Assistant(am) => assistant_chars(&am.content),
         Message::ToolResult(tr) => content_chars(&tr.content),
@@ -79,8 +89,7 @@ pub fn estimate_message_tokens(m: &Message) -> i64 {
         Message::Custom(custom) => content_chars(&custom.content.to_blocks()),
         Message::BranchSummary(summary) => utf16_len(&summary.summary),
         Message::CompactionSummary(summary) => utf16_len(&summary.summary),
-    };
-    (chars + 3) / 4 // ceil(chars / 4) for non-negative chars
+    }
 }
 
 fn assistant_chars(content: &ContentList) -> i64 {
@@ -104,14 +113,13 @@ fn content_chars(content: &ContentList) -> i64 {
     for c in content {
         match c {
             ContentBlock::Text { text, .. } => chars += utf16_len(text),
-            ContentBlock::Image { .. } => chars += ESTIMATED_IMAGE_CHARS, // fixed estimate per inline image
+            ContentBlock::Image { .. } => chars += ESTIMATED_IMAGE_CHARS,
             _ => {}
         }
     }
     chars
 }
 
-/// Sums estimated tokens across messages (pure heuristic).
 pub fn estimate_context_tokens(messages: &[Message]) -> i64 {
     messages.iter().map(|m| estimate_message_tokens(m)).sum()
 }
@@ -120,6 +128,13 @@ pub fn estimate_context_tokens(messages: &[Message]) -> i64 {
 /// heuristic estimate of the trailing messages (pi `estimateContextTokens`).
 /// Far more accurate than the pure char/4 heuristic on large contexts. Skips
 /// aborted/error and all-zero-usage messages when picking the usage anchor.
+///
+/// This measures a LIVE pre-compaction context: the anchor usage was reported
+/// against the full context at that turn. It MUST NOT be applied to a
+/// compacted context — the same anchor (and its trailing tail) survives the
+/// cut verbatim, so it reports the pre-compaction count unchanged. Use
+/// [`estimate_context_tokens`] for a post-compaction view (summary + kept
+/// tail), where no assistant turn has run yet and every usage total is stale.
 pub fn estimate_context_tokens_usage_aware(messages: &[Message]) -> i64 {
     let mut last_idx: i64 = -1;
     let mut last_usage_total = 0i64;
@@ -151,7 +166,6 @@ fn context_tokens_from_usage(u: &Usage) -> i64 {
     u.input + u.output + u.cache_read + u.cache_write
 }
 
-/// Reports whether the context exceeds the safe budget.
 pub fn should_compact(context_tokens: i64, context_window: i64, s: &CompactionSettings) -> bool {
     if !s.enabled || context_window <= 0 {
         return false;
@@ -210,7 +224,6 @@ static NON_RETRYABLE_LIMIT_PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new
     .collect()
 });
 
-/// Returns whether an assistant result indicates a context-window overflow.
 pub fn is_context_overflow(message: &pi_ai::AssistantMessage, context_window: i64) -> bool {
     if message.stop_reason == StopReason::Error
         && let Some(error) = message.error_message.as_deref()
@@ -230,7 +243,6 @@ pub fn is_context_overflow(message: &pi_ai::AssistantMessage, context_window: i6
         && input_tokens as f64 >= context_window as f64 * 0.99
 }
 
-/// Classifies transient provider and transport errors for bounded retry.
 pub fn is_retryable_assistant_error(message: &pi_ai::AssistantMessage) -> bool {
     let Some(error) = message.error_message.as_deref().filter(|_| message.stop_reason == StopReason::Error) else {
         return false;
@@ -331,7 +343,225 @@ pub fn apply_checkpoint(summary: &str, messages: &[Message], prefix_len: usize) 
     out
 }
 
-/// Converts stored agent messages to provider-compatible LLM roles.
+// ---------------------------------------------------------------------------
+// Useless-result elision
+// ---------------------------------------------------------------------------
+
+/// Drops useless tool-result entries from `messages`, returning the filtered
+/// list and the number of elided entries. Applied to the history being
+/// compacted (LLM summary and snap archive alike).
+///
+/// Two deterministic rules:
+/// 1. A tool result whose text content is empty or whitespace-only is elided.
+/// 2. A tool result whose text exactly duplicates the error text of the most
+///    recent preceding tool result that was an error is elided (the retried
+///    call failed with the identical error the model already saw). A
+///    non-error tool result clears the duplicate anchor; assistant/user
+///    messages between calls do not.
+///
+/// The elision is bounded and deterministic: both rules compare text exactly
+/// and never consult the provider.
+pub fn elide_useless_results(messages: &[Message]) -> (Vec<Message>, usize) {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut elided = 0usize;
+    // Error text of the most recent preceding tool call's result, if any.
+    let mut last_error_text: Option<String> = None;
+    for message in messages {
+        let Message::ToolResult(result) = message else {
+            out.push(message.clone());
+            continue;
+        };
+        let text = text_of(&result.content);
+        if text.trim().is_empty() {
+            elided += 1;
+            continue;
+        }
+        if last_error_text.as_deref() == Some(text.as_str()) {
+            elided += 1;
+            continue;
+        }
+        if result.is_error {
+            last_error_text = Some(text);
+        } else {
+            last_error_text = None;
+        }
+        out.push(message.clone());
+    }
+    (out, elided)
+}
+
+/// The `[elided N useless results]` note appended to a compaction summary when
+/// elision removed entries. Empty when nothing was elided.
+#[must_use]
+pub fn elided_note(elided: usize) -> String {
+    if elided == 0 {
+        String::new()
+    } else {
+        format!("[elided {elided} useless results]")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snap compact (deterministic archive)
+// ---------------------------------------------------------------------------
+
+const SNAPCOMPACT_MAX_USER_ASKS: usize = 10;
+const SNAPCOMPACT_MAX_TOOLS: usize = 20;
+
+/// Returns the index of the first message to keep so that the last `keep_turns`
+/// user turns (each starting at a `Message::User`) remain verbatim; everything
+/// before it is archived. `None` when there is nothing to archive: at most
+/// `keep_turns` user turns remain after `start`, or the whole keep window is
+/// already inside the archived region. The cut always lands on a user message,
+/// so a snap compaction never splits a turn.
+pub fn find_snap_cut_point(messages: &[Message], start: usize, keep_turns: i64) -> Option<usize> {
+    if keep_turns <= 0 || start >= messages.len() {
+        return None;
+    }
+    let keep_turns = keep_turns as usize;
+    let user_indices = messages
+        .iter()
+        .enumerate()
+        .skip(start)
+        .filter(|(_, message)| matches!(message, Message::User(_)))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if user_indices.len() <= keep_turns {
+        return None;
+    }
+    let cut = user_indices[user_indices.len() - keep_turns];
+    (cut > start).then_some(cut)
+}
+
+fn message_timestamp(m: &Message) -> Option<i64> {
+    match m {
+        Message::User(um) => Some(um.timestamp),
+        Message::Assistant(am) => Some(am.timestamp),
+        Message::ToolResult(tr) => Some(tr.timestamp),
+        Message::BashExecution(bash) => Some(bash.timestamp),
+        Message::Custom(custom) => Some(custom.timestamp),
+        Message::BranchSummary(summary) => Some(summary.timestamp),
+        Message::CompactionSummary(summary) => Some(summary.timestamp),
+    }
+}
+
+fn format_timestamp(millis: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(|| millis.to_string())
+}
+
+fn user_ask_first_line(message: &Message) -> Option<String> {
+    let Message::User(user) = message else {
+        return None;
+    };
+    text_of(&user.content)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// Builds the deterministic snapcompact summary block for the archived
+/// `messages`: per message-type counts, total archived characters, the
+/// timestamp span, the sorted unique tool names, and a bounded list of
+/// user-ask first lines. `elided` is the number of useless results dropped by
+/// [`elide_useless_results`]; a non-zero value appends the `[elided N useless
+/// results]` note. Pure and deterministic — no provider call.
+pub fn build_snapcompact_summary(messages: &[Message], elided: usize) -> String {
+    let mut counts = [0usize; 6];
+    let mut chars = 0i64;
+    let mut first_timestamp: Option<i64> = None;
+    let mut last_timestamp: Option<i64> = None;
+    let mut tools = BTreeSet::new();
+    let mut asks = Vec::new();
+    for message in messages {
+        chars += message_chars(message);
+        if let Some(timestamp) = message_timestamp(message) {
+            if first_timestamp.is_none() {
+                first_timestamp = Some(timestamp);
+            }
+            last_timestamp = Some(timestamp);
+        }
+        match message {
+            Message::User(_) => {
+                counts[0] += 1;
+                if asks.len() < SNAPCOMPACT_MAX_USER_ASKS
+                    && let Some(line) = user_ask_first_line(message)
+                {
+                    asks.push(line);
+                }
+            }
+            Message::Assistant(assistant) => {
+                counts[1] += 1;
+                for block in &assistant.content {
+                    if let ContentBlock::ToolCall(call) = block {
+                        tools.insert(call.name.clone());
+                    }
+                }
+            }
+            Message::ToolResult(result) => {
+                counts[2] += 1;
+                tools.insert(result.tool_name.clone());
+            }
+            Message::BashExecution(_) => counts[3] += 1,
+            Message::Custom(_) => counts[4] += 1,
+            Message::BranchSummary(_) => counts[5] += 1,
+            Message::CompactionSummary(_) => {}
+        }
+    }
+    let user_asks_count = messages
+        .iter()
+        .filter(|message| matches!(message, Message::User(_)))
+        .count();
+    let tool_names = tools.into_iter().collect::<Vec<_>>();
+    let mut block = format!(
+        "## Snapshot Summary (deterministic archive)\n\n\
+Archived {} messages: {} user, {} assistant, {} tool results, {} bash executions, {} custom, {} compaction summaries.\n\
+Total archived characters: {}\n",
+        messages.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        counts[5],
+        chars,
+    );
+    let span = match (first_timestamp, last_timestamp) {
+        (Some(first), Some(last)) => format!("{} to {}", format_timestamp(first), format_timestamp(last)),
+        (Some(first), None) => format_timestamp(first),
+        (None, _) => "(none)".to_owned(),
+    };
+    block.push_str(&format!("Time span: {span}\n"));
+    block.push_str("Tools used: ");
+    if tool_names.is_empty() {
+        block.push_str("(none)\n");
+    } else if tool_names.len() <= SNAPCOMPACT_MAX_TOOLS {
+        block.push_str(&tool_names.join(", "));
+        block.push('\n');
+    } else {
+        block.push_str(&tool_names[..SNAPCOMPACT_MAX_TOOLS].join(", "));
+        block.push_str(&format!(" (+{} more)\n", tool_names.len() - SNAPCOMPACT_MAX_TOOLS));
+    }
+    block.push_str("User asks:\n");
+    if asks.is_empty() {
+        block.push_str("- (none)\n");
+    } else {
+        for ask in &asks {
+            block.push_str(&format!("- {ask}\n"));
+        }
+        if user_asks_count > asks.len() {
+            block.push_str(&format!("(+{} more)\n", user_asks_count - asks.len()));
+        }
+    }
+    if !elided_note(elided).is_empty() {
+        block.push_str(&elided_note(elided));
+        block.push('\n');
+    }
+    block
+}
+
 pub fn messages_as_llm(messages: &[Message]) -> Vec<Message> {
     pi_ai::messages_to_llm(messages)
 }
@@ -474,7 +704,6 @@ impl FileOps {
             .cloned()
             .collect();
         let modified_files: Vec<String> = modified.iter().cloned().collect();
-        // BTreeSet iteration is already sorted ascending.
         (read_files, modified_files)
     }
 }
@@ -504,8 +733,6 @@ fn extract_file_ops_from_message(m: &Message, ops: &mut FileOps) {
     }
 }
 
-/// Derives the read-only and modified file lists from read/edit/write tool calls
-/// in the given messages.
 pub fn compute_file_lists(messages: &[Message]) -> (Vec<String>, Vec<String>) {
     let mut ops = FileOps::default();
     for m in messages {
@@ -630,13 +857,13 @@ mod tests {
 
     #[test]
     fn should_compact_threshold() {
-        let s = CompactionSettings { enabled: true, reserve_tokens: 16384, keep_recent_tokens: 20000 };
+        let s = CompactionSettings { enabled: true, reserve_tokens: 16384, keep_recent_tokens: 20000, snap_keep_turns: 10 };
         assert!(!should_compact(100, 200000, &s), "small context should not compact");
         assert!(should_compact(190000, 200000, &s), "above window-reserve should compact");
-        let off = CompactionSettings { enabled: false, reserve_tokens: 16384, keep_recent_tokens: 20000 };
+        let off = CompactionSettings { enabled: false, reserve_tokens: 16384, keep_recent_tokens: 20000, snap_keep_turns: 10 };
         assert!(!should_compact(190000, 200000, &off), "disabled must never trigger");
         // reserve larger than window: RHS negative → any positive context compacts.
-        let big_reserve = CompactionSettings { enabled: true, reserve_tokens: 200, keep_recent_tokens: 20000 };
+        let big_reserve = CompactionSettings { enabled: true, reserve_tokens: 200, keep_recent_tokens: 20000, snap_keep_turns: 10 };
         assert!(should_compact(50, 100, &big_reserve), "reserve>window must still compact positive context");
     }
 
@@ -822,6 +1049,47 @@ mod tests {
     }
 
     #[test]
+    fn compacted_context_estimate_must_not_reuse_stale_usage_anchor() {
+        // A live context ends with an assistant turn carrying the real usage
+        // the provider reported (measured against the FULL pre-compaction
+        // context). Compaction keeps that turn and everything after the cut
+        // verbatim, so the usage-aware estimator anchors on the same stale
+        // total for the compacted view and reports the before-count unchanged.
+        // The pure heuristic over the compacted view (summary + kept tail) is
+        // the honest post-compaction estimate and must be strictly smaller.
+        let padding = "x".repeat(4000); // ~1000 heuristic tokens per message
+        let mut messages = Vec::new();
+        for turn in 0..6 {
+            messages.push(user_text(&format!("ask {turn}: {padding}"), turn as i64 * 2));
+            let mut assistant = am(
+                vec![ContentBlock::text(format!("answer {turn}: {padding}"))],
+                StopReason::Stop,
+                Usage::default(),
+                turn as i64 * 2 + 1,
+            );
+            if turn == 5 {
+                assistant.usage = Usage { total_tokens: 64_154, ..Usage::default() };
+            }
+            messages.push(Message::Assistant(assistant));
+        }
+        let before = estimate_context_tokens_usage_aware(&messages);
+        assert_eq!(before, 64_154, "usage-aware estimate anchors on the last real usage");
+
+        // Compact: archive everything before the last turn behind a summary.
+        let compacted = apply_checkpoint("## Summary\narchived history", &messages, 10);
+        assert_eq!(
+            estimate_context_tokens_usage_aware(&compacted),
+            before,
+            "usage-aware over the compacted view must not be reused as the after-count: its anchor predates compaction"
+        );
+        let after = estimate_context_tokens(&compacted);
+        assert!(
+            after < before,
+            "pure estimate of summary + kept tail shrinks the context: before={before} after={after}"
+        );
+    }
+
+    #[test]
     fn default_compaction_settings() {
         assert!(DEFAULT_COMPACTION_SETTINGS.enabled);
         assert_eq!(DEFAULT_COMPACTION_SETTINGS.reserve_tokens, 16384);
@@ -857,5 +1125,149 @@ mod tests {
         let f = format_file_operations(&read, &modified);
         assert!(f.contains("<read-files>\n/a/a.go\n/c/c.go\n</read-files>"));
         assert!(f.contains("<modified-files>\n/b/b.go\n</modified-files>"));
+    }
+
+    fn tool_result(text: &str, is_error: bool, ts: i64) -> Message {
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: "t".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text { text: text.to_string(), text_signature: None }],
+            usage: None,
+            details: None,
+            added_tool_names: Vec::new(),
+            is_error,
+            timestamp: ts,
+        })
+    }
+
+    #[test]
+    fn elide_useless_results_drops_empty_and_duplicate_error_results() {
+        let messages = vec![
+            user_text("first ask", 1),
+            tool_result("   \n\t ", false, 2),
+            tool_result("read failed: no such file", true, 3),
+            tool_result("read failed: no such file", true, 4),
+            tool_result("read failed: no such file", true, 5),
+            tool_result("ok", false, 6),
+        ];
+        let (filtered, elided) = elide_useless_results(&messages);
+        assert_eq!(elided, 3, "empty + two duplicates must be elided");
+        assert_eq!(
+            filtered.iter().map(|m| message_timestamp(m).unwrap()).collect::<Vec<_>>(),
+            vec![1, 3, 6],
+            "the first error and the successful result survive"
+        );
+        // The duplicate anchor is cleared by the successful result, so a later
+        // identical error is new information and stays.
+        let mut with_later_error = messages;
+        with_later_error.push(tool_result("read failed: no such file", true, 7));
+        let (filtered, elided) = elide_useless_results(&with_later_error);
+        assert_eq!(elided, 3);
+        assert_eq!(filtered.len(), 4, "the error after a success must be kept");
+    }
+
+    #[test]
+    fn elide_useless_results_keeps_unique_errors_across_turns() {
+        let messages = vec![
+            user_text("first", 1),
+            tool_result("error: boom", true, 2),
+            user_text("second turn", 3),
+            tool_result("error: boom", true, 4),
+        ];
+        // The anchor persists across non-result messages, so the second
+        // identical error is a duplicate of the preceding tool call's error.
+        let (filtered, elided) = elide_useless_results(&messages);
+        assert_eq!(elided, 1);
+        assert_eq!(filtered.len(), 3);
+        assert!(!filtered.iter().any(|m| message_timestamp(m) == Some(4)));
+    }
+
+    #[test]
+    fn elided_note_only_renders_when_nonzero() {
+        assert_eq!(elided_note(0), "");
+        assert_eq!(elided_note(3), "[elided 3 useless results]");
+    }
+
+    #[test]
+    fn find_snap_cut_point_keeps_last_k_turns() {
+        // 5 user turns, keep the last 2: archive the first 3.
+        let mut messages = Vec::new();
+        for turn in 0..5 {
+            messages.push(user_text(&format!("ask {turn}"), turn * 2));
+            messages.push(assistant_text(&format!("answer {turn}"), turn * 2 + 1));
+        }
+        let cut = find_snap_cut_point(&messages, 0, 2).expect("cut exists");
+        assert_eq!(cut, 6, "keep from the 4th user message (index 6)");
+        assert!(matches!(messages[cut], Message::User(_)), "cut always lands on a user message");
+
+        // Nothing to archive when at most K turns exist.
+        assert_eq!(find_snap_cut_point(&messages, 0, 5), None);
+        assert_eq!(find_snap_cut_point(&messages, 0, 10), None);
+        assert_eq!(find_snap_cut_point(&messages, 0, 0), None, "zero keep turns archives nothing");
+
+        // After a previous compaction (prefix_len > 0) only the unarchived
+        // turns count toward the window.
+        let cut = find_snap_cut_point(&messages, 4, 2).expect("cut exists");
+        assert_eq!(cut, 6);
+        assert_eq!(find_snap_cut_point(&messages, 4, 3), None, "only 3 turns remain after index 4");
+    }
+
+    #[test]
+    fn build_snapcompact_summary_is_deterministic_and_bounded() {
+        let mut messages = Vec::new();
+        for turn in 0..12 {
+            messages.push(Message::user_text(
+                format!("ask number {turn} with extra detail"),
+                turn * 100,
+            ));
+            messages.push(assistant_text("plain answer", turn * 100 + 1));
+        }
+        messages.push(Message::ToolResult(ToolResultMessage {
+            tool_call_id: "t1".to_string(),
+            tool_name: "grep".to_string(),
+            content: vec![ContentBlock::Text { text: "match".to_string(), text_signature: None }],
+            usage: None,
+            details: None,
+            added_tool_names: Vec::new(),
+            is_error: false,
+            timestamp: 1201,
+        }));
+        messages.push(Message::ToolResult(ToolResultMessage {
+            tool_call_id: "t2".to_string(),
+            tool_name: "bash".to_string(),
+            content: vec![ContentBlock::Text { text: "ok".to_string(), text_signature: None }],
+            usage: None,
+            details: None,
+            added_tool_names: Vec::new(),
+            is_error: false,
+            timestamp: 1202,
+        }));
+        messages.push(Message::BashExecution(pi_ai::BashExecutionMessage {
+            command: "echo hi".into(), output: "hi".into(), exit_code: Some(0),
+            cancelled: false, truncated: false, full_output_path: None,
+            timestamp: 1203, exclude_from_context: None,
+        }));
+        let summary = build_snapcompact_summary(&messages, 2);
+        assert_eq!(build_snapcompact_summary(&messages, 2), summary, "deterministic");
+
+        assert!(summary.starts_with("## Snapshot Summary (deterministic archive)"));
+        assert!(summary.contains("Archived 27 messages: 12 user, 12 assistant, 2 tool results, 1 bash executions, 0 custom, 0 compaction summaries."), "{summary}");
+        assert!(summary.contains("Time span: "));
+        assert!(summary.contains("Tools used: bash, grep"));
+        // The user-ask list is bounded at 10, with the remainder counted.
+        let ask_lines = summary.lines().filter(|line| line.starts_with("- ask number")).count();
+        assert_eq!(ask_lines, 10, "user-ask first-lines are bounded");
+        assert!(summary.contains("(+2 more)"));
+        assert!(summary.contains("[elided 2 useless results]"));
+    }
+
+    #[test]
+    fn build_snapcompact_summary_empty_history_is_well_formed() {
+        let summary = build_snapcompact_summary(&[], 0);
+        assert!(summary.starts_with("## Snapshot Summary (deterministic archive)"));
+        assert!(summary.contains("Archived 0 messages: 0 user, 0 assistant, 0 tool results, 0 bash executions, 0 custom, 0 compaction summaries."));
+        assert!(summary.contains("Tools used: (none)"));
+        assert!(summary.contains("User asks:\n- (none)"));
+        assert!(!summary.contains("[elided"));
     }
 }

@@ -104,9 +104,7 @@ fn session_with_recorded_contexts(
 }
 
 #[derive(Clone, Default)]
-struct TestRuntimeFactory {
-    bun: Option<PathBuf>,
-}
+struct TestRuntimeFactory;
 
 #[derive(Clone)]
 struct FailingRuntimeFactory;
@@ -129,7 +127,6 @@ impl ApplicationRuntimeFactory for TestRuntimeFactory {
         mut options: SessionOptions,
         resume: Option<pi_coding::PreparedSessionResume>,
     ) -> ApplicationRuntimeFuture {
-        let bun = self.bun.clone();
         Box::pin(async move {
             options.cwd.clone_from(&cwd);
             let workspace = WorkspaceRoots::new(&cwd, Vec::<PathBuf>::new())?;
@@ -153,36 +150,30 @@ impl ApplicationRuntimeFactory for TestRuntimeFactory {
                 session.record(recorder)?;
             }
             let mut candidate = ApplicationRuntimeCandidate::new(session);
-            if let Some(bun) = bun {
-                let entry = cwd.join(".pi/extensions/target-probe.ts");
-                let permissions = ExtensionPermissionSet {
-                    capabilities: BTreeSet::from([ExtensionCapability::Commands]),
-                    ui_capabilities: BTreeSet::new(),
-                };
-                let mut spec = ExtensionSpec::new_runtime(
-                    "target-probe",
-                    ExtensionSpecRuntime::Bun { entry: entry.clone() },
-                    entry.parent().expect("extension parent"),
-                    ExtensionOrigin::Project,
-                    true,
-                    permissions.clone(),
-                );
-                spec.environment.insert(
-                    "PI_BUN_EXECUTABLE".to_owned(),
-                    bun.to_string_lossy().into_owned(),
-                );
-                let runtime = ExtensionRuntime::process(
-                    None,
-                    ExtensionRuntimeOptions {
-                        mode: ExtensionMode::Tui,
-                        invocation_timeout: Duration::from_secs(5),
-                        ..ExtensionRuntimeOptions::default()
-                    },
-                );
-                let report = runtime.load(vec![spec]).await;
-                anyhow::ensure!(report.failures.is_empty(), "{:?}", report.failures);
-                candidate = candidate.with_extensions(runtime, permissions);
-            }
+            let entry = cwd.join(".pi/extensions/target-probe.mjs");
+            let permissions = ExtensionPermissionSet {
+                capabilities: BTreeSet::from([ExtensionCapability::Commands]),
+                ui_capabilities: BTreeSet::new(),
+            };
+            let spec = ExtensionSpec::new_runtime(
+                "target-probe",
+                ExtensionSpecRuntime::QuickJs { entry: entry.clone() },
+                entry.parent().expect("extension parent"),
+                ExtensionOrigin::Project,
+                true,
+                permissions.clone(),
+            );
+            let runtime = ExtensionRuntime::process(
+                None,
+                ExtensionRuntimeOptions {
+                    mode: ExtensionMode::Tui,
+                    invocation_timeout: Duration::from_secs(5),
+                    ..ExtensionRuntimeOptions::default()
+                },
+            );
+            let report = runtime.load(vec![spec]).await;
+            anyhow::ensure!(report.failures.is_empty(), "{:?}", report.failures);
+            candidate = candidate.with_extensions(runtime, permissions);
             Ok(candidate)
         })
     }
@@ -232,19 +223,16 @@ async fn cross_cwd_switch_replaces_generation_and_preserves_old_session_lease() 
         "---\nname: target-skill\ndescription: target-only runtime resource\n---\ntarget body\n",
     )
     .expect("target skill");
-    let bun = bun_executable();
-    if bun.is_some() {
-        let extension_dir = target.path().join(".pi/extensions");
-        std::fs::create_dir_all(&extension_dir).expect("target extension directory");
-        std::fs::write(
-            extension_dir.join("target-probe.ts"),
-            r#"export default function (pi: any) {
+    let extension_dir = target.path().join(".pi/extensions");
+    std::fs::create_dir_all(&extension_dir).expect("target extension directory");
+    std::fs::write(
+        extension_dir.join("target-probe.mjs"),
+        r#"export default function (pi) {
   pi.registerCommand("target-probe", { handler: () => "target-extension" });
 }"#,
-        )
-        .expect("target extension");
-    }
-    let has_target_extension = bun.is_some();
+    )
+    .expect("target extension");
+    let has_target_extension = true;
 
     let session = Session::new(SessionOptions {
         model: Model::default(),
@@ -267,7 +255,7 @@ async fn cross_cwd_switch_replaces_generation_and_preserves_old_session_lease() 
         .expect("attach source recording");
     let application = Application::new(session).await;
     application
-        .attach_runtime_factory(Arc::new(TestRuntimeFactory { bun }))
+        .attach_runtime_factory(Arc::new(TestRuntimeFactory))
         .expect("factory");
     let clone = application.clone();
     let retained = application.session();
@@ -405,47 +393,29 @@ async fn cross_cwd_candidate_failure_preserves_old_runtime() {
     assert_eq!(application.messages(), [pi_ai::Message::user_text("source message", 1)]);
 }
 
-fn bun_executable() -> Option<PathBuf> {
-    if let Some(configured) = std::env::var_os("PI_BUN_EXECUTABLE") {
-        let configured = PathBuf::from(configured);
-        if configured.is_file() {
-            return Some(configured);
-        }
-    }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|directory| directory.join(if cfg!(windows) { "bun.exe" } else { "bun" }))
-            .find(|candidate| candidate.is_file())
-    })
-}
-
-async fn semantic_runtime_with_source(bun: &Path, source: Option<&str>) -> anyhow::Result<(ExtensionRuntime, ExtensionPermissionSet, Option<tempfile::TempDir>)> {
+async fn semantic_runtime_with_source(source: Option<&str>) -> anyhow::Result<(ExtensionRuntime, ExtensionPermissionSet, Option<tempfile::TempDir>)> {
     let temporary;
     let fixture = if let Some(source) = source {
         let directory = tempfile::tempdir()?;
-        let entry = directory.path().join("extension.ts");
+        let entry = directory.path().join("extension.mjs");
         std::fs::write(&entry, source)?;
         temporary = Some(directory);
         entry
     } else {
         temporary = None;
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extensions/hook-transforms.ts")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extensions/quickjs-hook-transforms.mjs")
     };
     let permissions = ExtensionPermissionSet {
         capabilities: BTreeSet::from([ExtensionCapability::EventHooks]),
         ui_capabilities: BTreeSet::new(),
     };
-    let mut spec = ExtensionSpec::new_runtime(
+    let spec = ExtensionSpec::new_runtime(
         "hook-transforms",
-        ExtensionSpecRuntime::Bun { entry: fixture.clone() },
+        ExtensionSpecRuntime::QuickJs { entry: fixture.clone() },
         fixture.parent().expect("fixture parent"),
         ExtensionOrigin::Project,
         true,
         permissions.clone(),
-    );
-    spec.environment.insert(
-        "PI_BUN_EXECUTABLE".to_owned(),
-        bun.to_string_lossy().into_owned(),
     );
     let runtime = ExtensionRuntime::process(
         None,
@@ -460,8 +430,8 @@ async fn semantic_runtime_with_source(bun: &Path, source: Option<&str>) -> anyho
     Ok((runtime, permissions, temporary))
 }
 
-async fn semantic_runtime(bun: &Path) -> anyhow::Result<(ExtensionRuntime, ExtensionPermissionSet)> {
-    let (runtime, permissions, _temporary) = semantic_runtime_with_source(bun, None).await?;
+async fn semantic_runtime() -> anyhow::Result<(ExtensionRuntime, ExtensionPermissionSet)> {
+    let (runtime, permissions, _temporary) = semantic_runtime_with_source(None).await?;
     Ok((runtime, permissions))
 }
 
@@ -1074,6 +1044,7 @@ async fn equivalent_reload_retains_running_and_retained_jobs() {
                 agent: "task".to_owned(),
                 assignment: "remain active across reload".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn")
@@ -1137,6 +1108,7 @@ async fn non_equivalent_reload_cleans_running_and_retained_job_state() {
                 agent: "task".to_owned(),
                 assignment: "cancel on non-equivalent reload".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn")
@@ -1201,6 +1173,7 @@ async fn non_equivalent_reload_resets_durable_sidecar_so_restart_recovers_no_job
                 agent: "task".to_owned(),
                 assignment: "must not survive non-equivalent reload into a restart".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn")
@@ -1269,7 +1242,6 @@ async fn non_equivalent_reload_resets_durable_sidecar_so_restart_recovers_no_job
 
 #[tokio::test]
 async fn extension_session_reducers_cancel_without_mutation_and_transform_tree() -> anyhow::Result<()> {
-    let Some(bun) = bun_executable() else { return Ok(()); };
     let (session, registration) = session_with_responses(vec![FauxResponse::text("answer")]);
     session.start_new_recording()?;
     session.run("question", Vec::new()).await?;
@@ -1280,7 +1252,7 @@ async fn extension_session_reducers_cancel_without_mutation_and_transform_tree()
         .find(|entry| matches!(entry.message, Some(pi_ai::Message::User(_))))
         .expect("recorded user entry")
         .id;
-    let (runtime, permissions) = semantic_runtime(&bun).await?;
+    let (runtime, permissions) = semantic_runtime().await?;
     let application = Application::new_with_extensions(session, runtime.clone(), permissions).await;
     let before = application.state().await;
     let history = application.messages();
@@ -1316,7 +1288,6 @@ async fn extension_session_reducers_cancel_without_mutation_and_transform_tree()
 
 #[tokio::test]
 async fn extension_fork_skip_conversation_restore_creates_empty_live_context() -> anyhow::Result<()> {
-    let Some(bun) = bun_executable() else { return Ok(()); };
     let (session, registration) = session_with_responses(vec![FauxResponse::text("answer")]);
     session.start_new_recording()?;
     session.run("question", Vec::new()).await?;
@@ -1330,7 +1301,7 @@ async fn extension_fork_skip_conversation_restore_creates_empty_live_context() -
     let source = r#"export default function (pi) {
         pi.on("session_before_fork", () => ({ skipConversationRestore: true }));
     }"#;
-    let (runtime, permissions, _temporary) = semantic_runtime_with_source(&bun, Some(source)).await?;
+    let (runtime, permissions, _temporary) = semantic_runtime_with_source(Some(source)).await?;
     let application = Application::new_with_extensions(session, runtime.clone(), permissions).await;
 
     let fork = application.fork_session(&user_id).await?;
@@ -1347,7 +1318,6 @@ async fn extension_fork_skip_conversation_restore_creates_empty_live_context() -
 
 #[tokio::test]
 async fn extension_clone_skip_conversation_restore_creates_empty_live_context() -> anyhow::Result<()> {
-    let Some(bun) = bun_executable() else { return Ok(()); };
     let (session, registration) = session_with_responses(vec![FauxResponse::text("answer")]);
     session.start_new_recording()?;
     session.run("question", Vec::new()).await?;
@@ -1357,7 +1327,7 @@ async fn extension_clone_skip_conversation_restore_creates_empty_live_context() 
             return { skipConversationRestore: true };
         });
     }"#;
-    let (runtime, permissions, _temporary) = semantic_runtime_with_source(&bun, Some(source)).await?;
+    let (runtime, permissions, _temporary) = semantic_runtime_with_source(Some(source)).await?;
     let application = Application::new_with_extensions(session, runtime.clone(), permissions).await;
 
     let clone = application.clone_session().await?;
@@ -1373,9 +1343,6 @@ async fn extension_clone_skip_conversation_restore_creates_empty_live_context() 
 
 #[tokio::test]
 async fn extension_context_snapshot_strips_model_headers() -> anyhow::Result<()> {
-    let Some(bun) = bun_executable() else {
-        return Ok(());
-    };
     let secret = "Bearer extension-context-header-secret";
     let (session, registration) = session_with_responses(Vec::new());
     let mut model = session.model().expect("session model");
@@ -1389,30 +1356,26 @@ async fn extension_context_snapshot_strips_model_headers() -> anyhow::Result<()>
     session.set_model(model, String::new());
 
     let source = r#"
-export default function (pi: any) {
+export default function (pi) {
   pi.registerCommand("probe-model", {
-    handler: (_args: string, ctx: any) => ctx.model ?? null,
+    handler: (_args, ctx) => ctx.model ?? null,
   });
 }
 "#;
     let directory = tempfile::tempdir()?;
-    let entry = directory.path().join("extension.ts");
+    let entry = directory.path().join("extension.mjs");
     std::fs::write(&entry, source)?;
     let permissions = ExtensionPermissionSet {
         capabilities: BTreeSet::from([ExtensionCapability::Commands]),
         ui_capabilities: BTreeSet::new(),
     };
-    let mut spec = ExtensionSpec::new_runtime(
+    let spec = ExtensionSpec::new_runtime(
         "context-model-probe",
-        ExtensionSpecRuntime::Bun { entry: entry.clone() },
+        ExtensionSpecRuntime::QuickJs { entry: entry.clone() },
         directory.path(),
         ExtensionOrigin::Project,
         true,
         permissions.clone(),
-    );
-    spec.environment.insert(
-        "PI_BUN_EXECUTABLE".to_owned(),
-        bun.to_string_lossy().into_owned(),
     );
     let runtime = ExtensionRuntime::process(
         None,
@@ -1632,6 +1595,7 @@ async fn enabling_orchestration_on_reload_forwards_job_events() {
                 agent: "task".to_owned(),
                 assignment: "prove reload event forwarding".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn child")
@@ -1692,6 +1656,7 @@ async fn compact_persists_checkpoint_and_keeps_application_transcript_usable() {
         enabled: true,
         reserve_tokens: 20,
         keep_recent_tokens: 4,
+        snap_keep_turns: 10,
     });
     let application = Application::new(session).await;
 

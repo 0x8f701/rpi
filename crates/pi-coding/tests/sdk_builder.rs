@@ -82,7 +82,7 @@ async fn builder_defaults_to_no_resource_discovery_and_injects_settings_tools_an
     )
     .await?;
 
-    assert_eq!(built.session().get_active_tool_names(), ["injected"]);
+    assert_eq!(built.session().get_active_tool_names(), ["injected", "todo"]);
     assert_eq!(built.session().recorder_info().map(|value| value.0), Some(recorder_id));
     assert_eq!(built.application.session().cwd(), cwd.path());
     let state = built.application.state().await;

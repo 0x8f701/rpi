@@ -103,6 +103,16 @@ pub enum WorkflowRpcCommand {
         #[serde(default)]
         name: Option<String>,
     },
+    /// Live detail projection (supervisor state, planning activity feed,
+    /// active tasks, workers with activity) — the workflow panel's detail.
+    WorkflowDetail {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        workflow_id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
     WorkflowPause {
         #[serde(default)]
         id: Option<String>,
@@ -137,6 +147,7 @@ impl WorkflowRpcCommand {
             Self::WorkflowCreate { id, .. }
             | Self::WorkflowList { id }
             | Self::WorkflowGet { id, .. }
+            | Self::WorkflowDetail { id, .. }
             | Self::WorkflowPause { id, .. }
             | Self::WorkflowResume { id, .. }
             | Self::WorkflowCancel { id, .. }
@@ -151,6 +162,7 @@ impl WorkflowRpcCommand {
             Self::WorkflowCreate { .. } => "workflow_create",
             Self::WorkflowList { .. } => "workflow_list",
             Self::WorkflowGet { .. } => "workflow_get",
+            Self::WorkflowDetail { .. } => "workflow_detail",
             Self::WorkflowPause { .. } => "workflow_pause",
             Self::WorkflowResume { .. } => "workflow_resume",
             Self::WorkflowCancel { .. } => "workflow_cancel",
@@ -166,6 +178,7 @@ impl WorkflowRpcCommand {
             "workflow_create"
                 | "workflow_list"
                 | "workflow_get"
+                | "workflow_detail"
                 | "workflow_pause"
                 | "workflow_resume"
                 | "workflow_cancel"
@@ -181,6 +194,14 @@ pub trait WorkflowRpcHost: Send + Sync {
     async fn create(&self, name: String, objective: String) -> Result<WorkflowSnapshot>;
     fn list(&self) -> Result<Vec<WorkflowSnapshot>>;
     fn get(&self, workflow_id: Option<&str>, name: Option<&str>) -> Result<WorkflowSnapshot>;
+    /// Live workflow-panel detail: supervisor state, planning activity feed,
+    /// active tasks, and workers with per-agent activity. Worktree labels are
+    /// already redacted to display-safe basenames.
+    async fn detail(
+        &self,
+        workflow_id: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<crate::workflow_panel::WorkflowPanelSnapshot>;
     async fn pause(&self, workflow_id: &str) -> Result<WorkflowSnapshot>;
     async fn resume(&self, workflow_id: &str) -> Result<WorkflowSnapshot>;
     async fn cancel(&self, workflow_id: &str) -> Result<WorkflowSnapshot>;
@@ -347,6 +368,19 @@ pub async fn dispatch_workflow_command(
             let snap = host.get(workflow_id.as_deref(), name.as_deref())?;
             Ok(serde_json::to_value(project_workflow_snapshot(&snap))?)
         }
+        WorkflowRpcCommand::WorkflowDetail {
+            workflow_id, name, ..
+        } => {
+            if workflow_id.as_deref().map(str::trim).unwrap_or("").is_empty()
+                && name.as_deref().map(str::trim).unwrap_or("").is_empty()
+            {
+                bail!("workflow_detail requires workflowId or name");
+            }
+            let mut panel = host.detail(workflow_id.as_deref(), name.as_deref()).await?;
+            // Worktree labels are display-only: never ship an absolute path.
+            panel.worktree.label = redact_worktree_path(&panel.worktree.label).unwrap_or_default();
+            Ok(serde_json::to_value(panel)?)
+        }
         WorkflowRpcCommand::WorkflowPause { workflow_id, .. } => {
             let snap = host.pause(workflow_id.trim()).await?;
             Ok(serde_json::to_value(project_workflow_snapshot(&snap))?)
@@ -379,12 +413,16 @@ pub fn parse_workflow_command(value: Value) -> Result<WorkflowRpcCommand, String
 #[derive(Clone)]
 pub struct ApplicationWorkflowHost {
     manager: WorkflowManager,
+    application: Application,
 }
 
 impl ApplicationWorkflowHost {
     #[must_use]
-    pub fn new(manager: WorkflowManager) -> Self {
-        Self { manager }
+    pub fn new(manager: WorkflowManager, application: Application) -> Self {
+        Self {
+            manager,
+            application,
+        }
     }
 
     fn resolve(&self, workflow_id: Option<&str>, name: Option<&str>) -> Result<WorkflowSnapshot> {
@@ -439,6 +477,20 @@ impl WorkflowRpcHost for ApplicationWorkflowHost {
         self.resolve(workflow_id, name)
     }
 
+    async fn detail(
+        &self,
+        workflow_id: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<crate::workflow_panel::WorkflowPanelSnapshot> {
+        let snapshot = self.resolve(workflow_id, name)?;
+        let detail = self
+            .application
+            .workflow_detail(&snapshot.workflow_id, snapshot.generation)?;
+        Ok(crate::workflow_panel::WorkflowPanelSnapshot::from_runtime_detail(
+            &detail, &snapshot,
+        ))
+    }
+
     async fn pause(&self, workflow_id: &str) -> Result<WorkflowSnapshot> {
         self.lifecycle(workflow_id, LifecycleOp::Pause).await
     }
@@ -480,7 +532,10 @@ impl WorkflowRpcState {
     pub fn for_application(application: &Application) -> Self {
         let state = Self::new();
         if let Ok(manager) = application.workflow_manager() {
-            *state.host.lock() = Some(Arc::new(ApplicationWorkflowHost::new(manager)));
+            *state.host.lock() = Some(Arc::new(ApplicationWorkflowHost::new(
+                manager,
+                application.clone(),
+            )));
         }
         state
     }
@@ -608,6 +663,17 @@ mod memory_host {
                 };
             }
             bail!("workflow selector requires workflowId or name")
+        }
+
+        async fn detail(
+            &self,
+            workflow_id: Option<&str>,
+            name: Option<&str>,
+        ) -> Result<crate::workflow_panel::WorkflowPanelSnapshot> {
+            // Test double: no live runtime, so project the durable snapshot
+            // (same fallback the Application uses for terminal workflows).
+            let snapshot = self.get(workflow_id, name)?;
+            Ok(crate::workflow_panel::WorkflowPanelSnapshot::from(&snapshot))
         }
 
         async fn pause(&self, workflow_id: &str) -> Result<WorkflowSnapshot> {

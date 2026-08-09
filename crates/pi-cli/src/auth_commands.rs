@@ -69,7 +69,11 @@ impl AuthInteraction for ConsoleAuthInteraction {
     }
 }
 
-pub async fn login(provider: Option<&str>, interactive: bool) -> Result<CredentialInfo> {
+pub async fn login(
+    provider: Option<&str>,
+    scope: Option<&str>,
+    interactive: bool,
+) -> Result<CredentialInfo> {
     let provider = require_explicit_provider_when_noninteractive(provider, interactive)?;
     let manager = manager()?;
     let interaction = if interactive {
@@ -77,10 +81,14 @@ pub async fn login(provider: Option<&str>, interactive: bool) -> Result<Credenti
     } else {
         ConsoleAuthInteraction::explicit_only()
     };
-    manager.login(provider, None, &interaction).await
+    manager.login(provider, None, scope, &interaction).await
 }
 
-pub async fn logout(provider: Option<&str>, interactive: bool) -> Result<CredentialInfo> {
+pub async fn logout(
+    provider: Option<&str>,
+    scope: Option<&str>,
+    interactive: bool,
+) -> Result<CredentialInfo> {
     let provider = require_explicit_provider_when_noninteractive(provider, interactive)?;
     let manager = manager()?;
     let interaction = if interactive {
@@ -88,22 +96,32 @@ pub async fn logout(provider: Option<&str>, interactive: bool) -> Result<Credent
     } else {
         ConsoleAuthInteraction::explicit_only()
     };
-    manager.logout(provider, &interaction).await
+    manager.logout(provider, scope, &interaction).await
 }
 
-pub async fn login_cli(provider: Option<&str>) -> Result<()> {
-    let info = login(provider, true).await?;
-    println!(
-        "Logged in to {} using {}",
-        info.provider_id,
-        info.credential_type.label()
-    );
+pub async fn login_cli(provider: Option<&str>, scope: Option<&str>) -> Result<()> {
+    let info = login(provider, scope, true).await?;
+    match info.scope.as_deref() {
+        Some(scope) => println!(
+            "Logged in to {} (scope {scope}) using {}",
+            info.provider_id,
+            info.credential_type.label()
+        ),
+        None => println!(
+            "Logged in to {} using {}",
+            info.provider_id,
+            info.credential_type.label()
+        ),
+    }
     Ok(())
 }
 
-pub async fn logout_cli(provider: Option<&str>) -> Result<()> {
-    let info = logout(provider, true).await?;
-    println!("Logged out of {}", info.provider_id);
+pub async fn logout_cli(provider: Option<&str>, scope: Option<&str>) -> Result<()> {
+    let info = logout(provider, scope, true).await?;
+    match info.scope.as_deref() {
+        Some(scope) => println!("Logged out of {} (scope {scope})", info.provider_id),
+        None => println!("Logged out of {}", info.provider_id),
+    }
     Ok(())
 }
 
@@ -169,7 +187,7 @@ fn prompt_secret(message: &str) -> Result<String> {
     secret
 }
 
-fn read_secret_line() -> Result<String> {
+pub(crate) fn read_secret_line() -> Result<String> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, read};
     use crossterm::terminal::enable_raw_mode;
 

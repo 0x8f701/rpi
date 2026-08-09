@@ -4,6 +4,7 @@
 //! on live `Session`/`Application` tool turns, plus CLI/settings resolution
 //! inputs that feed that boundary. Shared confirmation state is serialized.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -19,12 +20,13 @@ use pi_ai::providers::{
 use pi_ai::{ContentBlock, Model, StopReason, ToolCall};
 use pi_agent::ThinkingLevel;
 use pi_cli::Cli;
-use pi_cli::approval::host_approval_before_tool_call;
+use pi_cli::approval::{empty_permission_rules, host_approval_before_tool_call};
 use pi_cli::extension_ui::{
     ExtensionUiAdapter, ExtensionUiEvent, ExtensionUiInteraction, HostToolConfirmation,
 };
 use pi_coding::{
-    Application, ExtensionMode, Session, SessionOptions, Settings, SettingsManager, create_tool,
+    Application, ExtensionMode, PermissionRule, PermissionRuleAction, Session, SessionOptions,
+    Settings, SettingsManager, create_tool,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -142,7 +144,14 @@ async fn yolo_write_ask_capability_matrix_is_capability_only() {
         (ApprovalMode::Ask, ToolCapability::Exec, true),
     ];
     for (mode, capability, needs_confirm) in cases {
-        let hook = host_approval_before_tool_call(mode, ExtensionMode::Print, None, None);
+        let hook = host_approval_before_tool_call(
+            mode,
+            ExtensionMode::Print,
+            None,
+            None,
+            PathBuf::from("."),
+            empty_permission_rules(),
+        );
         let tool = match capability {
             ToolCapability::Read => "read",
             ToolCapability::Write => "write",
@@ -191,6 +200,8 @@ async fn interactive_allow_deny_cancel_are_distinct() {
             ExtensionMode::Tui,
             Some(adapter),
             None,
+            PathBuf::from("."),
+            empty_permission_rules(),
         );
         let result = hook(tool_call_context("bash", ToolCapability::Exec))
             .await
@@ -223,7 +234,14 @@ async fn noninteractive_modes_fail_closed_without_adapter() {
             (ApprovalMode::Ask, ToolCapability::Write),
             (ApprovalMode::Ask, ToolCapability::Exec),
         ] {
-            let hook = host_approval_before_tool_call(approval, mode, None, None);
+            let hook = host_approval_before_tool_call(
+                approval,
+                mode,
+                None,
+                None,
+                PathBuf::from("."),
+                empty_permission_rules(),
+            );
             let result = hook(tool_call_context("tool", capability))
                 .await
                 .expect("hook");
@@ -266,6 +284,8 @@ async fn host_hook_orders_before_existing_and_denial_skips_it() {
         ExtensionMode::Print,
         None,
         Some(existing.clone()),
+        PathBuf::from("."),
+        empty_permission_rules(),
     );
     let allowed = yolo(tool_call_context("read", ToolCapability::Read))
         .await
@@ -284,6 +304,8 @@ async fn host_hook_orders_before_existing_and_denial_skips_it() {
         ExtensionMode::Tui,
         Some(adapter),
         Some(existing),
+        PathBuf::from("."),
+        empty_permission_rules(),
     );
     let denied = ask(tool_call_context("bash", ToolCapability::Exec))
         .await
@@ -328,7 +350,14 @@ async fn cli_approval_mode_precedes_global_settings_default_yolo() {
 
     // Observable tool decision under the resolved CLI override.
     let mode = resolved_mode(&write_cli, &settings);
-    let hook = host_approval_before_tool_call(mode, ExtensionMode::Print, None, None);
+    let hook = host_approval_before_tool_call(
+        mode,
+        ExtensionMode::Print,
+        None,
+        None,
+        PathBuf::from("."),
+        empty_permission_rules(),
+    );
     let read_ok = hook(tool_call_context("read", ToolCapability::Read))
         .await
         .expect("read");
@@ -363,7 +392,14 @@ async fn application_tool_turn_fail_closed_under_write_and_ask() {
             create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool"),
             create_tool("write", cwd.path().to_str().expect("utf8")).expect("write tool"),
         ];
-        let hook = host_approval_before_tool_call(mode, ExtensionMode::Print, None, None);
+        let hook = host_approval_before_tool_call(
+            mode,
+            ExtensionMode::Print,
+            None,
+            None,
+            PathBuf::from("."),
+            empty_permission_rules(),
+        );
         let session = Session::new(SessionOptions {
             model,
             cwd: cwd.path().to_path_buf(),
@@ -456,8 +492,14 @@ async fn application_interactive_allow_executes_read_tool() {
     let events = adapter.subscribe();
     let responder = tokio::spawn(answer_confirmation(events, adapter.clone(), Some(true)));
     let tools = vec![create_tool("read", cwd.path().to_str().expect("utf8")).expect("read")];
-    let hook =
-        host_approval_before_tool_call(ApprovalMode::Ask, ExtensionMode::Tui, Some(adapter), None);
+    let hook = host_approval_before_tool_call(
+        ApprovalMode::Ask,
+        ExtensionMode::Tui,
+        Some(adapter),
+        None,
+        PathBuf::from("."),
+        empty_permission_rules(),
+    );
     let session = Session::new(SessionOptions {
         model,
         cwd: cwd.path().to_path_buf(),
@@ -521,8 +563,14 @@ async fn application_interactive_allow_executes_read_tool() {
 #[tokio::test]
 async fn missing_tool_metadata_defaults_to_exec_under_write() {
     let _guard = CONFIRMATION_LOCK.lock().expect("confirmation lock");
-    let hook =
-        host_approval_before_tool_call(ApprovalMode::Write, ExtensionMode::Print, None, None);
+    let hook = host_approval_before_tool_call(
+        ApprovalMode::Write,
+        ExtensionMode::Print,
+        None,
+        None,
+        PathBuf::from("."),
+        empty_permission_rules(),
+    );
     let mut context = tool_call_context("read", ToolCapability::Read);
     context.context.tools.clear();
     let result = hook(context).await.expect("hook");
@@ -551,6 +599,8 @@ async fn broker_errors_fail_closed_and_skip_existing_hook() {
         ExtensionMode::Tui,
         Some(ExtensionUiAdapter::new()),
         Some(existing),
+        PathBuf::from("."),
+        empty_permission_rules(),
     );
     let result = hook(tool_call_context("write", ToolCapability::Write))
         .await
@@ -617,4 +667,155 @@ fn cli_parses_approval_mode_values_case_sensitively() {
     }
     assert!(Cli::try_parse_from(["rpi", "--approval-mode", "WRITE"]).is_err());
     assert!(Cli::try_parse_from(["rpi", "--approval-mode", "always"]).is_err());
+}
+
+/// Path permission rules resolve inside a live session: a deny rule blocks a
+/// read before the capability decision, an ask rule forces confirmation (and
+/// fails closed headless), and an allow rule lets the allowlisted write
+/// through — all under a single write-mode session.
+#[tokio::test]
+async fn session_path_rules_deny_ask_and_allow_on_live_tool_turns() {
+    let _guard = CONFIRMATION_LOCK.lock().expect("confirmation lock");
+    let (model, registration) = faux_model("approval-rules");
+    registration.set_responses(vec![
+        tool_use_response("read", json!({"path": "secret/notes.txt"})),
+        tool_use_response(
+            "write",
+            json!({"path": "elsewhere/out.txt", "content": "ask me"}),
+        ),
+        tool_use_response(
+            "write",
+            json!({"path": "public/out.txt", "content": "allowed"}),
+        ),
+        FauxResponse::text("done after tools"),
+    ]);
+    let cwd = TempDir::new().expect("cwd");
+    std::fs::create_dir_all(cwd.path().join("secret")).expect("secret dir");
+    std::fs::write(cwd.path().join("secret/notes.txt"), "classified").expect("fixture");
+    std::fs::create_dir_all(cwd.path().join("public")).expect("public dir");
+    std::fs::create_dir_all(cwd.path().join("elsewhere")).expect("elsewhere dir");
+    let tools = vec![
+        create_tool("read", cwd.path().to_str().expect("utf8")).expect("read tool"),
+        create_tool("write", cwd.path().to_str().expect("utf8")).expect("write tool"),
+    ];
+    let rules = vec![
+        PermissionRule {
+            action: PermissionRuleAction::Deny,
+            path: "secret".to_owned(),
+            tools: None,
+            extra: Default::default(),
+        },
+        PermissionRule {
+            action: PermissionRuleAction::Ask,
+            path: "elsewhere".to_owned(),
+            tools: None,
+            extra: Default::default(),
+        },
+        PermissionRule {
+            action: PermissionRuleAction::Allow,
+            path: "public".to_owned(),
+            tools: None,
+            extra: Default::default(),
+        },
+    ];
+    let hook = host_approval_before_tool_call(
+        ApprovalMode::Write,
+        ExtensionMode::Print,
+        None,
+        None,
+        cwd.path().to_path_buf(),
+        Arc::new(move || rules.clone()),
+    );
+    let session = Session::new(SessionOptions {
+        model,
+        cwd: cwd.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: "faux".into(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(tools),
+        before_tool_call: Some(hook),
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+    })
+    .expect("session");
+    let application = Application::new(session).await;
+    let mut events = application.subscribe();
+    application
+        .prompt("exercise path rules".into(), Vec::new(), None)
+        .await;
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    // tool_call_id -> target path, so the two write calls stay distinguishable.
+    let mut calls = std::collections::HashMap::new();
+    let mut outcomes = std::collections::HashMap::new();
+    while tokio::time::Instant::now() < deadline && outcomes.len() < 3 {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Ok(pi_coding::ApplicationEvent::Agent(
+                pi_agent::AgentEvent::ToolExecutionStart {
+                    tool_call_id,
+                    arguments,
+                    ..
+                },
+            ))) => {
+                if let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) {
+                    calls.insert(tool_call_id, path.to_owned());
+                }
+            }
+            Ok(Ok(pi_coding::ApplicationEvent::Agent(
+                pi_agent::AgentEvent::ToolExecutionEnd {
+                    tool_call_id,
+                    is_error,
+                    result,
+                    ..
+                },
+            ))) => {
+                let Some(path) = calls.remove(&tool_call_id) else {
+                    continue;
+                };
+                let body = result
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                outcomes.insert(path, (is_error, body));
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    let (read_error, read_body) = outcomes
+        .get("secret/notes.txt")
+        .expect("rule-denied read must end");
+    assert!(*read_error, "deny rule must block the read");
+    assert!(
+        read_body.contains("denied by path permission rule"),
+        "read body: {read_body}"
+    );
+
+    let (ask_error, ask_body) = outcomes
+        .get("elsewhere/out.txt")
+        .expect("ask-rule write must end");
+    assert!(*ask_error, "ask rule must force confirmation (fails closed headless)");
+    assert!(
+        ask_body.contains("no interactive confirmation adapter"),
+        "ask body: {ask_body}"
+    );
+
+    let (allow_error, _) = outcomes
+        .get("public/out.txt")
+        .expect("allow-rule write must end");
+    assert!(!*allow_error, "allow rule must let the allowlisted write through");
+    let written =
+        std::fs::read_to_string(cwd.path().join("public/out.txt")).expect("written file");
+    assert_eq!(written, "allowed");
+
+    application.cleanup().await;
+    registration.unregister();
 }

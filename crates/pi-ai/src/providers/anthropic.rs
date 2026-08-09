@@ -1921,6 +1921,7 @@ pub fn register_anthropic() {
             api: API_ANTHROPIC_MESSAGES.into(),
             stream: stream_fn,
             stream_simple: simple_fn,
+            generate_image: None,
         },
         None,
     );

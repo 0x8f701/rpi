@@ -760,3 +760,179 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     }
     normalized
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::process::{Command, Output};
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+
+    use super::*;
+
+    #[test]
+    fn validate_workflow_id_accepts_safe_ids_and_rejects_dangerous_ones() {
+        // Accepted: alphanumeric-first, only [alnum - _ .], no "..", no
+        // trailing dot, no ".lock" suffix, bounded to 128 bytes.
+        for valid in [
+            "abc", "a1", "a-b", "a_b", "a.b", "workflow-1_task.2", "A-Z_09",
+            &"a".repeat(128),
+        ] {
+            assert!(
+                validate_workflow_id(valid).is_ok(),
+        "valid workflow id rejected: {valid:?}"
+            );
+        }
+        // Rejected: empty, non-alphanumeric first byte, path separators,
+        // whitespace, ".." traversal, trailing dot, ".lock" suffix, oversize,
+        // and disallowed punctuation.
+        for invalid in [
+            "", "-abc", ".abc", "a/b", "a b", "a..b", "abc.", "abc.lock",
+            "a$b", "a#b",
+        ] {
+            assert!(
+                validate_workflow_id(invalid).is_err(),
+                "invalid workflow id accepted: {invalid:?}"
+            );
+        }
+        // 129 bytes is one past the limit.
+        assert!(
+            validate_workflow_id(&"a".repeat(129)).is_err(),
+            "workflow id over 128 bytes must be rejected"
+        );
+        // The error carries the offending id for actionable diagnostics.
+        let err = validate_workflow_id("bad/id").expect_err("slash rejected");
+        match &err {
+            WorktreeError::InvalidWorkflowId(id) => assert_eq!(id, "bad/id"),
+            other => panic!("expected InvalidWorkflowId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redact_text_strips_url_credentials_named_secrets_and_control_chars() {
+        // URL credentials are redacted in-place.
+        assert_eq!(
+            redact_text("clone https://user:pass@host.example/repo.git"),
+            "clone https://[redacted]@host.example/repo.git"
+        );
+        // Named secret shapes are redacted.
+        let secret = ["sk-", "secret-value-", "12345678"].concat();
+        assert_eq!(redact_text(&format!("token={secret}")), "token=[redacted]");
+        assert_eq!(
+            redact_text("password=hunter2"),
+            "password=[redacted]"
+        );
+        // Control bytes (other than newline/tab/cr) become the replacement char.
+        assert_eq!(redact_text("a\x00\x01b"), "a\u{fffd}\u{fffd}b");
+        // Newline/tab/cr survive the control-char pass.
+        assert_eq!(redact_text("a\nb\tc"), "a\nb\tc");
+        // Plain text is untouched.
+        assert_eq!(redact_text("just a normal message"), "just a normal message");
+    }
+
+    #[test]
+    fn redact_args_redacts_absolute_paths_and_passes_relative_through_redact() {
+        let dir = tempfile::tempdir().expect("repository parent");
+        let absolute_path = dir.path().join("secret/repo").to_string_lossy().into_owned();
+        let secret = ["sk-", "leaked-", "1234567890abcdef"].concat();
+        let token_arg = format!("token={secret}");
+        let redacted = redact_args(&[&absolute_path, "clone", &token_arg]);
+        assert_eq!(redacted[0], "[absolute-path]", "absolute path must be redacted");
+        assert_eq!(redacted[1], "clone", "plain arg survives");
+        assert_eq!(
+            redacted[2], "token=[redacted]",
+            "secret in a relative arg must still be redacted"
+        );
+    }
+
+    #[test]
+    fn redact_stderr_decodes_and_redacts_secrets() {
+        let secret = ["sk-", "abc1234567890", "leak"].concat();
+        let stderr = format!("fatal: could not read token={secret}\n");
+        let redacted = redact_stderr(stderr.as_bytes());
+        assert!(!redacted.contains(&secret), "secret must be redacted");
+        assert!(redacted.contains("[redacted]"));
+        assert!(redacted.contains("fatal"));
+    }
+
+    #[test]
+    fn reject_if_inside_blocks_equal_nested_and_allows_disjoint() {
+        let source = Path::new("/var/src/repo");
+        // Equal -> blocked.
+        assert!(reject_if_inside(source, source).is_err());
+        // Nested under source -> blocked.
+        assert!(reject_if_inside(Path::new("/var/src/repo/sub"), source).is_err());
+        // Disjoint -> allowed.
+        assert!(reject_if_inside(Path::new("/var/worktrees"), source).is_ok());
+        // A sibling that does not start with the source path -> allowed.
+        assert!(reject_if_inside(Path::new("/var/src/other"), source).is_ok());
+    }
+
+    #[test]
+    fn validate_managed_branch_accepts_base_and_hex_suffix_rejects_foreign() {
+        let id = "wf-abc";
+        let base = format!("{WORKFLOW_BRANCH_PREFIX}{id}");
+        // Exact base branch name -> accepted.
+        assert!(validate_managed_branch(id, &base).is_ok());
+        // base-<12 hex chars> -> accepted (the allocated branch shape).
+        assert!(validate_managed_branch(id, &format!("{base}-0123456789ab")).is_ok());
+        assert!(validate_managed_branch(id, &format!("{base}-abcdefABCDEF")).is_ok());
+        // Wrong suffix lengths / non-hex -> rejected.
+        assert!(validate_managed_branch(id, &format!("{base}-0123456789a")).is_err());
+        assert!(validate_managed_branch(id, &format!("{base}-zzzzzzzzzzzz")).is_err());
+        // A foreign branch (different workflow id) -> rejected.
+        assert!(validate_managed_branch(id, &format!("{WORKFLOW_BRANCH_PREFIX}other-wf")).is_err());
+        // An invalid workflow id is rejected before the branch is inspected.
+        assert!(validate_managed_branch("bad/id", &base).is_err());
+    }
+
+    #[test]
+    fn collect_nul_paths_splits_on_nul_and_skips_empty_segments() {
+        let mut files = BTreeSet::new();
+        collect_nul_paths(&mut files, "src/a.rs\0src/b.rs\0README.md");
+        assert_eq!(
+            files,
+            BTreeSet::from(["src/a.rs".to_owned(), "src/b.rs".to_owned(), "README.md".to_owned()]
+                .into_iter()
+                .collect::<BTreeSet<_>>())
+        );
+
+        let mut empty_segments = BTreeSet::new();
+        collect_nul_paths(&mut empty_segments, "a.rs\0\0b.rs\0");
+        assert_eq!(
+            empty_segments,
+            ["a.rs".to_owned(), "b.rs".to_owned()].into_iter().collect::<BTreeSet<_>>(),
+            "empty NUL segments must be skipped, not stored as empty strings"
+        );
+
+        let mut nothing = BTreeSet::new();
+        collect_nul_paths(&mut nothing, "");
+        assert!(nothing.is_empty(), "empty input produces no paths");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_failed_redacts_args_and_stderr_in_the_error() {
+        let secret = ["sk-", "leaked-", "1234567890abcdef"].concat();
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: format!("fatal: token={secret}\n").into_bytes(),
+        };
+        let dir = tempfile::tempdir().expect("repository parent");
+        let absolute_path = dir.path().join("repo").to_string_lossy().into_owned();
+        let short_token = ["token=sk-", "leaked"].concat();
+        let error = command_failed(&[&absolute_path, "fetch", &short_token], &output);
+        let WorktreeError::CommandFailed { status, args, stderr } = error else {
+            panic!("expected CommandFailed, got {error:?}");
+        };
+        assert_eq!(status, 1);
+        // Absolute path redacted, secret redacted, plain arg survives.
+        assert_eq!(args[0], "[absolute-path]");
+        assert_eq!(args[1], "fetch");
+        assert_eq!(args[2], "token=[redacted]");
+        assert!(!stderr.contains(&secret), "stderr secret must be redacted");
+        assert!(stderr.contains("[redacted]"));
+    }
+}

@@ -20,16 +20,15 @@ fn type_chars(writer: &mut std::fs::File, text: &str) {
 }
 
 #[test]
-fn pty_bun_extension_select_then_input() {
-    if Command::new("bun").arg("--version").output().is_err() { return; }
+fn pty_quickjs_extension_select_then_input() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let extension = cwd.path().join("dialog-extension");
     std::fs::create_dir(&extension).unwrap();
-    std::fs::write(extension.join("pi-extension.json"), r#"{"schemaVersion":1,"id":"dialog-smoke","runtime":"bun","entry":"index.ts","capabilities":["commands","ui"],"uiCapabilities":["select","input","notify"]}"#).unwrap();
-    std::fs::write(extension.join("index.ts"), r#"
-export default function (pi: any) {
-  pi.registerCommand("dialog-smoke", { description: "Exercise TUI dialogs", handler: async (_args: string, ctx: any) => {
+    std::fs::write(extension.join("pi-extension.json"), r#"{"schemaVersion":1,"id":"dialog-smoke","runtime":"quickjs","entry":"index.mjs","capabilities":["commands","ui"],"uiCapabilities":["select","input","notify"]}"#).unwrap();
+    std::fs::write(extension.join("index.mjs"), r#"
+export default function (pi) {
+  pi.registerCommand("dialog-smoke", { description: "Exercise TUI dialogs", handler: async (_args, ctx) => {
     const selected = await ctx.ui.select("Choose target", [
       { value: "alpha-value", label: "Alpha label", description: "first" },
       { value: "beta-value", label: "Beta label", description: "second" },

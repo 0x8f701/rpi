@@ -293,15 +293,24 @@ async fn direct_bash_streams_persists_and_respects_context_exclusion() {
     let result = session.execute_bash("printf visible", false).await.expect("visible bash");
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.output, "visible");
-    let first = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await.expect("bash update timeout").expect("bash update");
-    assert!(matches!(first, SessionEvent::BashExecutionUpdate { ref delta, .. } if delta == "visible"));
-    let second = loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await.expect("bash end timeout").expect("bash end");
-        if matches!(event, SessionEvent::BashExecutionEnd { .. }) {
-            break event;
+    // Production streams arbitrary raw pipe-read chunks (each `read()` is one
+    // `BashExecutionUpdate.delta`); the streamed byte content is the
+    // concatenation in arrival order, never a guaranteed single chunk. Drain
+    // updates through the terminal end event, then assert the bytes.
+    let mut streamed = String::new();
+    let end = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("bash event timeout")
+            .expect("bash event");
+        match event {
+            SessionEvent::BashExecutionUpdate { delta, .. } => streamed.push_str(&delta),
+            terminal @ SessionEvent::BashExecutionEnd { .. } => break terminal,
+            _ => {}
         }
     };
-    assert!(matches!(second, SessionEvent::BashExecutionEnd { ref message } if message.command == "printf visible" && message.exit_code == Some(0) && message.exclude_from_context.is_none()));
+    assert_eq!(streamed, "visible");
+    assert!(matches!(end, SessionEvent::BashExecutionEnd { ref message } if message.command == "printf visible" && message.exit_code == Some(0) && message.exclude_from_context.is_none()));
     let excluded = session.execute_bash("printf hidden", true).await.expect("excluded bash");
     assert_eq!(excluded.output, "hidden");
     let history = session.history();

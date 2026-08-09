@@ -10,6 +10,10 @@ pub enum InlineStyle {
     Italic,
     Code,
     TableBorder,
+    /// The bullet/number/task prefix of a list item. The marker carries the
+    /// list-marker theme; the item body after it falls through to the base
+    /// text style (OMP colors only the bullet, not the item text).
+    ListMarker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -46,6 +46,12 @@ pub struct ResourcePaths {
     pub keybinding_files: Vec<PathBuf>,
     pub system_prompt_files: Vec<PathBuf>,
     pub append_system_prompt_files: Vec<PathBuf>,
+    /// Persona directories discovered for complete resource path accounting
+    /// (`<agent_dir>/personas` and, when the project is trusted,
+    /// `<cwd>/.pi/personas`). Persona definitions themselves are part of
+    /// [`ResourceSnapshot::agents`]; these dirs let reload/watch logic track
+    /// persona state alongside other resource roots.
+    pub persona_dirs: Vec<PathBuf>,
 }
 
 impl ResourcePaths {
@@ -55,12 +61,11 @@ impl ResourcePaths {
     }
 
     fn discover_from_agent_dir(cwd: &Path, agent_dir: &Path, project_trusted: bool) -> Self {
-        let skill_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        let project_dir = skill_cwd.join(CONFIG_DIR_NAME);
         let skill_paths = discover_skill_roots(cwd, agent_dir, project_trusted)
             .into_iter()
             .map(|root| root.path)
             .collect();
+        let project_dir = cwd.join(CONFIG_DIR_NAME);
         let mut paths = Self {
             context_roots: vec![agent_dir.to_path_buf()],
             skill_paths,
@@ -69,6 +74,7 @@ impl ResourcePaths {
             keybinding_files: vec![agent_dir.join("keybindings.json")],
             system_prompt_files: vec![agent_dir.join("SYSTEM.md")],
             append_system_prompt_files: vec![agent_dir.join("APPEND_SYSTEM.md")],
+            persona_dirs: vec![agent_dir.join("personas")],
         };
         if project_trusted {
             paths.context_roots.push(cwd.to_path_buf());
@@ -77,6 +83,7 @@ impl ResourcePaths {
             paths.keybinding_files.push(project_dir.join("keybindings.json"));
             paths.system_prompt_files.insert(0, project_dir.join("SYSTEM.md"));
             paths.append_system_prompt_files.insert(0, project_dir.join("APPEND_SYSTEM.md"));
+            paths.persona_dirs.push(project_dir.join("personas"));
         }
         paths
     }
@@ -320,6 +327,17 @@ struct ResourceManagerInner {
     settings: RwLock<SettingsManager>,
     trust_store: TrustStore,
     snapshot: RwLock<Arc<ResourceSnapshot>>,
+    /// One-shot trust decision composed by the Application's fail-open hook
+    /// surfaces (`pre_trust_decision` host hook + `trust_decision` extension
+    /// event). Consumed by the next `stage_reload` so the resource build
+    /// records exactly what the hooks decided without re-firing them.
+    composed_trust: RwLock<Option<TrustResolution>>,
+    /// Startup trust decision already composed by the session blueprint's
+    /// pre-load host-hook gate (P0 ordering: the host `pre_trust_decision`
+    /// hook fires before any project extension is discovered/loaded).
+    /// Consumed by the Application's startup trust resolution so the host
+    /// hook is not re-fired after the extension runtime is up.
+    startup_composed_trust: RwLock<Option<TrustResolution>>,
     reload_lock: Arc<AsyncMutex<()>>,
 }
 
@@ -353,12 +371,14 @@ impl ResourceManager {
     pub fn new(options: ResourceManagerOptions) -> Result<Self> {
         let settings = SettingsManager::load_phase_one(&options.cwd, &options.agent_dir)?;
         let trust_store = TrustStore::new(&options.agent_dir);
-        let candidate = build_candidate(&options, &settings, &trust_store, 1)?;
+        let candidate = build_candidate(&options, &settings, &trust_store, 1, None)?;
         Ok(Self { inner: Arc::new(ResourceManagerInner {
             options,
             settings: RwLock::new(settings),
             trust_store,
             snapshot: RwLock::new(Arc::new(candidate)),
+            composed_trust: RwLock::new(None),
+            startup_composed_trust: RwLock::new(None),
             reload_lock: Arc::new(AsyncMutex::new(())),
         }) })
     }
@@ -401,11 +421,16 @@ impl ResourceManager {
             &self.inner.options.cwd,
             &self.inner.options.agent_dir,
         )?;
+        // Consume any decision the Application composed through the fail-open
+        // hook surfaces; the resource build records it verbatim instead of
+        // re-resolving from the trust store (the hooks already fired).
+        let composed_trust = self.inner.composed_trust.write().take();
         let snapshot = Arc::new(build_candidate(
             &self.inner.options,
             &settings,
             &self.inner.trust_store,
             base_generation.saturating_add(1),
+            composed_trust.as_ref(),
         )?);
         Ok(ResourceReloadCandidate {
             owner: Arc::downgrade(&self.inner),
@@ -414,6 +439,30 @@ impl ResourceManager {
             settings,
             snapshot,
         })
+    }
+
+    /// Feed a trust decision composed by the Application's fail-open hook
+    /// surfaces into the next `stage_reload`. The decision is one-shot: the
+    /// next build consumes it and subsequent builds fall back to store-based
+    /// resolution unless the Application sets it again.
+    pub fn set_composed_trust(&self, trust: Option<TrustResolution>) {
+        *self.inner.composed_trust.write() = trust;
+    }
+
+    /// Record the startup trust decision the session blueprint composed by
+    /// firing the host `pre_trust_decision` hook before loading project
+    /// extensions. The Application's startup trust resolution consumes it so
+    /// the host hook fires exactly once per startup (see
+    /// [`ResourceManager::take_startup_composed_trust`]).
+    pub fn set_startup_composed_trust(&self, trust: Option<TrustResolution>) {
+        *self.inner.startup_composed_trust.write() = trust;
+    }
+
+    /// One-shot take of the blueprint-composed startup trust decision. `None`
+    /// means no pre-load hook gate ran (or it was already consumed), so the
+    /// Application resolves and fires the hook surfaces itself.
+    pub fn take_startup_composed_trust(&self) -> Option<TrustResolution> {
+        self.inner.startup_composed_trust.write().take()
     }
 
     pub fn commit_reload(&self, candidate: ResourceReloadCandidate) -> Result<ReloadResult> {
@@ -476,6 +525,7 @@ fn build_candidate(
     settings_manager: &SettingsManager,
     trust_store: &TrustStore,
     generation: u64,
+    composed_trust: Option<&TrustResolution>,
 ) -> Result<ResourceSnapshot> {
     settings_manager.load_project(false)?;
     settings_manager.reload()?;
@@ -483,13 +533,18 @@ fn build_candidate(
         .settings()
         .default_project_trust
         .unwrap_or(DefaultProjectTrust::Ask);
-    let trust = resolve_project_trust(
-        trust_store,
-        &options.cwd,
-        options.project_trust_override,
-        default_trust,
-        options.headless,
-    )?;
+    // A decision the Application already composed through the fail-open hook
+    // surfaces is recorded verbatim; otherwise resolve from the trust store.
+    let trust = match composed_trust {
+        Some(trust) => trust.clone(),
+        None => resolve_project_trust(
+            trust_store,
+            &options.cwd,
+            options.project_trust_override,
+            default_trust,
+            options.headless,
+        )?,
+    };
     let project_trusted = trust.allows_project_resources(options.headless);
     settings_manager.load_project(project_trusted)?;
     settings_manager.reload()?;
@@ -552,6 +607,20 @@ fn build_candidate(
         .map(|error| ResourceDiagnostic {
             level: ResourceDiagnosticLevel::Warning,
             message: error.to_string(),
+            path: agent.path.clone(),
+        })
+    }));
+    // Unknown declared tools are silently ignored (OMP-compatible) — the agent
+    // stays available — but each such agent gets exactly one Warning diagnostic
+    // per resource build listing all unknown names.
+    diagnostics.extend(agents.iter().filter_map(|agent| {
+        let unknown = crate::unsupported_agent_tools(agent, settings.agents.get(&agent.name));
+        if unknown.is_empty() {
+            return None;
+        }
+        Some(ResourceDiagnostic {
+            level: ResourceDiagnosticLevel::Warning,
+            message: crate::unknown_tools_warning(&agent.name, &unknown),
             path: agent.path.clone(),
         })
     }));
@@ -692,10 +761,27 @@ fn build_candidate(
     } else {
         packages.extensions
     };
+    // Marketplace plugins (`agent_dir/extensions/<name>`) become extensions
+    // only when the trust store marks them trusted; installed plugins are
+    // trusted by `rpi plugin install`.
+    if !options.disable_extensions {
+        package_extensions.extend(crate::plugin::marketplace_extension_resources(
+            &options.agent_dir,
+            trust_store,
+        )?);
+    }
+    // A composed re-stage (a decision the hook surfaces already made) omits
+    // explicit project extensions the decision does not trust instead of
+    // failing the build: the host hook denied the project, so its extensions
+    // simply must not run. The plain store-based initial build keeps failing
+    // closed so a user passing `--extension` into an untrusted project still
+    // sees the actionable "pass --approve" error.
+    let skip_untrusted_explicit_extensions = composed_trust.is_some();
     package_extensions.extend(explicit_extension_resources(
         &options.cwd,
         &options.explicit_extension_paths,
         project_trusted,
+        skip_untrusted_explicit_extensions,
     )?);
     validate_snapshot_size(
         &context_files,
@@ -730,13 +816,14 @@ fn explicit_extension_resources(
     cwd: &Path,
     raw_paths: &[PathBuf],
     project_trusted: bool,
+    skip_untrusted: bool,
 ) -> Result<Vec<crate::PackageResourceSpec>> {
     let project_root = cwd
         .canonicalize()
         .with_context(|| format!("resolving working directory {}", cwd.display()))?;
-    raw_paths
+    let resolved = raw_paths
         .iter()
-        .map(|raw| {
+        .map(|raw| -> Result<Option<crate::PackageResourceSpec>> {
             let resolved = resolve_explicit(cwd, raw);
             let manifest = if resolved.is_dir() {
                 resolved.join(crate::PROCESS_EXTENSION_MANIFEST_FILE)
@@ -760,12 +847,18 @@ fn explicit_extension_resources(
             })?;
             let project_local = manifest.starts_with(&project_root);
             if project_local && !project_trusted {
+                if skip_untrusted {
+                    // The host hook surfaces already denied the project; the
+                    // extension must simply not load. Skipping keeps the
+                    // startup (or reload) build consistent with the denial.
+                    return Ok(None);
+                }
                 bail!(
                     "explicit project extension requires project trust: {} (pass --approve to allow it)",
                     manifest.display()
                 );
             }
-            Ok(crate::PackageResourceSpec {
+            Ok(Some(crate::PackageResourceSpec {
                 kind: crate::PackageResourceKind::Extension,
                 path: manifest,
                 package_id: "cli".to_owned(),
@@ -775,9 +868,10 @@ fn explicit_extension_resources(
                     crate::PackageScope::Global
                 },
                 trusted: !project_local || project_trusted,
-            })
+            }))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(resolved.into_iter().flatten().collect())
 }
 
 fn validate_explicit_project_paths(
@@ -1004,6 +1098,7 @@ fn resolve_explicit(cwd: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::{RESOURCE_HOME_OVERRIDE, ResourceManager, ResourceManagerOptions, ResourcePaths};
     use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn resource_paths_order_global_ancestors_then_project() {
@@ -1397,5 +1492,109 @@ mod tests {
             assert_eq!(shared.description, "repository project");
             assert_eq!(shared.source, crate::SkillSource::Project);
         });
+    }
+
+    fn write_persona(root: &Path, name: &str, description: &str) -> PathBuf {
+        let dir = root.join("personas").join(name);
+        fs::create_dir_all(&dir).expect("persona dir");
+        fs::write(
+            dir.join("persona.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n{name} prompt"),
+        )
+        .expect("persona.md");
+        dir
+    }
+
+    #[test]
+    fn resource_snapshot_includes_user_persona_atomically() {
+        // A user persona discovered under agent_dir/personas appears in the
+        // snapshot's agents atomically (with the rest of the resource build),
+        // marked Persona with a valid persona_root.
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let cwd = root.path().join("project");
+        let agent_dir = home.join(".pi").join("agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        let mentor_dir = write_persona(&agent_dir, "mentor", "durable mentor");
+        // Untrusted: the user persona is global and must still load.
+        let mut options = ResourceManagerOptions::new(&cwd);
+        options.agent_dir = agent_dir.clone();
+        options.project_trust_override = Some(false);
+        let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+        let mentor = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.name == "mentor")
+            .expect("persona in snapshot.agents");
+        assert_eq!(mentor.kind, crate::orchestration::AgentDefinitionKind::Persona);
+        assert!(mentor.is_persona());
+        assert_eq!(mentor.source, crate::orchestration::AgentDefinitionSource::User);
+        assert_eq!(mentor.persona_root().as_deref(), Some(mentor_dir.as_path()));
+        assert_eq!(snapshot.cwd, cwd);
+    }
+
+    #[test]
+    fn resource_snapshot_excludes_untrusted_project_persona() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let cwd = root.path().join("project");
+        let agent_dir = home.join(".pi").join("agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(cwd.join(".git")).expect("git directory");
+        write_persona(&cwd.join(".pi"), "mentor", "project mentor");
+        let mut options = ResourceManagerOptions::new(&cwd);
+        options.agent_dir = agent_dir;
+        options.project_trust_override = Some(false);
+        let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+        assert!(
+            !snapshot.agents.iter().any(|agent| agent.name == "mentor"),
+            "untrusted project persona must not be in snapshot"
+        );
+    }
+
+    #[test]
+    fn resource_snapshot_includes_project_persona_when_trusted() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let cwd = root.path().join("project");
+        let agent_dir = home.join(".pi").join("agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(cwd.join(".git")).expect("git directory");
+        let mentor_dir = write_persona(&cwd.join(".pi"), "mentor", "project mentor");
+        let mut options = ResourceManagerOptions::new(&cwd);
+        options.agent_dir = agent_dir;
+        options.project_trust_override = Some(true);
+        let snapshot = ResourceManager::new(options).expect("resource manager").snapshot();
+        let mentor = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.name == "mentor")
+            .expect("project persona in snapshot.agents");
+        assert_eq!(mentor.kind, crate::orchestration::AgentDefinitionKind::Persona);
+        assert_eq!(mentor.source, crate::orchestration::AgentDefinitionSource::Project);
+        assert_eq!(mentor.persona_root().as_deref(), Some(mentor_dir.as_path()));
+    }
+
+    #[test]
+    fn resource_paths_account_for_persona_dirs() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let cwd = root.path().join("project");
+        let agent_dir = home.join(".pi").join("agent");
+        fs::create_dir_all(&cwd).expect("project directory");
+        fs::create_dir_all(&agent_dir).expect("agent directory");
+        fs::create_dir(cwd.join(".git")).expect("git directory");
+
+        let untrusted = ResourcePaths::discover_from_agent_dir(&cwd, &agent_dir, false);
+        assert_eq!(untrusted.persona_dirs, vec![agent_dir.join("personas")]);
+
+        let trusted = ResourcePaths::discover_from_agent_dir(&cwd, &agent_dir, true);
+        assert_eq!(
+            trusted.persona_dirs,
+            vec![agent_dir.join("personas"), cwd.join(".pi").join("personas")]
+        );
     }
 }

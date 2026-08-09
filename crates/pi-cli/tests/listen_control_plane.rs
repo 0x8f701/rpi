@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use pi_ai::providers::{
     FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
@@ -21,6 +22,7 @@ use pi_coding::{
     Application, ExtensionCancellation, ExtensionInstanceId, ExtensionMode,
     ExtensionThemeDescriptor, ExtensionUiContext, ExtensionUiHost, ExtensionUiRequest,
     ExtensionUiResponse, ProcessSpawnSpec, Session, SessionOptions, TodoPhase,
+    collab::{FrameDirection, capability, derive_connection_key, open_frame, parse_link, seal_frame},
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -31,279 +33,9 @@ use tokio_tungstenite::{
     tungstenite::{Message as WsMessage, client::IntoClientRequest},
 };
 
-const DEADLINE: Duration = Duration::from_secs(20);
-const REMOTE_UI_DISABLED: &str = "remote interactive extension UI is disabled";
-
-fn unique(label: &str) -> String {
-    format!("{label}-{}", uuid::Uuid::now_v7().simple())
-}
-
-fn spawn_sleep_spec(cwd: &std::path::Path, seconds: u64) -> ProcessSpawnSpec {
-    ProcessSpawnSpec {
-        argv: vec!["sleep".into(), seconds.to_string()],
-        cwd: cwd.to_path_buf(),
-        env: BTreeMap::new(),
-        tty: false,
-        terminal_size: None,
-        label: None,
-        timeout_ms: None,
-        output_bytes: None,
-    }
-}
-
-struct FauxApp {
-    application: Application,
-    _registration: FauxProviderRegistration,
-    cwd: TempDir,
-}
-
-fn faux_model(label: &str) -> (Model, FauxProviderRegistration) {
-    let suffix = unique(label);
-    let mut model = Model::default();
-    model.id = format!("{label}-model");
-    model.name = format!("{label} Model");
-    model.api = format!("{suffix}-api");
-    model.provider = format!("{suffix}-provider");
-    model.base_url = "http://localhost:0".into();
-    let registration = register_faux_provider(FauxProviderOptions {
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        models: vec![model.clone()],
-        chunk_size: 8,
-    });
-    registration.set_responses(vec![FauxResponse::text("listen-faux-reply")]);
-    (model, registration)
-}
-
-async fn faux_application(label: &str) -> FauxApp {
-    let (model, registration) = faux_model(label);
-    let cwd = tempfile::tempdir().expect("cwd");
-    let session = Session::new(SessionOptions {
-        model,
-        cwd: cwd.path().to_path_buf(),
-        system_prompt: String::new(),
-        thinking_level: ThinkingLevel::Off,
-        api_key: "faux".into(),
-        compaction: None,
-        stream_options: Default::default(),
-        tools: Some(Vec::new()),
-        before_tool_call: None,
-        after_tool_call: None,
-        stream_fn: None,
-        auth_resolver: None,
-    })
-    .expect("session");
-    FauxApp {
-        application: Application::new(session).await,
-        _registration: registration,
-        cwd,
-    }
-}
-
-async fn listen(application: Application) -> (ListenHandle, ExtensionUiAdapter) {
-    let extension_ui = ExtensionUiAdapter::new();
-    extension_ui.set_canonical_queries_supported(true);
-    let handle = start(
-        application,
-        extension_ui.clone(),
-        ListenConfig {
-            address: "127.0.0.1:0".parse().unwrap(),
-            token_file: None,
-        },
-    )
-    .await
-    .expect("start listener");
-    (handle, extension_ui)
-}
-
-async fn listen_with_token(
-    application: Application,
-    token: &str,
-) -> (ListenHandle, ExtensionUiAdapter, TempDir) {
-    let dir = tempfile::tempdir().expect("token dir");
-    let token_path = dir.path().join("token");
-    std::fs::write(&token_path, token).expect("write token");
-    let extension_ui = ExtensionUiAdapter::new();
-    extension_ui.set_canonical_queries_supported(true);
-    let handle = start(
-        application,
-        extension_ui.clone(),
-        ListenConfig {
-            address: "127.0.0.1:0".parse().unwrap(),
-            token_file: Some(token_path),
-        },
-    )
-    .await
-    .expect("start listener");
-    (handle, extension_ui, dir)
-}
-
-async fn http_post_rpc_with_headers(
-    addr: std::net::SocketAddr,
-    body: &[u8],
-    token: Option<&str>,
-    extra_headers: &[(&str, &str)],
-) -> (u16, Vec<u8>) {
-    tokio::time::timeout(DEADLINE, async {
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
-        let mut request = format!(
-            "POST /rpc HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
-            body.len()
-        );
-        if let Some(token) = token {
-            request.push_str(&format!("authorization: Bearer {token}\r\n"));
-        }
-        for (name, value) in extra_headers {
-            request.push_str(&format!("{name}: {value}\r\n"));
-        }
-        request.push_str("\r\n");
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("write request");
-        stream.write_all(body).await.expect("write body");
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("read response");
-        (
-            parse_status(&response).unwrap_or(0),
-            parse_body(&response).unwrap_or_default(),
-        )
-    })
-    .await
-    .expect("http POST /rpc timed out")
-}
-
-async fn http_post_rpc(
-    addr: std::net::SocketAddr,
-    body: &[u8],
-    token: Option<&str>,
-) -> (u16, Vec<u8>) {
-    http_post_rpc_with_headers(addr, body, token, &[]).await
-}
-
-fn parse_status(response: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(response).ok()?;
-    let first_line = text.lines().next()?;
-    let parts: Vec<&str> = first_line.split(' ').collect();
-    parts.get(1)?.parse().ok()
-}
-
-fn parse_body(response: &[u8]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(response).ok()?;
-    let split = text.find("\r\n\r\n")?;
-    Some(response[split + 4..].to_vec())
-}
-
-async fn http_get(addr: std::net::SocketAddr, path: &str, token: Option<&str>) -> (u16, Vec<u8>) {
-    tokio::time::timeout(DEADLINE, async {
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
-        let mut request = format!("GET {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n");
-        if let Some(token) = token {
-            request.push_str(&format!("authorization: Bearer {token}\r\n"));
-        }
-        request.push_str("\r\n");
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("write request");
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("read response");
-        (
-            parse_status(&response).unwrap_or(0),
-            parse_body(&response).unwrap_or_default(),
-        )
-    })
-    .await
-    .expect("http GET timed out")
-}
-
-async fn ws_connect(
-    addr: std::net::SocketAddr,
-    token: Option<&str>,
-) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
-    ws_connect_with_origin(addr, token, None).await
-}
-
-async fn ws_connect_with_origin(
-    addr: std::net::SocketAddr,
-    token: Option<&str>,
-    origin: Option<&str>,
-) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
-    tokio::time::timeout(DEADLINE, async {
-        let url = format!("ws://{addr}/ws");
-        let mut request = url.into_client_request().expect("build ws request");
-        if let Some(token) = token {
-            request.headers_mut().insert(
-                http::header::AUTHORIZATION,
-                format!("Bearer {token}").parse().unwrap(),
-            );
-        }
-        if let Some(origin) = origin {
-            request
-                .headers_mut()
-                .insert(http::header::ORIGIN, origin.parse().unwrap());
-        }
-        tokio_tungstenite::connect_async(request)
-            .await
-            .expect("ws connect")
-            .0
-    })
-    .await
-    .expect("ws connect timed out")
-}
-
-async fn try_ws_connect(
-    addr: std::net::SocketAddr,
-    token: Option<&str>,
-    origin: Option<&str>,
-) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
-    match tokio::time::timeout(DEADLINE, async {
-        let url = format!("ws://{addr}/ws");
-        let mut request = url.into_client_request().map_err(|e| e.to_string())?;
-        if let Some(token) = token {
-            request.headers_mut().insert(
-                http::header::AUTHORIZATION,
-                format!("Bearer {token}").parse().unwrap(),
-            );
-        }
-        if let Some(origin) = origin {
-            request
-                .headers_mut()
-                .insert(http::header::ORIGIN, origin.parse().unwrap());
-        }
-        tokio_tungstenite::connect_async(request)
-            .await
-            .map(|(ws, _)| ws)
-            .map_err(|e| e.to_string())
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err("ws connect timed out".into()),
-    }
-}
-
-/// Connect, write headers/body, and read the full HTTP response under [`DEADLINE`].
-async fn http_raw_exchange(addr: std::net::SocketAddr, request: &[u8]) -> Vec<u8> {
-    tokio::time::timeout(DEADLINE, async {
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
-        stream.write_all(request).await.expect("write request");
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("read response");
-        response
-    })
-    .await
-    .expect("http raw exchange timed out")
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::*;
 
 #[tokio::test]
 async fn http_get_state_returns_exact_rpc_response() {
@@ -434,6 +166,100 @@ async fn ws_get_state_returns_response_and_application_events() {
 }
 
 #[tokio::test]
+async fn collab_wire_auth_encrypts_snapshot_commands_and_stop_close() {
+    let app = faux_application("listen-collab-wire").await;
+    let (handle, _extension_ui) = listen(app.application.clone()).await;
+    let addr = handle.local_addr();
+    let body = json!({
+        "type": "collab_start",
+        "id": "collab-start",
+        "baseUrl": format!("http://{addr}"),
+    })
+    .to_string();
+    let (status, response) = http_post_rpc(addr, body.as_bytes(), None).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&response));
+    let response: Value = serde_json::from_slice(&response).expect("start response");
+    let link_text = response["data"]["controlLink"].as_str().expect("control link");
+    let link = parse_link(link_text).expect("parse control link");
+    let protocol = format!(
+        "rpi-collab.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(capability(&link.secret.key)),
+    );
+    let path = format!("/collab/ws/{}", link.room_id);
+    let (mut ws, handshake) = ws_connect_path_with_subprotocol(addr, &path, Some(&protocol), None)
+        .await
+        .expect("collab connect");
+    assert_eq!(
+        handshake.headers().get(http::header::SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()),
+        Some(protocol.as_str()),
+    );
+    let hello = match ws.next().await.expect("hello frame").expect("hello") {
+        WsMessage::Text(text) => serde_json::from_str::<Value>(&text).expect("hello json"),
+        other => panic!("expected hello text, got {other:?}"),
+    };
+    let epoch: [u8; 8] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(hello["epoch"].as_str().expect("epoch"))
+        .expect("epoch base64")
+        .try_into()
+        .expect("epoch length");
+    let server_key = derive_connection_key(&link.secret.key, &epoch, FrameDirection::ServerToClient)
+        .expect("server key");
+    let client_key = derive_connection_key(&link.secret.key, &epoch, FrameDirection::ClientToServer)
+        .expect("client key");
+    let snapshot_frame = match ws.next().await.expect("snapshot frame").expect("snapshot") {
+        WsMessage::Binary(frame) => frame,
+        other => panic!("expected encrypted snapshot, got {other:?}"),
+    };
+    let snapshot_plain = open_frame(
+        &server_key,
+        &link.room_id,
+        FrameDirection::ServerToClient,
+        &epoch,
+        0,
+        &snapshot_frame,
+    )
+    .expect("decrypt snapshot");
+    assert!(!snapshot_frame.windows(b"sessionId".len()).any(|w| w == b"sessionId"));
+    let snapshot: Value = serde_json::from_slice(&snapshot_plain).expect("snapshot json");
+    assert_eq!(snapshot["type"], "snapshot");
+
+    let command = json!({"type":"command","command":"abort","id":"abort-1"});
+    let command_frame = seal_frame(
+        &client_key,
+        &link.room_id,
+        FrameDirection::ClientToServer,
+        &epoch,
+        0,
+        &serde_json::to_vec(&command).expect("command json"),
+    )
+    .expect("seal command");
+    ws.send(WsMessage::Binary(command_frame.into())).await.expect("send command");
+    let response_frame = match ws.next().await.expect("response frame").expect("response") {
+        WsMessage::Binary(frame) => frame,
+        other => panic!("expected encrypted response, got {other:?}"),
+    };
+    let response_plain = open_frame(
+        &server_key,
+        &link.room_id,
+        FrameDirection::ServerToClient,
+        &epoch,
+        1,
+        &response_frame,
+    )
+    .expect("decrypt response");
+    let response: Value = serde_json::from_slice(&response_plain).expect("response json");
+    assert_eq!(response["type"], "response");
+    assert_eq!(response["command"], "abort");
+    assert_eq!(response["success"], true);
+
+    handle.collab_service().stop(&link.room_id).await.expect("stop room");
+    let close = tokio::time::timeout(DEADLINE, ws.next()).await.expect("close timeout");
+    assert!(matches!(close, Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None));
+    handle.stop().await.expect("stop listener");
+    app.application.cleanup().await;
+}
+
+#[tokio::test]
 async fn ws_rejects_binary_messages() {
     let app = faux_application("listen-ws-binary").await;
     let (handle, _extension_ui) = listen(app.application.clone()).await;
@@ -495,6 +321,195 @@ async fn auth_rejects_ws_without_token() {
     );
     handle.stop().await.expect("stop");
     app.application.cleanup().await;
+}
+
+/// `GET /web` serves the self-contained web client page (200, text/html,
+/// inline assets only) without authentication — the page carries no data and
+/// every command/event flows through the token-gated /rpc and /ws routes.
+#[tokio::test]
+async fn http_get_web_serves_self_contained_page_without_auth() {
+    let app = faux_application("listen-web-page").await;
+    let (handle, _extension_ui) = listen(app.application.clone()).await;
+    let addr = handle.local_addr();
+
+    let response = http_raw_exchange(
+        addr,
+        b"GET /web HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",
+    )
+    .await;
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 200"), "status line: {text}");
+    assert!(
+        text.contains("content-type: text/html; charset=utf-8"),
+        "content type: {text}"
+    );
+    assert!(text.contains("<!doctype html"), "page doctype");
+    assert!(text.contains("<script"), "inline script, no external assets");
+    assert!(text.contains("</html>"), "page closing tag");
+    assert!(
+        !text.contains("src=\"http") && !text.contains("href=\"http"),
+        "page must not reference external assets"
+    );
+    assert!(text.contains("rpi-auth."), "page must document the subprotocol");
+
+    // The page itself stays auth-optional even when a token is configured.
+    let (status, _) = http_get(addr, "/web", None).await;
+    assert_eq!(status, 200, "auth-optional /web with token configured");
+
+    // Other GET paths remain 404, and /rpc + /ws auth is unchanged.
+    let (status, _) = http_get(addr, "/", None).await;
+    assert_eq!(status, 404);
+    let (status, _) = http_get(addr, "/nope", None).await;
+    assert_eq!(status, 404);
+
+    handle.stop().await.expect("stop");
+    app.application.cleanup().await;
+}
+
+/// Browser WebSocket auth via the `Sec-WebSocket-Protocol: rpi-auth.<token>`
+/// subprotocol: a matching token authenticates even with a browser Origin,
+/// and the server echoes the exact offered protocol in the handshake.
+#[tokio::test]
+async fn ws_subprotocol_token_auth_accepts_and_echoes() {
+    let app = faux_application("listen-ws-subprotocol-ok").await;
+    let (handle, _extension_ui, _token_dir) =
+        listen_with_token(app.application.clone(), "web-token-ok").await;
+    let addr = handle.local_addr();
+
+    let (mut ws, response) = ws_connect_with_subprotocol(
+        addr,
+        Some("rpi-auth.web-token-ok"),
+        Some("https://app.example"),
+    )
+    .await
+    .expect("subprotocol-authenticated ws must connect");
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok()),
+        Some("rpi-auth.web-token-ok"),
+        "server must reflect the chosen subprotocol (RFC 6455)"
+    );
+
+    ws.send(WsMessage::Text(
+        json!({"type":"get_state","id":"subproto-1"}).to_string().into(),
+    ))
+    .await
+    .expect("ws send");
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut ok = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("parse");
+                if value["id"] == "subproto-1" {
+                    assert!(value["success"].as_bool().unwrap_or(false));
+                    ok = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            _ => break,
+        }
+    }
+    assert!(ok, "subprotocol-authenticated get_state missing");
+
+    // The Authorization header path still works untouched on the same listener.
+    let mut auth_ws = ws_connect_with_origin(addr, Some("web-token-ok"), None).await;
+    auth_ws
+        .send(WsMessage::Text(
+            json!({"type":"get_state","id":"header-1"}).to_string().into(),
+        ))
+        .await
+        .expect("ws send");
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut header_ok = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, auth_ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("parse");
+                if value["id"] == "header-1" {
+                    header_ok = value["success"].as_bool().unwrap_or(false);
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            _ => break,
+        }
+    }
+    assert!(header_ok, "authorization-header ws must keep working");
+
+    ws.close(None).await.ok();
+    auth_ws.close(None).await.ok();
+    handle.stop().await.expect("stop");
+    app.application.cleanup().await;
+}
+
+/// The subprotocol channel rejects wrong tokens, empty candidates, and — when
+/// no token is configured — every browser connection (Origin always present).
+#[tokio::test]
+async fn ws_subprotocol_wrong_token_and_missing_token_rejected() {
+    let app = faux_application("listen-ws-subprotocol-bad").await;
+    let (handle, _extension_ui, _token_dir) =
+        listen_with_token(app.application.clone(), "web-token-secret").await;
+    let addr = handle.local_addr();
+
+    // Wrong token: the handshake must fail outright.
+    let result = ws_connect_with_subprotocol(
+        addr,
+        Some("rpi-auth.web-token-wrong"),
+        Some("https://app.example"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "wrong subprotocol token must fail: {result:?}"
+    );
+
+    // Empty candidate after the prefix.
+    let result = ws_connect_with_subprotocol(addr, Some("rpi-auth."), Some("https://app.example"))
+        .await;
+    assert!(
+        result.is_err(),
+        "empty subprotocol candidate must fail: {result:?}"
+    );
+
+    // Browser connection with no subprotocol and no Authorization header.
+    let result = ws_connect_with_subprotocol(addr, None, Some("https://app.example")).await;
+    assert!(
+        result.is_err(),
+        "browser origin without any token channel must fail: {result:?}"
+    );
+
+    // A non-auth subprotocol must not authenticate either.
+    let result = ws_connect_with_subprotocol(addr, Some("chat"), Some("https://app.example")).await;
+    assert!(
+        result.is_err(),
+        "unrelated subprotocol must fail: {result:?}"
+    );
+
+    handle.stop().await.expect("stop");
+    app.application.cleanup().await;
+
+    // Tokenless loopback: even a correctly-shaped subprotocol cannot help,
+    // because there is no configured token to compare against and the browser
+    // Origin triggers the DNS-rebinding rejection.
+    let tokenless = faux_application("listen-ws-subprotocol-tokenless").await;
+    let (handle, _extension_ui) = listen(tokenless.application.clone()).await;
+    let addr = handle.local_addr();
+    let result = ws_connect_with_subprotocol(
+        addr,
+        Some("rpi-auth.web-token-secret"),
+        Some("https://app.example"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "tokenless loopback must reject browser origin even with a subprotocol: {result:?}"
+    );
+    handle.stop().await.expect("stop");
+    tokenless.application.cleanup().await;
 }
 
 #[tokio::test]
@@ -579,33 +594,130 @@ async fn token_authenticated_browser_origin_is_accepted() {
 }
 
 #[tokio::test]
-async fn non_loopback_listen_requires_token_file() {
-    let app = faux_application("listen-non-loopback").await;
+async fn non_loopback_policy_requires_both_token_and_explicit_opt_in() {
+    let app = faux_application("listen-remote-policy").await;
     let extension_ui = ExtensionUiAdapter::new();
-    let err = match start(
+    let token_dir = tempfile::tempdir().expect("token dir");
+    let token_path = token_dir.path().join("token-file");
+    std::fs::write(&token_path, "fixture-value").expect("write token");
+
+    let cases = [
+        ("0.0.0.0:0", None, false, "IPv4 wildcard without token or opt-in"),
+        ("0.0.0.0:0", Some(token_path.clone()), false, "IPv4 wildcard without opt-in"),
+        ("0.0.0.0:0", None, true, "IPv4 wildcard without token"),
+        ("[::]:0", None, false, "IPv6 wildcard without token or opt-in"),
+        ("[::]:0", Some(token_path.clone()), false, "IPv6 wildcard without opt-in"),
+        ("[::]:0", None, true, "IPv6 wildcard without token"),
+        ("198.51.100.7:0", Some(token_path.clone()), false, "distinct non-loopback IPv4 without opt-in"),
+        ("192.0.2.1:0", Some(token_path.clone()), false, "documentation IPv4 without opt-in"),
+        ("8.8.8.8:0", Some(token_path.clone()), false, "public IPv4 without opt-in"),
+        ("[2001:db8::1]:0", Some(token_path.clone()), false, "documentation IPv6 without opt-in"),
+    ];
+    for (address, token_file, allow_insecure_remote, label) in cases {
+        let error = match start(
+            app.application.clone(),
+            extension_ui.clone(),
+            ListenConfig {
+                address: address.parse().unwrap(),
+                token_file,
+                allow_insecure_remote,
+                session_factory: None,
+            },
+        )
+        .await
+        {
+            Ok(handle) => {
+                handle.stop().await.expect("stop unexpected listener");
+                panic!("{label} must be refused before bind");
+            }
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("loopback") || message.contains("token file"),
+            "{label}: refusal must explain missing security precondition: {message}"
+        );
+    }
+    app.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn wildcard_listener_with_opt_in_enforces_token_over_loopback_connection() {
+    let app = faux_application("listen-wildcard-auth").await;
+    let extension_ui = ExtensionUiAdapter::new();
+    let token_dir = tempfile::tempdir().expect("token dir");
+    let token_path = token_dir.path().join("token-file");
+    std::fs::write(&token_path, "fixture-value").expect("write token");
+    let handle = start(
         app.application.clone(),
         extension_ui,
         ListenConfig {
             address: "0.0.0.0:0".parse().unwrap(),
-            token_file: None,
+            token_file: Some(token_path),
+            allow_insecure_remote: true,
+            session_factory: None,
         },
     )
     .await
-    {
-        Ok(handle) => {
-            handle.stop().await.expect("stop unexpected listener");
-            panic!("non-loopback without token must fail");
-        }
-        Err(error) => error,
-    };
-    let message = format!("{err:#}");
-    assert!(
-        message.contains("listen-token-file")
-            || message.contains("non-loopback")
-            || message.contains("token"),
-        "unexpected error: {message}"
-    );
+    .expect("authenticated wildcard opt-in must bind");
+    let wildcard = handle.local_addr();
+    assert!(wildcard.ip().is_unspecified(), "expected wildcard bind: {wildcard}");
+    let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], wildcard.port()));
+
+    let (missing_status, _) = http_post_rpc(loopback, br#"{"type":"get_state","id":"missing"}"#, None).await;
+    assert_eq!(missing_status, 401, "wildcard listener accepted unauthenticated RPC");
+    let (wrong_status, _) = http_post_rpc(
+        loopback,
+        br#"{"type":"get_state","id":"wrong"}"#,
+        Some("wrong-value"),
+    )
+    .await;
+    assert_eq!(wrong_status, 401, "wildcard listener accepted wrong token");
+    let (ok_status, ok_body) = http_post_rpc(
+        loopback,
+        br#"{"type":"get_state","id":"authenticated"}"#,
+        Some("fixture-value"),
+    )
+    .await;
+    assert_eq!(ok_status, 200, "authenticated wildcard RPC failed");
+    let response: Value = serde_json::from_slice(&ok_body).expect("parse authenticated response");
+    assert_eq!(response["id"], "authenticated");
+    assert_eq!(response["success"], true);
+
+    handle.stop().await.expect("stop");
     app.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn loopback_listen_accepts_v4_and_v6_with_and_without_token() {
+    // Loopback behavior is unchanged: both v4 and v6 bind, tokenless and with
+    // a token. This guards against the loopback-only tightening regressing
+    // the legitimate local path.
+    let token_dir = tempfile::tempdir().expect("token dir");
+    let token_path = token_dir.path().join("token");
+    std::fs::write(&token_path, "fixture-value").expect("write token");
+    for addr in ["127.0.0.1:0", "[::1]:0"] {
+        for token_file in [None, Some(token_path.clone())] {
+            let app = faux_application(&format!("listen-loopback-{addr}-{}", token_file.is_some())).await;
+            let extension_ui = ExtensionUiAdapter::new();
+            let handle = start(
+                app.application.clone(),
+                extension_ui,
+                ListenConfig {
+                    address: addr.parse().unwrap(),
+                    token_file: token_file.as_deref().map(std::path::PathBuf::from),
+                    allow_insecure_remote: false,
+                    session_factory: None,
+                },
+            )
+            .await
+            .expect("loopback must bind");
+            let bound = handle.local_addr();
+            assert!(bound.ip().is_loopback(), "{addr} bound non-loopback {bound}");
+            handle.stop().await.expect("stop");
+            app.application.cleanup().await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -883,8 +995,10 @@ async fn listener_preserves_canonical_tui_extension_queries() {
 async fn tui_interaction_ids_are_not_ws_respondable() {
     let app = faux_application("listen-tui-interaction").await;
     let (handle, extension_ui) = listen(app.application.clone()).await;
-    // The listen server observes non-interactive UI state only. A live TUI is
-    // the exclusive owner required to keep interactive requests pending.
+    // The listen server projects EXTENSION-owned interactive requests as
+    // read-only notices, but HOST/TUI-owned interactions stay private to the
+    // live terminal (instance id "host"), which is the exclusive owner
+    // required to keep those requests pending.
     let _tui_events = extension_ui.subscribe();
     let addr = handle.local_addr();
     let mut ws = ws_connect(addr, None).await;
@@ -896,8 +1010,8 @@ async fn tui_interaction_ids_are_not_ws_respondable() {
             .request(
                 ExtensionUiContext {
                     instance: ExtensionInstanceId {
-                        extension_id: "tui-owner".into(),
-                        generation: 1,
+                        extension_id: "host".into(),
+                        generation: 0,
                     },
                     mode: ExtensionMode::Tui,
                 },
@@ -1012,8 +1126,10 @@ async fn tui_interaction_ids_are_not_ws_respondable() {
 async fn multiple_ws_clients_cannot_resolve_tui_interaction() {
     let app = faux_application("listen-multi-ws").await;
     let (handle, extension_ui) = listen(app.application.clone()).await;
-    // The listen server observes non-interactive UI state only. A live TUI is
-    // the exclusive owner required to keep interactive requests pending.
+    // The listen server projects EXTENSION-owned interactive requests as
+    // read-only notices, but HOST/TUI-owned interactions stay private to the
+    // live terminal (instance id "host"), which is the exclusive owner
+    // required to keep those requests pending.
     let _tui_events = extension_ui.subscribe();
     let addr = handle.local_addr();
     let mut ws_a = ws_connect(addr, None).await;
@@ -1025,8 +1141,8 @@ async fn multiple_ws_clients_cannot_resolve_tui_interaction() {
             .request(
                 ExtensionUiContext {
                     instance: ExtensionInstanceId {
-                        extension_id: "race-owner".into(),
-                        generation: 1,
+                        extension_id: "host".into(),
+                        generation: 0,
                     },
                     mode: ExtensionMode::Tui,
                 },
@@ -1258,12 +1374,13 @@ async fn http_rejects_extension_ui_response_command() {
 }
 
 #[tokio::test]
-async fn ws_projects_noninteractive_ui_events_but_not_confirms() {
+async fn ws_projects_ui_events_but_isolates_host_interactions() {
     let app = faux_application("listen-ui-notify").await;
     let (handle, extension_ui) = listen(app.application.clone()).await;
     let addr = handle.local_addr();
     let mut ws = ws_connect(addr, None).await;
 
+    // Non-interactive UI state still projects (notify).
     extension_ui
         .request(
             ExtensionUiContext {
@@ -1282,18 +1399,101 @@ async fn ws_projects_noninteractive_ui_events_but_not_confirms() {
         .await
         .expect("notify");
 
+    // An EXTENSION-owned interactive confirm projects as a read-only notice
+    // (the D94 web approval card), carrying the extension identity.
+    let adapter = extension_ui.clone();
+    let ext_pending = tokio::spawn(async move {
+        adapter
+            .request(
+                ExtensionUiContext {
+                    instance: ExtensionInstanceId {
+                        extension_id: "ext-owner".into(),
+                        generation: 2,
+                    },
+                    mode: ExtensionMode::Tui,
+                },
+                ExtensionUiRequest::Confirm {
+                    title: "Approve?".into(),
+                    message: "extension ask".into(),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+    });
+
+    // A HOST/TUI-owned interactive confirm stays private to the terminal.
+    let adapter = extension_ui.clone();
+    let host_pending = tokio::spawn(async move {
+        adapter
+            .request(
+                ExtensionUiContext {
+                    instance: ExtensionInstanceId {
+                        extension_id: "host".into(),
+                        generation: 0,
+                    },
+                    mode: ExtensionMode::Tui,
+                },
+                ExtensionUiRequest::Confirm {
+                    title: "Host?".into(),
+                    message: "tui only".into(),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await
+    });
+
+    // Collect both interaction ids (extension-owned + host-owned).
     let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut ext_id = None;
+    let mut host_id = None;
+    while ext_id.is_none() || host_id.is_none() {
+        for interaction in extension_ui.pending_interactions() {
+            match interaction.context.instance.extension_id.as_str() {
+                "ext-owner" => ext_id = Some(interaction.id.clone()),
+                "host" => host_id = Some(interaction.id.clone()),
+                _ => {}
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("interactions never became pending");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let ext_id = ext_id.expect("extension interaction id");
+    let host_id = host_id.expect("host interaction id");
+
+    // The WS must see the extension-owned confirm (method + extensionId) and
+    // the notify; it must NOT see the host-owned confirm.
     let mut saw_notify = false;
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout_at(deadline, ws.next()).await {
+    let mut saw_ext_confirm = false;
+    let mut saw_host_confirm = false;
+    let scan_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    while tokio::time::Instant::now() < scan_deadline {
+        match tokio::time::timeout(Duration::from_millis(50), ws.next()).await {
             Ok(Some(Ok(WsMessage::Text(text)))) => {
-                let value: Value = serde_json::from_str(&text).expect("parse");
-                if value["type"] == "extension_ui_request"
-                    && value["method"] == "notify"
-                {
-                    assert_eq!(value["message"], "hello-from-host");
-                    saw_notify = true;
-                    break;
+                let value: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                if value["type"] == "extension_ui_request" {
+                    match value["method"].as_str() {
+                        Some("notify") => {
+                            assert_eq!(value["message"], "hello-from-host");
+                            saw_notify = true;
+                        }
+                        Some("confirm") => match value["extensionId"].as_str() {
+                            Some("ext-owner") => {
+                                assert_ne!(
+                                    value["id"].as_str(),
+                                    Some(host_id.as_str()),
+                                    "extension confirm must not carry the host interaction id"
+                                );
+                                saw_ext_confirm = true;
+                            }
+                            Some("host") => {
+                                saw_host_confirm = true;
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
                 }
             }
             Ok(Some(Ok(_))) => continue,
@@ -1301,6 +1501,42 @@ async fn ws_projects_noninteractive_ui_events_but_not_confirms() {
         }
     }
     assert!(saw_notify, "non-interactive notify should project over WS");
+    assert!(
+        saw_ext_confirm,
+        "extension-owned confirm must project over WS as a read-only notice"
+    );
+    assert!(
+        !saw_host_confirm,
+        "host/TUI-owned confirm must stay private to the terminal"
+    );
+
+    // The terminal answers both locally; remote answers remain rejected (the
+    // dedicated tests cover the rejection paths).
+    extension_ui
+        .respond_confirmed(&ext_id, true)
+        .expect("extension answer");
+    extension_ui
+        .respond_confirmed(&host_id, false)
+        .expect("host answer");
+    let ext_decision = tokio::time::timeout(DEADLINE, ext_pending)
+        .await
+        .expect("ext join")
+        .expect("ext task")
+        .expect("ext result");
+    let host_decision = tokio::time::timeout(DEADLINE, host_pending)
+        .await
+        .expect("host join")
+        .expect("host task")
+        .expect("host result");
+    assert!(matches!(
+        ext_decision,
+        ExtensionUiResponse::Confirmed { confirmed: true }
+    ));
+    assert!(matches!(
+        host_decision,
+        ExtensionUiResponse::Confirmed { confirmed: false }
+    ));
+
     ws.close(None).await.ok();
     handle.stop().await.expect("stop");
     app.application.cleanup().await;
@@ -1421,6 +1657,7 @@ fn run_rpi_binary(args: &[&str]) -> (i32, String, String) {
         .env("PI_SKIP_VERSION_CHECK", "1")
         .env("PI_OFFLINE", "1")
         .env("PI_FAUX_RESPONSE", "listen-cli-should-not-run")
+        .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .stdin(Stdio::null())
@@ -1494,6 +1731,7 @@ fn binary_listen_with_prompt_serves_rpc_on_nontty_repl() {
         .env("PI_SKIP_VERSION_CHECK", "1")
         .env("PI_OFFLINE", "1")
         .env("PI_FAUX_RESPONSE", "listen-cli-should-not-run")
+        .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .stdin(Stdio::piped())
@@ -1709,6 +1947,497 @@ async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
     .expect("fresh WebSocket get_state timed out");
     assert_eq!(response["command"], "get_state");
     assert_eq!(response["success"], true);
+
+    fresh.close(None).await.ok();
+    handle.stop().await.expect("stop");
+    app.application.cleanup().await;
+}
+
+/// Long-running commands (process_wait) run off the WebSocket read/event
+/// select: application events keep streaming while one is pending, and its
+/// response arrives later, correlated by id (never serialized in front of the
+/// events).
+#[tokio::test]
+async fn ws_forwards_events_while_long_command_runs() {
+    let app = faux_application("listen-ws-nonblocking").await;
+    let (handle, _extension_ui) = listen(app.application.clone()).await;
+    let addr = handle.local_addr();
+    let mut ws = ws_connect(addr, None).await;
+
+    // process_wait is non-inline: it blocks until the process exits. Spawn a
+    // long-lived process and wait on it for far longer than the test deadline.
+    let spawn = json!({
+        "type": "process_spawn",
+        "id": "nb-spawn",
+        "spec": spawn_sleep_spec(app.cwd.path(), 30)
+    })
+    .to_string();
+    ws.send(WsMessage::Text(spawn.into()))
+        .await
+        .expect("send process_spawn");
+    let process_id = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).expect("parse spawn response");
+                    if value["type"] == "response" && value["id"] == "nb-spawn" {
+                        assert!(
+                            value["success"].as_bool().unwrap_or(false),
+                            "spawn failed: {value}"
+                        );
+                        return value["data"]["id"]
+                            .as_str()
+                            .expect("spawn response process id")
+                            .to_owned();
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("WebSocket failed: {error}"),
+                None => panic!("WebSocket closed before process_spawn response"),
+            }
+        }
+    })
+    .await
+    .expect("process_spawn response timed out");
+
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "process_wait",
+            "id": "nb-wait",
+            "processId": process_id,
+            "timeoutMs": 60_000
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send process_wait");
+    // Let the server pick up the wait before the event fires.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    app.application
+        .set_todos(vec![TodoPhase {
+            name: "during-long-command".into(),
+            tasks: vec![],
+        }])
+        .expect("set todos publishes TodoUpdated");
+
+    // The event must arrive BEFORE the process_wait response: the wait is
+    // still pending (the process runs for 30s), so its response cannot be
+    // produced until process_stop below.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut saw_event_first = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("parse ws frame");
+                if value["type"] == "todo_updated" {
+                    assert_eq!(value["phases"][0]["name"], "during-long-command");
+                    saw_event_first = true;
+                    break;
+                }
+                if value["type"] == "response" && value["id"] == "nb-wait" {
+                    panic!("process_wait response arrived before the application event");
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(error))) => panic!("WebSocket failed: {error}"),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_event_first,
+        "application event did not arrive while the long command ran"
+    );
+
+    // process_stop is inline and must work while the wait is still pending.
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "process_stop",
+            "id": "nb-stop",
+            "processId": process_id
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send process_stop");
+
+    // The wait response arrives after the stop, still correlated by id.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut saw_wait = false;
+    let mut saw_stop = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("parse ws frame");
+                if value["type"] == "response" && value["id"] == "nb-wait" {
+                    assert_eq!(value["command"], "process_wait");
+                    assert!(
+                        value["success"].as_bool().unwrap_or(false),
+                        "wait failed: {value}"
+                    );
+                    saw_wait = true;
+                } else if value["type"] == "response" && value["id"] == "nb-stop" {
+                    assert_eq!(value["command"], "process_stop");
+                    assert!(
+                        value["success"].as_bool().unwrap_or(false),
+                        "stop failed: {value}"
+                    );
+                    saw_stop = true;
+                }
+                if saw_wait && saw_stop {
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => panic!("WebSocket failed: {error}"),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(saw_wait, "process_wait response never arrived after process_stop");
+    assert!(saw_stop, "process_stop response never arrived");
+
+    ws.close(None).await.ok();
+    handle.stop().await.expect("stop");
+    app.application.cleanup().await;
+}
+
+/// A WebSocket connection's pending command set is bounded: the next
+/// non-inline command is rejected immediately with the same "too many
+/// concurrent RPC commands" response as the stdio/HTTP paths (id preserved
+/// for client correlation), and every pending command still completes once
+/// the load drains.
+#[tokio::test]
+async fn ws_rejects_commands_beyond_concurrency_limit() {
+    let app = faux_application("listen-ws-saturation").await;
+    let (handle, _extension_ui) = listen(app.application.clone()).await;
+    let addr = handle.local_addr();
+    let mut ws = ws_connect(addr, None).await;
+
+    // Matches super::rpc::MAX_CONCURRENT_COMMANDS, kept literal here like the
+    // existing HTTP overload test.
+    const MAX_CONCURRENT_COMMANDS: usize = 16;
+
+    let spawn = json!({
+        "type": "process_spawn",
+        "id": "sat-spawn",
+        "spec": spawn_sleep_spec(app.cwd.path(), 30)
+    })
+    .to_string();
+    ws.send(WsMessage::Text(spawn.into()))
+        .await
+        .expect("send process_spawn");
+    let process_id = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).expect("parse spawn response");
+                    if value["type"] == "response" && value["id"] == "sat-spawn" {
+                        return value["data"]["id"]
+                            .as_str()
+                            .expect("spawn response process id")
+                            .to_owned();
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("WebSocket failed: {error}"),
+                None => panic!("WebSocket closed before process_spawn response"),
+            }
+        }
+    })
+    .await
+    .expect("process_spawn response timed out");
+
+    // Saturate the per-connection command set with long process_waits.
+    for index in 0..MAX_CONCURRENT_COMMANDS {
+        ws.send(WsMessage::Text(
+            json!({
+                "type": "process_wait",
+                "id": format!("sat-wait-{index}"),
+                "processId": process_id,
+                "timeoutMs": 60_000
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send saturated process_wait");
+    }
+    // The next non-inline command must be rejected immediately, before any
+    // pending wait can complete (the process still runs for 30s).
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "process_wait",
+            "id": "sat-overflow",
+            "processId": process_id,
+            "timeoutMs": 60_000
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send overflow process_wait");
+
+    let overflow = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).expect("parse ws frame");
+                    if value["type"] == "response" && value["id"] == "sat-overflow" {
+                        return value;
+                    }
+                    if value["type"] == "response"
+                        && value["id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("sat-wait-"))
+                    {
+                        panic!("a pending wait completed before the overflow rejection");
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("WebSocket failed: {error}"),
+                None => panic!("WebSocket closed before overflow rejection"),
+            }
+        }
+    })
+    .await
+    .expect("overflow rejection timed out");
+    assert_eq!(overflow["command"], "process_wait");
+    assert_eq!(overflow["success"], false);
+    assert!(
+        overflow["error"].as_str().is_some_and(|error| error
+            .contains("too many concurrent RPC commands (limit")),
+        "overflow body: {overflow}"
+    );
+
+    // process_stop is inline and must bypass the saturated set.
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "process_stop",
+            "id": "sat-stop",
+            "processId": process_id
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send process_stop");
+
+    // All pending waits resolve with their own ids once the process exits.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut pending: std::collections::BTreeSet<String> = (0..MAX_CONCURRENT_COMMANDS)
+        .map(|index| format!("sat-wait-{index}"))
+        .collect();
+    let mut saw_stop = false;
+    while tokio::time::Instant::now() < deadline && (!pending.is_empty() || !saw_stop) {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("parse ws frame");
+                if value["type"] == "response" {
+                    if let Some(id) = value["id"].as_str() {
+                        if pending.remove(id) {
+                            assert_eq!(value["command"], "process_wait");
+                            assert!(
+                                value["success"].as_bool().unwrap_or(false),
+                                "wait failed: {value}"
+                            );
+                            continue;
+                        }
+                        if id == "sat-stop" {
+                            assert_eq!(value["command"], "process_stop");
+                            assert!(
+                                value["success"].as_bool().unwrap_or(false),
+                                "stop failed: {value}"
+                            );
+                            saw_stop = true;
+                        }
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => panic!("WebSocket failed: {error}"),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(saw_stop, "process_stop response never arrived");
+    assert!(
+        pending.is_empty(),
+        "pending waits never completed: {pending:?}"
+    );
+
+    ws.close(None).await.ok();
+    handle.stop().await.expect("stop");
+    app.application.cleanup().await;
+}
+
+/// Disconnecting mid-command must not strand the pending task or the
+/// connection: the server answers the close handshake promptly (the read loop
+/// is not blocked in the long command), aborts the pending wait without
+/// killing the process, and stays healthy for fresh clients.
+#[tokio::test]
+async fn ws_disconnect_aborts_pending_command_tasks() {
+    let app = faux_application("listen-ws-disconnect").await;
+    let (handle, _extension_ui) = listen(app.application.clone()).await;
+    let addr = handle.local_addr();
+    let mut ws = ws_connect(addr, None).await;
+
+    let spawn = json!({
+        "type": "process_spawn",
+        "id": "disc-spawn",
+        "spec": spawn_sleep_spec(app.cwd.path(), 30)
+    })
+    .to_string();
+    ws.send(WsMessage::Text(spawn.into()))
+        .await
+        .expect("send process_spawn");
+    let process_id = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).expect("parse spawn response");
+                    if value["type"] == "response" && value["id"] == "disc-spawn" {
+                        return value["data"]["id"]
+                            .as_str()
+                            .expect("spawn response process id")
+                            .to_owned();
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("WebSocket failed: {error}"),
+                None => panic!("WebSocket closed before process_spawn response"),
+            }
+        }
+    })
+    .await
+    .expect("process_spawn response timed out");
+
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "process_wait",
+            "id": "disc-wait",
+            "processId": process_id,
+            "timeoutMs": 60_000
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send process_wait");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The close handshake must complete promptly. Before this fix the read
+    // loop was blocked inside process_wait and would not answer the close for
+    // the full 30s the process runs.
+    tokio::time::timeout(Duration::from_secs(5), ws.close(None))
+        .await
+        .expect("server did not answer the close handshake while a command was pending")
+        .ok();
+
+    // The server aborted the pending wait (not the process) and remains
+    // healthy for fresh clients.
+    let mut fresh = ws_connect(addr, None).await;
+    fresh.send(WsMessage::Text(
+        json!({"type":"get_state","id":"after-disconnect"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send get_state after disconnect");
+    let response = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match fresh.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).expect("parse get_state response");
+                    if value["type"] == "response" && value["id"] == "after-disconnect" {
+                        return value;
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("fresh WebSocket failed: {error}"),
+                None => panic!("fresh WebSocket closed before get_state response"),
+            }
+        }
+    })
+    .await
+    .expect("fresh WebSocket get_state timed out");
+    assert_eq!(response["command"], "get_state");
+    assert_eq!(response["success"], true);
+
+    // The aborted wait must not have killed the process: a short wait on the
+    // fresh connection times out with the process still running.
+    fresh.send(WsMessage::Text(
+        json!({
+            "type": "process_wait",
+            "id": "disc-wait-2",
+            "processId": process_id,
+            "timeoutMs": 1
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send short process_wait");
+    let short_wait = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match fresh.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).expect("parse ws frame");
+                    if value["type"] == "response" && value["id"] == "disc-wait-2" {
+                        return value;
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("fresh WebSocket failed: {error}"),
+                None => panic!("fresh WebSocket closed before process_wait response"),
+            }
+        }
+    })
+    .await
+    .expect("short process_wait response timed out");
+    assert!(
+        short_wait["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out waiting for process")),
+        "expected the short wait to time out with the process still running: {short_wait}"
+    );
+
+    fresh.send(WsMessage::Text(
+        json!({
+            "type": "process_stop",
+            "id": "disc-stop",
+            "processId": process_id
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send process_stop");
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut saw_stop = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, fresh.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).expect("parse ws frame");
+                if value["type"] == "response" && value["id"] == "disc-stop" {
+                    assert!(
+                        value["success"].as_bool().unwrap_or(false),
+                        "stop failed: {value}"
+                    );
+                    saw_stop = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => panic!("WebSocket failed: {error}"),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(saw_stop, "process_stop response never arrived");
 
     fresh.close(None).await.ok();
     handle.stop().await.expect("stop");

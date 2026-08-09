@@ -181,6 +181,28 @@ impl PtyProbe {
         }
     }
 
+    /// ANSI-stripped count: the inline TUI paints styled text as
+    /// per-character SGR runs, so raw matches miss visibly-present text.
+    fn count_plain(&self, needle: &str) -> usize {
+        let buffer = self.buffer.lock().expect("buffer lock");
+        strip_ansi(&buffer).matches(needle).count()
+    }
+
+    /// Wait for `needle` at least `want` times in the ANSI-normalized
+    /// output, or `timeout` elapses.
+    fn wait_for_plain_count(&self, needle: &str, want: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.count_plain(needle) >= want {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Wait for `needle` strictly after a captured stream byte offset and
     /// return the offset immediately following the match. This lets lifecycle
     /// tests prove event ordering without sleeps or ambiguous global counts.
@@ -230,9 +252,19 @@ impl Drop for PtyProbe {
     }
 }
 
-/// Wait for the inline TUI to acquire the cursor, with a generous timeout
-/// covering debug-build session setup.
+/// Wait until the TUI is fully entered and the composer chrome is rendered.
+/// A rendered marker proves the event loop is ready before the test sends
+/// input; startup itself performs no terminal capability reads from stdin.
+/// The panic-injection test never renders a frame and must use
+/// [`await_acquired`] instead.
 fn await_entered(probe: &PtyProbe) -> bool {
+    probe.wait_for_plain_count("faux/faux-1", 1, Duration::from_secs(30))
+        || probe.wait_for_plain_count("Recent sessions", 1, Duration::from_secs(15))
+}
+
+/// Terminal acquisition only: the panic-injection test fires its panic right
+/// after `TerminalGuard::enter()`, before any frame is rendered.
+fn await_acquired(probe: &PtyProbe) -> bool {
     probe.wait_for_count(HIDE_CURSOR, 1, Duration::from_secs(30))
 }
 
@@ -282,6 +314,27 @@ fn pty_clean_exit_restores_terminal() {
 }
 
 #[test]
+fn pty_startup_preserves_input_sent_after_terminal_acquisition() {
+    let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"], &[]);
+    assert!(
+        await_acquired(&probe),
+        "TUI must acquire the terminal before startup input: {}",
+        probe.snapshot()
+    );
+    probe.bracketed_paste("startup-keystroke");
+    assert!(
+        probe.wait_for_plain_count("startup-keystroke", 1, Duration::from_secs(30)),
+        "the event loop must render every byte typed during startup: {}",
+        probe.snapshot()
+    );
+    probe.send(&[CTRL_C, CTRL_C]);
+    let status = probe
+        .wait_exit(Duration::from_secs(15))
+        .expect("rpi must exit after Ctrl+C twice");
+    assert!(status.success(), "startup-input probe must exit cleanly: {status:?}");
+}
+
+#[test]
 fn pty_settings_overlay_escape_does_not_retain_settings_in_scrollback() {
     // Open /settings on the normal-screen inline TUI, dismiss with Escape, keep
     // interacting, then quit. The PTY capture is the native scrollback surface:
@@ -310,27 +363,42 @@ fn pty_settings_overlay_escape_does_not_retain_settings_in_scrollback() {
         "settings overlay must render: {}",
         probe.snapshot()
     );
-    // Distinct settings chrome only present while the page is open.
+    // The settings footer is wider than the 80-column viewport, so the apply
+    // and scope chords near its end ("Ctrl-S apply", "type to filter") are
+    // truncated and never painted. "Del reset" appears in both footer variants
+    // and lands within the viewport, so it is the observable proof the overlay
+    // actually rendered. Wait for it through the PTY capture before dismissing
+    // instead of an arbitrary sleep.
     assert!(
-        probe.wait_for_count("Ctrl-S apply", 1, Duration::from_secs(5))
-            || probe.snapshot().contains("type to filter")
-            || probe.snapshot().contains("Ctrl-G"),
-        "settings help chrome must be visible while open: {}",
+        wait_for_live_viewport_contains(&probe, "Del reset", Duration::from_secs(20)),
+        "settings footer chrome must be painted before Escape: {}",
         probe.snapshot()
     );
-    thread::sleep(Duration::from_millis(150));
 
     // Escape dismisses the page overlay; clear-on-dismiss erases live pixels.
+    // Observe the chrome actually leaving the live viewport before continuing.
     probe.send(b"\x1b");
-    thread::sleep(Duration::from_millis(200));
+    assert!(
+        wait_for_live_viewport_absent(&probe, "Del reset", Duration::from_secs(10)),
+        "Escape must clear the settings overlay from the live viewport: {}",
+        probe.snapshot()
+    );
 
     // Continue without submitting a model turn (avoid faux prompt races). Type
     // into the composer then wipe with Ctrl-C so any dirty overlay rows would
     // still have had a chance to be committed if the dismiss clear were missing.
     probe.send(b"hello after settings");
-    thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_for_live_viewport_contains(&probe, "hello after settings", Duration::from_secs(10)),
+        "post-settings composer input must render: {}",
+        probe.snapshot()
+    );
     probe.send(&[CTRL_C]);
-    thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_for_live_viewport_absent(&probe, "hello after settings", Duration::from_secs(10)),
+        "Ctrl-C must clear the composer input: {}",
+        probe.snapshot()
+    );
 
     probe.send(&[CTRL_D]);
     assert!(
@@ -356,10 +424,12 @@ fn pty_settings_overlay_escape_does_not_retain_settings_in_scrollback() {
     // The full PTY write log still contains the open-frame paint (expected).
     // Retained scrollback is the content that survives after the dismiss clear
     // of the live inline viewport. Take the suffix after the first clear that
-    // follows the open settings chrome — that is the post-Escape surface.
+    // follows the open settings chrome — that is the post-Escape surface. The
+    // footer is truncated at 80 columns, so anchor on chrome that is actually
+    // painted within the viewport ("Del reset" / "Ctrl-G/P").
     let settings_open_at = output
-        .find("Ctrl-S apply")
-        .or_else(|| output.find("type to filter"))
+        .find("Del reset")
+        .or_else(|| output.find("Ctrl-G/P"))
         .expect("open settings chrome must have been painted");
     let after_open = &output[settings_open_at..];
     let post_dismiss = after_open
@@ -422,7 +492,6 @@ fn strip_ansi(input: &str) -> String {
                 }
                 Some(']') => {
                     chars.next();
-                    // OSC ... BEL or ST
                     while let Some(next) = chars.next() {
                         if next == '\u{7}' {
                             break;
@@ -562,21 +631,21 @@ fn replay_terminal_scrollback(input: &str, width: usize, height: usize) -> Vec<S
 }
 
 /// Wait until the inline composer is idle: the composer header line (the
-/// `╭── π … faux/faux-1 …╮` top border) is rendered AND its activity segment
-/// is absent. `composer_status_display` prepends the `⟲` activity separator
-/// only while busy (streaming/compacting/goal/non-default status); the idle
-/// `Ready` state omits `⟲` entirely (see `composer_header_line`). Unlike the
-/// `working` label — which `truncate_status_text` can shorten to `workin…`,
-/// `worki…`, `work…`, … depending on width — the `⟲` separator is dropped only
-/// as a whole, so its absence is a truncation-proof signal that the active
-/// `working` turn cleared and the composer is usable again.
+/// `╭── π … faux/faux-1 …╮` top border) is rendered AND the OMP-style status
+/// line directly above it is blank. While busy that status line carries the
+/// spinner/activity text (`⟲ working` / rotating frame); idle it is empty —
+/// the row is always reserved by the layout, so its emptiness is a
+/// truncation-proof signal that the active `working` turn cleared and the
+/// composer is usable again.
 fn wait_for_idle_composer(probe: &PtyProbe, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         let retained = replay_terminal_scrollback(&probe.snapshot(), 80, 24);
         let live_start = retained.len().saturating_sub(24);
-        let idle = retained[live_start..].iter().any(|line| {
-            line.contains('╭') && line.contains("faux/faux-1") && !line.contains('⟲')
+        let idle = retained[live_start..].windows(2).any(|rows| {
+            rows[1].contains('╭')
+                && rows[1].contains("faux/faux-1")
+                && rows[0].trim().is_empty()
         });
         if idle {
             return true;
@@ -588,9 +657,76 @@ fn wait_for_idle_composer(probe: &PtyProbe, timeout: Duration) -> bool {
     }
 }
 
+/// Wait until `needle` appears in the *committed* scrollback — the replayed
+/// region above the live 24-row viewport — rather than merely in the live
+/// paint. The inline TUI streams assistant content into the live viewport
+/// first and only promotes it to native scrollback through `insert_before`
+/// once the turn settles. The streaming indicator can clear just ahead of the
+/// still-queued `MessageEnd` (see the animation-tick note in `tui.rs`), so
+/// [`wait_for_idle_composer`] alone is not proof that the prior turn's
+/// assistant was actually committed. Observing the commit through the PTY
+/// capture keeps the test from exiting before the assistant content is
+/// durable, without an arbitrary sleep.
+fn wait_for_committed_scrollback(probe: &PtyProbe, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let retained = replay_terminal_scrollback(&probe.snapshot(), 80, 24);
+        let scrollback_end = retained.len().saturating_sub(24);
+        if scrollback_end > 0
+            && retained[..scrollback_end]
+                .iter()
+                .any(|line| line.contains(needle))
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Wait until `needle` is present in the live 24-row viewport (the replayed
+/// surface's last 24 rows). Used to observe an overlay actually painting its
+/// chrome before dismissing it — through the PTY capture, not an arbitrary
+/// sleep. The settings footer is truncated at the 80-column viewport, so the
+/// apply/scope chords near its end are never painted; the caller passes a
+/// chrome token that is actually rendered within the viewport.
+fn wait_for_live_viewport_contains(probe: &PtyProbe, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let retained = replay_terminal_scrollback(&probe.snapshot(), 80, 24);
+        let live_start = retained.len().saturating_sub(24);
+        if retained[live_start..].iter().any(|line| line.contains(needle)) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Wait until `needle` is absent from the live 24-row viewport. Used to observe
+/// a dismiss/erase actually clearing painted pixels before the next step.
+fn wait_for_live_viewport_absent(probe: &PtyProbe, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let retained = replay_terminal_scrollback(&probe.snapshot(), 80, 24);
+        let live_start = retained.len().saturating_sub(24);
+        if !retained[live_start..].iter().any(|line| line.contains(needle)) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn pty_committed_turns_never_promote_standalone_working_composer() {
-    let response = "assistant-scrollback-marker ".repeat(80);
+    let response = "assistant-scrollback-marker ".repeat(3);
     let mut probe = PtyProbe::spawn(
         &["--model", "faux/faux-1"],
         &[("PI_FAUX_RESPONSE", response.as_str())],
@@ -631,6 +767,16 @@ fn pty_committed_turns_never_promote_standalone_working_composer() {
             probe.snapshot()
         );
     }
+    // The streaming indicator can clear ahead of the queued `MessageEnd`, so
+    // an idle composer is not proof the prior turns' assistant content was
+    // committed. Observe the actual `insert_before` promotion through the PTY
+    // capture before exiting: at least one prior assistant turn must already
+    // be durable in scrollback (the final exit flush commits any remainder).
+    assert!(
+        wait_for_committed_scrollback(&probe, "assistant-scrollback-marker", Duration::from_secs(20)),
+        "a prior assistant turn must commit to scrollback before exit: {}",
+        probe.snapshot()
+    );
 
     probe.send(&[CTRL_D]);
     assert!(
@@ -642,7 +788,6 @@ fn pty_committed_turns_never_promote_standalone_working_composer() {
         .wait_exit(Duration::from_secs(15))
         .expect("rpi must exit after committed turns");
     assert!(status.success(), "committed-turn exit must succeed: {status:?}");
-
     let retained = replay_terminal_scrollback(&probe.snapshot(), 80, 24);
     let committed = retained
         .iter()
@@ -659,14 +804,17 @@ fn pty_committed_turns_never_promote_standalone_working_composer() {
         committed.iter().any(|line| line.contains("assistant-scrollback-marker")),
         "committed assistant content must survive terminal replay: {committed:#?}"
     );
-    let stale_composer = committed.windows(2).any(|rows| {
-        rows[0].contains("╭── π")
-            && rows[0].contains("working")
-            && rows[1].trim_start().starts_with("╰─")
+    // Transient composer chrome now spans three rows — the OMP-style status
+    // line (spinner/`working`), the `╭── π` header, and the `╰─` footer — and
+    // none of that frame may leak into committed scrollback.
+    let stale_composer = committed.windows(3).any(|rows| {
+        rows[0].contains("working")
+            && rows[1].contains("╭── π")
+            && rows[2].trim_start().starts_with("╰─")
     });
     assert!(
         !stale_composer,
-        "standalone working composer frame leaked into scrollback: {committed:#?}"
+        "standalone working status+composer frame leaked into scrollback: {committed:#?}"
     );
     assert!(
         !committed.iter().any(|line| line.contains("╭── π") && line.contains("working")),
@@ -715,7 +863,7 @@ fn pty_panic_restores_terminal() {
         &["--model", "faux/faux-1"],
         &[("PI_TEST_PANIC_AFTER_ENTER", "1")],
     );
-    assert!(await_entered(&probe), "TUI must acquire the cursor before panicking: {}", probe.snapshot());
+    assert!(await_acquired(&probe), "TUI must acquire the cursor before panicking: {}", probe.snapshot());
     assert!(!probe.snapshot().contains(ENTER_ALT));
     assert!(
         probe.wait_for_count(SHOW_CURSOR, 1, Duration::from_secs(15)),
@@ -729,6 +877,19 @@ fn pty_panic_restores_terminal() {
         status.code(),
         Some(101),
         "uncaught panic must exit with code 101: {status:?}"
+    );
+    let out = probe.snapshot();
+    // The panic report must be written BEFORE the terminal restore: the
+    // restore emits a tmux passthrough DCS that leaves tmux's screen parser
+    // unable to render anything written after it, so a report printed after
+    // the restore is invisible in a tmux pane (silent exit 101). The report
+    // must also carry the payload and a backtrace, not just the restore.
+    let message_at = out.find("pi-test: panic after TUI enter");
+    let backtrace_at = out.find("stack backtrace:");
+    let show_at = out.find(SHOW_CURSOR);
+    assert!(
+        matches!((message_at, backtrace_at, show_at), (Some(m), Some(b), Some(s)) if m < s && b < s),
+        "panic report (message + backtrace) must precede the terminal restore in the pty stream: {out}"
     );
 }
 
@@ -924,8 +1085,9 @@ fn pty_loop_iteration_esc_aborts_without_failure_toast() {
 
     probe.send(&[ESC]);
     // The abort must clear the active `working` UI and restore the idle
-    // composer (status settles to `Ready`, which omits the `⟲` activity
-    // segment). Assert this directly — not via the transient "Aborting"
+    // composer: the OMP-style status line above the header carries the
+    // spinner/`working` text while streaming and is blank once the turn
+    // settles. Assert this directly — not via the transient "Aborting"
     // status text, which is only rendered while NOT streaming and therefore
     // never appears for an in-flight cancellation.
     assert!(

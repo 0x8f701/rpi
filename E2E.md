@@ -1,13 +1,12 @@
 # rpi End-to-End Verification
 
-This handbook defines the release verification contract for `rpi` 0.2.0. It uses repository-relative paths and isolated temporary homes. Do not record local absolute paths, private endpoints, credential filenames, or credential values in committed evidence.
+This handbook defines the release verification contract for `rpi` 0.2.4. It uses repository-relative paths and isolated temporary homes. Do not record local absolute paths, private endpoints, credential filenames, or credential values in committed evidence.
 
 All prose, fixtures, agent definitions, skill bodies, and faux responses used by deterministic campaigns are English-only.
 
 ## Product contract
 
-- Primary executable: `rpi`.
-- RPC companion executable: `rpi-rpc`.
+- Primary executable: `rpi` (JSONL RPC control plane via the `rpi rpc` subcommand).
 - Managed install root: `~/.rpi` by default, overridden by `PI_HOME`.
 - Active executable: `~/.rpi/bin/rpi` on Unix and `%USERPROFILE%\.rpi\bin\rpi.exe` on Windows.
 - Runtime configuration remains compatible with the upstream Pi layout: `~/.pi/agent`, project `.pi/`, and `PI_*` environment variables.
@@ -67,7 +66,7 @@ This lane uses isolated homes, the faux provider, recorded fixtures, and bounded
 - `rpi --version`
 - JSON lifecycle output
 - LF-delimited RPC commands and responses
-- command discovery with exactly 12 primary slash commands, including `/workflow`
+- command discovery with exactly 22 primary slash commands, including `/workflow`
 - foreground bash
 - process supervision and `/ps`
 - loop scheduling
@@ -76,7 +75,7 @@ This lane uses isolated homes, the faux provider, recorded fixtures, and bounded
 - TUI Todo refresh after tree/fork/new-session (`replace_transcript_refreshes_todo_phases`)
 - session naming, tree, and state
 - orchestration umbrella: `orchestration.rpc` + `orchestration.rust` (`cargo +1.88.0`); `orchestration.tmux` when `tmux` is available — hard compact `Task N agents` card, NL exact vs skill-only, bidirectional IRC (rust), exact `/goal`/`/ps`
-- trusted Bun extension commands when Bun is available (`E2E_CI_EXTENSION=1`)
+- trusted QuickJS extension commands (`E2E_CI_EXTENSION=1`)
 - installer static regression checks
 - optional geometry matrix when `E2E_CI_TMUX=1`
 
@@ -107,7 +106,7 @@ RPI_BIN=target/release-dist/rpi bash E2E.d/release/archive-fixture-smoke.sh run
 The archive gate verifies:
 
 - exactly five platform archives
-- exact `rpi-0.2.0-<target-triple>` names
+- exact `rpi-0.2.4-<target-triple>` names
 - a single root-level `rpi` or `rpi.exe`
 - a root-level `LICENSE`
 - a complete and valid `SHA256SUMS`
@@ -137,11 +136,19 @@ Live scenarios cover architecture research, a build-and-fix task, running-child 
 
 ## Focused Rust gates
 
-The release workflow runs focused Rust 1.88.0 checks for workspace compilation, provider and agent contracts, coding tools, todo DAG behavior, process/session lifecycles, structured output modes, trusted Bun extensions, self-update, installers, and the release-dist binary.
+The separate hosted Test workflow (`test.yml`) gates focused Rust 1.88.0 checks
+for workspace compilation, provider and agent contracts, coding tools, todo DAG
+behavior, process/session lifecycles, structured output modes, trusted QuickJS
+extensions, self-update, installers, and the release-dist binary. The release
+workflow (`release.yml`) invokes the reusable `test.yml` `verify-tag-commit`
+job to re-run those tests against the exact tag commit before building archives
+and publishing them.
 
-Before a tag is created, also run the complete library suites serially:
+Before a tag is created, also run the complete library suites serially, plus the Codex provider loopback integration tests (the only tests covering `openai-codex-responses`):
 
 ```sh
+cargo +1.88.0 test -p pi-ai --lib --locked
+cargo +1.88.0 test -p pi-ai --test codex_transport --locked -- --test-threads=1
 cargo +1.88.0 test -p pi-agent --lib --locked -- --test-threads=1
 cargo +1.88.0 test -p pi-coding --lib --locked -- --test-threads=1
 cargo +1.88.0 test -p pi-cli --lib --locked -- --test-threads=1
@@ -160,7 +167,7 @@ Orchestration-focused cargo gates are also driven by `bash E2E.d/ci/orchestratio
 | `campaign.rpc-state` | same umbrella | 40s | `$EVIDENCE_ROOT/rpc-state/{output.jsonl,stderr.log}` | RPC responses succeed for models, commands, bash, todos, todo-state, goal, goal-get, loop, loops, spawn, process-list, state, name, tree; goal objective `deterministic release readiness`; todo task blockedBy inventory; ≥1 process |
 | `campaign.orchestration` | `bash E2E.d/ci/campaigns.sh orchestration` or umbrella `run` | see orchestration | nested under orchestration evidence | `todo_dag_execution` + NL/IRC both ways + hard compact-agent tmux + TUI Todo refresh gate; rpc+rust always; tmux when available |
 | `campaign.bash-tui` | `bash E2E.d/ci/campaigns.sh bash-tui` or umbrella `run` | 90s | `$EVIDENCE_ROOT/bash-tui/{tui.txt,assertions.json}` | foreground Bash sees EOF, unattended prompt/pager environment reaches the child, the tool turn completes, and an unsent composer sentinel remains editable |
-| `campaign.workflow` | `bash E2E.d/ci/campaigns.sh workflow` or `bash E2E.d/ci/workflow.sh run` (**opt-in**, not default `ci.sh`) | see workflow | nested under workflow evidence | Multi-workflow RPC and tmux contracts below; full campaign verified on the 0.2.0 release candidate |
+| `campaign.workflow` | `bash E2E.d/ci/campaigns.sh workflow` or `bash E2E.d/ci/workflow.sh run` (**opt-in**, not default `ci.sh`) | see workflow | nested under workflow evidence | Multi-workflow RPC and tmux contracts below; full 0.2.4 campaign passed (`RPI_BIN=target/release-dist/rpi bash E2E.d/ci/workflow.sh run`, exit 0, evidence under `$EVIDENCE_ROOT`; `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` all passed) |
 | `campaign.extension` | `E2E_CI_EXTENSION=1 bash E2E.d/ci.sh` or `bash E2E.d/ci/campaigns.sh extension` | tmux sleeps ~5s + command | `$EVIDENCE_ROOT/extension/{tui.txt,tui.ansi}` | pane contains `alpha:hello` and `beta:two` |
 | `campaign.tmux-matrix` | `E2E_CI_TMUX=1 bash E2E.d/ci.sh` or `bash E2E.d/ci/campaigns.sh tmux-matrix` | ~6s per size | `$EVIDENCE_ROOT/tmux-{90x31,120x31,163x40}/{tui.txt,tui.ansi,metadata.txt}` | each size captures `matrix input probe` |
 
@@ -284,10 +291,12 @@ Cleanup: `tmux kill-session` for the unique session name; outer `cleanup_e2e` re
 
 ### Workflow campaigns (`E2E.d/ci/workflow.sh`)
 
-**Execution status: PASSED on the 0.2.0 release candidate.**
-The full `bash E2E.d/ci/workflow.sh run` campaign completed with both
-`workflow.rpc` and `workflow.tmux` execution statuses set to `passed`. Workflow remains
-an explicit release lane rather than part of default `bash E2E.d/ci.sh`.
+**Execution status: passed for 0.2.4.**
+The full `bash E2E.d/ci/workflow.sh run` campaign passed for 0.2.4 with
+`workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` execution statuses
+set to `passed` (evidence under `$EVIDENCE_ROOT`).
+Workflow remains an explicit release lane rather than part of default
+`bash E2E.d/ci.sh`.
 
 ```sh
 bash E2E.d/ci/workflow.sh list
@@ -384,9 +393,9 @@ Default live timeout: `LIVE_TIMEOUT_SECONDS` (900s unless overridden).
 
 Every user-reported regression maps to an executable lane. Lanes claim **observable behavior**, not source text.
 
-### 1. Command discovery (12 primary slash commands)
+### 1. Command discovery (22 primary slash commands)
 
-**Lane:** RPC + unit/integration + executed workflow RPC/tmux campaign. `/workflow` is one of the 12 primary commands and owns the multi-workflow product surface.
+**Lane:** RPC + unit/integration + executed workflow RPC/tmux campaign. `/workflow` is one of the 22 primary commands and owns the multi-workflow product surface.
 
 **Commands:**
 
@@ -400,11 +409,11 @@ cargo +1.88.0 test -p pi-cli --test rpc_binary --locked
 
 **Expected visible / structured set (exactly these primary names):**
 
-`settings`, `model`, `branch`, `resume`, `fork`, `export`, `agents`, `compact`, `ps`, `loop`, `goal`, `workflow`
+`settings`, `model`, `branch`, `resume`, `fork`, `export`, `dump`, `handoff`, `agents`, `role`, `persona`, `compact`, `rewind`, `checkpoint`, `ps`, `loop`, `goal`, `workflow`, `code-review`, `btw`, `queue`, `live`
 
 TUI slash discovery MUST surface exactly:
 
-`/settings`, `/model`, `/branch`, `/resume`, `/fork`, `/export`, `/agents`, `/compact`, `/ps`, `/loop`, `/goal`, `/workflow`
+`/settings`, `/model`, `/branch`, `/resume`, `/fork`, `/export`, `/dump`, `/handoff`, `/agents`, `/role`, `/persona`, `/compact`, `/rewind`, `/checkpoint`, `/ps`, `/loop`, `/goal`, `/workflow`, `/code-review`, `/btw`, `/queue`, `/live`
 
 **Evidence:** `$EVIDENCE_ROOT/campaign-tools/output.jsonl` or `$EVIDENCE_ROOT/rpc-state/output.jsonl` (`commands` response).
 
@@ -815,20 +824,25 @@ Any `timeout` kill is a hard failure. Evidence directories MUST remain for diagn
 | Clipboard image in tmux | Optional/best-effort; rust fixture authoritative. |
 | Sparse palette / code highlighting / user no-indent | Covered by focused `cargo +1.88.0` tests, not `orchestration.sh`. |
 | Skills loading beyond routing | Resource/selector cargo tests; not a separate E2E.d shell scenario. |
+| Multi-workflow campaign (`E2E.d/ci/workflow.sh run`) | Passed for 0.2.4 (`workflow.rpc`, `workflow.tmux`, `workflow.goal-tmux`). Default `E2E.d/ci.sh` includes the user-perspective workflow TUI scenario on tmux hosts; the authoritative RPC/tmux/goal lanes run separately (and are gated by the hosted Test workflow). |
 
 ## Release checklist
 
-1. Workspace version and lockfile workspace packages are `0.2.0`.
+1. Workspace version and lockfile workspace packages are `0.2.4`.
 2. `cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked` succeeds.
-3. `target/release-dist/rpi --version` prints `rpi 0.2.0`.
-4. Complete library suites pass.
+3. `target/release-dist/rpi --version` prints `rpi 0.2.4`.
+4. Complete library suites pass, including `cargo +1.88.0 test -p pi-ai --test codex_transport --locked` (Codex WS/SSE loopback contracts).
 5. `bash E2E.d/ci.sh` passes (includes orchestration umbrella after core campaigns).
 6. `bash E2E.d/ci/orchestration.sh run` passes on a tmux-capable host (or rpc+rust with explicit tmux skip log).
 7. The release archive fixture passes.
 8. Installer and self-update fixtures pass.
 9. README installation commands match `install.sh`, `install.ps1`, and the published archive names.
 10. The release commit contains no credentials, local paths, build artifacts, exported sessions, or generated diagrams.
-11. Tag `v0.2.0` points exactly at the verified release commit.
-12. Push the release commit, then push `v0.2.0` to the GitHub remote.
+11. Tag `v0.2.4` points exactly at the verified release commit.
+    — Tagging is not performed locally per repository policy (`AGENTS.md` push
+      prohibition); left for the release manager after final review.
+12. Push the release commit, then push `v0.2.4` to the GitHub remote.
+    — **Not performed locally** per `AGENTS.md`; this agent does not push.
 13. Confirm every hosted build and the GitHub Release publication job succeeds.
+    — Depends on step 12, which is not performed locally.
 14. Confirm regression matrix rows 1–12 either passed or are explicitly listed under Known gaps for this tag.

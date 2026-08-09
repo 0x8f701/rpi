@@ -223,7 +223,7 @@ class GoalWorkflowHandler(BaseHTTPRequestHandler):
         text = message_text(body)
         names = tool_names(body)
         supervisor = re.search(
-            r"You supervise workflow\s+([^\s.]+)\.\s*Objective:\s*([^\n<]+)", text
+            r"You plan workflow\s+([^\s.]+)\.\s*Objective:\s*([^\n<]+)", text
         )
         if supervisor:
             return self.route_supervisor(body, text, names, supervisor)
@@ -357,7 +357,7 @@ class GoalWorkflowHandler(BaseHTTPRequestHandler):
                     "agent": None,
                     "task": None,
                     "todoTaskId": None,
-                    "context": None,
+                    "context": "Shared goal contract: both workers operate on the same active goal and its Zig objective; complete the assigned phase and report executable proof.",
                     "tasks": [
                         {
                             "name": "GoalResearch",
@@ -425,6 +425,17 @@ def wait_for_all(session: str, needles: list[str], timeout: float = 20.0) -> str
             raise STATE.error
         time.sleep(0.15)
     raise AssertionError(f"TUI omitted {needles!r}; final pane:\n{latest}")
+
+def select_todo_overview_row(session: str, identity: str, max_moves: int = 64) -> str:
+    needle = identity[:17]
+    latest = ""
+    for _ in range(max_moves):
+        latest = capture(session)
+        if any("›" in line and needle in line for line in latest.splitlines()):
+            return latest
+        tmux("send-keys", "-t", f"{session}:0", "Down")
+        time.sleep(0.05)
+    raise AssertionError(f"Todo DAG overview never selected {needle!r}; final pane:\n{latest}")
 
 
 def send_command(session: str, command: str) -> None:
@@ -577,7 +588,7 @@ def main() -> None:
             "--api-key",
             secrets.token_urlsafe(24),
         )
-        boot = wait_for_all(session, ["Start typing"], timeout=30.0)
+        boot = wait_for_all(session, ["Welcome back!", "goal-workflow-e2e/mock"], timeout=30.0)
         (evidence / "boot.txt").write_text(boot, encoding="utf-8")
         if "exited" in boot.lower() or "RPI_EXIT=" in boot:
             raise AssertionError(f"rpi exited before campaign input:\n{boot}")
@@ -618,10 +629,11 @@ def main() -> None:
         workflow_list = wait_for_all(
             session,
             [
+                "Workflows · 4/4",
                 "zig-agent",
                 "moonbit-agent",
-                ZIG_WORKFLOW_OBJECTIVE,
-                MOONBIT_WORKFLOW_OBJECTIVE,
+                ZIG_WORKFLOW_OBJECTIVE[:10],
+                MOONBIT_WORKFLOW_OBJECTIVE[:10],
             ],
         )
         (evidence / "workflow-list.txt").write_text(workflow_list, encoding="utf-8")
@@ -648,7 +660,7 @@ def main() -> None:
                 "Main session",
                 "Goal Zig Research",
                 "analyze active goal Zig",
-                "job: task · completed",
+                "task (task) · completed",
             ],
         )
         (evidence / "todo-detail-main.txt").write_text(main_detail, encoding="utf-8")
@@ -675,13 +687,12 @@ def main() -> None:
             for name, workflow_id in sorted_workflows
         ]
         for index, (name, phase, identity) in enumerate(ordered):
-            tmux("send-keys", "-t", f"{session}:0", "Down")
-            time.sleep(0.15)
+            select_todo_overview_row(session, identity)
             tmux("send-keys", "-t", f"{session}:0", "Enter")
+            time.sleep(0.15)
             language = "Moonbit" if "moonbit" in name else "Zig"
             needles = [
-                phase,
-                "job: worker · completed",
+                "worker · completed",
                 identity,
                 f"worker research {language} workflow {identity}",
             ]

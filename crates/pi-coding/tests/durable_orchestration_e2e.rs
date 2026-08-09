@@ -40,33 +40,37 @@ use tokio::sync::{Barrier, Notify};
 use tokio_util::sync::CancellationToken;
 
 fn task_definition() -> AgentDefinition {
-    AgentDefinition {
-        name: "task".to_owned(),
-        description: "background task".to_owned(),
-        system_prompt: "complete the assignment thoroughly".to_owned(),
-        tools: Some(Vec::new()),
-        autoload_skills: Vec::new(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        source: AgentDefinitionSource::Bundled,
-        path: None,
-        trusted: true,
-    }
+    AgentDefinition { name: "task".to_owned(),
+    description: "background task".to_owned(),
+    system_prompt: "complete the assignment thoroughly".to_owned(),
+    tools: Some(Vec::new()),
+    autoload_skills: Vec::new(),
+    model: None,
+    thinking_level: Some(ThinkingLevel::Off),
+    max_turns: None,
+    max_tool_calls: None,
+    timeout_secs: None,
+    disallowed_tools: Vec::new(),
+    capability_ceiling: None,
+    source: AgentDefinitionSource::Bundled,
+    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
 fn reviewer_definition() -> AgentDefinition {
-    AgentDefinition {
-        name: "reviewer".to_owned(),
-        description: "code reviewer".to_owned(),
-        system_prompt: "review carefully".to_owned(),
-        tools: Some(Vec::new()),
-        autoload_skills: Vec::new(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        source: AgentDefinitionSource::Bundled,
-        path: None,
-        trusted: true,
-    }
+    AgentDefinition { name: "reviewer".to_owned(),
+    description: "code reviewer".to_owned(),
+    system_prompt: "review carefully".to_owned(),
+    tools: Some(Vec::new()),
+    autoload_skills: Vec::new(),
+    model: None,
+    thinking_level: Some(ThinkingLevel::Off),
+    max_turns: None,
+    max_tool_calls: None,
+    timeout_secs: None,
+    disallowed_tools: Vec::new(),
+    capability_ceiling: None,
+    source: AgentDefinitionSource::Bundled,
+    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
 fn test_model() -> Model {
@@ -461,6 +465,7 @@ fn running_job(id: &str, agent_id: &str) -> JobSnapshot {
         started_at: Some(1_050),
         finished_at: None,
         result: None,
+        soft_budget_exhausted: false,
     }
 }
 
@@ -985,6 +990,7 @@ async fn revival_claim_failure_keeps_committed_mailbox_message() {
             started_at: Some(index),
             finished_at: Some(index),
             result: None,
+            soft_budget_exhausted: false,
         })
         .collect();
     let sidecar = plant_sidecar(
@@ -1132,7 +1138,10 @@ async fn lifecycle_rebind_after_runtime_and_session_replacement() {
     let task = tool(&tools, "task");
     let spawn = (task.execute)(context(
         "spawn-new",
-        json!({ "tasks": [{ "name": "Fresh", "task": "work under new parent" }] }),
+        json!({
+            "context": "Replacement-runtime roster check: complete the assignment so the parent can verify a fresh child under the new runtime.",
+            "tasks": [{ "name": "Fresh", "task": "work under new parent" }]
+        }),
     ))
     .await
     .expect("spawn under new parent");
@@ -1217,6 +1226,7 @@ async fn sibling_roster_same_batch_visibility_and_xml_bounds() {
     let spawn = (task.execute)(context(
         "batch-spawn",
         json!({
+            "context": "Same-batch sibling visibility check: children spawned together must each appear in the others' peer rosters and complete independently.",
             "tasks": [
                 { "name": "Alpha", "agent": "task", "task": "first sibling" },
                 { "name": "Beta", "agent": "reviewer", "task": "second sibling" },
@@ -1278,6 +1288,12 @@ async fn sibling_roster_same_batch_visibility_and_xml_bounds() {
         assert!(
             roster.ends_with("</peer_roster>"),
             "stable roster footer: {roster}"
+        );
+        assert!(
+            prompt.contains(
+                "<context>\nSame-batch sibling visibility check: children spawned together must each appear in the others' peer rosters and complete independently.\n</context>"
+            ),
+            "{child_id} prompt must carry the shared batch CONTEXT section: {prompt}"
         );
     }
 
@@ -1408,7 +1424,10 @@ async fn durable_spawn_keeps_parent_catalog_clean_and_nested_child_root() {
     let task = tool(&tools, "task");
     let spawn = (task.execute)(context(
         "spawn-isolated",
-        json!({ "tasks": [{ "name": "Nested", "task": "write under child root" }] }),
+        json!({
+            "context": "Child-root isolation check: perform the assignment inside the durable child's own root directory.",
+            "tasks": [{ "name": "Nested", "task": "write under child root" }]
+        }),
     ))
     .await
     .expect("spawn");
@@ -1915,6 +1934,7 @@ async fn public_recovery_rejects_active_child_without_mutating_live_state() {
                 agent: "task".to_owned(),
                 assignment: "remain active across rejected recovery".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn active child")
@@ -1983,6 +2003,7 @@ async fn running_woken_message_is_durable_before_active_delivery() {
                 agent: "task".to_owned(),
                 assignment: "remain active for delivery".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn running child");
@@ -2093,6 +2114,7 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
                 agent: "task".to_owned(),
                 assignment: "initial public durable turn".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("public spawn");
@@ -2218,6 +2240,7 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
                 agent: "task".to_owned(),
                 assignment: "old application child".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn Legacy");
@@ -2321,6 +2344,7 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
                 agent: "task".to_owned(),
                 assignment: "new application child".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn Fresh after Application cutover");

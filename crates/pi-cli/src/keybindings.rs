@@ -17,11 +17,36 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// Stable upstream action identifiers matched by the dispatch layer. Contextual
-/// selector actions are only exposed when their product flow has an executable
-/// handler; accepting a configured action and silently dropping it is forbidden.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Action {
+/// Declares the [`Action`] enum and its exhaustive variant list from one token
+/// list: [`Action::ALL`] is emitted from the same variants, so a newly added
+/// action can never be omitted from the enumeration the registry test relies
+/// on.
+macro_rules! actions {
+    ($(
+        $(#[$attr:meta])*
+        $variant:ident
+    ),* $(,)?) => {
+        /// Stable upstream action identifiers matched by the dispatch layer.
+        /// Contextual selector actions are only exposed when their product
+        /// flow has an executable handler; accepting a configured action and
+        /// silently dropping it is forbidden.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum Action {
+            $(
+                $(#[$attr])*
+                $variant,
+            )*
+        }
+
+        impl Action {
+            /// Every action variant in declaration order, generated from the
+            /// enum's defining token list.
+            pub const ALL: &[Self] = &[ $( Self::$variant, )* ];
+        }
+    };
+}
+
+actions! {
     EditorSubmit,
     EditorNewline,
     EditorBackspace,
@@ -60,7 +85,6 @@ pub enum Action {
     ThinkingToggle,
     ModelCycleForward,
     ModelSelect,
-
     ModelCycleBackward,
     ToolsExpand,
     FollowUp,
@@ -92,6 +116,13 @@ pub enum Action {
     TreeFilterAll,
     TreeFilterCycleForward,
     TreeFilterCycleBackward,
+    /// Hold-to-talk microphone capture while `/live` mode is on: press
+    /// starts recording, release transcribes into the composer draft.
+    LivePtt,
+    /// Flip focus between an open extension overlay (or the workflow panel)
+    /// and the composer. One focused input owner at a time; a non-capturing
+    /// overlay stays drawn while unfocused. Default chord: Alt+/.
+    ExtensionOverlayToggleFocus,
 }
 
 impl Action {
@@ -169,6 +200,8 @@ impl Action {
             "app.tree.filter.all" => Self::TreeFilterAll,
             "app.tree.filter.cycleForward" => Self::TreeFilterCycleForward,
             "app.tree.filter.cycleBackward" => Self::TreeFilterCycleBackward,
+            "app.live.ptt" | "live_ptt" => Self::LivePtt,
+            "app.extensions.overlayToggleFocus" => Self::ExtensionOverlayToggleFocus,
 
             _ => return None,
         })
@@ -248,6 +281,8 @@ impl Action {
             Self::TreeFilterAll => "Filter: all",
             Self::TreeFilterCycleForward => "Cycle filter forward",
             Self::TreeFilterCycleBackward => "Cycle filter backward",
+            Self::LivePtt => "Hold to talk (live voice)",
+            Self::ExtensionOverlayToggleFocus => "Toggle extension overlay focus",
         }
     }
 
@@ -324,6 +359,8 @@ impl Action {
             Self::TreeFilterAll => "app.tree.filter.all",
             Self::TreeFilterCycleForward => "app.tree.filter.cycleForward",
             Self::TreeFilterCycleBackward => "app.tree.filter.cycleBackward",
+            Self::LivePtt => "app.live.ptt",
+            Self::ExtensionOverlayToggleFocus => "app.extensions.overlayToggleFocus",
         }
     }
 
@@ -398,6 +435,7 @@ impl Action {
             | Self::TreeFilterAll
             | Self::TreeFilterCycleForward
             | Self::TreeFilterCycleBackward => Some("Session tree"),
+            Self::LivePtt | Self::ExtensionOverlayToggleFocus => Some("Application"),
         }
     }
 }
@@ -517,6 +555,8 @@ pub const VALID_ACTION_NAMES: &[&str] = &[
     "app.tree.filter.all",
     "app.tree.filter.cycleForward",
     "app.tree.filter.cycleBackward",
+    "app.live.ptt",
+    "app.extensions.overlayToggleFocus",
 ];
 
 /// Owns the active chord→action map plus per-file load diagnostics. Files are
@@ -787,6 +827,8 @@ fn default_bindings() -> HashMap<String, Vec<Action>> {
         ("ctrl+u", Action::TreeFilterUserOnly),
         ("ctrl+l", Action::TreeFilterLabeledOnly),
         ("ctrl+a", Action::TreeFilterAll),
+        ("ctrl+space", Action::LivePtt),
+        ("alt+/", Action::ExtensionOverlayToggleFocus),
     ];
     for (chord, action) in defaults {
         map.entry((*chord).to_owned()).or_default().push(*action);
@@ -1111,9 +1153,41 @@ mod tests {
     }
 
     #[test]
-    fn action_registry_only_accepts_executable_dispatch_actions() {
+    fn action_registry_round_trips_both_directions() {
+        // Registry → dispatch: every advertised name resolves to an action and
+        // round-trips back to the exact canonical name, so no alias or stale
+        // entry can hide in the registry.
         for name in VALID_ACTION_NAMES {
-            assert!(Action::from_name(name).is_some(), "{name}");
+            let action = Action::from_name(name)
+                .expect("registry name must be dispatchable");
+            assert_eq!(
+                action.config_name(),
+                *name,
+                "registry name `{name}` is not the canonical config name"
+            );
+        }
+        // Dispatch → registry: every action variant's canonical name must be
+        // advertised. `Action::ALL` is generated from the enum's own token
+        // list, so a newly added action cannot silently escape this check.
+        for action in Action::ALL {
+            assert!(
+                VALID_ACTION_NAMES.contains(&action.config_name()),
+                "action {action:?} (`{}`) is missing from VALID_ACTION_NAMES",
+                action.config_name()
+            );
+        }
+        // Regression targets: the two most recently added configurable actions
+        // must be resolvable and advertised in both directions.
+        for (action, name) in [
+            (Action::LivePtt, "app.live.ptt"),
+            (
+                Action::ExtensionOverlayToggleFocus,
+                "app.extensions.overlayToggleFocus",
+            ),
+        ] {
+            assert_eq!(Action::from_name(name), Some(action));
+            assert_eq!(action.config_name(), name);
+            assert!(VALID_ACTION_NAMES.contains(&name));
         }
         assert_eq!(
             Action::from_name("app.session.tree"),

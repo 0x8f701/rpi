@@ -25,18 +25,20 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 fn definition() -> AgentDefinition {
-    AgentDefinition {
-        name: "task".to_owned(),
-        description: "background task".to_owned(),
-        system_prompt: "complete the assignment".to_owned(),
-        tools: Some(Vec::new()),
-        autoload_skills: Vec::new(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        source: AgentDefinitionSource::Bundled,
-        path: None,
-        trusted: true,
-    }
+    AgentDefinition { name: "task".to_owned(),
+    description: "background task".to_owned(),
+    system_prompt: "complete the assignment".to_owned(),
+    tools: Some(Vec::new()),
+    autoload_skills: Vec::new(),
+    model: None,
+    thinking_level: Some(ThinkingLevel::Off),
+    max_turns: None,
+    max_tool_calls: None,
+    timeout_secs: None,
+    disallowed_tools: Vec::new(),
+    capability_ceiling: None,
+    source: AgentDefinitionSource::Bundled,
+    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
 struct ControlledRuntime {
@@ -224,6 +226,7 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
         (task.execute)(context(
             "spawn-pair",
             json!({
+                "context": "Supervised pair contract: children run under Main while the parent exercises mailbox bounds, IRC cancellation, and parking.",
                 "tasks": [
                     { "name": "Alpha", "task": "first supervised child" },
                     { "name": "Beta", "task": "second supervised child" }
@@ -371,7 +374,9 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
             && job
                 .result
                 .as_ref()
-                .is_some_and(|result| result.output == "supervised result")
+                .is_some_and(|result| {
+                    result.output == format!("supervised result\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+                })
     }));
 
     // Retained job table: Alpha completed, Beta cancelled.
@@ -392,7 +397,7 @@ async fn main_supervises_two_children_with_irc_cancel_and_park() {
     assert_eq!(alpha.status, JobStatus::Completed);
     assert_eq!(
         alpha.result.as_ref().map(|result| result.output.as_str()),
-        Some("supervised result")
+        Some(format!("supervised result\n\n{}", pi_coding::MISSING_YIELD_WARNING).as_str())
     );
     assert_eq!(beta.status, JobStatus::Cancelled);
 

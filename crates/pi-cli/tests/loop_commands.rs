@@ -89,7 +89,7 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
         .expect("created output contains task id")
         .to_owned();
 
-    let list = parse_interactive_loop_command("loops", None)
+    let list = parse_interactive_loop_command("loop", Some("list"))
         .expect("parse list")
         .expect("list command");
     let listed = execute_interactive_loop_command(&application, list)
@@ -99,8 +99,8 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
     assert!(listed.contains("cli scheduled"));
 
     let update = parse_interactive_loop_command(
-        "loop-update",
-        Some(&format!("{task_id} 2h cli updated")),
+        "loop",
+        Some(&format!("update {task_id} 2h cli updated")),
     )
     .expect("parse update")
     .expect("update command");
@@ -110,7 +110,7 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
     assert!(updated.contains("every 2 hours"));
     assert!(updated.contains("cli updated"));
 
-    let delete = parse_interactive_loop_command("loop-delete", Some(&task_id))
+    let delete = parse_interactive_loop_command("loop", Some(&format!("delete {task_id}")))
         .expect("parse delete")
         .expect("delete command");
     assert_eq!(
@@ -131,7 +131,7 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
         .and_then(|rest| rest.split_once(" · ").map(|(id, _)| id))
         .expect("second task id")
         .to_owned();
-    let cancel = parse_interactive_loop_command("loop-cancel", Some(&second_id))
+    let cancel = parse_interactive_loop_command("loop", Some(&format!("cancel {second_id}")))
         .expect("parse cancel")
         .expect("cancel command");
     assert_eq!(
@@ -141,6 +141,28 @@ async fn cli_loop_commands_drive_application_create_list_update_delete_and_cance
         format!("cancelled loop {second_id}")
     );
 
+    // The explicit `create` subcommand is the same operation as the bare form.
+    let explicit_create = parse_interactive_loop_command(
+        "loop",
+        Some("create 1h explicit create subcommand"),
+    )
+    .expect("parse explicit create")
+    .expect("explicit create command");
+    let explicit_created = execute_interactive_loop_command(&application, explicit_create)
+        .await
+        .expect("execute explicit create");
+    assert!(explicit_created.contains("every 1 hour"));
+    let explicit_id = explicit_created
+        .strip_prefix("scheduled ")
+        .and_then(|rest| rest.split_once(" · ").map(|(id, _)| id))
+        .expect("explicit task id")
+        .to_owned();
+    application
+        .loop_cancel(&explicit_id)
+        .await
+        .expect("cancel explicit task");
+
+    // Legacy alias `/loops` still lists (muscle-memory compatibility).
     let empty = execute_interactive_loop_command(
         &application,
         parse_interactive_loop_command("loops", None)

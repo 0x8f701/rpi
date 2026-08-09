@@ -660,6 +660,7 @@ pub fn register_pi_messages() {
             stream_simple: Arc::new(|m, c, o| {
                 async move { stream_simple_pi_messages(m, c, o) }.boxed()
             }),
+            generate_image: None,
         },
         None,
     )

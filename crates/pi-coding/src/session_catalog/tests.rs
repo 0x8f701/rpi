@@ -69,6 +69,7 @@ fn synthetic_row(index: usize) -> CatalogRow {
         status: CatalogRowStatus::Foreign,
         import_lineage: None,
         search_text: String::new(),
+        message_blob: String::new(),
     }
 }
 
@@ -1217,6 +1218,7 @@ fn foreign_dedupe_by_cwd_summary_and_empty_summary_fallback() {
             status: CatalogRowStatus::Foreign,
             import_lineage: None,
             search_text: String::new(),
+            message_blob: String::new(),
         },
         CatalogRow {
             kind: SessionSourceKind::Codex,
@@ -1232,6 +1234,7 @@ fn foreign_dedupe_by_cwd_summary_and_empty_summary_fallback() {
             status: CatalogRowStatus::Foreign,
             import_lineage: None,
             search_text: String::new(),
+            message_blob: String::new(),
         },
         CatalogRow {
             kind: SessionSourceKind::Codex,
@@ -1247,6 +1250,7 @@ fn foreign_dedupe_by_cwd_summary_and_empty_summary_fallback() {
             status: CatalogRowStatus::Foreign,
             import_lineage: None,
             search_text: String::new(),
+            message_blob: String::new(),
         },
     ];
     let fallback_deduped = SessionCatalog::dedupe_rows(&fallback);

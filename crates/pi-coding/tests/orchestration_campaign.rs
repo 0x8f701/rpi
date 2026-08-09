@@ -50,21 +50,23 @@ fn agent(
     tools: &[&str],
     autoload_skills: &[&str],
 ) -> AgentDefinition {
-    AgentDefinition {
-        name: name.to_owned(),
-        description: description.to_owned(),
-        system_prompt: prompt.to_owned(),
-        tools: Some(tools.iter().map(|tool| (*tool).to_owned()).collect()),
-        autoload_skills: autoload_skills
-            .iter()
-            .map(|skill| (*skill).to_owned())
-            .collect(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        source: AgentDefinitionSource::User,
-        path: None,
-        trusted: true,
-    }
+    AgentDefinition { name: name.to_owned(),
+    description: description.to_owned(),
+    system_prompt: prompt.to_owned(),
+    tools: Some(tools.iter().map(|tool| (*tool).to_owned()).collect()),
+    autoload_skills: autoload_skills
+        .iter()
+        .map(|skill| (*skill).to_owned())
+        .collect(),
+    model: None,
+    thinking_level: Some(ThinkingLevel::Off),
+    max_turns: None,
+    max_tool_calls: None,
+    timeout_secs: None,
+    disallowed_tools: Vec::new(),
+    capability_ceiling: None,
+    source: AgentDefinitionSource::User,
+    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
 fn skill(root: &Path, name: &str, description: &str, body: &str) -> OrchestrationSkill {
@@ -406,7 +408,7 @@ fn build_runtime(
                 "Review Rust security vulnerabilities and patches",
                 "REVIEWER_PROMPT",
                 &["read", "write"],
-                &["rust-security"],
+                &["rust-review"],
             ),
             agent(
                 "writer",
@@ -427,7 +429,7 @@ fn build_runtime(
                 "Review Rust security vulnerabilities in dark mode",
                 "SHADOW_PROMPT",
                 &["read", "write"],
-                &["rust-security"],
+                &["rust-review"],
             ),
         ]),
         artifacts,
@@ -455,9 +457,9 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     let skills = vec![
         skill(
             root.path(),
-            "rust-security",
+            "rust-review",
             "Review Rust code for memory safety and security vulnerabilities",
-            "RUST_SECURITY_BODY",
+            "RUST_REVIEW_BODY",
         ),
         skill(
             root.path(),
@@ -638,6 +640,7 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
         (task.execute)(context(
             "spawn-campaign-batch",
             json!({
+                "context": "Run two independent campaign tasks using the current role catalog.",
                 "tasks": [
                     {
                         "name": "Scribe",
@@ -710,12 +713,12 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     );
     assert!(!prompt.contains("WRITER_PROMPT"), "{prompt}");
     assert!(!prompt.contains("SHADOW_PROMPT"), "{prompt}");
-    assert_eq!(prompt.matches("RUST_SECURITY_BODY").count(), 1, "{prompt}");
+    assert_eq!(prompt.matches("RUST_REVIEW_BODY").count(), 1, "{prompt}");
     assert_eq!(prompt.matches("SECURITY_AUDIT_BODY").count(), 1, "{prompt}");
     assert_eq!(prompt.matches("DOCS_WRITING_BODY").count(), 0, "{prompt}");
     assert_eq!(
         prompt
-            .matches("<autoloaded_skill name=\"rust-security\"")
+            .matches("<autoloaded_skill name=\"rust-review\"")
             .count(),
         1,
         "{prompt}"
@@ -727,7 +730,7 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
         1,
         "{prompt}"
     );
-    assert!(prompt.contains("skill://rust-security"), "{prompt}");
+    assert!(prompt.contains("skill://rust-review"), "{prompt}");
     assert!(prompt.contains("skill://security-audit"), "{prompt}");
 
     let guidance = format!("{GUIDANCE_TOKEN}: replace marker with guided payload exactly once");
@@ -750,6 +753,19 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     assert_eq!(receipts[0]["outcome"], "woken");
     assert!(receipts[0].get("error").is_none() || receipts[0]["error"].is_null());
 
+    // A Woken delivery to an active child is committed to the durable mailbox
+    // before the active delivery bridge consumes it (deferred-ack durability,
+    // `durable_orchestration_e2e::running_woken_message_is_durable_before_active_delivery`).
+    // The running child acks the handoff asynchronously via its delivery bridge,
+    // draining the canonical mailbox; poll until it does, matching the post-ack
+    // inbox-empty check in `running_child_observes_mid_run_steering_exactly_once`.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !runtime.inbox(&steered_agent, true).is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("steered delivery must drain the canonical mailbox after ack");
     assert!(
         runtime.inbox(&steered_agent, true).is_empty(),
         "active steered delivery must not leave a canonical mailbox duplicate"
@@ -785,7 +801,10 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     assert_eq!(steered.agent_id, steered_agent);
     let steered_result = steered.result.as_ref().expect("steered result");
     assert!(steered_result.error.is_none(), "{:?}", steered_result.error);
-    assert_eq!(steered_result.output, "guidance applied exactly once");
+    assert_eq!(
+        steered_result.output,
+        format!("guidance applied exactly once\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+    );
     assert_eq!(
         guidance_write_calls.load(Ordering::SeqCst),
         1,
@@ -805,7 +824,7 @@ async fn orchestration_campaign_selector_steer_cancel_and_isolation() {
     let artifact_bytes = std::fs::read(&result_artifact).expect("read result artifact");
     assert_eq!(
         artifact_bytes,
-        b"guidance applied exactly once",
+        format!("guidance applied exactly once\n\n{}", pi_coding::MISSING_YIELD_WARNING).as_bytes(),
         "settled artifact body must match final output"
     );
 

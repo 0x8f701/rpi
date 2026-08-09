@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::{self, File};
-use std::io::Read as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{Arc, LazyLock, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use parking_lot::Mutex;
-use pi_agent::{AgentTool, BoxFuture, ThinkingLevel};
+use parking_lot::{Mutex, RwLock};
+use pi_agent::{
+    AgentTool, BoxFuture, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, ThinkingLevel,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::{Notify, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -18,8 +21,8 @@ use unicode_normalization::UnicodeNormalization;
 use crate::{Session, Skill};
 
 use super::{
-    AgentCatalog, AgentDefinition, JobClock, JobManager, JobRetention, JobSnapshot, JobStatus,
-    PreparedJobRecords, TaskSpawn,
+    AgentCatalog, AgentDefinition, CapabilityCeiling, JobClock, JobManager, JobRetention,
+    JobSnapshot, JobSoftBudget, JobStatus, PreparedJobRecords, TaskSpawn,
 };
 
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 100;
@@ -29,10 +32,21 @@ pub const DEFAULT_MAX_TOOLS_PER_AGENT: usize = 16;
 pub const DEFAULT_IDLE_TTL_SECS: u64 = 300;
 pub const DEFAULT_MAX_RETAINED_JOBS: usize = 256;
 pub const DEFAULT_RETAINED_JOB_TTL_SECS: u64 = 24 * 60 * 60;
+/// Bound on the delivered-message log the workflow page's Recent IRC reads.
+const DELIVERED_MESSAGE_LOG_CAP: usize = 200;
 /// Stable custom-message type for orchestration mailbox deliveries.
 pub const ORCHESTRATION_MESSAGE_TYPE: &str = "orchestration_message";
+/// Default number of transcript lines rendered by `hub read_history`.
+pub const DEFAULT_HISTORY_LINES: usize = 50;
+/// Hard maximum for `hub read_history` lines (clamped, never exceeded).
+pub const MAX_HISTORY_LINES: usize = 200;
+/// Hard byte cap for a rendered `hub read_history` transcript.
+pub const MAX_HISTORY_BYTES: usize = 32 * 1024;
 const MAX_AUTOLOAD_SKILL_BYTES: u64 = 256 * 1024;
 const MAX_AUTOLOAD_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_PERSONALITY_BYTES: usize = 64 * 1024;
+const PERSONA_CONTINUITY_MAX_MESSAGES: usize = 200;
+const PERSONA_CONTINUITY_MAX_BYTES: usize = 32 * 1024;
 const MAX_SIBLING_ROSTER_ENTRIES: usize = 64;
 const MAX_SIBLING_ROSTER_BYTES: usize = MAX_AUTOLOAD_PROMPT_BYTES / 64;
 const MAX_ROSTER_AGENT_CHARS: usize = 80;
@@ -87,6 +101,10 @@ impl ChildSession {
     fn history(&self) -> Vec<pi_ai::Message> {
         self.session.history()
     }
+
+    fn set_should_stop_after_turn(&self, hook: Option<ShouldStopAfterTurnFn>) {
+        self.session.set_should_stop_after_turn(hook);
+    }
 }
 
 impl From<Session> for ChildSession {
@@ -125,6 +143,7 @@ impl From<&Skill> for OrchestrationSkill {
     }
 }
 
+
 #[derive(Clone)]
 pub struct OrchestrationConfig {
     pub catalog: AgentCatalog,
@@ -137,6 +156,9 @@ pub struct OrchestrationConfig {
     pub main_agent_id: String,
     pub default_agent: String,
     pub default_agent_selector: Option<AgentSelectorFn>,
+    /// Persisted runtime preference used for unnamed child spawns. Invalid or
+    /// disabled values remain advisory and fall back through normal selection.
+    pub preferred_agent: Option<String>,
     selector_settings: Option<crate::SelectorSettings>,
     pub agent_settings: BTreeMap<String, crate::AgentRuntimeSettings>,
     pub parent_model: pi_ai::Model,
@@ -144,6 +166,11 @@ pub struct OrchestrationConfig {
     pub idle_ttl: Option<Duration>,
     pub max_retained_jobs: usize,
     pub retained_job_ttl: Duration,
+    /// Soft budget for child jobs. Defaults to unlimited (all knobs `None`),
+    /// preserving run-to-completion behavior; opt-in knobs make a child yield
+    /// with a partial result and the `soft_budget_exhausted` marker instead
+    /// of running to completion.
+    pub soft_budget: JobSoftBudget,
     job_clock: JobClock,
 }
 
@@ -164,9 +191,11 @@ impl std::fmt::Debug for OrchestrationConfig {
                 "default_agent_selector",
                 &self.default_agent_selector.as_ref().map(|_| "configured"),
             )
+            .field("preferred_agent", &self.preferred_agent)
             .field("idle_ttl", &self.idle_ttl)
             .field("max_retained_jobs", &self.max_retained_jobs)
             .field("retained_job_ttl", &self.retained_job_ttl)
+            .field("soft_budget", &self.soft_budget)
             .field("agent_settings", &self.agent_settings)
             .field("parent_model_provider", &self.parent_model_provider.as_ref().map(|_| "configured"))
             .finish()
@@ -208,13 +237,57 @@ impl OrchestrationRuntime {
                 let mut stream_options = snapshot.stream_options;
                 stream_options.stream.session_id = None;
                 let cwd = snapshot.cwd.to_string_lossy();
+                let sandbox = snapshot.sandbox.clone();
+                let memory = snapshot.memory.clone();
+                // Declared tools become base tools, EXCEPT orchestration plumbing
+                // (todo/process/task/hub/goal/yield): those are auto-provided by
+                // the factory below (orchestration_tools + the yield append), so
+                // they must never reach `create_tool`, which only knows the
+                // main-session tool set. Skipping a declared `yield` here is what
+                // keeps registration idempotent: declared-or-not, exactly one
+                // `yield` tool is appended below. Unknown declared names are
+                // likewise filtered before `create_tool` (which would otherwise
+                // error): they are silently ignored (OMP-compatible) and never
+                // injected into the child.
+                let persona_root = request.definition.persona_root();
+                let requested_memory = request.requested_tool_names.as_deref().is_some_and(|names| {
+                    names.iter().any(|name| matches!(name.as_str(), "memory" | "recall" | "retain" | "reflect"))
+                });
                 let base_tools = match request.requested_tool_names.as_deref() {
-                    Some(names) => names
-                        .iter()
-                        .filter(|name| !matches!(name.as_str(), "todo" | "process" | "task" | "hub" | "goal"))
-                        .map(|name| crate::create_tool_with_context_and_resolver(name, &cwd, None, None, uri_resolver.clone()))
-                        .collect::<Result<Vec<_>>>()?,
-                    None => crate::create_coding_tools_with_context_and_resolver(&cwd, None, None, None, uri_resolver.clone()),
+                    Some(names) => {
+                        let mut tools = names
+                            .iter()
+                            .filter(|name| {
+                                !crate::is_child_plumbing_tool(name)
+                                    && crate::is_known_child_tool(name)
+                                    && !matches!(name.as_str(), "memory" | "recall" | "retain" | "reflect")
+                            })
+                            .map(|name| match persona_root.as_deref() {
+                                Some(root) => crate::tools::create_tool_with_context_and_resolver_and_rules_for_persona(
+                                    name, &cwd, root, None, None, sandbox.clone(), uri_resolver.clone(), snapshot.permission_rules.clone(),
+                                ),
+                                None => crate::create_tool_with_context_and_resolver_and_rules(
+                                    name, &cwd, None, None, sandbox.clone(), uri_resolver.clone(), snapshot.permission_rules.clone(),
+                                ),
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        if requested_memory {
+                            let config = memory.as_ref().and_then(|resolver| resolver());
+                            tools.extend(match persona_root.as_deref() {
+                                Some(root) => crate::memory::memory_tools_for_persona(&cwd, root, None, config),
+                                None => crate::memory::memory_tools_for(&cwd, None, config),
+                            });
+                        }
+                        tools
+                    }
+                    None => match persona_root.as_deref() {
+                        Some(root) => crate::tools::create_coding_tools_with_context_and_resolver_for_persona(
+                            &cwd, root, None, None, None, sandbox, uri_resolver.clone(), memory.clone(), None,
+                        ),
+                        None => crate::create_coding_tools_with_context_and_resolver(
+                            &cwd, None, None, None, sandbox, uri_resolver.clone(), memory.clone(), None,
+                        ),
+                    },
                 };
                 if base_tools.len() > request.max_tools_per_agent {
                     bail!(
@@ -223,8 +296,35 @@ impl OrchestrationRuntime {
                         request.max_tools_per_agent
                     );
                 }
-                let mut tools = base_tools;
+                // Apply the role contract filters to the child's tool set:
+                // drop disallowed tools by name and any tool whose declared
+                // capability sits above the role's ceiling. Orchestration
+                // plumbing (todo/process/task/hub/goal) is kept so a restricted
+                // role can still delegate and be supervised.
+                let disallowed = request
+                    .definition
+                    .disallowed_tools
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let ceiling = request.definition.capability_ceiling;
+                let allowed_capabilities = ceiling.map(CapabilityCeiling::allowed_capabilities);
+                let mut tools = base_tools
+                    .into_iter()
+                    .filter(|tool| {
+                        !disallowed.contains(tool.name.as_str())
+                            && allowed_capabilities
+                                .as_ref()
+                                .is_none_or(|allowed| allowed.contains(&tool.capability))
+                    })
+                    .collect::<Vec<_>>();
                 tools.extend(request.orchestration_tools);
+                // The `yield` tool joins every orchestration child's tool set
+                // (OMP's explicit-delivery protocol): it is orchestration
+                // plumbing like task/hub/goal, so role filters never remove
+                // it. It is wired to the per-run delivery state the run loop
+                // reads when the child settles.
+                tools.push(super::tools::yield_tool(request.yield_state.clone()));
                 let api_key = if request.model.provider == snapshot.model.provider {
                     snapshot.api_key
                 } else if let Some(resolver) = &snapshot.auth_resolver {
@@ -280,6 +380,7 @@ impl OrchestrationConfig {
             main_agent_id: "Main".to_owned(),
             default_agent: "task".to_owned(),
             default_agent_selector: None,
+            preferred_agent: None,
             selector_settings: None,
             agent_settings: BTreeMap::new(),
             parent_model: pi_ai::Model::default(),
@@ -287,6 +388,7 @@ impl OrchestrationConfig {
             idle_ttl: Some(Duration::from_secs(DEFAULT_IDLE_TTL_SECS)),
             max_retained_jobs: DEFAULT_MAX_RETAINED_JOBS,
             retained_job_ttl: Duration::from_secs(DEFAULT_RETAINED_JOB_TTL_SECS),
+            soft_budget: JobSoftBudget::default(),
             job_clock: Arc::new(now_millis),
         }
     }
@@ -437,11 +539,13 @@ impl OrchestrationConfig {
             && self.main_agent_id == other.main_agent_id
             && self.default_agent == other.default_agent
             && selectors_equal
+            && self.preferred_agent == other.preferred_agent
             && self.agent_settings == other.agent_settings
             && parent_models_equal
             && self.idle_ttl == other.idle_ttl
             && self.max_retained_jobs == other.max_retained_jobs
             && self.retained_job_ttl == other.retained_job_ttl
+            && self.soft_budget == other.soft_budget
     }
 }
 
@@ -458,6 +562,17 @@ pub struct ChildSessionRequest {
     pub orchestration_tools: Vec<AgentTool>,
     pub thinking_level: Option<ThinkingLevel>,
     pub model: pi_ai::Model,
+    /// Per-item JSON Schema contract for the delivered `yield` payload (OMP
+    /// `outputSchema`). The run loop validates the settled payload against it.
+    pub output_schema: Option<Value>,
+    /// Validation mode for `output_schema`: `"permissive"` or `"strict"`.
+    pub schema_mode: Option<String>,
+    /// Delivery state for the child-only `yield` tool. The child factory wires
+    /// the tool to this state and the run loop reads the payload when the run
+    /// settles. Fresh per spawn/revival; it is not persisted (a job that
+    /// already delivered via `yield` never needs revival, and a revived run
+    /// gets a clean state for its remaining turns).
+    pub yield_state: Arc<YieldState>,
 }
 
 impl std::fmt::Debug for ChildSessionRequest {
@@ -474,6 +589,9 @@ impl std::fmt::Debug for ChildSessionRequest {
             .field("max_tools_per_agent", &self.max_tools_per_agent)
             .field("thinking_level", &self.thinking_level)
             .field("model", &format!("{}/{}", self.model.provider, self.model.id))
+            .field("output_schema", &self.output_schema)
+            .field("schema_mode", &self.schema_mode)
+            .field("yield_state", &self.yield_state.was_called())
             .finish_non_exhaustive()
     }
 }
@@ -555,7 +673,7 @@ pub struct DeliveryReceipt {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskItem {
     pub index: usize,
@@ -564,6 +682,21 @@ pub struct TaskItem {
     pub assignment: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo_task_id: Option<String>,
+    /// Shared background context rendered into the child's system prompt as a
+    /// `CONTEXT` section (OMP batch parity). `None` for single spawns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Per-item JSON Schema contract for the child's delivered `yield`
+    /// payload. When present, the run loop parses the payload as JSON and
+    /// validates it against this schema, reporting the outcome as
+    /// [`TaskResult::structured_output`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// Validation mode for [`TaskItem::output_schema`]: `"permissive"`
+    /// (default, reports the outcome only) or `"strict"` (surfaces a
+    /// validation failure as a job error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -624,16 +757,87 @@ pub struct TaskResult {
     pub output: String,
     #[serde(default)]
     pub usage: pi_ai::Usage,
+    /// True when the job settled early because a configured soft budget was
+    /// reached (max requests, max tokens, or a yield-after threshold). The job
+    /// is not failed: `output` holds the partial result and the parent decides
+    /// whether to continue the child.
+    #[serde(default)]
+    pub soft_budget_exhausted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Outcome of validating the delivered `yield` payload against the
+    /// invocation's per-item `outputSchema` contract (absent when the item
+    /// carried no contract or the run itself failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<StructuredOutput>,
     pub artifact_ref: String,
     pub history_ref: String,
     pub artifact_uri: String,
 }
 
+/// Report of validating a child's delivered `yield` payload against the
+/// invocation's `outputSchema` (OMP `outputSchema`/`schemaMode` parity).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StructuredOutput {
+    /// Where the effective schema came from — always `"task"` (the invocation
+    /// parameter); rpi has no agent-frontmatter or parent-session schema layer
+    /// yet, so this is the only source today.
+    pub schema_source: String,
+    /// Effective validation mode: `"permissive"` or `"strict"`.
+    pub schema_mode: String,
+    /// Whether the payload parsed as JSON and validated against the schema.
+    pub valid: bool,
+    /// The parsed payload when it was valid JSON (present even when the schema
+    /// rejected it, so the parent can inspect what the child delivered).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+    /// Validation/parse failure description; absent when `valid` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 pub struct OrchestrationRuntime {
     inner: Arc<RuntimeInner>,
     owner: bool,
+}
+
+/// Exclusive lifecycle claim for a persona destructive operation.
+///
+/// While held, new spawns and revivals for the persona fail closed. Creation
+/// is serialized with the existing spawn lock and durable mutation lock so the
+/// active check cannot race a queued spawn or a child settle transaction.
+pub struct PersonaLifecycleGuard {
+    inner: Arc<RuntimeInner>,
+    persona: String,
+    release_on_drop: bool,
+}
+
+impl std::fmt::Debug for PersonaLifecycleGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersonaLifecycleGuard")
+            .field("persona", &self.persona)
+            .field("release_on_drop", &self.release_on_drop)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PersonaLifecycleGuard {
+    /// Keep the persona blocked for the lifetime of this runtime. Used after a
+    /// destructive write succeeds but catalog reload fails, preventing stale
+    /// catalog state from spawning the deleted persona.
+    pub fn retain(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for PersonaLifecycleGuard {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.inner.persona_lifecycle_blocks.lock().remove(&self.persona);
+        }
+    }
 }
 
 impl Clone for OrchestrationRuntime {
@@ -658,10 +862,110 @@ struct RuntimeInner {
     workflow_scope: Mutex<Option<WorkflowRuntimeScope>>,
     global_concurrency: Mutex<Option<OrchestrationConcurrencyGate>>,
     events: broadcast::Sender<OrchestrationEvent>,
+    /// Bounded, newest-last log of every durably delivered group message
+    /// (subagent ⇄ subagent included), independent of mailbox consumption:
+    /// the workflow page's Recent IRC reads this stream, so messages stay
+    /// visible after the recipient consumes them.
+    delivered_messages: Mutex<VecDeque<MailboxMessage>>,
     durable: Mutex<Option<super::persistence::DurableRuntime>>,
     durable_bound: AtomicBool,
     durable_mutation: Mutex<()>,
+    /// Personas currently claimed by a destructive lifecycle operation.
+    persona_lifecycle_blocks: Mutex<std::collections::BTreeSet<String>>,
     rebind_reserved: AtomicBool,
+    /// Role selected with `/role <name> --select`; consulted as the default
+    /// agent for child task spawns that do not name an agent explicitly.
+    preferred_agent: RwLock<Option<String>>,
+    /// Dedup set of (agent, tool) pairs for silently-ignored unknown declared
+    /// tools. Each pair produces exactly one warning message for the lifetime
+    /// of the runtime (repeated spawns do not re-warn); surfaced via
+    /// [`OrchestrationRuntime::unknown_tool_warnings`].
+    unknown_tool_warnings: Mutex<std::collections::BTreeSet<(String, String)>>,
+}
+
+/// Per-job soft-budget counters shared between the agent-loop stop hook and
+/// `run_one`/`run_revival`.
+///
+/// The hook increments the counters after each completed assistant turn and,
+/// when a configured limit is reached, records `triggered` so the run loop can
+/// mark the settled job with `soft_budget_exhausted`.
+#[derive(Clone, Default)]
+struct JobSoftBudgetState {
+    requests: Arc<AtomicUsize>,
+    tokens: Arc<AtomicU64>,
+    triggered: Arc<AtomicBool>,
+}
+
+/// Per-job counters for role contract limits (max turns / max tool calls)
+/// shared between the turn stop hook and the run loop.
+///
+/// The hook counts completed assistant turns and the tool calls inside their
+/// messages; once a configured limit is reached the child stops cleanly after
+/// that turn and the run loop surfaces the triggered limit as a clear reason.
+#[derive(Clone, Default)]
+struct JobContractState {
+    turns: Arc<AtomicUsize>,
+    tool_calls: Arc<AtomicUsize>,
+    max_turns_triggered: Arc<AtomicBool>,
+    max_tool_calls_triggered: Arc<AtomicBool>,
+}
+
+/// Per-child delivery state shared between the child-only `yield` tool (inside
+/// the child session's tool set) and the run loop (after `child.run` settles).
+///
+/// The tool records the delivered payload exactly once; `was_called` doubles
+/// as the stop signal — the composed turn stop hook ends the run right after
+/// the yielding turn so the model never produces trailing text after the
+/// delivery. The run loop then projects the payload as the job's final output
+/// (OMP's explicit-delivery protocol: the payload, not the trailing assistant
+/// text, is what the parent receives).
+#[derive(Clone, Default)]
+pub struct YieldState {
+    called: Arc<AtomicBool>,
+    payload: Arc<Mutex<Option<String>>>,
+}
+
+impl YieldState {
+    /// Record a yield delivery. Only the first call wins; later calls (a
+    /// misbehaving model calling `yield` twice in one message) are ignored.
+    /// Returns `true` when this call recorded the payload.
+    pub fn deliver(&self, text: String) -> bool {
+        let mut payload = self.payload.lock();
+        if payload.is_none() {
+            *payload = Some(text);
+            self.called.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The delivered payload, if the child called `yield` at least once.
+    pub fn payload(&self) -> Option<String> {
+        self.payload.lock().clone()
+    }
+
+    /// Whether the child called `yield` at least once.
+    pub fn was_called(&self) -> bool {
+        self.called.load(Ordering::Acquire)
+    }
+}
+
+/// Appended to a naturally-completed child's output when it never called the
+/// `yield` tool. Back-compat: children written before the explicit-delivery
+/// protocol still settle with their natural final text; the warning makes the
+/// missed delivery observable to the parent.
+pub const MISSING_YIELD_WARNING: &str = "SYSTEM WARNING: Subagent exited without calling yield";
+
+/// Appends [`MISSING_YIELD_WARNING`] to a natural child output (an empty
+/// output becomes the warning itself).
+fn append_missing_yield_warning(output: &mut String) {
+    if output.is_empty() {
+        *output = MISSING_YIELD_WARNING.to_owned();
+    } else {
+        output.push_str("\n\n");
+        output.push_str(MISSING_YIELD_WARNING);
+    }
 }
 
 #[derive(Default)]
@@ -764,6 +1068,7 @@ impl OrchestrationRuntime {
         })?;
         let mut config = config;
         config.artifact_dir = artifact_dir;
+        let preferred_agent = config.preferred_agent.clone();
         let (events, _) = broadcast::channel(256);
         let group_id = Uuid::now_v7().to_string();
         REGISTRY.register(
@@ -803,10 +1108,14 @@ impl OrchestrationRuntime {
                 workflow_scope: Mutex::new(None),
                 global_concurrency: Mutex::new(None),
                 events,
+                delivered_messages: Mutex::new(VecDeque::new()),
                 durable: Mutex::new(None),
                 durable_bound: AtomicBool::new(false),
                 durable_mutation: Mutex::new(()),
+                persona_lifecycle_blocks: Mutex::new(std::collections::BTreeSet::new()),
                 rebind_reserved: AtomicBool::new(false),
+                preferred_agent: RwLock::new(preferred_agent),
+                unknown_tool_warnings: Mutex::new(std::collections::BTreeSet::new()),
             }),
             owner: true,
         })
@@ -815,6 +1124,19 @@ impl OrchestrationRuntime {
     #[must_use]
     pub fn group_id(&self) -> &str {
         &self.inner.group_id
+    }
+
+    /// Select the role used for child task spawns that do not name an agent
+    /// explicitly. `None` clears the preference (back to ranked/default
+    /// selection). The selected role must still be enabled and compatible.
+    pub fn set_preferred_agent(&self, name: Option<&str>) {
+        *self.inner.preferred_agent.write() = name.map(str::to_owned);
+    }
+
+    /// The currently preferred role for unnamed task spawns, if any.
+    #[must_use]
+    pub fn preferred_agent(&self) -> Option<String> {
+        self.inner.preferred_agent.read().clone()
     }
 
     #[must_use]
@@ -890,6 +1212,32 @@ impl OrchestrationRuntime {
                 .map(|error| error.to_string())
             })
             .collect()
+    }
+
+    /// Deduped warnings for agent-declared tools that were silently ignored
+    /// (unknown names never injected into children). Exactly one message per
+    /// (agent, tool) pair for the lifetime of this runtime, sorted by
+    /// (agent, tool) for determinism. Unknown tools never make an agent
+    /// unavailable, so these are advisory only.
+    #[must_use]
+    pub fn unknown_tool_warnings(&self) -> Vec<String> {
+        self.inner
+            .unknown_tool_warnings
+            .lock()
+            .iter()
+            .map(|(agent, tool)| {
+                crate::unknown_tools_warning(agent, std::slice::from_ref(tool))
+            })
+            .collect()
+    }
+
+    /// Record one deduped warning per (agent, tool) pair so repeated spawns of
+    /// the same agent never re-warn.
+    fn record_unknown_tool_warnings(&self, agent: &str, unknown: &[String]) {
+        let mut recorded = self.inner.unknown_tool_warnings.lock();
+        for tool in unknown {
+            recorded.insert((agent.to_owned(), tool.clone()));
+        }
     }
 
     fn prune_retained_jobs(&self) {
@@ -1243,10 +1591,18 @@ impl OrchestrationRuntime {
  autoload_skills: Vec::new(),
  model: None,
  thinking_level: None,
+ max_turns: None,
+ max_tool_calls: None,
+ timeout_secs: None,
+ disallowed_tools: Vec::new(),
+ capability_ceiling: None,
  source: super::persistence::PersistedDefinitionSource::Bundled,
  path: None,
- trusted: true,
- }),
+trusted: true,
+kind: super::AgentDefinitionKind::Agent,
+personality: None,
+soft_budget: None,
+}),
  request: durable_info
  .as_ref()
  .map(|info| info.request.clone())
@@ -1261,6 +1617,8 @@ impl OrchestrationRuntime {
  max_tools_per_agent: self.inner.config.max_tools_per_agent,
  model_provider: None,
  model_id: None,
+ output_schema: None,
+ schema_mode: None,
  }),
  session_path: durable_info
  .as_ref()
@@ -1331,6 +1689,23 @@ impl OrchestrationRuntime {
             Ok(resolved) => resolved,
             Err(_) => return Ok(None),
         };
+        let peer_roster = self.sibling_roster(target);
+        let system_prompt = match self.child_system_prompt(
+            &definition,
+            &info.request.assignment,
+            None,
+            info.request.output_schema.as_ref(),
+            info.request.schema_mode.as_deref(),
+            &peer_roster,
+        ) {
+            Ok(prompt) => prompt,
+            Err(_) => return Ok(None),
+        };
+        let requested_tool_names = crate::effective_agent_tool_names(
+            &definition,
+            self.inner.config.agent_settings.get(&definition.name),
+        )
+        .map(<[String]>::to_vec);
         let orchestration_tools = self.agent_tools(target, info.request.depth);
         let request = match super::persistence::reconstruct_request(
             &super::persistence::PersistedAgent {
@@ -1344,12 +1719,23 @@ impl OrchestrationRuntime {
             },
             resolved.model,
             &definition,
+            system_prompt,
+            requested_tool_names,
             orchestration_tools,
             self.inner.config.max_tools_per_agent,
         ) {
             Some(request) => request,
             None => return Ok(None),
         };
+        if definition.is_persona()
+            && self
+                .inner
+                .persona_lifecycle_blocks
+                .lock()
+                .contains(&definition.name)
+        {
+            bail!("persona {:?} has a destructive operation in progress", definition.name);
+        }
         if !REGISTRY.compare_status(
             &self.inner.group_id,
             target,
@@ -1376,6 +1762,7 @@ impl OrchestrationRuntime {
             started_at: None,
             finished_at: None,
             result: None,
+            soft_budget_exhausted: false,
         };
         if let Err(error) = self.inner.jobs.insert(job_snapshot.clone(), cancel.clone()) {
             let _ = REGISTRY.compare_status(
@@ -1460,17 +1847,18 @@ impl OrchestrationRuntime {
             id: agent_id.clone(),
             group_id: self.inner.group_id.clone(),
         };
+        let definition = request.definition.clone();
         let durable = match self.inner.durable.lock().clone() {
             Some(durable) => durable,
             None => return self.failed_result(
-                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None },
+                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                 job_id,
                 AgentStatus::Idle,
                 "durable orchestration binding is unavailable",
             ),
         };
         let artifact_ref = format!("agent://{agent_id}");
-        let history_ref = format!("history://{agent_id}");
+        let history_ref = history_reference(&definition, &agent_id);
         let artifact_uri = format!("artifact://{agent_id}");
         let artifact_path = self
             .inner
@@ -1487,14 +1875,14 @@ impl OrchestrationRuntime {
             permit = self.inner.semaphore.clone().acquire_owned() => match permit {
                 Ok(permit) => permit,
                 Err(_) => return self.failed_result(
-                    &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None },
+                    &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                     job_id,
                     AgentStatus::Aborted,
                     "orchestration semaphore closed",
                 ),
             },
             () = cancel.cancelled() => return self.failed_result(
-                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None },
+                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                 job_id,
                 AgentStatus::Aborted,
                 "task cancelled before start",
@@ -1504,7 +1892,7 @@ impl OrchestrationRuntime {
         if self.inner.rebind_reserved.load(Ordering::Acquire) {
             drop(durable_mutation);
             return self.failed_result(
-                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None },
+                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                 job_id,
                 AgentStatus::Idle,
                 "durable orchestration rebind is in progress",
@@ -1519,7 +1907,7 @@ impl OrchestrationRuntime {
             let error = format!("persisting revived child running state: {error:#}");
             drop(durable_mutation);
             return self.failed_result(
-                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None },
+                &TaskItem { index: 0, id: agent_id.clone(), agent: request.definition.name.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                 job_id,
                 AgentStatus::Idle,
                 &error,
@@ -1533,6 +1921,14 @@ impl OrchestrationRuntime {
             self.publish_job(job);
         }
         let agent_type = request.definition.name.clone();
+        // The factory takes `request` by value; the run loop still needs the
+        // delivery state (and the agent name below) after the child session is
+        // built, so both are captured before the move.
+        let yield_state = request.yield_state.clone();
+        let output_schema = request.output_schema.clone();
+        let schema_mode = request.schema_mode.clone();
+        let persona_root = definition.persona_root();
+        let mut canonical_session_path = session_path.clone();
         let child = match (self.inner.factory)(request).await {
             Ok(session) => {
                 let recording = match session_path.as_deref() {
@@ -1544,7 +1940,7 @@ impl OrchestrationRuntime {
                 };
                 if let Err(error) = recording {
                     return self.failed_result(
-                        &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None },
+                        &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                         job_id,
                         AgentStatus::Idle,
                         &format!("opening durable child transcript: {error:#}"),
@@ -1553,7 +1949,7 @@ impl OrchestrationRuntime {
                 if session_path.is_none() {
                     let Some((_, new_path)) = session.recorder_info() else {
                         return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None },
+                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                             job_id,
                             AgentStatus::Idle,
                             "durable child recorder is unavailable",
@@ -1562,17 +1958,18 @@ impl OrchestrationRuntime {
                     let new_path = match durable.canonicalize_child_session_path(&new_path) {
                         Ok(path) => path,
                         Err(error) => return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None },
+                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                             job_id,
                             AgentStatus::Idle,
                             &error.to_string(),
                         ),
                     };
+                    canonical_session_path = Some(new_path.clone());
                     let durable_mutation = self.inner.durable_mutation.lock();
                     if self.inner.rebind_reserved.load(Ordering::Acquire) {
                         drop(durable_mutation);
                         return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None },
+                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                             job_id,
                             AgentStatus::Idle,
                             "durable orchestration rebind is in progress",
@@ -1587,7 +1984,7 @@ impl OrchestrationRuntime {
                         let error = format!("persisting revived child transcript path: {error:#}");
                         drop(durable_mutation);
                         return self.failed_result(
-                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None },
+                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                             job_id,
                             AgentStatus::Idle,
                             &error,
@@ -1595,17 +1992,46 @@ impl OrchestrationRuntime {
                     }
                     drop(durable_mutation);
                 }
+                if let Some(root) = persona_root.as_deref() {
+                    let continuity = match load_persona_continuity(root) {
+                        Ok(messages) => messages,
+                        Err(error) => return self.failed_result(
+                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                            job_id,
+                            AgentStatus::Idle,
+                            &format!("loading revived persona continuity: {error:#}"),
+                        ),
+                    };
+                    let merged = merge_persona_continuity(continuity, session.history());
+                    if let Err(error) = session.load_history(merged).await {
+                        return self.failed_result(
+                            &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                            job_id,
+                            AgentStatus::Idle,
+                            &format!("installing revived persona continuity: {error:#}"),
+                        );
+                    }
+                }
                 ChildSession::new(session)
             }
             Err(error) => {
                 return self.failed_result(
-                    &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None },
+                    &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                     job_id,
                     AgentStatus::Idle,
                     &error.to_string(),
                 );
             }
         };
+        let soft_budget_state = JobSoftBudgetState::default();
+        let contract_state = JobContractState::default();
+        let stop_hook = self.compose_turn_stop_hooks(
+            &definition,
+            &soft_budget_state,
+            &contract_state,
+            &yield_state,
+        );
+        child.set_should_stop_after_turn(stop_hook);
 
         // Register active delivery and drain the durable mailbox atomically
         // against concurrent durable sends.
@@ -1615,7 +2041,7 @@ impl OrchestrationRuntime {
             if self.inner.rebind_reserved.load(Ordering::Acquire) {
                 drop(durable_mutation);
                 return self.failed_result(
-                    &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None },
+                    &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                     job_id,
                     AgentStatus::Idle,
                     "durable orchestration rebind is in progress",
@@ -1631,7 +2057,7 @@ impl OrchestrationRuntime {
                 Err(error) => {
                     drop(durable_mutation);
                     return self.failed_result(
-                        &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None },
+                        &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
                         job_id,
                         AgentStatus::Idle,
                         &error.to_string(),
@@ -1648,6 +2074,9 @@ impl OrchestrationRuntime {
 
         // Run the revival as a continuation turn.
         let mut run = Box::pin(child.run(&assignment));
+        let run_deadline = definition.timeout_secs.map(|seconds| {
+            tokio::time::Instant::now() + Duration::from_secs(seconds)
+        });
 
         let outcome = loop {
             tokio::select! {
@@ -1679,6 +2108,30 @@ impl OrchestrationRuntime {
                         Err("task cancelled".to_owned())
                     };
                 }
+                () = async {
+                    tokio::time::sleep_until(run_deadline.expect("deadline guard")).await;
+                }, if run_deadline.is_some() => {
+                    {
+                        let _durable_mutation = self.inner.durable_mutation.lock();
+                        REGISTRY.unregister_active_delivery(&self.inner.group_id, &agent_id);
+                    }
+                    let drain = async {
+                        child.abort().await;
+                        let _ = (&mut run).await;
+                    };
+                    let timeout_secs = definition.timeout_secs.unwrap_or_default();
+                    break if tokio::time::timeout(CHILD_ABORT_GRACE, drain).await.is_err() {
+                        Err(format!(
+                            "role `{}` exceeded its timeout contract of {timeout_secs}s and did not settle after abort",
+                            definition.name,
+                        ))
+                    } else {
+                        Err(format!(
+                            "role `{}` exceeded its timeout contract of {timeout_secs}s",
+                            definition.name,
+                        ))
+                    };
+                }
             }
         };
 
@@ -1693,14 +2146,18 @@ impl OrchestrationRuntime {
         } else {
             AgentStatus::Idle
         };
-        let (output, error, usage) = match outcome {
-            Ok(result) => (result.text, result.error_message, result.usage),
-            Err(error) => (
-                child.last_assistant_text(),
-                Some(error),
-                pi_ai::Usage::default(),
-            ),
-        };
+        let soft_budget_exhausted = soft_budget_state.triggered.load(Ordering::Acquire);
+        let execution_ceiling_reached = soft_budget_exhausted
+            || contract_state.max_turns_triggered.load(Ordering::Acquire)
+            || contract_state.max_tool_calls_triggered.load(Ordering::Acquire);
+        let (output, error, usage) =
+            self.settle_child_outcome(outcome, &child, &yield_state, execution_ceiling_reached);
+        let structured_output = super::tools::validate_delivered_output(
+            &output,
+            output_schema.as_ref(),
+            schema_mode.as_deref(),
+            error.as_deref(),
+        );
         let artifact_body = if output.is_empty() {
             error.as_deref().unwrap_or("(no output)").to_owned()
         } else {
@@ -1725,6 +2182,17 @@ impl OrchestrationRuntime {
             }),
             None => error,
         };
+        if let (Some(root), Some(source)) = (
+            persona_root.as_deref(),
+            canonical_session_path.as_deref(),
+        ) && let Err(archive_error) = archive_persona_session(root, &agent_id, source, true)
+        {
+            let message = format!("archiving revived persona transcript: {archive_error:#}");
+            final_error = Some(match final_error {
+                Some(error) => format!("{error}; {message}"),
+                None => message,
+            });
+        }
         if let Err(persist_error) = self.finish_agent(
             &agent_id,
             status,
@@ -1737,6 +2205,24 @@ impl OrchestrationRuntime {
                 None => message,
             });
         }
+        if let Some(reason) = self.contract_stop_reason(&definition, &contract_state) {
+            final_error = Some(match final_error {
+                Some(error) => format!("{reason}; {error}"),
+                None => reason,
+            });
+        }
+        // Strict schema mode surfaces a delivered payload that fails its
+        // outputSchema contract as a job error (the child still settled).
+        if schema_mode.as_deref() == Some("strict")
+            && let Some(validation) = structured_output.as_ref()
+            && !validation.valid
+            && let Some(validation_error) = validation.error.as_deref()
+        {
+            final_error = Some(match final_error {
+                Some(error) => format!("{validation_error}; {error}"),
+                None => validation_error.to_owned(),
+            });
+        }
         TaskResult {
             index: 0,
             id: agent_id,
@@ -1745,6 +2231,8 @@ impl OrchestrationRuntime {
             output,
             error: final_error,
             usage,
+            soft_budget_exhausted,
+            structured_output,
             artifact_ref,
             history_ref,
             artifact_uri,
@@ -1815,14 +2303,24 @@ impl OrchestrationRuntime {
                 .as_deref()
                 .map(|path| durable.canonicalize_child_session_path(Path::new(path)))
                 .transpose()?;
-            let snapshot = AgentSnapshot {
+            let definition = agent.definition;
+            let request = agent.request;
+            let mailbox = agent.mailbox;
+            let was_unsettled = matches!(
+                agent.snapshot.status,
+                AgentStatus::Queued | AgentStatus::Running
+            );
+            let mut snapshot = AgentSnapshot {
                 status: super::persistence::recovery_status(agent.snapshot.status),
                 last_activity: now,
                 ..agent.snapshot
             };
-            let definition = agent.definition;
-            let request = agent.request;
-            let mailbox = agent.mailbox;
+            if was_unsettled || snapshot.history_ref.is_some() {
+                snapshot.history_ref = Some(persisted_history_reference(
+                    &definition,
+                    &snapshot.id,
+                ));
+            }
             agents.push(super::persistence::PersistedAgent {
                 snapshot: snapshot.clone(),
                 definition: definition.clone(),
@@ -1854,10 +2352,18 @@ impl OrchestrationRuntime {
                 }),
             );
         }
+        let persona_names = agents
+            .iter()
+            .filter(|agent| agent.definition.kind == super::AgentDefinitionKind::Persona)
+            .map(|agent| (agent.snapshot.id.clone(), agent.definition.name.clone()))
+            .collect::<HashMap<_, _>>();
         let job_snapshots = state
             .jobs
             .into_iter()
-            .map(|job| super::persistence::recovery_job(job, now))
+            .map(|job| {
+                let persona = persona_names.get(&job.agent_id).map(String::as_str);
+                super::persistence::recovery_job_with_persona(job, now, persona)
+            })
             .collect::<Vec<_>>();
         let jobs = self.inner.jobs.prepare_replacement(job_snapshots);
         Ok(PreparedRecoveredState {
@@ -1985,6 +2491,26 @@ impl OrchestrationRuntime {
             group_id: self.inner.group_id.clone(),
             message,
         });
+    }
+
+    /// Append one durably delivered group message to the bounded delivered
+    /// log (newest-last). The log is the workflow page's Recent IRC source:
+    /// it survives mailbox consumption, so subagent ⇄ subagent messages stay
+    /// visible after the recipient reads them.
+    fn record_delivered_message(&self, message: MailboxMessage) {
+        let mut log = self.inner.delivered_messages.lock();
+        log.push_back(message);
+        if log.len() > DELIVERED_MESSAGE_LOG_CAP {
+            let excess = log.len() - DELIVERED_MESSAGE_LOG_CAP;
+            log.drain(..excess);
+        }
+    }
+
+    /// Bounded, newest-last log of every durably delivered group message,
+    /// independent of mailbox consumption.
+    #[must_use]
+    pub fn delivered_messages(&self) -> Vec<MailboxMessage> {
+        self.inner.delivered_messages.lock().iter().cloned().collect()
     }
 
     /// Human-facing label for an agent id; falls back to the stable id.
@@ -2120,6 +2646,11 @@ impl OrchestrationRuntime {
                         } {
                             Ok(revival) => {
                                 let outcome = revival.unwrap_or(outcome);
+                                // Every durably delivered group message lands
+                                // in the bounded delivered-message log (the
+                                // workflow page's Recent IRC source), whether
+                                // or not the recipient has consumed it yet.
+                                self.record_delivered_message(message.clone());
                                 if target == main_id {
                                     self.publish_message_delivered(message);
                                 }
@@ -2458,7 +2989,6 @@ impl OrchestrationRuntime {
         let mut prepared = Vec::with_capacity(items.len());
         let available_models = crate::available_models();
         for mut item in items {
-            item.id = self.allocate_unique_agent_id(&item.id, &mut reserved)?;
             let definition = self
                 .inner
                 .config
@@ -2466,8 +2996,31 @@ impl OrchestrationRuntime {
                 .get(&item.agent)
                 .cloned()
                 .ok_or_else(|| anyhow!("unknown agent definition {:?}", item.agent))?;
+            if definition.is_persona()
+                && self
+                    .inner
+                    .persona_lifecycle_blocks
+                    .lock()
+                    .contains(&definition.name)
+            {
+                bail!("persona {:?} has a destructive operation in progress", definition.name);
+            }
+            item.id = self.allocate_unique_agent_id_for_definition(
+                &item.id,
+                &definition,
+                &mut reserved,
+            )?;
             if !definition.trusted {
                 bail!("agent definition {:?} is not trusted", item.agent);
+            }
+            if definition.is_persona() && !self.inner.durable_bound.load(Ordering::Acquire) {
+                bail!(
+                    "persona {:?} requires orchestration to be bound to a durable parent session",
+                    definition.name
+                );
+            }
+            if definition.is_persona() && definition.persona_root().is_none() {
+                bail!("persona {:?} has no durable persona root", definition.name);
             }
             if self
                 .inner
@@ -2479,18 +3032,23 @@ impl OrchestrationRuntime {
                 return Err(crate::agent_disabled_error(&item.agent));
             }
             let agent_settings = self.inner.config.agent_settings.get(&item.agent);
+            // Unknown declared tools are silently ignored (OMP-compatible):
+            // record a deduped warning and continue — they never abort the
+            // batch and never make the agent unusable.
             let unsupported = crate::unsupported_agent_tools(&definition, agent_settings);
             if !unsupported.is_empty() {
-                return Err(crate::agent_unsupported_tools_error(
-                    &item.agent,
-                    &unsupported,
-                ));
+                self.record_unknown_tool_warnings(&item.agent, &unsupported);
             }
+            // The pre-check counts only names that will actually be injected
+            // (known, non-plumbing): unknown declarations and plumbing never
+            // consume max_tools_per_agent budget, matching the child-side
+            // enforcement in the factory.
             if crate::effective_agent_tool_names(&definition, agent_settings).is_some_and(|tools| {
                 tools
                     .iter()
                     .filter(|name| {
-                        !matches!(name.as_str(), "todo" | "process" | "task" | "hub" | "goal")
+                        !crate::is_child_plumbing_tool(name)
+                            && crate::is_known_child_tool(name)
                     })
                     .count()
                     > self.inner.config.max_tools_per_agent
@@ -2556,6 +3114,7 @@ impl OrchestrationRuntime {
                 started_at: None,
                 finished_at: None,
                 result: None,
+                soft_budget_exhausted: false,
             };
             launches.push((item, definition, resolved_model, cancel, agent_snapshot, job_snapshot));
         }
@@ -2584,6 +3143,9 @@ impl OrchestrationRuntime {
                     system_prompt: self.child_system_prompt(
                         &definition,
                         &item.assignment,
+                        item.context.as_deref(),
+                        item.output_schema.as_ref(),
+                        item.schema_mode.as_deref(),
                         &peer_roster,
                     )?,
                     requested_tool_names: crate::effective_agent_tool_names(
@@ -2597,6 +3159,9 @@ impl OrchestrationRuntime {
                     model: resolved_model.model,
                     definition,
                     assignment: item.assignment.clone(),
+                    output_schema: item.output_schema.clone(),
+                    schema_mode: item.schema_mode.clone(),
+                    yield_state: Arc::new(YieldState::default()),
                 };
                 Ok((item, request, cancel, agent_snapshot, job_snapshot))
             })
@@ -2702,6 +3267,184 @@ impl OrchestrationRuntime {
             .await
     }
 
+    /// Build the per-turn stop hook implementing this runtime's soft budget for
+    /// a child job, or `None` when no budget knob is configured (unlimited,
+    /// historical run-to-completion behavior).
+    ///
+    /// The hook fires after every completed assistant turn: it counts requests
+    /// and accumulates per-turn `Usage::total_tokens`, and returns `true` once
+    /// a configured limit is reached. The agent loop then ends the run cleanly
+    /// after that turn — the partial output and accumulated usage are preserved
+    /// — and `state.triggered` records that the settled job must carry the
+    /// `soft_budget_exhausted` marker (the job is never failed by a budget).
+    fn soft_budget_stop_hook(
+        &self,
+        definition: &AgentDefinition,
+        state: &JobSoftBudgetState,
+    ) -> Option<ShouldStopAfterTurnFn> {
+        let budget = if definition.is_persona() {
+            definition.soft_budget.unwrap_or(self.inner.config.soft_budget)
+        } else {
+            self.inner.config.soft_budget
+        };
+        if budget.max_requests.is_none()
+            && budget.max_tokens.is_none()
+            && budget.yield_after.is_none()
+        {
+            return None;
+        }
+        let requests = state.requests.clone();
+        let tokens = state.tokens.clone();
+        let triggered = state.triggered.clone();
+        Some(Arc::new(move |turn: &ShouldStopAfterTurnContext| {
+            let request_count = requests.fetch_add(1, Ordering::Relaxed) + 1;
+            let turn_tokens = u64::try_from(turn.message.usage.total_tokens.max(0))
+                .unwrap_or(u64::MAX);
+            let token_count = tokens.fetch_add(turn_tokens, Ordering::Relaxed) + turn_tokens;
+            let stop = budget.yield_after.is_some_and(|limit| request_count >= limit)
+                || budget.max_requests.is_some_and(|limit| request_count >= limit)
+                || budget.max_tokens.is_some_and(|limit| token_count >= limit);
+            if stop {
+                triggered.store(true, Ordering::Release);
+            }
+            stop
+        }))
+    }
+
+    /// Turn stop hook implementing the definition's `max_turns` and
+    /// `max_tool_calls` contracts, or `None` when neither is configured.
+    ///
+    /// Like [`Self::soft_budget_stop_hook`] the hook fires after each completed
+    /// assistant turn and ends the run cleanly once a limit is reached; the run
+    /// loop then surfaces the triggered limit as a clear per-job reason.
+    fn definition_contract_stop_hook(
+        &self,
+        definition: &AgentDefinition,
+        state: &JobContractState,
+    ) -> Option<ShouldStopAfterTurnFn> {
+        if definition.max_turns.is_none() && definition.max_tool_calls.is_none() {
+            return None;
+        }
+        let max_turns = definition.max_turns;
+        let max_tool_calls = definition.max_tool_calls;
+        let turns = state.turns.clone();
+        let tool_calls = state.tool_calls.clone();
+        let max_turns_triggered = state.max_turns_triggered.clone();
+        let max_tool_calls_triggered = state.max_tool_calls_triggered.clone();
+        Some(Arc::new(move |context: &ShouldStopAfterTurnContext| {
+            let mut stop = false;
+            let turn_count = turns.fetch_add(1, Ordering::Relaxed) + 1;
+            if max_turns.is_some_and(|limit| turn_count >= limit) {
+                max_turns_triggered.store(true, Ordering::Release);
+                stop = true;
+            }
+            let turn_tool_calls = context
+                .message
+                .content
+                .iter()
+                .filter(|block| matches!(block, pi_ai::ContentBlock::ToolCall(_)))
+                .count();
+            let call_count = tool_calls.fetch_add(turn_tool_calls, Ordering::Relaxed) + turn_tool_calls;
+            if max_tool_calls.is_some_and(|limit| call_count >= limit) {
+                max_tool_calls_triggered.store(true, Ordering::Release);
+                stop = true;
+            }
+            stop
+        }))
+    }
+
+    /// Combine the soft-budget, role-contract, and yield-delivery stop hooks so
+    /// the child stops when any of them fires. The yield hook is always
+    /// present: once the child calls `yield` the run must end after that turn
+    /// so the delivered payload becomes the final output and the model never
+    /// produces trailing text after the delivery.
+    fn compose_turn_stop_hooks(
+        &self,
+        definition: &AgentDefinition,
+        soft_budget: &JobSoftBudgetState,
+        contract: &JobContractState,
+        yield_state: &YieldState,
+    ) -> Option<ShouldStopAfterTurnFn> {
+        let yield_called = yield_state.clone();
+        let yield_hook = Arc::new(move |_turn: &ShouldStopAfterTurnContext| {
+            yield_called.was_called()
+        });
+        match (
+            self.soft_budget_stop_hook(definition, soft_budget),
+            self.definition_contract_stop_hook(definition, contract),
+        ) {
+            (Some(left), Some(right)) => Some(Arc::new(move |context| {
+                left(context) || right(context) || yield_hook(context)
+            })),
+            (Some(hook), None) | (None, Some(hook)) => Some(Arc::new(move |context| {
+                hook(context) || yield_hook(context)
+            })),
+            (None, None) => Some(yield_hook),
+        }
+    }
+
+    /// Clear reason when a role contract limit stopped the child early, or
+    /// `None` when no contract limit fired.
+    fn contract_stop_reason(
+        &self,
+        definition: &AgentDefinition,
+        state: &JobContractState,
+    ) -> Option<String> {
+        if state.max_turns_triggered.load(Ordering::Acquire) {
+            return Some(format!(
+                "role `{}` exceeded its maxTurns contract ({} turns)",
+                definition.name,
+                definition.max_turns.unwrap_or_default(),
+            ));
+        }
+        if state.max_tool_calls_triggered.load(Ordering::Acquire) {
+            return Some(format!(
+                "role `{}` exceeded its maxToolCalls contract ({} tool calls)",
+                definition.name,
+                definition.max_tool_calls.unwrap_or_default(),
+            ));
+        }
+        None
+    }
+
+    /// Projects a settled child run into the job's `(output, error, usage)`
+    /// triple.
+    ///
+    /// Yield protocol (OMP parity): when the child called `yield`, the
+    /// delivered payload REPLACES the trailing assistant text as the final
+    /// output — the transcript keeps the child's concise yield-marker message,
+    /// but the payload is what the parent receives. When the child ended
+    /// naturally WITHOUT calling yield, the natural final text is kept and
+    /// [`MISSING_YIELD_WARNING`] is appended (back-compat: children written
+    /// before the explicit-delivery protocol still settle with their text).
+    /// Soft-budget and contract-limited stops are untouched (no warning): the
+    /// host cut the run short, so the partial text stands as-is. Error paths
+    /// keep the error text and never project a payload.
+    fn settle_child_outcome(
+        &self,
+        outcome: Result<crate::RunResult, String>,
+        child: &ChildSession,
+        yield_state: &YieldState,
+        execution_ceiling_reached: bool,
+    ) -> (String, Option<String>, pi_ai::Usage) {
+        let (mut output, error, usage) = match outcome {
+            Ok(result) => (result.text, result.error_message, result.usage),
+            Err(error) => (
+                child.last_assistant_text(),
+                Some(error),
+                pi_ai::Usage::default(),
+            ),
+        };
+        if error.is_none() {
+            if let Some(payload) = yield_state.payload() {
+                output = payload;
+            } else if !execution_ceiling_reached {
+                append_missing_yield_warning(&mut output);
+            }
+        }
+        (output, error, usage)
+    }
+
     async fn run_one(
         &self,
         item: TaskItem,
@@ -2714,8 +3457,9 @@ impl OrchestrationRuntime {
             id: item.id.clone(),
             group_id: self.inner.group_id.clone(),
         };
+        let definition = request.definition.clone();
         let artifact_ref = format!("agent://{}", item.id);
-        let history_ref = format!("history://{}", item.id);
+        let history_ref = history_reference(&definition, &item.id);
         let artifact_uri = format!("artifact://{}", item.id);
         let artifact_path = self
             .inner
@@ -2778,6 +3522,12 @@ impl OrchestrationRuntime {
         if let Some(job) = running_job {
             self.publish_job(job);
         }
+        // The factory takes `request` by value; the run loop still needs the
+        // delivery state and output contract after the child session is built.
+        let yield_state = request.yield_state.clone();
+        let output_schema = request.output_schema.clone();
+        let schema_mode = request.schema_mode.clone();
+        let persona_root = request.definition.persona_root();
         let child_session = tokio::select! {
             result = (self.inner.factory)(request) => match result {
                 Ok(session) => session,
@@ -2785,11 +3535,35 @@ impl OrchestrationRuntime {
             },
             () = cancel.cancelled() => return self.failed_result(&item, job_id, AgentStatus::Aborted, "task cancelled during child session creation"),
         };
-        if self.inner.durable_bound.load(Ordering::Acquire) {
-            let durable = match self.inner.durable.lock().clone() {
-                Some(durable) => durable,
-                None => return self.failed_result(&item, job_id, AgentStatus::Idle, "durable orchestration binding is unavailable"),
+        if let Some(root) = persona_root.as_deref() {
+            let continuity = match load_persona_continuity(root) {
+                Ok(messages) => messages,
+                Err(error) => return self.failed_result(
+                    &item,
+                    job_id,
+                    AgentStatus::Idle,
+                    &format!("loading persona continuity: {error:#}"),
+                ),
             };
+            if let Err(error) = child_session.load_history(continuity).await {
+                return self.failed_result(
+                    &item,
+                    job_id,
+                    AgentStatus::Idle,
+                    &format!("installing persona continuity: {error:#}"),
+                );
+            }
+        }
+        let durable = if self.inner.durable_bound.load(Ordering::Acquire) {
+            match self.inner.durable.lock().clone() {
+                Some(durable) => Some(durable),
+                None => return self.failed_result(&item, job_id, AgentStatus::Idle, "durable orchestration binding is unavailable"),
+            }
+        } else {
+            None
+        };
+        let mut canonical_session_path = None;
+        if let Some(durable) = durable.as_ref() {
             if let Err(error) = child_session.start_durable_child_recording(
                 durable.child_root(),
                 durable.parent_session_path(),
@@ -2808,6 +3582,7 @@ impl OrchestrationRuntime {
                 Ok(path) => path,
                 Err(error) => return self.failed_result(&item, job_id, AgentStatus::Idle, &error.to_string()),
             };
+            canonical_session_path = Some(session_path.clone());
             let durable_mutation = self.inner.durable_mutation.lock();
             if self.inner.rebind_reserved.load(Ordering::Acquire) {
                 drop(durable_mutation);
@@ -2826,16 +3601,20 @@ impl OrchestrationRuntime {
             if let Err(error) = self.persist_state() {
                 let error = format!("persisting durable child transcript path: {error:#}");
                 drop(durable_mutation);
-                return self.failed_result(
-                    &item,
-                    job_id,
-                    AgentStatus::Idle,
-                    &error,
-                );
+                return self.failed_result(&item, job_id, AgentStatus::Idle, &error);
             }
             drop(durable_mutation);
         }
         let child = ChildSession::new(child_session);
+        let soft_budget_state = JobSoftBudgetState::default();
+        let contract_state = JobContractState::default();
+        let stop_hook = self.compose_turn_stop_hooks(
+            &definition,
+            &soft_budget_state,
+            &contract_state,
+            &yield_state,
+        );
+        child.set_should_stop_after_turn(stop_hook);
         let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
         let pre_run = {
             let durable_mutation = self.inner.durable_mutation.lock();
@@ -2866,6 +3645,9 @@ impl OrchestrationRuntime {
             self.acknowledge_delivery(&item.id, &message.id);
         }
         let mut run = Box::pin(child.run(&item.assignment));
+        let run_deadline = definition.timeout_secs.map(|seconds| {
+            tokio::time::Instant::now() + Duration::from_secs(seconds)
+        });
         let outcome = loop {
             tokio::select! {
                 result = &mut run => break result.map_err(|error| error.to_string()),
@@ -2896,6 +3678,30 @@ impl OrchestrationRuntime {
                         Err("task cancelled".to_owned())
                     };
                 }
+                () = async {
+                    tokio::time::sleep_until(run_deadline.expect("deadline guard")).await;
+                }, if run_deadline.is_some() => {
+                    {
+                        let _durable_mutation = self.inner.durable_mutation.lock();
+                        REGISTRY.unregister_active_delivery(&self.inner.group_id, &item.id);
+                    }
+                    let drain = async {
+                        child.abort().await;
+                        let _ = (&mut run).await;
+                    };
+                    let timeout_secs = definition.timeout_secs.unwrap_or_default();
+                    break if tokio::time::timeout(CHILD_ABORT_GRACE, drain).await.is_err() {
+                        Err(format!(
+                            "role `{}` exceeded its timeout contract of {timeout_secs}s and did not settle after abort",
+                            definition.name,
+                        ))
+                    } else {
+                        Err(format!(
+                            "role `{}` exceeded its timeout contract of {timeout_secs}s",
+                            definition.name,
+                        ))
+                    };
+                }
             }
         };
         {
@@ -2909,14 +3715,18 @@ impl OrchestrationRuntime {
         } else {
             AgentStatus::Idle
         };
-        let (output, error, usage) = match outcome {
-            Ok(result) => (result.text, result.error_message, result.usage),
-            Err(error) => (
-                child.last_assistant_text(),
-                Some(error),
-                pi_ai::Usage::default(),
-            ),
-        };
+        let soft_budget_exhausted = soft_budget_state.triggered.load(Ordering::Acquire);
+        let execution_ceiling_reached = soft_budget_exhausted
+            || contract_state.max_turns_triggered.load(Ordering::Acquire)
+            || contract_state.max_tool_calls_triggered.load(Ordering::Acquire);
+        let (output, error, usage) =
+            self.settle_child_outcome(outcome, &child, &yield_state, execution_ceiling_reached);
+        let structured_output = super::tools::validate_delivered_output(
+            &output,
+            output_schema.as_ref(),
+            schema_mode.as_deref(),
+            error.as_deref(),
+        );
         let artifact_body = if output.is_empty() {
             error.as_deref().unwrap_or("(no output)").to_owned()
         } else {
@@ -2941,6 +3751,15 @@ impl OrchestrationRuntime {
             }),
             None => error,
         };
+        if let (Some(root), Some(source)) = (persona_root.as_deref(), canonical_session_path.as_deref())
+            && let Err(archive_error) = archive_persona_session(root, &item.id, source, false)
+        {
+            let message = format!("archiving persona transcript: {archive_error:#}");
+            final_error = Some(match final_error {
+                Some(error) => format!("{error}; {message}"),
+                None => message,
+            });
+        }
         if let Err(persist_error) = self.finish_agent(
             &item.id,
             status,
@@ -2953,6 +3772,24 @@ impl OrchestrationRuntime {
                 None => message,
             });
         }
+        if let Some(reason) = self.contract_stop_reason(&definition, &contract_state) {
+            final_error = Some(match final_error {
+                Some(error) => format!("{reason}; {error}"),
+                None => reason,
+            });
+        }
+        // Strict schema mode surfaces a delivered payload that fails its
+        // outputSchema contract as a job error (the child still settled).
+        if schema_mode.as_deref() == Some("strict")
+            && let Some(validation) = structured_output.as_ref()
+            && !validation.valid
+            && let Some(validation_error) = validation.error.as_deref()
+        {
+            final_error = Some(match final_error {
+                Some(error) => format!("{validation_error}; {error}"),
+                None => validation_error.to_owned(),
+            });
+        }
         TaskResult {
             index: item.index,
             id: item.id,
@@ -2961,6 +3798,8 @@ impl OrchestrationRuntime {
             output,
             error: final_error,
             usage,
+            soft_budget_exhausted,
+            structured_output,
             artifact_ref,
             history_ref,
             artifact_uri,
@@ -2975,7 +3814,15 @@ impl OrchestrationRuntime {
         error: &str,
     ) -> TaskResult {
         let artifact_ref = format!("agent://{}", item.id);
-        let history_ref = format!("history://{}", item.id);
+        let history_ref = self
+            .inner
+            .config
+            .catalog
+            .get(&item.agent)
+            .map_or_else(
+                || format!("history://{}", item.id),
+                |definition| history_reference(definition, &item.id),
+            );
         let artifact_uri = format!("artifact://{}", item.id);
         let artifact_path = self
             .inner
@@ -3011,6 +3858,8 @@ impl OrchestrationRuntime {
             output: String::new(),
             error: Some(final_error),
             usage: pi_ai::Usage::default(),
+            soft_budget_exhausted: false,
+            structured_output: None,
             artifact_ref,
             history_ref,
             artifact_uri,
@@ -3021,9 +3870,27 @@ impl OrchestrationRuntime {
         &self,
         definition: &AgentDefinition,
         assignment: &str,
+        context: Option<&str>,
+        output_schema: Option<&Value>,
+        schema_mode: Option<&str>,
         peer_roster: &str,
     ) -> Result<String> {
         let mut prompt = definition.system_prompt.clone();
+        if let Some(personality) = definition
+            .is_persona()
+            .then_some(definition.personality.as_deref())
+            .flatten()
+            .filter(|personality| !personality.trim().is_empty())
+        {
+            if personality.len() > MAX_PERSONALITY_BYTES {
+                bail!(
+                    "persona personality exceeds maximum size of {MAX_PERSONALITY_BYTES} bytes"
+                );
+            }
+            prompt.push_str("\n\n<personality>\n");
+            prompt.push_str(&escape_xml(personality));
+            prompt.push_str("\n</personality>");
+        }
         let mut autoload_bytes = 0_usize;
         let visible_skills = self
             .inner
@@ -3123,6 +3990,24 @@ impl OrchestrationRuntime {
         }
         prompt.push_str("\n\n");
         prompt.push_str(peer_roster);
+        if let Some(context) = context.filter(|text| !text.trim().is_empty()) {
+            // OMP batch parity: the shared `context` is rendered verbatim into
+            // every spawned child's system prompt as a CONTEXT section, so
+            // each child of a batch sees the shared background alongside its
+            // own delegated assignment.
+            prompt.push_str(&format!("\n\n<context>\n{context}\n</context>"));
+        }
+        prompt.push_str(
+            "\n\n<delivery_protocol>\nWhen the assigned work is fully complete, call the `yield` tool exactly once with your final deliverable as its `text` argument: that payload becomes your delivered output and ends your session. Do not call `yield` mid-work, and do not do any work after calling it.\n</delivery_protocol>",
+        );
+        if let Some(output_schema) = output_schema {
+            let schema_text = serde_json::to_string_pretty(output_schema)
+                .unwrap_or_else(|_| output_schema.to_string());
+            prompt.push_str(&format!(
+                "\n\n<output_contract>\nYour final `yield` payload must be a single JSON value that validates against this JSON Schema:\n{schema_text}\nValidation mode: {}\n</output_contract>",
+                schema_mode.unwrap_or("permissive")
+            ));
+        }
         prompt.push_str(&format!(
             "\n\n<delegated_assignment>\n{}\n</delegated_assignment>",
             assignment
@@ -3199,12 +4084,32 @@ impl OrchestrationRuntime {
 
     /// Resolve the agent for a task assignment.
     ///
-    /// Precedence: explicit `task.agent` override, then unique exact trusted
-    /// agent-name mention (including disabled/untrusted rejection), then ranked
-    /// metadata selection / default. Ambiguous exact mentions return an error.
+    /// Precedence: explicit `task.agent` override (validated against the
+    /// catalog: missing, disabled, or incompatible definitions fail actionably
+    /// instead of falling back), then unique exact trusted agent-name mention
+    /// (including disabled/untrusted rejection), then ranked metadata
+    /// selection / default. Ambiguous exact mentions return an error.
     pub fn resolve_task_agent(&self, assignment: &str, explicit: Option<&str>) -> Result<String> {
         if let Some(explicit) = explicit.filter(|name| !name.trim().is_empty()) {
+            if self.inner.config.catalog.get(explicit).is_none() {
+                bail!(
+                    "explicit agent {:?} is not defined in the agent catalog; \
+                     define it as a user agent (~/.pi/agents) or a project agent in the \
+                     current worktree, or remove the explicit agent choice",
+                    explicit
+                );
+            }
             self.ensure_agent_enabled(explicit)?;
+            if !self
+                .enabled_agents()
+                .iter()
+                .any(|agent| agent.name == explicit)
+            {
+                bail!(
+                    "explicit agent {:?} is not available for spawning",
+                    explicit
+                );
+            }
             return Ok(explicit.to_owned());
         }
         match self.exact_agent_mention_in_catalog(assignment) {
@@ -3234,21 +4139,36 @@ impl OrchestrationRuntime {
         }
     }
 
-    /// Spawn a child when the request carries a delegation verb and a unique
-    /// exact trusted agent name. Generic skill/semantic text returns `Ok(None)`
-    /// so the caller can keep selection recommendations without spawning.
+    /// Spawn a child when the request carries a delegation construction and a
+    /// unique exact trusted agent name. Delegation intent is Unicode-aware:
+    /// either a recognized English delegation verb token anywhere in the
+    /// request (`Have researcher study this`) or a conservative CJK
+    /// construction where a Chinese delegation token abuts the agent name and
+    /// an action clause follows it (`你让researcher仔细调研pi-coding-agent`).
+    /// Informational mentions (`researcher 是做什么的？`,
+    /// `我在文档里看到researcher`) and generic skill/semantic text return
+    /// `Ok(None)` so the caller can keep selection recommendations without
+    /// spawning.
     pub fn spawn_from_natural_language(
         &self,
         parent_id: &str,
         parent_depth: usize,
         request: &str,
     ) -> Result<Option<Vec<TaskSpawn>>> {
-        if !request_has_delegation_verb(request) {
-            return Ok(None);
-        }
         match self.exact_agent_mention_in_catalog(request) {
             crate::selector::ExactAgentMention::None => Ok(None),
-            crate::selector::ExactAgentMention::Ambiguous(_) => {
+            crate::selector::ExactAgentMention::Ambiguous(names) => {
+                // Only explicit delegation intent escalates an ambiguous
+                // mention into an error: an English delegation verb anywhere
+                // or a CJK construction aimed at one of the candidates. A
+                // plain informational mention ("researcher和writer哪个好")
+                // stays a recommendation.
+                let cjk_hit = names
+                    .iter()
+                    .any(|name| cjk_delegation_construction(request, name));
+                if !request_has_delegation_verb(request) && !cjk_hit {
+                    return Ok(None);
+                }
                 bail!(
                     "{}",
                     self.exact_agent_ambiguity(request).unwrap_or_else(|| {
@@ -3257,6 +4177,9 @@ impl OrchestrationRuntime {
                 );
             }
             crate::selector::ExactAgentMention::Unique(name) => {
+                if !delegation_intent(request, &name) {
+                    return Ok(None);
+                }
                 self.ensure_agent_enabled(&name)?;
                 if !self
                     .enabled_agents()
@@ -3277,11 +4200,84 @@ impl OrchestrationRuntime {
                         agent: name,
                         assignment: request.to_owned(),
                         todo_task_id: None,
+                        ..Default::default()
                     }],
                 )?;
                 Ok(Some(spawns))
             }
         }
+    }
+
+    /// P0-C catalog diagnostics: fail actionably when `request` (a workflow
+    /// objective) explicitly delegates to agent names that are absent from
+    /// this catalog or disabled in it, instead of silently degrading to the
+    /// default agent. Skill names are exempt (a skill invocation is not an
+    /// agent delegation). The message names the missing/disabled definition
+    /// and where workflow agents are discovered.
+    pub fn validate_delegation_agents(&self, request: &str) -> Result<()> {
+        let catalog_agents = self.inner.config.catalog.agents().clone();
+        let skill_names = self
+            .skills()
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut absent = std::collections::BTreeSet::new();
+        let mut disabled = std::collections::BTreeSet::new();
+        for candidate in delegation_candidates(request) {
+            if skill_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&candidate))
+            {
+                continue;
+            }
+            if let Some(agent) = catalog_agents
+                .iter()
+                .find(|agent| agent.name.eq_ignore_ascii_case(&candidate))
+            {
+                if self
+                    .inner
+                    .config
+                    .agent_settings
+                    .get(&agent.name)
+                    .is_some_and(|settings| settings.enabled == Some(false))
+                {
+                    disabled.insert(agent.name.clone());
+                }
+                continue;
+            }
+            absent.insert(candidate);
+        }
+        if absent.is_empty() && disabled.is_empty() {
+            return Ok(());
+        }
+        let mut message = String::new();
+        if !absent.is_empty() {
+            let names = absent
+                .iter()
+                .map(|name| format!("{name:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!(
+                "workflow objective delegates to agent(s) {names} that are not defined in the \
+                 workflow agent catalog; define them as user agents under ~/.pi/agents or as \
+                 project agents inside the workflow worktree, or reword the objective"
+            ));
+        }
+        if !disabled.is_empty() {
+            if !message.is_empty() {
+                message.push_str("; ");
+            }
+            let names = disabled
+                .iter()
+                .map(|name| format!("{name:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            message.push_str(&format!(
+                "workflow objective delegates to disabled agent(s) {names}; enable them in the \
+                 workflow agent settings or reword the objective"
+            ));
+        }
+        bail!("{message}");
     }
 
     fn select_ranked_or_default_agent(&self, assignment: &str) -> String {
@@ -3290,6 +4286,13 @@ impl OrchestrationRuntime {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
+        // An explicit `/role <name> --select` preference wins over ranked
+        // selection; it only applies when the role is enabled and compatible.
+        if let Some(preferred) = self.inner.preferred_agent.read().as_ref()
+            && enabled_owned.iter().any(|agent| agent.name == *preferred)
+        {
+            return preferred.clone();
+        }
         // Cross-kind: unique/ambiguous exact skill mention keeps the configured
         // default rather than promoting an overlapping agent via ranking.
         if !matches!(
@@ -3366,13 +4369,23 @@ impl OrchestrationRuntime {
     }
 
     pub fn read_uri_resolver(&self) -> crate::InternalUriResolverFn {
-        let group_id = self.inner.group_id.clone();
-        let artifact_dir = self.inner.config.artifact_dir.clone();
-        Arc::new(move |uri| resolve_read_uri_in(&group_id, &artifact_dir, uri))
+        let runtime = self.clone();
+        Arc::new(move |uri| {
+            if let Some(reference) = uri.strip_prefix("history://") {
+                return runtime.resolve_history_reference(reference);
+            }
+            resolve_read_uri_in(
+                &runtime.inner.group_id,
+                &runtime.inner.config.artifact_dir,
+                uri,
+            )
+        })
     }
 
-
     pub fn resolve_read_uri(&self, uri: &str) -> Result<PathBuf> {
+        if let Some(reference) = uri.strip_prefix("history://") {
+            return self.resolve_history_reference(reference);
+        }
         resolve_read_uri_in(&self.inner.group_id, &self.inner.config.artifact_dir, uri)
     }
 
@@ -3385,14 +4398,187 @@ impl OrchestrationRuntime {
         )
     }
 
-    pub fn resolve_history_reference(&self, id: &str) -> Result<PathBuf> {
-        resolve_registered_artifact(
-            &self.inner.group_id,
-            &self.inner.config.artifact_dir,
-            id,
-            true,
-        )
+    pub fn resolve_history_reference(&self, reference: &str) -> Result<PathBuf> {
+        if let Some(qualified) = reference.strip_prefix("persona/") {
+            let (persona, agent_id) = qualified
+                .split_once('/')
+                .ok_or_else(|| anyhow!("persona history URI must be history://persona/<persona>/<agent-id>"))?;
+            validate_agent_id(persona)?;
+            validate_agent_id(agent_id)?;
+            return self.resolve_qualified_persona_archive(persona, agent_id);
+        }
+        validate_agent_id(reference)?;
+        let Some(entry) = REGISTRY.get(&self.inner.group_id, reference) else {
+            return self.resolve_persona_archive(reference);
+        };
+        match entry.history_path.lock().clone() {
+            Some(path) => ensure_existing_artifact(&self.inner.config.artifact_dir, &path),
+            None => self.resolve_persona_archive(reference),
+        }
     }
+
+    pub fn read_child_history(&self, agent_id: &str, lines: usize) -> Result<String> {
+        let lines = lines.clamp(1, MAX_HISTORY_LINES);
+        let path = if agent_id.starts_with("persona/") {
+            self.resolve_history_reference(agent_id)?
+        } else {
+            validate_agent_id(agent_id)?;
+            self.resolve_history_source(agent_id)?
+        };
+        let rendered = render_history_file(&path, lines)
+            .with_context(|| format!("rendering history for agent {agent_id:?}"))?;
+        let redacted = crate::redact::redact_secrets(&rendered);
+        if redacted.len() <= MAX_HISTORY_BYTES {
+            return Ok(redacted);
+        }
+        let marker = format!("\n[history truncated at {} KiB]", MAX_HISTORY_BYTES / 1024);
+        let budget = MAX_HISTORY_BYTES.saturating_sub(marker.len());
+        let mut end = budget;
+        while !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut capped = redacted[..end].to_owned();
+        capped.push_str(&marker);
+        Ok(capped)
+    }
+
+    fn resolve_persona_archive(&self, agent_id: &str) -> Result<PathBuf> {
+        let mut matches = Vec::new();
+        for definition in self.inner.config.catalog.agents() {
+            if !definition.trusted || !definition.is_persona() {
+                continue;
+            }
+            let Some(root) = definition.persona_root() else {
+                continue;
+            };
+            let candidate = persona_archive_path(&root, agent_id)?;
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => matches.push((definition.name.clone(), root, candidate)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("reading persona history metadata"),
+            }
+        }
+        match matches.as_slice() {
+            [] => bail!("unknown orchestration agent {agent_id:?}"),
+            [(persona, root, candidate)] => validate_persona_archive_candidate(
+                &root.join("sessions"),
+                candidate,
+            )
+            .with_context(|| format!("resolving persona history {persona:?}/{agent_id:?}")),
+            _ => bail!(
+                "persona history id {agent_id:?} is ambiguous; use history://persona/<persona>/{agent_id}"
+            ),
+        }
+    }
+
+    fn resolve_qualified_persona_archive(&self, persona: &str, agent_id: &str) -> Result<PathBuf> {
+        let definition = self
+            .inner
+            .config
+            .catalog
+            .get(persona)
+            .filter(|definition| definition.trusted && definition.is_persona())
+            .ok_or_else(|| anyhow!("unknown persona {persona:?}"))?;
+        let root = definition
+            .persona_root()
+            .ok_or_else(|| anyhow!("persona {persona:?} has no durable root"))?;
+        let candidate = persona_archive_path(&root, agent_id)?;
+        validate_persona_archive_candidate(&root.join("sessions"), &candidate)
+            .with_context(|| format!("resolving persona history {persona:?}/{agent_id:?}"))
+    }
+
+    /// Resolve the canonical transcript file for a registered agent: the
+    /// durable child session JSONL (the live transcript) when the agent has
+    /// one, the settle-time `.history.json` snapshot otherwise, and the bound
+    /// parent session JSONL for Main (whose registry history path starts
+    /// unset). Every path is runtime-owned and canonical — never constructed
+    /// from the caller-supplied `agent_id` (which only selects a registry entry).
+    fn resolve_history_source(&self, agent_id: &str) -> Result<PathBuf> {
+        let Some(entry) = REGISTRY.get(&self.inner.group_id, agent_id) else {
+            return self.resolve_persona_archive(agent_id);
+        };
+        if let Some(info) = entry.durable_info.lock().clone()
+            && let Some(session_path) = info.session_path
+        {
+            let durable = self
+                .inner
+                .durable
+                .lock()
+                .clone()
+                .ok_or_else(|| anyhow!("orchestration history for agent {agent_id:?} is not available yet"))?;
+            return durable
+                .canonicalize_child_session_path(&session_path)
+                .with_context(|| format!("resolving history for agent {agent_id:?}"));
+        }
+        if let Some(path) = entry.history_path.lock().clone() {
+            return ensure_existing_artifact(&self.inner.config.artifact_dir, &path);
+        }
+        if agent_id == self.main_agent_id() {
+            let durable = self
+                .inner
+                .durable
+                .lock()
+                .clone()
+                .ok_or_else(|| anyhow!("orchestration history for agent {agent_id:?} is not available yet"))?;
+            let path = durable.parent_session_path().to_path_buf();
+            let metadata = fs::metadata(&path)
+                .with_context(|| format!("reading parent session history {}", path.display()))?;
+            if !metadata.is_file() {
+                bail!("orchestration history for agent {agent_id:?} is not available yet");
+            }
+            return Ok(path);
+        }
+        bail!("orchestration history for agent {agent_id:?} is not available yet")
+    }
+    /// Claim a persona for reset/removal after proving it has no queued or
+    /// running jobs and no active registry entry.
+    ///
+    /// The returned guard must remain alive through the destructive operation
+    /// (and any catalog reload). New spawns and revivals for this persona are
+    /// rejected until the guard is dropped.
+    pub fn begin_persona_destructive_operation(
+        &self,
+        persona: &str,
+    ) -> Result<PersonaLifecycleGuard> {
+        let _spawn_guard = self.inner.jobs.lock_spawns();
+        let _durable_mutation = self.inner.durable_mutation.lock();
+        let definition = self
+            .inner
+            .config
+            .catalog
+            .get(persona)
+            .filter(|definition| definition.is_persona())
+            .ok_or_else(|| anyhow!("unknown persona {persona:?}"))?;
+        let mut blocked = self.inner.persona_lifecycle_blocks.lock();
+        if blocked.contains(&definition.name) {
+            bail!("persona {persona:?} already has a destructive operation in progress");
+        }
+        let active_ids = self.inner.active.lock().keys().cloned().collect::<std::collections::BTreeSet<_>>();
+        let registry_active = REGISTRY
+            .list(&self.inner.group_id, self.main_agent_id())
+            .into_iter()
+            .any(|snapshot| {
+                snapshot.agent == definition.name
+                    && (active_ids.contains(&snapshot.id)
+                        || matches!(snapshot.status, AgentStatus::Queued | AgentStatus::Running))
+            });
+        let job_active = self
+            .inner
+            .jobs
+            .snapshots(None)
+            .iter()
+            .any(|job| job.agent == definition.name && !job.status.is_settled());
+        if registry_active || job_active {
+            bail!("persona {persona:?} is in use by an active orchestration job");
+        }
+        blocked.insert(definition.name.clone());
+        Ok(PersonaLifecycleGuard {
+            inner: self.inner.clone(),
+            persona: definition.name.clone(),
+            release_on_drop: true,
+        })
+    }
+
 
     #[must_use]
     pub fn jobs(&self, ids: Option<&[String]>) -> Vec<JobSnapshot> {
@@ -3918,7 +5104,16 @@ impl GlobalRegistry {
             *entry.artifact_path.lock() = Some(artifact_path);
         }
         if let Some(history_path) = history_path {
-            snapshot.history_ref = Some(format!("history://{id}"));
+            snapshot.history_ref = Some(
+                entry
+                    .durable_info
+                    .lock()
+                    .as_ref()
+                    .map_or_else(
+                        || format!("history://{id}"),
+                        |info| persisted_history_reference(&info.definition, id),
+                    ),
+            );
             *entry.history_path.lock() = Some(history_path);
         }
         Ok(())
@@ -4133,6 +5328,674 @@ fn validate_agent_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn persona_archive_path(persona_root: &Path, agent_id: &str) -> Result<PathBuf> {
+    validate_agent_id(agent_id)?;
+    Ok(persona_root
+        .join("sessions")
+        .join(format!("{agent_id}.jsonl")))
+}
+
+fn validate_persona_archive_candidate(
+    sessions_root: &Path,
+    candidate: &Path,
+) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(candidate)
+        .with_context(|| format!("reading persona archive metadata {}", candidate.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("persona archive is not a regular non-symlink file: {}", candidate.display());
+    }
+    let canonical_root = fs::canonicalize(sessions_root)
+        .with_context(|| format!("resolving persona sessions root {}", sessions_root.display()))?;
+    let canonical = fs::canonicalize(candidate)
+        .with_context(|| format!("resolving persona archive {}", candidate.display()))?;
+    if canonical.parent() != Some(canonical_root.as_path())
+        || canonical.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+    {
+        bail!("persona archive escapes its sessions root: {}", candidate.display());
+    }
+    Ok(canonical)
+}
+fn validate_persona_sessions_root(persona_root: &Path) -> Result<Option<PathBuf>> {
+    let root_metadata = fs::symlink_metadata(persona_root)
+        .with_context(|| format!("reading persona root {}", persona_root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+        bail!("persona root is not a regular non-symlink directory");
+    }
+    let canonical_root = fs::canonicalize(persona_root)
+        .with_context(|| format!("resolving persona root {}", persona_root.display()))?;
+    let sessions = persona_root.join("sessions");
+    let metadata = match fs::symlink_metadata(&sessions) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading persona sessions {}", sessions.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        bail!("persona sessions path is not a regular non-symlink directory");
+    }
+    let canonical_sessions = fs::canonicalize(&sessions)
+        .with_context(|| format!("resolving persona sessions {}", sessions.display()))?;
+    if canonical_sessions.parent() != Some(canonical_root.as_path()) {
+        bail!("persona sessions directory escapes its persona root");
+    }
+    Ok(Some(canonical_sessions))
+}
+
+fn persona_archives_newest_first(persona_root: &Path) -> Result<Vec<PathBuf>> {
+    let Some(sessions) = validate_persona_sessions_root(persona_root)? else {
+        return Ok(Vec::new());
+    };
+    let mut archives = Vec::new();
+    for entry in fs::read_dir(&sessions)
+        .with_context(|| format!("reading persona sessions {}", sessions.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("reading persona sessions {}", sessions.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let path = validate_persona_archive_candidate(&sessions, &path)?;
+        let modified = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        archives.push((modified, path));
+    }
+    archives.sort_by(|(left_time, left_path), (right_time, right_path)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| right_path.cmp(left_path))
+    });
+    Ok(archives.into_iter().map(|(_, path)| path).collect())
+}
+
+fn load_persona_continuity(persona_root: &Path) -> Result<Vec<pi_ai::Message>> {
+    let mut newest_to_oldest = Vec::new();
+    let mut bytes = 0usize;
+    for path in persona_archives_newest_first(persona_root)? {
+        let messages = crate::session_store::load_session_messages(&path)
+            .with_context(|| format!("loading persona continuity archive {}", path.display()))?;
+        for message in messages.into_iter().rev() {
+            if newest_to_oldest.len() >= PERSONA_CONTINUITY_MAX_MESSAGES {
+                break;
+            }
+            let message_bytes = serde_json::to_vec(&message)
+                .context("measuring persona continuity message")?
+                .len();
+            if bytes.saturating_add(message_bytes) > PERSONA_CONTINUITY_MAX_BYTES {
+                newest_to_oldest.reverse();
+                return Ok(newest_to_oldest);
+            }
+            bytes += message_bytes;
+            newest_to_oldest.push(message);
+        }
+        if newest_to_oldest.len() >= PERSONA_CONTINUITY_MAX_MESSAGES {
+            break;
+        }
+    }
+    newest_to_oldest.reverse();
+    Ok(newest_to_oldest)
+}
+
+fn merge_persona_continuity(
+    continuity: Vec<pi_ai::Message>,
+    resumed: Vec<pi_ai::Message>,
+) -> Vec<pi_ai::Message> {
+    let mut merged = continuity;
+    for message in resumed {
+        if !merged.contains(&message) {
+            merged.push(message);
+        }
+    }
+    merged
+}
+
+fn history_reference(definition: &AgentDefinition, agent_id: &str) -> String {
+    if definition.is_persona() {
+        format!("history://persona/{}/{agent_id}", definition.name)
+    } else {
+        format!("history://{agent_id}")
+    }
+}
+
+fn persisted_history_reference(
+    definition: &super::persistence::PersistedDefinition,
+    agent_id: &str,
+) -> String {
+    if definition.kind == super::AgentDefinitionKind::Persona {
+        format!("history://persona/{}/{agent_id}", definition.name)
+    } else {
+        format!("history://{agent_id}")
+    }
+}
+
+fn archive_persona_session(
+    persona_root: &Path,
+    agent_id: &str,
+    source: &Path,
+    replace_existing: bool,
+) -> Result<PathBuf> {
+    let source_metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("reading canonical child transcript {}", source.display()))?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.file_type().is_file() {
+        bail!("canonical child transcript is not a regular non-symlink file");
+    }
+    let destination = persona_archive_path(persona_root, agent_id)?;
+    let parent = match validate_persona_sessions_root(persona_root)? {
+        Some(parent) => parent,
+        None => {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| anyhow!("persona archive has no parent"))?;
+            fs::create_dir(parent)
+                .with_context(|| format!("creating persona sessions directory {}", parent.display()))?;
+            validate_persona_sessions_root(persona_root)?
+                .ok_or_else(|| anyhow!("persona sessions directory was not created"))?
+        }
+    };
+    let destination = parent.join(format!("{agent_id}.jsonl"));
+    let temporary = parent.join(format!(".{agent_id}.{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| -> Result<()> {
+        let mut input = File::open(source)
+            .with_context(|| format!("opening canonical child transcript {}", source.display()))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("creating persona archive temporary {}", temporary.display()))?;
+        std::io::copy(&mut input, &mut output)
+            .with_context(|| format!("copying persona archive {}", destination.display()))?;
+        output.flush().context("flushing persona archive")?;
+        output.sync_all().context("syncing persona archive")?;
+        drop(output);
+        if replace_existing {
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+                {
+                    bail!("existing persona archive is not a regular non-symlink file");
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("reading persona archive {}", destination.display())
+                    });
+                }
+            }
+            match fs::rename(&temporary, &destination) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    let destination_metadata = fs::symlink_metadata(&destination).with_context(|| {
+                        format!("reading persona archive {}", destination.display())
+                    })?;
+                    if destination_metadata.file_type().is_symlink()
+                        || !destination_metadata.file_type().is_file()
+                    {
+                        bail!("existing persona archive is not a regular non-symlink file");
+                    }
+                    fs::remove_file(&destination).with_context(|| {
+                        format!("replacing persona archive {}", destination.display())
+                    })?;
+                    fs::rename(&temporary, &destination).with_context(|| {
+                        format!("installing persona archive {}", destination.display())
+                    })?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("installing persona archive {}", destination.display())
+                    });
+                }
+            }
+        } else {
+            fs::hard_link(&temporary, &destination)
+                .with_context(|| format!("installing persona archive {}", destination.display()))?;
+            fs::remove_file(&temporary).with_context(|| {
+                format!("removing persona archive temporary {}", temporary.display())
+            })?;
+        }
+        File::open(&parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("syncing persona sessions directory {}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    validate_persona_archive_candidate(&parent, &destination)
+}
+
+#[cfg(test)]
+mod persona_runtime_tests {
+    use super::*;
+
+    fn persona_definition(root: &Path) -> AgentDefinition {
+        let persona_root = root.join("personas").join("mentor");
+        fs::create_dir_all(&persona_root).expect("persona root");
+        let path = persona_root.join("persona.md");
+        super::super::definitions::parse_persona_definition(
+            &path,
+            "---\nname: mentor\ndescription: mentor\n---\nprompt",
+            super::super::AgentDefinitionSource::User,
+            true,
+        )
+        .expect("persona definition")
+    }
+
+    fn runtime(root: &Path) -> (OrchestrationRuntime, AgentDefinition) {
+        let definition = persona_definition(root);
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![definition.clone()]),
+            root.join("artifacts"),
+        );
+        config.default_agent = definition.name.clone();
+        let runtime = OrchestrationRuntime::new(
+            config,
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .expect("runtime");
+        (runtime, definition)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persona_archive_rejects_symlinked_sessions_directory() {
+        let root = tempfile::tempdir().expect("root");
+        let persona_root = root.path().join("persona");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&persona_root).expect("persona root");
+        fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, persona_root.join("sessions"))
+            .expect("sessions symlink");
+        let source = root.path().join("source.jsonl");
+        fs::write(&source, "{}\n").expect("source");
+
+        let error = archive_persona_session(&persona_root, "run-1", &source, false)
+            .expect_err("symlinked sessions directory must fail");
+        assert!(error.to_string().contains("non-symlink directory"), "{error:#}");
+        assert!(!outside.join("run-1.jsonl").exists());
+    }
+
+    #[test]
+    fn persona_history_fallback_survives_ordinary_retention() {
+        let root = tempfile::tempdir().expect("root");
+        let (runtime, definition) = runtime(root.path());
+        let persona_root = definition.persona_root().expect("persona root");
+        let source = root.path().join("source.jsonl");
+        fs::write(&source, "{}\n").expect("source");
+        let archive = archive_persona_session(&persona_root, "MentorRun", &source, false)
+            .expect("archive");
+
+        assert_eq!(
+            runtime
+                .resolve_read_uri("history://MentorRun")
+                .expect("persona history"),
+            archive,
+        );
+        runtime.prune_retained_jobs();
+        assert!(archive.exists(), "ordinary retention must preserve persona archives");
+    }
+
+    #[test]
+    fn cross_persona_history_requires_qualified_uri() {
+        let root = tempfile::tempdir().expect("root");
+        let mentor = persona_definition(root.path());
+        let reviewer_root = root.path().join("personas").join("reviewer");
+        fs::create_dir_all(&reviewer_root).expect("reviewer root");
+        let reviewer = super::super::definitions::parse_persona_definition(
+            &reviewer_root.join("persona.md"),
+            "---\nname: reviewer\ndescription: reviewer\n---\nprompt",
+            super::super::AgentDefinitionSource::User,
+            true,
+        )
+        .expect("reviewer");
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![mentor.clone(), reviewer.clone()]),
+            root.path().join("artifacts"),
+        );
+        config.default_agent = mentor.name.clone();
+        let runtime = OrchestrationRuntime::new(
+            config,
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .expect("runtime");
+        for definition in [&mentor, &reviewer] {
+            let persona_root = definition.persona_root().expect("persona root");
+            fs::create_dir_all(persona_root.join("sessions")).expect("sessions");
+            fs::write(persona_root.join("sessions").join("Shared.jsonl"), "{}\n")
+                .expect("archive");
+        }
+        let error = runtime
+            .resolve_read_uri("history://Shared")
+            .expect_err("bare collision must be ambiguous");
+        assert!(error.to_string().contains("ambiguous"), "{error:#}");
+        assert_eq!(
+            runtime
+                .resolve_read_uri("history://persona/mentor/Shared")
+                .expect("qualified mentor"),
+            fs::canonicalize(
+                mentor
+                    .persona_root()
+                    .expect("mentor root")
+                    .join("sessions/Shared.jsonl")
+            )
+            .expect("canonical mentor archive")
+        );
+    }
+    #[tokio::test]
+    async fn finish_agent_keeps_persona_history_qualified_and_agent_history_bare() {
+        let root = tempfile::tempdir().expect("root");
+        let persona = persona_definition(root.path());
+        let ordinary = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("ordinary definition");
+        let config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![persona.clone(), ordinary.clone()]),
+            root.path().join("artifacts"),
+        );
+        let runtime = OrchestrationRuntime::new(
+            config,
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .expect("runtime");
+        for (id, definition) in [("MentorRun", persona), ("TaskRun", ordinary)] {
+            REGISTRY
+                .register(
+                    &runtime.inner.group_id,
+                    AgentSnapshot {
+                        id: id.to_owned(),
+                        display_name: definition.name.clone(),
+                        agent: definition.name.clone(),
+                        parent_id: Some("Main".to_owned()),
+                        status: AgentStatus::Running,
+                        created_at: 1,
+                        last_activity: 1,
+                        unread: 0,
+                        artifact_ref: None,
+                        history_ref: None,
+                    },
+                    runtime.inner.config.mailbox_capacity,
+                )
+                .expect("register child");
+            let entry = REGISTRY
+                .get(&runtime.inner.group_id, id)
+                .expect("registered entry");
+            *entry.durable_info.lock() = Some(DurableAgentInfo {
+                definition: super::super::persistence::persist_definition(&definition),
+                request: super::super::persistence::PersistedRequest {
+                    child_id: id.to_owned(),
+                    parent_id: "Main".to_owned(),
+                    depth: 1,
+                    assignment: "work".to_owned(),
+                    system_prompt: "prompt".to_owned(),
+                    requested_tool_names: None,
+                    thinking_level: None,
+                    max_tools_per_agent: 16,
+                    model_provider: None,
+                    model_id: None,
+                    output_schema: None,
+                    schema_mode: None,
+                },
+                session_path: None,
+            });
+            runtime
+                .finish_agent(
+                    id,
+                    AgentStatus::Idle,
+                    None,
+                    Some(root.path().join(format!("{id}.history.json"))),
+                )
+                .expect("finish child");
+        }
+
+        assert_eq!(
+            runtime.agent_snapshot("MentorRun").expect("persona snapshot").history_ref.as_deref(),
+            Some("history://persona/mentor/MentorRun")
+        );
+        assert_eq!(
+            runtime.agent_snapshot("TaskRun").expect("agent snapshot").history_ref.as_deref(),
+            Some("history://TaskRun")
+        );
+    }
+
+    #[test]
+    fn persona_archive_names_are_not_reused() {
+        let root = tempfile::tempdir().expect("root");
+        let (runtime, definition) = runtime(root.path());
+        let persona_root = definition.persona_root().expect("persona root");
+        fs::create_dir_all(persona_root.join("sessions")).expect("sessions");
+        fs::write(persona_root.join("sessions").join("Mentor.jsonl"), "{}\n")
+            .expect("archive");
+        let mut reserved = std::collections::BTreeSet::new();
+
+        let id = runtime
+            .allocate_unique_agent_id_for_definition("Mentor", &definition, &mut reserved)
+            .expect("unique id");
+        assert_eq!(id, "Mentor_2");
+    }
+
+
+    #[test]
+    fn persona_lifecycle_guard_blocks_spawn_and_preserves_other_personas() {
+        let root = tempfile::tempdir().expect("root");
+        let mentor = persona_definition(root.path());
+        let reviewer_root = root.path().join("personas").join("reviewer");
+        fs::create_dir_all(&reviewer_root).expect("reviewer root");
+        let reviewer = super::super::definitions::parse_persona_definition(
+            &reviewer_root.join("persona.md"),
+            "---\nname: reviewer\ndescription: reviewer\n---\nprompt",
+            super::super::AgentDefinitionSource::User,
+            true,
+        )
+        .expect("reviewer");
+        let task = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("task");
+        let config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![mentor, reviewer, task]),
+            root.path().join("artifacts"),
+        );
+        let runtime = OrchestrationRuntime::new(
+            config,
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .expect("runtime");
+        let guard = runtime
+            .begin_persona_destructive_operation("mentor")
+            .expect("idle mentor claim");
+
+        let blocked = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "MentorRun".to_owned(),
+                    agent: "mentor".to_owned(),
+                    assignment: "work".to_owned(),
+                    ..TaskItem::default()
+                }],
+            )
+            .expect_err("claimed persona spawn must fail");
+        assert!(blocked.to_string().contains("destructive operation"), "{blocked:#}");
+        assert!(
+            runtime
+                .inner
+                .persona_lifecycle_blocks
+                .lock()
+                .contains("mentor")
+        );
+        assert!(
+            !runtime
+                .inner
+                .persona_lifecycle_blocks
+                .lock()
+                .contains("reviewer"),
+            "unrelated persona must remain available"
+        );
+
+        drop(guard);
+        assert!(runtime.inner.persona_lifecycle_blocks.lock().is_empty());
+
+        let retained = runtime
+            .begin_persona_destructive_operation("mentor")
+            .expect("idle mentor claim after release");
+        retained.retain();
+        let second = runtime
+            .begin_persona_destructive_operation("mentor")
+            .expect_err("retained lifecycle block must fail closed");
+        assert!(second.to_string().contains("destructive operation"), "{second:#}");
+    }
+
+    #[test]
+    fn persona_lifecycle_guard_rejects_active_registry_entry_without_job() {
+        let root = tempfile::tempdir().expect("root");
+        let (runtime, _) = runtime(root.path());
+        REGISTRY
+            .register(
+                &runtime.inner.group_id,
+                AgentSnapshot {
+                    id: "MentorActive".to_owned(),
+                    display_name: "mentor".to_owned(),
+                    agent: "mentor".to_owned(),
+                    parent_id: Some("Main".to_owned()),
+                    status: AgentStatus::Running,
+                    created_at: 1,
+                    last_activity: 1,
+                    unread: 0,
+                    artifact_ref: None,
+                    history_ref: None,
+                },
+                runtime.inner.config.mailbox_capacity,
+            )
+            .expect("register active persona");
+
+        let error = runtime
+            .begin_persona_destructive_operation("mentor")
+            .expect_err("active registry entry must reject lifecycle claim");
+        assert!(error.to_string().contains("active orchestration job"), "{error:#}");
+    }
+    #[test]
+    fn persona_continuity_accumulates_across_archives() {
+        let root = tempfile::tempdir().expect("root");
+        let persona_root = root.path().join("persona");
+        fs::create_dir_all(&persona_root).expect("persona root");
+
+        let first = root.path().join("first.jsonl");
+        let first_recorder = crate::session_store::start_session_in(
+            root.path(),
+            None,
+            None,
+            Some(root.path()),
+            Some("first"),
+            None,
+        )
+        .expect("first session");
+        first_recorder
+            .record_message(&pi_ai::Message::user_text("first run", 0))
+            .expect("first record");
+        first_recorder.close().expect("close first session");
+        archive_persona_session(&persona_root, "run-1", &first, false).expect("first archive");
+
+        let second = root.path().join("second.jsonl");
+        let second_recorder = crate::session_store::start_session_in(
+            root.path(),
+            None,
+            None,
+            Some(root.path()),
+            Some("second"),
+            None,
+        )
+        .expect("second session");
+        second_recorder
+            .record_message(&pi_ai::Message::user_text("second run", 1))
+            .expect("second record");
+        second_recorder.close().expect("close second session");
+        archive_persona_session(&persona_root, "run-2", &second, false).expect("second archive");
+
+        let continuity = load_persona_continuity(&persona_root).expect("continuity");
+        let rendered = serde_json::to_string(&continuity).expect("continuity json");
+        assert!(rendered.contains("first run"), "{rendered}");
+        assert!(rendered.contains("second run"), "{rendered}");
+    }
+
+    #[test]
+    fn revival_continuity_merge_keeps_archives_and_deduplicates_resume() {
+        let archived = pi_ai::Message::user_text("archived before crash", 1);
+        let resumed = pi_ai::Message::user_text("persisted partial", 2);
+        let merged = merge_persona_continuity(
+            vec![archived.clone(), resumed.clone()],
+            vec![resumed.clone()],
+        );
+        assert_eq!(merged, vec![archived, resumed]);
+    }
+
+    #[test]
+    fn definition_soft_budget_replaces_global_budget() {
+        let root = tempfile::tempdir().expect("root");
+        let (runtime, mut definition) = runtime(root.path());
+        definition.soft_budget = Some(JobSoftBudget {
+            max_requests: Some(1),
+            max_tokens: None,
+            yield_after: None,
+        });
+        let state = JobSoftBudgetState::default();
+        let hook = runtime
+            .soft_budget_stop_hook(&definition, &state)
+            .expect("persona budget hook");
+        let mut assistant = pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
+        assistant.usage.total_tokens = 0;
+        assert!(hook(&pi_agent::ShouldStopAfterTurnContext {
+            message: assistant,
+            tool_results: Vec::new(),
+            context: pi_agent::AgentContext {
+                system_prompt: String::new(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+            },
+            new_messages: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn ordinary_agent_ignores_persona_runtime_fields_defense_in_depth() {
+        let root = tempfile::tempdir().expect("root");
+        let (runtime, mut definition) = runtime(root.path());
+        definition.kind = super::super::AgentDefinitionKind::Agent;
+        definition.personality = Some("must not inject".to_owned());
+        definition.soft_budget = Some(JobSoftBudget {
+            max_requests: Some(1),
+            max_tokens: None,
+            yield_after: None,
+        });
+        let prompt = runtime
+            .child_system_prompt(&definition, "work", None, None, None, "<peer_roster />")
+            .expect("prompt");
+        assert!(!prompt.contains("must not inject"), "{prompt}");
+        let state = JobSoftBudgetState::default();
+        assert!(
+            runtime.soft_budget_stop_hook(&definition, &state).is_none(),
+            "ordinary agent must use the unlimited global budget"
+        );
+    }
+}
+
 fn write_new_artifact(path: &Path, content: &[u8]) -> Result<()> {
     use std::io::Write as _;
 
@@ -4241,14 +6104,36 @@ fn render_roster_peer(peer: &AgentSnapshot) -> String {
     )
 }
 
-/// True when the request uses an explicit natural-language delegation verb.
-/// Used to gate parent prompt-time auto-spawn; the task tool does not require it.
+/// English natural-language delegation verbs recognized as tokens anywhere in
+/// the request. `request_has_delegation_verb` and the diagnostics candidate
+/// scan share this list.
+const ENGLISH_DELEGATION_VERBS: &[&str] = &[
+    "have", "ask", "tell", "get", "let", "make", "please", "delegate", "assign", "spawn", "run",
+    "send", "kick", "dispatch",
+];
+
+/// Chinese delegation constructions recognized by [`cjk_delegation_construction`].
+/// The single-character tokens (`让`/`请`/`叫`/`派`) must directly abut the
+/// agent name; the two-character tokens (`安排`/`委托`/`交给`) end immediately
+/// before it.
+const CJK_DELEGATION_TOKENS: &[&str] = &["让", "请", "叫", "派", "安排", "委托", "交给"];
+
+/// True when the request uses an explicit natural-language delegation
+/// construction: a recognized English delegation verb token anywhere in the
+/// request, or a conservative CJK construction where a Chinese delegation
+/// token abuts `agent_name` and a non-trivial action clause follows it.
+/// Informational mentions ("researcher 是做什么的？", "我在文档里看到researcher")
+/// return false even when they name the agent exactly.
+#[must_use]
+fn delegation_intent(request: &str, agent_name: &str) -> bool {
+    request_has_delegation_verb(request) || cjk_delegation_construction(request, agent_name)
+}
+
+/// True when the request uses an explicit English natural-language delegation
+/// verb token (whitespace/`-`/`_` separated). Used to gate parent prompt-time
+/// auto-spawn; the task tool does not require it.
 #[must_use]
 fn request_has_delegation_verb(request: &str) -> bool {
-    const VERBS: &[&str] = &[
-        "have", "ask", "tell", "get", "let", "make", "please", "delegate", "assign", "spawn",
-        "run", "send", "kick", "dispatch",
-    ];
     let tokens = request
         .nfkc()
         .flat_map(char::to_lowercase)
@@ -4259,7 +6144,219 @@ fn request_has_delegation_verb(request: &str) -> bool {
         .collect::<Vec<_>>();
     tokens
         .iter()
-        .any(|token| VERBS.iter().any(|verb| token == verb))
+        .any(|token| ENGLISH_DELEGATION_VERBS.iter().any(|verb| token == verb))
+}
+
+/// Byte span of the first occurrence of `agent_name` in `request` with
+/// non-ASCII-alphanumeric boundaries on both sides (mirrors the selector's
+/// `contains_embedded_ascii_word` semantics, so `researcher` never matches
+/// inside `researchers` and CJK-embedded names are found). Case-insensitive
+/// for ASCII; agent names are ASCII by construction.
+fn agent_name_span(request: &str, agent_name: &str) -> Option<(usize, usize)> {
+    let name_chars = agent_name.chars().collect::<Vec<_>>();
+    if name_chars.is_empty() {
+        return None;
+    }
+    let chars = request.char_indices().collect::<Vec<_>>();
+    if chars.len() < name_chars.len() {
+        return None;
+    }
+    for start in 0..=chars.len() - name_chars.len() {
+        let matched = (0..name_chars.len()).all(|offset| {
+            let request_char = chars[start + offset].1;
+            let name_char = name_chars[offset];
+            if request_char.is_ascii() && name_char.is_ascii() {
+                request_char.eq_ignore_ascii_case(&name_char)
+            } else {
+                request_char == name_char
+            }
+        });
+        if !matched {
+            continue;
+        }
+        let before_ok = start == 0 || !chars[start - 1].1.is_ascii_alphanumeric();
+        let after_index = start + name_chars.len();
+        let after_ok = after_index >= chars.len() || !chars[after_index].1.is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            let (byte_start, _) = chars[start];
+            let (byte_end, last_char) = chars[after_index - 1];
+            return Some((byte_start, byte_end + last_char.len_utf8()));
+        }
+    }
+    None
+}
+
+/// Conservative CJK delegation construction: a Chinese delegation token
+/// (`让`/`请`/`叫`/`派`/`安排`/`委托`/`交给`) directly abuts the agent name
+/// (no whitespace or intervening characters) and a non-trivial action clause
+/// follows the name. This is deliberately stricter than the English token
+/// path: `请 review the security patch` is not a delegation to an agent named
+/// `review`, and `请使用research技能` names a skill, not an agent.
+#[must_use]
+fn cjk_delegation_construction(request: &str, agent_name: &str) -> bool {
+    let Some((span_start, span_end)) = agent_name_span(request, agent_name) else {
+        return false;
+    };
+    let before = &request[..span_start];
+    let Some(last) = before.chars().next_back() else {
+        return false;
+    };
+    let token_hit = CJK_DELEGATION_TOKENS.iter().any(|token| {
+        token.chars().last() == Some(last)
+            && before.ends_with(token)
+    });
+    if !token_hit {
+        return false;
+    }
+    let after = &request[span_end..];
+    // If the clause opens with a determiner/preposition (English), the name is
+    // the clause's object ("请review the security patch"), not a delegated
+    // agent — reject it like the English candidate scan does.
+    let clause_open = after
+        .trim_start_matches(|c: char| {
+            c.is_whitespace()
+                || c.is_ascii_punctuation()
+                || matches!(
+                    c,
+                    '。' | '？' | '！' | '，' | '、' | '；' | '：' | '…' | '～' | '「' | '」'
+                        | '『' | '』' | '（' | '）' | '《' | '》'
+                )
+        })
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect::<String>();
+    if !clause_open.is_empty() && follows_without_action(&clause_open.to_ascii_lowercase()) {
+        return false;
+    }
+    // An action clause must follow: at least two characters that are neither
+    // whitespace nor punctuation (e.g. 仔细调研 in the literal prompt). A bare
+    // name, trailing punctuation, or a possessive marker (的) does not count.
+    let mut clause_chars = 0;
+    for character in after.chars() {
+        if character == '的' {
+            break;
+        }
+        if character.is_whitespace()
+            || character.is_ascii_punctuation()
+            || matches!(
+                character,
+                '。' | '？' | '！' | '，' | '、' | '；' | '：' | '…' | '～' | '「' | '」'
+                    | '『' | '』' | '（' | '）' | '《' | '》'
+            )
+        {
+            continue;
+        }
+        clause_chars += 1;
+        if clause_chars >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
+/// ASCII identifier-like tokens that could name an agent: `[A-Za-z][A-Za-z0-9_-]*`
+/// with 2..=80 characters (the orchestration agent-id charset).
+fn looks_like_agent_name(token: &str) -> bool {
+    let mut chars = token.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
+        && token.len() >= 2
+        && token.len() <= 80
+        && token.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+        })
+}
+
+/// English function words that cannot be agent names. Used to reject
+/// `have the researcher …` / `ask me …` style false candidates.
+fn is_english_function_word(token: &str) -> bool {
+    matches!(
+        token,
+        "the" | "a" | "an" | "this" | "that" | "these" | "those" | "some" | "any" | "my"
+            | "your" | "our" | "their" | "its" | "his" | "her" | "me" | "us" | "them"
+            | "him" | "we" | "you" | "i" | "it" | "they" | "he" | "she"
+    )
+}
+
+/// Tokens whose presence directly after a candidate indicates the candidate is
+/// the grammatical object of the clause rather than a delegated agent
+/// (`please review THE patch`, `ask writer TO write` is deliberately allowed,
+/// so `to` is not listed).
+fn follows_without_action(token: &str) -> bool {
+    matches!(
+        token,
+        "the" | "a" | "an" | "this" | "that" | "these" | "those" | "my" | "your" | "our"
+            | "its" | "his" | "her" | "him" | "them" | "us" | "me" | "it" | "for" | "of"
+            | "in" | "on" | "at" | "with" | "by" | "from" | "and" | "or" | "but" | "is"
+            | "are" | "was" | "were" | "be" | "being" | "been" | "as" | "than" | "then"
+            | "there" | "here" | "so" | "just" | "only" | "also" | "too" | "very" | "really"
+            | "how" | "why" | "what" | "when" | "where" | "who" | "whom" | "which" | "whose"
+    )
+}
+
+/// ASCII identifier runs of `request` (the orchestration agent-id charset).
+fn ascii_identifier_runs(request: &str) -> Vec<(String, usize)> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    let mut start = 0;
+    for (index, character) in request.char_indices() {
+        if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+            if current.is_empty() {
+                start = index;
+            }
+            current.push(character);
+        } else if !current.is_empty() {
+            runs.push((std::mem::take(&mut current), start));
+        }
+    }
+    if !current.is_empty() {
+        runs.push((current, start));
+    }
+    runs
+}
+
+/// Deterministic candidate agent names referenced with explicit delegation
+/// intent in `request`: CJK constructions (a Chinese delegation token abuts
+/// the name and an action clause follows) and the noun directly after an
+/// English delegation verb. Function words and the verbs themselves are never
+/// candidates, so `Have researcher study this` yields `researcher` while
+/// `please review the security patch` and `请使用research技能` yield nothing.
+fn delegation_candidates(request: &str) -> Vec<String> {
+    let mut candidates = std::collections::BTreeSet::new();
+    // English: the token right after a delegation verb.
+    let tokens = request
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if !ENGLISH_DELEGATION_VERBS.contains(&token.as_str()) {
+            continue;
+        }
+        let Some(next) = tokens.get(index + 1) else {
+            continue;
+        };
+        if looks_like_agent_name(next) && !is_english_function_word(next) {
+            // The token after the candidate must not be a determiner /
+            // pronoun / preposition that turns the candidate into the
+            // clause's object ("please review the patch", "ask me to …").
+            let action_follows = tokens.get(index + 2).is_none_or(|after| {
+                !follows_without_action(after)
+            });
+            if action_follows {
+                candidates.insert(next.clone());
+            }
+        }
+    }
+    // CJK: names abutted by a Chinese delegation token with an action clause.
+    for (run, _) in ascii_identifier_runs(request) {
+        if looks_like_agent_name(&run) && cjk_delegation_construction(request, &run) {
+            candidates.insert(run);
+        }
+    }
+    candidates.into_iter().collect()
 }
 
 fn one_line(value: &str) -> String {
@@ -4276,10 +6373,188 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Per-line preview cap for `hub read_history` transcript labels, mirroring the
+/// tree-panel label style (prefix + first-line preview) with a slightly larger
+/// allowance than the TUI's 60-char row cap so a coach can read useful context.
+const HISTORY_LABEL_MAX_CHARS: usize = 120;
+
+/// Renders a session transcript file into compact single-line labels, keeping
+/// the last `lines` records. The file is either a durable child JSONL (session
+/// records) or the settle-time `.history.json` snapshot (a JSON array of
+/// [`pi_ai::Message`]); the format is sniffed from the first non-whitespace byte.
+fn render_history_file(path: &Path, lines: usize) -> Result<String> {
+    let data = fs::read(path).with_context(|| format!("reading history {}", path.display()))?;
+    if data.iter().copied().find(|byte| !byte.is_ascii_whitespace()) == Some(b'[') {
+        let messages: Vec<pi_ai::Message> = serde_json::from_slice(&data)
+            .with_context(|| format!("parsing history snapshot {}", path.display()))?;
+        let rendered: Vec<String> = messages.iter().map(history_message_label).collect();
+        let start = rendered.len().saturating_sub(lines);
+        return Ok(rendered[start..].join("\n"));
+    }
+    let tree = crate::session_store::load_session_tree(path)
+        .with_context(|| format!("parsing session transcript {}", path.display()))?;
+    let rendered: Vec<String> = tree
+        .entries
+        .iter()
+        .filter(|entry| entry.entry_type != "label" && entry.entry_type != "checkpoint")
+        .map(history_entry_label)
+        .collect();
+    let start = rendered.len().saturating_sub(lines);
+    Ok(rendered[start..].join("\n"))
+}
+
+/// Compact single-line label for one transcript message, mirroring the
+/// tree-panel style: a type prefix plus a first-line preview; tool results
+/// render as just `[tool: <name>]` so their output never floods the rendering.
+fn history_message_label(message: &pi_ai::Message) -> String {
+    let (prefix, body) = match message {
+        pi_ai::Message::User(user) => ("user: ".to_owned(), content_list_text(&user.content)),
+        pi_ai::Message::Assistant(assistant) => ("assistant: ".to_owned(), assistant.text()),
+        pi_ai::Message::ToolResult(result) => (format!("[tool: {}]", result.tool_name), String::new()),
+        pi_ai::Message::BashExecution(bash) => ("[bash] ".to_owned(), bash.command.clone()),
+        pi_ai::Message::Custom(custom) => {
+            ("custom: ".to_owned(), custom_content_text(&custom.content))
+        }
+        pi_ai::Message::BranchSummary(summary) => {
+            ("[branch summary] ".to_owned(), summary.summary.clone())
+        }
+        pi_ai::Message::CompactionSummary(summary) => {
+            ("[compaction] ".to_owned(), summary.summary.clone())
+        }
+    };
+    let preview = if matches!(message, pi_ai::Message::ToolResult(_)) {
+        ""
+    } else {
+        first_line(&body)
+    };
+    let composed = if preview.is_empty() { prefix } else { format!("{prefix}{preview}") };
+    truncate_label(composed.trim_end(), HISTORY_LABEL_MAX_CHARS)
+}
+
+/// Compact single-line label for one session record. Message records delegate
+/// to [`history_message_label`]; non-message records (model/thinking changes,
+/// session info, compaction, custom state) render as short bracketed tags.
+fn history_entry_label(entry: &crate::session_store::SessionEntry) -> String {
+    if let Some(message) = entry.message.as_ref() {
+        return history_message_label(message);
+    }
+    let (prefix, body) = match entry.entry_type.as_str() {
+        "custom_message" => (
+            "custom: ".to_owned(),
+            entry.content.as_ref().map(custom_content_text).unwrap_or_default(),
+        ),
+        "model_change" => (
+            format!(
+                "[model: {}/{}]",
+                entry.provider.as_deref().unwrap_or_default(),
+                entry.model_id.as_deref().unwrap_or_default()
+            ),
+            String::new(),
+        ),
+        "thinking_level_change" => (
+            format!("[thinking: {}]", entry.thinking_level.as_deref().unwrap_or_default()),
+            String::new(),
+        ),
+        "session_info" => (
+            format!("[title: {}]", entry.name.as_deref().unwrap_or_default()),
+            String::new(),
+        ),
+        "compaction" => ("[compaction] ".to_owned(), entry.summary.clone().unwrap_or_default()),
+        "branch_summary" => {
+            ("[branch summary] ".to_owned(), entry.summary.clone().unwrap_or_default())
+        }
+        other => (format!("[{other}]"), String::new()),
+    };
+    let preview = first_line(&body);
+    let composed = if preview.is_empty() { prefix } else { format!("{prefix}{preview}") };
+    truncate_label(composed.trim_end(), HISTORY_LABEL_MAX_CHARS)
+}
+
+/// Joins the text blocks of a content list with single spaces (mirrors the
+/// tree panel's `text` helper).
+fn content_list_text(content: &[pi_ai::ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            pi_ai::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Extracts the text of a [`pi_ai::CustomMessageContent`] (a bare string or a
+/// block list) for label previews.
+fn custom_content_text(content: &pi_ai::CustomMessageContent) -> String {
+    match content {
+        pi_ai::CustomMessageContent::Text(text) => text.clone(),
+        pi_ai::CustomMessageContent::Blocks(blocks) => content_list_text(blocks),
+    }
+}
+
+/// Returns the first line (before any CR/LF) of `value`.
+fn first_line(value: &str) -> &str {
+    match value.find(['\r', '\n']) {
+        Some(index) => &value[..index],
+        None => value,
+    }
+}
+
+/// Truncates `value` to at most `max_chars` characters, appending an ellipsis
+/// when content was cut (mirrors the tree panel's `truncate_label`).
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let mut out: String = value.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
 impl OrchestrationRuntime {
     pub(crate) fn generated_agent_id(&self, index: usize) -> String {
         let suffix = Uuid::now_v7().simple().to_string();
         format!("Agent{}-{}", index + 1, &suffix[..8])
+    }
+
+    fn allocate_unique_agent_id_for_definition(
+        &self,
+        requested: &str,
+        definition: &AgentDefinition,
+        reserved: &mut std::collections::BTreeSet<String>,
+    ) -> Result<String> {
+        let Some(persona_root) = definition.persona_root() else {
+            return self.allocate_unique_agent_id(requested, reserved);
+        };
+        validate_agent_id(requested)?;
+        let mut suffix = 1u32;
+        loop {
+            let candidate = if suffix == 1 {
+                requested.to_owned()
+            } else {
+                format!("{requested}_{suffix}")
+            };
+            validate_agent_id(&candidate)?;
+            let archive_exists = match fs::symlink_metadata(persona_archive_path(
+                &persona_root,
+                &candidate,
+            )?) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("reading persona archive metadata for {candidate:?}")
+                    });
+                }
+            };
+            if !archive_exists && !self.agent_id_is_taken(&candidate, reserved) {
+                reserved.insert(candidate.clone());
+                return Ok(candidate);
+            }
+            suffix = suffix
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("exhausted unique agent id suffixes for {requested:?}"))?;
+        }
     }
 
     /// Prefer `requested` as the agent id; on collision with registry entries,
@@ -4365,6 +6640,41 @@ impl OrchestrationRuntime {
     }
 }
 
+/// Test helper: register an agent in this runtime's group and (optionally) arm
+/// its settled history path via [`OrchestrationRuntime::finish_agent`]. Used by
+/// `hub read_history` tests in `tools.rs` that exercise the history snapshot
+/// path without a full durable binding.
+#[cfg(test)]
+pub(crate) fn register_test_agent(
+    runtime: &OrchestrationRuntime,
+    id: &str,
+    history_path: Option<PathBuf>,
+) {
+    REGISTRY
+        .register(
+            &runtime.inner.group_id,
+            AgentSnapshot {
+                id: id.to_owned(),
+                display_name: id.to_owned(),
+                agent: "task".to_owned(),
+                parent_id: Some("Main".to_owned()),
+                status: AgentStatus::Idle,
+                created_at: 1,
+                last_activity: 1,
+                unread: 0,
+                artifact_ref: None,
+                history_ref: None,
+            },
+            runtime.inner.config.mailbox_capacity,
+        )
+        .expect("register test agent");
+    if let Some(path) = history_path {
+        runtime
+            .finish_agent(id, AgentStatus::Idle, None, Some(path))
+            .expect("finish test agent");
+    }
+}
+
 #[cfg(test)]
 mod prompt_size_tests {
     use super::*;
@@ -4430,6 +6740,39 @@ mod prompt_size_tests {
         )
     }
     #[test]
+    fn delivered_message_log_survives_mailbox_consumption() {
+        // Every durably delivered group message (subagent ⇄ subagent
+        // included) lands in the bounded delivered log that the workflow
+        // page's Recent IRC reads; draining the recipient's mailbox must not
+        // erase it, so consumed messages stay visible.
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        // "Main" is pre-registered by the runtime itself.
+        register_peer(&runtime, "WorkerA", "task", Some("Main"), AgentStatus::Parked);
+        register_peer(&runtime, "WorkerB", "task", Some("Main"), AgentStatus::Parked);
+
+        runtime.send("WorkerA", "WorkerB", "results ready", None);
+        runtime.send("WorkerB", "WorkerA", "acknowledged", None);
+        runtime.send("WorkerA", "Main", "progress", None);
+
+        let log = runtime.delivered_messages();
+        assert_eq!(log.len(), 3, "every delivered message must be logged");
+        assert_eq!(log[0].from, "WorkerA");
+        assert_eq!(log[0].to, "WorkerB");
+        assert_eq!(log[0].body, "results ready");
+        assert_eq!(log[1].from, "WorkerB");
+        assert_eq!(log[1].to, "WorkerA");
+        assert_eq!(log[2].from, "WorkerA");
+        assert_eq!(log[2].to, "Main");
+
+        // The recipient consumes its mailbox; the log is unchanged.
+        assert_eq!(runtime.inbox("WorkerB", false).len(), 1);
+        assert_eq!(runtime.inbox("WorkerB", true).len(), 0);
+        assert_eq!(runtime.delivered_messages().len(), 3, "consumption must not erase the log");
+        assert!(runtime.delivered_messages().iter().any(|message| message.body == "results ready"));
+    }
+
+    #[test]
     fn child_prompt_includes_stable_live_peer_roster_and_excludes_self() {
         let root = tempfile::tempdir().expect("root");
         let runtime = prompt_runtime(root.path());
@@ -4450,7 +6793,7 @@ mod prompt_size_tests {
         let definition = runtime.catalog().get("task").expect("agent");
         let roster = runtime.sibling_roster("Pending");
         let prompt = runtime
-            .child_system_prompt(definition, "inspect assignment", &roster)
+            .child_system_prompt(definition, "inspect assignment", None, None, None, &roster)
             .expect("prompt");
         let expected = concat!(
             "<peer_roster>\n",
@@ -4518,7 +6861,7 @@ mod prompt_size_tests {
         let definition = runtime.catalog().get("task").expect("agent");
         let roster = runtime.sibling_roster("Pending");
         let prompt = runtime
-            .child_system_prompt(definition, "work", &roster)
+            .child_system_prompt(definition, "work", None, None, None, &roster)
             .expect("prompt");
         let roster_start = prompt.find("<peer_roster>").expect("roster start");
         let roster_end = prompt.find("</peer_roster>").expect("roster end")
@@ -4623,6 +6966,7 @@ mod prompt_size_tests {
                     agent: "task".to_owned(),
                     assignment: "work".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 }],
             )
             .expect("spawn")
@@ -4676,6 +7020,7 @@ mod prompt_size_tests {
                         agent: "task".to_owned(),
                         assignment: "first".to_owned(),
                         todo_task_id: None,
+                        ..Default::default()
                     },
                     TaskItem {
                         index: 1,
@@ -4683,6 +7028,7 @@ mod prompt_size_tests {
                         agent: "task".to_owned(),
                         assignment: "second".to_owned(),
                         todo_task_id: None,
+                        ..Default::default()
                     },
                 ],
             )
@@ -4727,6 +7073,8 @@ mod prompt_size_tests {
             history_ref: format!("history://{id}"),
             artifact_uri: format!("artifact://{id}"),
             usage: pi_ai::Usage::default(),
+            soft_budget_exhausted: false,
+            structured_output: None,
         }
     }
 
@@ -4772,6 +7120,7 @@ mod prompt_size_tests {
                     started_at: None,
                     finished_at: None,
                     result: None,
+                    soft_budget_exhausted: false,
                 },
                 CancellationToken::new(),
             )
@@ -4826,6 +7175,7 @@ mod prompt_size_tests {
                     started_at: None,
                     finished_at: None,
                     result: None,
+                    soft_budget_exhausted: false,
                 },
                 CancellationToken::new(),
             )
@@ -4843,6 +7193,8 @@ mod prompt_size_tests {
                 history_ref: "history://Shared".to_owned(),
                 artifact_uri: "artifact://Shared".to_owned(),
                 usage: pi_ai::Usage::default(),
+                soft_budget_exhausted: false,
+                structured_output: None,
             },
             2,
         );
@@ -4896,6 +7248,7 @@ mod prompt_size_tests {
                     started_at: None,
                     finished_at: None,
                     result: None,
+                    soft_budget_exhausted: false,
                 },
                 CancellationToken::new(),
             )
@@ -4918,6 +7271,7 @@ mod prompt_size_tests {
                     started_at: None,
                     finished_at: None,
                     result: None,
+                    soft_budget_exhausted: false,
                 },
                 CancellationToken::new(),
             )
@@ -4983,7 +7337,7 @@ mod prompt_size_tests {
         let definition = runtime.catalog().get("bounded").expect("agent");
         let roster = runtime.sibling_roster("Pending");
         runtime
-            .child_system_prompt(definition, "work", &roster)
+            .child_system_prompt(definition, "work", None, None, None, &roster)
             .expect("boundary accepted");
     }
 
@@ -4996,7 +7350,7 @@ mod prompt_size_tests {
         let definition = runtime.catalog().get("bounded").expect("agent");
         let roster = runtime.sibling_roster("Pending");
         let error = runtime
-            .child_system_prompt(definition, "work", &roster)
+            .child_system_prompt(definition, "work", None, None, None, &roster)
             .expect_err("oversized rejected")
             .to_string();
         assert!(error.contains("exceeds maximum size"));
@@ -5052,10 +7406,12 @@ mod prompt_size_tests {
             started_at: None,
             finished_at: None,
             result: None,
+            soft_budget_exhausted: false,
         };
         let legacy_wire = serde_json::to_value(&legacy).expect("serialize legacy job");
         assert!(legacy_wire.get("workflowId").is_none());
         assert!(legacy_wire.get("workflowGeneration").is_none());
+        assert!(legacy_wire.get("softBudgetExhausted").is_none());
 
         let scoped = JobSnapshot {
             workflow_id: Some("workflow-a".to_owned()),
@@ -5104,6 +7460,7 @@ mod prompt_size_tests {
                     started_at: None,
                     finished_at: None,
                     result: None,
+                    soft_budget_exhausted: false,
                 },
                 CancellationToken::new(),
             )
@@ -5121,5 +7478,1302 @@ mod prompt_size_tests {
             )
             .expect_err("active job blocks gate replacement");
         assert!(gate_error.to_string().contains("jobs are active"));
+    }
+
+    fn budget_runtime(
+        root: &Path,
+        budget: JobSoftBudget,
+    ) -> (OrchestrationRuntime, AgentDefinition) {
+        let definition = super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition");
+        let definition_for_hook = definition.clone();
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![definition]),
+            root,
+        );
+        config.soft_budget = budget;
+        let runtime = OrchestrationRuntime::new(
+            config,
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .expect("runtime");
+        (runtime, definition_for_hook)
+    }
+
+    fn budget_turn(tokens: i64) -> pi_agent::ShouldStopAfterTurnContext {
+        let mut message = pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
+        message.usage.total_tokens = tokens;
+        pi_agent::ShouldStopAfterTurnContext {
+            message,
+            tool_results: Vec::new(),
+            context: pi_agent::AgentContext {
+                system_prompt: String::new(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+            },
+            new_messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn soft_budget_config_builds_stop_hook_that_triggers_on_limits() {
+        let root = tempfile::tempdir().expect("root");
+        let (runtime, definition) = budget_runtime(
+            root.path(),
+            JobSoftBudget {
+                max_requests: Some(2),
+                max_tokens: None,
+                yield_after: None,
+            },
+        );
+        let state = JobSoftBudgetState::default();
+        let hook = runtime
+            .soft_budget_stop_hook(&definition, &state)
+            .expect("configured budget must build a stop hook");
+        assert!(!hook(&budget_turn(0)), "first request stays under the cap");
+        assert!(hook(&budget_turn(0)), "second request reaches the cap");
+        assert!(state.triggered.load(Ordering::Relaxed), "budget marks the job");
+
+        // Token cap: 100 tokens per turn against a 150-token budget.
+        let (token_runtime, token_definition) = budget_runtime(
+            root.path(),
+            JobSoftBudget {
+                max_requests: None,
+                max_tokens: Some(150),
+                yield_after: None,
+            },
+        );
+        let token_state = JobSoftBudgetState::default();
+        let token_hook = token_runtime
+            .soft_budget_stop_hook(&token_definition, &token_state)
+            .expect("token budget must build a stop hook");
+        assert!(!token_hook(&budget_turn(100)), "100 tokens stay under the cap");
+        assert!(
+            token_hook(&budget_turn(100)),
+            "200 cumulative tokens exceed the cap"
+        );
+        assert!(token_state.triggered.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn unlimited_default_soft_budget_builds_no_stop_hook() {
+        let root = tempfile::tempdir().expect("root");
+        // OrchestrationConfig::new defaults soft_budget to unlimited, which is
+        // what a Settings without orchestration.softBudget resolves to.
+        let (runtime, definition) = budget_runtime(root.path(), JobSoftBudget::default());
+        assert!(
+            runtime
+                .soft_budget_stop_hook(&definition, &JobSoftBudgetState::default())
+                .is_none(),
+            "unlimited budget must preserve run-to-completion behavior"
+        );
+    }
+}
+
+#[cfg(test)]
+mod delegation_intent_tests {
+    use super::*;
+
+    #[test]
+    fn english_delegation_verbs_are_recognized() {
+        for prompt in [
+            "Have researcher study this",
+            "please ask researcher to investigate",
+            "let researcher handle the patch",
+            "dispatch researcher now",
+        ] {
+            assert!(request_has_delegation_verb(prompt), "{prompt}");
+            assert!(delegation_intent(prompt, "researcher"), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn literal_cjk_prompt_has_delegation_intent() {
+        assert!(delegation_intent(
+            "你让researcher仔细调研pi-coding-agent",
+            "researcher"
+        ));
+    }
+
+    #[test]
+    fn cjk_constructions_are_conservative() {
+        for (prompt, agent) in [
+            ("请你让researcher去调查这个项目", "researcher"),
+            ("请researcher写一份调研报告", "researcher"),
+            ("把这项调研交给researcher完成", "researcher"),
+            ("安排researcher仔细调研这个仓库", "researcher"),
+            ("委托researcher调研这个仓库", "researcher"),
+            ("叫researcher去研究这个bug", "researcher"),
+            ("派researcher去处理这个任务", "researcher"),
+        ] {
+            assert!(
+                cjk_delegation_construction(prompt, agent),
+                "{prompt:?} must be a CJK delegation construction"
+            );
+        }
+        // Negatives: informational mentions, questions, possessive markers,
+        // and whitespace-separated English after a CJK token.
+        for (prompt, agent) in [
+            ("researcher 是做什么的？", "researcher"),
+            ("我在文档里看到researcher", "researcher"),
+            ("让researcher的调研完成", "researcher"),
+            ("请 researcher 去调查", "researcher"),
+            ("请review the security patch", "review"),
+            ("请使用research技能", "research"),
+        ] {
+            assert!(
+                !cjk_delegation_construction(prompt, agent),
+                "{prompt:?} must NOT be a CJK delegation construction"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_name_span_respects_embedded_ascii_word_boundaries() {
+        // CJK-embedded and standalone mentions are found…
+        assert_eq!(
+            agent_name_span("你让researcher仔细调研", "researcher"),
+            Some(("你让".len(), "你让researcher".len()))
+        );
+        assert_eq!(
+            agent_name_span("Have researcher study this", "researcher"),
+            Some(("Have ".len(), "Have researcher".len()))
+        );
+        // …but `researcher` never matches inside `researchers`, and casing is
+        // matched case-insensitively.
+        assert!(agent_name_span("researchers study this", "researcher").is_none());
+        assert!(agent_name_span("你让Researcher去调查", "researcher").is_some());
+    }
+
+    #[test]
+    fn delegation_candidates_are_precise() {
+        // English: the noun directly after a delegation verb.
+        assert_eq!(
+            delegation_candidates("Have researcher study this"),
+            vec!["researcher".to_owned()]
+        );
+        // The verb itself and clause objects are never candidates.
+        assert!(delegation_candidates("please review the security patch").is_empty());
+        assert!(delegation_candidates("ask me to review").is_empty());
+        // CJK: only names abutted by a delegation token with an action clause.
+        assert_eq!(
+            delegation_candidates("你让researcher仔细调研pi-coding-agent"),
+            vec!["researcher".to_owned()]
+        );
+        assert!(delegation_candidates("请使用research技能").is_empty());
+        assert!(delegation_candidates("researcher 是做什么的？").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod yield_tool_tests {
+    use super::*;
+    use crate::orchestration::tools::yield_tool;
+    use crate::SessionOptions;
+    use pi_ai::{
+        AssistantMessage, AssistantMessageEvent, ContentBlock, Model, SimpleStreamOptions,
+        StopReason, ToolCall, new_assistant_message_event_stream,
+    };
+    use serde_json::json;
+
+    /// Scripted provider: pops one assistant message per stream invocation so
+    /// the turn count is deterministic; an exhausted script falls back to a
+    /// plain "done" message, so any turn streamed after the scripted ones is
+    /// observable in the transcript.
+    fn scripted(messages: Vec<AssistantMessage>) -> pi_agent::StreamFn {
+        let messages = Arc::new(parking_lot::Mutex::new(VecDeque::from(messages)));
+        Arc::new(move |model: Model, _context: pi_ai::Context, _options: SimpleStreamOptions| {
+            let messages = messages.clone();
+            Box::pin(async move {
+                let message = messages.lock().pop_front().unwrap_or_else(|| {
+                    let mut fallback = AssistantMessage::pending(&model);
+                    fallback.content = vec![ContentBlock::text("done")];
+                    fallback.stop_reason = StopReason::Stop;
+                    fallback
+                });
+                let stream = new_assistant_message_event_stream();
+                let producer = stream.clone();
+                let model = model.clone();
+                tokio::spawn(async move {
+                    producer
+                        .push(AssistantMessageEvent::Start {
+                            partial: AssistantMessage::pending(&model),
+                        })
+                        .await;
+                    let terminal = if matches!(
+                        message.stop_reason,
+                        StopReason::Error | StopReason::Aborted
+                    ) {
+                        AssistantMessageEvent::Error {
+                            reason: message.stop_reason,
+                            error: message.clone(),
+                        }
+                    } else {
+                        AssistantMessageEvent::Done {
+                            reason: message.stop_reason,
+                            message: message.clone(),
+                        }
+                    };
+                    producer.push(terminal).await;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    fn task_definition() -> AgentDefinition {
+        super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition")
+    }
+
+    /// Like [`task_definition`] but the agent explicitly declares `tools:
+    /// [read, yield]` — the qwen-style case where `yield` appears in the
+    /// definition's tool list. The validator must accept it and the child
+    /// factory must skip it during base-tool creation (so `create_tool` is
+    /// never asked to build `yield`) and append exactly one `yield` tool.
+    fn yield_declaring_definition() -> AgentDefinition {
+        super::super::definitions::parse_agent_definition(
+            Path::new("qwen.md"),
+            "---\nname: qwen\ndescription: qwen\ntools: [read, yield]\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("qwen definition")
+    }
+
+    /// Runtime whose catalog carries the yield-declaring definition, so spawns
+    /// exercise the declared-`yield` path through the real child factory.
+    fn yield_declaring_runtime(
+        root: &Path,
+        messages: Vec<AssistantMessage>,
+    ) -> OrchestrationRuntime {
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: root.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(scripted(messages)),
+            auth_resolver: None,
+        })
+        .expect("parent session");
+        let snapshot = session.child_session_options_snapshot();
+        let catalog = AgentCatalog::from_agents(vec![task_definition(), yield_declaring_definition()]);
+        let config = OrchestrationConfig::new(catalog, root.join("artifacts"));
+        OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime")
+    }
+
+    /// Runtime whose child factory builds real sessions from a parent session
+    /// carrying the scripted provider — the exact production path, so the
+    /// child's tool set includes the orchestration plumbing plus the appended
+    /// `yield` tool.
+    fn yield_runtime(
+        root: &Path,
+        messages: Vec<AssistantMessage>,
+        soft_budget: JobSoftBudget,
+    ) -> OrchestrationRuntime {
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: root.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(scripted(messages)),
+            auth_resolver: None,
+        })
+        .expect("parent session");
+        let snapshot = session.child_session_options_snapshot();
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![task_definition()]),
+            root.join("artifacts"),
+        );
+        config.soft_budget = soft_budget;
+        OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime")
+    }
+
+    async fn spawn_and_settle(
+        runtime: &OrchestrationRuntime,
+        id: &str,
+        assignment: &str,
+    ) -> JobSnapshot {
+        let spawn = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: id.to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: assignment.to_owned(),
+                    todo_task_id: None,
+                    ..Default::default()
+                }],
+            )
+            .expect("spawn")
+            .remove(0);
+        let settled = runtime
+            .wait_jobs(&[spawn.job_id.clone()], Some(Duration::from_secs(10)), None)
+            .await
+            .expect("jobs settle");
+        settled
+            .into_iter()
+            .find(|job| job.id == spawn.job_id)
+            .expect("settled job")
+    }
+
+    /// Assistant message that calls the `yield` tool with `text`, preceded by
+    /// a concise yield-marker text block (the trailing text the payload must
+    /// replace in the delivered output).
+    fn yield_call_message(text: &str) -> AssistantMessage {
+        let mut message = AssistantMessage::pending(&Model::default());
+        message.content = vec![
+            ContentBlock::text("Delivering my final result."),
+            ContentBlock::ToolCall(ToolCall {
+                id: "call-yield".to_owned(),
+                name: "yield".to_owned(),
+                arguments: serde_json::json!({ "text": text }),
+                thought_signature: None,
+            }),
+        ];
+        message.stop_reason = StopReason::ToolUse;
+        message
+    }
+
+    fn text_message(text: &str) -> AssistantMessage {
+        let mut message = AssistantMessage::pending(&Model::default());
+        message.content = vec![ContentBlock::text(text)];
+        message.stop_reason = StopReason::Stop;
+        message
+    }
+
+    fn read_history(root: &Path, id: &str, job_id: &str) -> Vec<pi_ai::Message> {
+        let path = root
+            .join("artifacts")
+            .join(format!("{id}-{job_id}.history.json"));
+        let bytes = fs::read(&path).expect("history file");
+        serde_json::from_slice(&bytes).expect("parse history")
+    }
+
+    #[tokio::test]
+    async fn yield_call_settles_job_with_delivered_payload_and_stops_after_the_turn() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = yield_runtime(
+            root.path(),
+            vec![yield_call_message("deliverable")],
+            JobSoftBudget::default(),
+        );
+        let job = spawn_and_settle(&runtime, "YieldChild", "produce a deliverable").await;
+
+        assert_eq!(
+            job.status,
+            JobStatus::Completed,
+            "a yield call settles the job as Completed"
+        );
+        let result = job.result.expect("settled result");
+        assert_eq!(
+            result.output, "deliverable",
+            "the yield payload becomes the job's final output"
+        );
+        assert!(
+            !result.output.contains("Delivering my final result."),
+            "the trailing assistant text is replaced, not kept: {:?}",
+            result.output
+        );
+        assert!(result.error.is_none());
+        assert!(!result.soft_budget_exhausted);
+
+        // The run must end right after the yielding turn: the transcript holds
+        // exactly one assistant message (the yield-marker turn) and never a
+        // follow-up turn after the delivery.
+        let history = read_history(root.path(), "YieldChild", &job.id);
+        let assistant_count = history
+            .iter()
+            .filter(|message| matches!(message, pi_ai::Message::Assistant(_)))
+            .count();
+        assert_eq!(
+            assistant_count, 1,
+            "the run stops after the yield turn: {history:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_that_never_calls_yield_keeps_natural_text_with_missing_yield_warning() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = yield_runtime(
+            root.path(),
+            vec![text_message("natural final text")],
+            JobSoftBudget::default(),
+        );
+        let job = spawn_and_settle(&runtime, "NoYieldChild", "work without yield").await;
+
+        assert_eq!(job.status, JobStatus::Completed);
+        let result = job.result.expect("settled result");
+        assert_eq!(
+            result.output,
+            format!("natural final text\n\n{MISSING_YIELD_WARNING}"),
+            "natural completion keeps the final text and appends the warning"
+        );
+        assert!(result.error.is_none());
+        assert!(!result.soft_budget_exhausted);
+    }
+
+    #[tokio::test]
+    async fn soft_budget_and_yield_compose_without_panic() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = yield_runtime(
+            root.path(),
+            vec![yield_call_message("budgeted deliverable")],
+            JobSoftBudget {
+                max_requests: Some(1),
+                ..JobSoftBudget::default()
+            },
+        );
+        let job = spawn_and_settle(&runtime, "BudgetedYield", "budgeted work").await;
+
+        assert_eq!(
+            job.status,
+            JobStatus::Completed,
+            "a soft budget must not fail a job that yields"
+        );
+        let result = job.result.expect("settled result");
+        assert_eq!(
+            result.output, "budgeted deliverable",
+            "the yield payload wins over the budget's partial-text projection"
+        );
+        assert!(
+            result.soft_budget_exhausted,
+            "the soft-budget marker must survive the yield delivery"
+        );
+    }
+
+    #[test]
+    fn yield_is_not_registered_in_main_session_tool_sets() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let cwd = cwd.path().to_str().expect("utf-8 cwd");
+        let error = crate::create_tool("yield", cwd)
+            .expect_err("main-session create_tool must reject yield");
+        assert!(
+            error.to_string().contains("Unknown tool"),
+            "rejection must be the standard unknown-tool error: {error}"
+        );
+        assert!(!crate::TOOL_NAMES.contains(&"yield"), "yield must not be a built-in");
+        assert!(
+            !crate::create_all_tools(cwd)
+                .iter()
+                .any(|tool| tool.name == "yield"),
+            "create_all_tools must not expose yield"
+        );
+        assert!(
+            !crate::create_coding_tools(cwd)
+                .iter()
+                .any(|tool| tool.name == "yield"),
+            "the default coding set must not expose yield"
+        );
+    }
+
+    #[tokio::test]
+    async fn yield_payload_is_raw_in_storage_and_redacted_at_presentation() {
+        let root = tempfile::tempdir().expect("root");
+        let secret = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let payload = format!("deploy using {secret} and token=abc123");
+        let runtime = yield_runtime(
+            root.path(),
+            vec![yield_call_message(&payload)],
+            JobSoftBudget::default(),
+        );
+        let job = spawn_and_settle(&runtime, "RedactedYield", "work with secrets").await;
+        let result = job.result.as_ref().expect("settled result");
+
+        // Storage keeps the raw payload (same contract as every tool text:
+        // raw in storage, redacted at display/transport boundaries).
+        let artifact_path = root
+            .path()
+            .join("artifacts")
+            .join(format!("RedactedYield-{}.md", job.id));
+        let artifact = fs::read_to_string(&artifact_path).expect("artifact file");
+        assert!(
+            artifact.contains(secret.as_str()),
+            "storage must keep the raw payload: {artifact}"
+        );
+        let history = fs::read_to_string(
+            root.path()
+                .join("artifacts")
+                .join(format!("RedactedYield-{}.history.json", job.id)),
+        )
+        .expect("history file");
+        assert!(history.contains(secret.as_str()), "the raw transcript keeps the payload");
+
+        // Presentation redacts the payload at the same boundary as any other
+        // tool text: the presented job output and the presented tool-call
+        // arguments never carry the secret.
+        let presented = presentation_job_snapshot(job);
+        let presented_output = presented.result.expect("presented result").output;
+        assert!(
+            !presented_output.contains(secret.as_str()),
+            "presentation must redact the payload: {presented_output}"
+        );
+        assert!(presented_output.contains("[REDACTED]"), "redaction marker");
+        let redacted_arguments =
+            crate::redact_value(&serde_json::json!({ "text": payload }));
+        assert!(
+            !redacted_arguments.to_string().contains(secret.as_str()),
+            "presented tool-call arguments must be redacted like every other tool's"
+        );
+    }
+
+    #[tokio::test]
+    async fn yield_tool_records_payload_once_and_ignores_repeats() {
+        let state = Arc::new(YieldState::default());
+        let tool = yield_tool(state.clone());
+        assert_eq!(tool.name, "yield");
+        assert!(
+            tool.description.contains("final deliverable"),
+            "the description carries the delivery protocol: {}",
+            tool.description
+        );
+        assert!(tool.description.contains("Do not call it mid-work"));
+
+        let (_, abort) = pi_agent::AbortController::new();
+        let context = pi_agent::ToolCallContext {
+            tool_call_id: "call-yield".to_owned(),
+            arguments: serde_json::json!({ "text": "direct deliverable" }),
+            on_update: Arc::new(|_| {}),
+            abort,
+            model: None,
+        };
+        let result = (tool.execute)(context).await.expect("yield executes");
+        assert_eq!(state.payload().as_deref(), Some("direct deliverable"));
+        assert!(state.was_called());
+        // The acknowledgment never echoes the payload back into the transcript.
+        let result_text = result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            !result_text.contains("direct deliverable"),
+            "the tool result must not echo the payload: {result_text}"
+        );
+
+        // A second call (a model calling yield twice in one message) is
+        // ignored: the first payload wins.
+        let (_, second_abort) = pi_agent::AbortController::new();
+        let second = (tool.execute)(pi_agent::ToolCallContext {
+                tool_call_id: "call-yield-2".to_owned(),
+                arguments: serde_json::json!({ "text": "second payload" }),
+                on_update: Arc::new(|_| {}),
+                abort: second_abort,
+                model: None,
+            })
+            .await
+            .expect("second yield executes");
+        let second_text = second
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(second_text.contains("already called"), "{second_text}");
+        assert_eq!(
+            state.payload().as_deref(),
+            Some("direct deliverable"),
+            "the first payload wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn definition_declaring_yield_spawns_with_exactly_one_working_yield_tool() {
+        // Idempotency + qwen-case regression: an agent definition that declares
+        // `yield` among its tools must (a) pass the validator (no "unsupported
+        // child tools" rejection), (b) spawn without the child factory asking
+        // `create_tool` to build `yield` (which would fail with "Unknown tool
+        // name"), and (c) end up with exactly one working `yield` tool — the
+        // factory appends it regardless of the declaration. A child that calls
+        // `yield` settles with the delivered payload, proving the single
+        // appended tool is live and the declared copy was not double-registered.
+        let root = tempfile::tempdir().expect("root");
+        let runtime =
+            yield_declaring_runtime(root.path(), vec![yield_call_message("declared-yield")]);
+        let job = spawn_and_settle(&runtime, "QwenChild", "deliver via declared yield").await;
+
+        assert_eq!(
+            job.status,
+            JobStatus::Completed,
+            "the declared-yield child must spawn and complete, not be rejected"
+        );
+        let result = job.result.expect("settled result");
+        assert_eq!(
+            result.output, "declared-yield",
+            "the single appended yield tool must deliver the payload"
+        );
+        assert!(result.error.is_none(), "no spawn/tool errors: {:?}", result.error);
+        // Exactly one assistant turn: the factory did not register two yield
+        // tools that could confuse the model into extra turns.
+        let history = read_history(root.path(), "QwenChild", &job.id);
+        let assistant_count = history
+            .iter()
+            .filter(|message| matches!(message, pi_ai::Message::Assistant(_)))
+            .count();
+        assert_eq!(
+            assistant_count, 1,
+            "one yield turn, no trailing work: {history:?}"
+        );
+    }
+
+    async fn spawn_and_settle_with_contract(
+        runtime: &OrchestrationRuntime,
+        id: &str,
+        assignment: &str,
+        output_schema: Option<Value>,
+        schema_mode: Option<&str>,
+    ) -> JobSnapshot {
+        let spawn = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: id.to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: assignment.to_owned(),
+                    todo_task_id: None,
+                    output_schema,
+                    schema_mode: schema_mode.map(str::to_owned),
+                    ..TaskItem::default()
+                }],
+            )
+            .expect("spawn")
+            .remove(0);
+        let settled = runtime
+            .wait_jobs(&[spawn.job_id.clone()], Some(Duration::from_secs(10)), None)
+            .await
+            .expect("jobs settle");
+        settled
+            .into_iter()
+            .find(|job| job.id == spawn.job_id)
+            .expect("settled job")
+    }
+
+    #[tokio::test]
+    async fn output_schema_validates_conforming_delivered_payload_per_child() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = yield_runtime(
+            root.path(),
+            vec![yield_call_message(r#"{"ok": true}"#)],
+            JobSoftBudget::default(),
+        );
+        let schema = json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        });
+        let job = spawn_and_settle_with_contract(
+            &runtime,
+            "SchemaChild",
+            "deliver a JSON report",
+            Some(schema),
+            Some("strict"),
+        )
+        .await;
+
+        assert_eq!(job.status, JobStatus::Completed);
+        let result = job.result.expect("settled result");
+        assert_eq!(result.output, r#"{"ok": true}"#);
+        assert!(result.error.is_none(), "conforming payload must not fail: {:?}", result.error);
+        let validation = result.structured_output.expect("structured output");
+        assert!(validation.valid, "conforming payload must validate");
+        assert_eq!(validation.schema_source, "task");
+        assert_eq!(validation.schema_mode, "strict");
+        assert_eq!(validation.data, Some(json!({"ok": true})));
+        assert_eq!(validation.error, None);
+    }
+
+    #[tokio::test]
+    async fn output_schema_reports_non_conforming_payload_without_failing_permissive_job() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = yield_runtime(
+            root.path(),
+            vec![yield_call_message(r#"{"ok": "nope"}"#)],
+            JobSoftBudget::default(),
+        );
+        let schema = json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        });
+        let job = spawn_and_settle_with_contract(
+            &runtime,
+            "PermissiveChild",
+            "deliver a JSON report",
+            Some(schema),
+            None,
+        )
+        .await;
+
+        assert_eq!(job.status, JobStatus::Completed, "permissive mode keeps the job completed");
+        let result = job.result.expect("settled result");
+        assert!(result.error.is_none(), "permissive mode must not fail the job: {:?}", result.error);
+        let validation = result.structured_output.expect("structured output");
+        assert!(!validation.valid, "non-conforming payload must be flagged");
+        assert_eq!(validation.schema_mode, "permissive");
+        assert_eq!(validation.data, Some(json!({"ok": "nope"})));
+        assert!(
+            validation.error.as_deref().is_some_and(|error| error.contains("outputSchema")),
+            "validation error: {:?}",
+            validation.error
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_output_schema_failure_surfaces_as_job_error() {
+        let root = tempfile::tempdir().expect("root");
+        let runtime = yield_runtime(
+            root.path(),
+            vec![yield_call_message("not json at all")],
+            JobSoftBudget::default(),
+        );
+        let schema = json!({"type": "object"});
+        let job = spawn_and_settle_with_contract(
+            &runtime,
+            "StrictChild",
+            "deliver a JSON report",
+            Some(schema),
+            Some("strict"),
+        )
+        .await;
+
+        assert_eq!(
+            job.status,
+            JobStatus::Failed,
+            "strict mode surfaces the validation failure as a job failure"
+        );
+        let result = job.result.expect("settled result");
+        assert!(
+            result.error.as_deref().is_some_and(|error| error.contains("not valid JSON")),
+            "strict mode surfaces the validation failure as a job error: {:?}",
+            result.error
+        );
+        let validation = result.structured_output.expect("structured output");
+        assert!(!validation.valid);
+        assert_eq!(validation.schema_mode, "strict");
+        assert_eq!(validation.data, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_context_is_rendered_into_every_child_prompt_with_own_task() {
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
+        let factory_capture = captured.clone();
+        let definition = task_definition();
+        let runtime = OrchestrationRuntime::new(
+            OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition]), root.path()),
+            Arc::new(move |request| {
+                factory_capture
+                    .lock()
+                    .insert(request.child_id, request.system_prompt);
+                Box::pin(async { Err(anyhow!("stop after prompt capture")) })
+            }),
+        )
+        .expect("runtime");
+
+        let spawns = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![
+                    TaskItem {
+                        index: 0,
+                        id: "First".to_owned(),
+                        agent: "task".to_owned(),
+                        assignment: "first task briefing".to_owned(),
+                        todo_task_id: None,
+                        context: Some("shared background context".to_owned()),
+                        output_schema: Some(json!({"type": "object"})),
+                        schema_mode: Some("strict".to_owned()),
+                    },
+                    TaskItem {
+                        index: 1,
+                        id: "Second".to_owned(),
+                        agent: "task".to_owned(),
+                        assignment: "second task briefing".to_owned(),
+                        todo_task_id: None,
+                        context: Some("shared background context".to_owned()),
+                        ..TaskItem::default()
+                    },
+                ],
+            )
+            .expect("spawn batch");
+        let job_ids = spawns
+            .iter()
+            .map(|spawn| spawn.job_id.clone())
+            .collect::<Vec<_>>();
+        runtime
+            .wait_jobs(&job_ids, Some(Duration::from_secs(1)), None)
+            .await
+            .expect("settled");
+
+        let prompts = captured.lock();
+        let first = prompts.get("First").expect("first prompt");
+        let second = prompts.get("Second").expect("second prompt");
+        for prompt in [first, second] {
+            assert!(
+                prompt.contains("<context>\nshared background context\n</context>"),
+                "every child prompt carries the shared CONTEXT section: {prompt}"
+            );
+        }
+        assert!(
+            first.contains("<delegated_assignment>\nfirst task briefing\n</delegated_assignment>"),
+            "first child's own task: {first}"
+        );
+        assert!(
+            second.contains("<delegated_assignment>\nsecond task briefing\n</delegated_assignment>"),
+            "second child's own task: {second}"
+        );
+        // The context is not duplicated into the assignment.
+        assert!(!first.contains("shared background context\n\nfirst task briefing"));
+        // The output contract is rendered only for the item that carries it.
+        assert!(first.contains("<output_contract>"), "first child sees its contract: {first}");
+        assert!(first.contains("Validation mode: strict"));
+        assert!(!second.contains("<output_contract>"), "no contract for the second child: {second}");
+    }
+}
+
+#[cfg(test)]
+mod unknown_tool_declaration_tests {
+    use super::*;
+    use crate::SessionOptions;
+    use pi_ai::{
+        AssistantMessage, AssistantMessageEvent, ContentBlock, Model, SimpleStreamOptions,
+        StopReason, new_assistant_message_event_stream,
+    };
+
+    /// Stream function that records the exact tool set injected into the
+    /// child session (the `Context.tools` the provider sees) and then
+    /// completes with a plain "done" message so the run settles cleanly.
+    fn recording_stream(captured: Arc<Mutex<Vec<String>>>) -> pi_agent::StreamFn {
+        Arc::new(move |model: Model, context: pi_ai::Context, _options: SimpleStreamOptions| {
+            *captured.lock() = context
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect();
+            Box::pin(async move {
+                let mut done = AssistantMessage::pending(&model);
+                done.content = vec![ContentBlock::text("done")];
+                done.stop_reason = StopReason::Stop;
+                let stream = new_assistant_message_event_stream();
+                let producer = stream.clone();
+                let model = model.clone();
+                tokio::spawn(async move {
+                    producer
+                        .push(AssistantMessageEvent::Start {
+                            partial: AssistantMessage::pending(&model),
+                        })
+                        .await;
+                    producer
+                        .push(AssistantMessageEvent::Done {
+                            reason: StopReason::Stop,
+                            message: done.clone(),
+                        })
+                        .await;
+                    producer.end(Some(done)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    fn qa_definition(tools: &[&str]) -> AgentDefinition {
+        super::super::definitions::parse_agent_definition(
+            Path::new("qa.md"),
+            &format!(
+                "---\nname: qa\ndescription: qa\ntools: [{}]\n---\nprompt",
+                tools.join(", ")
+            ),
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("qa definition")
+    }
+
+    fn task_definition() -> AgentDefinition {
+        super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            super::super::AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("task definition")
+    }
+
+    /// Runtime whose catalog carries the qa-style definition (declaring the
+    /// ghost `yield_output` plus valid tools) and a plain task definition.
+    /// The child factory is the real production path; the recording stream fn
+    /// captures each child's injected tool set.
+    fn qa_runtime(
+        root: &Path,
+        qa_tools: &[&str],
+        captured: Arc<Mutex<Vec<String>>>,
+        max_tools_per_agent: usize,
+    ) -> OrchestrationRuntime {
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: root.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(recording_stream(captured)),
+            auth_resolver: None,
+        })
+        .expect("parent session");
+        let snapshot = session.child_session_options_snapshot();
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![task_definition(), qa_definition(qa_tools)]),
+            root.join("artifacts"),
+        );
+        config.max_tools_per_agent = max_tools_per_agent;
+        OrchestrationRuntime::new(
+            config,
+            OrchestrationRuntime::child_factory_from_snapshot(snapshot),
+        )
+        .expect("runtime")
+    }
+
+    fn spawn_item(runtime: &OrchestrationRuntime, id: &str, agent: &str) -> TaskSpawn {
+        runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: id.to_owned(),
+                    agent: agent.to_owned(),
+                    assignment: "work".to_owned(),
+                    todo_task_id: None,
+                    ..TaskItem::default()
+                }],
+            )
+            .expect("spawn")
+            .remove(0)
+    }
+
+    async fn settle(runtime: &OrchestrationRuntime, spawns: &[TaskSpawn]) {
+        let ids = spawns.iter().map(|spawn| spawn.job_id.clone()).collect::<Vec<_>>();
+        runtime
+            .wait_jobs(&ids, Some(Duration::from_secs(10)), None)
+            .await
+            .expect("jobs settle");
+    }
+
+    #[tokio::test]
+    async fn child_factory_skips_unknown_declared_tools() {
+        // A qa-style definition declaring `yield_output` + a ghost next to
+        // valid tools: the child receives the valid tools + orchestration
+        // plumbing + yield, and NEVER the unknown names (which would otherwise
+        // hard-fail `create_tool` with "Unknown tool name").
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let runtime = qa_runtime(
+            root.path(),
+            &["read", "yield_output", "ghost"],
+            captured.clone(),
+            16,
+        );
+        let spawn = spawn_item(&runtime, "QaChild", "qa");
+        settle(&runtime, &[spawn]).await;
+
+        let injected = captured.lock().clone();
+        assert!(
+            injected.iter().any(|name| name == "read"),
+            "valid declared tools are injected: {injected:?}"
+        );
+        assert!(
+            injected.iter().any(|name| name == "yield"),
+            "the child-only yield tool is appended: {injected:?}"
+        );
+        assert!(
+            injected.iter().any(|name| name == "task" || name == "hub"),
+            "orchestration plumbing is injected: {injected:?}"
+        );
+        assert!(
+            !injected.iter().any(|name| name == "yield_output" || name == "ghost"),
+            "unknown declared tools are silently dropped, never injected: {injected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_succeeds_with_deduped_warning() {
+        // The qa definition loads, spawns, and completes despite declaring the
+        // ghost yield_output; the warning fires exactly once per (agent, tool)
+        // even across repeated spawns.
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let runtime = qa_runtime(
+            root.path(),
+            &["read", "grep", "bash", "write", "yield_output"],
+            captured.clone(),
+            16,
+        );
+        let first = spawn_item(&runtime, "QaChildA", "qa");
+        let second = spawn_item(&runtime, "QaChildB", "qa");
+        settle(&runtime, &[first, second]).await;
+
+        assert!(
+            captured.lock().iter().all(|name| name != "yield_output"),
+            "the ghost tool is never injected: {:?}",
+            captured.lock()
+        );
+        let warnings = runtime.unknown_tool_warnings();
+        assert_eq!(warnings.len(), 1, "one deduped warning: {warnings:?}");
+        assert!(warnings[0].contains("qa"), "{}", warnings[0]);
+        assert!(warnings[0].contains("yield_output"), "{}", warnings[0]);
+        assert!(warnings[0].contains("ignoring"), "{}", warnings[0]);
+    }
+
+    #[tokio::test]
+    async fn batch_with_one_unknown_tool_item_still_spawns_every_item() {
+        // A batch where ONE item's agent declares an unknown tool must not
+        // abort the batch: every item spawns.
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let runtime = qa_runtime(
+            root.path(),
+            &["read", "yield_output"],
+            captured.clone(),
+            16,
+        );
+        let batch = runtime
+            .spawn_tasks(
+                "Main",
+                0,
+                vec![
+                    TaskItem {
+                        index: 0,
+                        id: "TaskChild".to_owned(),
+                        agent: "task".to_owned(),
+                        assignment: "plain work".to_owned(),
+                        todo_task_id: None,
+                        ..TaskItem::default()
+                    },
+                    TaskItem {
+                        index: 1,
+                        id: "QaChild".to_owned(),
+                        agent: "qa".to_owned(),
+                        assignment: "ghost work".to_owned(),
+                        todo_task_id: None,
+                        ..TaskItem::default()
+                    },
+                ],
+            )
+            .expect("the whole batch must spawn despite the unknown tool");
+        assert_eq!(batch.len(), 2, "both items spawn: {batch:?}");
+        settle(&runtime, &batch).await;
+        assert_eq!(
+            runtime.unknown_tool_warnings().len(),
+            1,
+            "the qa item warns once, the task item never: {:?}",
+            runtime.unknown_tool_warnings()
+        );
+    }
+
+    #[tokio::test]
+    async fn max_tools_per_agent_counts_only_injected_names() {
+        // max_tools_per_agent = 1; the qa definition declares 4 names but only
+        // `read` is actually injected (the unknowns are dropped), so the
+        // pre-check counts 1 — the spawn must NOT be rejected for
+        // over-counting ghosts.
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let runtime = qa_runtime(
+            root.path(),
+            &["read", "yield_output", "ghost_a", "ghost_b"],
+            captured.clone(),
+            1,
+        );
+        let spawn = spawn_item(&runtime, "QaChild", "qa");
+        settle(&runtime, &[spawn]).await;
+
+        let injected = captured.lock().clone();
+        assert_eq!(
+            injected.iter().filter(|name| *name == "read").count(),
+            1,
+            "exactly one declared tool is injected: {injected:?}"
+        );
+        assert!(
+            !injected.iter().any(|name| name == "yield_output" || name == "ghost_a" || name == "ghost_b"),
+            "unknowns never count toward or occupy the tool budget: {injected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn definition_declaring_only_unknowns_loads_with_zero_injected_tools() {
+        // A definition declaring ONLY unknown names stays compatible and
+        // spawns; no declared tool is injected (plumbing + yield remain).
+        let root = tempfile::tempdir().expect("root");
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let runtime = qa_runtime(root.path(), &["yield_output", "computer"], captured.clone(), 16);
+        let spawn = spawn_item(&runtime, "GhostChild", "qa");
+        settle(&runtime, &[spawn]).await;
+
+        let injected = captured.lock().clone();
+        assert!(
+            !injected.iter().any(|name| name == "yield_output" || name == "computer"),
+            "no unknown tool is injected: {injected:?}"
+        );
+        assert!(
+            injected.iter().any(|name| name == "yield"),
+            "plumbing + the yield tool are still appended: {injected:?}"
+        );
+        assert!(
+            runtime.unknown_tool_warnings().len() == 2,
+            "one warning per unknown tool: {:?}",
+            runtime.unknown_tool_warnings()
+        );
+    }
+}
+
+#[cfg(test)]
+mod memory_child_factory_tests {
+    use super::*;
+    use crate::SessionOptions;
+    use pi_ai::{AssistantMessage, AssistantMessageEvent, ContentBlock, Model, SimpleStreamOptions, StopReason, new_assistant_message_event_stream};
+
+    fn recording_stream(captured: Arc<Mutex<Vec<String>>>) -> pi_agent::StreamFn {
+        Arc::new(move |model: Model, context: pi_ai::Context, _options: SimpleStreamOptions| {
+            *captured.lock() = context.tools.iter().map(|tool| tool.name.clone()).collect();
+            Box::pin(async move {
+                let mut done = AssistantMessage::pending(&model);
+                done.content = vec![ContentBlock::text("done")];
+                done.stop_reason = StopReason::Stop;
+                let stream = new_assistant_message_event_stream();
+                let producer = stream.clone();
+                let model = model.clone();
+                tokio::spawn(async move {
+                    producer.push(AssistantMessageEvent::Start { partial: AssistantMessage::pending(&model) }).await;
+                    producer.push(AssistantMessageEvent::Done { reason: StopReason::Stop, message: done.clone() }).await;
+                    producer.end(Some(done)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    fn definition(root: &Path, persona: bool, tools: Option<&str>) -> AgentDefinition {
+        let path = if persona { root.join("reviewer").join("persona.md") } else { root.join("task.md") };
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).expect("definition parent"); }
+        let tools = tools.map(|tools| format!("tools: [{tools}]\n")).unwrap_or_default();
+        let mut definition = super::super::definitions::parse_agent_definition(
+            &path,
+            &format!("---\nname: test\ndescription: test\n{tools}---\nprompt"),
+            super::super::AgentDefinitionSource::User,
+            true,
+        ).expect("definition");
+        if persona { definition.kind = super::super::definitions::AgentDefinitionKind::Persona; }
+        definition
+    }
+
+    fn parent_snapshot(root: &Path, captured: Arc<Mutex<Vec<String>>>, config: crate::MemoryConfig) -> crate::ChildSessionOptionsSnapshot {
+        let session = Session::new(SessionOptions {
+            model: Model::default(), cwd: root.to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: Some(recording_stream(captured)), auth_resolver: None,
+        }).expect("parent session");
+        let mut snapshot = session.child_session_options_snapshot();
+        snapshot.memory = Some(Arc::new(move || Some(config.clone())));
+        snapshot
+    }
+
+    fn request(definition: AgentDefinition, requested: Option<Vec<String>>) -> ChildSessionRequest {
+        ChildSessionRequest {
+            child_id: "Child".to_owned(), parent_id: "Main".to_owned(), max_tools_per_agent: 32,
+            depth: 1, definition, assignment: "work".to_owned(), system_prompt: String::new(),
+            requested_tool_names: requested, orchestration_tools: Vec::new(), thinking_level: None,
+            model: Model::default(), output_schema: None, schema_mode: None,
+            yield_state: Arc::new(YieldState::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_and_persona_children_inherit_hindsight_for_default_and_explicit_memory_requests() {
+        for (persona, explicit) in [(false, false), (false, true), (true, false), (true, true)] {
+            let root = tempfile::tempdir().expect("root");
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let config = crate::MemoryConfig {
+                backend: crate::MemoryBackend::Hindsight,
+                hindsight_api_url: Some("https://memory.example.test/nondefault".to_owned()),
+                hindsight_bank_id: "nondefault-bank".to_owned(),
+                hindsight_scoping: crate::HindsightScoping::PerProject,
+                ..Default::default()
+            };
+            let factory = OrchestrationRuntime::child_factory_from_snapshot(parent_snapshot(root.path(), captured.clone(), config));
+            let child = factory(request(
+                definition(root.path(), persona, explicit.then_some("memory")),
+                explicit.then(|| vec!["memory".to_owned()]),
+            )).await.expect("child");
+            child.run("work", Vec::new()).await.expect("run child");
+            let tools = captured.lock().clone();
+            assert!(!tools.iter().any(|name| name == "memory"), "{tools:?}");
+            for name in ["recall", "retain", "reflect"] { assert!(tools.iter().any(|tool| tool == name), "{tools:?}"); }
+        }
+    }
+
+    #[tokio::test]
+    async fn child_factory_applies_off_and_local_to_ordinary_and_persona_scopes() {
+        for persona in [false, true] {
+            for backend in [crate::MemoryBackend::Off, crate::MemoryBackend::Local] {
+                let root = tempfile::tempdir().expect("root");
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let factory = OrchestrationRuntime::child_factory_from_snapshot(parent_snapshot(root.path(), captured.clone(), crate::MemoryConfig { backend, ..Default::default() }));
+                let child = factory(request(definition(root.path(), persona, None), None)).await.expect("child");
+                child.run("work", Vec::new()).await.expect("run child");
+                let tools = captured.lock().clone();
+                if backend == crate::MemoryBackend::Off {
+                    assert!(!tools.iter().any(|name| matches!(name.as_str(), "memory" | "recall" | "retain" | "reflect")), "{tools:?}");
+                } else {
+                    assert!(tools.iter().any(|name| name == "memory"), "{tools:?}");
+                    assert!(!tools.iter().any(|name| matches!(name.as_str(), "recall" | "retain" | "reflect")), "{tools:?}");
+                }
+            }
+        }
     }
 }

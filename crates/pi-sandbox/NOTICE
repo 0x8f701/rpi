@@ -1,0 +1,8 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+The sandbox policy, bubblewrap planning, discovery/probing, and seccomp primitives
+in this crate are adapted from OpenAI Codex at commit
+646f7c0a91b8e327d263335da68ae8ef212895ce under the Apache License 2.0. They
+were modified to remove Codex workspace dependencies, helper binary packaging,
+command execution, and runtime policy selection. No bubblewrap C source is included.

@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use pi_coding::Application;
@@ -29,30 +29,60 @@ use tokio_tungstenite::{
 };
 
 use crate::extension_ui::ExtensionUiAdapter;
+use super::collab_service::{CollabService, capability_from_protocols};
 
-use super::rpc::{
-    MAX_RPC_MESSAGE_BYTES, RpcDispatcher, RpcInput, RpcResponse, parse_input,
-    project_application_event, project_extension_ui_event,
+use super::rpc::{MAX_CONCURRENT_COMMANDS, MAX_RPC_MESSAGE_BYTES, RpcInput, RpcResponse, parse_input};
+use super::session_runtime_manager::SessionRuntimeManager;
+pub use super::session_runtime_manager::{
+    MAX_CONCURRENT_SESSION_COMMANDS, MAX_LOADED_SESSIONS, SessionSpawner,
 };
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
-pub const MAX_CONNECTION_TASKS: usize = 64;
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTENT_TYPE_JSON: &str = "application/json";
 const REMOTE_EXTENSION_UI_ERROR: &str = "remote interactive extension UI is disabled";
 
+// Transport auth policy shared with the ACP WebSocket server (`ws_auth`);
+// `MAX_CONNECTION_TASKS` stays publicly reachable through this module.
+pub use super::ws_auth::MAX_CONNECTION_TASKS;
+use super::ws_auth::{
+    ListenAddressPolicy, authorized, constant_work_eq, load_auth_token, read_token_file,
+    websocket_subprotocol,
+};
+
+/// Web client assets (vite build output) embedded into the binary by
+/// build.rs from `crates/pi-cli/web/dist/`. The page carries no data itself:
+/// every command and event flows through the token-gated `/rpc` and `/ws`
+/// routes, so the page is served without authentication and everything else
+/// keeps the existing auth policy.
+///
+/// Development override: `RPI_WEB_DEV_DIR` points at a directory containing a
+/// built `index.html` (e.g. `crates/pi-cli/web/dist`) served instead of the
+/// embedded copy, so frontend iteration does not require rebuilding the
+/// binary. `vite dev` is the primary dev loop and needs no override.
+const RPI_WEB_DEV_DIR: &str = "RPI_WEB_DEV_DIR";
+
 #[derive(Clone)]
 pub struct ListenConfig {
     pub address: SocketAddr,
     pub token_file: Option<PathBuf>,
+    /// Permit a non-loopback plaintext bind only when `token_file` is valid.
+    pub allow_insecure_remote: bool,
+    /// Factory that builds manager-owned session runtimes for the Web
+    /// control plane (switch_session / new_session / fork / clone). `None`
+    /// disables lifecycle opens with a clear error; tests inject a faux
+    /// factory.
+    pub session_factory: Option<std::sync::Arc<dyn SessionSpawner>>,
 }
 
 pub struct ListenHandle {
     address: SocketAddr,
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<()>>,
+    manager: std::sync::Arc<SessionRuntimeManager>,
+    collab: CollabService,
 }
 
 impl ListenHandle {
@@ -60,6 +90,15 @@ impl ListenHandle {
     pub fn local_addr(&self) -> SocketAddr {
         self.address
     }
+    #[must_use]
+    pub fn collab_service(&self) -> CollabService {
+        self.collab.clone()
+    }
+    #[must_use]
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
 
     pub async fn stop(self) -> Result<()> {
         let shutdown_result = self
@@ -70,6 +109,10 @@ impl ListenHandle {
             Ok(result) => result.context("running control plane listener"),
             Err(error) => Err(anyhow!(error).context("joining control plane listener")),
         };
+        // Listener shutdown cleans the manager: abort every fan-in forwarder,
+        // then clean manager-owned non-primary runtimes. The primary TUI
+        // Application remains owned by lib.rs.
+        self.manager.shutdown().await;
         match (shutdown_result, task_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(shutdown_error), Ok(())) => Err(shutdown_error),
@@ -83,9 +126,10 @@ impl ListenHandle {
 
 #[derive(Clone)]
 struct ServerState {
-    dispatcher: RpcDispatcher,
-    extension_ui: ExtensionUiAdapter,
+    manager: std::sync::Arc<SessionRuntimeManager>,
+    collab: CollabService,
     token: Option<Arc<[u8]>>,
+    base_url: String,
 }
 
 pub async fn start(
@@ -93,17 +137,30 @@ pub async fn start(
     extension_ui: ExtensionUiAdapter,
     config: ListenConfig,
 ) -> Result<ListenHandle> {
-    let token = load_auth_token(config.address.ip(), config.token_file.as_deref())?;
+    let policy = if config.allow_insecure_remote {
+        ListenAddressPolicy::AllowAuthenticatedPlaintextRemote
+    } else {
+        ListenAddressPolicy::LoopbackOnly
+    };
+    let token = load_auth_token(
+        config.address.ip(),
+        config.token_file.as_deref(),
+        "--listen",
+        policy,
+    )?;
     let listener = TcpListener::bind(config.address)
         .await
         .with_context(|| format!("binding control plane to {}", config.address))?;
     let address = listener
         .local_addr()
         .context("reading control plane listener address")?;
+    let manager = SessionRuntimeManager::new(application, extension_ui, config.session_factory).await;
+    let collab = CollabService::new(manager.clone());
     let state = ServerState {
-        dispatcher: RpcDispatcher::new(application),
-        extension_ui,
+        manager: manager.clone(),
+        collab: collab.clone(),
         token: token.map(Arc::from),
+        base_url: format!("http://{address}"),
     };
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(run_listener(listener, state, shutdown_rx));
@@ -111,6 +168,8 @@ pub async fn start(
         address,
         shutdown,
         task,
+        manager,
+        collab,
     })
 }
 
@@ -125,6 +184,8 @@ async fn run_listener(
             biased;
             changed = shutdown.changed() => {
                 let _ = changed;
+                state.collab.stop_all().await;
+                tokio::task::yield_now().await;
                 break;
             }
             accepted = listener.accept(), if connections.len() < MAX_CONNECTION_TASKS => {
@@ -165,15 +226,54 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<
     };
 
     if is_websocket_upgrade(&raw.headers) {
-        if raw.method != Method::GET || raw.path != "/ws" {
+        if raw.method != Method::GET {
             write_plain_response(&mut stream, StatusCode::NOT_FOUND, "not found").await?;
             return Ok(());
         }
-        if !authorized(&raw.headers, state.token.as_deref()) {
+        if let Some(room_id) = collab_room_id(&raw.path) {
+            let Some((protocol, presented)) = capability_from_protocols(&raw.headers) else {
+                write_plain_response(&mut stream, StatusCode::UNAUTHORIZED, "unauthorized").await?;
+                return Ok(());
+            };
+            let connection = match state.collab.authenticate(room_id, &presented).await {
+                Ok(connection) => connection,
+                Err(_) => {
+                    write_plain_response(&mut stream, StatusCode::UNAUTHORIZED, "unauthorized").await?;
+                    return Ok(());
+                }
+            };
+            return collab_websocket_connection(stream, raw, connection, protocol).await;
+        }
+        if raw.path != "/ws" {
+            write_plain_response(&mut stream, StatusCode::NOT_FOUND, "not found").await?;
+            return Ok(());
+        }
+        let protocol = websocket_subprotocol(&raw.headers, state.token.as_deref());
+        if !authorized(&raw.headers, state.token.as_deref()) && protocol.is_none() {
             write_plain_response(&mut stream, StatusCode::UNAUTHORIZED, "unauthorized").await?;
             return Ok(());
         }
-        return websocket_connection(stream, raw, state).await;
+        return websocket_connection(stream, raw, state, protocol).await;
+    }
+
+    // The static web client page is served without authentication: it carries
+    // no data itself, and every command/event flows through authenticated or
+    // capability-gated WebSockets. A collaboration join link uses the WS path
+    // as its browser document URL; non-upgrade GETs at that exact validated
+    // route receive the same embedded client, which reads the secret fragment
+    // locally before opening the encrypted WebSocket.
+    if raw.method == Method::GET
+        && (raw.path == "/web" || collab_room_id(&raw.path).is_some())
+    {
+        return serve_web_page(&mut stream).await;
+    }
+    // Named web assets (e.g. hashed JS/CSS bundles) from the embedded table.
+    if raw.method == Method::GET && raw.path.starts_with("/assets/") {
+        let Some((mime, bytes)) = crate::web::get(&raw.path) else {
+            write_plain_response(&mut stream, StatusCode::NOT_FOUND, "not found").await?;
+            return Ok(());
+        };
+        return write_response(&mut stream, StatusCode::OK, mime, bytes).await;
     }
 
     if raw.method != Method::POST || raw.path != "/rpc" {
@@ -221,7 +321,9 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<
         }
     };
     let response = match parse_input(&body) {
-        Ok(RpcInput::Command(command)) => state.dispatcher.dispatch(command).await,
+        Ok(RpcInput::Command { command, session_id }) => {
+            dispatch_http_command(&state, command, session_id).await
+        }
         Ok(RpcInput::ExtensionUiResponse(_)) => RpcResponse::failure(
             None,
             "extension_ui_response",
@@ -241,6 +343,52 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<
         StatusCode::BAD_REQUEST
     };
     write_json_response(&mut stream, status, &response).await
+}
+
+async fn dispatch_http_command(
+    state: &ServerState,
+    command: super::rpc::RpcCommand,
+    session_id: Option<String>,
+) -> RpcResponse {
+    let id = command.id();
+    let name = command.command_name();
+    match command {
+        super::rpc::RpcCommand::CollabStart { base_url, .. } => {
+            let base_url = base_url.as_deref().unwrap_or(&state.base_url);
+            match state.collab.start(session_id.as_deref(), base_url).await {
+                Ok(started) => RpcResponse::success(id, name, serde_json::to_value(started).ok()),
+                Err(error) => RpcResponse::failure(id, name, error.to_string()),
+            }
+        }
+        super::rpc::RpcCommand::CollabStatus { room_id, .. } => RpcResponse::success(
+            id,
+            name,
+            Some(serde_json::json!({
+                "rooms": state.collab.status(room_id.as_deref()).await,
+            })),
+        ),
+        super::rpc::RpcCommand::CollabStop { room_id, .. } => {
+            match state.collab.stop(&room_id).await {
+                Ok(room) => RpcResponse::success(
+                    id,
+                    name,
+                    Some(serde_json::json!({"stopped": true, "room": room})),
+                ),
+                Err(error) => RpcResponse::failure(id, name, error.to_string()),
+            }
+        }
+        command => state.manager.dispatch(command, session_id).await,
+    }
+}
+
+fn collab_room_id(path: &str) -> Option<&str> {
+    let room_id = path.strip_prefix("/collab/ws/")?;
+    (!room_id.is_empty()
+        && !room_id.contains('/')
+        && room_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+    .then_some(room_id)
 }
 
 struct RawRequest {
@@ -482,9 +630,154 @@ enum WriterControl {
 // Subscribe before accepting the WebSocket upgrade. Once the client observes
 // a successful handshake, every subsequent application/UI event must have an
 // active receiver rather than racing the server's post-handshake setup.
-async fn websocket_connection(stream: TcpStream, raw: RawRequest, state: ServerState) -> Result<()> {
-    let mut events = state.dispatcher.application().subscribe();
-    let mut ui_events = state.extension_ui.subscribe_non_interactive();
+async fn collab_websocket_connection(
+    stream: TcpStream,
+    raw: RawRequest,
+    mut connection: super::collab_service::CollabConnection,
+    protocol: String,
+) -> Result<()> {
+    let path = raw.path.clone();
+    let mut prefix = raw.raw_headers;
+    prefix.extend_from_slice(&raw.remainder);
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(pi_coding::collab::MAX_FRAME_BYTES))
+        .max_frame_size(Some(pi_coding::collab::MAX_FRAME_BYTES))
+        .max_write_buffer_size(2 * pi_coding::collab::MAX_FRAME_BYTES);
+    let websocket = accept_hdr_async_with_config(
+        PrefixedStream {
+            prefix,
+            offset: 0,
+            stream,
+        },
+        move |request: &Request, mut response: Response| -> std::result::Result<Response, ErrorResponse> {
+            if request.uri().path() != path {
+                let mut error = ErrorResponse::new(Some("not found".into()));
+                *error.status_mut() = StatusCode::NOT_FOUND;
+                return Err(error);
+            }
+            response.headers_mut().insert(
+                http::header::SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_str(&protocol).map_err(|_| {
+                    let mut error = ErrorResponse::new(Some("invalid subprotocol".into()));
+                    *error.status_mut() = StatusCode::BAD_REQUEST;
+                    error
+                })?,
+            );
+            Ok(response)
+        },
+        Some(config),
+    )
+    .await
+    .context("upgrading collaboration WebSocket")?;
+
+    let (mut write, mut read) = websocket.split();
+    if *connection.stopped.borrow() {
+        let _ = write.send(Message::Close(Some(collab_stopped_close_frame()))).await;
+        return Ok(());
+    }
+    let hello = serde_json::to_string(&connection.hello())
+        .context("serializing collaboration hello")?;
+    write
+        .send(Message::Text(hello.into()))
+        .await
+        .context("sending collaboration hello")?;
+    if *connection.stopped.borrow() {
+        let _ = write.send(Message::Close(Some(collab_stopped_close_frame()))).await;
+        return Ok(());
+    }
+    write
+        .send(Message::Binary(connection.snapshot_frame()?.into()))
+        .await
+        .context("sending collaboration snapshot")?;
+
+    loop {
+        tokio::select! {
+            biased;
+            changed = connection.stopped.changed() => {
+                if changed.is_err() || *connection.stopped.borrow() {
+                    let _ = write.send(Message::Close(Some(collab_stopped_close_frame()))).await;
+                    return Ok(());
+                }
+            }
+            event = connection.events.recv() => match event {
+                Ok(event) if connection.event_matches_room(&event) => {
+                    let frame = connection.event_frame(&event)?;
+                    write.send(Message::Binary(frame.into())).await
+                        .context("sending collaboration event")?;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = write.send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Policy,
+                        reason: "collaboration event stream lagged".into(),
+                    }))).await;
+                    return Ok(());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+            incoming = read.next() => match incoming {
+                Some(Ok(Message::Binary(frame))) => {
+                    let pending = match connection.prepare_client_frame(&frame) {
+                        Ok(pending) => pending,
+                        Err(_) => {
+                            let _ = write.send(Message::Close(Some(CloseFrame {
+                                code: CloseCode::Policy,
+                                reason: "invalid collaboration frame".into(),
+                            }))).await;
+                            return Ok(());
+                        }
+                    };
+                    let response = pending.execute().await;
+                    let frame = connection.response_frame(response)?;
+                    write.send(Message::Binary(frame.into())).await
+                        .context("sending collaboration response")?;
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    write.send(Message::Pong(payload)).await
+                        .context("sending collaboration pong")?;
+                }
+                Some(Ok(Message::Close(_))) | None => return Ok(()),
+                Some(Ok(Message::Text(_) | Message::Pong(_) | Message::Frame(_))) => {
+                    let _ = write.send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Unsupported,
+                        reason: "encrypted binary messages required".into(),
+                    }))).await;
+                    return Ok(());
+                }
+                Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(_))) => {
+                    let _ = write.send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Size,
+                        reason: "message too large".into(),
+                    }))).await;
+                    return Ok(());
+                }
+                Some(Err(_)) => return Ok(()),
+            }
+        }
+    }
+}
+fn collab_stopped_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Away,
+        reason: "collaboration room stopped".into(),
+    }
+}
+
+
+async fn websocket_connection(
+    stream: TcpStream,
+    raw: RawRequest,
+    state: ServerState,
+    protocol: Option<String>,
+) -> Result<()> {
+    // Fan-in: the manager merges every session runtime's projected events
+    // (tagged with the owning top-level `sessionId`); every connection sees
+    // every session's events, and commands route explicitly by sessionId.
+    let mut events = state.manager.events();
+    // Extension UI events likewise fan in through the manager; host/TUI-owned
+    // interactions were already filtered by the runtime forwarders, and
+    // remote answering stays rejected below.
+    let mut ui_events = state.manager.ui_events();
     let mut prefix = raw.raw_headers;
     prefix.extend_from_slice(&raw.remainder);
     let config = WebSocketConfig::default()
@@ -497,14 +790,26 @@ async fn websocket_connection(stream: TcpStream, raw: RawRequest, state: ServerS
             offset: 0,
             stream,
         },
-        |request: &Request, response: Response| -> std::result::Result<Response, ErrorResponse> {
-            if request.uri().path() == "/ws" {
-                Ok(response)
-            } else {
+        |request: &Request, mut response: Response| -> std::result::Result<Response, ErrorResponse> {
+            if request.uri().path() != "/ws" {
                 let mut error = ErrorResponse::new(Some("not found".into()));
                 *error.status_mut() = StatusCode::NOT_FOUND;
-                Err(error)
+                return Err(error);
             }
+            // RFC 6455: the server must select at most one offered subprotocol
+            // and echo it, otherwise browsers abort the handshake. Only echo a
+            // protocol that already passed the auth check above.
+            if let Some(protocol) = protocol.as_deref() {
+                response.headers_mut().insert(
+                    http::header::SEC_WEBSOCKET_PROTOCOL,
+                    HeaderValue::from_str(protocol).map_err(|_| {
+                        let mut error = ErrorResponse::new(Some("invalid subprotocol".into()));
+                        *error.status_mut() = StatusCode::BAD_REQUEST;
+                        error
+                    })?,
+                );
+            }
+            Ok(response)
         },
         Some(config),
     )
@@ -513,6 +818,11 @@ async fn websocket_connection(stream: TcpStream, raw: RawRequest, state: ServerS
 
     let (mut websocket_write, mut websocket_read) = websocket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
+    // Non-inline commands run on a per-connection task set so a long command
+    // never blocks the read/event select below. The set is bounded at
+    // MAX_CONCURRENT_COMMANDS (mirroring the stdio RPC session); dropping it
+    // on disconnect aborts whatever is still pending.
+    let mut commands = JoinSet::new();
     let (writer_control_tx, mut writer_control_rx) = mpsc::channel::<WriterControl>(1);
     let mut writer = AbortTask::new(tokio::spawn(async move {
         loop {
@@ -563,7 +873,7 @@ async fn websocket_connection(stream: TcpStream, raw: RawRequest, state: ServerS
             }
             event = events.recv() => match event {
                 Ok(event) => {
-                    if enqueue_json(&outbound_tx, &project_application_event(event)?).is_err() {
+                    if enqueue_json(&outbound_tx, &event).is_err() {
                         break WebSocketExit::SlowClient;
                     }
                 }
@@ -578,9 +888,10 @@ async fn websocket_connection(stream: TcpStream, raw: RawRequest, state: ServerS
             },
             event = ui_events.recv() => match event {
                 Ok(event) => {
-                    if let Some(request) = project_extension_ui_event(event)?
-                        && enqueue_json(&outbound_tx, &request).is_err()
-                    {
+                    // Extension-owned interactions project as read-only
+                    // notice cards ("answer in the terminal"); host/TUI-owned
+                    // interactions were filtered by the runtime forwarders.
+                    if enqueue_json(&outbound_tx, &event).is_err() {
                         break WebSocketExit::SlowClient;
                     }
                 }
@@ -593,15 +904,68 @@ async fn websocket_connection(stream: TcpStream, raw: RawRequest, state: ServerS
                     break WebSocketExit::Graceful(None);
                 }
             },
+            completed = commands.join_next(), if !commands.is_empty() => match completed {
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(_))) => {
+                    // A spawned command could not enqueue its response: the
+                    // client stopped reading (outbound queue full) or the
+                    // writer stopped. Tear the connection down like any
+                    // other outbound failure.
+                    break WebSocketExit::SlowClient;
+                }
+                Some(Err(error)) => {
+                    return Err(anyhow!(error).context("joining control plane WebSocket command task"));
+                }
+                None => {}
+            },
             incoming = websocket_read.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
-                    let response = match parse_input(text.as_bytes()) {
-                        Ok(RpcInput::Command(command)) => state.dispatcher.dispatch(command).await,
-                        Ok(RpcInput::ExtensionUiResponse(_)) => RpcResponse::failure(None, "extension_ui_response", REMOTE_EXTENSION_UI_ERROR),
-                        Err(response) => response,
-                    };
-                    if enqueue_json(&outbound_tx, &response).is_err() {
-                        break WebSocketExit::SlowClient;
+                    match parse_input(text.as_bytes()) {
+                        Ok(RpcInput::Command { command, session_id }) if command.is_collab_lifecycle() => {
+                            let response = dispatch_http_command(&state, command, session_id).await;
+                            if enqueue_json(&outbound_tx, &response).is_err() {
+                                break WebSocketExit::SlowClient;
+                            }
+                        }
+                        Ok(RpcInput::Command { command, session_id }) if command.runs_inline() => {
+                            let response = state.manager.dispatch_inner(command, session_id).await;
+                            if enqueue_json(&outbound_tx, &response).is_err() {
+                                break WebSocketExit::SlowClient;
+                            }
+                        }
+                        Ok(RpcInput::Command { command, session_id }) if commands.len() >= MAX_CONCURRENT_COMMANDS => {
+                            let response = RpcResponse::failure(
+                                command.id(),
+                                command.command_name(),
+                                format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
+                            );
+                            if enqueue_json(&outbound_tx, &response).is_err() {
+                                break WebSocketExit::SlowClient;
+                            }
+                        }
+                        Ok(RpcInput::Command { command, session_id }) => {
+                            let manager = state.manager.clone();
+                            let outbound_tx = outbound_tx.clone();
+                            commands.spawn(async move {
+                                let response = manager.dispatch_spawned(command, session_id).await;
+                                enqueue_json(&outbound_tx, &response)
+                            });
+                        }
+                        Ok(RpcInput::ExtensionUiResponse(_)) => {
+                            if enqueue_json(
+                                &outbound_tx,
+                                &RpcResponse::failure(None, "extension_ui_response", REMOTE_EXTENSION_UI_ERROR),
+                            )
+                            .is_err()
+                            {
+                                break WebSocketExit::SlowClient;
+                            }
+                        }
+                        Err(response) => {
+                            if enqueue_json(&outbound_tx, &response).is_err() {
+                                break WebSocketExit::SlowClient;
+                            }
+                        }
                     }
                 }
                 Some(Ok(Message::Binary(_))) => {
@@ -733,68 +1097,17 @@ fn content_length(headers: &HeaderMap) -> Option<usize> {
     Some(first)
 }
 
-fn authorized(headers: &HeaderMap, token: Option<&[u8]>) -> bool {
-    let Some(token) = token else {
-        // Loopback is a network boundary, not a browser-origin boundary.
-        // Native clients omit Origin; browser HTTP/WebSocket clients send it.
-        return !headers.contains_key(http::header::ORIGIN);
-    };
-    let Some(value) = headers.get(http::header::AUTHORIZATION) else {
-        return false;
-    };
-    let Some(value) = value.as_bytes().strip_prefix(b"Bearer ") else {
-        return false;
-    };
-    !value.is_empty()
-        && !value.iter().any(|byte| byte.is_ascii_whitespace())
-        && constant_work_eq(value, token)
-}
-
-fn constant_work_eq(candidate: &[u8], expected: &[u8]) -> bool {
-    let mut different = candidate.len() ^ expected.len();
-    let length = candidate.len().max(expected.len());
-    for index in 0..length {
-        let left = candidate.get(index).copied().unwrap_or(0);
-        let right = expected.get(index).copied().unwrap_or(0);
-        different |= usize::from(left ^ right);
+async fn serve_web_page(stream: &mut TcpStream) -> Result<()> {
+    if let Ok(dir) = std::env::var(RPI_WEB_DEV_DIR)
+        && !dir.trim().is_empty()
+    {
+        let path = Path::new(dir.trim()).join("index.html");
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            return write_response(stream, StatusCode::OK, "text/html; charset=utf-8", &bytes).await;
+        }
     }
-    different == 0
-}
-
-fn load_auth_token(address: IpAddr, path: Option<&Path>) -> Result<Option<Vec<u8>>> {
-    if !address.is_loopback() && path.is_none() {
-        bail!("--listen on a non-loopback address requires --listen-token-file");
-    }
-    path.map(read_token_file).transpose()
-}
-
-fn read_token_file(path: &Path) -> Result<Vec<u8>> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("reading control plane token file metadata {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!("control plane token path must be a regular file");
-    }
-    if metadata.len() > 4096 {
-        bail!("control plane token file exceeds 4096 bytes");
-    }
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading control plane token file {}", path.display()))?;
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-    let token = bytes[start..end].to_vec();
-    if token.is_empty() {
-        bail!("control plane token file must not be empty");
-    }
-    if token.iter().any(|byte| byte.is_ascii_whitespace()) {
-        bail!("control plane token must not contain whitespace");
-    }
-    Ok(token)
+    let (mime, bytes) = crate::web::index().context("embedded web client assets are missing")?;
+    write_response(stream, StatusCode::OK, mime, bytes).await
 }
 
 async fn write_plain_response(
@@ -837,6 +1150,112 @@ async fn write_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+    use tokio::sync::broadcast;
+    use tokio_tungstenite::{
+        MaybeTlsStream, WebSocketStream,
+        tungstenite::client::IntoClientRequest,
+    };
+
+    use super::super::{
+        collab_service::{CollabConnection, CollabRuntime},
+        rpc::RpcCommand,
+    };
+
+    struct CollabTestRuntime {
+        events: broadcast::Sender<Value>,
+    }
+
+    impl CollabTestRuntime {
+        fn new() -> Arc<Self> {
+            let (events, _) = broadcast::channel(8);
+            Arc::new(Self { events })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CollabRuntime for CollabTestRuntime {
+        fn events(&self) -> broadcast::Receiver<Value> {
+            self.events.subscribe()
+        }
+
+        async fn snapshot(
+            &self,
+            _session_id: Option<&str>,
+            _max_entries: usize,
+            _max_bytes: usize,
+        ) -> Result<(String, Value)> {
+            Ok((
+                "session-1".to_owned(),
+                json!({"sessionId":"session-1","truncated":false,"entries":[]}),
+            ))
+        }
+
+        async fn dispatch(&self, command: RpcCommand, _session_id: String) -> RpcResponse {
+            RpcResponse::success(None, command.command_name(), None)
+        }
+    }
+
+    async fn open_collab_socket(
+        connection: CollabConnection,
+    ) -> (
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        JoinHandle<Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let protocol = "rpi-collab.test";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept connection");
+            let raw = read_http_request(&mut stream).await.expect("read upgrade request");
+            collab_websocket_connection(stream, raw, connection, protocol.to_owned()).await
+        });
+        let mut request = format!("ws://{address}/collab/ws/test-room")
+            .into_client_request()
+            .expect("client request");
+        request.headers_mut().insert(
+            http::header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static(protocol),
+        );
+        let (socket, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("connect WebSocket");
+        (socket, server)
+    }
+
+    async fn test_collab_connection() -> (CollabService, String, CollabConnection) {
+        let service = CollabService::with_runtime(CollabTestRuntime::new());
+        let started = service
+            .start(None, "http://127.0.0.1:4321")
+            .await
+            .expect("start room");
+        let parsed = pi_coding::collab::parse_link(&started.view_link).expect("parse view link");
+        let capability = pi_coding::collab::capability(&parsed.secret.key);
+        let connection = service
+            .authenticate(&started.room_id, &capability)
+            .await
+            .expect("authenticate");
+        (service, started.room_id, connection)
+    }
+
+    async fn next_collab_message(
+        socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) -> Message {
+        tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("WebSocket message timeout")
+            .expect("WebSocket closed without a message")
+            .expect("read WebSocket message")
+    }
+
+    fn assert_away_close(message: Message) {
+        let Message::Close(Some(frame)) = message else {
+            panic!("expected Away close, received {message:?}");
+        };
+        assert_eq!(frame.code, CloseCode::Away);
+        assert_eq!(frame.reason, "collaboration room stopped");
+    }
+
 
     fn headers(input: &[u8]) -> std::result::Result<RawRequest, RequestError> {
         let end = find_header_end(input).expect("header terminator");
@@ -844,14 +1263,59 @@ mod tests {
     }
 
     #[test]
-    fn auth_policy_requires_token_for_non_loopback_and_honors_loopback_token() {
-        assert!(load_auth_token("127.0.0.1".parse().unwrap(), None)
-            .unwrap()
-            .is_none());
-        assert!(load_auth_token("::1".parse().unwrap(), None)
-            .unwrap()
-            .is_none());
-        assert!(load_auth_token("0.0.0.0".parse().unwrap(), None).is_err());
+    fn auth_policy_keeps_default_strict_and_allows_authenticated_remote_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token-file");
+        std::fs::write(&token, b"fixture-value").unwrap();
+        for address in ["127.0.0.1", "::1"] {
+            let address = address.parse().unwrap();
+            assert!(
+                load_auth_token(address, None, "--listen", ListenAddressPolicy::LoopbackOnly)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                load_auth_token(
+                    address,
+                    Some(&token),
+                    "--listen",
+                    ListenAddressPolicy::LoopbackOnly,
+                )
+                .unwrap(),
+                Some(b"fixture-value".to_vec())
+            );
+        }
+        for address in ["0.0.0.0", "::", "198.51.100.7", "8.8.8.8"] {
+            let address = address.parse().unwrap();
+            assert!(
+                load_auth_token(
+                    address,
+                    Some(&token),
+                    "--listen",
+                    ListenAddressPolicy::LoopbackOnly,
+                )
+                .is_err()
+            );
+            assert!(
+                load_auth_token(
+                    address,
+                    None,
+                    "--listen",
+                    ListenAddressPolicy::AllowAuthenticatedPlaintextRemote,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                load_auth_token(
+                    address,
+                    Some(&token),
+                    "--listen",
+                    ListenAddressPolicy::AllowAuthenticatedPlaintextRemote,
+                )
+                .unwrap(),
+                Some(b"fixture-value".to_vec())
+            );
+        }
     }
 
     #[test]
@@ -913,5 +1377,120 @@ mod tests {
         assert!(authorized(&headers, None));
         headers.insert(http::header::ORIGIN, HeaderValue::from_static("https://example.test"));
         assert!(!authorized(&headers, None));
+    }
+
+    fn protocol_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_str(value).expect("header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn ws_subprotocol_accepts_exact_token_and_echoes_spelling() {
+        let headers = protocol_headers("rpi-auth.secret");
+        assert_eq!(
+            websocket_subprotocol(&headers, Some(b"secret")).as_deref(),
+            Some("rpi-auth.secret")
+        );
+        // The exact offered spelling is preserved so the server echoes it.
+        let headers = protocol_headers("rpi-auth.secret, something-else");
+        assert_eq!(
+            websocket_subprotocol(&headers, Some(b"secret")).as_deref(),
+            Some("rpi-auth.secret")
+        );
+        let headers = protocol_headers("chat, rpi-auth.secret");
+        assert_eq!(
+            websocket_subprotocol(&headers, Some(b"secret")).as_deref(),
+            Some("rpi-auth.secret")
+        );
+    }
+
+    #[test]
+    fn ws_subprotocol_rejects_wrong_empty_and_missing_token() {
+        assert_eq!(
+            websocket_subprotocol(&protocol_headers("rpi-auth.wrong"), Some(b"secret")),
+            None,
+            "wrong token must not authenticate"
+        );
+        assert_eq!(
+            websocket_subprotocol(&protocol_headers("rpi-auth."), Some(b"secret")),
+            None,
+            "empty candidate must not authenticate"
+        );
+        assert_eq!(
+            websocket_subprotocol(&protocol_headers("rpi-auth.sec ret"), Some(b"secret")),
+            None,
+            "whitespace candidate must not authenticate"
+        );
+        assert_eq!(
+            websocket_subprotocol(&protocol_headers("rpi-auth.secret"), None),
+            None,
+            "no configured token must not grant subprotocol auth"
+        );
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            websocket_subprotocol(&headers, Some(b"secret")),
+            None,
+            "missing header must not authenticate"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("not-an-auth-protocol"),
+        );
+        assert_eq!(
+            websocket_subprotocol(&headers, Some(b"secret")),
+            None,
+            "unrelated subprotocol must not authenticate"
+        );
+    }
+
+    #[test]
+    fn ws_subprotocol_is_constant_time_and_case_sensitive() {
+        assert_eq!(
+            websocket_subprotocol(&protocol_headers("rpi-auth.Secret"), Some(b"secret")),
+            None,
+            "token compare must be case-sensitive"
+        );
+        assert_eq!(
+            websocket_subprotocol(&protocol_headers("rpi-auth.secret-long"), Some(b"secret")),
+            None,
+            "prefix match on a longer token must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_stopped_collaboration_connection_closes_before_hello_or_snapshot() {
+        let (service, room_id, connection) = test_collab_connection().await;
+        service.stop(&room_id).await.expect("stop room");
+
+        let (mut socket, server) = open_collab_socket(connection).await;
+
+        assert_away_close(next_collab_message(&mut socket).await);
+        server.await.expect("server task").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn established_collaboration_connection_closes_away_on_future_stop() {
+        let (service, room_id, connection) = test_collab_connection().await;
+        let (mut socket, server) = open_collab_socket(connection).await;
+
+        assert!(matches!(next_collab_message(&mut socket).await, Message::Text(_)));
+        assert!(matches!(next_collab_message(&mut socket).await, Message::Binary(_)));
+        service.stop(&room_id).await.expect("stop room");
+        assert_away_close(next_collab_message(&mut socket).await);
+        server.await.expect("server task").expect("server result");
+    }
+
+    #[test]
+    fn collaboration_browser_path_accepts_only_valid_room_ids() {
+        assert_eq!(collab_room_id("/collab/ws/room-123_abc"), Some("room-123_abc"));
+        assert_eq!(collab_room_id("/collab/ws/"), None);
+        assert_eq!(collab_room_id("/collab/ws/room/child"), None);
+        assert_eq!(collab_room_id("/collab/ws/room?secret=x"), None);
+        assert_eq!(collab_room_id("/collab/ws/room%23fragment"), None);
     }
 }

@@ -3,6 +3,7 @@ set -eu
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 INSTALLER="$REPO_ROOT/install.sh"
+POWERSHELL_INSTALLER="$REPO_ROOT/install.ps1"
 ROOT="$(mktemp -d)"
 trap 'rm -rf "$ROOT"' EXIT HUP INT TERM
 FIXTURES="$ROOT/fixtures"
@@ -17,9 +18,20 @@ printf 'license\n' > "$FIXTURES/archive/LICENSE"
 ASSET='rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz'
 tar -C "$FIXTURES/archive" -czf "$FIXTURES/$ASSET" .
 (cd "$FIXTURES" && sha256sum "$ASSET" > SHA256SUMS)
+WRONG_FIXTURES="$ROOT/wrong-fixtures"
+mkdir -p "$WRONG_FIXTURES/archive"
+cat > "$WRONG_FIXTURES/archive/rpi" <<'EOF'
+#!/bin/sh
+printf 'pi 0.1.0\n'
+EOF
+chmod 0755 "$WRONG_FIXTURES/archive/rpi"
+printf 'license\n' > "$WRONG_FIXTURES/archive/LICENSE"
+tar -C "$WRONG_FIXTURES/archive" -czf "$WRONG_FIXTURES/$ASSET" .
+(cd "$WRONG_FIXTURES" && sha256sum "$ASSET" > SHA256SUMS)
 cat > "$FIXTURES/release.json" <<EOF
 {"tag_name":"v0.1.0","assets":[{"browser_download_url":"https://example.test/$ASSET"},{"browser_download_url":"https://example.test/SHA256SUMS"}]}
 EOF
+cp "$FIXTURES/release.json" "$WRONG_FIXTURES/release.json"
 cat > "$MOCK_BIN/uname" <<'EOF'
 #!/bin/sh
 case "${1:-}" in
@@ -76,6 +88,19 @@ run_install "$MANAGED" "$ROOT/home-managed"
 UNMANAGED="$ROOT/unmanaged"; mkdir -p "$UNMANAGED/bin"
 printf '#!/bin/sh\nprintf "user pi\\n"\n' > "$UNMANAGED/bin/pi"; chmod 0755 "$UNMANAGED/bin/pi"
 run_install "$UNMANAGED" "$ROOT/home-unmanaged"; [ -f "$UNMANAGED/bin/pi" ]
+MISMATCH="$ROOT/mismatch"
+run_install "$MISMATCH" "$ROOT/home-mismatch"
+MISMATCH_TARGET="$(readlink "$MISMATCH/bin/rpi")"
+cp "$MISMATCH/update-state.json" "$ROOT/mismatch-state.before"
+set -- "$MISMATCH"/downloads/*
+MISMATCH_DOWNLOAD_COUNT="$#"
+if TEST_FIXTURES="$WRONG_FIXTURES" HOME="$ROOT/home-mismatch" PI_HOME="$MISMATCH" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/mismatch.out" 2>&1; then exit 1; fi
+grep -Fq "downloaded binary reported unexpected identity/version (expected 'rpi 0.1.0'); existing install left untouched" "$ROOT/mismatch.out"
+[ "$(readlink "$MISMATCH/bin/rpi")" = "$MISMATCH_TARGET" ]
+[ "$("$MISMATCH/bin/rpi" --version)" = 'rpi 0.1.0' ]
+cmp "$ROOT/mismatch-state.before" "$MISMATCH/update-state.json"
+set -- "$MISMATCH"/downloads/*
+[ "$#" -eq "$MISMATCH_DOWNLOAD_COUNT" ]
 NEW_DIGEST="$(awk '{print $1}' "$FIXTURES/SHA256SUMS")"
 NEW_BINARY="rpi-0.1.0-linux-x86_64-sha256-$NEW_DIGEST"
 DEST_DIR="$ROOT/dest-directory"; mkdir -p "$DEST_DIR/downloads/$NEW_BINARY" "$ROOT/home-dest-directory"
@@ -98,4 +123,17 @@ CONTENDED="$ROOT/contended"; mkdir -p "$CONTENDED"; printf '%s\n' "$$" > "$CONTE
 if TEST_FIXTURES="$FIXTURES" HOME="$ROOT/home-contended" PI_HOME="$CONTENDED" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/contended.out" 2>&1; then exit 1; fi
 grep -Fq 'timed out after 30s waiting for another rpi install' "$ROOT/contended.out"
 [ ! -e "$CONTENDED/bin/rpi" ] && [ ! -L "$CONTENDED/bin/rpi" ]; [ "$("$UNMANAGED/bin/pi")" = 'user pi' ]
-printf 'install.sh focused behavior tests passed\n'
+if command -v pwsh >/dev/null 2>&1; then
+  pwsh -NoProfile -Command '$errors = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $args[0]), [ref]$null, [ref]$errors) | Out-Null; if ($errors.Count -ne 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }' "$POWERSHELL_INSTALLER"
+fi
+grep -Fq 'function Get-CandidateIdentityFailure([string]$Path, [string]$ExpectedVersion)' "$POWERSHELL_INSTALLER"
+grep -Fq '$CandidateOutput.Count -ne 1 -or [string]$CandidateOutput[0] -cne "rpi $ExpectedVersion"' "$POWERSHELL_INSTALLER"
+PRE_SMOKE_LINE="$(grep -n 'Get-CandidateIdentityFailure $Binary.FullName $ResolvedVersion' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
+STAGED_SMOKE_LINE="$(grep -n 'Get-CandidateIdentityFailure $Staged $ResolvedVersion' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
+ACTIVATION_LINE="$(grep -n '\[PiInstall.Native\]::MoveFileEx($Staged, $Dest' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
+STATE_COMMIT_LINE="$(grep -n 'Move-Item -LiteralPath $StateTmp -Destination $StatePath' "$POWERSHELL_INSTALLER" | cut -d: -f1)"
+[ -n "$PRE_SMOKE_LINE" ] && [ -n "$STAGED_SMOKE_LINE" ] && [ -n "$ACTIVATION_LINE" ] && [ -n "$STATE_COMMIT_LINE" ]
+[ "$PRE_SMOKE_LINE" -lt "$ACTIVATION_LINE" ]
+[ "$STAGED_SMOKE_LINE" -lt "$ACTIVATION_LINE" ]
+[ "$PRE_SMOKE_LINE" -lt "$STATE_COMMIT_LINE" ]
+printf 'install.sh focused behavior tests passed (10 install attempts, 1 identity mismatch rejection, 4 PowerShell identity contracts)\n'

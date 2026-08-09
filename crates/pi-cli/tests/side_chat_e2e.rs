@@ -29,7 +29,8 @@ use pi_cli::interactive_commands::{
     BUILTIN_COMMANDS, PRIMARY_COMMAND_NAMES, builtin, executable_catalog,
 };
 use pi_cli::side_chat::{
-    SideChatAction, SideChatAsyncRequest, SideChatController, SideChatRole, SideChatToolMode,
+    MAX_SIDE_CHAT_TABS, SideChatAction, SideChatAsyncRequest, SideChatController, SideChatRole,
+    SideChatTabs, SideChatToolMode,
 };
 use pi_cli::side_chat_panel::render_side_chat_panel;
 use pi_cli::theme;
@@ -392,7 +393,10 @@ fn btw_is_registered_primary_slash_command() {
         "btw description should mention side chat: {}",
         btw.description
     );
-    assert_eq!(btw.argument_hint, Some("[prompt]"));
+    assert_eq!(
+        btw.argument_hint.as_deref(),
+        Some("[prompt | new <name> | list | close [<name>]]")
+    );
     assert!(!btw.requires_arguments);
 }
 
@@ -1336,6 +1340,7 @@ async fn edit_mode_excludes_main_control_tools_and_write_stays_in_workspace() {
                 depends_on: Vec::new(),
                 ready: true,
                 blocked_by: Vec::new(),
+                agent: None,
             }],
         }])
         .expect("seed main todos");
@@ -1383,13 +1388,30 @@ async fn edit_mode_excludes_main_control_tools_and_write_stays_in_workspace() {
         },
         {
             let mut expected = vec![
+                "ask".to_owned(),
+                "ast_edit".to_owned(),
+                "ast_grep".to_owned(),
                 "bash".to_owned(),
+                "browser".to_owned(),
+                "debug".to_owned(),
                 "edit".to_owned(),
+                "eval".to_owned(),
                 "find".to_owned(),
+                "generate_image".to_owned(),
+                "github".to_owned(),
                 "glob".to_owned(),
                 "grep".to_owned(),
+                "inspect_image".to_owned(),
                 "ls".to_owned(),
+                "lsp".to_owned(),
+                "mcp".to_owned(),
+                "memory".to_owned(),
+                "notebook".to_owned(),
                 "read".to_owned(),
+                "recall".to_owned(),
+                "reflect".to_owned(),
+                "retain".to_owned(),
+                "web_search".to_owned(),
                 "write".to_owned(),
             ];
             expected.sort();
@@ -1776,49 +1798,67 @@ async fn side_fork_refreshes_auth_and_keeps_independent_provider_session() {
     side.shutdown().await;
 }
 
-/// Public controller stream path: a turn with two tool calls plus trailing
-/// ToolResult echoes must finalize exactly one row per tool_call_id even when
-/// completions arrive out of order. Causal B-before-A is test-controlled: A
-/// blocks on a FIFO it creates; B prints and exits without releasing A; the
-/// wait predicate opens the FIFO only after observing finalized B.
+/// Public controller stream path: a turn with two non-bash tool calls plus
+/// trailing ToolResult echoes must finalize exactly one row per tool_call_id
+/// even when completions arrive out of order. Causal B-before-A is
+/// test-controlled and deterministic via a kernel-blocking loopback TCP gate
+/// (not an ordering sleep): call-a (eval python) connects to a listener the
+/// test binds before the turn, then blocks on `recv(1)` until the test writes
+/// a release byte; call-b (read) completes immediately. Bash is intentionally
+/// process-wide serialized, so it is not used here — the contract under test
+/// is tool-call ordering/dedup, not bash concurrency. The test first accepts
+/// call-a's connection (proving it entered the barrier), then observes a
+/// finalized call-b row while call-a is still pending, then releases call-a.
+/// The side event channel is unbounded, so accepting without polling cannot
+/// backpressure the agent. The eval per-call timeout safely exceeds the outer
+/// observable wait so host scheduling delays cannot make call-a time out
+/// before the test releases it. Polling uses `yield_now` — a timeout is only a
+/// failure bound, never the ordering mechanism.
 #[tokio::test]
 async fn side_streamed_parallel_tool_calls_dedup_by_tool_call_id() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
     let cwd = TempDir::new().expect("cwd");
     let session_dir = TempDir::new().expect("session dir");
     let session_id = unique("btw-tools");
     let marker_a = "result-a-unique-marker";
     let marker_b = "result-b-unique-marker";
-    // Relative paths under the side workspace cwd (tools run there).
-    let gate = "side-tool-gate.fifo";
-    let ready = "side-tool-gate.ready";
-    let gate_abs = cwd.path().join(gate);
+    // call-b reads this prewritten file; its result carries marker_b.
+    let marker_b_path = "marker-b.txt";
+    fs::write(cwd.path().join(marker_b_path), marker_b).expect("prewrite marker-b");
 
-    // call-a: create FIFO + ready marker, block reading FIFO, then print A.
-    // Release is performed by the test after B is observed — not by B and not
-    // by wall-clock sleep.
+    // Loopback TCP gate: call-a connects and blocks on recv(1) until released.
+    let gate = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind gate");
+    let gate_addr = gate.local_addr().expect("gate local addr");
+    let host = serde_json::to_string("127.0.0.1").expect("host json");
+    let marker = serde_json::to_string(marker_a).expect("marker json");
+    // call-a: eval python — deterministic kernel-blocking barrier. Connects to
+    // the loopback gate (proving it started), blocks on recv(1) until the test
+    // writes a release byte, then prints marker_a. Runs in a python3 subprocess
+    // off the reactor; the eval per-call timeout bounds the wait.
+    let code_a = format!(
+        "import socket\ns = socket.create_connection(({host}, {port}))\ns.recv(1)\nprint({marker})",
+        port = gate_addr.port(),
+    );
     let call_a = ContentBlock::ToolCall(ToolCall {
         id: "call-a".to_owned(),
-        name: "bash".to_owned(),
+        name: "eval".to_owned(),
         arguments: json!({
-            "command": format!(
-                "rm -f '{gate}' '{ready}'; mkfifo '{gate}'; : > '{ready}'; cat '{gate}' >/dev/null; printf '%s' '{marker_a}'"
-            ),
-            "timeout": 5,
+            "language": "python",
+            "code": code_a,
+            "timeout": 30,
         }),
         thought_signature: None,
     });
-    // call-b: bounded-wait for ready/FIFO, print B, exit WITHOUT releasing A.
+    // call-b: read the prewritten marker_b file. Fast, non-blocking, non-bash;
+    // runs concurrently with call-a (different tool, no shared serialization).
     let call_b = ContentBlock::ToolCall(ToolCall {
         id: "call-b".to_owned(),
-        name: "bash".to_owned(),
-        arguments: json!({
-            "command": format!(
-                "for i in $(seq 1 50); do [ -f '{ready}' ] && [ -p '{gate}' ] && break; sleep 0.05; done; \
-[ -f '{ready}' ] && [ -p '{gate}' ] || {{ echo 'gate missing' >&2; exit 1; }}; \
-printf '%s' '{marker_b}'"
-            ),
-            "timeout": 5,
-        }),
+        name: "read".to_owned(),
+        arguments: json!({ "path": marker_b_path }),
         thought_signature: None,
     });
     let stream = scripted_reply_stream(vec![
@@ -1843,81 +1883,91 @@ printf '%s' '{marker_b}'"
     let mut side = SideChatController::fork_from(&application)
         .await
         .expect("fork");
-    // Fresh side-scoped workspace tools (includes bash); never main Session tools.
-    side.toggle_tool_mode().await.expect("edit mode for bash tools");
+    // Edit mode installs create_all_tools (includes eval + read) + peek_main;
+    // never main Session control tools.
+    side.toggle_tool_mode()
+        .await
+        .expect("edit mode for workspace tools");
+    let edit_tools = side.tool_names().await;
     assert!(
-        side.tool_names()
-            .await
-            .iter()
-            .any(|name| name == "bash"),
-        "edit mode must expose side-scoped bash"
+        edit_tools.iter().any(|name| name == "eval"),
+        "edit mode must expose side-scoped eval: {edit_tools:?}"
+    );
+    assert!(
+        edit_tools.iter().any(|name| name == "read"),
+        "edit mode must expose side-scoped read: {edit_tools:?}"
     );
 
     side.submit_prompt("run both gated tools");
-    let mut saw_b_before_a = false;
-    let mut released_a = false;
+
+    // Phase 0: accept call-a's connection — proves it started and is now
+    // blocked on recv(1). The side event channel is unbounded, so accumulated
+    // events cannot backpressure the agent while this awaits.
+    let (mut release_a, _peer) = tokio::time::timeout(Duration::from_secs(15), gate.accept())
+        .await
+        .expect("call-a must connect to the gate within 15s")
+        .expect("accept call-a");
+
+    // Phase 1: drive the runtime until call-b is finalized. yield_now is
+    // cooperative polling — no wall-clock sleep; the timeout is only a failure
+    // bound.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            side.poll_events();
+            if tool_rows(&side)
+                .iter()
+                .any(|row| !row.is_partial && row.text.contains(marker_b))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("call-b did not finalize within 15s");
+    // B-before-A: call-a must still be pending (blocked on recv) when call-b
+    // is finalized — completions arrived out of order.
     assert!(
-        wait_until(
-            || {
-                let _ = side.poll_events();
-                let rows = tool_rows(&side);
-                let b_done = rows
-                    .iter()
-                    .any(|row| !row.is_partial && row.text.contains(marker_b));
-                let a_done = rows
-                    .iter()
-                    .any(|row| !row.is_partial && row.text.contains(marker_a));
-                // Test-controlled causal release: only after finalized B is
-                // observed (and A is still pending) open/write the FIFO once.
-                // Non-blocking open retries until A is blocked on cat — no
-                // wall-clock sleep ordering and no helper-thread leak.
-                if b_done && !a_done {
-                    saw_b_before_a = true;
-                    if !released_a {
-                        use std::io::Write;
-                        use std::os::unix::fs::OpenOptionsExt;
-                        // Linux O_NONBLOCK: fail fast if the reader is not yet
-                        // attached instead of blocking the test reactor.
-                        match std::fs::OpenOptions::new()
-                            .write(true)
-                            .custom_flags(0o4000)
-                            .open(&gate_abs)
-                        {
-                            Ok(mut file) => {
-                                let _ = file.write_all(b"x");
-                                released_a = true;
-                            }
-                            Err(_) => {
-                                // A has not entered cat yet; retry next poll.
-                            }
-                        }
-                    }
-                }
-                !side.is_streaming()
-                    && a_done
-                    && b_done
-                    && side.entries().iter().any(|entry| {
-                        entry.role == SideChatRole::Assistant
-                            && entry.text.contains("both tools complete")
-                    })
-            },
-            Duration::from_secs(8)
-        )
-        .await,
-        "dual tool turn did not complete; streaming={} status={} entries={:?} b_before_a={saw_b_before_a} released={released_a}",
-        side.is_streaming(),
-        side.status(),
+        !tool_rows(&side)
+            .iter()
+            .any(|row| !row.is_partial && row.text.contains(marker_a)),
+        "call-a must still be pending when call-b finalizes (B-before-A): {:?}",
         side.entries()
     );
-    assert!(
-        saw_b_before_a,
-        "expected call-b to finalize before call-a (test-controlled FIFO release); entries={:?}",
-        side.entries()
-    );
-    assert!(
-        released_a,
-        "test must have released call-a after observing finalized B"
-    );
+
+    // Release call-a: one byte unblocks its recv(1).
+    release_a
+        .write_all(b"x")
+        .await
+        .expect("release call-a over the gate");
+
+    // Phase 2: drive the runtime until the turn is idle with both tool rows
+    // finalized and the trailing assistant text.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            side.poll_events();
+            let rows = tool_rows(&side);
+            let a_done = rows
+                .iter()
+                .any(|row| !row.is_partial && row.text.contains(marker_a));
+            let b_done = rows
+                .iter()
+                .any(|row| !row.is_partial && row.text.contains(marker_b));
+            if !side.is_streaming()
+                && a_done
+                && b_done
+                && side.entries().iter().any(|entry| {
+                    entry.role == SideChatRole::Assistant
+                        && entry.text.contains("both tools complete")
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dual tool turn did not finalize within 15s");
 
     let rows = tool_rows(&side);
     assert_eq!(
@@ -1929,8 +1979,8 @@ printf '%s' '{marker_b}'"
         assert!(!row.is_partial, "tool row must be finalized: {row:?}");
         assert!(!row.is_error, "tool row must not be error: {row:?}");
         assert!(
-            row.text.contains("[bash]"),
-            "tool row must keep bash identity: {row:?}"
+            row.text.starts_with("[eval]") || row.text.starts_with("[read]"),
+            "tool row must keep its non-bash tool identity: {row:?}"
         );
     }
     let texts: Vec<&str> = rows.iter().map(|row| row.text.as_str()).collect();
@@ -1953,7 +2003,7 @@ printf '%s' '{marker_b}'"
         2,
         "ToolResult echoes must not create extra rows: {texts:?}"
     );
-    // Association: each marker lives on its own single bash row (not swapped/merged).
+    // Association: each marker lives on its own single row (not swapped/merged).
     assert!(
         rows.iter().any(|row| row.text.contains(marker_a) && !row.text.contains(marker_b)),
         "call-a marker must own a dedicated row: {texts:?}"
@@ -1961,6 +2011,17 @@ printf '%s' '{marker_b}'"
     assert!(
         rows.iter().any(|row| row.text.contains(marker_b) && !row.text.contains(marker_a)),
         "call-b marker must own a dedicated row: {texts:?}"
+    );
+    // Identity association: marker_a on the eval row, marker_b on the read row.
+    assert!(
+        rows.iter()
+            .any(|row| row.text.starts_with("[eval]") && row.text.contains(marker_a)),
+        "call-a marker must be on the eval row: {texts:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.text.starts_with("[read]") && row.text.contains(marker_b)),
+        "call-b marker must be on the read row: {texts:?}"
     );
     assert!(
         side.entries().iter().any(|entry| {
@@ -2093,8 +2154,9 @@ async fn side_chat_render_strips_csi_osc_from_streamed_payloads() {
 
     let backend = TestBackend::new(120, 40);
     let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut tabs = pi_cli::side_chat::SideChatTabs::from_single("default", side);
     terminal
-        .draw(|frame| render_side_chat_panel(frame, &side, theme::DARK))
+        .draw(|frame| render_side_chat_panel(frame, &tabs, theme::DARK))
         .expect("draw side panel");
     let text = buffer_text(&terminal);
 
@@ -2155,5 +2217,125 @@ async fn side_chat_render_strips_csi_osc_from_streamed_payloads() {
         "tool CSI payload leaked into main session JSONL"
     );
 
-    side.shutdown().await;
+    tabs.shutdown().await;
+}
+
+#[tokio::test]
+async fn side_chat_tabs_switch_preserves_isolated_transcripts() {
+    let cwd = TempDir::new().expect("cwd");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream = gated_reply_stream(
+        "tab A response",
+        started.clone(),
+        release.clone(),
+        calls.clone(),
+    );
+    let application = application_with_history(
+        cwd.path(),
+        vec![Message::user_text("shared root", 1)],
+        Some(stream),
+    )
+    .await;
+
+    let mut tabs = SideChatTabs::new_default(&application).await.expect("default tab");
+    assert_eq!(tabs.tab_names(), vec!["default"]);
+    assert_eq!(tabs.active_name(), "default");
+    assert!(tabs.entries().is_empty(), "fresh tab transcript must be empty");
+
+    tabs.new_tab(&application, "alpha").await.expect("alpha tab");
+    assert_eq!(tabs.active_name(), "alpha");
+    assert!(tabs.entries().is_empty(), "new tab transcript must be empty");
+
+    // Write in tab A (alpha) — the side prompt stays in alpha's record.
+    tabs.submit_prompt("alpha draft");
+    assert!(
+        tabs.entries()
+            .iter()
+            .any(|entry| entry.role == SideChatRole::User && entry.text == "alpha draft"),
+        "alpha transcript must own the draft: {:?}",
+        tabs.entries()
+    );
+
+    // Switch to tab B (default) — instant, no model call — empty transcript.
+    tabs.switch_to("default").expect("switch to default");
+    assert_eq!(tabs.active_name(), "default");
+    assert!(tabs.entries().is_empty(), "default transcript must stay empty");
+
+    // Switch back to A: the transcript is preserved in A's own record.
+    tabs.switch_to("alpha").expect("switch back to alpha");
+    assert_eq!(tabs.active_name(), "alpha");
+    assert!(
+        tabs.entries()
+            .iter()
+            .any(|entry| entry.role == SideChatRole::User && entry.text == "alpha draft"),
+        "alpha transcript must survive the round trip: {:?}",
+        tabs.entries()
+    );
+
+    // The main session never saw the side draft.
+    assert!(
+        application
+            .messages()
+            .iter()
+            .all(|message| message_text(message) != "alpha draft"),
+        "side draft must not enter main messages"
+    );
+
+    // list + close round trip through the container API.
+    assert_eq!(tabs.tab_names(), vec!["default", "alpha"]);
+    assert!(tabs.contains("default") && tabs.contains("alpha"));
+    tabs.close_tab(&application, "default").await.expect("close default");
+    assert_eq!(tabs.tab_names(), vec!["alpha"]);
+    assert_eq!(tabs.active_name(), "alpha", "closing inactive tab keeps active");
+
+    tabs.shutdown().await;
+}
+
+#[tokio::test]
+async fn side_chat_tabs_bound_validation_and_last_tab_replacement() {
+    let cwd = TempDir::new().expect("cwd");
+    let application = application_with_history(cwd.path(), Vec::new(), None).await;
+
+    let mut tabs = SideChatTabs::new_default(&application).await.expect("default tab");
+    assert!(
+        SideChatTabs::validate_tab_name("bad name").is_err(),
+        "spaces must be rejected"
+    );
+    assert!(SideChatTabs::validate_tab_name("new").is_err(), "reserved words rejected");
+    assert!(SideChatTabs::validate_tab_name("close").is_err(), "reserved words rejected");
+    assert!(SideChatTabs::validate_tab_name("list").is_err(), "reserved words rejected");
+    assert!(
+        SideChatTabs::validate_tab_name(&"a".repeat(33)).is_err(),
+        "names longer than 32 chars must be rejected"
+    );
+    assert!(SideChatTabs::validate_tab_name("tab_1").is_ok(), "valid names accepted");
+    assert!(
+        SideChatTabs::validate_tab_name(&"b".repeat(32)).is_ok(),
+        "exactly 32 chars accepted"
+    );
+
+    // Bound: MAX_SIDE_CHAT_TABS total tabs.
+    for index in 1..MAX_SIDE_CHAT_TABS {
+        tabs.new_tab(&application, &format!("t{index}")).await.expect("tab within bound");
+    }
+    assert_eq!(tabs.len(), MAX_SIDE_CHAT_TABS);
+    let error = tabs.new_tab(&application, "overflow").await.expect_err("bound must reject");
+    assert!(
+        error.to_string().contains("maximum"),
+        "bound error must explain the limit: {error}"
+    );
+    assert_eq!(tabs.len(), MAX_SIDE_CHAT_TABS);
+
+    // Closing the last tab replaces it with a fresh default tab.
+    tabs.close_tab(&application, "default").await.expect("close first");
+    for index in 1..MAX_SIDE_CHAT_TABS {
+        tabs.close_tab(&application, &format!("t{index}")).await.expect("close");
+    }
+    assert_eq!(tabs.len(), 1, "container must never drop to zero tabs");
+    assert_eq!(tabs.active_name(), "default");
+    assert!(tabs.entries().is_empty(), "replacement default tab must be fresh");
+
+    tabs.shutdown().await;
 }

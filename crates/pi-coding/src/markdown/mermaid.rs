@@ -19,6 +19,7 @@ pub enum FlowDirection {
 pub enum MermaidDiagramKind {
     Flowchart,
     ClassDiagram,
+    Sequence,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +90,11 @@ pub struct MermaidDiagnostic {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MermaidArt {
-    pub lines: Vec<String>,
+    /// One entry per rendered panel. Diagrams that fit the output budget have
+    /// exactly one entry; over-budget flowcharts and class diagrams are split
+    /// into ordered panels, each of at most `MermaidLimits::max_output_cells`
+    /// cells (see `split_flowchart_chunks` / `split_class_chunks`).
+    pub chunks: Vec<Vec<String>>,
     pub diagram: MermaidFlowchart,
     pub kind: MermaidDiagramKind,
 }
@@ -111,6 +116,9 @@ pub fn parse_mermaid(
     let header = source_statements.first().map(|(_, header)| header.as_str()).unwrap_or_default();
     if header.eq_ignore_ascii_case("classDiagram") {
         return parse_class_diagram(source, limits).map(|parsed| parsed.diagram);
+    }
+    if is_sequence_header(header) {
+        return parse_sequence_diagram(source, limits).map(|parsed| sequence_to_flowchart(&parsed));
     }
     parse_flowchart(source_statements, header_line, limits).map(|parsed| parsed.diagram)
 }
@@ -136,106 +144,200 @@ pub fn render_mermaid_unicode(
     if header.eq_ignore_ascii_case("classDiagram") {
         return render_class_diagram(source, width, limits);
     }
+    if is_sequence_header(header) {
+        return render_sequence_diagram(source, width, limits);
+    }
 
     let parsed = parse_flowchart(source_statements, header_line, limits)?;
     let diagram = parsed.diagram;
-    let estimated_cells = 12usize
-        .saturating_add(
-            diagram
-                .nodes
-                .iter()
-                .map(|node| {
-                    display_width(&node.id)
-                        .saturating_add(display_width(&sanitize_mermaid_label(&node.label)))
-                        .saturating_add(6)
-                })
-                .sum::<usize>(),
-        )
-        .saturating_add(
-            diagram
-                .edges
-                .iter()
-                .map(|edge| {
-                    display_width(&edge.from)
-                        .saturating_add(display_width(&edge.to))
-                        .saturating_add(
-                            edge.label
-                                .as_ref()
-                                .map_or(0, |label| display_width(label)),
-                        )
-                        .saturating_add(7)
-                })
-                .sum::<usize>(),
-        )
-        .saturating_add(
-            parsed
-                .subgraphs
-                .iter()
-                .map(|group| display_width(&group.id).saturating_add(display_width(&group.title)).saturating_add(18))
-                .sum::<usize>(),
-        );
-    if estimated_cells > limits.max_output_cells.saturating_mul(8) {
-        return Err(diagnostic(
-            MermaidDiagnosticKind::OutputLimit,
-            "Mermaid labels exceed the configured output cell budget",
-            None,
-        ));
+    let lines = render_flowchart_lines(&diagram, &parsed.subgraphs, width);
+    let cells = rendered_cells(&lines);
+    if cells > limits.max_output_cells {
+        // Over-budget flowcharts split into ordered panels instead of
+        // erroring or falling back to the raw source: every panel stays within
+        // `max_output_cells`, edges crossing a panel boundary become stub
+        // notes, and supported syntax always renders.
+        let chunks = split_flowchart_chunks(&diagram, &parsed.subgraphs, width, limits.max_output_cells);
+        return Ok(MermaidArt {
+            chunks,
+            diagram,
+            kind: MermaidDiagramKind::Flowchart,
+        });
     }
-    let minimum_lines = 1usize
-        .saturating_add(diagram.nodes.len())
-        .saturating_add(parsed.subgraphs.len().saturating_mul(2))
-        .saturating_add(usize::from(!diagram.edges.is_empty()))
-        .saturating_add(diagram.edges.len());
-    if minimum_lines > limits.max_output_cells {
-        return Err(diagnostic(
-            MermaidDiagnosticKind::OutputLimit,
-            "Mermaid output cell limit is too small for this graph",
-            None,
-        ));
-    }
-    let mut lines = Vec::new();
-    let direction = match diagram.direction {
-        FlowDirection::TopDown => "TD",
-        FlowDirection::BottomUp => "BU",
-        FlowDirection::LeftRight => "LR",
-        FlowDirection::RightLeft => "RL",
-    };
-    lines.push(fit_text(&format!("flowchart {direction}"), width));
+    Ok(MermaidArt {
+        chunks: vec![lines],
+        diagram,
+        kind: MermaidDiagramKind::Flowchart,
+    })
+}
 
+/// Render a flowchart the way `render_mermaid_unicode` always did: header,
+/// nodes in declaration order with interleaved subgraph markers, then the
+/// `edges` section. This is the single-chunk output; `split_flowchart_chunks`
+/// re-packs the same pieces into bounded panels.
+fn render_flowchart_lines(
+    diagram: &MermaidFlowchart,
+    subgraphs: &[MermaidSubgraph],
+    width: usize,
+) -> Vec<String> {
+    let mut lines = vec![fit_text(
+        &format!("flowchart {}", flowchart_direction_text(diagram.direction)),
+        width,
+    )];
     for (index, node) in diagram.nodes.iter().enumerate() {
-        for group in parsed.subgraphs.iter().filter(|group| group.start_node == index) {
-            lines.push(fit_text(
-                &format!("subgraph {} · {}", group.id, sanitize_mermaid_label(&group.title)),
-                width,
-            ));
-        }
-        append_node(&mut lines, node, width);
-        for group in parsed.subgraphs.iter().filter(|group| group.end_node == index + 1) {
-            lines.push(fit_text(&format!("end subgraph {}", group.id), width));
-        }
+        append_flowchart_node_lines(&mut lines, index, node, subgraphs, width);
     }
     if !diagram.edges.is_empty() {
         lines.push(fit_text("edges", width));
         for edge in &diagram.edges {
-            let connector = match (&edge.label, edge.arrow) {
-                (Some(label), true) => format!(" ─{}─▶ ", sanitize_mermaid_label(label)),
-                (Some(label), false) => format!(" ─{}── ", sanitize_mermaid_label(label)),
-                (None, true) => " ───▶ ".to_owned(),
-                (None, false) => " ──── ".to_owned(),
-            };
-            lines.push(fit_text(
-                &format!("{}{}{}", edge.from, connector, edge.to),
-                width,
-            ));
+            lines.push(flowchart_edge_line(edge, width));
         }
     }
+    lines
+}
 
-    check_output_cells(&lines, limits)?;
-    Ok(MermaidArt {
-        lines,
-        diagram,
-        kind: MermaidDiagramKind::Flowchart,
-    })
+fn flowchart_direction_text(direction: FlowDirection) -> &'static str {
+    match direction {
+        FlowDirection::TopDown => "TD",
+        FlowDirection::BottomUp => "BU",
+        FlowDirection::LeftRight => "LR",
+        FlowDirection::RightLeft => "RL",
+    }
+}
+
+fn append_flowchart_node_lines(
+    output: &mut Vec<String>,
+    index: usize,
+    node: &MermaidNode,
+    subgraphs: &[MermaidSubgraph],
+    width: usize,
+) {
+    for group in subgraphs.iter().filter(|group| group.start_node == index) {
+        output.push(fit_text(
+            &format!("subgraph {} · {}", group.id, sanitize_mermaid_label(&group.title)),
+            width,
+        ));
+    }
+    append_node(output, node, width);
+    for group in subgraphs.iter().filter(|group| group.end_node == index + 1) {
+        output.push(fit_text(&format!("end subgraph {}", group.id), width));
+    }
+}
+
+fn flowchart_edge_line(edge: &MermaidEdge, width: usize) -> String {
+    let connector = match (&edge.label, edge.arrow) {
+        (Some(label), true) => format!(" ─{}─▶ ", sanitize_mermaid_label(label)),
+        (Some(label), false) => format!(" ─{}── ", sanitize_mermaid_label(label)),
+        (None, true) => " ───▶ ".to_owned(),
+        (None, false) => " ──── ".to_owned(),
+    };
+    fit_text(&format!("{}{}{}", edge.from, connector, edge.to), width)
+}
+
+/// Greedily partition `costs` into contiguous chunks, each summing to at most
+/// `limit`. A single element that alone exceeds `limit` becomes a chunk of its
+/// own (a node cannot be split) rather than being dropped.
+fn greedy_chunk_of(costs: &[usize], limit: usize) -> Vec<usize> {
+    let mut chunk_of = Vec::with_capacity(costs.len());
+    let mut current_cost = 0usize;
+    let mut current_chunk = 0usize;
+    for (index, cost) in costs.iter().copied().enumerate() {
+        if index > 0 && current_cost.saturating_add(cost) > limit {
+            current_chunk += 1;
+            current_cost = 0;
+        }
+        chunk_of.push(current_chunk);
+        current_cost = current_cost.saturating_add(cost);
+    }
+    chunk_of
+}
+
+/// Split an over-budget flowchart into ordered panels: nodes are packed in
+/// declaration order so each panel's rendered cells stay within `limit` (each
+/// node unit also carries the rendered cost of its outgoing edges, drawn in
+/// the source node's panel). Edges whose endpoints land in different panels
+/// become stub notes (`A → …` in the source panel, `… → B` in the target
+/// panel); edges whose source panel already holds the target render in full.
+fn split_flowchart_chunks(
+    diagram: &MermaidFlowchart,
+    subgraphs: &[MermaidSubgraph],
+    width: usize,
+    limit: usize,
+) -> Vec<Vec<String>> {
+    let header = fit_text(
+        &format!("flowchart {}", flowchart_direction_text(diagram.direction)),
+        width,
+    );
+    let mut costs = Vec::with_capacity(diagram.nodes.len());
+    for (index, node) in diagram.nodes.iter().enumerate() {
+        let mut scratch = Vec::new();
+        append_flowchart_node_lines(&mut scratch, index, node, subgraphs, width);
+        let mut cost = rendered_cells(&scratch);
+        cost = cost.saturating_add(
+            diagram
+                .edges
+                .iter()
+                .filter(|edge| edge.from == node.id)
+                .map(|edge| display_width(&flowchart_edge_line(edge, width)))
+                .sum::<usize>(),
+        );
+        costs.push(cost);
+    }
+    if let Some(first) = costs.first_mut() {
+        *first = first.saturating_add(display_width(&header));
+    }
+    let chunk_of_node = greedy_chunk_of(&costs, limit);
+    let chunk_count = chunk_of_node.last().copied().unwrap_or(0).saturating_add(1);
+    let node_index: HashMap<&str, usize> = diagram
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect();
+    let last_chunk = chunk_count.saturating_sub(1);
+    let from_chunk = |edge: &MermaidEdge| -> usize {
+        node_index
+            .get(edge.from.as_str())
+            .and_then(|index| chunk_of_node.get(*index).copied())
+            .unwrap_or(last_chunk)
+    };
+    let to_chunk = |edge: &MermaidEdge| -> Option<usize> {
+        node_index
+            .get(edge.to.as_str())
+            .and_then(|index| chunk_of_node.get(*index).copied())
+    };
+
+    let mut chunks = Vec::with_capacity(chunk_count);
+    for chunk in 0..chunk_count {
+        let mut lines = Vec::new();
+        if chunk == 0 {
+            lines.push(header.clone());
+        }
+        for (index, node) in diagram.nodes.iter().enumerate() {
+            if chunk_of_node[index] != chunk {
+                continue;
+            }
+            append_flowchart_node_lines(&mut lines, index, node, subgraphs, width);
+        }
+        let mut edge_lines: Vec<String> = Vec::new();
+        for edge in &diagram.edges {
+            let source_chunk = from_chunk(edge);
+            let target_chunk = to_chunk(edge).unwrap_or(source_chunk);
+            if source_chunk == chunk && target_chunk == chunk {
+                edge_lines.push(flowchart_edge_line(edge, width));
+            } else if source_chunk == chunk {
+                edge_lines.push(fit_text(&format!("{} → …", edge.from), width));
+            } else if target_chunk == chunk {
+                edge_lines.push(fit_text(&format!("… → {}", edge.to), width));
+            }
+        }
+        if !edge_lines.is_empty() {
+            lines.push(fit_text("edges", width));
+            lines.extend(edge_lines);
+        }
+        chunks.push(lines);
+    }
+    chunks
 }
 
 #[derive(Clone, Debug)]
@@ -297,7 +399,7 @@ fn parse_flowchart(
     let direction = parse_header(header).ok_or_else(|| {
         diagnostic(
             MermaidDiagnosticKind::UnsupportedDiagram,
-            "Only flowchart/graph and classDiagram diagrams are supported",
+            "Only flowchart/graph, classDiagram, and sequenceDiagram diagrams are supported",
             Some(header_line),
         )
     })?;
@@ -389,7 +491,7 @@ fn parse_class_diagram(
             if !statement.eq_ignore_ascii_case("classDiagram") {
                 return Err(diagnostic(
                     MermaidDiagnosticKind::UnsupportedDiagram,
-                    "Only flowchart/graph and classDiagram diagrams are supported",
+                    "Only flowchart/graph, classDiagram, and sequenceDiagram diagrams are supported",
                     Some(line),
                 ));
             }
@@ -511,48 +613,148 @@ fn render_class_diagram(
     limits: MermaidLimits,
 ) -> Result<MermaidArt, MermaidDiagnostic> {
     let parsed = parse_class_diagram(source, limits)?;
-    let minimum_lines = 1usize
-        .saturating_add(parsed.diagram.nodes.len().saturating_mul(3))
-        .saturating_add(parsed.classes.iter().map(|class| class.members.len()).sum::<usize>())
-        .saturating_add(usize::from(!parsed.relations.is_empty()))
-        .saturating_add(parsed.relations.len());
-    if minimum_lines > limits.max_output_cells {
-        return Err(diagnostic(
-            MermaidDiagnosticKind::OutputLimit,
-            "Mermaid output cell limit is too small for this class diagram",
-            None,
-        ));
-    }
     let mut lines = vec![fit_text("classDiagram", width)];
     for node in &parsed.diagram.nodes {
-        let members = parsed
-            .classes
-            .iter()
-            .find(|class| class.name == node.id)
-            .map_or(&[][..], |class| class.members.as_slice());
-        append_class(&mut lines, &node.id, members, width);
+        append_class(
+            &mut lines,
+            &node.id,
+            class_members(&parsed.classes, &node.id),
+            width,
+        );
     }
     if !parsed.relations.is_empty() {
         lines.push(fit_text("edges", width));
         for relation in &parsed.relations {
-            let connector = match (relation.dotted, &relation.label) {
-                (true, Some(label)) => format!(" ··{}··▶ ", sanitize_mermaid_label(label)),
-                (true, None) => " ····▶ ".to_owned(),
-                (false, Some(label)) => format!(" ─{}─▶ ", sanitize_mermaid_label(label)),
-                (false, None) => " ───▶ ".to_owned(),
-            };
-            lines.push(fit_text(
-                &format!("{}{}{}", relation.from, connector, relation.to),
-                width,
-            ));
+            lines.push(class_relation_line(relation, width));
         }
     }
-    check_output_cells(&lines, limits)?;
+    // Class boxes are self-contained, so over-budget class diagrams split by
+    // class into bounded panels (relations crossing a boundary become stub
+    // notes) instead of erroring or falling back to the raw source.
+    let cells = rendered_cells(&lines);
+    if cells > limits.max_output_cells {
+        let chunks = split_class_chunks(&parsed, width, limits.max_output_cells);
+        return Ok(MermaidArt {
+            chunks,
+            diagram: parsed.diagram,
+            kind: MermaidDiagramKind::ClassDiagram,
+        });
+    }
     Ok(MermaidArt {
-        lines,
+        chunks: vec![lines],
         diagram: parsed.diagram,
         kind: MermaidDiagramKind::ClassDiagram,
     })
+}
+
+fn class_members<'a>(classes: &'a [MermaidClass], name: &str) -> &'a [String] {
+    classes
+        .iter()
+        .find(|class| class.name == name)
+        .map_or(&[][..], |class| class.members.as_slice())
+}
+
+fn class_relation_line(relation: &ClassRelation, width: usize) -> String {
+    let connector = match (relation.dotted, &relation.label) {
+        (true, Some(label)) => format!(" ··{}··▶ ", sanitize_mermaid_label(label)),
+        (true, None) => " ····▶ ".to_owned(),
+        (false, Some(label)) => format!(" ─{}─▶ ", sanitize_mermaid_label(label)),
+        (false, None) => " ───▶ ".to_owned(),
+    };
+    fit_text(&format!("{}{}{}", relation.from, connector, relation.to), width)
+}
+
+/// Split an over-budget class diagram by class into bounded panels: each
+/// class unit carries the rendered cost of its outgoing relations, and
+/// relations whose endpoints land in different panels become stub notes,
+/// mirroring `split_flowchart_chunks`.
+fn split_class_chunks(
+    parsed: &ParsedClassDiagram,
+    width: usize,
+    limit: usize,
+) -> Vec<Vec<String>> {
+    let header = fit_text("classDiagram", width);
+    let mut costs = Vec::with_capacity(parsed.diagram.nodes.len());
+    for node in &parsed.diagram.nodes {
+        let mut scratch = Vec::new();
+        append_class(
+            &mut scratch,
+            &node.id,
+            class_members(&parsed.classes, &node.id),
+            width,
+        );
+        let mut cost = rendered_cells(&scratch);
+        cost = cost.saturating_add(
+            parsed
+                .relations
+                .iter()
+                .filter(|relation| relation.from == node.id)
+                .map(|relation| display_width(&class_relation_line(relation, width)))
+                .sum::<usize>(),
+        );
+        costs.push(cost);
+    }
+    if let Some(first) = costs.first_mut() {
+        *first = first.saturating_add(display_width(&header));
+    }
+    let chunk_of_class = greedy_chunk_of(&costs, limit);
+    let chunk_count = chunk_of_class.last().copied().unwrap_or(0).saturating_add(1);
+    let class_index: HashMap<&str, usize> = parsed
+        .diagram
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect();
+    let last_chunk = chunk_count.saturating_sub(1);
+    let from_chunk = |relation: &ClassRelation| -> usize {
+        class_index
+            .get(relation.from.as_str())
+            .and_then(|index| chunk_of_class.get(*index).copied())
+            .unwrap_or(last_chunk)
+    };
+    let to_chunk = |relation: &ClassRelation| -> Option<usize> {
+        class_index
+            .get(relation.to.as_str())
+            .and_then(|index| chunk_of_class.get(*index).copied())
+    };
+
+    let mut chunks = Vec::with_capacity(chunk_count);
+    for chunk in 0..chunk_count {
+        let mut lines = Vec::new();
+        if chunk == 0 {
+            lines.push(header.clone());
+        }
+        for (index, node) in parsed.diagram.nodes.iter().enumerate() {
+            if chunk_of_class[index] != chunk {
+                continue;
+            }
+            append_class(
+                &mut lines,
+                &node.id,
+                class_members(&parsed.classes, &node.id),
+                width,
+            );
+        }
+        let mut relation_lines: Vec<String> = Vec::new();
+        for relation in &parsed.relations {
+            let source_chunk = from_chunk(relation);
+            let target_chunk = to_chunk(relation).unwrap_or(source_chunk);
+            if source_chunk == chunk && target_chunk == chunk {
+                relation_lines.push(class_relation_line(relation, width));
+            } else if source_chunk == chunk {
+                relation_lines.push(fit_text(&format!("{} → …", relation.from), width));
+            } else if target_chunk == chunk {
+                relation_lines.push(fit_text(&format!("… → {}", relation.to), width));
+            }
+        }
+        if !relation_lines.is_empty() {
+            lines.push(fit_text("edges", width));
+            lines.extend(relation_lines);
+        }
+        chunks.push(lines);
+    }
+    chunks
 }
 
 fn append_class(output: &mut Vec<String>, name: &str, members: &[String], width: usize) {
@@ -581,6 +783,394 @@ fn append_class(output: &mut Vec<String>, name: &str, members: &[String], width:
     output.push(format!("└{}┘", "─".repeat(inner_width)));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SequenceArrow {
+    /// `->>`: solid line, closed arrowhead.
+    SolidClosed,
+    /// `-->>`: dotted line, closed arrowhead.
+    DottedClosed,
+    /// `-)`: solid line, open arrowhead.
+    SolidOpen,
+    /// `-->`: dotted line, no arrowhead.
+    DottedOpen,
+    /// `-x`: solid line, cross end.
+    SolidCross,
+}
+
+const SEQUENCE_ARROWS: &[(&str, SequenceArrow)] = &[
+    ("->>", SequenceArrow::SolidClosed),
+    ("-->>", SequenceArrow::DottedClosed),
+    ("-)", SequenceArrow::SolidOpen),
+    ("-->", SequenceArrow::DottedOpen),
+    ("-x", SequenceArrow::SolidCross),
+    ("-X", SequenceArrow::SolidCross),
+    ("--x", SequenceArrow::SolidCross),
+    ("--X", SequenceArrow::SolidCross),
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SequenceParticipant {
+    id: String,
+    label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SequenceMessage {
+    from: String,
+    to: String,
+    arrow: SequenceArrow,
+    label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SequenceRow {
+    Message(SequenceMessage),
+    /// Sanitized body after the `note ` keyword, e.g. `over A, B: text`.
+    Note(String),
+    /// Unknown statement kept as a visible plain-text row.
+    Plain(String),
+}
+
+#[derive(Clone, Debug)]
+struct ParsedSequence {
+    participants: Vec<SequenceParticipant>,
+    rows: Vec<SequenceRow>,
+}
+
+fn is_sequence_header(header: &str) -> bool {
+    header.eq_ignore_ascii_case("sequenceDiagram") || header.eq_ignore_ascii_case("sequence")
+}
+
+fn parse_sequence_diagram(
+    source: &str,
+    limits: MermaidLimits,
+) -> Result<ParsedSequence, MermaidDiagnostic> {
+    let mut participants = Vec::new();
+    let mut rows = Vec::new();
+    let mut message_count = 0usize;
+    let mut saw_header = false;
+
+    for (index, raw_line) in source.lines().enumerate() {
+        let line = index + 1;
+        let statement = raw_line
+            .split_once("%%")
+            .map_or(raw_line, |(before, _)| before)
+            .trim();
+        if statement.is_empty() {
+            continue;
+        }
+        if !saw_header {
+            if !is_sequence_header(statement) {
+                return Err(diagnostic(
+                    MermaidDiagnosticKind::UnsupportedDiagram,
+                    "Only flowchart/graph, classDiagram, and sequenceDiagram diagrams are supported",
+                    Some(line),
+                ));
+            }
+            saw_header = true;
+            continue;
+        }
+        parse_sequence_statement(
+            statement,
+            line,
+            &mut participants,
+            &mut rows,
+            &mut message_count,
+            limits,
+        )?;
+    }
+    if participants.is_empty() {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::InvalidSyntax,
+            "Sequence diagram contains no participants",
+            Some(1),
+        ));
+    }
+    Ok(ParsedSequence { participants, rows })
+}
+
+fn parse_sequence_statement(
+    statement: &str,
+    line: usize,
+    participants: &mut Vec<SequenceParticipant>,
+    rows: &mut Vec<SequenceRow>,
+    message_count: &mut usize,
+    limits: MermaidLimits,
+) -> Result<(), MermaidDiagnostic> {
+    if let Some(rest) = keyword_tail(statement, "participant")
+        .or_else(|| keyword_tail(statement, "actor"))
+    {
+        let rest = rest.trim();
+        let (id, alias) = rest
+            .split_once(" as ")
+            .map_or((rest, None), |(id, alias)| (id, Some(alias)));
+        let id = id.trim();
+        let label = match alias {
+            Some(alias) => {
+                let label = alias.trim().trim_matches(['"', '\'']).trim();
+                if label.is_empty() {
+                    None
+                } else {
+                    Some(sanitize_mermaid_label(label))
+                }
+            }
+            None => Some(id.to_owned()),
+        };
+        let Some(label) = label else {
+            rows.push(SequenceRow::Plain(sanitize_mermaid_label(statement)));
+            return Ok(());
+        };
+        if !valid_identifier(id) {
+            rows.push(SequenceRow::Plain(sanitize_mermaid_label(statement)));
+            return Ok(());
+        }
+        upsert_sequence_participant(participants, id.to_owned(), label, limits, line)?;
+        return Ok(());
+    }
+    if keyword_tail(statement, "autonumber").is_some() {
+        return Ok(());
+    }
+    if let Some(body) = keyword_tail(statement, "note") {
+        let body = sanitize_mermaid_label(body.trim());
+        if body.is_empty() {
+            rows.push(SequenceRow::Plain(sanitize_mermaid_label(statement)));
+        } else {
+            rows.push(SequenceRow::Note(body));
+        }
+        return Ok(());
+    }
+    if let Some(message) = parse_sequence_message(statement) {
+        upsert_sequence_participant(
+            participants,
+            message.from.clone(),
+            message.from.clone(),
+            limits,
+            line,
+        )?;
+        upsert_sequence_participant(
+            participants,
+            message.to.clone(),
+            message.to.clone(),
+            limits,
+            line,
+        )?;
+        if *message_count >= limits.max_edges {
+            return Err(diagnostic(
+                MermaidDiagnosticKind::OversizeGraph,
+                format!("Mermaid message limit of {} exceeded", limits.max_edges),
+                Some(line),
+            ));
+        }
+        *message_count += 1;
+        rows.push(SequenceRow::Message(message));
+        return Ok(());
+    }
+    rows.push(SequenceRow::Plain(sanitize_mermaid_label(statement)));
+    Ok(())
+}
+
+fn upsert_sequence_participant(
+    participants: &mut Vec<SequenceParticipant>,
+    id: String,
+    label: String,
+    limits: MermaidLimits,
+    line: usize,
+) -> Result<(), MermaidDiagnostic> {
+    if participants.iter().any(|participant| participant.id == id) {
+        return Ok(());
+    }
+    if participants.len() >= limits.max_nodes {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::OversizeGraph,
+            format!(
+                "Mermaid participant limit of {} exceeded",
+                limits.max_nodes
+            ),
+            Some(line),
+        ));
+    }
+    participants.push(SequenceParticipant { id, label });
+    Ok(())
+}
+
+fn keyword_tail<'a>(statement: &'a str, keyword: &str) -> Option<&'a str> {
+    let len = keyword.len();
+    // `len` may fall inside a multibyte char (e.g. a CJK statement like
+    // `loop 每个模型回合` checked against the 10-byte `autonumber`); slicing
+    // at a non-char-boundary would panic, so bail out instead.
+    if statement.len() < len
+        || !statement.is_char_boundary(len)
+        || !statement[..len].eq_ignore_ascii_case(keyword)
+    {
+        return None;
+    }
+    if statement.len() > len
+        && !statement[len..].chars().next().is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(&statement[len..])
+}
+
+fn parse_sequence_message(statement: &str) -> Option<SequenceMessage> {
+    let mut best: Option<(usize, usize, SequenceArrow)> = None;
+    for (token, arrow) in SEQUENCE_ARROWS {
+        let Some(index) = statement.find(token) else {
+            continue;
+        };
+        let better = match best {
+            None => true,
+            Some((best_index, best_len, _)) => {
+                index < best_index || (index == best_index && token.len() > best_len)
+            }
+        };
+        if better {
+            best = Some((index, token.len(), *arrow));
+        }
+    }
+    let (index, len, arrow) = best?;
+    let from = statement[..index].trim();
+    let remainder = &statement[index + len..];
+    let (to, label) = remainder
+        .split_once(':')
+        .map_or((remainder, None), |(to, label)| (to, Some(label.trim())));
+    let to = to.trim();
+    if !valid_identifier(from) || !valid_identifier(to) {
+        return None;
+    }
+    let label = label
+        .filter(|text| !text.is_empty())
+        .map(sanitize_mermaid_label);
+    Some(SequenceMessage {
+        from: from.to_owned(),
+        to: to.to_owned(),
+        arrow,
+        label,
+    })
+}
+
+fn sequence_to_flowchart(parsed: &ParsedSequence) -> MermaidFlowchart {
+    MermaidFlowchart {
+        direction: FlowDirection::LeftRight,
+        nodes: parsed
+            .participants
+            .iter()
+            .map(|participant| MermaidNode {
+                id: participant.id.clone(),
+                label: participant.label.clone(),
+                shape: MermaidNodeShape::Plain,
+            })
+            .collect(),
+        edges: parsed
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                SequenceRow::Message(message) => Some(MermaidEdge {
+                    from: message.from.clone(),
+                    to: message.to.clone(),
+                    label: message.label.clone(),
+                    arrow: true,
+                }),
+                SequenceRow::Note(_) | SequenceRow::Plain(_) => None,
+            })
+            .collect(),
+    }
+}
+
+/// Sequence diagrams render as a single aligned panel and are NOT split by
+/// participant: every message row is padded against the widest participant
+/// label, so rows cannot be re-flowed into independent per-participant panels
+/// without losing that alignment (participant splits would also strand notes
+/// and arrows that span arbitrary participants). Over-budget sequence diagrams
+/// therefore keep the `OutputLimit` diagnostic, unlike flowcharts and class
+/// diagrams which split into bounded panels.
+fn render_sequence_diagram(
+    source: &str,
+    width: usize,
+    limits: MermaidLimits,
+) -> Result<MermaidArt, MermaidDiagnostic> {
+    let parsed = parse_sequence_diagram(source, limits)?;
+    let minimum_lines = 3usize.saturating_add(parsed.rows.len());
+    if minimum_lines > limits.max_output_cells {
+        return Err(diagnostic(
+            MermaidDiagnosticKind::OutputLimit,
+            "Mermaid output cell limit is too small for this sequence diagram",
+            None,
+        ));
+    }
+    let header = parsed
+        .participants
+        .iter()
+        .map(|participant| sanitize_mermaid_label(&participant.label))
+        .collect::<Vec<_>>()
+        .join(" ── ");
+    let header = fit_text(&header, width);
+    let rule_width = display_width(&header);
+    let mut lines = vec![
+        fit_text("sequenceDiagram", width),
+        header,
+        "─".repeat(rule_width),
+    ];
+    let max_from = parsed
+        .participants
+        .iter()
+        .map(|participant| display_width(&participant.label))
+        .max()
+        .unwrap_or(0);
+    for row in &parsed.rows {
+        match row {
+            SequenceRow::Message(message) => {
+                let from_label = parsed
+                    .participants
+                    .iter()
+                    .find(|participant| participant.id == message.from)
+                    .map_or(&message.from, |participant| &participant.label);
+                let to_label = parsed
+                    .participants
+                    .iter()
+                    .find(|participant| participant.id == message.to)
+                    .map_or(&message.to, |participant| &participant.label);
+                let label_part = message
+                    .label
+                    .as_ref()
+                    .map_or(String::new(), |label| format!(" : {label}"));
+                lines.push(fit_text(
+                    &format!(
+                        "│ {} │{}│ {}{} │",
+                        pad_to_width(from_label, max_from),
+                        sequence_arrow_text(message.arrow),
+                        to_label,
+                        label_part
+                    ),
+                    width,
+                ));
+            }
+            SequenceRow::Note(body) => {
+                lines.push(fit_text(&format!("│ [note {body}] │"), width));
+            }
+            SequenceRow::Plain(text) => {
+                lines.push(fit_text(&format!("│ {text} │"), width));
+            }
+        }
+    }
+    check_output_cells(&lines, limits)?;
+    Ok(MermaidArt {
+        chunks: vec![lines],
+        diagram: sequence_to_flowchart(&parsed),
+        kind: MermaidDiagramKind::Sequence,
+    })
+}
+
+fn sequence_arrow_text(arrow: SequenceArrow) -> &'static str {
+    match arrow {
+        SequenceArrow::SolidClosed => "──▶",
+        SequenceArrow::DottedClosed => "···▶",
+        SequenceArrow::SolidOpen => "──○",
+        SequenceArrow::DottedOpen => "···",
+        SequenceArrow::SolidCross => "──✕",
+    }
+}
+
 fn sanitize_mermaid_label(text: &str) -> String {
     sanitize_inline(text)
         .replace("<br/>", " · ")
@@ -595,8 +1185,14 @@ fn valid_identifier(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
 }
 
+/// Total rendered cell count of `lines` — the metric `check_output_cells` and
+/// the per-chunk split budgets operate on.
+fn rendered_cells(lines: &[String]) -> usize {
+    lines.iter().map(|line| display_width(line)).sum::<usize>()
+}
+
 fn check_output_cells(lines: &[String], limits: MermaidLimits) -> Result<(), MermaidDiagnostic> {
-    let cells = lines.iter().map(|line| display_width(line)).sum::<usize>();
+    let cells = rendered_cells(lines);
     if cells > limits.max_output_cells {
         return Err(diagnostic(
             MermaidDiagnosticKind::OutputLimit,
@@ -670,32 +1266,47 @@ fn parse_statement(
     limits: MermaidLimits,
 ) -> Result<(), MermaidDiagnostic> {
     let mut cursor = Cursor::new(statement);
-    let first = cursor.node().ok_or_else(|| invalid_line(line, statement))?;
-    upsert_node(first.clone(), nodes, node_indices, limits, line)?;
+    let mut from = cursor
+        .node_group()
+        .ok_or_else(|| invalid_line(line, statement))?;
+    for node in &from {
+        upsert_node(node.clone(), nodes, node_indices, limits, line)?;
+    }
     cursor.whitespace();
     if cursor.done() {
         return Ok(());
     }
 
-    let mut from = first.id;
     while !cursor.done() {
         let (arrow, label) = cursor.edge().ok_or_else(|| invalid_line(line, statement))?;
-        let next = cursor.node().ok_or_else(|| invalid_line(line, statement))?;
-        upsert_node(next.clone(), nodes, node_indices, limits, line)?;
-        if edges.len() >= limits.max_edges {
+        let targets = cursor
+            .node_group()
+            .ok_or_else(|| invalid_line(line, statement))?;
+        for node in &targets {
+            upsert_node(node.clone(), nodes, node_indices, limits, line)?;
+        }
+        // `A & B --> C & D` expands to the cartesian product A->C, A->D,
+        // B->C, B->D; reject the whole statement when the expansion would
+        // exceed the edge limit.
+        let edge_count = from.len().saturating_mul(targets.len());
+        if edges.len().saturating_add(edge_count) > limits.max_edges {
             return Err(diagnostic(
                 MermaidDiagnosticKind::OversizeGraph,
                 format!("Mermaid edge limit of {} exceeded", limits.max_edges),
                 Some(line),
             ));
         }
-        edges.push(MermaidEdge {
-            from,
-            to: next.id.clone(),
-            label,
-            arrow,
-        });
-        from = next.id;
+        for source in &from {
+            for target in &targets {
+                edges.push(MermaidEdge {
+                    from: source.id.clone(),
+                    to: target.id.clone(),
+                    label: label.clone(),
+                    arrow,
+                });
+            }
+        }
+        from = targets;
         cursor.whitespace();
     }
     Ok(())
@@ -810,6 +1421,22 @@ impl<'a> Cursor<'a> {
         Some(MermaidNode { id, label, shape })
     }
 
+    /// Parses a `&`-joined list of one or more nodes, matching upstream
+    /// mermaid multi-node statements such as `A & B --> C & D`. Returns
+    /// `None` when an ampersand is not followed by a node (stray `&`, e.g.
+    /// `A & --> C` or `A --> B &`).
+    fn node_group(&mut self) -> Option<Vec<MermaidNode>> {
+        let mut group = vec![self.node()?];
+        loop {
+            self.whitespace();
+            if !self.rest.starts_with('&') {
+                return Some(group);
+            }
+            self.rest = &self.rest[1..];
+            group.push(self.node()?);
+        }
+    }
+
     fn edge(&mut self) -> Option<(bool, Option<String>)> {
         self.whitespace();
         let arrow = if let Some(rest) = self.rest.strip_prefix("-->") {
@@ -855,6 +1482,54 @@ fn invalid_line(line: usize, statement: &str) -> MermaidDiagnostic {
     )
 }
 
+
+/// Exact user-reported shape: subgraphs CWD/TR/RM/AD/PJ/SNAP/SESS/EXT/ORCH/
+/// SBX with boxed nodes and labeled edges, sized like a real architecture
+/// diagram (long descriptive labels, edges crossing subgraph boundaries) so
+/// the full render crosses the former 4x total output ceiling at typical
+/// widths. Shared by the mermaid.rs and render.rs regression suites so the
+/// card-level fallback behavior is tested against the same input.
+#[cfg(test)]
+pub(crate) fn reported_subgraph_flowchart_source() -> String {
+    let mut source = String::from("flowchart LR\n");
+    let groups = [
+        ("CWD", "current working directory resolution and trust checks"),
+        ("TR", "transcript compaction with rewind checkpoints"),
+        ("RM", "runtime state machine and mode transitions"),
+        ("AD", "agent directory with skills and memory index"),
+        ("PJ", "project-scoped settings and .pi overlay"),
+        ("SNAP", "snapshot-based recovery and rollback"),
+        ("SESS", "session store with branch fork and resume"),
+        ("EXT", "extension host quickjs event matrix"),
+        ("ORCH", "orchestration jobs mailbox and todo dag"),
+        ("SBX", "sandbox isolation with deny rules"),
+    ];
+    let mut prev: Option<&str> = None;
+    for (id, title) in groups {
+        source.push_str(&format!("subgraph {id}[\"{title}\"]\n"));
+        for n in 1..=5 {
+            source.push_str(&format!(
+                "{id}{n}[{title} component {n} with state and event handling]\n"
+            ));
+            if n > 1 {
+                source.push_str(&format!("{id}{} -->|data flow| {id}{n}\n", n - 1));
+            }
+        }
+        source.push_str("end\n");
+        if let Some(prev_id) = prev {
+            source.push_str(&format!("{prev_id}5 -->|handoff| {id}1\n"));
+        }
+        prev = Some(id);
+    }
+    for (i, (id, _)) in groups.iter().enumerate() {
+        for (j, (other, _)) in groups.iter().enumerate() {
+            if i != j && (i + j) % 3 == 0 {
+                source.push_str(&format!("{id}5 -->|ref {i}:{j}| {other}1\n"));
+            }
+        }
+    }
+    source
+}
 
 #[cfg(test)]
 mod tests {
@@ -918,7 +1593,7 @@ X[User] --> A
     fn class_diagram_render_includes_members_and_relation_edges() {
         let art = render_mermaid_unicode(CLASS_SOURCE, 48, MermaidLimits::default()).unwrap();
         assert_eq!(art.kind, MermaidDiagramKind::ClassDiagram);
-        let text = art.lines.join("\n");
+        let text = art.chunks[0].join("\n");
         assert!(text.starts_with("classDiagram"), "{text}");
         assert!(text.contains("+run()"), "{text}");
         assert!(text.contains("+id: String"), "{text}");
@@ -965,7 +1640,7 @@ X[User] --> A
     fn labeled_subgraph_render_keeps_title_and_end_markers() {
         let art = render_mermaid_unicode(FLOW_SOURCE, 48, MermaidLimits::default()).unwrap();
         assert_eq!(art.kind, MermaidDiagramKind::Flowchart);
-        let text = art.lines.join("\n");
+        let text = art.chunks[0].join("\n");
         assert!(text.starts_with("flowchart LR"), "{text}");
         assert!(
             text.contains("subgraph records · SessionRecord types"),
@@ -979,5 +1654,763 @@ X[User] --> A
         assert!(text.contains("A ───▶ B"), "{text}");
         assert!(text.contains("B ───▶ C"), "{text}");
         assert!(text.contains("X ───▶ A"), "{text}");
+    }
+
+    /// Multi-node (`&`-joined) flowchart statements expand to the cartesian
+    /// product of sources and targets, matching upstream mermaid.
+    #[test]
+    fn flowchart_multi_node_source_side_expands() {
+        let chart = parse_mermaid("flowchart LR\nA & B --> C", MermaidLimits::default()).unwrap();
+        assert_eq!(
+            chart
+                .nodes
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "B", "C"]
+        );
+        assert_eq!(chart.edges.len(), 2);
+        assert_eq!(
+            (chart.edges[0].from.as_str(), chart.edges[0].to.as_str()),
+            ("A", "C")
+        );
+        assert_eq!(
+            (chart.edges[1].from.as_str(), chart.edges[1].to.as_str()),
+            ("B", "C")
+        );
+    }
+
+    #[test]
+    fn flowchart_multi_node_target_side_expands() {
+        let chart = parse_mermaid("flowchart LR\nA --> C & D", MermaidLimits::default()).unwrap();
+        assert_eq!(chart.edges.len(), 2);
+        assert_eq!(
+            (chart.edges[0].from.as_str(), chart.edges[0].to.as_str()),
+            ("A", "C")
+        );
+        assert_eq!(
+            (chart.edges[1].from.as_str(), chart.edges[1].to.as_str()),
+            ("A", "D")
+        );
+    }
+
+    #[test]
+    fn flowchart_multi_node_both_sides_is_cartesian_product() {
+        let chart =
+            parse_mermaid("flowchart LR\nA & B --> C & D", MermaidLimits::default()).unwrap();
+        assert_eq!(chart.nodes.len(), 4);
+        assert_eq!(chart.edges.len(), 4);
+        let pairs: Vec<_> = chart
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("A", "C"), ("A", "D"), ("B", "C"), ("B", "D")]);
+    }
+
+    #[test]
+    fn flowchart_multi_node_labels_and_shapes_parse() {
+        let chart = parse_mermaid(
+            "flowchart LR\nA[\"x\"] & B[\"y\"] --> C",
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            chart
+                .nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.label.as_str(), n.shape))
+                .collect::<Vec<_>>(),
+            vec![
+                ("A", "x", MermaidNodeShape::Rectangle),
+                ("B", "y", MermaidNodeShape::Rectangle),
+                ("C", "C", MermaidNodeShape::Plain),
+            ]
+        );
+        assert_eq!(chart.edges.len(), 2);
+        assert_eq!(
+            (chart.edges[0].from.as_str(), chart.edges[0].to.as_str()),
+            ("A", "C")
+        );
+        assert_eq!(
+            (chart.edges[1].from.as_str(), chart.edges[1].to.as_str()),
+            ("B", "C")
+        );
+    }
+
+    #[test]
+    fn flowchart_multi_node_chained_groups_expand_per_segment() {
+        let chart = parse_mermaid(
+            "flowchart LR\nA & B --> C & D --> E",
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(chart.nodes.len(), 5);
+        let pairs: Vec<_> = chart
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("A", "C"),
+                ("A", "D"),
+                ("B", "C"),
+                ("B", "D"),
+                ("C", "E"),
+                ("D", "E"),
+            ]
+        );
+    }
+
+    #[test]
+    fn flowchart_multi_node_user_reported_statements_parse() {
+        let chart = parse_mermaid(
+            "flowchart LR\nENV & HOME & PROJ & CLI --> AUTH & SET & CAT & RES",
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(chart.nodes.len(), 8);
+        assert_eq!(chart.edges.len(), 16);
+        let chart = parse_mermaid(
+            "flowchart LR\nTOOLS --> BASH & EDIT & FS & WEB & IMG & ASK & PROC",
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(chart.nodes.len(), 8);
+        assert_eq!(chart.edges.len(), 7);
+    }
+
+    #[test]
+    fn flowchart_multi_node_expansion_enforces_limits() {
+        // An expansion that would exceed max_edges is rejected.
+        let err = parse_mermaid(
+            "flowchart LR\nA & B --> C & D",
+            MermaidLimits {
+                max_edges: 3,
+                ..MermaidLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, MermaidDiagnosticKind::OversizeGraph);
+        assert!(err.message.contains("edge limit"), "{}", err.message);
+
+        // An expansion exactly at the limit is accepted.
+        let chart = parse_mermaid(
+            "flowchart LR\nA & B --> C & D",
+            MermaidLimits {
+                max_edges: 4,
+                ..MermaidLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(chart.edges.len(), 4);
+
+        // Existing single-edge limit behavior is unchanged.
+        let err = parse_mermaid(
+            "flowchart LR\nA --> B\nC --> D",
+            MermaidLimits {
+                max_edges: 1,
+                ..MermaidLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, MermaidDiagnosticKind::OversizeGraph);
+        assert!(err.message.contains("edge limit"), "{}", err.message);
+
+        // A `&`-joined group still counts against max_nodes.
+        let err = parse_mermaid(
+            "flowchart LR\nA & B & C & D --> E",
+            MermaidLimits {
+                max_nodes: 3,
+                ..MermaidLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, MermaidDiagnosticKind::OversizeGraph);
+        assert!(err.message.contains("node limit"), "{}", err.message);
+    }
+
+    #[test]
+    fn flowchart_multi_node_stray_ampersand_errors() {
+        for source in [
+            "flowchart LR\nA & --> C",
+            "flowchart LR\nA --> B &",
+            "flowchart LR\nA --> B & & C",
+            "flowchart LR\n& A --> C",
+        ] {
+            let err = parse_mermaid(source, MermaidLimits::default()).unwrap_err();
+            assert_eq!(err.kind, MermaidDiagnosticKind::InvalidSyntax, "{source}");
+        }
+    }
+
+    #[test]
+    fn flowchart_multi_node_plain_declaration_declares_all_nodes() {
+        let chart = parse_mermaid("flowchart LR\nA & B", MermaidLimits::default()).unwrap();
+        assert_eq!(chart.edges.len(), 0);
+        assert_eq!(
+            chart
+                .nodes
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "B"]
+        );
+    }
+
+    #[test]
+    fn flowchart_multi_node_renders_expanded_edges() {
+        let art = render_mermaid_unicode(
+            "flowchart LR\nA & B --> C & D",
+            48,
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::Flowchart);
+        let text = art.chunks[0].join("\n");
+        for edge in ["A ───▶ C", "A ───▶ D", "B ───▶ C", "B ───▶ D"] {
+            assert!(text.contains(edge), "{edge}: {text}");
+        }
+    }
+
+    #[test]
+    fn small_flowchart_stays_a_single_chunk() {
+        let art = render_mermaid_unicode("flowchart LR\nA --> B", 48, MermaidLimits::default())
+            .unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::Flowchart);
+        assert_eq!(art.chunks.len(), 1, "small diagrams must not split");
+        assert_eq!(art.chunks[0][0], "flowchart LR");
+        assert!(art.chunks[0].iter().any(|line| line == "A ───▶ B"));
+    }
+
+    #[test]
+    fn over_budget_flowchart_splits_into_bounded_chunks_with_stub_edges() {
+        // A 112-node chain renders to ~5.1k cells: over the 3_200 per-chunk
+        // budget but under the 4x total ceiling, so it must split into two
+        // panels with stub notes on the single edge crossing the boundary
+        // instead of erroring with OutputLimit.
+        let mut source = String::from("flowchart TD\n");
+        for i in 1..112 {
+            source.push_str(&format!("A{i} --> A{}\n", i + 1));
+        }
+        let limits = MermaidLimits {
+            max_nodes: 256,
+            max_edges: 256,
+            ..MermaidLimits::default()
+        };
+        let art = render_mermaid_unicode(&source, 48, limits).unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::Flowchart);
+        assert!(
+            art.chunks.len() >= 2,
+            "over-budget graph must split, got {} chunk(s)",
+            art.chunks.len()
+        );
+        for (index, chunk) in art.chunks.iter().enumerate() {
+            let cells = rendered_cells(chunk);
+            assert!(
+                cells <= limits.max_output_cells,
+                "chunk {index} exceeds the per-chunk budget: {cells} cells"
+            );
+        }
+        // The diagram header lives in the first panel only.
+        assert!(art.chunks[0].first().is_some_and(|line| line.starts_with("flowchart ")));
+        assert!(art.chunks[1..]
+            .iter()
+            .all(|chunk| chunk.first().is_some_and(|line| !line.starts_with("flowchart "))));
+        // Every node appears in exactly one panel; every edge is either full
+        // (same panel) or a stub note across the boundary.
+        let text = art.chunks.concat().join("\n");
+        for i in 1..=112 {
+            assert!(text.contains(&format!("A{i}")), "node A{i} missing: {text}");
+        }
+        assert!(text.contains("A1 ───▶ A2"), "in-chunk edge must stay full: {text}");
+        // Exactly one edge crosses the boundary: the source panel carries its
+        // `A{n} → …` stub, the target panel the matching `… → A{n+1}` stub.
+        let source_stubs = art.chunks[0]
+            .iter()
+            .filter(|line| line.ends_with(" → …"))
+            .collect::<Vec<_>>();
+        let target_stubs = art.chunks[1]
+            .iter()
+            .filter(|line| line.starts_with("… → "))
+            .collect::<Vec<_>>();
+        assert_eq!(source_stubs.len(), 1, "{text}");
+        assert_eq!(target_stubs.len(), 1, "{text}");
+        let from_id = source_stubs[0].trim_end_matches(" → …").trim_start_matches('A');
+        let to_id = target_stubs[0].trim_start_matches("… → ").trim_start_matches('A');
+        assert_eq!(
+            to_id.parse::<u32>().unwrap(),
+            from_id.parse::<u32>().unwrap() + 1,
+            "stubs must describe the same crossing edge: {text}"
+        );
+    }
+
+    #[test]
+    fn reported_subgraph_flowchart_renders_or_splits_across_widths() {
+        // Regression: this shape used to return OutputLimit at widths >= 80
+        // (the rendered cells crossed the 4x total ceiling), which made the
+        // card fall back to the raw source. It must render as a diagram —
+        // single or split into bounded panels — at every width, never
+        // erroring and never losing a node.
+        let source = reported_subgraph_flowchart_source();
+        for width in [24usize, 32, 48, 60, 80, 100, 120, 160, 200, 240, 300] {
+            let art = render_mermaid_unicode(&source, width, MermaidLimits::default())
+                .unwrap_or_else(|err| panic!("width {width} must not fail: {err:?}"));
+            assert_eq!(art.kind, MermaidDiagramKind::Flowchart, "width {width}");
+            assert!(!art.chunks.is_empty(), "width {width}");
+            for (index, chunk) in art.chunks.iter().enumerate() {
+                let cells = rendered_cells(chunk);
+                assert!(
+                    cells <= MermaidLimits::default().max_output_cells,
+                    "width {width}: chunk {index} exceeds the per-chunk budget: {cells} cells"
+                );
+            }
+            let text = art.chunks.concat().join("\n");
+            for (id, _) in [
+                ("CWD", 0), ("TR", 0), ("RM", 0), ("AD", 0), ("PJ", 0),
+                ("SNAP", 0), ("SESS", 0), ("EXT", 0), ("ORCH", 0), ("SBX", 0),
+            ] {
+                assert!(
+                    text.contains(&format!("subgraph {id} ·")),
+                    "width {width}: subgraph {id} header missing"
+                );
+                for n in 1..=5 {
+                    assert!(
+                        text.contains(&format!("{id}{n}")),
+                        "width {width}: node {id}{n} missing"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flowchart_beyond_any_total_ceiling_still_splits_into_bounded_chunks() {
+        // A 500-node chain renders to ~14.5k cells: far past the former 4x
+        // total ceiling (12_800). Size must never flip a supported flowchart
+        // to the source fallback, so it splits into bounded panels instead of
+        // erroring with OutputLimit.
+        let mut source = String::from("flowchart TD\n");
+        for i in 1..500 {
+            source.push_str(&format!("A{i} --> A{}\n", i + 1));
+        }
+        let limits = MermaidLimits {
+            max_nodes: 1024,
+            max_edges: 1024,
+            ..MermaidLimits::default()
+        };
+        let art = render_mermaid_unicode(&source, 48, limits).unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::Flowchart);
+        assert!(
+            art.chunks.len() >= 5,
+            "a ~14.5k-cell graph must split into many panels, got {}",
+            art.chunks.len()
+        );
+        for (index, chunk) in art.chunks.iter().enumerate() {
+            let cells = rendered_cells(chunk);
+            assert!(
+                cells <= limits.max_output_cells,
+                "chunk {index} exceeds the per-chunk budget: {cells} cells"
+            );
+        }
+        let text = art.chunks.concat().join("\n");
+        for i in 1..=500 {
+            assert!(text.contains(&format!("A{i}")), "node A{i} missing: {text}");
+        }
+    }
+
+    #[test]
+    fn over_budget_class_diagram_splits_into_bounded_chunks() {
+        // 190 chained classes render to ~7.6k cells: over the per-chunk budget
+        // but under the total ceiling, so the class diagram must split with
+        // stub notes on relations crossing panel boundaries.
+        let mut source = String::from("classDiagram\n");
+        for i in 1..=190 {
+            source.push_str(&format!("class C{i} {{\n+m\n}}\n"));
+        }
+        for i in 1..190 {
+            source.push_str(&format!("C{i} --> C{}\n", i + 1));
+        }
+        let limits = MermaidLimits {
+            max_nodes: 256,
+            max_edges: 256,
+            ..MermaidLimits::default()
+        };
+        let art = render_mermaid_unicode(&source, 48, limits).unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::ClassDiagram);
+        assert!(
+            art.chunks.len() >= 2,
+            "over-budget class diagram must split, got {} chunk(s)",
+            art.chunks.len()
+        );
+        for (index, chunk) in art.chunks.iter().enumerate() {
+            let cells = rendered_cells(chunk);
+            assert!(
+                cells <= limits.max_output_cells,
+                "chunk {index} exceeds the per-chunk budget: {cells} cells"
+            );
+        }
+        assert!(art.chunks[0].first().is_some_and(|line| line.starts_with("classDiagram")));
+        let text = art.chunks.concat().join("\n");
+        for i in 1..=190 {
+            assert!(text.contains(&format!("C{i}")), "class C{i} missing: {text}");
+        }
+        assert!(text.contains("──▶"), "in-chunk relations must stay full: {text}");
+        assert!(
+            text.contains("→ …") && text.contains("… →"),
+            "cross-chunk relation stubs missing: {text}"
+        );
+    }
+
+    #[test]
+    fn class_diagram_beyond_any_total_ceiling_still_splits_into_bounded_chunks() {
+        // 400 chained classes render to ~15k cells: past the former 4x total
+        // ceiling, so this used to return OutputLimit and fall back to the
+        // raw source. It must split into bounded panels instead.
+        let mut source = String::from("classDiagram\n");
+        for i in 1..=400 {
+            source.push_str(&format!("class C{i} {{\n+m\n}}\n"));
+        }
+        for i in 1..400 {
+            source.push_str(&format!("C{i} --> C{}\n", i + 1));
+        }
+        let limits = MermaidLimits {
+            max_nodes: 1024,
+            max_edges: 1024,
+            ..MermaidLimits::default()
+        };
+        let art = render_mermaid_unicode(&source, 48, limits).unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::ClassDiagram);
+        assert!(
+            art.chunks.len() >= 5,
+            "a ~15k-cell class diagram must split into many panels, got {}",
+            art.chunks.len()
+        );
+        for (index, chunk) in art.chunks.iter().enumerate() {
+            let cells = rendered_cells(chunk);
+            assert!(
+                cells <= limits.max_output_cells,
+                "chunk {index} exceeds the per-chunk budget: {cells} cells"
+            );
+        }
+        let text = art.chunks.concat().join("\n");
+        for i in 1..=400 {
+            assert!(text.contains(&format!("C{i}")), "class C{i} missing: {text}");
+        }
+        assert!(
+            text.contains("→ …") && text.contains("… →"),
+            "cross-chunk relation stubs missing: {text}"
+        );
+    }
+
+    /// Full-featured sequence source: aliased participants, all five arrow
+    /// forms, a note, an ignored autonumber, and an unknown-arrow line that
+    /// must degrade to a plain row instead of failing the whole diagram.
+    const SEQUENCE_SOURCE: &str = "\
+sequenceDiagram
+autonumber
+participant A as Alice
+actor B as Bob
+A ->> B: hello
+B -->> A: ack
+A -) B: ping
+B --> A: pong
+A -x B: quit
+note over A, B: working
+A => B: hmm
+";
+
+    #[test]
+    fn sequence_diagram_parses_participants_messages_notes_and_plain_rows() {
+        let parsed = parse_sequence_diagram(SEQUENCE_SOURCE, MermaidLimits::default()).unwrap();
+        assert_eq!(
+            parsed
+                .participants
+                .iter()
+                .map(|p| (p.id.as_str(), p.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("A", "Alice"), ("B", "Bob")]
+        );
+        let expected_rows: Vec<(&str, &str, SequenceArrow, Option<&str>)> = vec![
+            ("A", "B", SequenceArrow::SolidClosed, Some("hello")),
+            ("B", "A", SequenceArrow::DottedClosed, Some("ack")),
+            ("A", "B", SequenceArrow::SolidOpen, Some("ping")),
+            ("B", "A", SequenceArrow::DottedOpen, Some("pong")),
+            ("A", "B", SequenceArrow::SolidCross, Some("quit")),
+        ];
+        let rows: Vec<_> = parsed.rows.iter().collect();
+        assert_eq!(rows.len(), 7, "{rows:?}");
+        for (index, (from, to, arrow, label)) in expected_rows.iter().enumerate() {
+            let SequenceRow::Message(message) = &rows[index] else {
+                panic!("row {index} is not a message: {:?}", rows[index]);
+            };
+            assert_eq!(&message.from, from, "row {index}");
+            assert_eq!(&message.to, to, "row {index}");
+            assert_eq!(message.arrow, *arrow, "row {index}");
+            assert_eq!(message.label.as_deref(), *label, "row {index}");
+        }
+        assert_eq!(rows[5], &SequenceRow::Note("over A, B: working".to_owned()));
+        assert_eq!(rows[6], &SequenceRow::Plain("A => B: hmm".to_owned()));
+    }
+
+    #[test]
+    fn sequence_diagram_render_is_golden() {
+        let art = render_mermaid_unicode(SEQUENCE_SOURCE, 48, MermaidLimits::default()).unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::Sequence);
+        assert_eq!(
+            art.chunks[0].join("\n"),
+            "sequenceDiagram\n\
+Alice ── Bob\n\
+────────────\n\
+│ Alice │──▶│ Bob : hello │\n\
+│ Bob   │···▶│ Alice : ack │\n\
+│ Alice │──○│ Bob : ping │\n\
+│ Bob   │···│ Alice : pong │\n\
+│ Alice │──✕│ Bob : quit │\n\
+│ [note over A, B: working] │\n\
+│ A => B: hmm │"
+        );
+        assert_eq!(art.diagram.nodes.len(), 2);
+        assert_eq!(art.diagram.edges.len(), 5);
+        assert_eq!(art.diagram.edges[0].label.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn sequence_diagram_auto_creates_undeclared_participants() {
+        let parsed = parse_sequence_diagram(
+            "sequenceDiagram\nX ->> Y: hi",
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .participants
+                .iter()
+                .map(|p| (p.id.as_str(), p.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("X", "X"), ("Y", "Y")]
+        );
+        let SequenceRow::Message(message) = &parsed.rows[0] else {
+            panic!("expected message row: {:?}", parsed.rows[0]);
+        };
+        assert_eq!((message.from.as_str(), message.to.as_str()), ("X", "Y"));
+    }
+
+    #[test]
+    fn sequence_diagram_user_reported_arrow_forms_render() {
+        // The exact reported shape: participant declarations plus
+        // `L->>T: execute tools` and `T-->>L: ToolResult`.
+        let source = "sequenceDiagram\nparticipant L\nparticipant T\nL->>T: execute tools\nT-->>L: ToolResult";
+        let parsed = parse_sequence_diagram(source, MermaidLimits::default()).unwrap();
+        assert_eq!(
+            parsed
+                .participants
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["L", "T"]
+        );
+        let rows: Vec<_> = parsed.rows.iter().collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for (index, arrow) in [SequenceArrow::SolidClosed, SequenceArrow::DottedClosed]
+            .iter()
+            .enumerate()
+        {
+            let SequenceRow::Message(message) = &rows[index] else {
+                panic!("row {index} is not a message: {:?}", rows[index]);
+            };
+            assert_eq!(message.arrow, *arrow, "row {index}");
+        }
+        assert_eq!(rows[0], &SequenceRow::Message(SequenceMessage {
+            from: "L".to_owned(),
+            to: "T".to_owned(),
+            arrow: SequenceArrow::SolidClosed,
+            label: Some("execute tools".to_owned()),
+        }));
+        assert_eq!(rows[1], &SequenceRow::Message(SequenceMessage {
+            from: "T".to_owned(),
+            to: "L".to_owned(),
+            arrow: SequenceArrow::DottedClosed,
+            label: Some("ToolResult".to_owned()),
+        }));
+        let art = render_mermaid_unicode(source, 48, MermaidLimits::default()).unwrap();
+        assert_eq!(
+            art.chunks[0].join("\n"),
+            "sequenceDiagram\n\
+L ── T\n\
+──────\n\
+│ L │──▶│ T : execute tools │\n\
+│ T │···▶│ L : ToolResult │"
+        );
+    }
+
+    #[test]
+    fn sequence_bare_header_and_aliases_are_accepted() {
+        let chart = parse_mermaid(
+            "sequence\nparticipant A as \"Alice\"\nA ->> B: hi",
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(chart.nodes.len(), 2);
+        assert_eq!(chart.nodes[0].label, "Alice");
+        let art = render_mermaid_unicode(
+            "sequence\nparticipant A as \"Alice\"\nA ->> B: hi",
+            48,
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::Sequence);
+        assert_eq!(art.chunks[0][1], "Alice ── B");
+    }
+
+    #[test]
+    fn sequence_compact_arrow_forms_parse() {
+        let parsed = parse_sequence_diagram(
+            "sequenceDiagram\nA->>B: sync\nB-->>A: reply\nC-)D: open\nE-->F: dotted\nG-xH: cross",
+            MermaidLimits::default(),
+        )
+        .unwrap();
+        let arrows: Vec<_> = parsed
+            .rows
+            .iter()
+            .map(|row| match row {
+                SequenceRow::Message(message) => Some(message.arrow),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            arrows,
+            vec![
+                Some(SequenceArrow::SolidClosed),
+                Some(SequenceArrow::DottedClosed),
+                Some(SequenceArrow::SolidOpen),
+                Some(SequenceArrow::DottedOpen),
+                Some(SequenceArrow::SolidCross),
+            ]
+        );
+    }
+
+    #[test]
+    fn sequence_diagram_parse_mermaid_maps_participants_and_messages() {
+        let chart = parse_mermaid(SEQUENCE_SOURCE, MermaidLimits::default()).unwrap();
+        assert_eq!(
+            chart
+                .nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("A", "Alice"), ("B", "Bob")]
+        );
+        assert_eq!(chart.edges.len(), 5);
+        assert_eq!(chart.edges[0].from, "A");
+        assert_eq!(chart.edges[0].to, "B");
+        assert_eq!(chart.edges[0].label.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn sequence_diagram_limits_are_enforced() {
+        let err = parse_sequence_diagram(
+            "sequenceDiagram\nparticipant A\nparticipant B\nparticipant C",
+            MermaidLimits {
+                max_nodes: 2,
+                ..MermaidLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, MermaidDiagnosticKind::OversizeGraph);
+        assert!(err.message.contains("participant limit"), "{}", err.message);
+
+        let err = parse_sequence_diagram(
+            "sequenceDiagram\nA ->> B: one\nA ->> B: two",
+            MermaidLimits {
+                max_edges: 1,
+                ..MermaidLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, MermaidDiagnosticKind::OversizeGraph);
+        assert!(err.message.contains("message limit"), "{}", err.message);
+
+        let err = render_mermaid_unicode(
+            SEQUENCE_SOURCE,
+            48,
+            MermaidLimits {
+                max_output_cells: 4,
+                ..MermaidLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, MermaidDiagnosticKind::OutputLimit);
+    }
+
+    #[test]
+    fn sequence_multibyte_block_keywords_do_not_panic() {
+        // Regression: `keyword_tail` sliced `statement[..len]` at the keyword
+        // byte length without checking the char boundary, so a CJK statement
+        // like `loop 每个模型回合` (byte 10 lands inside 个) panicked while
+        // being checked against the 10-byte `autonumber` keyword. Unknown
+        // block keywords must degrade to plain rows, never panic.
+        let source = "sequenceDiagram\n\
+U->>AP: prompt(text)\n\
+loop 每个模型回合\n\
+AP->>SE: run(prompt)\n\
+alt 有工具调用\n\
+SE->>TL: 执行工具\n\
+else 无工具调用\n\
+SE-->>AP: RunResult\n\
+end\n\
+AP-->>U: 渲染结果\n";
+        let parsed = parse_sequence_diagram(source, MermaidLimits::default()).unwrap();
+        let rows: Vec<_> = parsed.rows.iter().collect();
+        assert_eq!(rows.len(), 9, "{rows:?}");
+        assert!(matches!(rows[1], SequenceRow::Plain(p) if p == "loop 每个模型回合"));
+        assert!(matches!(rows[3], SequenceRow::Plain(p) if p == "alt 有工具调用"));
+        assert!(matches!(rows[5], SequenceRow::Plain(p) if p == "else 无工具调用"));
+        assert!(matches!(rows[7], SequenceRow::Plain(p) if p == "end"));
+        let art = render_mermaid_unicode(source, 48, MermaidLimits::default()).unwrap();
+        assert_eq!(art.kind, MermaidDiagramKind::Sequence);
+        let text = art.chunks[0].join("\n");
+        assert!(text.contains("loop 每个模型回合"), "{text}");
+        assert!(text.contains("AP : prompt(text)"), "{text}");
+        assert!(text.contains("SE : run(prompt)"), "{text}");
+    }
+
+    #[test]
+    fn over_budget_sequence_diagram_keeps_output_limit_diagnostic() {
+        // Sequence diagrams are NOT participant-split (rows align against the
+        // widest participant label, see render_sequence_diagram), so an
+        // over-budget sequence must keep the OutputLimit diagnostic even
+        // though flowcharts and class diagrams split into bounded panels.
+        let source = format!("sequenceDiagram\n{}", "A ->> B: m\n".repeat(1_000));
+        let limits = MermaidLimits {
+            max_edges: 2_048,
+            ..MermaidLimits::default()
+        };
+        let err = render_mermaid_unicode(&source, 48, limits).unwrap_err();
+        assert_eq!(err.kind, MermaidDiagnosticKind::OutputLimit);
+        assert!(err.message.contains("needs"), "{}", err.message);
+    }
+
+    #[test]
+    fn unsupported_mermaid_kinds_still_fall_back_to_diagnostics() {
+        for source in [
+            "pie\n\"Breakfast\" 5\n\"Lunch\" 3",
+            "gantt\ntitle A Gantt Diagram",
+            "stateDiagram-v2\nA --> B",
+        ] {
+            let err = parse_mermaid(source, MermaidLimits::default()).unwrap_err();
+            assert_eq!(
+                err.kind,
+                MermaidDiagnosticKind::UnsupportedDiagram,
+                "{source}: {err:?}"
+            );
+            let err = render_mermaid_unicode(source, 48, MermaidLimits::default()).unwrap_err();
+            assert_eq!(
+                err.kind,
+                MermaidDiagnosticKind::UnsupportedDiagram,
+                "{source}: {err:?}"
+            );
+        }
     }
 }

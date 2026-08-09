@@ -7,9 +7,12 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -20,8 +23,8 @@ use crate::models_config::ModelRequestAuth;
 use crate::session_run_blueprint::RunSessionBlueprint;
 use crate::output::{parse_thinking_level, thinking_level_str, warn_line};
 use pi_coding::{
-    Application, BranchContext, DEFAULT_COMPACTION_SETTINGS, ExtensionMode, ResourceManagerOptions,
-    SessionOptions,
+    Application, ApplicationRuntimeFactory, BranchContext, DEFAULT_COMPACTION_SETTINGS,
+    ExtensionMode, ResourceManagerOptions, SessionOptions,
 };
 
 static OFFLINE: AtomicBool = AtomicBool::new(false);
@@ -48,6 +51,267 @@ pub struct RunSession {
     /// collected for interactive TUI display. Empty for non-interactive modes
     /// where warnings are emitted directly to stderr instead.
     pub startup_warnings: Vec<String>,
+    /// Cloneable factory for building additional session runtimes for the Web
+    /// control plane (`session_run::build_session` policy from a sanitized
+    /// clone of the startup CLI). Consumed by `modes::listen`.
+    pub spawner: RunSessionSpawner,
+}
+
+/// Builds manager-owned session runtimes for the Web/listen control plane.
+///
+/// Children are built with the SAME production policy as startup
+/// (`RunSessionBlueprint` + `ApplicationRuntimeFactory`) from a sanitized
+/// clone of the startup [`Cli`], so auth resolver, orchestration, goal,
+/// resources, and extension approval isolation are preserved — without
+/// re-running process-global catalog loads or clearing runtime API keys.
+///
+/// Every child gets its own `Application` and a NON-INTERACTIVE extension UI
+/// host (`extension_ui: None` in the blueprint): secondary Web-only sessions
+/// must never share the primary TUI's approval slot, and approval-required
+/// tools fail closed instead of hanging or routing to the wrong session.
+#[derive(Clone)]
+pub struct RunSessionSpawner {
+    cli: Cli,
+    session_dir: PathBuf,
+}
+
+impl RunSessionSpawner {
+    pub(crate) fn from_startup(cli: &Cli, session_dir: PathBuf) -> Self {
+        Self {
+            cli: sanitize_cli_for_children(cli),
+            session_dir,
+        }
+    }
+
+    /// Open (resume) the persisted session at `path` as an independent
+    /// runtime. The target cwd, model, and history come from the recorded
+    /// session file (backend-authoritative), never from a frontend cache.
+    pub(crate) async fn open_resumed(
+        &self,
+        source: &Application,
+        path: &Path,
+    ) -> Result<crate::modes::session_runtime_manager::SessionSpawnResult> {
+        let prepared = pi_coding::PreparedSessionResume::prepare_path(path)
+            .with_context(|| format!("opening session {}", path.display()))?;
+        let recorded_cwd = prepared.target_cwd();
+        let mut target_cwd = source.session().cwd().to_path_buf();
+        if !recorded_cwd.as_os_str().is_empty() && recorded_cwd.exists() {
+            target_cwd = recorded_cwd.canonicalize().with_context(|| {
+                format!("resolving resumed working directory {}", recorded_cwd.display())
+            })?;
+        }
+        let blueprint = self.child_blueprint()?;
+        let options = child_session_options(source, &target_cwd);
+        let candidate = blueprint
+            .build_runtime_candidate(target_cwd.clone(), options, Some(prepared))
+            .await
+            .context("building resumed session runtime")?;
+        // The child blueprint carries the session dir, so the built session
+        // is already configured (ApplicationRuntimeCandidate.session is
+        // crate-private by design).
+        let application = Application::from_runtime_candidate(candidate).await?;
+        application.attach_runtime_factory(Arc::new(blueprint.clone()))?;
+        application.prepare_resumed_goal(false)?;
+        let (session_id, session_file) = application
+            .session()
+            .recorder_info()
+            .ok_or_else(|| anyhow!("resumed session has no recorder"))?;
+        setup_child_workflows(&application, &target_cwd, &session_id).await?;
+        Ok(crate::modes::session_runtime_manager::SessionSpawnResult {
+            session_id,
+            session_file: Some(session_file),
+            application,
+            extension_ui: ExtensionUiAdapter::default(),
+        })
+    }
+
+    /// Start a brand-new recorded session as an independent runtime. The
+    /// child inherits the source's model/thinking/auth resolver and its own
+    /// session-scoped workflow storage.
+    pub(crate) async fn new_session(
+        &self,
+        source: &Application,
+    ) -> Result<crate::modes::session_runtime_manager::SessionSpawnResult> {
+        let cwd = source.session().cwd().to_path_buf();
+        let blueprint = self.child_blueprint()?;
+        let options = child_session_options(source, &cwd);
+        let candidate = blueprint
+            .build_runtime_candidate(cwd.clone(), options, None)
+            .await
+            .context("building fresh session runtime")?;
+        let application = Application::from_runtime_candidate(candidate).await?;
+        application.attach_runtime_factory(Arc::new(blueprint.clone()))?;
+        let (session_id, session_file) = application
+            .session()
+            .recorder_info()
+            .ok_or_else(|| anyhow!("new session has no recorder"))?;
+        setup_child_workflows(&application, &cwd, &session_id).await?;
+        Ok(crate::modes::session_runtime_manager::SessionSpawnResult {
+            session_id,
+            session_file: Some(session_file),
+            application,
+            extension_ui: ExtensionUiAdapter::default(),
+        })
+    }
+
+    /// Fork the source session at `entry_id` into an independent runtime.
+    /// Mirrors the in-place `/fork` semantics: a branched session file is
+    /// created under the source's parent entry and the restored conversation
+    /// comes from that branch (backend recorder), not the frontend.
+    pub(crate) async fn fork_session(
+        &self,
+        source: &Application,
+        entry_id: &str,
+    ) -> Result<crate::modes::session_runtime_manager::SessionSpawnResult> {
+        let (source_path, _) = source
+            .session()
+            .recorder_info()
+            .ok_or_else(|| anyhow!("source session has no recorder"))?;
+        let tree = pi_coding::load_session_tree(Path::new(&source_path))
+            .with_context(|| format!("loading session {}", Path::new(&source_path).display()))?;
+        let selected = tree
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .ok_or_else(|| anyhow!("invalid entry id for fork: {entry_id}"))?;
+        if !matches!(selected.message, Some(pi_ai::Message::User(_))) {
+            bail!("invalid entry id for fork: {entry_id} (entry is not a user message)");
+        }
+        let Some(parent_id) = selected.parent_id.as_deref() else {
+            // Root entry: no branch to create; the fork starts fresh,
+            // mirroring the in-place fork's no-parent path.
+            return self.new_session(source).await;
+        };
+        let recorder = pi_coding::create_branched_session_in(
+            &source_path,
+            parent_id,
+            Some(&self.session_dir),
+        )?;
+        recorder.persist_now()?;
+        let branched = recorder.path();
+        self.open_resumed(source, &branched).await
+    }
+
+    /// Clone the source session's active leaf into an independent runtime
+    /// (mirrors in-place `/clone`).
+    pub(crate) async fn clone_session(
+        &self,
+        source: &Application,
+    ) -> Result<crate::modes::session_runtime_manager::SessionSpawnResult> {
+        let (source_path, _) = source
+            .session()
+            .recorder_info()
+            .ok_or_else(|| anyhow!("source session has no recorder"))?;
+        let leaf_id = source
+            .session()
+            .session_tree()?
+            .active_leaf_id
+            .ok_or_else(|| anyhow!("cannot clone session: no current entry selected"))?;
+        let recorder =
+            pi_coding::create_branched_session_in(&source_path, &leaf_id, Some(&self.session_dir))?;
+        recorder.persist_now()?;
+        let branched = recorder.path();
+        self.open_resumed(source, &branched).await
+    }
+
+    /// Rebuild the child blueprint from the sanitized CLI. `extension_ui` is
+    /// deliberately None so the child uses a per-session non-interactive
+    /// (fail-closed) approval host instead of the primary TUI adapter.
+    fn child_blueprint(&self) -> Result<RunSessionBlueprint> {
+        let (_, resource_options) = startup_resource_options(&self.cli, true)?;
+        let mut blueprint = RunSessionBlueprint::from_cli(&self.cli, resource_options, None);
+        blueprint.set_session_dir(self.session_dir.clone());
+        Ok(blueprint)
+    }
+}
+
+impl crate::modes::session_runtime_manager::SessionSpawner for RunSessionSpawner {
+    fn spawn(
+        &self,
+        request: crate::modes::session_runtime_manager::SessionSpawnRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::modes::session_runtime_manager::SessionSpawnResult>> + Send>>
+    {
+        let this = self.clone();
+        Box::pin(async move {
+            match &request.kind {
+                crate::modes::session_runtime_manager::SessionSpawnKind::Open { resume_path } => {
+                    this.open_resumed(&request.source, resume_path).await
+                }
+                crate::modes::session_runtime_manager::SessionSpawnKind::Fresh => {
+                    this.new_session(&request.source).await
+                }
+                crate::modes::session_runtime_manager::SessionSpawnKind::Fork { entry_id } => {
+                    this.fork_session(&request.source, entry_id).await
+                }
+                crate::modes::session_runtime_manager::SessionSpawnKind::Clone => {
+                    this.clone_session(&request.source).await
+                }
+            }
+        })
+    }
+}
+
+/// Child `SessionOptions` derived from the source runtime's live snapshot,
+/// mirroring the cross-directory switch construction exactly.
+fn child_session_options(source: &Application, cwd: &Path) -> SessionOptions {
+    let options = source.session().child_session_options_snapshot();
+    SessionOptions {
+        model: options.model,
+        cwd: cwd.to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: options.thinking_level,
+        api_key: options.api_key,
+        compaction: source.session().compaction_settings(),
+        stream_options: options.stream_options,
+        tools: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: Some(options.stream_fn),
+        auth_resolver: options.auth_resolver,
+    }
+}
+
+/// Attach session-scoped workflow storage for a spawned child: same policy as
+/// startup (`setup_workflows` with roots namespaced by the child's session
+/// identity), so per-session Workflow RPC state is isolated.
+async fn setup_child_workflows(
+    application: &Application,
+    cwd: &Path,
+    session_id: &str,
+) -> Result<()> {
+    let agent_dir = pi_coding::agent_dir_path();
+    let (store_root, worktree_root) = workflow_storage_roots(cwd, &agent_dir, session_id);
+    application
+        .setup_workflows(cwd.to_path_buf(), store_root, worktree_root)
+        .await
+        .context("binding workflow storage for spawned session")?;
+    Ok(())
+}
+
+/// The child CLI inherits every startup policy (tools, extensions, trust,
+/// approval mode, model scoping, profiles) but drops per-run baggage: no
+/// nested listener, no resume/open/fork selection, no initial prompts, and
+/// recording is FORCED so every manager-owned runtime has a durable session
+/// id (the routing registry must never key an empty id).
+fn sanitize_cli_for_children(cli: &Cli) -> Cli {
+    let mut clone = cli.clone();
+    clone.listen = None;
+    clone.listen_token_file = None;
+    clone.listen_allow_insecure_remote = false;
+    clone.prompt = Vec::new();
+    clone.resume = None;
+    clone.session = None;
+    clone.fork = None;
+    clone.continue_latest = false;
+    clone.session_id = None;
+    clone.no_session = false;
+    clone.name = None;
+    clone.export = None;
+    clone.output = None;
+    clone.jsonl = false;
+    clone.list_models = None;
+    clone.print = false;
+    clone
 }
 
 pub(crate) fn extension_mode(cli: &Cli) -> ExtensionMode {
@@ -107,8 +371,85 @@ async fn first_authenticated_model(
     Ok(None)
 }
 
+/// Resolve the initial model for a session: explicit CLI spec, an
+/// authenticated resumed model, the authenticated settings default, then the
+/// first authenticated model. Returns `(model, api_key, parsed_think)` where
+/// `parsed_think` is the reasoning-level suffix extracted from an explicit
+/// model spec (empty when none was present).
+///
+/// Shared by [`build_session`] and the ACP agent mode so both entrypoints
+/// resolve models with identical precedence.
+pub(crate) async fn resolve_initial_model(
+    cli: &Cli,
+    settings: &pi_coding::Settings,
+    resume_ctx: Option<&BranchContext>,
+) -> Result<(pi_ai::Model, String, String)> {
+    let explicit_model = cli.model.as_deref().filter(|spec| !spec.is_empty());
+    let explicit_key = cli.api_key.as_deref();
+    let mut parsed_think = String::new();
+    let mut selected: Option<(pi_ai::Model, ModelRequestAuth)> = None;
+    let explicit_model_spec = explicit_model.map(|spec| {
+        let Some(provider) = cli.provider.as_deref() else {
+            return spec.to_owned();
+        };
+        let prefix = format!("{provider}/");
+        if spec.get(..prefix.len()).is_some_and(|value| value.eq_ignore_ascii_case(&prefix)) {
+            spec.to_owned()
+        } else {
+            format!("{provider}/{spec}")
+        }
+    });
+    if let Some(spec) = explicit_model_spec.as_deref() {
+        let (model, level) = resolve_model_spec(spec)?;
+        parsed_think = level;
+        selected = authenticated_model(model, explicit_key).await?;
+        if selected.is_none() {
+            bail!("Model {spec:?} is not available for the resolved credential");
+        }
+    } else if let Some(ctx) = resume_ctx
+        && let (Some(provider), Some(id)) = (ctx.provider.as_ref(), ctx.model_id.as_ref())
+    {
+        match pi_ai::get_model(provider, id) {
+            Some(model) => match authenticated_model(model, explicit_key).await? {
+                Some(resolved) => selected = Some(resolved),
+                None => warn_line(&format!(
+                    "Warning: Could not restore model {provider}/{id} (no auth configured)"
+                )),
+            },
+            None => warn_line(&format!("Warning: Could not restore model {provider}/{id}")),
+        }
+    }
+    if selected.is_none()
+        && let (Some(provider), Some(id)) = (
+            settings
+                .default_provider
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+            settings
+                .default_model
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+        )
+        && let Some(model) = pi_ai::get_model(provider, id)
+    {
+        selected = authenticated_model(model, explicit_key).await?;
+    }
+    if selected.is_none() {
+        selected = first_authenticated_model(explicit_key).await?;
+    }
+    let (model, auth) = selected.ok_or_else(|| {
+        anyhow!(
+            "No authenticated models available. Configure auth.json, models.json, a provider API-key environment variable, or pass --model with --api-key."
+        )
+    })?;
+    if let Some(key) = explicit_key.filter(|key| !key.trim().is_empty()) {
+        crate::models_config::set_runtime_api_key(&model.provider, key);
+    }
+    Ok((model, auth.api_key, parsed_think))
+}
 
-fn resolve_initial_thinking_level(
+
+pub(crate) fn resolve_initial_thinking_level(
     cli_level: Option<&str>,
     model_level: &str,
     resume: Option<&BranchContext>,
@@ -269,6 +610,68 @@ fn expand_session_dir_tilde(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Environment variable honored for the active config profile when the
+/// `--profile` flag is absent.
+pub(crate) const PROFILE_ENV: &str = "PI_PROFILE";
+
+/// Resolve the active config profile from the CLI and `PI_PROFILE`, validate
+/// it, and install it process-wide so every agent-dir-derived path (settings,
+/// auth, sessions, memory, skills, workflows) relocates under
+/// `<base>/profiles/<name>`. `default`, empty, and whitespace select the
+/// default profile (no relocation). Must run before any dispatch that
+/// resolves an agent-dir-derived path.
+pub(crate) fn activate_profile(cli: &Cli) -> Result<()> {
+    let profile = resolve_active_profile(cli.profile.as_deref())?;
+    pi_coding::set_active_profile(profile.as_deref());
+    Ok(())
+}
+
+/// Resolve the active config profile name: the CLI `--profile` flag wins over
+/// the `PI_PROFILE` environment variable; `default`, empty, or whitespace
+/// selects the default profile (no relocation). Named profiles are validated
+/// with an actionable error.
+pub(crate) fn resolve_active_profile(cli_profile: Option<&str>) -> Result<Option<String>> {
+    let env_profile = std::env::var(PROFILE_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    resolve_profile_precedence(
+        cli_profile.map(str::trim).filter(|name| !name.is_empty()),
+        env_profile.as_deref(),
+    )
+}
+
+/// Pure precedence resolver for [`resolve_active_profile`], factored out so
+/// CLI-over-env precedence and name validation are unit-testable without
+/// mutating process environment.
+fn resolve_profile_precedence(
+    cli_profile: Option<&str>,
+    env_profile: Option<&str>,
+) -> Result<Option<String>> {
+    match cli_profile.or(env_profile) {
+        Some(name) if name == "default" => Ok(None),
+        Some(name) => {
+            crate::args::validate_profile_name(name).map_err(anyhow::Error::msg)?;
+            Ok(Some(name.to_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Startup TTL for expired-session pruning: the `sessionTtlDays` setting when
+/// present, otherwise [`pi_coding::DEFAULT_SESSION_TTL_DAYS`]. Settings
+/// validation rejects `0`, and zero defensively falls back to the default
+/// here rather than ever pruning everything.
+fn session_ttl_from_settings(settings: &pi_coding::Settings) -> Duration {
+    settings
+        .session_ttl_days
+        .filter(|days| *days > 0)
+        .map(|days| Duration::from_secs(days.saturating_mul(24 * 60 * 60)))
+        .unwrap_or(Duration::from_secs(
+            pi_coding::DEFAULT_SESSION_TTL_DAYS * 24 * 60 * 60,
+        ))
+}
+
 fn resolve_session_argument(
     argument: &str,
     cwd: &Path,
@@ -310,19 +713,59 @@ fn resolve_session_argument(
 
 
 
-/// Build the live [`Session`] from the parsed CLI flags, applying resume,
-/// model restoration, and recording exactly as the Go CLI does.
-fn workflow_storage_roots(cwd: &Path, agent_dir: &Path) -> (PathBuf, PathBuf) {
+/// Stable per-process fallback identity for `--no-session` runs, where no
+/// recorder exists to bind workflow storage to. Each process gets its own
+/// namespace, so a fresh run never sees another run's workflows.
+pub(crate) fn fallback_session_identity() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| format!("proc-{}", uuid::Uuid::now_v7()))
+}
+
+/// Resolve per-session workflow storage roots: the workflow store and the
+/// managed worktree root for the given session identity. The namespace is
+/// session-scoped (repository digest + session id for git directories, session
+/// id alone otherwise), so a resumed session (same session id) restores its
+/// workflows while a new session id in the same repository starts empty.
+pub(crate) fn workflow_storage_roots(cwd: &Path, agent_dir: &Path, session_id: &str) -> (PathBuf, PathBuf) {
     let namespace = pi_coding::workflow_worktree::WorkflowWorktreeManager::new(cwd)
-        .repository_namespace()
-        .unwrap_or_else(|_| "non-git".to_owned());
+        .session_namespace(session_id);
     (
         agent_dir.join("workflows").join(&namespace),
         agent_dir.join("workflow-worktrees").join(namespace),
     )
 }
 
-pub async fn build_session(cli: &Cli) -> Result<RunSession> {
+/// Rebind workflow storage to the ACTIVE session identity after a session
+/// cutover (`/new`, `/fresh`, resume, fork, import). `setup_workflows` runs
+/// once at startup with the initial session id; without this rebind every
+/// later session in the process would keep showing (and mutating) the first
+/// session's workflows. The roots are recomputed from the live recorder id +
+/// cwd + agent dir, so a fresh session starts with an empty workflow list
+/// while a resumed session (same id) restores its own workflows. No-op when
+/// workflows were never configured (e.g. RPC-only applications).
+pub(crate) async fn rebind_workflows_for_active_session(
+    application: &pi_coding::Application,
+) -> Result<()> {
+    if application.workflow_manager().is_err() {
+        return Ok(());
+    }
+    let Some((session_id, _)) = application.session().recorder_info() else {
+        return Ok(());
+    };
+    let cwd = application.session().cwd().to_path_buf();
+    let agent_dir = pi_coding::agent_dir_path();
+    let (workflow_store_root, workflow_worktree_root) =
+        workflow_storage_roots(&cwd, &agent_dir, &session_id);
+    application
+        .rebind_workflows(workflow_store_root, workflow_worktree_root)
+        .await?;
+    Ok(())
+}
+
+/// Load the process-wide model catalog: custom `models.json` entries, the
+/// Radius catalog (best-effort), the llama.cpp router catalog, and a clean
+/// runtime-key slate. Shared by [`build_session`] and the ACP agent mode.
+pub(crate) async fn load_startup_catalogs(cli: &Cli) -> Result<()> {
     crate::models_config::load_custom_models()?;
     if let Err(error) = crate::models_config::load_radius_catalog(!offline()).await
         && cli.verbose
@@ -344,6 +787,13 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     for provider in pi_ai::get_providers() {
         crate::models_config::clear_runtime_api_key(&provider);
     }
+    Ok(())
+}
+
+/// Resolve the canonical working directory and the resource-manager options
+/// for a run, honoring CLI flags. `headless` is caller-supplied: interactive
+/// TUI runs pass false, protocol modes (rpc/json/acp) pass true.
+pub(crate) fn startup_resource_options(cli: &Cli, headless: bool) -> Result<(PathBuf, ResourceManagerOptions)> {
     let mut cwd: PathBuf = match &cli.cwd {
         Some(cwd) => cwd.clone(),
         None => std::env::current_dir().context("getting current directory")?,
@@ -354,21 +804,8 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     if let Some(id) = cli.session_id.as_deref() {
         pi_coding::validate_session_id(id)?;
     }
-
     let mut resource_options = ResourceManagerOptions::new(&cwd);
-    let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let stdout_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    resource_options.headless = matches!(cli.mode, Some(crate::args::Mode::Json | crate::args::Mode::Rpc))
-        || cli.is_print_mode()
-        || !stdin_tty
-        || !stdout_tty;
-    // Interactive TUI mode: capture settings diagnostics so they can be shown
-    // in the UI after startup instead of vanishing into pre-TUI stderr. Non-
-    // interactive modes keep the existing stderr behavior.
-    let is_tui = !resource_options.headless;
-    if is_tui {
-        pi_coding::arm_settings_diagnostic_capture();
-    }
+    resource_options.headless = headless;
     resource_options.project_trust_override = if cli.approve {
         Some(true)
     } else if cli.no_approve {
@@ -385,6 +822,27 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     resource_options.disable_prompt_templates = cli.no_prompt_templates;
     resource_options.disable_themes = cli.no_themes;
     resource_options.disable_context_files = cli.no_context_files;
+    Ok((cwd, resource_options))
+}
+
+/// Build the live [`Session`] from the parsed CLI flags, applying resume,
+/// model restoration, and recording exactly as the Go CLI does.
+pub async fn build_session(cli: &Cli) -> Result<RunSession> {
+    load_startup_catalogs(cli).await?;
+    let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let stdout_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let headless = matches!(cli.mode, Some(crate::args::Mode::Json | crate::args::Mode::Rpc))
+        || cli.is_print_mode()
+        || !stdin_tty
+        || !stdout_tty;
+    let (mut cwd, resource_options) = startup_resource_options(cli, headless)?;
+    // Interactive TUI mode: capture settings diagnostics so they can be shown
+    // in the UI after startup instead of vanishing into pre-TUI stderr. Non-
+    // interactive modes keep the existing stderr behavior.
+    let is_tui = !headless;
+    if is_tui {
+        pi_coding::arm_settings_diagnostic_capture();
+    }
     let mut blueprint = RunSessionBlueprint::from_cli(
         cli,
         resource_options,
@@ -477,68 +935,8 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
 
     // 3. Resolve the initial model: explicit CLI, authenticated resumed model,
     //    authenticated settings default, then the first authenticated model.
-    let explicit_model = cli.model.as_deref().filter(|spec| !spec.is_empty());
-    let explicit_key = cli.api_key.as_deref();
-    let mut parsed_think = String::new();
-    let mut selected: Option<(pi_ai::Model, ModelRequestAuth)> = None;
-    let explicit_model_spec = explicit_model.map(|spec| {
-        let Some(provider) = cli.provider.as_deref() else {
-            return spec.to_owned();
-        };
-        let prefix = format!("{provider}/");
-        if spec.get(..prefix.len()).is_some_and(|value| value.eq_ignore_ascii_case(&prefix)) {
-            spec.to_owned()
-        } else {
-            format!("{provider}/{spec}")
-        }
-    });
-    if let Some(spec) = explicit_model_spec.as_deref() {
-        let (model, level) = resolve_model_spec(spec)?;
-        parsed_think = level;
-        selected = authenticated_model(model, explicit_key).await?;
-        if selected.is_none() {
-            bail!("Model {spec:?} is not available for the resolved credential");
-        }
-    } else if let Some(ctx) = &resume_ctx
-        && let (Some(provider), Some(id)) = (ctx.provider.as_ref(), ctx.model_id.as_ref())
-    {
-        match pi_ai::get_model(provider, id) {
-            Some(model) => match authenticated_model(model, explicit_key).await? {
-                Some(resolved) => selected = Some(resolved),
-                None => warn_line(&format!(
-                    "Warning: Could not restore model {provider}/{id} (no auth configured)"
-                )),
-            },
-            None => warn_line(&format!("Warning: Could not restore model {provider}/{id}")),
-        }
-    }
-    if selected.is_none()
-        && let (Some(provider), Some(id)) = (
-            settings
-                .default_provider
-                .as_deref()
-                .filter(|value| !value.is_empty()),
-            settings
-                .default_model
-                .as_deref()
-                .filter(|value| !value.is_empty()),
-        )
-        && let Some(model) = pi_ai::get_model(provider, id)
-    {
-        selected = authenticated_model(model, explicit_key).await?;
-    }
-    if selected.is_none() {
-        selected = first_authenticated_model(explicit_key).await?;
-    }
-    let (model, auth) = selected.ok_or_else(|| {
-        anyhow!(
-            "No authenticated models available. Configure auth.json, models.json, a provider API-key environment variable, or pass --model with --api-key."
-        )
-    })?;
-    if let Some(key) = explicit_key.filter(|key| !key.trim().is_empty()) {
-        crate::models_config::set_runtime_api_key(&model.provider, key);
-    }
-    let api_key = auth.api_key;
+    let (model, api_key, parsed_think) =
+        resolve_initial_model(cli, &settings, resume_ctx.as_ref()).await?;
 
     // 4. Thinking priority: --think, model suffix, resumed recorded thinking,
     //    settings default, then the existing medium default.
@@ -627,6 +1025,50 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         return Err(error);
     }
 
+    // Best-effort TTL cleanup of expired native session files, run after
+    // resume/start resolution so the current run's session file is known and
+    // skipped (a resumed session may itself be older than the TTL). The prune
+    // swallows I/O errors, so cleanup can never fail startup.
+    {
+        let native_root = pi_coding::native_sessions_root();
+        let mut prune_roots = Vec::new();
+        if !session_dir.starts_with(&native_root) {
+            prune_roots.push(session_dir.clone());
+        }
+        prune_roots.push(native_root);
+        let mut prune_skip = Vec::new();
+        if let Some(path) = &resume_path {
+            prune_skip.push(path.clone());
+        }
+        if let Some((_, path)) = session.recorder_info() {
+            prune_skip.push(path);
+        }
+        // Directory-level guard: the prune best-effort-removes emptied
+        // per-cwd dirs, and a just-started auto-id recorder has NO file on
+        // disk yet, so its dir is empty and would be deleted before the first
+        // flush (ENOENT on the next persist). Never remove this run's session
+        // dir root, nor the parent of the current/resumed session file.
+        let mut prune_dir_skip = Vec::new();
+        prune_dir_skip.push(session_dir.clone());
+        if let Some(path) = &resume_path {
+            if let Some(parent) = path.parent() {
+                prune_dir_skip.push(parent.to_path_buf());
+            }
+        }
+        if let Some((_, path)) = session.recorder_info() {
+            if let Some(parent) = path.parent() {
+                prune_dir_skip.push(parent.to_path_buf());
+            }
+        }
+        let _ = pi_coding::prune_expired_sessions(
+            &prune_roots,
+            std::time::SystemTime::now(),
+            session_ttl_from_settings(&settings),
+            &prune_skip,
+            &prune_dir_skip,
+        );
+    }
+
     let application = Application::new_with_extensions(session, runtime, permissions).await;
     application.attach_runtime_factory(Arc::new(blueprint.clone()))?;
     if resume_path.is_some() {
@@ -642,7 +1084,16 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         }
     }
     let agent_dir = pi_coding::agent_dir_path();
-    let (workflow_store_root, workflow_worktree_root) = workflow_storage_roots(&cwd, &agent_dir);
+    // Workflow storage is scoped to the owning session: the recorder's id for
+    // recorded sessions (new or resumed), a stable per-process token for
+    // `--no-session` runs where no recorder exists.
+    let session_identity = application
+        .session()
+        .recorder_info()
+        .map(|(id, _)| id)
+        .unwrap_or_else(|| fallback_session_identity().to_owned());
+    let (workflow_store_root, workflow_worktree_root) =
+        workflow_storage_roots(&cwd, &agent_dir, &session_identity);
     if let Err(error) = application
         .setup_workflows(cwd.clone(), workflow_store_root, workflow_worktree_root)
         .await
@@ -662,6 +1113,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         model,
         scoped_models,
         startup_warnings,
+        spawner: RunSessionSpawner::from_startup(cli, session_dir),
     })
 }
 
@@ -841,7 +1293,112 @@ mod tests {
     }
 
     #[test]
-    fn workflow_storage_roots_are_stable_and_repository_scoped() {
+    fn profile_precedence_cli_wins_over_env() {
+        // CLI --profile beats PI_PROFILE.
+        assert_eq!(
+            resolve_profile_precedence(Some("cli-work"), Some("env-work"))
+                .expect("CLI wins"),
+            Some("cli-work".to_owned())
+        );
+        // Env is used when no flag is present.
+        assert_eq!(
+            resolve_profile_precedence(None, Some("env-work")).expect("env honored"),
+            Some("env-work".to_owned())
+        );
+        // Neither source selects the default profile.
+        assert_eq!(
+            resolve_profile_precedence(None, None).expect("no profile"),
+            None
+        );
+        // The flag position does not matter; empty values are filtered before
+        // this resolver runs.
+        assert_eq!(
+            resolve_profile_precedence(Some("work"), Some("")).expect("empty env ignored"),
+            Some("work".to_owned())
+        );
+    }
+
+    #[test]
+    fn profile_precedence_default_selects_default_profile() {
+        assert_eq!(
+            resolve_profile_precedence(Some("default"), None).expect("explicit default"),
+            None
+        );
+        assert_eq!(
+            resolve_profile_precedence(None, Some("default")).expect("env default"),
+            None
+        );
+        // The CLI flag wins over the environment in either direction.
+        assert_eq!(
+            resolve_profile_precedence(Some("work"), Some("default"))
+                .expect("named CLI beats env default"),
+            Some("work".to_owned())
+        );
+        assert_eq!(
+            resolve_profile_precedence(Some("default"), Some("env-work"))
+                .expect("explicit CLI default beats env profile"),
+            None
+        );
+    }
+
+    #[test]
+    fn profile_precedence_validates_names_actionably() {
+        for (cli, env) in [
+            (Some("bad/name"), None),
+            (None, Some("bad/name")),
+            (Some("with space"), None),
+        ] {
+            let error = resolve_profile_precedence(cli, env)
+                .expect_err("invalid profile name must fail");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("profile name") && message.contains("letters, digits"),
+                "error must be actionable, got: {message}"
+            );
+        }
+        // A valid CLI profile shadows an invalid environment value entirely.
+        assert_eq!(
+            resolve_profile_precedence(Some("x"), Some("bad/name")).expect("CLI wins"),
+            Some("x".to_owned())
+        );
+    }
+
+    #[test]
+    fn profile_precedence_accepts_valid_and_max_length_names() {
+        let max = "a".repeat(crate::args::MAX_PROFILE_NAME_LENGTH);
+        assert_eq!(
+            resolve_profile_precedence(Some(&max), None).expect("max length valid"),
+            Some(max)
+        );
+        assert_eq!(
+            resolve_profile_precedence(Some("my-profile_2"), None).expect("charset valid"),
+            Some("my-profile_2".to_owned())
+        );
+    }
+
+    #[test]
+    fn session_ttl_defaults_to_30_days_and_honors_the_setting() {
+        assert_eq!(
+            session_ttl_from_settings(&Settings::default()),
+            Duration::from_secs(30 * 24 * 60 * 60)
+        );
+        let mut settings = Settings::default();
+        settings.session_ttl_days = Some(7);
+        assert_eq!(
+            session_ttl_from_settings(&settings),
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
+        // Zero (rejected by settings validation) defensively falls back to the
+        // default rather than pruning everything.
+        settings.session_ttl_days = Some(0);
+        assert_eq!(
+            session_ttl_from_settings(&settings),
+            Duration::from_secs(30 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn workflow_storage_roots_are_stable_and_session_scoped() {
         fn init_repo(path: &Path) {
             fs::create_dir_all(path).expect("repo directory");
             for args in [
@@ -879,12 +1436,22 @@ mod tests {
         init_repo(&first);
         init_repo(&second);
 
-        let first_roots = workflow_storage_roots(&first, &agent_dir);
-        assert_eq!(first_roots, workflow_storage_roots(&first, &agent_dir));
-        let second_roots = workflow_storage_roots(&second, &agent_dir);
-        assert_ne!(first_roots, second_roots);
-        assert_eq!(first_roots.0.parent(), Some(agent_dir.join("workflows").as_path()));
-        assert_eq!(first_roots.1.parent(), Some(agent_dir.join("workflow-worktrees").as_path()));
+        // Same session id resolves to the same roots, deterministically.
+        let first_roots = workflow_storage_roots(&first, &agent_dir, "session-a");
+        assert_eq!(first_roots, workflow_storage_roots(&first, &agent_dir, "session-a"));
+        // Different session ids in the same repository are isolated.
+        assert_ne!(first_roots, workflow_storage_roots(&first, &agent_dir, "session-b"));
+        // Different repositories keep distinct namespaces.
+        assert_ne!(first_roots, workflow_storage_roots(&second, &agent_dir, "session-a"));
+        assert!(first_roots.0.starts_with(agent_dir.join("workflows")));
+        assert!(first_roots.1.starts_with(agent_dir.join("workflow-worktrees")));
+
+        // Non-git directories still resolve a valid, session-scoped namespace.
+        let plain = sandbox.path().join("plain");
+        fs::create_dir_all(&plain).expect("plain directory");
+        let plain_roots = workflow_storage_roots(&plain, &agent_dir, "session-a");
+        assert_eq!(plain_roots, workflow_storage_roots(&plain, &agent_dir, "session-a"));
+        assert_ne!(plain_roots, workflow_storage_roots(&plain, &agent_dir, "session-b"));
     }
 
     #[test]
@@ -988,19 +1555,21 @@ mod tests {
             provider: "test-provider".to_owned(),
             ..Model::default()
         };
-        let bundled = AgentDefinition {
-            name: "task".to_owned(),
-            description: "bundled task agent".to_owned(),
-            system_prompt: "do the task".to_owned(),
-            tools: Some(Vec::new()),
-            autoload_skills: Vec::new(),
-            // No definition model list — must fall through to parent.
-            model: None,
-            thinking_level: Some(ThinkingLevel::Off),
-            source: AgentDefinitionSource::Bundled,
-            path: None,
-            trusted: true,
-        };
+        let bundled = AgentDefinition { name: "task".to_owned(),
+        description: "bundled task agent".to_owned(),
+        system_prompt: "do the task".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        // No definition model list — must fall through to parent.
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None };
         let snapshot = ResourceSnapshot {
             generation: 1,
             cwd: artifacts.path().to_path_buf(),
@@ -1072,6 +1641,7 @@ mod tests {
                     agent: "task".to_owned(),
                     assignment: "inherit parent model".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 }],
             )
             .expect("spawn");
@@ -1140,9 +1710,17 @@ mod tests {
                 autoload_skills: Vec::new(),
                 model: None,
                 thinking_level: Some(ThinkingLevel::Off),
+                max_turns: None,
+                max_tool_calls: None,
+                timeout_secs: None,
+                disallowed_tools: Vec::new(),
+                capability_ceiling: None,
                 source: pi_coding::AgentDefinitionSource::Bundled,
                 path: None,
                 trusted: true,
+                kind: pi_coding::AgentDefinitionKind::Agent,
+                personality: None,
+                soft_budget: None,
             }]),
             artifacts.path(),
         );
@@ -1194,9 +1772,17 @@ mod tests {
                 autoload_skills: Vec::new(),
                 model: None,
                 thinking_level: Some(ThinkingLevel::Off),
+                max_turns: None,
+                max_tool_calls: None,
+                timeout_secs: None,
+                disallowed_tools: Vec::new(),
+                capability_ceiling: None,
                 source: pi_coding::AgentDefinitionSource::Bundled,
                 path: None,
                 trusted: true,
+                kind: pi_coding::AgentDefinitionKind::Agent,
+                personality: None,
+                soft_budget: None,
             }]),
             artifacts.path(),
         );

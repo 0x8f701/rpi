@@ -30,6 +30,12 @@ pub struct SelectorSettings {
     pub auto_select_threshold: i32,
     pub confidence_margin: i32,
     pub classifier: SelectorClassifierSettings,
+    /// Automatic interaction-mode classification for user prompts
+    /// (`selector.autoMode`): `off` disables it, `suggest` surfaces a status
+    /// hint after a detected code task / long-running goal, `auto` additionally
+    /// creates a todo DAG for detected code tasks (bounded by orchestration
+    /// being enabled and the todo list being empty).
+    pub auto_mode: AutoMode,
 }
 
 impl Default for SelectorSettings {
@@ -42,6 +48,7 @@ impl Default for SelectorSettings {
             auto_select_threshold: DEFAULT_AUTO_SELECT_THRESHOLD,
             confidence_margin: DEFAULT_CONFIDENCE_MARGIN,
             classifier: SelectorClassifierSettings::default(),
+            auto_mode: AutoMode::Suggest,
         }
     }
 }
@@ -64,6 +71,221 @@ impl Default for SelectorClassifierSettings {
             timeout_ms: DEFAULT_CLASSIFIER_TIMEOUT_MS,
         }
     }
+}
+
+/// Interaction mode the deterministic auto-mode classifier detects for a user
+/// prompt. The classification is advisory: `Question` keeps the normal
+/// plain-answer flow, `CodeTask` suggests (or auto-runs) a todo DAG, and
+/// `Goal` suggests tracking the request as a long-running goal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptMode {
+    /// Code task: implement/build/fix/refactor with code evidence.
+    CodeTask,
+    /// Plain question answered directly without orchestration.
+    #[default]
+    Question,
+    /// Long-running goal the user wants tracked and driven.
+    Goal,
+}
+
+impl PromptMode {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CodeTask => "code task",
+            Self::Question => "question",
+            Self::Goal => "long-running goal",
+        }
+    }
+}
+
+/// Behavior of the automatic interaction-mode classifier
+/// (`selector.autoMode`): off, status hint only, or auto-create the todo DAG
+/// for detected code tasks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoMode {
+    /// Classifier disabled; no hints and no auto todos.
+    Off,
+    /// Classify and show a status hint after the prompt (`Detected: ...`).
+    #[default]
+    Suggest,
+    /// `Suggest` plus auto-create (and start) a todo DAG for code tasks when
+    /// orchestration is enabled and no todo list exists yet.
+    Auto,
+}
+
+impl AutoMode {
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    #[must_use]
+    pub const fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// Strong code-task verbs that alone (without file-path or code-domain
+/// evidence) mark a prompt as a code task.
+const STRONG_CODE_TASK_VERBS: &[&str] = &[
+    "implement", "build", "refactor", "rewrite", "code", "program", "develop", "port",
+    "migrate", "debug", "fix", "patch",
+];
+
+/// General task-tool-style verbs; a match needs additional code evidence.
+const CODE_TASK_VERBS: &[&str] = &[
+    "add", "update", "modify", "remove", "delete", "optimize", "write", "create", "change",
+    "integrate", "wire", "extract", "split", "rename", "upgrade", "deprecate", "resolve",
+    "address", "revert", "reproduce", "scaffold", "configure", "implement", "build",
+    "refactor", "rewrite", "code", "program", "develop", "port", "migrate", "debug", "fix",
+    "patch",
+];
+
+/// File-path evidence: extensions and path prefixes commonly pointing at code.
+const CODE_PATH_MARKERS: &[&str] = &[
+    ".rs", ".ts", ".js", ".jsx", ".tsx", ".py", ".go", ".c", ".h", ".cpp", ".hpp", ".java",
+    ".rb", ".kt", ".swift", ".php", ".sh", ".sql", ".toml", ".json", ".yaml", ".yml",
+    ".html", ".css", ".scss", ".vue", ".svelte",
+];
+
+const CODE_PATH_PREFIXES: &[&str] = &[
+    "src/", "crates/", "lib/", "tests/", "test/", "app/", "components/", "packages/",
+    "modules/", "cmd/", "internal/", "pkg/", "bin/", "core/", "api/", "scripts/",
+];
+
+/// Code-domain vocabulary reinforcing a task verb.
+const CODE_DOMAIN_TOKENS: &[&str] = &[
+    "function", "struct", "impl", "trait", "class", "interface", "api", "endpoint", "tool",
+    "crate", "module", "cli", "command", "handler", "service", "component", "compiler",
+    "lint", "codebase", "library", "sdk", "schema", "database", "migration", "bug", "error",
+    "crash", "panic", "build", "test", "tests", "type", "variable", "loop", "callback",
+    "async", "worker", "daemon", "plugin", "extension", "config", "parser", "compiler",
+    "binary", "executable", "runtime", "framework", "dependency",
+];
+
+/// Interrogative starters that mark a prompt as a question even when it also
+/// carries task verbs or code evidence ("what is the best way to implement...").
+const QUESTION_STARTERS: &[&str] = &[
+    "what is", "what's", "what are", "what does", "what do", "whats", "why", "how does",
+    "how do", "how can", "how to", "when", "where", "who", "which", "is it", "is there",
+    "are there", "can you explain", "explain", "compare", "difference between", "does it",
+    "should i", "should we", "do you", "can you", "could you", "what is the",
+];
+
+/// Explicit goal phrasing that outranks every other heuristic.
+const GOAL_PHRASES: &[&str] = &[
+    "goal:", "my goal is", "the goal is", "long-running", "long running", "ongoing",
+    "over the next", "in the coming", "i want to achieve", "i'd like to achieve",
+    "i would like to achieve", "track this goal", "set a goal", "continuous effort",
+];
+
+/// Deterministic auto-mode classifier (MVP, no model calls).
+///
+/// Precedence: explicit goal phrasing → interrogative question → code task
+/// (task verb plus strong verb, file-path, or code-domain evidence) → default
+/// question. The result only drives advisory hints / bounded todo creation;
+/// the session itself always runs the model as usual.
+#[must_use]
+pub fn classify_prompt(prompt: &str) -> PromptMode {
+    let normalized = prompt.trim().to_lowercase();
+    if normalized.is_empty() {
+        return PromptMode::Question;
+    }
+    if GOAL_PHRASES
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        return PromptMode::Goal;
+    }
+    let trimmed_end = normalized.trim_end_matches(['?', ' ', '.']);
+    if QUESTION_STARTERS
+        .iter()
+        .any(|starter| trimmed_end.starts_with(starter))
+        || normalized.trim_end().ends_with('?')
+    {
+        return PromptMode::Question;
+    }
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    let has_task_verb = CODE_TASK_VERBS
+        .iter()
+        .any(|verb| words.iter().any(|word| word_matches_verb(word, verb)));
+    if !has_task_verb {
+        return PromptMode::Question;
+    }
+    let has_strong_verb = STRONG_CODE_TASK_VERBS
+        .iter()
+        .any(|verb| words.iter().any(|word| word_matches_verb(word, verb)));
+    let has_path = CODE_PATH_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        || CODE_PATH_PREFIXES
+            .iter()
+            .any(|prefix| normalized.contains(prefix));
+    let has_code_token = CODE_DOMAIN_TOKENS
+        .iter()
+        .any(|token| normalized.contains(token));
+    if has_strong_verb || has_path || has_code_token {
+        PromptMode::CodeTask
+    } else {
+        PromptMode::Question
+    }
+}
+
+/// Exact-word or inflected-form verb match (`implement`, `implements`,
+/// `implementing`, `implemented`).
+fn word_matches_verb(word: &str, verb: &str) -> bool {
+    if word == verb {
+        return true;
+    }
+    if let Some(stem) = word.strip_suffix('s')
+        && stem == verb
+    {
+        return true;
+    }
+    if let Some(stem) = word.strip_suffix("ing")
+        && stem == verb
+    {
+        return true;
+    }
+    if let Some(stem) = word.strip_suffix("ed")
+        && stem == verb
+    {
+        return true;
+    }
+    false
+}
+
+/// Status-hint text for a detected mode, or `None` when no hint applies
+/// (plain questions keep the default flow).
+#[must_use]
+pub const fn mode_hint(mode: PromptMode) -> Option<&'static str> {
+    match mode {
+        PromptMode::CodeTask => Some("Detected: code task — /todo to plan"),
+        PromptMode::Goal => Some("Detected: long-running goal — /goal create to track"),
+        PromptMode::Question => None,
+    }
+}
+
+/// Minimal todo DAG seeded for an auto-detected code task: one phase whose
+/// single task is the user prompt. `prepare_todo_phases` assigns the task id
+/// and readiness, so the DAG is immediately executable.
+#[must_use]
+pub fn auto_create_todo_phases(prompt: &str) -> Vec<crate::TodoPhase> {
+    vec![crate::TodoPhase {
+        name: "Plan".to_owned(),
+        tasks: vec![crate::TodoItem {
+            id: String::new(),
+            content: prompt.trim().to_owned(),
+            status: crate::TodoStatus::Pending,
+            depends_on: Vec::new(),
+            ready: true,
+            blocked_by: Vec::new(),
+            agent: None,
+        }],
+    }]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -265,12 +487,27 @@ fn select_deterministic_with_exact_agent(
         input.skills,
         input.settings,
     );
-    let agents = rank_agents_with_tokens(
+    let mut agents = rank_agents_with_tokens(
         &request_tokens,
         &request_phrase,
         input.agents,
         input.settings,
     );
+    // An explicit agent-name mention is a direct instruction: the mentioned
+    // agent must outrank every skill suggestion, even when a same-named (or
+    // always-applied) skill also matches the prompt. The skill is still
+    // suggested and autoloaded, it just never wins the recommendation.
+    if let ExactAgentMention::Unique(name) = &exact_agent_mention
+        && let Some(agent_hit) = agents.iter_mut().find(|hit| hit.name == *name)
+    {
+        let skill_ceiling = skills.iter().map(|hit| hit.score).max().unwrap_or(0);
+        if agent_hit.score <= skill_ceiling {
+            agent_hit.score = skill_ceiling + 1;
+            agent_hit.reasons.push(
+                "explicit agent mention outranks skill recommendations".to_owned(),
+            );
+        }
+    }
     let selected_agent = match &exact_agent_mention {
         ExactAgentMention::Unique(name) => Some(name.clone()),
         ExactAgentMention::Ambiguous(_) => None,
@@ -864,6 +1101,32 @@ fn contains_phrase(haystack: &str, needle: &str) -> bool {
         || haystack.starts_with(&format!("{needle} "))
         || haystack.ends_with(&format!(" {needle}"))
         || haystack.contains(&format!(" {needle} "))
+        || contains_embedded_ascii_word(haystack, needle)
+}
+
+/// Word-boundary substring match for ASCII names embedded in scripts that do
+/// not use whitespace (CJK): `你让researcher去调查` contains the word
+/// `researcher` even though tokenization produced one contiguous run. The
+/// match requires the characters around `needle` to be non-ASCII-alphanumeric,
+/// so `researcher` never matches inside `researchers` and `research` never
+/// matches inside `researcher`.
+fn contains_embedded_ascii_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || !needle.is_ascii() || haystack.len() < needle.len() {
+        return false;
+    }
+    let mut search_from = 0;
+    while let Some(relative) = haystack[search_from..].find(needle) {
+        let at = search_from + relative;
+        let before = haystack[..at].chars().next_back();
+        let after = haystack[at + needle.len()..].chars().next();
+        let boundary_before = before.is_none_or(|character| !character.is_ascii_alphanumeric());
+        let boundary_after = after.is_none_or(|character| !character.is_ascii_alphanumeric());
+        if boundary_before && boundary_after {
+            return true;
+        }
+        search_from = at + needle.len();
+    }
+    false
 }
 
 fn unique_overlap(request: &BTreeSet<&str>, candidate: &[String]) -> Vec<String> {
@@ -971,9 +1234,17 @@ mod tests {
             autoload_skills: Vec::new(),
             model: None,
             thinking_level: None,
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
             source: AgentDefinitionSource::Bundled,
             path: None,
             trusted: true,
+            kind: crate::orchestration::AgentDefinitionKind::Agent,
+            personality: None,
+            soft_budget: None,
         }
     }
 
@@ -1238,6 +1509,168 @@ mod tests {
     }
 
     #[test]
+    fn exact_agent_mention_detects_cjk_embedded_and_ascii_word_boundaries() {
+        let researcher = agent("researcher", "Research and study assigned topics");
+        // CJK scripts do not use whitespace: the ASCII agent name sits inside
+        // a contiguous alphanumeric run and must still count as a word
+        // mention, in every casing/whitespace arrangement.
+        for request in [
+            "你让researcher去调查这个项目",
+            "你让Researcher去调查这个项目",
+            "让researcher去调查",
+            "researcher去调查",
+            "researcher 去调查这个项目",
+            "去调查researcher",
+        ] {
+            assert!(
+                matches!(
+                    exact_agent_mention(request, &[researcher.clone()]),
+                    ExactAgentMention::Unique(name) if name == "researcher"
+                ),
+                "expected a unique researcher mention in {request:?}"
+            );
+        }
+        // Partial words and unrelated prompts must not match: `researcher`
+        // never matches inside `researchers` or `researcherx`, and CJK-only
+        // text matches nothing.
+        for request in [
+            "researchers are studying this",
+            "researcherx 去调查",
+            "请研究一下这个项目",
+            "调查一下技术栈",
+        ] {
+            assert!(
+                matches!(
+                    exact_agent_mention(request, &[researcher.clone()]),
+                    ExactAgentMention::None
+                ),
+                "expected no agent mention in {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cjk_embedded_agent_mention_wins_over_same_named_skill() {
+        let settings = SelectorSettings {
+            autoload_threshold: 1,
+            auto_select_threshold: 1,
+            confidence_margin: 0,
+            min_score: 0,
+            ..SelectorSettings::default()
+        };
+        let research = skill("research", "Research topics for a researcher study");
+        let researcher = agent("researcher", "Research and study assigned topics");
+        let plan = select_deterministic(SelectionInput {
+            request: "你让researcher去调查这个项目",
+            skills: &[research],
+            agents: &[researcher],
+            settings: &settings,
+        });
+        assert_eq!(plan.selected_agent.as_deref(), Some("researcher"));
+        let researcher_hit = plan
+            .agents
+            .iter()
+            .find(|hit| hit.name == "researcher")
+            .expect("the mentioned agent must be ranked");
+        assert!(
+            researcher_hit
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("exact name")),
+            "agent boost must come from the exact-name mention: {:?}",
+            researcher_hit.reasons
+        );
+        assert!(
+            plan.skills.iter().all(|hit| hit.score < researcher_hit.score),
+            "the same-named skill must not outrank the explicitly mentioned agent"
+        );
+    }
+
+    #[test]
+    fn cjk_agent_and_skill_both_mentioned_agent_wins() {
+        let settings = SelectorSettings {
+            autoload_threshold: 1,
+            auto_select_threshold: 1,
+            confidence_margin: 0,
+            min_score: 0,
+            ..SelectorSettings::default()
+        };
+        let research = skill("research", "Research topics for a researcher study");
+        let researcher = agent("researcher", "Research and study assigned topics");
+        let plan = select_deterministic(SelectionInput {
+            request: "让researcher用research技能去调查",
+            skills: &[research],
+            agents: &[researcher],
+            settings: &settings,
+        });
+        assert_eq!(plan.selected_agent.as_deref(), Some("researcher"));
+        // The skill is still suggested alongside, but never wins.
+        assert!(plan.skills.iter().any(|hit| hit.name == "research"));
+        let researcher_hit = plan
+            .agents
+            .iter()
+            .find(|hit| hit.name == "researcher")
+            .expect("the mentioned agent must be ranked");
+        assert!(plan.skills.iter().all(|hit| hit.score < researcher_hit.score));
+        assert!(
+            researcher_hit
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("outranks skill")),
+            "mention boost must be explainable: {:?}",
+            researcher_hit.reasons
+        );
+    }
+
+    #[test]
+    fn cjk_skill_mention_suggests_skill_when_no_agent_mentioned() {
+        let settings = SelectorSettings {
+            autoload_threshold: 1,
+            min_score: 0,
+            ..SelectorSettings::default()
+        };
+        let research = skill("research", "Research assigned topics");
+        let researcher = agent("researcher", "Study assigned topics");
+        let request = "请使用research技能来调查";
+        assert!(matches!(
+            exact_skill_mention(request, &[research.clone()]),
+            ExactSkillMention::Unique(name) if name == "research"
+        ));
+        assert!(matches!(
+            exact_agent_mention(request, &[researcher.clone()]),
+            ExactAgentMention::None
+        ));
+        let plan = select_deterministic(SelectionInput {
+            request,
+            skills: &[research],
+            agents: &[researcher],
+            settings: &settings,
+        });
+        assert_eq!(plan.skills[0].name, "research");
+        assert_eq!(plan.autoload_skills, vec!["research"]);
+        assert!(plan.selected_agent.is_none());
+    }
+
+    #[test]
+    fn cjk_prompt_without_agent_or_skill_mention_is_unchanged() {
+        let research = skill("research", "Research assigned topics");
+        let researcher = agent("researcher", "Study assigned topics");
+        let plan = select_deterministic(SelectionInput {
+            request: "请调查一下这个项目的技术栈",
+            skills: &[research],
+            agents: &[researcher],
+            settings: &SelectorSettings::default(),
+        });
+        assert!(plan.selected_agent.is_none());
+        assert!(plan.skills.is_empty());
+        assert!(plan.agents.is_empty());
+        assert_eq!(
+            plan.fallback_reason.as_deref(),
+            Some("no metadata match met the threshold")
+        );
+    }
+
+    #[test]
     fn skill_uri_rejects_traversal_but_allows_hidden() {
         let root = TempDir::new().unwrap();
         let base = root.path().join("hidden");
@@ -1381,6 +1814,81 @@ mod tests {
         assert_eq!(plan.skills[0].name, "docs");
         assert!(plan.skills.iter().all(|hit| hit.name != "invented"));
     }
+
+    #[tokio::test]
+    async fn classifier_ranking_research_first_never_overrides_exact_agent_selection() {
+        let research = skill("research", "Research topics for a researcher study");
+        let researcher = agent("researcher", "Research and study assigned topics");
+        let stream: StreamFn = Arc::new(|model, _, _| {
+            async move {
+                let events = pi_ai::new_assistant_message_event_stream();
+                let writer = events.clone();
+                tokio::spawn(async move {
+                    let mut message = AssistantMessage::pending(&model);
+                    // The optional classifier ranks the overlapping SKILL
+                    // first — it must only reorder the hit lists, never the
+                    // deterministic exact-agent selection.
+                    message.content = vec![pi_ai::ContentBlock::text(
+                        r#"[{"kind":"skill","name":"research"},{"kind":"agent","name":"researcher"}]"#,
+                    )];
+                    message.stop_reason = StopReason::Stop;
+                    writer
+                        .push(AssistantMessageEvent::Done {
+                            reason: StopReason::Stop,
+                            message: message.clone(),
+                        })
+                        .await;
+                    writer.end(Some(message)).await;
+                });
+                events
+            }
+            .boxed()
+        });
+        let (_, abort) = AbortController::new();
+        let settings = SelectorSettings {
+            min_score: 0,
+            autoload_threshold: 1,
+            auto_select_threshold: 1,
+            confidence_margin: 0,
+            classifier: SelectorClassifierSettings {
+                enabled: true,
+                ..SelectorClassifierSettings::default()
+            },
+            ..SelectorSettings::default()
+        };
+        let classifier = ProviderClassifier {
+            model: Model::default(),
+            stream,
+            options: SimpleStreamOptions::default(),
+            abort,
+        };
+        let plan = select(
+            SelectionInput {
+                request: "你让researcher去调查这个项目",
+                skills: &[research],
+                agents: &[researcher],
+                settings: &settings,
+            },
+            Some(&classifier),
+        )
+        .await;
+        assert!(plan.classifier_used);
+        assert_eq!(
+            plan.skills.first().map(|hit| hit.name.as_str()),
+            Some("research"),
+            "the classifier order applies to the skill hit list"
+        );
+        assert_eq!(
+            plan.selected_agent.as_deref(),
+            Some("researcher"),
+            "the classifier must never override the deterministic exact-agent selection"
+        );
+        assert!(
+            !plan.autoload_skills.iter().any(|name| name == "research"),
+            "the exact agent mention must keep ranked skill autoload suppressed: {:?}",
+            plan.autoload_skills
+        );
+    }
     #[test]
     fn rendered_plan_contains_event_state_explanation() {
         let plan = deterministic("review Rust", &[skill("rust", "review Rust code")]);
@@ -1433,5 +1941,145 @@ mod tests {
             ..SelectionPlan::default()
         };
         assert!(load_autoload_skill_bodies(&oversized_plan, &[oversized]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use crate::TodoStatus;
+
+    use super::*;
+
+    /// Deterministic fixture table for the auto-mode classifier. Every row
+    /// pins a prompt to exactly one expected mode; changing a row means
+    /// changing a user-visible classification contract.
+    const FIXTURES: &[(&str, PromptMode)] = &[
+        // Code tasks: task verb + strong verb, path, or code-domain evidence.
+        ("implement a parser in src/lib.rs", PromptMode::CodeTask),
+        ("build a web server", PromptMode::CodeTask),
+        ("fix the bug in crates/pi-coding/src/session.rs", PromptMode::CodeTask),
+        ("refactor the auth module", PromptMode::CodeTask),
+        ("add tests for the todo tool", PromptMode::CodeTask),
+        ("write documentation for the CLI", PromptMode::CodeTask),
+        ("update src/main.rs to handle the new flag", PromptMode::CodeTask),
+        ("debug the session run", PromptMode::CodeTask),
+        ("migrate the database schema", PromptMode::CodeTask),
+        ("implementing a new tool", PromptMode::CodeTask),
+        ("refactored the parser into crates/pi-ai", PromptMode::CodeTask),
+        ("create an API endpoint for the users table", PromptMode::CodeTask),
+        ("port the CLI to Rust", PromptMode::CodeTask),
+        // Questions win over code evidence.
+        ("what is the best way to implement a parser", PromptMode::Question),
+        ("why does the build fail in src/lib.rs", PromptMode::Question),
+        ("explain how the selector works", PromptMode::Question),
+        ("compare rust and go", PromptMode::Question),
+        ("how to implement a parser", PromptMode::Question),
+        ("can you fix the merge conflict for me", PromptMode::Question),
+        ("what's the difference between steer and follow-up", PromptMode::Question),
+        ("does the todo tool support dependencies", PromptMode::Question),
+        ("help me understand this error", PromptMode::Question),
+        ("", PromptMode::Question),
+        ("hello", PromptMode::Question),
+        // Goal phrasing outranks everything.
+        ("goal: ship the release over the next month", PromptMode::Goal),
+        ("my goal is to keep the codebase green", PromptMode::Goal),
+        ("long-running: maintain the nightly pipeline", PromptMode::Goal),
+        ("i want to achieve a stable API by next quarter", PromptMode::Goal),
+        ("set a goal to reduce test flakiness", PromptMode::Goal),
+        // Weak verb without code evidence stays a question.
+        ("add this to my notes", PromptMode::Question),
+        ("update me on the status", PromptMode::Question),
+        ("remove the duplicate from the list", PromptMode::Question),
+        // Agent-mention prompts are not code tasks: the auto-mode classifier
+        // must never hijack them into a todo DAG or skill suggestion.
+        ("你让researcher去调查这个项目", PromptMode::Question),
+        ("researcher 去调查这个项目", PromptMode::Question),
+    ];
+
+    #[test]
+    fn classify_prompt_fixture_table() {
+        for (prompt, expected) in FIXTURES {
+            let actual = classify_prompt(prompt);
+            assert_eq!(
+                actual, *expected,
+                "classify_prompt({prompt:?}) = {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_prompt_is_case_insensitive_and_trims() {
+        assert_eq!(
+            classify_prompt("  IMPLEMENT A PARSER IN SRC/LIB.RS  "),
+            PromptMode::CodeTask
+        );
+        assert_eq!(classify_prompt("WHAT IS RUST?"), PromptMode::Question);
+        assert_eq!(classify_prompt("Goal: ship"), PromptMode::Goal);
+    }
+
+    #[test]
+    fn mode_hint_only_fires_for_code_task_and_goal() {
+        assert_eq!(
+            mode_hint(PromptMode::CodeTask),
+            Some("Detected: code task — /todo to plan")
+        );
+        assert_eq!(
+            mode_hint(PromptMode::Goal),
+            Some("Detected: long-running goal — /goal create to track")
+        );
+        assert_eq!(mode_hint(PromptMode::Question), None);
+    }
+
+    #[test]
+    fn prompt_mode_serde_uses_snake_case_names() {
+        assert_eq!(serde_json::to_string(&PromptMode::CodeTask).unwrap(), "\"code_task\"");
+        assert_eq!(serde_json::to_string(&PromptMode::Question).unwrap(), "\"question\"");
+        assert_eq!(serde_json::to_string(&PromptMode::Goal).unwrap(), "\"goal\"");
+        assert_eq!(
+            serde_json::from_str::<PromptMode>("\"code_task\"").unwrap(),
+            PromptMode::CodeTask
+        );
+    }
+
+    #[test]
+    fn auto_mode_serde_uses_lowercase_names_and_defaults_to_suggest() {
+        assert_eq!(serde_json::to_string(&AutoMode::Off).unwrap(), "\"off\"");
+        assert_eq!(serde_json::to_string(&AutoMode::Suggest).unwrap(), "\"suggest\"");
+        assert_eq!(serde_json::to_string(&AutoMode::Auto).unwrap(), "\"auto\"");
+        assert_eq!(serde_json::from_str::<AutoMode>("\"auto\"").unwrap(), AutoMode::Auto);
+        assert_eq!(AutoMode::default(), AutoMode::Suggest);
+        assert!(AutoMode::Suggest.is_enabled());
+        assert!(!AutoMode::Suggest.is_auto());
+        assert!(AutoMode::Auto.is_auto());
+        assert!(!AutoMode::Off.is_enabled());
+    }
+
+    #[test]
+    fn selector_settings_round_trip_through_json_keeps_auto_mode() {
+        let settings = SelectorSettings::default();
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["autoMode"], "suggest");
+        let restored: SelectorSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.auto_mode, AutoMode::Suggest);
+
+        let mut auto = settings.clone();
+        auto.auto_mode = AutoMode::Auto;
+        let json = serde_json::to_value(&auto).unwrap();
+        assert_eq!(json["autoMode"], "auto");
+        let restored: SelectorSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.auto_mode, AutoMode::Auto);
+    }
+
+    #[test]
+    fn auto_create_todo_phases_seeds_one_executable_task() {
+        let phases = auto_create_todo_phases("  implement a parser in src/lib.rs  ");
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0].name, "Plan");
+        assert_eq!(phases[0].tasks.len(), 1);
+        let task = &phases[0].tasks[0];
+        assert_eq!(task.content, "implement a parser in src/lib.rs");
+        assert_eq!(task.status, TodoStatus::Pending);
+        assert!(task.ready);
+        assert!(task.depends_on.is_empty());
     }
 }

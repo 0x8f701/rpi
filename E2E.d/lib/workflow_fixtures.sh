@@ -24,7 +24,7 @@ WORKFLOW_DETAIL_LABELS=(
     'Status'
     'Todo'
     'Supervisor'
-    'Subagents'
+    'Agents'
     'Recent IRC'
     'Worktree'
     'Integration'

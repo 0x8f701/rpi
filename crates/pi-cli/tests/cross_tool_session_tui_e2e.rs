@@ -41,12 +41,10 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthChar;
 use tempfile::TempDir;
 
-const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
 const CTRL_D: u8 = 0x04;
 const ESC: u8 = 0x1b;
 const CTRL_U: u8 = 0x15;
-
 /// Hard cap on retained PTY output.
 const PTY_OUTPUT_CAP: usize = 512 * 1024;
 
@@ -308,10 +306,16 @@ impl PtyProbe {
         }
     }
 
+    /// Poll the live terminal for `needle` in the ANSI-normalized stream.
+    ///
+    /// The inline TUI paints styled text as per-character SGR runs (e.g.
+    /// `Recent\x1b[49m\x1b[38;2;…msessions`), so a raw substring match fails
+    /// on text that is visibly present. Searches run against [`strip_ansi`];
+    /// raw escape-sequence needles are only used on direct snapshots.
     fn wait_for(&self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.snapshot().contains(needle) {
+            if strip_ansi(&self.snapshot()).contains(needle) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -324,7 +328,7 @@ impl PtyProbe {
     fn wait_for_after(&self, marker: usize, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.since(marker).contains(needle) {
+            if strip_ansi(&self.since(marker)).contains(needle) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -337,7 +341,7 @@ impl PtyProbe {
     fn wait_for_any(&self, needles: &[&str], timeout: Duration) -> Option<String> {
         let deadline = Instant::now() + timeout;
         loop {
-            let snap = self.snapshot();
+            let snap = strip_ansi(&self.snapshot());
             for needle in needles {
                 if snap.contains(needle) {
                     return Some((*needle).to_owned());
@@ -358,7 +362,7 @@ impl PtyProbe {
     ) -> Option<String> {
         let deadline = Instant::now() + timeout;
         loop {
-            let delta = self.since(marker);
+            let delta = strip_ansi(&self.since(marker));
             for needle in needles {
                 if delta.contains(needle) {
                     return Some((*needle).to_owned());
@@ -442,14 +446,16 @@ fn kill_and_reap(child: &mut std::process::Child, timeout: Duration) {
     }
 }
 
+/// The TUI is fully entered only once a rendered marker appears. Startup
+/// capability detection does not read stdin, so bytes typed after terminal
+/// acquisition remain owned by the event loop.
 fn await_entered(probe: &PtyProbe) -> bool {
-    probe.wait_for(HIDE_CURSOR, Duration::from_secs(30))
-        || probe.wait_for("pi (rs)", Duration::from_secs(5))
-        || probe.wait_for("π", Duration::from_secs(5))
-        || probe.wait_for("Ready", Duration::from_secs(5))
-        || probe.wait_for("ready", Duration::from_secs(5))
-        || probe.wait_for("faux/faux-1", Duration::from_secs(5))
-        || probe.wait_for("Recent sessions", Duration::from_secs(5))
+    probe.wait_for("Recent sessions", Duration::from_secs(30))
+        || probe.wait_for("faux/faux-1", Duration::from_secs(15))
+        || probe.wait_for("π", Duration::from_secs(15))
+        || probe.wait_for("pi (rs)", Duration::from_secs(15))
+        || probe.wait_for("Ready", Duration::from_secs(15))
+        || probe.wait_for("ready", Duration::from_secs(15))
 }
 
 fn strip_ansi(input: &str) -> String {

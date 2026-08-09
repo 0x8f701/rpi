@@ -1394,6 +1394,7 @@ pub fn register_google_vertex() {
             api: API_GOOGLE_VERTEX.into(),
             stream: native,
             stream_simple: simple,
+            generate_image: None,
         },
         None,
     );

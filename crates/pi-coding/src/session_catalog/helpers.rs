@@ -83,7 +83,7 @@ pub(super) fn fuzzy_match(candidate: &str, query: &str) -> bool {
         .all(|expected| candidate.by_ref().any(|actual| actual == expected))
 }
 
-pub(super) fn expand_tilde(path: PathBuf, home: &Path) -> PathBuf {
+pub(crate) fn expand_tilde(path: PathBuf, home: &Path) -> PathBuf {
     if path == Path::new("~") {
         return home.to_path_buf();
     }
@@ -96,7 +96,7 @@ pub(super) fn expand_tilde(path: PathBuf, home: &Path) -> PathBuf {
     path
 }
 
-pub(super) fn make_absolute(path: PathBuf) -> PathBuf {
+pub(crate) fn make_absolute(path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
     } else {

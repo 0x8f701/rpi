@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use pi_coding::{
@@ -344,9 +344,18 @@ async fn dropping_last_manager_kills_process_group() {
             .spawn(owner, spec(directory.path(), &script))
             .await
             .expect("spawn");
+        let pid_deadline = Instant::now() + Duration::from_secs(3);
         loop {
             if let Ok(text) = std::fs::read_to_string(&pid_file) {
-                break text.trim().parse::<i32>().expect("pid");
+                // The shell truncates the pid file before `echo` writes it;
+                // an empty read must retry instead of failing the parse.
+                let pid = text.trim();
+                if !pid.is_empty() {
+                    break pid.parse::<i32>().expect("pid");
+                }
+            }
+            if Instant::now() > pid_deadline {
+                panic!("spawned shell never wrote a pid to {}", pid_file.display());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -358,6 +367,49 @@ async fn dropping_last_manager_kills_process_group() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("process survived ProcessManager drop");
+}
+
+#[tokio::test]
+async fn task_abort_keeps_supervised_process_listed_and_alive_then_explicit_stop_cleans_up() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let manager = ProcessManager::with_config(ProcessManagerConfig {
+        idle_timeout: None,
+        ..ProcessManagerConfig::default()
+    });
+    let owner = ProcessOwnerId::new("task-abort-owner");
+    let info = manager
+        .spawn(owner.clone(), spec(directory.path(), "sleep 30"))
+        .await
+        .expect("spawn supervised process");
+
+    // A task interrupt is external to the manager: `Application::abort` cancels
+    // the active turn by firing the AbortSignal the agent's in-flight tool
+    // calls observe (`agent.abort`). The ProcessManager must be oblivious to it
+    // — no unlist, no signal, no drop.
+    let (controller, _abort) = pi_agent::AbortController::new();
+    controller.abort();
+
+    let listed = manager.list(&owner);
+    assert_eq!(listed.len(), 1, "task interrupt must keep the process listed");
+    assert_eq!(listed[0].id, info.id);
+    assert_eq!(listed[0].state, ProcessState::Running);
+    let pid = listed[0].pid.expect("managed pid") as i32;
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+        .expect("supervised process must stay alive across a task interrupt");
+
+    // Only an explicit /ps stop terminates it.
+    let stopped = manager
+        .stop(&owner, &info.id, Some(Duration::from_secs(3)))
+        .await
+        .expect("explicit stop");
+    assert!(stopped.state.is_terminal());
+    for _ in 0..100 {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("supervised process survived an explicit stop");
 }
 
 #[test]

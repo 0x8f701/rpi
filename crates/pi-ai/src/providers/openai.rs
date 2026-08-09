@@ -575,6 +575,7 @@ pub fn register_openai_completions() {
                     .boxed()
             }),
             stream_simple,
+            generate_image: None,
         },
         None,
     );
@@ -1787,6 +1788,54 @@ mod tests {
             payload(&qwen_chat_template, None, 1024)["chat_template_kwargs"],
             json!({"enable_thinking":false, "preserve_thinking":true})
         );
+    }
+
+    #[test]
+    fn xai_completions_models_omit_reasoning_effort_by_catalog_compat() {
+        // Catalog pins supportsReasoningEffort:false for completions-path
+        // Grok models (grok-4.3, grok-build-0.1). Pin the wire contract so a
+        // catalog flip or accidental xai branch cannot silently start
+        // emitting reasoning_effort without an explicit product decision.
+        for id in ["grok-4.3", "grok-build-0.1"] {
+            let model = builtin_model("xai", id);
+            assert_eq!(model.provider, "xai");
+            assert_eq!(model.api, API_OPENAI_COMPLETIONS);
+            assert!(model.reasoning, "{id} is catalogued as reasoning-capable");
+            assert_eq!(
+                thinking_format(&model),
+                "openai",
+                "{id} uses the default openai thinking format"
+            );
+            assert!(
+                !supports_reasoning_effort(&model),
+                "{id} must honor supportsReasoningEffort:false"
+            );
+
+            let with_effort = payload(&model, Some("high"), 1024);
+            assert_eq!(with_effort["model"], id);
+            assert!(
+                with_effort.get("reasoning_effort").is_none(),
+                "{id} must not emit reasoning_effort even when effort is selected: {with_effort}"
+            );
+            assert!(
+                with_effort.get("reasoning").is_none(),
+                "{id} must not emit nested reasoning on the completions path: {with_effort}"
+            );
+            assert!(
+                with_effort.get("thinking").is_none(),
+                "{id} must not emit thinking on the completions path: {with_effort}"
+            );
+            assert_eq!(
+                with_effort["max_completion_tokens"], 1024,
+                "{id} still accepts max_completion_tokens"
+            );
+
+            let without_effort = payload(&model, None, 1024);
+            assert!(
+                without_effort.get("reasoning_effort").is_none(),
+                "{id} off/default path must also omit reasoning_effort: {without_effort}"
+            );
+        }
     }
 
     #[test]

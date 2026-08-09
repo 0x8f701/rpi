@@ -5,7 +5,10 @@
 //! JSON, RPC, print mode, logs, and ratatui buffers never receive escape frames.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, Cursor, Write};
+use std::io::{self, Cursor, Read, Write};
+use std::process::{Command, Stdio};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use image::imageops::FilterType;
@@ -14,12 +17,26 @@ use sha2::{Digest, Sha256};
 
 use crate::image_pipeline;
 
-const DEFAULT_IMAGE_WIDTH_CELLS: u16 = 50;
+const DEFAULT_IMAGE_WIDTH_CELLS: u16 = 60;
 const DEFAULT_CELL_WIDTH_PIXELS: u16 = 8;
 const DEFAULT_CELL_HEIGHT_PIXELS: u16 = 16;
 const KITTY_CHUNK_BYTES: usize = 4_096;
 const MAX_METADATA_CACHE_ENTRIES: usize = 256;
-pub const KITTY_DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
+const KITTY_QUERY_ID: u32 = 31;
+const KITTY_SUPPORT_QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+
+/// tmux DCS passthrough prefix. tmux strips `\x1bPtmux;` plus the trailing
+/// `\x1b\\` and forwards the wrapped escape verbatim to the outer terminal
+/// (requires `allow-passthrough`, which defaults to on since tmux 3.0a).
+const TMUX_PASSTHROUGH_PREFIX: &[u8] = b"\x1bPtmux;";
+const TMUX_PASSTHROUGH_SUFFIX: &[u8] = b"\x1b\\";
+/// First tmux release that reliably forwards wrapped kitty graphics. Older
+/// tmux drops the APC even when wrapped, so sessions at those versions keep
+/// the previous no-protocol fallback.
+const TMUX_KITTY_SUPPORT: (u32, u32) = (3, 3);
+/// Bounded budget for the one-shot `tmux -V` probe and its poll interval.
+const TMUX_VERSION_TIMEOUT: Duration = Duration::from_millis(2_000);
+const TMUX_VERSION_POLL: Duration = Duration::from_millis(10);
 
 /// The terminal graphics protocol identified from explicit environment hints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +49,8 @@ pub enum TerminalImageProtocol {
 }
 
 /// Terminal environment values used for deterministic capability detection.
+/// [`TerminalEnvironment::current`] snapshots the process environment; the
+/// tmux version probe is bounded and runs at most once per process.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminalEnvironment {
     pub term: Option<String>,
@@ -40,6 +59,9 @@ pub struct TerminalEnvironment {
     pub iterm_session_id: Option<String>,
     pub tmux: Option<String>,
     pub sty: Option<String>,
+    /// Raw `tmux -V` stdout ("tmux 3.4"), populated only when `TMUX` is set.
+    /// `None` when the probe failed, timed out, or was never needed.
+    pub tmux_version: Option<String>,
 }
 
 impl TerminalEnvironment {
@@ -52,28 +74,123 @@ impl TerminalEnvironment {
             iterm_session_id: nonempty_env("ITERM_SESSION_ID"),
             tmux: nonempty_env("TMUX"),
             sty: nonempty_env("STY"),
+            tmux_version: tmux_version_probe(),
         }
     }
 }
 
-/// Detect only protocols with explicit, protocol-specific evidence. Multiplexer
-/// sessions fall back because their passthrough configuration cannot be proven
-/// from the child process environment.
-#[must_use]
-pub fn detect_protocol(environment: &TerminalEnvironment) -> Option<TerminalImageProtocol> {
-    if environment.tmux.is_some() || environment.sty.is_some() {
-        return None;
-    }
+/// One-shot bounded `tmux -V` probe, run only when the `TMUX` environment
+/// variable is set and cached per process so at most one subprocess is ever
+/// spawned. The version decides whether Kitty APCs can be sent through tmux's
+/// passthrough wrapper without reading from the TUI's shared input stream.
+fn tmux_version_probe() -> Option<String> {
+    static PROBE: LazyLock<Option<String>> = LazyLock::new(|| {
+        nonempty_env("TMUX")?;
+        run_tmux_version_command()
+    });
+    PROBE.clone()
+}
 
+/// Run `tmux -V` with a bounded wait. Returns stdout only when the command
+/// exits successfully within [`TMUX_VERSION_TIMEOUT`]; a hung or failing
+/// binary is treated as "version unknown" and never blocks the caller.
+fn run_tmux_version_command() -> Option<String> {
+    let mut child = Command::new("tmux")
+        .arg("-V")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + TMUX_VERSION_TIMEOUT;
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) if status.success() => {
+                let mut output = String::new();
+                child.stdout.take()?.read_to_string(&mut output).ok()?;
+                return Some(output);
+            }
+            Some(_) => return None,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(TMUX_VERSION_POLL),
+        }
+    }
+}
+
+/// Parse `tmux -V` output such as `tmux 3.4`, `tmux 3.3a`, or `tmux next-3.4`
+/// into a `(major, minor)` pair. Trailing suffixes (`a`, `-rc`, dates) and a
+/// leading `next-` are ignored; unparseable output yields `None`.
+#[must_use]
+pub fn parse_tmux_version(output: &str) -> Option<(u32, u32)> {
+    let mut parts = output.split_whitespace();
+    let first = parts.next()?;
+    let version = if first == "tmux" { parts.next()? } else { first };
+    let version = version.strip_prefix("next-").unwrap_or(version);
+    let mut digits = version.split(|c: char| !c.is_ascii_digit());
+    let major = digits.next()?.parse().ok()?;
+    let minor = digits.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Terminals with a partial kitty implementation (Warp) that answer graphics
+/// queries but lack the placement/crop/clear guarantees inline overlays rely
+/// on. They are explicitly excluded so stale pixels can never linger.
+fn is_partial_kitty_terminal(environment: &TerminalEnvironment) -> bool {
+    environment
+        .term_program
+        .as_deref()
+        .is_some_and(|program| program.eq_ignore_ascii_case("WarpTerminal"))
+}
+
+fn has_kitty_environment_evidence(environment: &TerminalEnvironment) -> bool {
     let term = environment.term.as_deref().unwrap_or_default();
     let term_program = environment.term_program.as_deref().unwrap_or_default();
-    if environment.kitty_window_id.is_some()
+    environment.kitty_window_id.is_some()
         || term.eq_ignore_ascii_case("xterm-kitty")
         || term_program.eq_ignore_ascii_case("wezterm")
         || term_program.eq_ignore_ascii_case("ghostty")
-    {
+}
+
+/// Detect protocols from explicit, protocol-specific evidence, with one
+/// multiplexer carve-out: tmux 3.3 and newer forward kitty APCs wrapped in
+/// its DCS passthrough sequence, so a tmux session at that version reports
+/// Kitty. Screen sessions (`STY`) and older tmux keep falling back.
+///
+/// The interactive TUI deliberately does not perform an active response probe:
+/// terminal replies and user keystrokes share the same input stream, and a
+/// startup reader cannot consume one without risking the other. The valid
+/// query bytes and lossless response splitter below define the contract for
+/// any isolated caller that owns its input channel.
+#[must_use]
+pub fn detect_protocol(environment: &TerminalEnvironment) -> Option<TerminalImageProtocol> {
+    if environment.sty.is_some() {
+        return None;
+    }
+    if environment.tmux.is_some() {
+        if is_partial_kitty_terminal(environment) || !has_kitty_environment_evidence(environment) {
+            return None;
+        }
+        let version = environment.tmux_version.as_deref().and_then(parse_tmux_version);
+        let kitty_passthrough = version.is_some_and(|(major, minor)| {
+            major > TMUX_KITTY_SUPPORT.0
+                || (major == TMUX_KITTY_SUPPORT.0 && minor >= TMUX_KITTY_SUPPORT.1)
+        });
+        return kitty_passthrough.then_some(TerminalImageProtocol::Kitty);
+    }
+    if is_partial_kitty_terminal(environment) {
+        // Warp answers kitty queries but lacks the placement/crop/clear
+        // guarantees inline overlays rely on; stale pixels could linger.
+        return None;
+    }
+
+    if has_kitty_environment_evidence(environment) {
         return Some(TerminalImageProtocol::Kitty);
     }
+    let term = environment.term.as_deref().unwrap_or_default();
+    let term_program = environment.term_program.as_deref().unwrap_or_default();
     if term_program.eq_ignore_ascii_case("iterm.app") && environment.iterm_session_id.is_some() {
         return Some(TerminalImageProtocol::Iterm2);
     }
@@ -81,6 +198,65 @@ pub fn detect_protocol(environment: &TerminalEnvironment) -> Option<TerminalImag
         return Some(TerminalImageProtocol::Sixel);
     }
     None
+}
+
+/// Wrap one complete escape sequence in tmux's DCS passthrough. Every ESC
+/// byte is doubled so tmux forwards the inner sequence verbatim to the outer
+/// terminal, e.g. `\x1b_G…\x1b\\` becomes
+/// `\x1bPtmux;\x1b\x1b_G…\x1b\x1b\\\x1b\\`. Input that is already wrapped
+/// passes through unchanged, so emission paths can wrap unconditionally
+/// without risking nested passthrough.
+#[must_use]
+pub fn wrap_tmux_passthrough(bytes: &[u8]) -> Vec<u8> {
+    if bytes.starts_with(TMUX_PASSTHROUGH_PREFIX) {
+        return bytes.to_vec();
+    }
+    let mut wrapped = Vec::with_capacity(bytes.len() + TMUX_PASSTHROUGH_PREFIX.len() + TMUX_PASSTHROUGH_SUFFIX.len());
+    wrapped.extend_from_slice(TMUX_PASSTHROUGH_PREFIX);
+    for &byte in bytes {
+        wrapped.push(byte);
+        if byte == 0x1b {
+            wrapped.push(0x1b);
+        }
+    }
+    wrapped.extend_from_slice(TMUX_PASSTHROUGH_SUFFIX);
+    wrapped
+}
+
+/// Build the spec query for a caller that owns its input channel. The query
+/// sends one 1x1 RGB pixel and asks the terminal not to retain it. The
+/// interactive TUI never sends this on shared stdin/stdout during startup.
+fn kitty_support_query(tmux_passthrough: bool) -> Vec<u8> {
+    if tmux_passthrough {
+        wrap_tmux_passthrough(KITTY_SUPPORT_QUERY)
+    } else {
+        KITTY_SUPPORT_QUERY.to_vec()
+    }
+}
+
+/// Remove only the complete response for [`KITTY_QUERY_ID`], preserving all
+/// unrelated bytes byte-for-byte for the input owner. `Some(true)` is `OK`,
+/// `Some(false)` is a terminal error, and `None` means no complete response.
+fn split_kitty_support_response(bytes: &[u8]) -> (Option<bool>, Vec<u8>) {
+    let prefix = format!("\x1b_Gi={KITTY_QUERY_ID};");
+    let Some(start) = bytes
+        .windows(prefix.len())
+        .position(|window| window == prefix.as_bytes())
+    else {
+        return (None, bytes.to_vec());
+    };
+    let payload_start = start + prefix.len();
+    let Some(end_offset) = bytes[payload_start..]
+        .windows(2)
+        .position(|window| window == b"\x1b\\")
+    else {
+        return (None, bytes.to_vec());
+    };
+    let end = payload_start + end_offset;
+    let mut preserved = Vec::with_capacity(bytes.len() - (end + 2 - start));
+    preserved.extend_from_slice(&bytes[..start]);
+    preserved.extend_from_slice(&bytes[end + 2..]);
+    (Some(&bytes[payload_start..end] == b"OK"), preserved)
 }
 
 /// Effective settings for one TUI image layout pass.
@@ -246,29 +422,53 @@ struct PreparedImage {
 /// or retaining an unbounded history of decoded image payloads.
 pub struct TerminalImageRenderer {
     protocol: Option<TerminalImageProtocol>,
+    /// Wrap every kitty APC in tmux's DCS passthrough. Set when the TUI
+    /// writes through tmux; cursor moves and iTerm/sixel output stay plain.
+    tmux_passthrough: bool,
     metadata: VecDeque<MetadataCacheEntry>,
+    /// Encoded PNG per asset (exact display pixels), reused by every
+    /// placement of that asset. Evicted when the asset leaves the frame set.
     prepared: HashMap<AssetKey, PreparedImage>,
-    active: HashMap<RenderIdentity, u32>,
+    /// Assets transmitted to the terminal: asset -> collision-resistant image
+    /// id. Each asset is transmitted exactly once while it remains live.
+    transmitted: HashMap<AssetKey, u32>,
+    /// Exact placements drawn in the current frame. Explicit placement ids let
+    /// reconciliation remove or replace only this renderer's overlays.
+    active: HashMap<RenderIdentity, ActiveKittyPlacement>,
     frame_identity: Option<ImageFrameIdentity>,
     next_kitty_id: u32,
 }
 
 impl Default for TerminalImageRenderer {
     fn default() -> Self {
-        Self::new(detect_protocol(&TerminalEnvironment::current()))
+        let environment = TerminalEnvironment::current();
+        Self::with_tmux_passthrough(detect_protocol(&environment), environment.tmux.is_some())
     }
 }
 
 impl TerminalImageRenderer {
     #[must_use]
     pub fn new(protocol: Option<TerminalImageProtocol>) -> Self {
+        Self::with_tmux_passthrough(protocol, false)
+    }
+
+    /// Construct with an explicit protocol and tmux passthrough state, so
+    /// tests and embedders exercise DCS wrapping without consulting the
+    /// process environment.
+    #[must_use]
+    pub fn with_tmux_passthrough(
+        protocol: Option<TerminalImageProtocol>,
+        tmux_passthrough: bool,
+    ) -> Self {
         Self {
             protocol,
+            tmux_passthrough,
             metadata: VecDeque::new(),
             prepared: HashMap::new(),
+            transmitted: HashMap::new(),
             active: HashMap::new(),
             frame_identity: None,
-            next_kitty_id: 1,
+            next_kitty_id: random_nonzero_kitty_id(),
         }
     }
 
@@ -356,6 +556,8 @@ impl TerminalImageRenderer {
 
     /// Reconcile and emit overlays after ratatui has completed the cell draw.
     /// Repeated calls for the same frame and placements write no bytes.
+    /// Kitty assets are transmitted once and then placed by id, so scrolling
+    /// and repeated placements reuse the payload instead of retransmitting.
     pub fn present<W: Write>(
         &mut self,
         writer: &mut W,
@@ -365,37 +567,52 @@ impl TerminalImageRenderer {
         if !self.supports_images() {
             self.active.clear();
             self.prepared.clear();
+            self.transmitted.clear();
             self.frame_identity = Some(frame);
             return Ok(());
         }
 
-        if self.frame_identity != Some(frame) {
-            self.delete_active_kitty(writer)?;
-            self.active.clear();
-            self.frame_identity = Some(frame);
-        }
+        self.frame_identity = Some(frame);
 
         let desired = placements
             .iter()
             .map(RenderIdentity::from)
             .collect::<HashSet<_>>();
-        if self.protocol == Some(TerminalImageProtocol::Kitty) {
-            let stale = self
+        let stale = self
+            .active
+            .keys()
+            .filter(|identity| !desired.contains(identity))
+            .copied()
+            .collect::<Vec<_>>();
+        for identity in stale {
+            let active = self
                 .active
-                .iter()
-                .filter_map(|(identity, id)| {
-                    (!desired.contains(identity)).then_some((*identity, *id))
-                })
-                .collect::<Vec<_>>();
-            for (identity, id) in stale {
-                write_kitty_delete(writer, id)?;
-                self.active.remove(&identity);
+                .remove(&identity)
+                .expect("stale placement came from active map");
+            if self.protocol == Some(TerminalImageProtocol::Kitty) {
+                write_kitty_delete_placement(
+                    writer,
+                    active.image_id,
+                    active.placement_id,
+                    self.tmux_passthrough,
+                )?;
             }
-        } else {
-            self.active.retain(|identity, _| desired.contains(identity));
+        }
+        let live_assets = desired
+            .iter()
+            .map(|identity| identity.asset)
+            .collect::<HashSet<_>>();
+        let orphaned = self
+            .transmitted
+            .iter()
+            .filter_map(|(asset, id)| (!live_assets.contains(asset)).then_some((*asset, *id)))
+            .collect::<Vec<_>>();
+        for (asset, id) in orphaned {
+            write_kitty_delete(writer, id, self.tmux_passthrough)?;
+            self.transmitted.remove(&asset);
         }
         self.prepared
-            .retain(|asset, _| desired.iter().any(|identity| identity.asset == *asset));
+            .retain(|asset, _| live_assets.contains(asset));
 
         for placement in placements {
             let identity = RenderIdentity::from(placement);
@@ -411,46 +628,71 @@ impl TerminalImageRenderer {
                 };
                 self.prepared.insert(placement.layout.asset, prepared);
             }
-            let allocated_kitty_id = if self.protocol == Some(TerminalImageProtocol::Kitty) {
-                Some(self.allocate_kitty_id())
-            } else {
-                None
+            let (kitty_id, placement_id) = match self.protocol {
+                Some(TerminalImageProtocol::Kitty) => {
+                    let image_id = if let Some(&id) = self.transmitted.get(&placement.layout.asset) {
+                        id
+                    } else {
+                        let id = self.allocate_kitty_id();
+                        let prepared = self
+                            .prepared
+                            .get(&placement.layout.asset)
+                            .expect("prepared image inserted above");
+                        write_kitty_transmit(
+                            writer,
+                            id,
+                            placement.layout.asset,
+                            &prepared.png_base64,
+                            self.tmux_passthrough,
+                        )?;
+                        self.transmitted.insert(placement.layout.asset, id);
+                        id
+                    };
+                    (image_id, self.allocate_kitty_id())
+                }
+                Some(TerminalImageProtocol::Iterm2 | TerminalImageProtocol::Sixel) | None => (0, 0),
             };
-            let prepared = self
-                .prepared
-                .get(&placement.layout.asset)
-                .expect("prepared image inserted above");
             write!(
                 writer,
                 "\x1b7\x1b[{};{}H",
                 placement.y.saturating_add(1),
                 placement.x.saturating_add(1)
             )?;
-            let kitty_id = match self.protocol {
+            match self.protocol {
                 Some(TerminalImageProtocol::Kitty) => {
-                    let id = allocated_kitty_id.expect("Kitty id allocated above");
-                    write_kitty_image(writer, id, placement.layout, &prepared.png_base64)?;
-                    id
+                    write_kitty_place(
+                        writer,
+                        kitty_id,
+                        placement_id,
+                        placement.layout,
+                        self.tmux_passthrough,
+                    )?;
                 }
                 Some(TerminalImageProtocol::Iterm2) => {
+                    let prepared = self
+                        .prepared
+                        .get(&placement.layout.asset)
+                        .expect("prepared image inserted above");
                     write_iterm_image(writer, placement.layout, &prepared.png_base64)?;
-                    0
                 }
-                Some(TerminalImageProtocol::Sixel) | None => 0,
-            };
+                Some(TerminalImageProtocol::Sixel) | None => {}
+            }
             writer.write_all(b"\x1b8")?;
-            self.active.insert(identity, kitty_id);
+            self.active.insert(identity, ActiveKittyPlacement {
+                image_id: kitty_id,
+                placement_id,
+            });
         }
         writer.flush()
     }
 
-    /// Delete all Kitty image IDs before leaving the alternate screen. Other
-    /// protocols have no safe explicit deletion primitive, so their cache is
-    /// simply invalidated and ratatui clears the reserved cells.
+    /// Delete this renderer's transmitted Kitty image IDs before terminal
+    /// release. No global delete is used, so other applications remain intact.
     pub fn cleanup<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
-        self.delete_active_kitty(writer)?;
+        self.delete_transmitted_kitty(writer)?;
         self.active.clear();
         self.prepared.clear();
+        self.transmitted.clear();
         self.frame_identity = None;
         writer.flush()
     }
@@ -471,19 +713,36 @@ impl TerminalImageRenderer {
     }
 
     fn allocate_kitty_id(&mut self) -> u32 {
-        let id = self.next_kitty_id.max(1);
-        self.next_kitty_id = id.checked_add(1).unwrap_or(1);
-        id
+        loop {
+            let id = self.next_kitty_id.max(1);
+            self.next_kitty_id = id.wrapping_add(1).max(1);
+            let image_id_is_live = self.transmitted.values().any(|candidate| *candidate == id);
+            let placement_id_is_live = self.active.values().any(|active| active.placement_id == id);
+            if !image_id_is_live && !placement_id_is_live {
+                return id;
+            }
+        }
     }
 
-    fn delete_active_kitty<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    fn delete_transmitted_kitty<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         if self.protocol == Some(TerminalImageProtocol::Kitty) {
-            for id in self.active.values().copied().filter(|id| *id != 0) {
-                write_kitty_delete(writer, id)?;
+            for id in self.transmitted.values().copied().filter(|id| *id != 0) {
+                write_kitty_delete(writer, id, self.tmux_passthrough)?;
             }
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveKittyPlacement {
+    image_id: u32,
+    placement_id: u32,
+}
+
+fn random_nonzero_kitty_id() -> u32 {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    u32::from_le_bytes(bytes[..4].try_into().expect("UUID has four leading bytes")).max(1)
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
@@ -573,35 +832,81 @@ fn resize_for_layout(image: DynamicImage, asset: AssetKey) -> DynamicImage {
     }
 }
 
-fn write_kitty_image<W: Write>(
+fn write_kitty_escape<W: Write>(writer: &mut W, passthrough: bool, escape: &[u8]) -> io::Result<()> {
+    if passthrough {
+        writer.write_all(&wrap_tmux_passthrough(escape))
+    } else {
+        writer.write_all(escape)
+    }
+}
+
+/// Transmit one encoded PNG under `id`. The transmit-only action stores the
+/// image; later `a=p` commands with explicit placement ids draw it.
+fn write_kitty_transmit<W: Write>(
     writer: &mut W,
     id: u32,
-    layout: ImageLayout,
+    asset: AssetKey,
     payload: &str,
+    passthrough: bool,
 ) -> io::Result<()> {
     let mut chunks = payload.as_bytes().chunks(KITTY_CHUNK_BYTES).peekable();
     let Some(first) = chunks.next() else {
         return Ok(());
     };
+    let mut escape = Vec::with_capacity(first.len() + 64);
     let more = u8::from(chunks.peek().is_some());
     write!(
-        writer,
-        "\x1b_Ga=T,f=100,t=d,i={id},q=2,c={},r={},m={more};",
-        layout.columns, layout.rows
+        escape,
+        "\x1b_Ga=t,f=100,t=d,i={id},q=2,s={},v={},m={more};",
+        asset.width_pixels, asset.height_pixels
     )?;
-    writer.write_all(first)?;
-    writer.write_all(b"\x1b\\")?;
+    escape.extend_from_slice(first);
+    escape.extend_from_slice(b"\x1b\\");
+    write_kitty_escape(writer, passthrough, &escape)?;
     while let Some(chunk) = chunks.next() {
         let more = u8::from(chunks.peek().is_some());
-        write!(writer, "\x1b_Gm={more};")?;
-        writer.write_all(chunk)?;
-        writer.write_all(b"\x1b\\")?;
+        escape.clear();
+        write!(escape, "\x1b_Gm={more};")?;
+        escape.extend_from_slice(chunk);
+        escape.extend_from_slice(b"\x1b\\");
+        write_kitty_escape(writer, passthrough, &escape)?;
     }
     Ok(())
 }
 
-fn write_kitty_delete<W: Write>(writer: &mut W, id: u32) -> io::Result<()> {
-    write!(writer, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
+/// Place a previously transmitted image at the current cursor position. The
+/// explicit placement id makes updates and deletion ownership-scoped.
+fn write_kitty_place<W: Write>(
+    writer: &mut W,
+    id: u32,
+    placement_id: u32,
+    layout: ImageLayout,
+    passthrough: bool,
+) -> io::Result<()> {
+    let mut escape = Vec::with_capacity(48);
+    write!(
+        escape,
+        "\x1b_Ga=p,i={id},p={placement_id},q=2,c={},r={}\x1b\\",
+        layout.columns, layout.rows
+    )?;
+    write_kitty_escape(writer, passthrough, &escape)
+}
+
+fn write_kitty_delete<W: Write>(writer: &mut W, id: u32, passthrough: bool) -> io::Result<()> {
+    let mut escape = Vec::with_capacity(32);
+    write!(escape, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
+    write_kitty_escape(writer, passthrough, &escape)
+}
+
+fn write_kitty_delete_placement<W: Write>(
+    writer: &mut W,
+    image_id: u32,
+    placement_id: u32,
+    passthrough: bool,
+) -> io::Result<()> {
+    let mut escape = Vec::with_capacity(48);
+    write!(escape, "\x1b_Ga=d,d=i,i={image_id},p={placement_id},q=2\x1b\\")?;
+    write_kitty_escape(writer, passthrough, &escape)
 }
 
 fn write_iterm_image<W: Write>(
@@ -659,10 +964,6 @@ mod tests {
             ImageDisplayConfig { show_images: false, width_cells: 1 }
         );
     }
-    #[test]
-    fn kitty_delete_all_frame_is_bounded_and_quiet() {
-        assert_eq!(KITTY_DELETE_ALL, b"\x1b_Ga=d,d=A,q=2\x1b\\");
-    }
 
 
     #[test]
@@ -690,6 +991,194 @@ mod tests {
         };
         assert_eq!(detect_protocol(&tmux), None);
         assert_eq!(detect_protocol(&TerminalEnvironment::default()), None);
+    }
+
+    #[test]
+    fn non_tmux_kitty_evidence_covers_wezterm_and_ghostty() {
+        for term_program in ["wezterm", "ghostty", "WezTerm", "Ghostty"] {
+            let environment = TerminalEnvironment {
+                term_program: Some(term_program.to_owned()),
+                ..TerminalEnvironment::default()
+            };
+            assert_eq!(
+                detect_protocol(&environment),
+                Some(TerminalImageProtocol::Kitty),
+                "TERM_PROGRAM={term_program:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tmux_version_parser_handles_releases_suffixes_and_garbage() {
+        assert_eq!(parse_tmux_version("tmux 3.4"), Some((3, 4)));
+        assert_eq!(parse_tmux_version("tmux 3.3a"), Some((3, 3)));
+        assert_eq!(parse_tmux_version("tmux 3.2"), Some((3, 2)));
+        assert_eq!(parse_tmux_version("tmux 2.9a"), Some((2, 9)));
+        assert_eq!(parse_tmux_version("tmux next-3.4"), Some((3, 4)));
+        assert_eq!(parse_tmux_version("3.4"), Some((3, 4)));
+        assert_eq!(parse_tmux_version(""), None);
+        assert_eq!(parse_tmux_version("tmux"), None);
+        assert_eq!(parse_tmux_version("garbage"), None);
+    }
+
+    #[test]
+    fn tmux_detection_requires_version_3_3_or_newer() {
+        let kitty = TerminalEnvironment {
+            kitty_window_id: Some("1".to_owned()),
+            ..TerminalEnvironment::default()
+        };
+        for (version, expected) in [
+            (Some("tmux 3.3a"), Some(TerminalImageProtocol::Kitty)),
+            (Some("tmux 3.4"), Some(TerminalImageProtocol::Kitty)),
+            (Some("tmux next-3.4"), Some(TerminalImageProtocol::Kitty)),
+            (Some("tmux 3.2"), None),
+            (Some("tmux 2.9a"), None),
+            (Some("not a version"), None),
+            (None, None), // version probe failed, binary missing, or offline
+        ] {
+            let tmux = TerminalEnvironment {
+                tmux: Some("/tmp/tmux".to_owned()),
+                tmux_version: version.map(str::to_owned),
+                ..kitty.clone()
+            };
+            assert_eq!(
+                detect_protocol(&tmux),
+                expected,
+                "tmux_version={version:?}"
+            );
+        }
+        let tmux_without_outer_terminal_evidence = TerminalEnvironment {
+            tmux: Some("/tmp/tmux".to_owned()),
+            tmux_version: Some("tmux 3.4".to_owned()),
+            ..TerminalEnvironment::default()
+        };
+        assert_eq!(
+            detect_protocol(&tmux_without_outer_terminal_evidence),
+            None,
+            "tmux version alone must not claim an unknown outer terminal supports Kitty"
+        );
+        let sty = TerminalEnvironment {
+            sty: Some("screen".to_owned()),
+            ..kitty
+        };
+        assert_eq!(detect_protocol(&sty), None);
+    }
+
+    #[test]
+    fn tmux_passthrough_wrapper_uses_dcs_and_doubles_escapes() {
+        let escape = b"\x1b_Ga=t,f=100,m=0;AAAA\x1b\\";
+        assert_eq!(
+            wrap_tmux_passthrough(escape),
+            b"\x1bPtmux;\x1b\x1b_Ga=t,f=100,m=0;AAAA\x1b\x1b\\\x1b\\"
+        );
+        let once = wrap_tmux_passthrough(escape);
+        assert_eq!(
+            wrap_tmux_passthrough(&once),
+            once,
+            "already-wrapped input must not be re-wrapped"
+        );
+        assert!(once.starts_with(b"\x1bPtmux;"));
+    }
+
+
+    /// Strip tmux's DCS passthrough wrapper the same way tmux does: consume
+    /// doubled ESC pairs inside the payload and terminate on the first
+    /// unescaped `ESC \`.
+    fn unwrap_tmux_passthrough(wrapped: &str) -> String {
+        let mut out = String::new();
+        let mut rest = wrapped;
+        while let Some(prefix) = rest.find("\u{1b}Ptmux;") {
+            out.push_str(&rest[..prefix]);
+            rest = &rest[prefix + "\u{1b}Ptmux;".len()..];
+            let bytes = rest.as_bytes();
+            let mut i = 0;
+            let end = loop {
+                assert!(
+                    i + 1 < bytes.len(),
+                    "unterminated tmux passthrough segment"
+                );
+                if bytes[i] == 0x1b {
+                    if bytes[i + 1] == 0x1b {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i + 1] == b'\\' {
+                        break i;
+                    }
+                }
+                i += 1;
+            };
+            out.push_str(&rest[..end].replace("\u{1b}\u{1b}", "\u{1b}"));
+            rest = &rest[end + 2..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn tmux_passthrough_wraps_each_kitty_apc_once_and_leaves_cursor_escapes_plain() {
+        let data = png(160, 160);
+        let config = ImageDisplayConfig {
+            show_images: true,
+            width_cells: 20,
+        };
+        let layout = TerminalImageRenderer::new(Some(TerminalImageProtocol::Kitty))
+            .layout(
+                &data,
+                "image/png",
+                config,
+                80,
+                24,
+                TerminalCellSize::default(),
+            )
+            .unwrap();
+        let placement = ImagePlacement::new(layout, &data, "image/png", 3, 4);
+
+        let mut plain = TerminalImageRenderer::new(Some(TerminalImageProtocol::Kitty));
+        let mut plain_bytes = Vec::new();
+        plain
+            .present(&mut plain_bytes, frame(1), std::slice::from_ref(&placement))
+            .unwrap();
+        let plain_out = String::from_utf8(plain_bytes).unwrap();
+
+        let mut wrapped =
+            TerminalImageRenderer::with_tmux_passthrough(Some(TerminalImageProtocol::Kitty), true);
+        let wrapped_placement = ImagePlacement::new(layout, &data, "image/png", 3, 4);
+        let mut wrapped_bytes = Vec::new();
+        wrapped
+            .present(
+                &mut wrapped_bytes,
+                frame(1),
+                std::slice::from_ref(&wrapped_placement),
+            )
+            .unwrap();
+        let wrapped_out = String::from_utf8(wrapped_bytes).unwrap();
+
+        assert!(
+            wrapped_out.starts_with("\u{1b}Ptmux;\u{1b}\u{1b}_Ga=t"),
+            "the transmit is wrapped and comes first: {wrapped_out:?}"
+        );
+        assert!(
+            wrapped_out.ends_with("\u{1b}8"),
+            "cursor restore stays outside the DCS wrapper"
+        );
+        assert_eq!(
+            wrapped_out.matches("\u{1b}Ptmux;").count(),
+            plain_out.matches("\u{1b}_G").count(),
+            "every kitty APC is wrapped exactly once"
+        );
+        assert!(
+            !wrapped_out.contains("\u{1b}Ptmux;\u{1b}Ptmux;"),
+            "no nested passthrough"
+        );
+
+        let mut cleanup = Vec::new();
+        wrapped.cleanup(&mut cleanup).unwrap();
+        let cleanup = String::from_utf8(cleanup).unwrap();
+        assert!(
+            cleanup.contains("\u{1b}Ptmux;\u{1b}\u{1b}_Ga=d,d=I,i="),
+            "cleanup deletes are wrapped too: {cleanup:?}"
+        );
     }
 
     #[test]
@@ -797,18 +1286,23 @@ mod tests {
             .present(&mut first, frame(1), std::slice::from_ref(&placement))
             .unwrap();
         let first = String::from_utf8(first).unwrap();
-        assert!(first.starts_with("\u{1b}7\u{1b}[5;4H\u{1b}_Ga=T,f=100,t=d,i=1"));
+        // A spec-valid transmit-only command comes first. Width and height use
+        // separate control keys; the following placement has an explicit id.
+        assert!(first.starts_with("\u{1b}_Ga=t,f=100,t=d,i="));
+        assert!(first.contains(",q=2,s=160,v=160,"));
+        assert!(!first.contains("a=T"));
+        assert!(!first.contains("s=160x160"));
         assert!(
-            first.contains("\u{1b}_Gm="),
-            "payload should require continuation chunks"
+            first.contains("\u{1b}7\u{1b}[5;4H\u{1b}_Ga=p,i=")
+                && first.contains(",p=")
+                && first.contains(",q=2,c=20,r=10"),
+            "one explicit placement draws the transmitted image at the cursor"
         );
         for protocol_frame in first.split("\u{1b}\\") {
-            // Each Kitty chunk is `\x1b_G<control>;<payload>`. The leading
-            // cursor-positioning CSI on the first chunk (`\x1b[<row>;<col>H`)
-            // also contains a `;`, so isolate the payload by splitting after
-            // the `\x1b_G` APC introducer rather than on the first `;` in the
-            // segment, which would wrongly fold the cursor suffix into the
-            // payload and exceed KITTY_CHUNK_BYTES.
+            // Each Kitty chunk is `\x1b_G<control>;<payload>`. The cursor
+            // positioning CSI inside the placement segment also contains a
+            // `;`, so isolate the payload by splitting after the `\x1b_G`
+            // APC introducer rather than on the first `;` in the segment.
             let Some(after_apc) = protocol_frame
                 .split_once("\u{1b}_G")
                 .map(|(_, rest)| rest)
@@ -831,18 +1325,159 @@ mod tests {
             .unwrap();
         assert!(cached.is_empty(), "unchanged frames must not retransmit");
 
+        // A new frame with the same placement is already reconciled and emits
+        // no duplicate placement.
         let mut changed = Vec::new();
         renderer
             .present(&mut changed, frame(2), std::slice::from_ref(&placement))
             .unwrap();
-        let changed = String::from_utf8(changed).unwrap();
-        assert!(changed.contains("a=d,d=I,i=1"));
-        assert!(changed.contains("a=T,f=100,t=d,i=2"));
+        assert!(changed.is_empty(), "unchanged placements survive frame identity changes");
+
+        // When the asset leaves the frame set, its exact placement and image
+        // id are deleted without touching another client's images.
+        let mut gone = Vec::new();
+        renderer.present(&mut gone, frame(3), &[]).unwrap();
+        let gone = String::from_utf8(gone).unwrap();
+        assert!(gone.contains("a=d,d=i,i="));
+        assert!(gone.contains(",p="));
+        assert!(gone.contains("a=d,d=I,i="));
+        assert!(!gone.contains("d=A"));
+
+        let mut again = Vec::new();
+        renderer
+            .present(&mut again, frame(4), std::slice::from_ref(&placement))
+            .unwrap();
+        let again = String::from_utf8(again).unwrap();
+        assert!(again.contains("a=t,f=100,t=d,i="));
 
         let mut cleanup = Vec::new();
         renderer.cleanup(&mut cleanup).unwrap();
-        assert!(String::from_utf8(cleanup).unwrap().contains("a=d,d=I,i=2"));
+        let cleanup = String::from_utf8(cleanup).unwrap();
+        assert!(cleanup.contains("a=d,d=I,i="));
+        assert!(!cleanup.contains("d=A"));
     }
+
+    #[test]
+    fn kitty_transmits_once_and_places_many_for_shared_assets() {
+        let data = png(160, 160);
+        let mut renderer = TerminalImageRenderer::new(Some(TerminalImageProtocol::Kitty));
+        let layout = renderer
+            .layout(
+                &data,
+                "image/png",
+                ImageDisplayConfig {
+                    show_images: true,
+                    width_cells: 20,
+                },
+                80,
+                24,
+                TerminalCellSize::default(),
+            )
+            .unwrap();
+        let placements = [
+            ImagePlacement::new(layout, &data, "image/png", 1, 1),
+            ImagePlacement::new(layout, &data, "image/png", 40, 1),
+            ImagePlacement::new(layout, &data, "image/png", 1, 12),
+        ];
+        let mut output = Vec::new();
+        renderer.present(&mut output, frame(1), &placements).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(
+            output.matches("a=t,").count(),
+            1,
+            "one transmit serves every placement"
+        );
+        assert_eq!(output.matches("a=p,i=").count(), 3);
+        let placement_ids = output
+            .split("a=p,i=")
+            .skip(1)
+            .filter_map(|command| command.split(",p=").nth(1))
+            .filter_map(|command| command.split(',').next())
+            .collect::<HashSet<_>>();
+        assert_eq!(placement_ids.len(), 3, "each placement has an isolated id");
+        assert!(!output.contains("a=d"), "no deletions while the asset is live");
+        assert_eq!(output.matches("\u{1b}7").count(), 3, "cursor save per placement");
+    }
+
+    #[test]
+    fn kitty_query_is_valid_and_response_split_preserves_user_input() {
+        assert_eq!(
+            kitty_support_query(false),
+            b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"
+        );
+        assert_eq!(
+            kitty_support_query(true),
+            b"\x1bPtmux;\x1b\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\x1b\\\x1b\\"
+        );
+
+        let input = b"typed-before\x1b_Gi=31;OK\x1b\\typed-after";
+        let (supported, preserved) = split_kitty_support_response(input);
+        assert_eq!(supported, Some(true));
+        assert_eq!(preserved, b"typed-beforetyped-after");
+
+        let incomplete = b"x\x1b_Gi=31;O";
+        let (supported, preserved) = split_kitty_support_response(incomplete);
+        assert_eq!(supported, None);
+        assert_eq!(preserved, incomplete);
+
+        let other = b"x\x1b_Gi=99;OK\x1b\\y";
+        let (supported, preserved) = split_kitty_support_response(other);
+        assert_eq!(supported, None);
+        assert_eq!(preserved, other);
+    }
+
+    #[test]
+    fn kitty_reposition_deletes_old_explicit_placement_only() {
+        let data = png(16, 16);
+        let mut renderer = TerminalImageRenderer::new(Some(TerminalImageProtocol::Kitty));
+        let layout = renderer
+            .layout(&data, "image/png", ImageDisplayConfig { show_images: true, width_cells: 4 }, 80, 24, TerminalCellSize::default())
+            .unwrap();
+        let first = ImagePlacement::new(layout, &data, "image/png", 1, 1);
+        let moved = ImagePlacement::new(layout, &data, "image/png", 20, 8);
+        let mut initial = Vec::new();
+        renderer.present(&mut initial, frame(1), &[first]).unwrap();
+        let initial = String::from_utf8(initial).unwrap();
+        let image_id = initial.split("a=t,").nth(1).unwrap().split("i=").nth(1).unwrap().split(',').next().unwrap();
+        let old_placement_id = initial.split("a=p,i=").nth(1).unwrap().split(",p=").nth(1).unwrap().split(',').next().unwrap();
+
+        let mut repositioned = Vec::new();
+        renderer.present(&mut repositioned, frame(2), &[moved]).unwrap();
+        let repositioned = String::from_utf8(repositioned).unwrap();
+        assert!(repositioned.contains(&format!("a=d,d=i,i={image_id},p={old_placement_id},q=2")));
+        assert!(repositioned.contains(&format!("a=p,i={image_id},p=")));
+        assert!(repositioned.contains("\u{1b}[9;21H"));
+        assert!(!repositioned.contains("a=t,"), "moving reuses transmitted data");
+        assert!(!repositioned.contains("d=A"));
+    }
+
+    #[test]
+    fn kitty_renderers_use_collision_resistant_image_and_placement_ids() {
+        let data = png(8, 8);
+        let render_ids = || {
+            let mut renderer = TerminalImageRenderer::new(Some(TerminalImageProtocol::Kitty));
+            let layout = renderer.layout(&data, "image/png", ImageDisplayConfig { show_images: true, width_cells: 2 }, 80, 24, TerminalCellSize::default()).unwrap();
+            let mut bytes = Vec::new();
+            renderer.present(&mut bytes, frame(1), &[ImagePlacement::new(layout, &data, "image/png", 0, 0)]).unwrap();
+            let output = String::from_utf8(bytes).unwrap();
+            let image_id = output.split("a=t,").nth(1).unwrap().split("i=").nth(1).unwrap().split(',').next().unwrap().parse::<u32>().unwrap();
+            let placement_id = output.split("a=p,i=").nth(1).unwrap().split(",p=").nth(1).unwrap().split(',').next().unwrap().parse::<u32>().unwrap();
+            (image_id, placement_id)
+        };
+        let first = render_ids();
+        let mut second = render_ids();
+        for _ in 0..3 {
+            if first != second {
+                break;
+            }
+            second = render_ids();
+        }
+        assert_ne!(first.0, 0);
+        assert_ne!(first.1, 0);
+        assert_ne!(first.0, first.1);
+        assert_ne!(first, second, "independent renderer namespaces must not start at fixed ids");
+    }
+
 
     #[test]
     fn iterm_protocol_bytes_are_isolated_and_cached() {

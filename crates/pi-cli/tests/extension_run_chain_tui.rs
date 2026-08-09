@@ -14,53 +14,30 @@ fn rpi_bin() -> String {
     env!("CARGO_BIN_EXE_rpi").to_owned()
 }
 
-fn bun_available() -> bool {
-    Command::new("bun").arg("--version").output().is_ok()
-}
-
-fn require_bun_for_designated_test() {
-    if bun_available() {
-        return;
-    }
-    let required = matches!(
-        std::env::var("BUN_REQUIRED").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "YES")
-    );
-    if required {
-        panic!(
-            "BUN_REQUIRED is set but Bun was not found; install Bun on PATH or set PI_BUN_EXECUTABLE before running designated Bun extension tests"
-        );
-    }
-}
-
 #[test]
-fn pty_bun_extension_run_and_chain_commands() {
-    require_bun_for_designated_test();
-    if !bun_available() {
-        return;
-    }
+fn pty_quickjs_extension_run_and_chain_commands() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let extension = cwd.path().join("run-extension");
     std::fs::create_dir(&extension).unwrap();
     // Trusted installed extension: explicit --extension path with
-    // pi-extension.json manifest (capabilities/commands) and Bun entry.
+    // pi-extension.json manifest (capabilities/commands) and QuickJS entry.
     std::fs::write(
         extension.join("pi-extension.json"),
-        r#"{"schemaVersion":1,"id":"run-smoke","runtime":"bun","entry":"index.ts","capabilities":["commands","ui"],"uiCapabilities":["notify"]}"#,
+        r#"{"schemaVersion":1,"id":"run-smoke","runtime":"quickjs","entry":"index.mjs","capabilities":["commands","ui"],"uiCapabilities":["notify"]}"#,
     )
     .unwrap();
     std::fs::write(
-        extension.join("index.ts"),
+        extension.join("index.mjs"),
         r#"
-export default function (pi: any) {
+export default function (pi) {
   pi.registerCommand("alpha", {
     description: "first",
-    handler: async (args: string) => `alpha:${args || "none"}`,
+    handler: async (args) => `alpha:${args || "none"}`,
   });
   pi.registerCommand("beta", {
     description: "second",
-    handler: async (args: string) => `beta:${args || "none"}`,
+    handler: async (args) => `beta:${args || "none"}`,
   });
 }
 "#,
@@ -149,7 +126,7 @@ export default function (pi: any) {
     writer.flush().unwrap();
     assert!(
         wait_for("alpha:hello", Duration::from_secs(20)),
-        "/run missing over trusted Bun extension command: {}",
+        "/run missing over trusted QuickJS extension command: {}",
         output.lock().unwrap()
     );
 

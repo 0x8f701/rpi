@@ -120,6 +120,10 @@ EOF
 # Launch a full-screen TUI in an isolated tmux session over an ALREADY-CREATED
 # workspace root (callers run setup fixtures before this). $1=root $2=name;
 # reply/extra-env via the globals FAUX_REPLY and FAUX_EXTRA.
+# rpi stderr is captured to evidence/stderr.log, the exit code is printed to
+# the pane, and the shell stays alive for a bounded keep-alive after rpi exits
+# so the ===TUI-DONE- marker and final screen remain capturable (tmux closes a
+# window the moment its command exits, which used to lose the marker).
 launch_tui() {
     local root="$1" name="$2" evidence session binpath
     evidence="$EVIDENCE_ROOT/$name"; mkdir -p "$evidence"
@@ -134,13 +138,16 @@ PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
 PI_FAUX_RESPONSE='${FAUX_REPLY:-$FAUX_REPLY_NORMAL}' \
 TERM=xterm-256color \
 ${FAUX_EXTRA:-} \
-'$RPI_BIN' --offline --model faux/faux-1; printf '===TUI-DONE-${name}===\n'"
+'$RPI_BIN' --offline --model faux/faux-1 2>'$evidence/stderr.log'; rc=\$?; printf '===TUI-DONE-${name}===\n'; printf 'RPI_EXIT=%s\n' \"\$rc\"; sleep 60"
     printf '%s\n' "$session"
 }
 
 # Launch a line REPL with a pre-written command script piped to stdin (stdin
-# non-tty + stdout tty => REPL mode, ANSI on). A DONE marker prints after rpi
-# exits to prove terminal restoration in the same pane.
+# non-tty + stdout tty => REPL mode, ANSI on). rpi stderr is captured to
+# evidence/stderr.log and the exit code is echoed to the pane; the shell then
+# stays alive (bounded keep-alive) so the ===REPL-DONE- marker printed after
+# rpi exits is observable: tmux destroys the window as soon as the command
+# ends, which previously produced an empty pane.txt.
 launch_repl() {
     local root="$1" name="$2" cmds="$3" evidence session binpath
     evidence="$EVIDENCE_ROOT/$name"; mkdir -p "$evidence"
@@ -155,7 +162,7 @@ PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
 PI_FAUX_RESPONSE='${FAUX_REPLY:-$FAUX_REPLY_NORMAL}' \
 TERM=xterm-256color \
 ${FAUX_EXTRA:-} \
-'$RPI_BIN' --offline --model faux/faux-1 < '$cmds'; printf '===REPL-DONE-${name}===\n'"
+'$RPI_BIN' --offline --model faux/faux-1 < '$cmds' 2>'$evidence/stderr.log'; rc=\$?; printf '===REPL-DONE-${name}===\n'; printf 'RPI_EXIT=%s\n' \"\$rc\"; sleep 60"
     printf '%s\n' "$session"
 }
 
@@ -180,9 +187,18 @@ run_repl_display() {
     session="$(launch_repl "$root" "$name" "$cmds")"
     wait_capture "$session" "$evidence/pane.txt" '===REPL-DONE-' 30
     capture_pane "$session" >"$evidence/pane.txt"
-    assert_file_contains "$evidence/pane.txt" '/model' '/loop' 'Show available commands'
-    assert_file_contains "$evidence/pane.txt" 'Enter submit'
-    grep -E '^#' "$evidence/pane.txt" >/dev/null || fail "changelog heading missing"
+    # /help catalog: descriptions and command rows must render.
+    assert_file_contains "$evidence/pane.txt" 'Show available commands' '/model' '/loop'
+    # /changelog: the checked-in changelog heading + intro line prove the
+    # changelog file itself streamed (not a stub).
+    assert_file_contains "$evidence/pane.txt" '# Changelog' 'All notable changes to'
+    # /hotkeys: the key-binding line is hotkeys-only text.
+    assert_file_contains "$evidence/pane.txt" 'Enter submit · Ctrl-D quit' '!command record bash'
+    # Shell restoration + exit proof: rpi exited cleanly and the marker
+    # printed after it in the same pane.
+    grep -E '^RPI_EXIT=0$' "$evidence/pane.txt" >/dev/null \
+        || fail "REPL did not exit cleanly (see $evidence/pane.txt and $evidence/stderr.log)"
+    [ -f "$evidence/stderr.log" ] || fail "REPL stderr was not captured"
     tmux kill-session -t "$session" 2>/dev/null || true
     log "ic.$name passed"
 }

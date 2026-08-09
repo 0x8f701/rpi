@@ -3,6 +3,9 @@
 //! This module derives controls, validation, scope access, and provenance from
 //! `pi_coding::SettingsCatalog` and `SettingsDraft`. It owns no second schema.
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 use anyhow::{Result, bail};
 use pi_coding::{
     Application, SettingApplyOutcome, SettingCategory, SettingSource, SettingValueType,
@@ -20,6 +23,7 @@ const CATEGORIES: &[SettingCategory] = &[
     SettingCategory::Orchestration,
     SettingCategory::Resources,
     SettingCategory::TrustSecurity,
+    SettingCategory::Live,
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -61,9 +65,6 @@ pub struct SettingsPanelRow {
 impl SettingsPanelRow {
     #[must_use]
     pub fn section(&self) -> String {
-        if self.key.starts_with("thinkingBudgets.") {
-            return "Thinking token budgets".to_owned();
-        }
         settings_key_section(&self.key)
     }
 
@@ -78,13 +79,98 @@ impl SettingsPanelRow {
                 _ => level,
             };
         }
+        if self.key == "defaultThinkingLevel" {
+            return "default thinking level";
+        }
         self.key
             .split_once('.')
             .map_or(self.key.as_str(), |(_, child)| child)
     }
 }
 
+/// Explicit subsection overrides (S3-S7): undotted keys that the dot-prefix
+/// rule would dump into the catch-all "General" bucket get a named section,
+/// splitting the RetryTransport / Resources / TrustSecurity / Session general
+/// buckets into meaningful groups. The thinking-level picker and its per-level
+/// caps are handled in [`settings_key_section`] directly (D1/S1).
+const SECTION_OVERRIDES: &[(&str, &str)] = &[
+    // RetryTransport: the transport/timeout settings (the bulk of the
+    // category) form their own section; retry.* keeps its prefix group.
+    ("transport", "Transport"),
+    ("timeoutMs", "Transport"),
+    ("httpIdleTimeoutMs", "Transport"),
+    ("websocketConnectTimeoutMs", "Transport"),
+    ("maxRetryDelayMs", "Transport"),
+    // Resources: one named section per resource kind.
+    ("packages", "Packages"),
+    ("extensions", "Extensions"),
+    ("enableSkillCommands", "Extensions"),
+    ("skills", "Skills"),
+    ("prompts", "Prompts"),
+    ("themes", "Themes"),
+    ("mcpServers", "MCP servers"),
+    // TrustSecurity.
+    ("hooks", "Hooks"),
+    ("permissionRules", "Permission rules"),
+    ("defaultProjectTrust", "Trust policy"),
+    ("approvalMode", "Trust policy"),
+    ("apiKey", "Secrets"),
+    // Session.
+    ("steeringMode", "Steering"),
+    ("followUpMode", "Steering"),
+    ("sessionDir", "Storage"),
+    ("sessionImportSources", "Storage"),
+    ("sessionTtlDays", "Storage"),
+    // Orchestration.
+    ("agents", "Orchestration"),
+];
+
+/// Legacy aliases mapped to their canonical key (S2). Derived from the
+/// catalog's `Legacy alias for <canonical>.` / `Legacy inverse alias for
+/// <canonical>.` descriptions so the mapping cannot drift from the schema: an
+/// alias renders next to the setting it forwards to instead of landing in the
+/// catch-all "General" bucket.
+static LEGACY_ALIAS_CANONICALS: LazyLock<HashMap<&'static str, &'static str>> =
+    LazyLock::new(|| {
+        let mut map = HashMap::new();
+        for definition in SettingsCatalog::definitions() {
+            let canonical = definition
+                .description
+                .strip_prefix("Legacy alias for ")
+                .or_else(|| definition.description.strip_prefix("Legacy inverse alias for "))
+                .and_then(|rest| rest.strip_suffix('.'));
+            if let Some(canonical) = canonical {
+                map.insert(definition.key, canonical);
+            }
+        }
+        map
+    });
+
+/// Canonical subsection label for a catalog key.
+///
+/// The default rule groups by the first dot-prefix, capitalized (`retry.*` →
+/// "Retry"). Overrides exist for the cases the prefix rule gets wrong:
+/// - the thinking-level picker (`defaultThinkingLevel`) and its four per-level
+///   caps (`thinkingBudgets.*`) form one cohesive "Thinking" section with the
+///   level selector first (D1/S1);
+/// - legacy aliases render in their canonical setting's section (S2);
+/// - undotted keys that the prefix rule would dump into "General" get named
+///   sections (S3-S7).
 fn settings_key_section(key: &str) -> String {
+    if key == "defaultThinkingLevel" || key.starts_with("thinkingBudgets.") {
+        return "Thinking".to_owned();
+    }
+    if let Some(canonical) = LEGACY_ALIAS_CANONICALS.get(key) {
+        return settings_key_section(canonical);
+    }
+    if let Some((_, section)) = SECTION_OVERRIDES.iter().find(|(candidate, _)| *candidate == key) {
+        return (*section).to_owned();
+    }
+    // Two-segment prefix groups: the provider-level retry knobs are distinct
+    // from the transport-level retry policy.
+    if key.starts_with("retry.provider.") {
+        return "Retry provider".to_owned();
+    }
     let Some((prefix, _)) = key.split_once('.') else {
         return "General".to_owned();
     };
@@ -365,61 +451,7 @@ impl SettingsPanel {
     }
 
     pub fn set_input(&mut self, key: &str, input: &str) -> Result<()> {
-        let definition = SettingsCatalog::definition(key)
-            .ok_or_else(|| anyhow::anyhow!("unknown setting key {key:?}"))?;
-        let value = match definition.value_type {
-            SettingValueType::Boolean => match input.trim() {
-                "true" => Value::Bool(true),
-                "false" => Value::Bool(false),
-                _ => bail!("{key} must be true or false"),
-            },
-            SettingValueType::Enum | SettingValueType::String { .. } => {
-                Value::String(input.to_owned())
-            }
-            SettingValueType::Integer { .. } => {
-                let value = input
-                    .trim()
-                    .parse::<i64>()
-                    .map_err(|_| anyhow::anyhow!("{key} must be an integer"))?;
-                Value::Number(value.into())
-            }
-            SettingValueType::UnsignedInteger { .. } => {
-                let value = input
-                    .trim()
-                    .parse::<u64>()
-                    .map_err(|_| anyhow::anyhow!("{key} must be a non-negative integer"))?;
-                Value::Number(value.into())
-            }
-            SettingValueType::Number { .. } => {
-                let value = input
-                    .trim()
-                    .parse::<f64>()
-                    .map_err(|_| anyhow::anyhow!("{key} must be a number"))?;
-                let number = serde_json::Number::from_f64(value)
-                    .ok_or_else(|| anyhow::anyhow!("{key} must be a finite number"))?;
-                Value::Number(number)
-            }
-            SettingValueType::StringList { .. } => {
-                let value: Value = serde_json::from_str(input).map_err(|error| {
-                    anyhow::anyhow!("{key} must be a valid JSON array of strings: {error}")
-                })?;
-                if value
-                    .as_array()
-                    .is_none_or(|values| values.iter().any(|value| !value.is_string()))
-                {
-                    bail!("{key} must be a JSON array of strings");
-                }
-                value
-            }
-            SettingValueType::Array | SettingValueType::Object => {
-                serde_json::from_str(input).map_err(|error| {
-                    anyhow::anyhow!("{key} must be valid JSON: {error}")
-                })?
-            }
-            SettingValueType::Secret => {
-                bail!("{key} is secret material and cannot be edited here")
-            }
-        };
+        let value = parse_setting_input(key, input)?;
         self.set_value(key, value)
     }
 
@@ -506,6 +538,66 @@ impl SettingsPanel {
         self.cursor = self.cursor.min(self.rows()?.len().saturating_sub(1));
         Ok(outcome)
     }
+}
+
+/// Parse a typed value from text input against the catalog schema. Shared by
+/// the interactive editor ([`SettingsPanel::set_input`]) and the headless
+/// `rpi config set` CLI so both surfaces accept exactly the same shapes — the
+/// panel owns no second schema.
+pub fn parse_setting_input(key: &str, input: &str) -> Result<Value> {
+    let definition = SettingsCatalog::definition(key)
+        .ok_or_else(|| anyhow::anyhow!("unknown setting key {key:?}"))?;
+    let value = match definition.value_type {
+        SettingValueType::Boolean => match input.trim() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => bail!("{key} must be true or false"),
+        },
+        SettingValueType::Enum | SettingValueType::String { .. } => Value::String(input.to_owned()),
+        SettingValueType::Integer { .. } => {
+            let value = input
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("{key} must be an integer"))?;
+            Value::Number(value.into())
+        }
+        SettingValueType::UnsignedInteger { .. } => {
+            let value = input
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("{key} must be a non-negative integer"))?;
+            Value::Number(value.into())
+        }
+        SettingValueType::Number { .. } => {
+            let value = input
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| anyhow::anyhow!("{key} must be a number"))?;
+            let number = serde_json::Number::from_f64(value)
+                .ok_or_else(|| anyhow::anyhow!("{key} must be a finite number"))?;
+            Value::Number(number)
+        }
+        SettingValueType::StringList { .. } => {
+            let value: Value = serde_json::from_str(input).map_err(|error| {
+                anyhow::anyhow!("{key} must be a valid JSON array of strings: {error}")
+            })?;
+            if value
+                .as_array()
+                .is_none_or(|values| values.iter().any(|value| !value.is_string()))
+            {
+                bail!("{key} must be a JSON array of strings");
+            }
+            value
+        }
+        SettingValueType::Array | SettingValueType::Object => {
+            serde_json::from_str(input)
+                .map_err(|error| anyhow::anyhow!("{key} must be valid JSON: {error}"))?
+        }
+        SettingValueType::Secret => {
+            bail!("{key} is secret material and cannot be edited here")
+        }
+    };
+    Ok(value)
 }
 
 fn control_for(
@@ -622,7 +714,7 @@ mod tests {
         panel.set_search("thinkingBudgets.medium");
         let row = panel.selected().expect("selected").expect("medium row");
         assert_eq!(row.key, "thinkingBudgets.medium");
-        assert_eq!(row.section(), "Thinking token budgets");
+        assert_eq!(row.section(), "Thinking");
         assert_eq!(row.display_key(), "medium token budget");
         assert_eq!(panel.input_hint(&row.key).expect("hint"), "integer token override; inherited when unset");
         assert!(row.inherited);
@@ -660,6 +752,145 @@ mod tests {
         assert_eq!(panel.category(), Some(SettingCategory::Orchestration));
         panel.previous_category();
         assert_eq!(panel.category(), Some(SettingCategory::TerminalUi));
+    }
+
+    #[test]
+    fn thinking_level_picker_collocates_with_its_caps_first() {
+        // D1/S1: defaultThinkingLevel and the four per-level caps form one
+        // "Thinking" section with the level picker first.
+        let (_agent, _cwd, manager) = manager(true);
+        let mut panel = SettingsPanel::new(manager, SettingsScope::Global).expect("panel");
+        panel.set_category(Some(SettingCategory::Models));
+        let rows = panel.rows().expect("rows");
+        let thinking = rows
+            .iter()
+            .filter(|row| row.section() == "Thinking")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            thinking.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            vec![
+                "defaultThinkingLevel",
+                "thinkingBudgets.minimal",
+                "thinkingBudgets.low",
+                "thinkingBudgets.medium",
+                "thinkingBudgets.high",
+            ],
+            "level picker must come first, then the four per-level caps"
+        );
+        let picker = rows
+            .iter()
+            .find(|row| row.key == "defaultThinkingLevel")
+            .expect("level picker row");
+        assert_eq!(picker.section(), "Thinking");
+        assert_eq!(picker.display_key(), "default thinking level");
+        assert!(
+            matches!(&picker.control, SettingsControl::Enum { options, .. } if options.len() >= 4),
+            "the level selector is the Enum picker"
+        );
+    }
+
+    #[test]
+    fn legacy_aliases_and_general_buckets_group_into_named_sections() {
+        // S2: legacy aliases render next to their canonical setting.
+        let (_agent, _cwd, manager) = manager(true);
+        let mut panel = SettingsPanel::new(manager, SettingsScope::Global).expect("panel");
+        panel.set_category(Some(SettingCategory::RetryTransport));
+        let rows = panel.rows().expect("rows");
+        let section = |key: &str| {
+            rows.iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("{key} row"))
+                .section()
+        };
+        assert_eq!(section("autoRetry"), "Retry");
+        assert_eq!(section("maxRetries"), "Retry");
+        assert_eq!(section("baseDelayMs"), "Retry");
+        assert_eq!(section("transport"), "Transport");
+        assert_eq!(section("timeoutMs"), "Transport");
+        // No catch-all "General" bucket remains in RetryTransport.
+        assert!(
+            !rows.iter().any(|row| row.section() == "General"),
+            "RetryTransport general bucket must be fully split: {:?}",
+            rows.iter().map(|row| (row.key.as_str(), row.section())).collect::<Vec<_>>()
+        );
+
+        // S3-S7: Resources / TrustSecurity / Session named buckets.
+        let mut resources = SettingsPanel::new(panel.manager.clone(), SettingsScope::Global)
+            .expect("resources panel");
+        resources.set_category(Some(SettingCategory::Resources));
+        let rows = resources.rows().expect("resources rows");
+        let section = |key: &str| {
+            rows.iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("{key} row"))
+                .section()
+        };
+        assert_eq!(section("packages"), "Packages");
+        assert_eq!(section("extensions"), "Extensions");
+        assert_eq!(section("enableSkillCommands"), "Extensions");
+        assert_eq!(section("skills"), "Skills");
+        assert_eq!(section("prompts"), "Prompts");
+        assert_eq!(section("themes"), "Themes");
+        assert_eq!(section("mcpServers"), "MCP servers");
+
+        let mut trust = SettingsPanel::new(panel.manager.clone(), SettingsScope::Global)
+            .expect("trust panel");
+        trust.set_category(Some(SettingCategory::TrustSecurity));
+        let rows = trust.rows().expect("trust rows");
+        let section = |key: &str| {
+            rows.iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("{key} row"))
+                .section()
+        };
+        assert_eq!(section("defaultProjectTrust"), "Trust policy");
+        assert_eq!(section("approvalMode"), "Trust policy");
+        assert_eq!(section("hooks"), "Hooks");
+        assert_eq!(section("permissionRules"), "Permission rules");
+        assert_eq!(section("apiKey"), "Secrets");
+
+        let mut session = SettingsPanel::new(panel.manager.clone(), SettingsScope::Global)
+            .expect("session panel");
+        session.set_category(Some(SettingCategory::Session));
+        let rows = session.rows().expect("session rows");
+        let section = |key: &str| {
+            rows.iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("{key} row"))
+                .section()
+        };
+        assert_eq!(section("steeringMode"), "Steering");
+        assert_eq!(section("followUpMode"), "Steering");
+        assert_eq!(section("sessionDir"), "Storage");
+        assert_eq!(section("sessionImportSources"), "Storage");
+        assert_eq!(section("sessionTtlDays"), "Storage");
+
+        let mut orchestration = SettingsPanel::new(panel.manager.clone(), SettingsScope::Global)
+            .expect("orchestration panel");
+        orchestration.set_category(Some(SettingCategory::Orchestration));
+        let rows = orchestration.rows().expect("orchestration rows");
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.key == "agents")
+                .expect("agents row")
+                .section(),
+            "Orchestration"
+        );
+
+        // TerminalUi legacy aliases land with their canonical keys too.
+        let mut terminal = SettingsPanel::new(panel.manager.clone(), SettingsScope::Global)
+            .expect("terminal panel");
+        terminal.set_category(Some(SettingCategory::TerminalUi));
+        let rows = terminal.rows().expect("terminal rows");
+        let section = |key: &str| {
+            rows.iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("{key} row"))
+                .section()
+        };
+        assert_eq!(section("showImages"), "Terminal");
+        assert_eq!(section("imageWidthCells"), "Terminal");
+        assert_eq!(section("autoResizeImages"), "Images");
     }
 
     #[test]

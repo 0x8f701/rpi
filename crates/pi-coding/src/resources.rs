@@ -4,6 +4,7 @@
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 use anyhow::Context;
@@ -15,13 +16,10 @@ fn ps(p: impl AsRef<Path>) -> String {
     p.as_ref().to_string_lossy().into_owned()
 }
 
-/// pi's per-project/user config directory name.
 pub const CONFIG_DIR_NAME: &str = ".pi";
 
-/// Maximum bytes read from any single configurable text resource.
 pub const MAX_RESOURCE_FILE_BYTES: u64 = 1024 * 1024;
 
-/// Maximum combined bytes retained in one validated resource snapshot.
 pub const MAX_RESOURCE_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Read one UTF-8 resource without allocating beyond the per-file cap.
@@ -72,17 +70,50 @@ const MAX_SKILL_DESCRIPTION_LENGTH: i64 = 1024;
 const CONTEXT_FILE_CANDIDATES: &[&str] = &["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 const SKILL_IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".ignore", ".fdignore"];
 
-/// Returns the global agent config directory (`~/.pi/agent`).
-pub fn agent_dir() -> String {
+/// The active config profile for this process, installed once by the CLI
+/// before any dispatch (`--profile` wins over `PI_PROFILE`). `None` means the
+/// default (unprofiled) user base is active.
+static ACTIVE_PROFILE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Set the active config profile for this process. `None` selects the default
+/// (unprofiled) user base; a named profile relocates every agent-dir-derived
+/// path under `<base>/profiles/<name>`. The profile is a process constant
+/// fixed at startup, so a second call is ignored.
+pub fn set_active_profile(profile: Option<&str>) {
+    let _ = ACTIVE_PROFILE.set(profile.map(str::to_owned));
+}
+
+/// Relocate a user base directory under the active config profile:
+/// `<base>` becomes `<base>/profiles/<name>` when a named profile is active,
+/// and is returned unchanged for the default profile.
+#[must_use]
+pub fn apply_profile(base: PathBuf) -> PathBuf {
+    match ACTIVE_PROFILE.get().and_then(|profile| profile.as_deref()) {
+        Some(name) => base.join("profiles").join(name),
+        None => base,
+    }
+}
+
+/// The user agent base directory (`~/.pi/agent`, honoring
+/// `PI_CODING_AGENT_DIR`), before any profile relocation. Shared by
+/// [`agent_dir`] and the session store so both apply the active profile
+/// exactly once.
+pub(crate) fn agent_dir_base() -> PathBuf {
     if let Some(configured) = std::env::var_os("PI_CODING_AGENT_DIR")
         .filter(|value| !value.is_empty())
     {
-        return ps(PathBuf::from(configured));
+        return PathBuf::from(configured);
     }
     match home_dir() {
-        Some(home) => ps(Path::new(&home).join(CONFIG_DIR_NAME).join("agent")),
-        None => ps(Path::new(CONFIG_DIR_NAME).join("agent")),
+        Some(home) => Path::new(&home).join(CONFIG_DIR_NAME).join("agent"),
+        None => Path::new(CONFIG_DIR_NAME).join("agent"),
     }
+}
+
+/// Returns the global agent config directory (`~/.pi/agent`), relocated under
+/// the active config profile (`<base>/profiles/<name>`) when one is active.
+pub fn agent_dir() -> String {
+    ps(&apply_profile(agent_dir_base()))
 }
 
 #[must_use]
@@ -213,7 +244,6 @@ fn load_context_file_from_dir(dir: &Path) -> Option<ContextFile> {
     None
 }
 
-/// Resolves symlinks, falling back to the input when it cannot be resolved.
 fn canonicalize_path(p: &str) -> String {
     fs::canonicalize(p)
         .map(|c| ps(&c))
@@ -369,7 +399,6 @@ pub fn load_context_files(cwd: &str, include_project: bool) -> Vec<ContextFile> 
     files
 }
 
-/// Compatibility helper for callers that already established project trust.
 pub fn load_project_context_files(cwd: &str) -> Vec<ContextFile> {
     load_context_files(cwd, true)
 }
@@ -456,7 +485,6 @@ impl SkillSource {
     }
 }
 
-/// A discovered Agent Skill (`SKILL.md` with frontmatter).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,
@@ -471,7 +499,6 @@ pub struct Skill {
     pub trusted: bool,
 }
 
-/// A validation warning (or error) with the offending file path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillDiagnostic {
     /// `"warning"` | `"error"`.
@@ -755,7 +782,6 @@ fn to_posix(p: &str) -> String {
     p.replace('\\', "/")
 }
 
-/// Resolves whether `full` is a regular file, following symlinks.
 fn stat_is_file(full: &Path, e: &fs::DirEntry) -> (bool, bool) {
     let ft = match e.file_type() {
         Ok(t) => t,
@@ -1003,7 +1029,6 @@ fn parse_block_scalar(header: &str, lines: &[&str], start: usize) -> (String, us
     (val, i)
 }
 
-/// Parses a fully single- or double-quoted scalar.
 fn parse_quoted_scalar(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     if bytes.len() < 2 {
@@ -1354,7 +1379,6 @@ fn get_esc(chunk: &[u8]) -> Option<(u8, &[u8])> {
     Some((c[0], &c[1..]))
 }
 
-/// Renders visible skills as the Agent Skills XML block.
 pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     let visible: Vec<&Skill> = skills
         .iter()

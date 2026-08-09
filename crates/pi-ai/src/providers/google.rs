@@ -1087,6 +1087,7 @@ pub fn register_google() {
             api: API_GOOGLE_GENERATIVE_AI.into(),
             stream: native,
             stream_simple: simple,
+            generate_image: None,
         },
         None,
     );

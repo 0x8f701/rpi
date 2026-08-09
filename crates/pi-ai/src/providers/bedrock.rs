@@ -1927,6 +1927,7 @@ pub fn register_bedrock() {
             api: API_BEDROCK_CONVERSE_STREAM.into(),
             stream,
             stream_simple,
+            generate_image: None,
         },
         None,
     );

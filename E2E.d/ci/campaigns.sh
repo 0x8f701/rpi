@@ -13,10 +13,12 @@ list_scenarios() {
         'campaign.openai-schema - strict OpenAI todo/task schema request validation' \
         'campaign.bash-tui - foreground Bash stdin isolation and unattended TUI completion' \
         'campaign.workflow - opt-in multi-workflow RPC+tmux release gate' \
-        'campaign.extension - trusted Bun command and chain in isolated TUI (requires bun, explicit group)' \
-        'campaign.tmux-matrix - TUI visual/input capture at 90x31, 120x31, and 163x40 (explicit group)'
+        'campaign.extension - trusted QuickJS command and chain in isolated TUI' \
+        'campaign.tmux-matrix - TUI visual/input capture at 90x31, 120x31, and 163x40 (explicit group)' \
+        'campaign.user - user-perspective goal-driven tmux scenarios (goal/rewind/btw/queue/bash-card/todo/workflow)'
     "$SCRIPT_DIR/orchestration.sh" list
     "$SCRIPT_DIR/workflow.sh" list
+    "$SCRIPT_DIR/user_scenarios.sh" list
 }
 
 run_version() {
@@ -76,17 +78,17 @@ run_bash_tui() {
 }
 
 run_extension() {
-    require_cmd bun; require_cmd tmux
+    require_cmd tmux
     local root evidence extension session
     root="$(scenario_workspace extension)"; evidence="$EVIDENCE_ROOT/extension"; extension="$root/extension"; session="$(unique_tmux_name extension)"
     mkdir -p "$extension"
     cat > "$extension/pi-extension.json" <<'EOF'
-{"schemaVersion":1,"id":"e2e-run","runtime":"bun","entry":"index.ts","capabilities":["commands","ui"],"uiCapabilities":["notify"]}
+{"schemaVersion":1,"id":"e2e-run","runtime":"quickjs","entry":"index.mjs","capabilities":["commands","ui"],"uiCapabilities":["notify"]}
 EOF
-    cat > "$extension/index.ts" <<'EOF'
-export default function (pi: any) {
-  pi.registerCommand("alpha", {handler: async (args: string) => `alpha:${args || "none"}`});
-  pi.registerCommand("beta", {handler: async (args: string) => `beta:${args || "none"}`});
+    cat > "$extension/index.mjs" <<'EOF'
+export default function (pi) {
+  pi.registerCommand("alpha", {handler: async (args) => `alpha:${args || "none"}`});
+  pi.registerCommand("beta", {handler: async (args) => `beta:${args || "none"}`});
 }
 EOF
     register_tmux_session "$session"
@@ -135,6 +137,12 @@ case "${1:-run}" in
         if command -v tmux >/dev/null 2>&1; then run_bash_tui; else log "tmux not available; skipped Bash TUI ownership lane"; fi
         # Deterministic orchestration lane (rpc + rust; tmux when available).
         "$SCRIPT_DIR/orchestration.sh" run
+        # User-perspective goal-driven tmux lane (faux + loopback mock).
+        if command -v tmux >/dev/null 2>&1; then
+            "$SCRIPT_DIR/user_scenarios.sh" run
+        else
+            log "tmux not available; skipped user-perspective tmux scenarios"
+        fi
         # Multi-workflow remains an explicit release lane because it includes
         # destructive git worktree integration/conflict fixtures.
         printf 'campaigns passed\nevidence=%s\n' "$EVIDENCE_ROOT"
@@ -151,5 +159,14 @@ case "${1:-run}" in
     workflow-tmux) "$SCRIPT_DIR/workflow.sh" tmux ;;
     extension) prepare_roots; require_rpi; run_extension; printf 'extension campaign passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
     tmux-matrix) prepare_roots; require_rpi; run_tmux_matrix; printf 'tmux matrix passed\nevidence=%s\n' "$EVIDENCE_ROOT" ;;
-    *) fail "usage: $0 [run|list|--dry-run|openai-schema|bash-tui|orchestration|orchestration-rpc|orchestration-rust|orchestration-tmux|workflow|workflow-rpc|workflow-tmux|extension|tmux-matrix]" ;;
+    user) "$SCRIPT_DIR/user_scenarios.sh" run ;;
+    user-goal) "$SCRIPT_DIR/user_scenarios.sh" goal ;;
+    user-rewind-compact) "$SCRIPT_DIR/user_scenarios.sh" rewind-compact ;;
+    user-btw) "$SCRIPT_DIR/user_scenarios.sh" btw ;;
+    user-steering-queue) "$SCRIPT_DIR/user_scenarios.sh" steering-queue ;;
+    user-bash-card) "$SCRIPT_DIR/user_scenarios.sh" bash-card ;;
+    user-fence) "$SCRIPT_DIR/user_scenarios.sh" fence ;;
+    user-todo-dag) "$SCRIPT_DIR/user_scenarios.sh" todo-dag ;;
+    user-workflow-run) "$SCRIPT_DIR/user_scenarios.sh" workflow-run ;;
+    *) fail "usage: $0 [run|list|--dry-run|openai-schema|bash-tui|orchestration|orchestration-rpc|orchestration-rust|orchestration-tmux|workflow|workflow-rpc|workflow-tmux|extension|tmux-matrix|user|user-goal|user-rewind-compact|user-btw|user-steering-queue|user-bash-card|user-fence|user-todo-dag|user-workflow-run]" ;;
 esac

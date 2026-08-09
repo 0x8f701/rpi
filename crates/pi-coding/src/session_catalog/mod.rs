@@ -38,10 +38,11 @@ use self::discovery::{
     path_lexically_under_root, path_under_depth, selected_sources,
 };
 use self::helpers::{
-    canonical_fingerprint, content_fingerprint, display_name, expand_tilde, format_epoch,
-    compare_rows_newest, make_absolute, metadata_epoch, normalize_cwd, normalize_summary,
+    canonical_fingerprint, content_fingerprint, display_name, format_epoch,
+    compare_rows_newest, metadata_epoch, normalize_cwd, normalize_summary,
     row_matches_query, sort_rows_newest, truncate_summary,
 };
+pub(crate) use self::helpers::{expand_tilde, make_absolute};
 use self::lineage::{read_native_header_lite, read_native_lineage, read_native_list_info};
 
 pub(super) const LINEAGE_CUSTOM_TYPE: &str = "import_lineage";
@@ -269,6 +270,9 @@ pub struct CatalogRow {
     pub import_lineage: Option<ImportLineageKey>,
     /// Concatenated corpus used by fuzzy search.
     pub search_text: String,
+    /// Isolated message corpus matched by the TUI selector without crossing
+    /// into cwd/path; the catalog matcher still uses `search_text`.
+    pub message_blob: String,
 }
 
 /// Options for unified listing.
@@ -1200,6 +1204,7 @@ impl SessionCatalog {
                 status: CatalogRowStatus::Native,
                 import_lineage: info.lineage,
                 search_text,
+                message_blob: info.first_message.clone(),
             }));
         }
 
@@ -1277,6 +1282,7 @@ impl SessionCatalog {
             status,
             import_lineage: Some(lineage),
             search_text,
+            message_blob,
         }))
     }
 }

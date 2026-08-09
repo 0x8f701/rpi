@@ -56,6 +56,7 @@ fn compact_settings() -> CompactionSettings {
         enabled: true,
         reserve_tokens: 20,
         keep_recent_tokens: 4,
+        snap_keep_turns: 10,
     }
 }
 
@@ -359,6 +360,7 @@ async fn overflow_retry_provider_context_retains_coherent_tail() {
         enabled: true,
         reserve_tokens: 20,
         keep_recent_tokens: 20,
+        snap_keep_turns: 10,
     };
     let (session, registration, _cwd) = session_with_context_capture(
         model,
@@ -568,6 +570,7 @@ async fn overflow_recovery_preserves_active_goal_and_todo_state() {
             list: Some(vec![TodoInitPhase {
                 phase: "Recovery".into(),
                 items: vec!["preserve dag".into(), "finish turn".into()],
+                agents: None,
             }]),
             items: None,
             phase: None,
@@ -766,6 +769,7 @@ async fn manual_compact_then_prompt_is_usable_and_preserves_goal_todo() {
         enabled: true,
         reserve_tokens: 20,
         keep_recent_tokens: 20,
+        snap_keep_turns: 10,
     };
     let (session, registration, session_dir) = session_with_context_capture(
         model.clone(),
@@ -805,6 +809,7 @@ async fn manual_compact_then_prompt_is_usable_and_preserves_goal_todo() {
             list: Some(vec![TodoInitPhase {
                 phase: "Manual".into(),
                 items: vec!["compact".into(), "continue".into()],
+                agents: None,
             }]),
             items: None,
             phase: None,
@@ -1002,6 +1007,7 @@ async fn application_is_compacting_only_while_manual_summary_runs() {
                 enabled: true,
                 reserve_tokens: 20,
                 keep_recent_tokens: 20,
+                snap_keep_turns: 10,
             }),
             stream_options: Default::default(),
             tools: Some(Vec::new()),

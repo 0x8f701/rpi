@@ -1,0 +1,13 @@
+[book]
+title = "rpi — reference manual"
+authors = []
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "navy"

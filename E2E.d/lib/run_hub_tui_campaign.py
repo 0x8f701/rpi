@@ -117,6 +117,7 @@ class HubTuiHandler(BaseHTTPRequestHandler):
                     "main-spawn-alpha-beta",
                     "task",
                     {
+                        "context": "Hub relay contract: Main coordinates, Alpha relays to Beta, Beta relays to Main; every message body is passed through unchanged.",
                         "tasks": [
                             {"name": "Alpha", "agent": "Alpha", "task": "Wait for Main, then send Beta."},
                             {"name": "Beta", "agent": "Beta", "task": "Wait for Alpha, then send Main."},

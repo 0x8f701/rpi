@@ -30,7 +30,7 @@ use pi_cli::loop_commands::{
 };
 use pi_coding::{
     Application, ApplicationEvent, GoalContinuationDecision, GoalLifecycle, GoalPauseReason,
-    GoalUsageDelta, LoopCreateRequest, NavigateTreeOptions, ResourceManager,
+    GoalUsageDelta, LoopCreateRequest, NavigateTreeOptions, RequestAuth, ResourceManager,
     ResourceManagerOptions, Session, SessionOptions,
 };
 use serde_json::{Value, json};
@@ -154,7 +154,21 @@ async fn recorded_application(
         ThinkingLevel::Xhigh => "xhigh",
         ThinkingLevel::Max => "max",
     };
-    let session = Session::new(session_options(model.clone(), cwd, thinking)).expect("session");
+    // Faux providers share the static "faux" api key, so a trivial auth
+    // resolver lets session switches that cross the per-application provider
+    // suffix resolve auth through the resolver branch instead of tripping the
+    // production fail-closed guard (which correctly rejects real provider
+    // changes made without an auth resolver).
+    let mut options = session_options(model.clone(), cwd, thinking);
+    options.auth_resolver = Some(Arc::new(|_model: Model| {
+        Box::pin(async move {
+            Ok(RequestAuth {
+                api_key: "faux".into(),
+                ..Default::default()
+            })
+        })
+    }));
+    let session = Session::new(options).expect("session");
     let recorder = pi_coding::start_session_in(
         cwd,
         Some(&model),

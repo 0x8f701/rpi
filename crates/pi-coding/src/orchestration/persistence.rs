@@ -77,10 +77,26 @@ pub struct PersistedDefinition {
     pub model: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<pi_agent::ThinkingLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disallowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_ceiling: Option<super::CapabilityCeiling>,
     pub source: PersistedDefinitionSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     pub trusted: bool,
+    #[serde(default)]
+    pub kind: super::AgentDefinitionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_budget: Option<super::JobSoftBudget>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +127,10 @@ pub struct PersistedRequest {
     pub model_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_mode: Option<String>,
 }
 
 /// Durable runtime binding: holds the canonical parent session path, canonical
@@ -143,6 +163,18 @@ impl DurableRuntime {
         let requested_parent_dir = requested_parent
             .parent()
             .ok_or_else(|| anyhow!("parent session path has no parent"))?;
+        // The parent session directory may not exist yet on first launch: the
+        // recorder defers materializing its file, and startup TTL pruning can
+        // remove the empty per-cwd directory before this binding runs. Create
+        // it (with ancestors) so canonicalizing the binding target never fails
+        // merely because the directory has not been materialized. Other
+        // failures (permissions, a non-directory path) still fail closed.
+        fs::create_dir_all(requested_parent_dir).with_context(|| {
+            format!(
+                "creating parent session directory {}",
+                requested_parent_dir.display()
+            )
+        })?;
         let session_root = fs::canonicalize(requested_parent_dir).with_context(|| {
             format!(
                 "canonicalizing parent session directory {}",
@@ -615,7 +647,15 @@ pub fn recovery_status(status: AgentStatus) -> AgentStatus {
 /// Cancelled) are kept as-is. Unsettled jobs (Queued/Running) become Cancelled
 /// with a contextual result and finished timestamp, truthfully recording that
 /// the process interrupted them.
-pub fn recovery_job(mut job: JobSnapshot, finished_at: u64) -> JobSnapshot {
+pub fn recovery_job(job: JobSnapshot, finished_at: u64) -> JobSnapshot {
+    recovery_job_with_persona(job, finished_at, None)
+}
+
+pub(crate) fn recovery_job_with_persona(
+    mut job: JobSnapshot,
+    finished_at: u64,
+    persona: Option<&str>,
+) -> JobSnapshot {
     if job.status.is_settled() {
         return job;
     }
@@ -629,29 +669,33 @@ pub fn recovery_job(mut job: JobSnapshot, finished_at: u64) -> JobSnapshot {
             status: AgentStatus::Aborted,
             output: String::new(),
             usage: pi_ai::Usage::default(),
+            soft_budget_exhausted: false,
             error: Some("orchestration job interrupted by process restart".to_owned()),
+            structured_output: None,
             artifact_ref: format!("agent://{}", job.agent_id),
-            history_ref: format!("history://{}", job.agent_id),
+            history_ref: persona.map_or_else(
+                || format!("history://{}", job.agent_id),
+                |persona| format!("history://persona/{persona}/{}", job.agent_id),
+            ),
             artifact_uri: format!("artifact://{}", job.agent_id),
         });
     }
     job
 }
 
-/// Reconstruct a `ChildSessionRequest` from persisted material and a freshly
-/// resolved model. Returns `None` if the persisted definition name no longer
-/// resolves to a trusted, enabled agent, or the model cannot be resolved.
+/// Reconstruct a `ChildSessionRequest` from persisted execution identity and
+/// freshly resolved policy. Returns `None` if the live definition no longer
+/// exactly matches the persisted definition or is not trusted.
 pub fn reconstruct_request(
     agent: &PersistedAgent,
     resolved_model: pi_ai::Model,
     definition: &super::AgentDefinition,
+    system_prompt: String,
+    requested_tool_names: Option<Vec<String>>,
     orchestration_tools: Vec<pi_agent::AgentTool>,
     max_tools_per_agent: usize,
 ) -> Option<ChildSessionRequest> {
-    if !definition.trusted {
-        return None;
-    }
-    if definition.name != agent.definition.name {
+    if !definition.trusted || persist_definition(definition) != agent.definition {
         return None;
     }
     Some(ChildSessionRequest {
@@ -661,11 +705,14 @@ pub fn reconstruct_request(
         depth: agent.request.depth,
         definition: definition.clone(),
         assignment: agent.request.assignment.clone(),
-        system_prompt: agent.request.system_prompt.clone(),
-        requested_tool_names: agent.request.requested_tool_names.clone(),
+        system_prompt,
+        requested_tool_names,
         orchestration_tools,
         thinking_level: agent.request.thinking_level,
         model: resolved_model,
+        output_schema: agent.request.output_schema.clone(),
+        schema_mode: agent.request.schema_mode.clone(),
+        yield_state: std::sync::Arc::new(super::YieldState::default()),
     })
 }
 
@@ -679,6 +726,11 @@ pub fn persist_definition(definition: &super::AgentDefinition) -> PersistedDefin
         autoload_skills: definition.autoload_skills.clone(),
         model: definition.model.clone(),
         thinking_level: definition.thinking_level,
+        max_turns: definition.max_turns,
+        max_tool_calls: definition.max_tool_calls,
+        timeout_secs: definition.timeout_secs,
+        disallowed_tools: definition.disallowed_tools.clone(),
+        capability_ceiling: definition.capability_ceiling,
         source: match definition.source {
             super::AgentDefinitionSource::Project => PersistedDefinitionSource::Project,
             super::AgentDefinitionSource::User => PersistedDefinitionSource::User,
@@ -686,6 +738,9 @@ pub fn persist_definition(definition: &super::AgentDefinition) -> PersistedDefin
         },
         path: definition.path.clone(),
         trusted: definition.trusted,
+        kind: definition.kind,
+        personality: definition.personality.clone(),
+        soft_budget: definition.soft_budget,
     }
 }
 
@@ -702,6 +757,8 @@ pub fn persist_request(request: &ChildSessionRequest) -> PersistedRequest {
         max_tools_per_agent: request.max_tools_per_agent,
         model_provider: Some(request.model.provider.clone()),
         model_id: Some(request.model.id.clone()),
+        output_schema: request.output_schema.clone(),
+        schema_mode: request.schema_mode.clone(),
     }
 }
 
@@ -762,9 +819,17 @@ mod tests {
                 autoload_skills: Vec::new(),
                 model: None,
                 thinking_level: None,
+                max_turns: None,
+                max_tool_calls: None,
+                timeout_secs: None,
+                disallowed_tools: Vec::new(),
+                capability_ceiling: None,
                 source: PersistedDefinitionSource::Bundled,
                 path: None,
                 trusted: true,
+                kind: super::super::AgentDefinitionKind::Agent,
+                personality: None,
+                soft_budget: None,
             },
             request: PersistedRequest {
                 child_id: id.to_owned(),
@@ -777,6 +842,8 @@ mod tests {
                 max_tools_per_agent: 16,
                 model_provider: Some("test".to_owned()),
                 model_id: Some("test-model".to_owned()),
+                output_schema: None,
+                schema_mode: None,
             },
             session_path: None,
             mailbox: Vec::new(),
@@ -942,6 +1009,7 @@ mod tests {
             started_at: Some(2),
             finished_at: None,
             result: None,
+            soft_budget_exhausted: false,
         };
         let recovered = recovery_job(running.clone(), 100);
         assert_eq!(recovered.status, JobStatus::Cancelled);
@@ -952,6 +1020,59 @@ mod tests {
         let settled = recovery_job(running, 100);
         assert_eq!(settled.status, JobStatus::Completed);
         assert_eq!(settled.finished_at, Some(50));
+    }
+
+    #[test]
+    fn recovery_job_preserves_qualified_persona_history() {
+        let job = JobSnapshot {
+            id: "job-persona".to_owned(),
+            agent_id: "MentorRun".to_owned(),
+            agent: "mentor".to_owned(),
+            parent_id: "Main".to_owned(),
+            description: None,
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status: JobStatus::Running,
+            created_at: 1,
+            started_at: Some(2),
+            finished_at: None,
+            result: None,
+            soft_budget_exhausted: false,
+        };
+
+        let recovered = recovery_job_with_persona(job, 100, Some("mentor"));
+        assert_eq!(
+            recovered.result.expect("recovery result").history_ref,
+            "history://persona/mentor/MentorRun"
+        );
+    }
+
+    #[test]
+    fn binding_creates_missing_parent_session_directory() {
+        let root = tempdir().expect("root");
+        // First-launch shape: the per-cwd session directory (and its
+        // ancestors) does not exist yet — e.g. startup TTL pruning removed the
+        // empty directory before the orchestration binding ran.
+        let parent_path = root
+            .path()
+            .join("sessions")
+            .join("--missing--")
+            .join("parent.jsonl");
+        assert!(!parent_path.parent().expect("parent").exists());
+        let rt = DurableRuntime::new(
+            parent_id(),
+            parent_path.clone(),
+            root.path()
+                .join("sessions")
+                .join("--missing--")
+                .join("children")
+                .join(parent_id()),
+        )
+        .expect("binding must create the missing parent session directory");
+        assert!(parent_path.parent().expect("parent").is_dir());
+        assert_eq!(rt.parent_session_path(), &parent_path);
+        assert!(rt.child_root().is_dir());
     }
 
     #[test]
@@ -985,13 +1106,91 @@ mod tests {
             autoload_skills: Vec::new(),
             model: None,
             thinking_level: None,
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
             source: super::super::AgentDefinitionSource::Bundled,
             path: None,
             trusted: true,
+            kind: super::super::AgentDefinitionKind::Agent,
+            personality: None,
+            soft_budget: None,
         };
         let model = pi_ai::Model::default();
-        assert!(reconstruct_request(&agent, model.clone(), &definition, Vec::new(), 16).is_some());
+        assert!(reconstruct_request(
+            &agent,
+            model.clone(),
+            &definition,
+            "prompt".to_owned(),
+            None,
+            Vec::new(),
+            16,
+        )
+        .is_some());
         definition.name = "other".to_owned();
-        assert!(reconstruct_request(&agent, model, &definition, Vec::new(), 16).is_none());
+        assert!(reconstruct_request(
+            &agent,
+            model,
+            &definition,
+            "prompt".to_owned(),
+            None,
+            Vec::new(),
+            16,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn reconstruct_request_rejects_changed_definition_policy() {
+        let agent = persisted_agent("Alpha");
+        let mut definition = super::super::AgentDefinition {
+            name: "task".to_owned(),
+            description: "task".to_owned(),
+            system_prompt: "prompt".to_owned(),
+            tools: None,
+            autoload_skills: Vec::new(),
+            model: None,
+            thinking_level: None,
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
+            source: super::super::AgentDefinitionSource::Bundled,
+            path: None,
+            trusted: true,
+            kind: super::super::AgentDefinitionKind::Agent,
+            personality: None,
+            soft_budget: None,
+        };
+        definition.tools = Some(vec!["read".to_owned()]);
+        assert!(reconstruct_request(
+            &agent,
+            pi_ai::Model::default(),
+            &definition,
+            "current prompt".to_owned(),
+            Some(vec!["read".to_owned()]),
+            Vec::new(),
+            16,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn old_persisted_definition_json_defaults_new_fields() {
+        let value = serde_json::json!({
+            "name": "task",
+            "description": "task",
+            "systemPrompt": "prompt",
+            "source": "bundled",
+            "trusted": true
+        });
+        let definition: PersistedDefinition =
+            serde_json::from_value(value).expect("old definition remains readable");
+        assert_eq!(definition.kind, super::super::AgentDefinitionKind::Agent);
+        assert_eq!(definition.personality, None);
+        assert_eq!(definition.soft_budget, None);
     }
 }

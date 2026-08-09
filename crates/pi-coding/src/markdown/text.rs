@@ -1,7 +1,19 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-pub(crate) fn display_width(text: &str) -> usize {
+/// Display width of `text` in terminal cells, measured per grapheme cluster.
+///
+/// Width conventions follow `unicode-width`'s defaults: East Asian Wide/Fullwidth
+/// count 2 cells, everything else 1. East Asian **Ambiguous** characters
+/// (`·`, `─`, `│`, `→`, `—`, box-drawing glyphs, …) are counted as **1 cell**
+/// here — the ECMA-48 neutral default. A CJK-locale terminal (`LC_CTYPE` in
+/// `ja`/`zh`/`ko`, or a terminal configured `Ambiguous=wide`) renders those
+/// glyphs 2 cells wide, so frame math built on this function can diverge from
+/// what such a terminal paints by one cell per Ambiguous glyph. That is a
+/// terminal-locale limitation, deliberately NOT worked around here (forcing
+/// Ambiguous=wide would break every non-CJK terminal); verbatim frames in a
+/// CJK locale should run with `LC_CTYPE=C`/a narrow-Ambiguous terminal.
+pub fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
@@ -85,7 +97,14 @@ pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-pub(crate) fn wrap_verbatim(text: &str, width: usize) -> Vec<String> {
+/// Wrap `text` verbatim (no word reflow) to `width` cells, keeping every
+/// grapheme cluster intact. Tabs expand to four spaces and control characters
+/// are replaced before measuring, so the caller can build exact-width frames.
+///
+/// A single cluster wider than `width` occupies its own row intact (user text
+/// is never split); callers framing the output should clamp such rows with
+/// [`fit_text`] so every frame row stays exactly frame-width.
+pub fn wrap_verbatim(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let safe = sanitize_inline(text);
     if safe.is_empty() {
@@ -120,7 +139,9 @@ pub(crate) fn wrap_verbatim(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-pub(crate) fn fit_text(text: &str, width: usize) -> String {
+/// Truncate `text` to `width` cells with a trailing `…`, never splitting a
+/// grapheme cluster. Tabs/control characters are sanitized first.
+pub fn fit_text(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }

@@ -13,6 +13,10 @@ pub(crate) type JobClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 const DEFAULT_MAX_SETTLED_JOBS: usize = 256;
 const DEFAULT_SETTLED_JOB_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct JobRetention {
     pub(crate) max_settled: usize,
@@ -77,6 +81,13 @@ pub struct JobSnapshot {
     pub finished_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<TaskResult>,
+    /// True when the job settled early because a configured soft budget was
+    /// reached (max requests, max tokens, or a yield-after threshold). The job
+    /// is not failed: it completed with a partial result and the parent
+    /// decides whether to continue it. Serialization omits the field when
+    /// false so persisted legacy snapshots and wire payloads stay compatible.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub soft_budget_exhausted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +261,7 @@ impl JobManager {
             JobStatus::Completed
         };
         record.snapshot.finished_at = Some(timestamp);
+        record.snapshot.soft_budget_exhausted = result.soft_budget_exhausted;
         record.snapshot.result = Some(result);
         let snapshot = record.snapshot.clone();
         drop(records);
@@ -564,6 +576,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             result: None,
+            soft_budget_exhausted: false,
         }
     }
 
@@ -609,5 +622,66 @@ mod tests {
         assert!(message.contains("ambiguous"), "{message}");
         assert!(message.contains("Alpha"), "{message}");
         assert!(message.contains("shared"), "{message}");
+    }
+
+    fn task_result(soft_budget_exhausted: bool) -> TaskResult {
+        TaskResult {
+            index: 0,
+            id: "Worker".to_owned(),
+            agent: "task".to_owned(),
+            status: super::super::AgentStatus::Idle,
+            output: "partial".to_owned(),
+            usage: pi_ai::Usage::default(),
+            soft_budget_exhausted,
+            error: None,
+            artifact_ref: "agent://Worker".to_owned(),
+            history_ref: "history://Worker".to_owned(),
+            artifact_uri: "artifact://Worker".to_owned(),
+            structured_output: None,
+        }
+    }
+
+    #[test]
+    fn finish_propagates_soft_budget_marker_from_result() {
+        let jobs = JobManager::new();
+        jobs.insert(snapshot("job-budget", "Worker"), CancellationToken::new())
+            .expect("insert");
+
+        let finished = jobs
+            .finish("job-budget", task_result(true), 2)
+            .expect("finish with soft budget");
+        assert!(finished.soft_budget_exhausted, "snapshot must carry the marker");
+        assert_eq!(finished.status, JobStatus::Completed, "soft budget must not fail the job");
+        assert_eq!(finished.finished_at, Some(2));
+        assert!(finished.result.is_some_and(|result| result.soft_budget_exhausted));
+
+        let plain = jobs
+            .finish("job-budget", task_result(false), 3)
+            .expect("finish without soft budget");
+        assert!(!plain.soft_budget_exhausted);
+        assert_eq!(plain.status, JobStatus::Completed);
+    }
+
+    #[test]
+    fn soft_budget_marker_serializes_only_when_set() {
+        let plain = snapshot("job-plain", "Worker");
+        let wire = serde_json::to_value(&plain).expect("serialize plain job");
+        assert!(wire.get("softBudgetExhausted").is_none());
+
+        let marked = JobSnapshot {
+            soft_budget_exhausted: true,
+            ..plain
+        };
+        let wire = serde_json::to_value(&marked).expect("serialize marked job");
+        assert_eq!(wire["softBudgetExhausted"], true);
+
+        // Legacy payloads without the field deserialize as unlimited (false).
+        let mut legacy = wire;
+        legacy
+            .as_object_mut()
+            .expect("marked object")
+            .remove("softBudgetExhausted");
+        let decoded: JobSnapshot = serde_json::from_value(legacy).expect("deserialize legacy");
+        assert!(!decoded.soft_budget_exhausted);
     }
 }

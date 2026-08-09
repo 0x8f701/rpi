@@ -1,30 +1,34 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use pi_agent::{AbortController, AgentTool, ThinkingLevel, ToolCallContext};
-use pi_ai::{Model, StopReason};
+use pi_ai::{ContentBlock, Model, StopReason, ToolCall, Usage};
 use pi_coding::{
     AgentCatalog, AgentDefinition, AgentDefinitionSource, ChildSessionFactory, JobSnapshot,
     JobStatus, OrchestrationConfig, OrchestrationRuntime, Session, SessionOptions, TaskSpawn,
 };
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 fn definition() -> AgentDefinition {
-    AgentDefinition {
-        name: "task".to_owned(),
-        description: "background task".to_owned(),
-        system_prompt: "complete the assignment".to_owned(),
-        tools: Some(Vec::new()),
-        autoload_skills: Vec::new(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        source: AgentDefinitionSource::Bundled,
-        path: None,
-        trusted: true,
-    }
+    AgentDefinition { name: "task".to_owned(),
+    description: "background task".to_owned(),
+    system_prompt: "complete the assignment".to_owned(),
+    tools: Some(Vec::new()),
+    autoload_skills: Vec::new(),
+    model: None,
+    thinking_level: Some(ThinkingLevel::Off),
+    max_turns: None,
+    max_tool_calls: None,
+    timeout_secs: None,
+    disallowed_tools: Vec::new(),
+    capability_ceiling: None,
+    source: AgentDefinitionSource::Bundled,
+    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
 struct ControlledRuntime {
@@ -194,6 +198,7 @@ async fn task_returns_before_completion_and_hub_retains_job_results() {
         (task.execute)(context(
             "spawn-background",
             json!({
+                "context": "Background batch contract: children run asynchronously while the parent verifies that the hub retains their job results.",
                 "tasks": [
                     { "name": "AsyncOne", "task": "first" },
                     { "name": "AsyncTwo", "task": "second" }
@@ -287,9 +292,9 @@ async fn task_returns_before_completion_and_hub_retains_job_results() {
     assert_eq!(retained.len(), 2);
     assert!(retained.iter().all(|job| job.status == JobStatus::Completed));
     assert!(retained.iter().all(|job| {
-        job.result
-            .as_ref()
-            .is_some_and(|result| result.output == "retained result")
+        job.result.as_ref().is_some_and(|result| {
+            result.output == format!("retained result\n\n{}", pi_coding::MISSING_YIELD_WARNING)
+        })
     }));
     assert_eq!(controlled.runtime.inbox("Main", false).len(), 1);
     assert_eq!(controlled.peak.load(Ordering::SeqCst), 1);
@@ -386,6 +391,7 @@ async fn owner_drop_cancels_jobs_and_unblocks_synchronous_waiter() {
                     agent: "task".to_owned(),
                     assignment: "remain blocked".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 }],
                 abort,
             )
@@ -475,6 +481,7 @@ async fn cancellation_settles_when_child_stream_ignores_abort() {
                 agent: "task".to_owned(),
                 assignment: "ignore cancellation".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn")
@@ -519,6 +526,7 @@ async fn failed_artifact_write_does_not_publish_artifact_alias() {
                 agent: "task".to_owned(),
                 assignment: "persist result".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
         )
         .expect("spawn")
@@ -589,6 +597,7 @@ async fn workflow_job_projection_tracks_running_and_terminal_status() {
                 agent: "task".to_owned(),
                 assignment: "scoped work".to_owned(),
                 todo_task_id: Some("todo-scoped".to_owned()),
+                ..Default::default()
             }],
         )
         .expect("spawn")
@@ -654,6 +663,7 @@ async fn shared_workflow_gate_bounds_two_independent_runtimes() {
                 agent: "task".to_owned(),
                 assignment: "alpha root".to_owned(),
                 todo_task_id: Some("alpha-root".to_owned()),
+                ..Default::default()
             }],
         )
         .expect("alpha spawn");
@@ -668,6 +678,7 @@ async fn shared_workflow_gate_bounds_two_independent_runtimes() {
                 agent: "task".to_owned(),
                 assignment: "beta root".to_owned(),
                 todo_task_id: Some("beta-root".to_owned()),
+                ..Default::default()
             }],
         )
         .expect("beta spawn");
@@ -726,6 +737,7 @@ async fn roster_keeps_waiting_child_queued_until_permit_acquired() {
                     agent: "task".to_owned(),
                     assignment: "hold permit".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 },
                 pi_coding::TaskItem {
                     index: 1,
@@ -733,6 +745,7 @@ async fn roster_keeps_waiting_child_queued_until_permit_acquired() {
                     agent: "task".to_owned(),
                     assignment: "wait for permit".to_owned(),
                     todo_task_id: None,
+                    ..Default::default()
                 },
             ],
         )
@@ -848,6 +861,7 @@ async fn batch_duplicate_names_allocate_deterministic_sequence() {
     let result = (task.execute)(context(
         "batch-dupes",
         json!({
+            "context": "Batch naming contract: duplicate item names must receive deterministic suffixed ids in spawn order.",
             "tasks": [
                 { "name": "worker", "task": "one" },
                 { "name": "worker", "task": "two" },
@@ -1065,8 +1079,19 @@ async fn hub_send_by_job_uuid_reaches_canonical_mailbox_once() {
     assert_eq!(receipts[0]["outcome"], "woken");
     assert!(receipts[0].get("error").is_none() || receipts[0]["error"].is_null());
 
-    // Canonical running agent receives exactly once through its active Session;
-    // job UUID is not a separate mailbox key and no durable duplicate remains.
+    // A Woken delivery to an active child is committed to the durable mailbox
+    // before the active delivery bridge consumes it (deferred-ack durability,
+    // `durable_orchestration_e2e::running_woken_message_is_durable_before_active_delivery`).
+    // The running child acks the handoff asynchronously via its delivery bridge,
+    // draining the canonical mailbox; poll until it does, matching the post-ack
+    // inbox-empty check in `running_child_observes_mid_run_steering_exactly_once`.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !controlled.runtime.inbox(&agent_id, true).is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("active delivery must drain the canonical mailbox after ack");
     assert!(
         controlled.runtime.inbox(&agent_id, true).is_empty(),
         "active delivery must not leave a canonical mailbox duplicate"
@@ -1232,4 +1257,301 @@ async fn hub_await_reply_from_tracks_canonical_agent_after_job_uuid_send() {
     .await
     .expect("settled");
     controlled.runtime.shutdown().await;
+}
+
+/// One scripted child assistant turn: optional visible text, optional `hub`
+/// tool call (forcing a follow-up turn), and the faux usage the provider
+/// reports for the turn.
+struct ScriptedTurn {
+    text: String,
+    tool: Option<(String, String, Value)>,
+    usage_tokens: i64,
+}
+
+fn scripted_turn(text: &str, tool: Option<(String, String, Value)>) -> ScriptedTurn {
+    ScriptedTurn {
+        text: text.to_owned(),
+        tool,
+        usage_tokens: 0,
+    }
+}
+
+/// Runtime whose child factory streams a fixed script of assistant turns.
+///
+/// Every non-final turn must carry a `hub` tool call so the agent loop runs
+/// the next turn; the final turn carries plain text and `Stop`. Per-turn usage
+/// is injected through the stream so token-budget tests observe real
+/// accumulation.
+fn scripted_runtime(
+    artifact_dir: &std::path::Path,
+    turns: Vec<ScriptedTurn>,
+    budget: pi_coding::JobSoftBudget,
+) -> OrchestrationRuntime {
+    let turns = Arc::new(Mutex::new(VecDeque::from(turns)));
+    let factory: ChildSessionFactory = Arc::new(move |request| {
+        let turns = turns.clone();
+        Box::pin(async move {
+            let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, options| {
+                let turns = turns.clone();
+                Box::pin(async move {
+                    let stream = pi_ai::new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    tokio::spawn(async move {
+                        let turn = turns.lock().pop_front().unwrap_or_else(|| ScriptedTurn {
+                            text: "script exhausted".to_owned(),
+                            tool: None,
+                            usage_tokens: 0,
+                        });
+                        let mut message = pi_ai::AssistantMessage::pending(&model);
+                        if let Some((id, name, arguments)) = &turn.tool {
+                            message.content.push(ContentBlock::ToolCall(ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: arguments.clone(),
+                                thought_signature: None,
+                            }));
+                            message.stop_reason = StopReason::ToolUse;
+                        } else {
+                            message.stop_reason = StopReason::Stop;
+                        }
+                        if !turn.text.is_empty() {
+                            message.content.push(ContentBlock::text(turn.text.clone()));
+                        }
+                        message.usage = Usage {
+                            total_tokens: turn.usage_tokens,
+                            ..Usage::default()
+                        };
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            });
+            Session::new(SessionOptions {
+                model: request.model,
+                cwd: std::env::current_dir().expect("cwd"),
+                system_prompt: request.system_prompt,
+                thinking_level: ThinkingLevel::Off,
+                api_key: String::new(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(request.orchestration_tools),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: Some(stream_fn),
+                auth_resolver: None,
+            })
+        })
+    });
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![definition()]),
+        artifact_dir,
+    );
+    config.idle_ttl = None;
+    config.soft_budget = budget;
+    config.parent_model = Model {
+        id: "soft-budget-test".to_owned(),
+        name: "Soft Budget Test".to_owned(),
+        api: "soft-budget-test".to_owned(),
+        provider: "soft-budget-test".to_owned(),
+        ..Model::default()
+    };
+    OrchestrationRuntime::new(config, factory).expect("runtime")
+}
+
+fn hub_list_tool_call(id: &str) -> (String, String, Value) {
+    (id.to_owned(), "hub".to_owned(), json!({ "op": "list" }))
+}
+
+/// Spawn a single child via the `task` tool and wait for its job to settle.
+async fn spawn_and_settle(runtime: &OrchestrationRuntime, name: &str) -> JobSnapshot {
+    let tools = runtime.agent_tools("Main", 0);
+    let task = tool(&tools, "task");
+    let spawn_result = (task.execute)(context(
+        "spawn-soft-budget",
+        json!({ "name": name, "task": "budgeted work" }),
+    ))
+    .await
+    .expect("task spawn result");
+    let spawn: TaskSpawn = serde_json::from_value::<Vec<TaskSpawn>>(spawn_result.details)
+        .expect("spawn details")
+        .remove(0);
+    let jobs = runtime
+        .wait_jobs(
+            &[spawn.job_id],
+            Some(Duration::from_secs(5)),
+            None,
+        )
+        .await
+        .expect("child settlement");
+    assert_eq!(jobs.len(), 1);
+    jobs.into_iter().next().expect("settled job")
+}
+
+#[tokio::test]
+async fn soft_budget_yield_after_settles_with_marker_not_failed() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = scripted_runtime(
+        artifacts.path(),
+        vec![
+            scripted_turn("first", Some(hub_list_tool_call("hub-1"))),
+            scripted_turn("second", Some(hub_list_tool_call("hub-2"))),
+            scripted_turn("third", None),
+        ],
+        pi_coding::JobSoftBudget {
+            yield_after: Some(2),
+            ..Default::default()
+        },
+    );
+    let job = spawn_and_settle(&runtime, "YieldChild").await;
+
+    // The child yielded after its second request: partial output, not Failed.
+    assert_eq!(job.status, JobStatus::Completed, "yield must not fail the job");
+    assert!(job.soft_budget_exhausted, "job snapshot must carry the soft-limit marker");
+    let result = job.result.as_ref().expect("settled result");
+    assert!(result.soft_budget_exhausted, "task result must carry the soft-limit marker");
+    assert!(result.error.is_none(), "yield must not be an error: {:?}", result.error);
+    assert_eq!(result.output, "second", "partial output from the yield turn");
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn soft_budget_max_requests_caps_child_turns() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = scripted_runtime(
+        artifacts.path(),
+        vec![
+            scripted_turn("first", Some(hub_list_tool_call("hub-1"))),
+            scripted_turn("second", Some(hub_list_tool_call("hub-2"))),
+            scripted_turn("third", None),
+        ],
+        pi_coding::JobSoftBudget {
+            max_requests: Some(1),
+            ..Default::default()
+        },
+    );
+    let job = spawn_and_settle(&runtime, "CappedChild").await;
+
+    assert_eq!(job.status, JobStatus::Completed, "cap must not fail the job");
+    assert!(job.soft_budget_exhausted);
+    let result = job.result.as_ref().expect("settled result");
+    assert!(result.soft_budget_exhausted);
+    assert!(result.error.is_none(), "cap must not be an error: {:?}", result.error);
+    assert_eq!(result.output, "first", "child stopped after its single allowed request");
+    // Only one assistant request was consumed: the remaining scripted turns
+    // were never streamed.
+    assert_eq!(
+        job.result.as_ref().expect("result").usage.total_tokens, 0,
+        "no further turns ran"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn soft_budget_max_tokens_yields_on_usage_accumulation() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = scripted_runtime(
+        artifacts.path(),
+        vec![
+            ScriptedTurn {
+                text: "first".to_owned(),
+                tool: Some(hub_list_tool_call("hub-1")),
+                usage_tokens: 5_000,
+            },
+            ScriptedTurn {
+                text: "second".to_owned(),
+                tool: Some(hub_list_tool_call("hub-2")),
+                usage_tokens: 5_000,
+            },
+            ScriptedTurn {
+                text: "third".to_owned(),
+                tool: None,
+                usage_tokens: 5_000,
+            },
+        ],
+        pi_coding::JobSoftBudget {
+            max_tokens: Some(4_000),
+            ..Default::default()
+        },
+    );
+    let job = spawn_and_settle(&runtime, "TokenCappedChild").await;
+
+    assert_eq!(job.status, JobStatus::Completed, "token cap must not fail the job");
+    assert!(job.soft_budget_exhausted);
+    let result = job.result.as_ref().expect("settled result");
+    assert!(result.soft_budget_exhausted);
+    assert!(result.error.is_none(), "token cap must not be an error: {:?}", result.error);
+    assert_eq!(result.output, "first", "child yielded once its first turn crossed the cap");
+    // Accumulated usage from the streamed turns is preserved in the result.
+    assert_eq!(result.usage.total_tokens, 5_000);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn soft_budget_max_tokens_accumulates_across_turns_before_yielding() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = scripted_runtime(
+        artifacts.path(),
+        vec![
+            ScriptedTurn {
+                text: "first".to_owned(),
+                tool: Some(hub_list_tool_call("hub-1")),
+                usage_tokens: 2_000,
+            },
+            ScriptedTurn {
+                text: "second".to_owned(),
+                tool: Some(hub_list_tool_call("hub-2")),
+                usage_tokens: 2_000,
+            },
+            ScriptedTurn {
+                text: "third".to_owned(),
+                tool: None,
+                usage_tokens: 2_000,
+            },
+        ],
+        pi_coding::JobSoftBudget {
+            max_tokens: Some(3_000),
+            ..Default::default()
+        },
+    );
+    let job = spawn_and_settle(&runtime, "TokenAccumulatingChild").await;
+
+    assert_eq!(job.status, JobStatus::Completed);
+    assert!(job.soft_budget_exhausted);
+    let result = job.result.as_ref().expect("settled result");
+    assert!(result.soft_budget_exhausted);
+    assert_eq!(result.output, "second", "cap crossed only after the second turn");
+    assert_eq!(result.usage.total_tokens, 4_000, "both streamed turns reported usage");
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn soft_budget_unlimited_default_runs_to_completion() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = scripted_runtime(
+        artifacts.path(),
+        vec![
+            scripted_turn("first", Some(hub_list_tool_call("hub-1"))),
+            scripted_turn("second", Some(hub_list_tool_call("hub-2"))),
+            scripted_turn("third", None),
+        ],
+        pi_coding::JobSoftBudget::default(),
+    );
+    let job = spawn_and_settle(&runtime, "UnlimitedChild").await;
+
+    assert_eq!(job.status, JobStatus::Completed);
+    assert!(!job.soft_budget_exhausted, "default budget must not mark the job");
+    let result = job.result.as_ref().expect("settled result");
+    assert!(!result.soft_budget_exhausted);
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(
+        result.output,
+        format!("third\n\n{}", pi_coding::MISSING_YIELD_WARNING),
+        "unlimited child ran to natural completion"
+    );
+
+    runtime.shutdown().await;
 }

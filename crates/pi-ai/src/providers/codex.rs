@@ -145,6 +145,7 @@ pub fn register_openai_codex_responses() {
         stream_simple: Arc::new(|model, context, options| async move {
             stream_simple_openai_codex_responses(model, context, options)
         }.boxed()),
+        generate_image: None,
     }, None);
 }
 
@@ -361,6 +362,7 @@ fn build_codex_body(
         reasoning_summary: options.reasoning_summary.clone().or_else(|| Some("auto".into())),
         service_tier: options.service_tier.clone(),
         tool_choice: options.tool_choice.as_ref().map(|choice| json!(choice)),
+        responses_stateful_chain: false,
     };
     let mut body = responses::build_responses_params(&compat_model, &input_context, &response_options)?;
     let object = body.as_object_mut().expect("Responses body is an object");

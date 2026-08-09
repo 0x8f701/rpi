@@ -22,18 +22,20 @@ use pi_coding::{
 use serde_json::{Value, json};
 
 fn definition() -> AgentDefinition {
-    AgentDefinition {
-        name: "task".to_owned(),
-        description: "background task".to_owned(),
-        system_prompt: "complete the assignment".to_owned(),
-        tools: Some(Vec::new()),
-        autoload_skills: Vec::new(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        source: AgentDefinitionSource::Bundled,
-        path: None,
-        trusted: true,
-    }
+    AgentDefinition { name: "task".to_owned(),
+    description: "background task".to_owned(),
+    system_prompt: "complete the assignment".to_owned(),
+    tools: Some(Vec::new()),
+    autoload_skills: Vec::new(),
+    model: None,
+    thinking_level: Some(ThinkingLevel::Off),
+    max_turns: None,
+    max_tool_calls: None,
+    timeout_secs: None,
+    disallowed_tools: Vec::new(),
+    capability_ceiling: None,
+    source: AgentDefinitionSource::Bundled,
+    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
 fn test_model() -> Model {
@@ -312,7 +314,10 @@ async fn non_bound_runtime_works_without_persistence() {
     let task = tool(&tools, "task");
     let result = (task.execute)(context(
         "spawn",
-        json!({ "tasks": [{ "name": "Child", "task": "do work" }] }),
+        json!({
+            "context": "Non-durable runtime check: complete the assignment, then stay available until the parent settles the test.",
+            "tasks": [{ "name": "Child", "task": "do work" }]
+        }),
     ))
     .await
     .expect("spawn");
@@ -406,7 +411,10 @@ async fn parked_send_returns_revived() {
     let task = tool(&tools, "task");
     let spawn_result = (task.execute)(context(
         "spawn-child",
-        json!({ "tasks": [{ "name": "Worker", "task": "do work" }] }),
+        json!({
+            "context": "Durable child session check: complete the assignment; the parent then parks and wakes the child to verify recovery.",
+            "tasks": [{ "name": "Worker", "task": "do work" }]
+        }),
     ))
     .await
     .expect("spawn");
@@ -464,6 +472,7 @@ fn interrupted_job_cancelled_on_recovery() {
         started_at: Some(2),
         finished_at: None,
         result: None,
+        soft_budget_exhausted: false,
     };
     let recovered = pi_coding::recovery_job(job, 100);
     assert_eq!(recovered.status, JobStatus::Cancelled);

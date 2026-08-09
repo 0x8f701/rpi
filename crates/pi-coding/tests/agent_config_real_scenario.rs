@@ -96,6 +96,9 @@ async fn real_enable_model_thinking_and_legacy_migration_persist() {
     })
     .expect("session");
     session
+        .start_new_recording()
+        .expect("start agent config recording");
+    session
         .attach_resources(resources.clone())
         .await
         .expect("attach");

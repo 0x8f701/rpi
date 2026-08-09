@@ -1,6 +1,7 @@
 //! Session / RPC / CLI compatibility end-to-end contracts.
 //!
-//! Drives the real `rpi` and `rpi-rpc` binaries (plus on-disk Pi v3 JSONL) for
+//! Drives the real `rpi` binary (the `rpc` subcommand for the JSONL RPC
+//! control plane, plus on-disk Pi v3 JSONL) for
 //! public boundaries that are easy to regress without a full integration path:
 //! session create → file → resume round-trip, sessionDir lifecycle, `-r`,
 //! `:max` model suffixes, `@file` expansion, `get_commands` source projection,
@@ -26,8 +27,12 @@ fn rpi_bin() -> String {
     env!("CARGO_BIN_EXE_rpi").to_owned()
 }
 
-fn rpc_bin() -> String {
-    env!("CARGO_BIN_EXE_rpi-rpc").to_owned()
+/// Spawn the real `rpi` binary with the `rpc` subcommand first — the
+/// successor of the removed `rpi-rpc` companion binary (≡ `--mode rpc`).
+fn rpc_cmd() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rpi"));
+    command.arg("rpc");
+    command
 }
 
 fn write_agent_home(agent: &Path, settings: &str, models: &str) {
@@ -45,6 +50,7 @@ fn offline_env<'a>(command: &'a mut Command, agent: &Path, cwd: &Path) -> &'a mu
         .env("PI_OFFLINE", "1")
         .env("PI_SKIP_VERSION_CHECK", "1")
         .env_remove("PI_CODING_AGENT_SESSION_DIR")
+        .env_remove("PI_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("DEEPSEEK_API_KEY")
@@ -258,7 +264,7 @@ impl RpcSession {
         let session_dir = home.path().join("rpc-sessions");
         fs::create_dir_all(&session_dir).expect("rpc session dir");
         write_agent_home(home.path(), "{}", "");
-        let mut child = Command::new(rpc_bin());
+        let mut child = rpc_cmd();
         offline_env(&mut child, home.path(), cwd.path())
             .args(["--offline", "--model", "faux/faux-1", "--session-dir"])
             .arg(&session_dir)
@@ -267,7 +273,7 @@ impl RpcSession {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = child.spawn().expect("spawn rpi-rpc");
+        let mut child = child.spawn().expect("spawn rpi rpc");
         let stdout = child.stdout.take().expect("stdout");
         let stderr = child.stderr.take().expect("stderr");
         let (tx, rx) = mpsc::sync_channel::<StdoutMsg>(STDOUT_CHANNEL_CAP);
@@ -297,7 +303,7 @@ impl RpcSession {
     fn child_mut(&mut self) -> &mut Child {
         self.child
             .as_mut()
-            .expect("rpi-rpc child already finished")
+            .expect("rpi rpc child already finished")
     }
 
     fn write_line(&mut self, line: &str) {
@@ -346,7 +352,7 @@ impl RpcSession {
             let now = Instant::now();
             if now >= deadline {
                 self.kill_child();
-                panic!("timed out waiting for next JSONL record from rpi-rpc");
+                panic!("timed out waiting for next JSONL record from rpi rpc");
             }
             let remaining = deadline.saturating_duration_since(now);
             match self.lines_rx.recv_timeout(remaining) {
@@ -371,22 +377,22 @@ impl RpcSession {
                         .child
                         .as_mut()
                         .and_then(|child| child.try_wait().ok().flatten());
-                    panic!("rpi-rpc stdout closed early (status={status:?})");
+                    panic!("rpi rpc stdout closed early (status={status:?})");
                 }
                 Ok(StdoutMsg::IoError(error)) => {
                     self.kill_child();
-                    panic!("reading rpi-rpc stdout: {error}");
+                    panic!("reading rpi rpc stdout: {error}");
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     self.kill_child();
-                    panic!("timed out waiting for next JSONL record from rpi-rpc");
+                    panic!("timed out waiting for next JSONL record from rpi rpc");
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     let status = self
                         .child
                         .as_mut()
                         .and_then(|child| child.try_wait().ok().flatten());
-                    panic!("rpi-rpc stdout reader disconnected (status={status:?})");
+                    panic!("rpi rpc stdout reader disconnected (status={status:?})");
                 }
             }
         }
@@ -413,7 +419,7 @@ impl RpcSession {
                     return Some(value);
                 }
                 Ok(StdoutMsg::Eof) | Err(RecvTimeoutError::Timeout) => return None,
-                Ok(StdoutMsg::IoError(error)) => panic!("reading rpi-rpc stdout: {error}"),
+                Ok(StdoutMsg::IoError(error)) => panic!("reading rpi rpc stdout: {error}"),
                 Err(RecvTimeoutError::Disconnected) => return None,
             }
         }
@@ -474,7 +480,7 @@ impl RpcSession {
                             let _ = child.kill();
                             let _ = child.wait();
                         }
-                        panic!("try_wait rpi-rpc: {error}");
+                        panic!("try_wait rpi rpc: {error}");
                     }
                 }
             } else {
@@ -497,7 +503,7 @@ impl RpcSession {
             // Deadline elapsed or child still running: force termination.
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
-                status = Some(child.wait().expect("wait rpi-rpc after kill"));
+                status = Some(child.wait().expect("wait rpi rpc after kill"));
             }
         } else if let Some(mut child) = self.child.take() {
             // Exit already observed via try_wait; reap without blocking forever.
@@ -522,7 +528,7 @@ impl RpcSession {
             .unwrap_or_default();
         let stdout = std::mem::take(&mut self.finished_stdout);
         Output {
-            status: status.expect("rpi-rpc exit status"),
+            status: status.expect("rpi rpc exit status"),
             stdout,
             stderr,
         }

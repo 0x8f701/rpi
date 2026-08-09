@@ -14,17 +14,18 @@ use uuid::Uuid;
 
 use crate::{SessionRecorder, SessionTree};
 
-/// Custom session entry type used by the append-only goal journal.
 pub const GOAL_SESSION_CUSTOM_TYPE: &str = "pi.goal.event";
-/// Current typed payload version for [`GOAL_SESSION_CUSTOM_TYPE`].
 pub const GOAL_SESSION_ENTRY_VERSION: u32 = 1;
 /// Maximum UTF-8 objective size. Goal events store both the transition and its
 /// resulting snapshot, so this leaves ample headroom under the 8 MiB session
 /// record limit.
 pub const MAX_GOAL_OBJECTIVE_BYTES: usize = 64 * 1024;
+pub const MAX_GOAL_PINS: usize = 8;
+/// Maximum UTF-8 character length of a single goal pin. Pins are short
+/// example/instruction strings shown verbatim in the goal turn's context.
+pub const MAX_GOAL_PIN_CHARS: usize = 200;
 
 
-/// The public lifecycle of a session goal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalLifecycle {
@@ -41,7 +42,6 @@ impl GoalLifecycle {
     }
 }
 
-/// Why an otherwise unfinished goal is paused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalPauseReason {
@@ -50,7 +50,6 @@ pub enum GoalPauseReason {
     ResumeSafety,
 }
 
-/// Cumulative usage charged to a goal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalUsage {
@@ -58,7 +57,6 @@ pub struct GoalUsage {
     pub active_time_seconds: u64,
 }
 
-/// A monotonic usage increment reported after work has run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalUsageDelta {
@@ -81,7 +79,6 @@ impl GoalUsageDelta {
     }
 }
 
-/// The one current goal owned by a session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Goal {
@@ -91,6 +88,10 @@ pub struct Goal {
     pub objective: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
+    /// Short role-model example/instruction strings shown in the goal turn's
+    /// system context. Bounded by [`MAX_GOAL_PINS`] and [`MAX_GOAL_PIN_CHARS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pins: Vec<String>,
     pub lifecycle: GoalLifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_reason: Option<GoalPauseReason>,
@@ -107,7 +108,6 @@ impl Goal {
     }
 }
 
-/// Session-owned goal state. A session has zero or one current goal.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalState {
@@ -116,7 +116,6 @@ pub struct GoalState {
     pub revision: u64,
 }
 
-/// The semantic operation stored in each append-only goal event.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GoalEventKind {
@@ -127,6 +126,8 @@ pub enum GoalEventKind {
     Completed,
     Dropped,
     UsageUpdated { delta: GoalUsageDelta },
+    /// A pin was appended or removed; `pins` is the resulting list.
+    PinsUpdated { pins: Vec<String> },
 }
 
 /// A typed, revisioned goal journal event. `goal` is the resulting snapshot.
@@ -139,7 +140,6 @@ pub struct GoalEvent {
     pub goal: Goal,
 }
 
-/// Versioned data stored inside a `custom` session record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalSessionEntry {
@@ -147,7 +147,6 @@ pub struct GoalSessionEntry {
     pub event: GoalEvent,
 }
 
-/// Pure continuation result for callers that decide whether to start a turn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum GoalContinuationDecision {
@@ -171,7 +170,6 @@ pub enum GoalContinuationDecision {
     },
 }
 
-/// Goal state-machine and journal failures.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GoalError {
     #[error("no current goal")]
@@ -186,6 +184,14 @@ pub enum GoalError {
     InvalidTokenBudget,
     #[error("goal usage update must charge tokens or active time")]
     EmptyUsageUpdate,
+    #[error("goal pin must not be empty")]
+    EmptyPin,
+    #[error("goal pin must be at most {max_chars} characters")]
+    PinTooLong { max_chars: usize },
+    #[error("goal pins are limited to {max_pins}")]
+    PinLimitReached { max_pins: usize },
+    #[error("goal pin index {index} is out of range (0..{len})")]
+    PinIndexOutOfRange { index: usize, len: usize },
     #[error("goal usage overflow")]
     UsageOverflow,
     #[error("cannot {operation} a goal in the {lifecycle:?} lifecycle")]
@@ -204,7 +210,6 @@ pub enum GoalError {
 pub type GoalPersistFn = Arc<dyn Fn(&GoalEvent) -> Result<(), GoalError> + Send + Sync>;
 pub type GoalClockFn = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
-/// Cloneable, linearizable owner of the current goal.
 #[derive(Clone)]
 pub struct GoalRuntime {
     state: Arc<Mutex<GoalState>>,
@@ -219,7 +224,6 @@ impl Default for GoalRuntime {
 }
 
 impl GoalRuntime {
-    /// Creates an empty, in-memory goal runtime.
     #[must_use]
     pub fn memory() -> Self {
         Self::with_components(
@@ -229,19 +233,16 @@ impl GoalRuntime {
         )
     }
 
-    /// Creates an empty runtime with an append callback.
     #[must_use]
     pub fn with_persistence(persist: GoalPersistFn) -> Self {
         Self::with_components(GoalState::default(), persist, Arc::new(Utc::now))
     }
 
-    /// Creates an empty runtime with injectable persistence and time.
     #[must_use]
     pub fn with_clock_and_persistence(clock: GoalClockFn, persist: GoalPersistFn) -> Self {
         Self::with_components(GoalState::default(), persist, clock)
     }
 
-    /// Replays an event sequence into an in-memory runtime.
     pub fn from_events(events: &[GoalEvent]) -> Result<Self, GoalError> {
         Self::from_events_with_components(events, Arc::new(|_| Ok(())), Arc::new(Utc::now))
     }
@@ -339,6 +340,7 @@ impl GoalRuntime {
             origin_goal_id: None,
             objective: objective.to_owned(),
             token_budget,
+            pins: Vec::new(),
             lifecycle: GoalLifecycle::Active,
             pause_reason: None,
             created_at: timestamp,
@@ -373,6 +375,7 @@ impl GoalRuntime {
             ),
             objective: source.objective.clone(),
             token_budget: source.token_budget,
+            pins: source.pins.clone(),
             lifecycle,
             pause_reason,
             created_at: timestamp,
@@ -482,7 +485,6 @@ impl GoalRuntime {
         }
     }
 
-    /// Permanently drops an active or paused goal.
     pub fn drop(&self) -> Result<Goal, GoalError> {
         let mut state = self.state.lock();
         let current = current_goal(&state)?;
@@ -535,6 +537,88 @@ impl GoalRuntime {
             GoalEventKind::UsageUpdated { delta },
             goal,
         )
+    }
+
+    /// Appends a role-model pin shown verbatim in the goal turn's system
+    /// context. Pins are trimmed, non-empty, at most [`MAX_GOAL_PIN_CHARS`]
+    /// characters, and the goal carries at most [`MAX_GOAL_PINS`] of them.
+    pub fn pin(&self, text: impl Into<String>) -> Result<Goal, GoalError> {
+        let text = text.into();
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(GoalError::EmptyPin);
+        }
+        if text.chars().count() > MAX_GOAL_PIN_CHARS {
+            return Err(GoalError::PinTooLong {
+                max_chars: MAX_GOAL_PIN_CHARS,
+            });
+        }
+        let mut state = self.state.lock();
+        let current = current_goal(&state)?;
+        match current.lifecycle {
+            GoalLifecycle::Active | GoalLifecycle::Paused => {}
+            lifecycle => {
+                return Err(GoalError::InvalidTransition {
+                    operation: "pin",
+                    lifecycle,
+                });
+            }
+        }
+        if current.pins.len() >= MAX_GOAL_PINS {
+            return Err(GoalError::PinLimitReached {
+                max_pins: MAX_GOAL_PINS,
+            });
+        }
+        let mut goal = current.clone();
+        goal.pins.push(text.to_owned());
+        goal.updated_at = self.next_timestamp(goal.updated_at);
+        self.commit(
+            &mut state,
+            GoalEventKind::PinsUpdated {
+                pins: goal.pins.clone(),
+            },
+            goal,
+        )
+    }
+
+    pub fn unpin(&self, index: usize) -> Result<Goal, GoalError> {
+        let mut state = self.state.lock();
+        let current = current_goal(&state)?;
+        match current.lifecycle {
+            GoalLifecycle::Active | GoalLifecycle::Paused => {}
+            lifecycle => {
+                return Err(GoalError::InvalidTransition {
+                    operation: "unpin",
+                    lifecycle,
+                });
+            }
+        }
+        if index >= current.pins.len() {
+            return Err(GoalError::PinIndexOutOfRange {
+                index,
+                len: current.pins.len(),
+            });
+        }
+        let mut goal = current.clone();
+        goal.pins.remove(index);
+        goal.updated_at = self.next_timestamp(goal.updated_at);
+        self.commit(
+            &mut state,
+            GoalEventKind::PinsUpdated {
+                pins: goal.pins.clone(),
+            },
+            goal,
+        )
+    }
+
+    /// Lists the current goal's role-model pins. Empty when there is no goal.
+    #[must_use]
+    pub fn pins(&self) -> Vec<String> {
+        let state = self.state.lock();
+        state
+            .current
+            .as_ref()
+            .map_or_else(Vec::new, |goal| goal.pins.clone())
     }
 
     /// Computes the next action without queuing, starting, or mutating a turn.
@@ -651,6 +735,7 @@ fn replay_event(state: &mut GoalState, event: &GoalEvent) -> Result<(), GoalErro
                 || event.goal.lifecycle != GoalLifecycle::Active
                 || event.goal.pause_reason.is_some()
                 || event.goal.usage != GoalUsage::default()
+                || !event.goal.pins.is_empty()
                 || event.goal.created_at != event.goal.updated_at
             {
                 return Err(invalid_event(event, "invalid created snapshot"));
@@ -702,6 +787,23 @@ fn validate_goal(goal: &Goal, revision: u64) -> Result<(), GoalError> {
         return Err(GoalError::InvalidJournal(format!(
             "revision {revision} has a zero token budget"
         )));
+    }
+    if goal.pins.len() > MAX_GOAL_PINS {
+        return Err(GoalError::InvalidJournal(format!(
+            "revision {revision} exceeds the {MAX_GOAL_PINS} pin limit"
+        )));
+    }
+    for pin in &goal.pins {
+        if pin.trim().is_empty() || pin.trim() != pin {
+            return Err(GoalError::InvalidJournal(format!(
+                "revision {revision} has an invalid pin"
+            )));
+        }
+        if pin.chars().count() > MAX_GOAL_PIN_CHARS {
+            return Err(GoalError::InvalidJournal(format!(
+                "revision {revision} pin exceeds {MAX_GOAL_PIN_CHARS} characters"
+            )));
+        }
     }
     if goal.updated_at < goal.created_at {
         return Err(GoalError::InvalidJournal(format!(
@@ -764,6 +866,7 @@ fn validate_fork_cloned(source: &Goal, event: &GoalEvent) -> Result<(), GoalErro
         || goal.origin_goal_id.as_ref() != Some(expected_origin)
         || goal.objective != source.objective
         || goal.token_budget != source.token_budget
+        || goal.pins != source.pins
         || goal.lifecycle != expected_lifecycle
         || goal.pause_reason != expected_pause_reason
         || goal.usage != source.usage
@@ -798,6 +901,7 @@ fn validate_replayed_transition(
             if previous.lifecycle != GoalLifecycle::Active
                 || goal.lifecycle != GoalLifecycle::Paused
                 || goal.pause_reason != Some(*reason)
+                || goal.pins != previous.pins
                 || goal.usage != previous.usage
             {
                 return Err(invalid_event(event, "invalid pause transition"));
@@ -808,6 +912,7 @@ fn validate_replayed_transition(
                 || previous.pause_reason == Some(GoalPauseReason::BudgetExhausted)
                 || goal.lifecycle != GoalLifecycle::Active
                 || goal.pause_reason.is_some()
+                || goal.pins != previous.pins
                 || goal.usage != previous.usage
             {
                 return Err(invalid_event(event, "invalid resume transition"));
@@ -816,6 +921,7 @@ fn validate_replayed_transition(
         GoalEventKind::Completed => {
             if goal.lifecycle != GoalLifecycle::Completed
                 || goal.pause_reason.is_some()
+                || goal.pins != previous.pins
                 || goal.usage != previous.usage
             {
                 return Err(invalid_event(event, "invalid completion transition"));
@@ -824,6 +930,7 @@ fn validate_replayed_transition(
         GoalEventKind::Dropped => {
             if goal.lifecycle != GoalLifecycle::Dropped
                 || goal.pause_reason.is_some()
+                || goal.pins != previous.pins
                 || goal.usage != previous.usage
             {
                 return Err(invalid_event(event, "invalid drop transition"));
@@ -846,6 +953,9 @@ fn validate_replayed_transition(
             {
                 return Err(invalid_event(event, "invalid usage transition"));
             }
+            if goal.pins != previous.pins {
+                return Err(invalid_event(event, "usage changed the pins"));
+            }
             let exhausted = goal
                 .token_budget
                 .is_some_and(|budget| goal.usage.tokens_used >= budget);
@@ -865,6 +975,16 @@ fn validate_replayed_transition(
                 || goal.pause_reason != previous.pause_reason
             {
                 return Err(invalid_event(event, "usage changed the lifecycle"));
+            }
+        }
+        GoalEventKind::PinsUpdated { pins } => {
+            if goal.pins != *pins
+                || goal.pins == previous.pins
+                || goal.lifecycle != previous.lifecycle
+                || goal.pause_reason != previous.pause_reason
+                || goal.usage != previous.usage
+            {
+                return Err(invalid_event(event, "invalid pins transition"));
             }
         }
         GoalEventKind::Created | GoalEventKind::ForkCloned { .. } => {

@@ -43,6 +43,14 @@ pub struct Theme {
     pub border: Color,
     pub border_accent: Color,
     pub border_muted: Color,
+    /// Frame color for succeeded/repair tool cards and their internal
+    /// separators. Upstream OMP titanium ships no dedicated tool-card border
+    /// role — its `borderMuted` (#1f252d) sits too close to the #0f1216
+    /// background to read as a frame, so pi-rs extends the palette with a
+    /// slightly-whiter neutral that keeps the blue-gray family while clearly
+    /// separating tool cards from the background. Custom themes may override
+    /// it with `toolCardBorder` / `tool_card_border`.
+    pub tool_card_border: Color,
     pub success: Color,
     pub error: Color,
     pub warning: Color,
@@ -85,6 +93,23 @@ pub struct Theme {
     pub thinking_xhigh: Color,
     pub thinking_max: Color,
     pub bash_mode: Color,
+    /// OMP `statusLine*` family: the composer header/status-line segment
+    /// roles. OMP renders the footer with `statusLineBg` and per-segment
+    /// colors instead of painting the whole row with the accent chrome.
+    pub status_line_bg: Color,
+    pub status_line_sep: Color,
+    pub status_line_model: Color,
+    pub status_line_path: Color,
+    pub status_line_git_clean: Color,
+    pub status_line_git_dirty: Color,
+    pub status_line_context: Color,
+    pub status_line_spend: Color,
+    pub status_line_staged: Color,
+    pub status_line_dirty: Color,
+    pub status_line_untracked: Color,
+    pub status_line_output: Color,
+    pub status_line_cost: Color,
+    pub status_line_subagents: Color,
     pub selected_bg: Color,
     pub user_message_bg: Color,
     pub custom_message_bg: Color,
@@ -108,11 +133,19 @@ pub struct ThemeExport {
 
 /// Built-in dark palette resolved from the installed OMP v17.2.6 default
 /// `titanium` theme (`src/modes/theme/defaults/titanium.json`).
+///
+/// Every role is the exact titanium value: the electric-blue accent also
+/// drives markdown headings, links and list bullets plus syntax
+/// keywords/types/operators and thinking-high, exactly as OMP's TUI renders
+/// them (the render sites add BOLD to headings/table headers and UNDERLINE to
+/// links; the palette holds OMP's colors). `thinkingMax` has no upstream
+/// equivalent and follows `thinkingXhigh` (titanium gold).
 pub const DARK: Theme = Theme {
     accent: rgb(0x00, 0xb4, 0xff),
     border: rgb(0x2a, 0x30, 0x38),
     border_accent: rgb(0x00, 0xb4, 0xff),
     border_muted: rgb(0x1f, 0x25, 0x2d),
+    tool_card_border: rgb(0x3a, 0x43, 0x50),
     success: rgb(0x00, 0xff, 0x88),
     error: rgb(0xff, 0x47, 0x57),
     warning: rgb(0xff, 0xb3, 0x47),
@@ -155,6 +188,20 @@ pub const DARK: Theme = Theme {
     thinking_xhigh: rgb(0xd4, 0xc0, 0x90),
     thinking_max: rgb(0xd4, 0xc0, 0x90),
     bash_mode: rgb(0x00, 0xff, 0x88),
+    status_line_bg: rgb(0x0f, 0x12, 0x16),
+    status_line_sep: rgb(0x2a, 0x30, 0x38),
+    status_line_model: rgb(0x00, 0xb4, 0xff),
+    status_line_path: rgb(0xe8, 0xec, 0xf4),
+    status_line_git_clean: rgb(0x00, 0xff, 0x88),
+    status_line_git_dirty: rgb(0xff, 0xb3, 0x47),
+    status_line_context: rgb(0x9c, 0xa3, 0xb0),
+    status_line_spend: rgb(0xd4, 0xc0, 0x90),
+    status_line_staged: rgb(0x00, 0xff, 0x88),
+    status_line_dirty: rgb(0xff, 0xb3, 0x47),
+    status_line_untracked: rgb(0x9c, 0xa3, 0xb0),
+    status_line_output: rgb(0x00, 0x82, 0xb3),
+    status_line_cost: rgb(0xd4, 0xc0, 0x90),
+    status_line_subagents: rgb(0x00, 0xb4, 0xff),
     selected_bg: rgb(0x00, 0x82, 0xb3),
     user_message_bg: rgb(0x0f, 0x12, 0x16),
     custom_message_bg: rgb(0x2a, 0x30, 0x38),
@@ -168,18 +215,24 @@ pub const DARK: Theme = Theme {
     },
 };
 
-/// Built-in light palette, faithful to the installed Oh My Pi 17.1.8 `light`
+/// Built-in light palette, faithful to the installed Oh My Pi 17.2.6 `light`
 /// theme (`src/modes/theme/light.json`). Upstream variable references are
 /// resolved to RGB for ratatui. Upstream empty-string roles (`text`,
 /// `userMessageText`, `customMessageText`, `toolTitle`) mean "default
 /// terminal color" and map to `Color::Reset`, matching the live TUI rendering
 /// path. `thinkingMax` is optional upstream and falls back to `thinkingXhigh`
-/// (`#8b008b`) when omitted.
+/// (`#8b008b`) when omitted. The upstream `statusLine*` roles that ship as
+/// xterm-256 indexes (`statusLineStaged` 28, `statusLineDirty` 136,
+/// `statusLineUntracked` 31, `statusLineOutput`/`statusLineCost` 133) are
+/// resolved to their RGB cube values, exactly as the live renderer resolves
+/// them. The upstream `export` block (pageBg `#f8f8f8`, cardBg `#ffffff`,
+/// infoBg `#fffae6`) is preserved verbatim.
 pub const LIGHT: Theme = Theme {
     accent: rgb(0x5a, 0x80, 0x80),
     border: rgb(0x54, 0x7d, 0xa7),
     border_accent: rgb(0x5a, 0x80, 0x80),
     border_muted: rgb(0xb0, 0xb0, 0xb0),
+    tool_card_border: rgb(0x8f, 0x95, 0x9e),
     success: rgb(0x58, 0x84, 0x58),
     error: rgb(0xaa, 0x55, 0x55),
     warning: rgb(0x9a, 0x73, 0x26),
@@ -222,6 +275,20 @@ pub const LIGHT: Theme = Theme {
     thinking_xhigh: rgb(0x8b, 0x00, 0x8b),
     thinking_max: rgb(0x8b, 0x00, 0x8b),
     bash_mode: rgb(0x58, 0x84, 0x58),
+    status_line_bg: rgb(0xe0, 0xe0, 0xe0),
+    status_line_sep: rgb(0x80, 0x80, 0x80),
+    status_line_model: rgb(0x87, 0x5f, 0x87),
+    status_line_path: rgb(0x00, 0x5f, 0x87),
+    status_line_git_clean: rgb(0x00, 0x5f, 0x00),
+    status_line_git_dirty: rgb(0xaf, 0x5f, 0x00),
+    status_line_context: rgb(0x5f, 0x5f, 0x87),
+    status_line_spend: rgb(0x00, 0x5f, 0x5f),
+    status_line_staged: rgb(0x00, 0x87, 0x00),
+    status_line_dirty: rgb(0xaf, 0x87, 0x00),
+    status_line_untracked: rgb(0x00, 0x87, 0xaf),
+    status_line_output: rgb(0xaf, 0x5f, 0xaf),
+    status_line_cost: rgb(0xaf, 0x5f, 0xaf),
+    status_line_subagents: rgb(0x5a, 0x80, 0x80),
     selected_bg: rgb(0xd0, 0xd0, 0xe0),
     user_message_bg: rgb(0xe8, 0xe8, 0xe8),
     custom_message_bg: rgb(0xed, 0xe7, 0xf6),
@@ -229,9 +296,9 @@ pub const LIGHT: Theme = Theme {
     tool_success_bg: rgb(0xe8, 0xf0, 0xe8),
     tool_error_bg: rgb(0xf0, 0xe8, 0xe8),
     export: ThemeExport {
-        page_bg: None,
-        card_bg: None,
-        info_bg: None,
+        page_bg: Some(rgb(0xf8, 0xf8, 0xf8)),
+        card_bg: Some(rgb(0xff, 0xff, 0xff)),
+        info_bg: Some(rgb(0xff, 0xfa, 0xe6)),
     },
 };
 
@@ -628,6 +695,7 @@ impl Theme {
             "border" => &mut self.border,
             "borderaccent" => &mut self.border_accent,
             "bordermuted" => &mut self.border_muted,
+            "toolcardborder" => &mut self.tool_card_border,
             "success" | "assistantlabel" => &mut self.success,
             "error" | "statuserror" => &mut self.error,
             "warning" => &mut self.warning,
@@ -670,6 +738,20 @@ impl Theme {
             "thinkingxhigh" => &mut self.thinking_xhigh,
             "thinkingmax" => &mut self.thinking_max,
             "bashmode" => &mut self.bash_mode,
+            "statuslinebg" => &mut self.status_line_bg,
+            "statuslinesep" => &mut self.status_line_sep,
+            "statuslinemodel" => &mut self.status_line_model,
+            "statuslinepath" => &mut self.status_line_path,
+            "statuslinegitclean" => &mut self.status_line_git_clean,
+            "statuslinegitdirty" => &mut self.status_line_git_dirty,
+            "statuslinecontext" => &mut self.status_line_context,
+            "statuslinespend" => &mut self.status_line_spend,
+            "statuslinestaged" => &mut self.status_line_staged,
+            "statuslinedirty" => &mut self.status_line_dirty,
+            "statuslineuntracked" => &mut self.status_line_untracked,
+            "statuslineoutput" => &mut self.status_line_output,
+            "statuslinecost" => &mut self.status_line_cost,
+            "statuslinesubagents" => &mut self.status_line_subagents,
             "selectedbg" | "completionselectedbg" => &mut self.selected_bg,
             "usermessagebg" => &mut self.user_message_bg,
             "custommessagebg" => &mut self.custom_message_bg,
@@ -930,6 +1012,20 @@ mod tests {
             "thinkingXhigh",
             "thinkingMax",
             "bashMode",
+            "statusLineBg",
+            "statusLineSep",
+            "statusLineModel",
+            "statusLinePath",
+            "statusLineGitClean",
+            "statusLineGitDirty",
+            "statusLineContext",
+            "statusLineSpend",
+            "statusLineStaged",
+            "statusLineDirty",
+            "statusLineUntracked",
+            "statusLineOutput",
+            "statusLineCost",
+            "statusLineSubagents",
             "selectedBg",
             "userMessageBg",
             "customMessageBg",
@@ -973,13 +1069,22 @@ mod tests {
     }
 
     #[test]
-    fn dark_palette_matches_installed_omp_titanium_resolved_values() {
-        // Source: installed OMP v17.2.6 default titanium theme.
+    fn dark_palette_matches_installed_omp_titanium_exactly() {
+        // Source: installed OMP v17.2.6 default titanium theme
+        // (src/modes/theme/defaults/titanium.json), variables resolved to RGB.
+        // Every role is the exact titanium value — markdown headings, links
+        // and bullets included — matching how OMP's TUI actually renders them
+        // (theme.ts getMarkdownTheme: heading = fg(mdHeading)+bold, link =
+        // fg(mdLink)+underline, listBullet = fg(mdListBullet)).
+        // `toolCardBorder` has no upstream equivalent: it is a pi-rs extension
+        // (see `Theme::tool_card_border`) — a slightly-whiter gray so
+        // succeeded tool-card frames stay visible on the #0f1216 background.
         let expected = Theme {
             accent: Color::Rgb(0x00, 0xb4, 0xff),
             border: Color::Rgb(0x2a, 0x30, 0x38),
             border_accent: Color::Rgb(0x00, 0xb4, 0xff),
             border_muted: Color::Rgb(0x1f, 0x25, 0x2d),
+            tool_card_border: Color::Rgb(0x3a, 0x43, 0x50),
             success: Color::Rgb(0x00, 0xff, 0x88),
             error: Color::Rgb(0xff, 0x47, 0x57),
             warning: Color::Rgb(0xff, 0xb3, 0x47),
@@ -1022,6 +1127,20 @@ mod tests {
             thinking_xhigh: Color::Rgb(0xd4, 0xc0, 0x90),
             thinking_max: Color::Rgb(0xd4, 0xc0, 0x90),
             bash_mode: Color::Rgb(0x00, 0xff, 0x88),
+            status_line_bg: Color::Rgb(0x0f, 0x12, 0x16),
+            status_line_sep: Color::Rgb(0x2a, 0x30, 0x38),
+            status_line_model: Color::Rgb(0x00, 0xb4, 0xff),
+            status_line_path: Color::Rgb(0xe8, 0xec, 0xf4),
+            status_line_git_clean: Color::Rgb(0x00, 0xff, 0x88),
+            status_line_git_dirty: Color::Rgb(0xff, 0xb3, 0x47),
+            status_line_context: Color::Rgb(0x9c, 0xa3, 0xb0),
+            status_line_spend: Color::Rgb(0xd4, 0xc0, 0x90),
+            status_line_staged: Color::Rgb(0x00, 0xff, 0x88),
+            status_line_dirty: Color::Rgb(0xff, 0xb3, 0x47),
+            status_line_untracked: Color::Rgb(0x9c, 0xa3, 0xb0),
+            status_line_output: Color::Rgb(0x00, 0x82, 0xb3),
+            status_line_cost: Color::Rgb(0xd4, 0xc0, 0x90),
+            status_line_subagents: Color::Rgb(0x00, 0xb4, 0xff),
             selected_bg: Color::Rgb(0x00, 0x82, 0xb3),
             user_message_bg: Color::Rgb(0x0f, 0x12, 0x16),
             custom_message_bg: Color::Rgb(0x2a, 0x30, 0x38),
@@ -1061,11 +1180,49 @@ mod tests {
         assert_eq!(DARK.thinking_high, DARK.accent);
         assert_eq!(DARK.thinking_xhigh, DARK.custom_message_label);
         assert_eq!(DARK.thinking_max, DARK.thinking_xhigh);
+
+        // statusLine* family mirrors the OMP footer segment colors: model and
+        // subagents are accent, git clean/staged are readout green, dirty is
+        // warning amber, context is muted, spend/cost are titanium gold.
+        assert_eq!(DARK.status_line_bg, DARK.user_message_bg);
+        assert_eq!(DARK.status_line_sep, DARK.border);
+        assert_eq!(DARK.status_line_model, DARK.accent);
+        assert_eq!(DARK.status_line_path, DARK.syntax_variable);
+        assert_eq!(DARK.status_line_git_clean, DARK.success);
+        assert_eq!(DARK.status_line_git_dirty, DARK.warning);
+        assert_eq!(DARK.status_line_context, DARK.muted);
+        assert_eq!(DARK.status_line_spend, DARK.custom_message_label);
+        assert_eq!(DARK.status_line_staged, DARK.success);
+        assert_eq!(DARK.status_line_dirty, DARK.warning);
+        assert_eq!(DARK.status_line_untracked, DARK.muted);
+        assert_eq!(DARK.status_line_output, DARK.selected_bg);
+        assert_eq!(DARK.status_line_cost, DARK.custom_message_label);
+        assert_eq!(DARK.status_line_subagents, DARK.accent);
+    }
+
+    #[test]
+    fn tool_card_border_is_a_visible_neutral_frame() {
+        // User-reported: tool-card frames were invisible against the dark
+        // background. The dedicated role is a slightly-whiter gray — clearly
+        // brighter than the shared border_muted/border roles (which stay
+        // byte-for-byte OMP titanium) — and never collides with the semantic
+        // colors (bash green, error red, accent blue) or card backgrounds.
+        assert_eq!(DARK.tool_card_border, Color::Rgb(0x3a, 0x43, 0x50));
+        assert_eq!(LIGHT.tool_card_border, Color::Rgb(0x8f, 0x95, 0x9e));
+        for theme in [DARK, LIGHT] {
+            assert_ne!(theme.tool_card_border, theme.border_muted);
+            assert_ne!(theme.tool_card_border, theme.border);
+            assert_ne!(theme.tool_card_border, theme.accent);
+            assert_ne!(theme.tool_card_border, theme.bash_mode);
+            assert_ne!(theme.tool_card_border, theme.error);
+            assert_ne!(theme.tool_card_border, theme.tool_success_bg);
+            assert_ne!(theme.tool_card_border, theme.tool_pending_bg);
+        }
     }
 
     #[test]
     fn light_palette_matches_omp_light_resolved_values() {
-        // Source: @oh-my-pi/pi-coding-agent 17.1.8 src/modes/theme/light.json.
+        // Source: @oh-my-pi/pi-coding-agent 17.2.6 src/modes/theme/light.json.
         // Variable refs (teal, blue, green, red, yellow, mediumGray, dimGray,
         // lightGray, selectedBg, userMsgBg, customMsgBg, tool{Pending,Success,
         // Error}Bg) resolved to RGB.
@@ -1074,6 +1231,7 @@ mod tests {
         assert_eq!(LIGHT.border, Color::Rgb(0x54, 0x7d, 0xa7));
         assert_eq!(LIGHT.border_accent, Color::Rgb(0x5a, 0x80, 0x80));
         assert_eq!(LIGHT.border_muted, Color::Rgb(0xb0, 0xb0, 0xb0));
+        assert_eq!(LIGHT.tool_card_border, Color::Rgb(0x8f, 0x95, 0x9e));
         // messages: empty upstream roles map to terminal default (Color::Reset)
         assert_eq!(LIGHT.user_message_text, Color::Reset);
         assert_eq!(LIGHT.custom_message_text, Color::Reset);
@@ -1102,11 +1260,30 @@ mod tests {
         assert_eq!(LIGHT.thinking_max, LIGHT.thinking_xhigh);
         // bash
         assert_eq!(LIGHT.bash_mode, Color::Rgb(0x58, 0x84, 0x58));
+        // status line family (light.json; xterm-256 indexes resolved to RGB)
+        assert_eq!(LIGHT.status_line_bg, Color::Rgb(0xe0, 0xe0, 0xe0));
+        assert_eq!(LIGHT.status_line_sep, Color::Rgb(0x80, 0x80, 0x80));
+        assert_eq!(LIGHT.status_line_model, Color::Rgb(0x87, 0x5f, 0x87));
+        assert_eq!(LIGHT.status_line_path, Color::Rgb(0x00, 0x5f, 0x87));
+        assert_eq!(LIGHT.status_line_git_clean, Color::Rgb(0x00, 0x5f, 0x00));
+        assert_eq!(LIGHT.status_line_git_dirty, Color::Rgb(0xaf, 0x5f, 0x00));
+        assert_eq!(LIGHT.status_line_context, Color::Rgb(0x5f, 0x5f, 0x87));
+        assert_eq!(LIGHT.status_line_spend, Color::Rgb(0x00, 0x5f, 0x5f));
+        assert_eq!(LIGHT.status_line_staged, Color::Rgb(0x00, 0x87, 0x00));
+        assert_eq!(LIGHT.status_line_dirty, Color::Rgb(0xaf, 0x87, 0x00));
+        assert_eq!(LIGHT.status_line_untracked, Color::Rgb(0x00, 0x87, 0xaf));
+        assert_eq!(LIGHT.status_line_output, Color::Rgb(0xaf, 0x5f, 0xaf));
+        assert_eq!(LIGHT.status_line_cost, Color::Rgb(0xaf, 0x5f, 0xaf));
+        assert_eq!(LIGHT.status_line_subagents, LIGHT.accent);
         // backgrounds
         assert_eq!(LIGHT.selected_bg, Color::Rgb(0xd0, 0xd0, 0xe0));
         assert_eq!(LIGHT.tool_pending_bg, Color::Rgb(0xe8, 0xe8, 0xf0));
         assert_eq!(LIGHT.tool_success_bg, Color::Rgb(0xe8, 0xf0, 0xe8));
         assert_eq!(LIGHT.tool_error_bg, Color::Rgb(0xf0, 0xe8, 0xe8));
+        // export block is preserved verbatim from light.json
+        assert_eq!(LIGHT.export.page_bg, Some(Color::Rgb(0xf8, 0xf8, 0xf8)));
+        assert_eq!(LIGHT.export.card_bg, Some(Color::Rgb(0xff, 0xff, 0xff)));
+        assert_eq!(LIGHT.export.info_bg, Some(Color::Rgb(0xff, 0xfa, 0xe6)));
     }
 
     #[test]
@@ -1205,5 +1382,42 @@ mod tests {
         assert_eq!(DARK.warning, Color::Rgb(0xff, 0xb3, 0x47));
         assert_eq!(DARK.selected_bg, Color::Rgb(0x00, 0x82, 0xb3));
         assert_eq!(DARK.md_code_block_border, Color::Rgb(0x2a, 0x30, 0x38));
+    }
+
+    #[test]
+    fn key_roles_pin_omp_palettes_for_dark_and_light() {
+        // Regression: rpi palettes must equal the colors OMP actually renders
+        // (titanium.json / light.json resolved through theme.ts role mapping).
+        // In OMP, mdHeading and mdListBullet are the theme accent for dark
+        // (titanium electricBlue) while light keeps its own yellow heading and
+        // blue link; the rpi render sites add BOLD/UNDERLINE exactly like OMP.
+        // DARK (titanium.json)
+        assert_eq!(DARK.accent, Color::Rgb(0x00, 0xb4, 0xff));
+        assert_eq!(DARK.text, Color::Reset);
+        assert_eq!(DARK.muted, Color::Rgb(0x9c, 0xa3, 0xb0));
+        assert_eq!(DARK.md_heading, DARK.accent);
+        assert_eq!(DARK.md_link, DARK.accent);
+        assert_eq!(DARK.user_message_text, Color::Reset);
+        assert_eq!(DARK.thinking_text, DARK.muted);
+        assert_eq!(DARK.selected_bg, Color::Rgb(0x00, 0x82, 0xb3));
+        // statusLine family: DARK git clean/dirty split (green/amber) and
+        // LIGHT model purple — the footer segments OMP renders distinctly.
+        assert_eq!(DARK.status_line_git_clean, DARK.success);
+        assert_eq!(DARK.status_line_git_dirty, DARK.warning);
+        assert_eq!(DARK.status_line_context, DARK.muted);
+        assert_eq!(DARK.status_line_subagents, DARK.accent);
+        // LIGHT (light.json)
+        assert_eq!(LIGHT.accent, Color::Rgb(0x5a, 0x80, 0x80));
+        assert_eq!(LIGHT.text, Color::Reset);
+        assert_eq!(LIGHT.muted, Color::Rgb(0x6c, 0x6c, 0x6c));
+        assert_eq!(LIGHT.md_heading, Color::Rgb(0x9a, 0x73, 0x26));
+        assert_eq!(LIGHT.md_link, LIGHT.border);
+        assert_eq!(LIGHT.user_message_text, Color::Reset);
+        assert_eq!(LIGHT.thinking_text, LIGHT.muted);
+        assert_eq!(LIGHT.selected_bg, Color::Rgb(0xd0, 0xd0, 0xe0));
+        assert_eq!(LIGHT.status_line_model, Color::Rgb(0x87, 0x5f, 0x87));
+        assert_eq!(LIGHT.status_line_git_dirty, Color::Rgb(0xaf, 0x5f, 0x00));
+        assert_eq!(LIGHT.status_line_context, Color::Rgb(0x5f, 0x5f, 0x87));
+        assert_eq!(LIGHT.status_line_subagents, LIGHT.accent);
     }
 }

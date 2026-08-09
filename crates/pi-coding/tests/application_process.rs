@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use pi_agent::{AbortController, AgentTool, AgentToolResult, ToolCallContext, ToolUpdateFn};
-use pi_ai::{ContentBlock, Model};
-use pi_ai::providers::{FauxProviderOptions, register_faux_provider};
+use pi_ai::{ContentBlock, Model, StopReason, ToolCall};
+use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
 use pi_coding::{
     Application, ApplicationEvent, ProcessKey, ProcessSpawnSpec, ProcessState, Session,
     SessionOptions,
@@ -340,4 +340,127 @@ async fn same_cwd_switch_session_stops_owned_process_and_drops_old_output() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("process survived same-cwd logical session switch");
+}
+
+#[tokio::test]
+async fn task_abort_keeps_supervised_process_then_explicit_stop_cleans_up() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let pid_file = cwd.path().join("task-abort.pid");
+    let (session, registration) = session(cwd.path());
+    let application = Application::new(session).await;
+    let process = application
+        .process_spawn(spec(
+            cwd.path(),
+            &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+        ))
+        .await
+        .expect("spawn supervised process");
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            break text.trim().parse::<i32>().expect("pid");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    // The exact task-interrupt entry point the TUI Esc/Ctrl-C path calls.
+    application.abort().await;
+
+    let listed = application.process_list();
+    assert_eq!(listed.len(), 1, "task abort must keep the supervised process listed");
+    assert_eq!(listed[0].id, process.id);
+    assert_eq!(listed[0].state, ProcessState::Running);
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+        .expect("supervised process must stay alive across a task abort");
+
+    // Only an explicit /ps stop terminates it.
+    let stopped = application
+        .process_stop(&process.id, Some(Duration::from_secs(3)))
+        .await
+        .expect("explicit stop");
+    assert!(stopped.state.is_terminal());
+    for _ in 0..100 {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            registration.unregister();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("supervised process survived an explicit stop");
+}
+
+#[tokio::test]
+async fn task_abort_cancels_in_flight_turn_but_keeps_supervised_process_alive() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let (session, registration) = session(cwd.path());
+    let application = Application::new(session).await;
+
+    // A supervised process owned by the session, started before the turn.
+    let process = application
+        .process_spawn(spec(cwd.path(), "sleep 30"))
+        .await
+        .expect("spawn supervised process");
+    let pid = process.pid.expect("managed pid") as i32;
+
+    // The agent's first turn issues a long-running foreground `bash` tool call
+    // (the turn's foreground command); the second response ends the run.
+    registration.set_responses(vec![
+        FauxResponse {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "call-sleep".to_owned(),
+                name: "bash".to_owned(),
+                arguments: json!({ "command": "sleep 30" }),
+                thought_signature: None,
+            })],
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+        },
+        FauxResponse {
+            content: vec![ContentBlock::text("settled")],
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        },
+    ]);
+
+    let runner = application.clone();
+    let run = tokio::spawn(async move {
+        runner
+            .prompt("run the foreground command".to_owned(), Vec::new(), None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !application.is_streaming() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn must start");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Task interrupt mid-turn: the foreground bash child is cancelled, the
+    // turn settles, and the supervised process must survive untouched.
+    application.abort().await;
+    tokio::time::timeout(Duration::from_secs(3), run)
+        .await
+        .expect("aborted turn must settle");
+
+    let listed = application.process_list();
+    assert_eq!(listed.len(), 1, "task abort must keep the supervised process listed");
+    assert_eq!(listed[0].id, process.id);
+    assert_eq!(listed[0].state, ProcessState::Running);
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+        .expect("supervised process must stay alive across an in-flight task abort");
+
+    // Only an explicit /ps stop terminates it.
+    application
+        .process_stop(&process.id, Some(Duration::from_secs(3)))
+        .await
+        .expect("explicit stop");
+    for _ in 0..100 {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            registration.unregister();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("supervised process survived an explicit stop");
 }

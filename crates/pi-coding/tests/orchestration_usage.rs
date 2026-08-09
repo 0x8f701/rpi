@@ -8,18 +8,20 @@ use pi_coding::{
 };
 
 fn definition() -> AgentDefinition {
-    AgentDefinition {
-        name: "task".to_owned(),
-        description: "usage test agent".to_owned(),
-        system_prompt: "Return the requested result.".to_owned(),
-        tools: Some(Vec::new()),
-        autoload_skills: Vec::new(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        source: AgentDefinitionSource::Bundled,
-        path: None,
-        trusted: true,
-    }
+    AgentDefinition { name: "task".to_owned(),
+    description: "usage test agent".to_owned(),
+    system_prompt: "Return the requested result.".to_owned(),
+    tools: Some(Vec::new()),
+    autoload_skills: Vec::new(),
+    model: None,
+    thinking_level: Some(ThinkingLevel::Off),
+    max_turns: None,
+    max_tool_calls: None,
+    timeout_secs: None,
+    disallowed_tools: Vec::new(),
+    capability_ceiling: None,
+    source: AgentDefinitionSource::Bundled,
+    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
 #[tokio::test]
@@ -94,6 +96,7 @@ async fn completed_child_usage_is_preserved_in_result_and_job_snapshot() {
                 agent: "task".to_owned(),
                 assignment: "report usage".to_owned(),
                 todo_task_id: None,
+                ..Default::default()
             }],
             abort,
         )

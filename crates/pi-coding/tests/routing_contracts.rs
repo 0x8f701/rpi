@@ -25,18 +25,20 @@ fn model() -> Model {
 }
 
 fn agent(name: &str, description: &str, prompt: &str, autoload_skills: &[&str]) -> AgentDefinition {
-    AgentDefinition {
-        name: name.to_owned(),
-        description: description.to_owned(),
-        system_prompt: prompt.to_owned(),
-        tools: Some(Vec::new()),
-        autoload_skills: autoload_skills.iter().map(|name| (*name).to_owned()).collect(),
-        model: None,
-        thinking_level: Some(ThinkingLevel::Off),
-        source: AgentDefinitionSource::User,
-        path: None,
-        trusted: true,
-    }
+    AgentDefinition { name: name.to_owned(),
+    description: description.to_owned(),
+    system_prompt: prompt.to_owned(),
+    tools: Some(Vec::new()),
+    autoload_skills: autoload_skills.iter().map(|name| (*name).to_owned()).collect(),
+    model: None,
+    thinking_level: Some(ThinkingLevel::Off),
+    max_turns: None,
+    max_tool_calls: None,
+    timeout_secs: None,
+    disallowed_tools: Vec::new(),
+    capability_ceiling: None,
+    source: AgentDefinitionSource::User,
+    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
 fn skill(root: &std::path::Path, name: &str, description: &str, body: &str) -> OrchestrationSkill {
@@ -480,5 +482,231 @@ fn missing_ambiguous_and_untrusted_skills_fail_actionably() -> Result<()> {
         .expect("untrusted skill must fail")
         .to_string();
     assert!(untrusted_error.contains("untrusted") && untrusted_error.contains("not trusted"), "{untrusted_error}");
+    Ok(())
+}
+
+/// Contract (P0-A): the literal CJK delegation prompt
+/// `你让researcher仔细调研pi-coding-agent` spawns the named agent without any
+/// English sentinel; the other conservative Chinese constructions
+/// (请/叫/派/安排/委托/交给) work too when paired with a unique exact agent
+/// name and an action clause. Informational mentions, questions, and skill
+/// invocations must NOT spawn.
+#[tokio::test]
+async fn cjk_delegation_intent_is_unicode_aware_and_negatives_do_not_spawn() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![
+            agent(
+                "researcher",
+                "Research and study assigned topics",
+                "RESEARCHER_PROMPT",
+                &[],
+            ),
+            agent("writer", "Write assigned content", "WRITER_PROMPT", &[]),
+        ]),
+        root.path(),
+    )
+    .with_selector_settings(selector_settings());
+    config.default_agent = "writer".to_owned();
+    config.parent_model = model();
+    let runtime = OrchestrationRuntime::new(config, recording_factory(contexts))?;
+
+    // The literal prompt needs no English sentinel.
+    let spawns = runtime
+        .spawn_from_natural_language("Main", 0, "你让researcher仔细调研pi-coding-agent")?
+        .expect("the literal CJK delegation prompt must spawn");
+    assert_eq!(spawns[0].agent, "researcher");
+    assert_eq!(spawns[0].agent_id, "researcher");
+    wait_for_spawn(&runtime, &spawns[0]).await?;
+
+    // Every conservative CJK delegation construction spawns when paired with
+    // the exact agent name and an action clause.
+    for prompt in [
+        "请你让researcher去调查这个项目",
+        "请researcher写一份调研报告",
+        "把这项调研交给researcher完成",
+        "安排researcher仔细调研这个仓库",
+        "委托researcher调研这个仓库",
+        "叫researcher去研究这个bug",
+        "派researcher去处理这个任务",
+    ] {
+        let spawned = runtime
+            .spawn_from_natural_language("Main", 0, prompt)?
+            .unwrap_or_else(|| panic!("{prompt:?} must spawn"));
+        assert_eq!(spawned[0].agent, "researcher", "{prompt}");
+        wait_for_spawn(&runtime, &spawned[0]).await?;
+    }
+
+    // Informational / question / skill-only mentions must stay
+    // recommendations, even though they name the same agents.
+    for negative in [
+        "researcher 是做什么的？",
+        "我在文档里看到researcher",
+        "请使用research技能",
+        "请 review the security patch",
+        "让test跑起来",
+    ] {
+        assert!(
+            runtime
+                .spawn_from_natural_language("Main", 0, negative)?
+                .is_none(),
+            "{negative:?} must not auto-spawn"
+        );
+    }
+    runtime.shutdown().await;
+    Ok(())
+}
+
+/// Contract (P0-A/P0-C): normalized duplicate agent names fail actionably in
+/// the CJK path too, and a disabled agent named through a CJK delegation
+/// fails with the disabled diagnostic instead of spawning.
+#[tokio::test]
+async fn cjk_ambiguity_and_disabled_agents_fail_like_english() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let ambiguous_runtime = runtime_with_agents(
+        root.path(),
+        vec![
+            agent("Research-Agent", "First researcher", "FIRST_PROMPT", &[]),
+            agent("research-agent", "Second researcher", "SECOND_PROMPT", &[]),
+        ],
+    );
+    let error = ambiguous_runtime
+        .spawn_from_natural_language("Main", 0, "你让Research-Agent调研这个")
+        .expect_err("ambiguous CJK delegation must fail");
+    let message = error.to_string();
+    assert!(message.contains("ambiguous"), "{message}");
+    assert!(message.contains("Research-Agent"), "{message}");
+    assert!(message.contains("research-agent"), "{message}");
+    ambiguous_runtime.shutdown().await;
+
+    let mut disabled_settings = BTreeMap::new();
+    disabled_settings.insert(
+        "researcher".to_owned(),
+        AgentRuntimeSettings {
+            enabled: Some(false),
+            model: None,
+            tools: None,
+        },
+    );
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let mut disabled_config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![
+            agent(
+                "researcher",
+                "Research and study assigned topics",
+                "RESEARCHER_PROMPT",
+                &[],
+            ),
+            agent("writer", "Write assigned content", "WRITER_PROMPT", &[]),
+        ]),
+        root.path(),
+    )
+    .with_selector_settings(selector_settings())
+    .with_agent_settings(disabled_settings);
+    disabled_config.default_agent = "writer".to_owned();
+    disabled_config.parent_model = model();
+    let disabled_runtime =
+        OrchestrationRuntime::new(disabled_config, recording_factory(contexts))?;
+    let error = disabled_runtime
+        .spawn_from_natural_language("Main", 0, "你让researcher仔细调研")
+        .expect_err("disabled CJK delegation must fail");
+    let message = error.to_string();
+    assert!(message.contains("researcher") && message.contains("disabled"), "{message}");
+    disabled_runtime.shutdown().await;
+    Ok(())
+}
+
+/// Contract (P0-C): the workflow catalog diagnostics fail actionably when an
+/// objective explicitly delegates to an agent that is absent or disabled in
+/// the catalog (never a silent fallback to `task`), while present agents and
+/// skill invocations pass.
+#[tokio::test]
+async fn workflow_catalog_diagnostics_fail_for_missing_and_disabled_agents() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let research = skill(
+        root.path(),
+        "research",
+        "Research topics for a researcher study",
+        "RESEARCH_BODY",
+    );
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![
+            agent("researcher", "Research topics", "RESEARCHER_PROMPT", &[]),
+            agent("writer", "Write content", "WRITER_PROMPT", &[]),
+        ]),
+        root.path(),
+    );
+    config.default_agent = "writer".to_owned();
+    config.skills = vec![research];
+    config.parent_model = model();
+    let runtime = OrchestrationRuntime::new(config, Arc::new(|_| Box::pin(async { unreachable!() })))?;
+
+    // Present agent + action clause: valid.
+    runtime
+        .validate_delegation_agents("你让researcher仔细调研pi-coding-agent")
+        .expect("a present exact agent must validate");
+    // English delegation to a present agent: valid.
+    runtime
+        .validate_delegation_agents("Have researcher study this")
+        .expect("an English delegation to a present agent must validate");
+    // Skill invocation is not an agent delegation: valid.
+    runtime
+        .validate_delegation_agents("请使用research技能")
+        .expect("a skill invocation must not be flagged as a missing agent");
+    // No delegation construction: valid.
+    runtime
+        .validate_delegation_agents("researcher 是做什么的？")
+        .expect("an informational mention must validate");
+    runtime
+        .validate_delegation_agents("仔细调研pi-coding-agent")
+        .expect("a delegation-free objective must validate");
+
+    // Missing agent named by a CJK delegation: actionable failure.
+    let error = runtime
+        .validate_delegation_agents("你让ghost-agent仔细调研pi-coding-agent")
+        .expect_err("a missing explicit agent must fail actionably")
+        .to_string();
+    assert!(error.contains("ghost-agent"), "{error}");
+    assert!(error.contains("not defined"), "{error}");
+    assert!(error.contains("~/.pi/agents"), "{error}");
+    // Missing agent named by an English delegation: actionable failure.
+    let error = runtime
+        .validate_delegation_agents("Have ghost-agent study this")
+        .expect_err("a missing explicit English agent must fail actionably")
+        .to_string();
+    assert!(error.contains("ghost-agent") && error.contains("not defined"), "{error}");
+
+    // Disabled agent named by a delegation: actionable failure.
+    let mut disabled_settings = BTreeMap::new();
+    disabled_settings.insert(
+        "researcher".to_owned(),
+        AgentRuntimeSettings {
+            enabled: Some(false),
+            model: None,
+            tools: None,
+        },
+    );
+    let mut disabled_config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![
+            agent("researcher", "Research topics", "RESEARCHER_PROMPT", &[]),
+            agent("writer", "Write content", "WRITER_PROMPT", &[]),
+        ]),
+        root.path(),
+    )
+    .with_agent_settings(disabled_settings);
+    disabled_config.default_agent = "writer".to_owned();
+    disabled_config.parent_model = model();
+    let disabled_runtime = OrchestrationRuntime::new(
+        disabled_config,
+        Arc::new(|_| Box::pin(async { unreachable!() })),
+    )?;
+    let error = disabled_runtime
+        .validate_delegation_agents("你让researcher仔细调研")
+        .expect_err("a disabled explicit agent must fail actionably")
+        .to_string();
+    assert!(error.contains("researcher") && error.contains("disabled"), "{error}");
+    runtime.shutdown().await;
+    disabled_runtime.shutdown().await;
     Ok(())
 }

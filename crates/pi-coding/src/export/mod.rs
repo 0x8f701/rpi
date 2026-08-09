@@ -21,11 +21,12 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use pi_ai::{ContentBlock, Message, ToolCall};
 use serde_json::Value;
 
+use crate::redact::redact_secrets;
 use crate::session_store::{
     SessionEntry, SessionTree, load_session_tree, load_session_messages,
 };
@@ -98,9 +99,16 @@ pub fn export_session_html(
 ) -> Result<PathBuf> {
     let tree = load_session_tree(session_path)
         .with_context(|| format!("loading session {}", session_path.display()))?;
+    if tree.entries.is_empty() {
+        bail!(
+            "session {} contains no transcript entries; nothing to export",
+            session_path.display()
+        );
+    }
     let metadata = metadata_from_tree(&tree);
     let html = render_tree_html(&tree, &metadata, options);
     let out = resolve_output(session_path, output, "html")?;
+    refuse_in_place(session_path, &out)?;
     atomic_write(&out, &html)
         .with_context(|| format!("writing HTML export {}", out.display()))?;
     Ok(out)
@@ -111,18 +119,38 @@ pub fn export_session_jsonl(
     session_path: &Path,
     output: Option<&Path>,
 ) -> Result<PathBuf> {
+    let jsonl = branch_jsonl(session_path)?;
+    let out = resolve_output(session_path, output, "jsonl")?;
+    refuse_in_place(session_path, &out)?;
+    atomic_write(&out, &jsonl)
+        .with_context(|| format!("writing JSONL export {}", out.display()))?;
+    Ok(out)
+}
+
+/// Render the current branch (root → leaf) of a session as JSONL bytes in
+/// memory, without writing anything to disk.
+///
+/// Used by the encrypted-share path so the plaintext branch is never staged
+/// as a temp file (see [`crate::share::encrypt_session_share_to_file`]).
+pub fn export_session_jsonl_bytes(session_path: &Path) -> Result<Vec<u8>> {
+    Ok(branch_jsonl(session_path)?.into_bytes())
+}
+
+fn branch_jsonl(session_path: &Path) -> Result<String> {
     let tree = load_session_tree(session_path)
         .with_context(|| format!("loading session {}", session_path.display()))?;
+    if tree.entries.is_empty() {
+        bail!(
+            "session {} contains no transcript entries; nothing to export",
+            session_path.display()
+        );
+    }
     let branch_ids: HashSet<String> = tree
         .branch(None)
         .iter()
         .map(|entry| entry.id.clone())
         .collect();
-    let jsonl = filter_branch_jsonl(session_path, &branch_ids)?;
-    let out = resolve_output(session_path, output, "jsonl")?;
-    atomic_write(&out, &jsonl)
-        .with_context(|| format!("writing JSONL export {}", out.display()))?;
-    Ok(out)
+    filter_branch_jsonl(session_path, &branch_ids)
 }
 
 /// Export in-memory messages to a self-contained HTML file (live session
@@ -617,9 +645,14 @@ fn entry_html(
 // ---------------------------------------------------------------------------
 
 /// Escape text for safe insertion into HTML text content or attribute values.
+///
+/// Credential-shaped patterns are redacted first: the model's replies and
+/// tool output may echo tokens/keys, and the exported file is the rendered
+/// record, so every text fragment crossing into the HTML surface runs the
+/// shared [`redact_secrets`] pass here (raw storage is never touched).
 fn escape_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
+    for ch in redact_secrets(text).chars() {
         match ch {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -730,6 +763,24 @@ fn resolve_output(session_path: &Path, output: Option<&Path>, ext: &str) -> Resu
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     Ok(dir.join(format!("{stem}.{ext}")))
+}
+
+/// Refuse to write an export over its own source session file. The default
+/// JSONL output path (`<stem>.jsonl`) collides with a `.jsonl` input, and an
+/// explicit `--output` may too; silently replacing the source would discard
+/// off-branch records or truncate a live/partial session.
+fn refuse_in_place(session_path: &Path, out: &Path) -> Result<()> {
+    if out == session_path
+        || (out.exists()
+            && session_path.exists()
+            && fs::canonicalize(out).ok() == fs::canonicalize(session_path).ok())
+    {
+        bail!(
+            "refusing to overwrite the source session {}; pass --output with a different path",
+            session_path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Write `content` to `path` atomically via a temp file in the same directory
@@ -859,6 +910,41 @@ mod tests {
         assert!(html.contains("Output truncated. Full output: /tmp/&lt;full&gt;.log"));
         assert!(!html.contains("printf '<script>'"));
         assert!(!html.contains("<img onerror"));
+    }
+
+    #[test]
+    fn html_export_redacts_credential_shapes_in_messages() {
+        let ghp = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let sk = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let mut assistant = pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
+        assistant.content = vec![ContentBlock::text(format!("your token is {ghp}"))];
+        let messages = vec![
+            Message::user_text("login with token=abc123 please", 1),
+            Message::Assistant(assistant),
+            Message::BashExecution(pi_ai::BashExecutionMessage {
+                command: "curl -H 'Authorization: Bearer xyz789' https://api".into(),
+                output: sk.clone(),
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+                full_output_path: None,
+                timestamp: 3,
+                exclude_from_context: None,
+            }),
+        ];
+        let html = render_messages_html(&messages, &ExportMetadata::default(), &ExportOptions::default());
+        for leaked in [ghp.as_str(), "abc123", "xyz789", sk.as_str()] {
+            assert!(!html.contains(leaked), "{leaked:?} leaked into export");
+        }
+        assert_eq!(html.matches("[REDACTED]").count(), 4);
+    }
+
+    #[test]
+    fn html_export_leaves_plain_text_unchanged() {
+        let messages = vec![Message::user_text("plain conversation, no secrets", 1)];
+        let html = render_messages_html(&messages, &ExportMetadata::default(), &ExportOptions::default());
+        assert!(html.contains("plain conversation, no secrets"));
+        assert!(!html.contains("[REDACTED]"));
     }
 
     #[test]
@@ -1020,5 +1106,97 @@ mod tests {
         let content = fs::read_to_string(&out).unwrap();
         assert!(content.contains("\"type\":\"session\""));
         assert!(content.contains("\"id\":\"a\""));
+    }
+
+    const HEADER_ONLY_SESSION: &str =
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n";
+
+    const MESSAGED_SESSION: &str = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"2024-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
+        "{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"timestamp\":0}}\n",
+        "{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"a\",\"timestamp\":\"2024-01-01T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"yo\"}],\"api\":\"x\",\"provider\":\"x\",\"model\":\"x\",\"stopReason\":\"stop\",\"timestamp\":0}}\n",
+    );
+
+    /// A session file with only the header (no entries) must fail with an
+    /// actionable error instead of silently producing an empty-content export.
+    #[test]
+    fn export_session_html_rejects_header_only_session_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        fs::write(&path, HEADER_ONLY_SESSION).unwrap();
+        let out = dir.path().join("empty.html");
+        let error = export_session_html(&path, Some(&out), &ExportOptions::default())
+            .expect_err("header-only session must fail");
+        assert!(
+            error.to_string().contains("no transcript entries"),
+            "error must be actionable: {error:#}"
+        );
+        assert!(!out.exists(), "no output file may be written");
+    }
+
+    /// `--jsonl` on a header-only session must fail instead of writing a
+    /// header-only JSONL (which the in-place default would write over the
+    /// source file).
+    #[test]
+    fn export_session_jsonl_rejects_header_only_session_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        fs::write(&path, HEADER_ONLY_SESSION).unwrap();
+        let out = dir.path().join("empty-export.jsonl");
+        let error = export_session_jsonl(&path, Some(&out))
+            .expect_err("header-only session must fail");
+        assert!(
+            error.to_string().contains("no transcript entries"),
+            "error must be actionable: {error:#}"
+        );
+        assert!(!out.exists(), "no output file may be written");
+    }
+
+    /// The default JSONL output path (`<stem>.jsonl`) is the source itself;
+    /// exporting in place would silently overwrite the session. It must be
+    /// refused with an actionable error and leave the source untouched.
+    #[test]
+    fn export_session_jsonl_refuses_default_output_over_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        fs::write(&path, MESSAGED_SESSION).unwrap();
+        let error =
+            export_session_jsonl(&path, None).expect_err("in-place jsonl export must fail");
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "error must be actionable: {error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            MESSAGED_SESSION,
+            "source session must remain untouched"
+        );
+    }
+
+    /// An explicit `--output` pointing back at the source session (including
+    /// a `./` alias that canonicalizes to it) must be refused too.
+    #[test]
+    fn export_session_html_refuses_explicit_output_over_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        fs::write(&path, MESSAGED_SESSION).unwrap();
+        let error = export_session_html(&path, Some(&path), &ExportOptions::default())
+            .expect_err("in-place html export must fail");
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "error must be actionable: {error:#}"
+        );
+        let aliased = dir.path().join(".").join("session.jsonl");
+        let error = export_session_html(&path, Some(&aliased), &ExportOptions::default())
+            .expect_err("canonical alias must fail");
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "error must be actionable: {error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            MESSAGED_SESSION,
+            "source session must remain untouched"
+        );
     }
 }

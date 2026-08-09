@@ -2,23 +2,28 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use pi_agent::AgentEvent;
+use pi_ai::{AssistantMessageEvent, ContentBlock};
+use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use super::{workflow_backend::WorkflowApplicationBackend, workflow_events::{WorkflowForwardingState, event_workflow_id}, Application, ApplicationRuntimeFactory};
 use crate::workflow_worktree::{
     CreateWorktreeOptions, IntegrateOptions, IntegrateOutcome, TrustedWorkflowCwd,
-    WorkflowWorktreeIdentity, WorkflowWorktreeManager,
+    WorkflowIsolation, WorkflowWorktreeIdentity, WorkflowWorktreeManager,
 };
 use crate::{
     ApplicationEvent, OrchestrationConcurrencyGate, OrchestrationEvent, OrchestrationRuntime,
     SessionOptions, TodoState, WorkflowIntegration, WorkflowRuntimeFactory,
     WorkflowRuntimeIdentity, WorkflowRuntimeProjectionSink, WorkflowRuntimeRequest,
-    WorkflowRuntimeUpdate, WorkflowSnapshot, WorkflowStatus, WorkflowSupervisor,
-    WorkflowSupervisorContract, WorkflowSupervisorEvent,
+    WorkflowRuntimeScope, WorkflowRuntimeUpdate, WorkflowSnapshot, WorkflowStatus,
+    WorkflowSupervisor, WorkflowSupervisorContract, WorkflowSupervisorEvent,
+    WorkflowSupervisorTodoObservation,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -54,14 +59,20 @@ struct WorkflowRegistryEntry {
     runtime: Mutex<Option<Arc<WorkflowChildRuntime>>>,
 }
 
-/// Application-backed workflow runtime factory with exact worktree and generation ownership.
+/// Application-backed workflow runtime factory with exact isolation and
+/// generation ownership. The isolation backend (git worktree, overlayfs, or
+/// none) is selected from `settings.orchestration.isolation`.
 pub struct ApplicationWorkflowRuntimeFactory {
-    worktrees: WorkflowWorktreeManager,
+    worktrees: Arc<dyn WorkflowIsolation>,
     managed_root: PathBuf,
     runtime_factory: Arc<dyn ApplicationRuntimeFactory>,
     session_options: SessionOptions,
     max_concurrency: usize,
     global_concurrency: OrchestrationConcurrencyGate,
+    /// Wall-clock budget (millis) for one workflow planning prompt; 0 keeps
+    /// the crate default (90s). Atomic so the factory (held behind `Arc`) can
+    /// expose a setter; read per child build.
+    planning_deadline_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     registry: Mutex<HashMap<WorkflowRuntimeKey, Arc<WorkflowRegistryEntry>>>,
     projection_sink: Mutex<Option<WorkflowRuntimeProjectionSink>>,
 }
@@ -102,7 +113,7 @@ impl WorkflowRegistryEntry {
 
 impl ApplicationWorkflowRuntimeFactory {
     pub fn new(
-        worktrees: WorkflowWorktreeManager,
+        worktrees: Arc<dyn WorkflowIsolation>,
         managed_root: impl Into<PathBuf>,
         runtime_factory: Arc<dyn ApplicationRuntimeFactory>,
         session_options: SessionOptions,
@@ -119,9 +130,20 @@ impl ApplicationWorkflowRuntimeFactory {
             session_options,
             max_concurrency,
             global_concurrency,
+            planning_deadline_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             registry: Mutex::new(HashMap::new()),
             projection_sink: Mutex::new(None),
         })
+    }
+
+    /// Override the wall-clock budget for workflow planning prompts on this
+    /// factory (a short deadline lets tests exercise the P0-1 timeout bound).
+    pub fn set_workflow_planning_deadline(&self, deadline: Duration) {
+        use std::sync::atomic::Ordering;
+        self.planning_deadline_ms.store(
+            u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     fn attach_projection_sink(&self, sink: WorkflowRuntimeProjectionSink) -> Result<()> {
@@ -164,8 +186,13 @@ impl ApplicationWorkflowRuntimeFactory {
             todo: projection.todo,
             supervisor_agent_id: Some(projection.supervisor_agent_id),
             supervisor_job_id: None,
-            failure: projection.failure.map(|_| crate::WorkflowFailure {
-                message: "workflow supervisor failed".to_owned(),
+            // Surface the supervisor's failure reason (e.g. the actionable
+            // "planning produced no tasks" stuck-planning message) while
+            // still redacting any secrets the failure text may embed.
+            failure: projection.failure.as_deref().map(|message| crate::WorkflowFailure {
+                message: crate::redact_value(&serde_json::Value::String(message.to_owned()))
+                    .as_str()
+                    .map_or_else(|| message.to_string(), str::to_owned),
             }),
             integration,
         }
@@ -173,14 +200,18 @@ impl ApplicationWorkflowRuntimeFactory {
 
     /// Whether an `ApplicationEvent` is workflow-relevant for the supervisor
     /// and should be forwarded. Only events the supervisor consumes are
-    /// forwarded: `RunFailed`, workflow-scoped `JobUpdated`, and
-    /// `MessageDelivered`. Foreign/stale `JobUpdated` (different workflow id
-    /// or generation) are filtered here so they never occupy supervisor
-    /// command capacity; the supervisor's own generation/terminal guards
-    /// remain the authoritative backstop.
+    /// forwarded: `RunFailed`, workflow-scoped `JobUpdated`,
+    /// `MessageDelivered`, and `TodoUpdated` (the workflow child's canonical
+    /// Todo DAG is the workflow's todo, so the supervisor must observe every
+    /// mutation to keep its projection live — including mid-planning, see
+    /// BUG-2). Foreign/stale `JobUpdated` (different workflow id or
+    /// generation) are filtered here so they never occupy supervisor command
+    /// capacity; the supervisor's own generation/terminal guards remain the
+    /// authoritative backstop.
     fn supervisor_relevant_event(workflow_id: &str, generation: u64, event: &ApplicationEvent) -> bool {
         match event {
             ApplicationEvent::RunFailed { .. } => true,
+            ApplicationEvent::TodoUpdated { .. } => true,
             ApplicationEvent::Orchestration(OrchestrationEvent::JobUpdated { job, .. }) => {
                 let foreign_workflow = job
                     .workflow_id
@@ -193,6 +224,148 @@ impl ApplicationWorkflowRuntimeFactory {
             }
             ApplicationEvent::Orchestration(OrchestrationEvent::MessageDelivered { .. }) => true,
             _ => false,
+        }
+    }
+
+    /// Map an agent event of the supervisor's own turn to a coalescable
+    /// planning-activity delta: streaming thinking/text chunks and tool-call
+    /// starts. Tool calls flush immediately; thinking/text deltas are
+    /// accumulated by the forwarder and flushed as bounded chunks (bounded
+    /// interval + on the next non-delta event) so the workflow page sees real
+    /// movement without a per-token projection storm.
+    fn supervisor_activity_delta(event: &ApplicationEvent) -> Option<(crate::WorkflowSupervisorActivityKind, String)> {
+        match event {
+            ApplicationEvent::Agent(AgentEvent::MessageUpdate {
+                assistant_message_event,
+                ..
+            }) => match assistant_message_event {
+                AssistantMessageEvent::ThinkingDelta { delta, .. } => Some((
+                    crate::WorkflowSupervisorActivityKind::Thinking,
+                    delta.clone(),
+                )),
+                AssistantMessageEvent::TextDelta { delta, .. } => Some((
+                    crate::WorkflowSupervisorActivityKind::Text,
+                    delta.clone(),
+                )),
+                _ => None,
+            },
+            ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+                tool_name,
+                arguments,
+                ..
+            }) => Some((
+                crate::WorkflowSupervisorActivityKind::Tool,
+                Self::tool_activity_summary(tool_name, arguments),
+            )),
+            _ => None,
+        }
+    }
+
+    /// One-line bounded summary of a supervisor tool call for the planning
+    /// feed: the tool name plus a bounded argument fragment for calls that
+    /// carry user-visible intent — `bash` shows the command after the `$`
+    /// (first ~40 chars), `goal`/`todo` the operation name, and
+    /// `read`/`edit`/`write` the target path. Fragments are control-stripped,
+    /// credential-redacted, and capped at 60 chars; the summary is capped
+    /// again by the supervisor's activity feed before it reaches the page.
+    fn tool_activity_summary(tool_name: &str, arguments: &Value) -> String {
+        const FRAGMENT_CAP: usize = 60;
+        const BASH_COMMAND_CAP: usize = 40;
+        let fragment = match tool_name {
+            "bash" => arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|command| command.strip_prefix('$').unwrap_or(command).trim())
+                .map(|command| Self::bounded_activity_fragment(command, BASH_COMMAND_CAP)),
+            "goal" | "todo" => Self::todo_arguments_fingerprint(arguments)
+                .0
+                .map(|op| Self::bounded_activity_fragment(&op, FRAGMENT_CAP)),
+            "read" | "edit" | "write" => arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|path| Self::bounded_activity_fragment(path, FRAGMENT_CAP)),
+            _ => None,
+        };
+        fragment.map_or_else(
+            || tool_name.to_owned(),
+            |fragment| format!("{tool_name} · {fragment}"),
+        )
+    }
+
+    /// Control-strip, credential-redact, and bound one activity fragment.
+    fn bounded_activity_fragment(raw: &str, cap: usize) -> String {
+        let cleaned: String = raw
+            .chars()
+            .map(|character| if character.is_control() { ' ' } else { character })
+            .collect();
+        let redacted = crate::redact_value(&serde_json::Value::String(cleaned.clone()))
+            .as_str()
+            .map_or_else(|| cleaned, str::to_owned);
+        if redacted.chars().count() <= cap {
+            return redacted;
+        }
+        let prefix: String = redacted.chars().take(cap.saturating_sub(3)).collect();
+        format!("{prefix}...")
+    }
+
+    /// Pair a completed supervisor tool call with its recorded start summary
+    /// and mark it `ok`/`err`, so the planning feed's tool rows carry an
+    /// outcome instead of only a start. Unpaired starts stay in `pending`
+    /// (the same bounded-lifetime pattern as `supervisor_todo_observation`).
+    fn supervisor_tool_end_activity(
+        event: &ApplicationEvent,
+        pending: &mut HashMap<String, String>,
+    ) -> Option<String> {
+        match event {
+            ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                is_error,
+                ..
+            }) => pending.remove(tool_call_id).map(|summary| {
+                format!("{summary} · {}", if *is_error { "err" } else { "ok" })
+            }),
+            _ => None,
+        }
+    }
+
+    /// Map a completed `todo` tool call of the supervisor's own turn to a
+    /// semantic observation for planning non-progress detection (P1-2). The
+    /// `todo` tool's operation name and target IDs come from the call start
+    /// (paired by `tool_call_id`); the error state and normalized error
+    /// prefix come from the completion. Todo-state change is evaluated by the
+    /// supervisor against its canonical projection, so the observation itself
+    /// carries no state.
+    fn supervisor_todo_observation(
+        event: &ApplicationEvent,
+        pending: &mut HashMap<String, (Option<String>, Vec<String>)>,
+    ) -> Option<WorkflowSupervisorTodoObservation> {
+        match event {
+            ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                arguments,
+                ..
+            }) if tool_name == "todo" => {
+                let (op, target_ids) = Self::todo_arguments_fingerprint(arguments);
+                pending.insert(tool_call_id.clone(), (op, target_ids));
+                None
+            }
+            ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            }) if tool_name == "todo" => {
+                let (op, target_ids) = pending.remove(tool_call_id).unwrap_or_default();
+                let error_prefix = (*is_error).then(|| Self::todo_error_prefix(result)).flatten();
+                Some(WorkflowSupervisorTodoObservation {
+                    op,
+                    target_ids,
+                    is_error: *is_error,
+                    error_prefix,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -218,6 +391,45 @@ impl ApplicationWorkflowRuntimeFactory {
             .map(|runtime| runtime.backend.application().clone())
     }
 
+    /// Extract the normalized Todo operation name and target task/dependency
+    /// IDs (plus `init` items) from a `todo` tool-call's arguments.
+    fn todo_arguments_fingerprint(arguments: &Value) -> (Option<String>, Vec<String>) {
+        let op = arguments
+            .get("op")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut target_ids = Vec::new();
+        if let Some(task) = arguments.get("task").and_then(Value::as_str) {
+            target_ids.push(task.to_owned());
+        }
+        if let Some(dependencies) = arguments.get("dependsOn").and_then(Value::as_array) {
+            target_ids.extend(dependencies.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+        if let Some(items) = arguments.get("items").and_then(Value::as_array) {
+            target_ids.extend(items.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+        if let Some(list) = arguments.get("list").and_then(Value::as_array) {
+            for phase in list {
+                if let Some(items) = phase.get("items").and_then(Value::as_array) {
+                    target_ids.extend(items.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+            }
+        }
+        (op, target_ids)
+    }
+
+    /// Normalized, bounded error prefix of a failed `todo` tool result.
+    fn todo_error_prefix(result: &pi_agent::AgentToolResult) -> Option<String> {
+        let text = result
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })?;
+        Some(text.chars().take(120).collect())
+    }
+
     fn runtime_detail(
         &self,
         snapshot: &WorkflowSnapshot,
@@ -233,8 +445,12 @@ impl ApplicationWorkflowRuntimeFactory {
         let orchestration = runtime.backend.orchestration();
         let agents = orchestration.list("");
         let jobs = orchestration.workflow_jobs(snapshot.workflow_id.as_str(), snapshot.generation);
-        let mut irc = projection.irc.clone();
-        irc.extend(orchestration.inbox(&projection.supervisor_agent_id, true));
+        // The workflow page's Recent IRC reads the group's delivered-message
+        // log — every durably delivered message (subagent ⇄ subagent
+        // included), independent of mailbox consumption — so messages stay
+        // visible after the recipient reads them. The supervisor projection's
+        // own inbox is redundant with that log and is not re-added.
+        let irc = orchestration.delivered_messages();
         Some(crate::WorkflowRuntimeDetail::from_live(snapshot, projection, agents, jobs, irc))
     }
 
@@ -387,6 +603,17 @@ impl ApplicationWorkflowRuntimeFactory {
             .orchestration_runtime
             .clone()
             .ok_or_else(|| anyhow!("workflow child orchestration is not configured"))?;
+        // Stamp the orchestration as workflow-scoped BEFORE the candidate is
+        // attached to an Application: the todo mutation commit hook and the
+        // attach-time DAG arm consult this scope to decide whether the
+        // workflow child may auto-arm DAG execution (it may not — the
+        // supervisor owns DAG execution for workflow children, see BUG-1).
+        // The later configure_workflow_runtime call re-validates the same
+        // scope and is idempotent while no jobs are active.
+        orchestration.set_workflow_scope(WorkflowRuntimeScope {
+            workflow_id: request.workflow_id.as_str().to_owned(),
+            generation: request.generation,
+        })?;
         let application = Application::from_runtime_candidate(candidate)
             .await
             .map_err(|_| anyhow!("workflow child Application construction failed"))?;
@@ -395,6 +622,7 @@ impl ApplicationWorkflowRuntimeFactory {
             orchestration.clone(),
             request.workflow_id.as_str().to_owned(),
             request.generation,
+            self.planning_deadline_ms.load(std::sync::atomic::Ordering::Relaxed),
         )?);
         let contract = WorkflowSupervisorContract {
             workflow_id: request.workflow_id.as_str().to_owned(),
@@ -452,30 +680,120 @@ impl ApplicationWorkflowRuntimeFactory {
         // forwarder drains the application broadcast serially and awaits
         // supervisor observation in arrival order (no per-event spawn). Only
         // events the supervisor consumes (`RunFailed`, workflow-scoped
-        // `JobUpdated`, `MessageDelivered`) are forwarded; foreign/stale
-        // `JobUpdated` are filtered here so they never occupy supervisor
-        // command capacity. When the supervisor actor is busy, this forwarder
-        // blocks on the supervisor command channel and the application
-        // broadcast backpressures by lagging, coalescing unconsumed events.
-        // The projection task above is independent and keeps the projection
-        // sink live during the stall.
+        // `JobUpdated`, `MessageDelivered`, `TodoUpdated`) are forwarded;
+        // foreign/stale `JobUpdated` are filtered here so they never occupy
+        // supervisor command capacity. When the supervisor actor is busy, this
+        // forwarder blocks on the supervisor command channel and the
+        // application broadcast backpressures by lagging, coalescing
+        // unconsumed events. The projection task above is independent and
+        // keeps the projection sink live during the stall.
+        //
+        // The supervisor's own turn additionally streams live planning
+        // activity (thinking/text chunks, tool calls) into the projection so
+        // the workflow page never reads as a static spinner. Thinking/text
+        // deltas are per-token and are coalesced here into bounded chunks:
+        // flushed on a 1s tick while accumulating, on the next forwarded
+        // event, or when a chunk size cap is reached — never one projection
+        // per token.
         let forwarder_task = tokio::spawn(async move {
+            const ACTIVITY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+            const ACTIVITY_CHUNK_CHARS: usize = 600;
+            let mut activity_kind = crate::WorkflowSupervisorActivityKind::Thinking;
+            let mut activity_buffer = String::new();
+            // Pairs in-flight `todo` tool calls (start args) with their
+            // completion so the supervisor gets one semantic observation per
+            // call for non-progress detection (P1-2).
+            let mut todo_pending: HashMap<String, (Option<String>, Vec<String>)> =
+                HashMap::new();
+            // Start summaries of in-flight supervisor tool calls, paired by
+            // tool_call_id so the matching ToolExecutionEnd can append an
+            // ok/err outcome to the same bounded tool row.
+            let mut tool_pending: HashMap<String, String> = HashMap::new();
+            let mut flush_ticker = tokio::time::interval(ACTIVITY_FLUSH_INTERVAL);
+            flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first interval tick fires immediately; discard it so the
+            // buffer only flushes after a full interval of accumulation.
+            flush_ticker.tick().await;
             loop {
-                match application_events.recv().await {
-                    Ok(event) => {
-                        if !ApplicationWorkflowRuntimeFactory::supervisor_relevant_event(
-                            workflow_id.as_str(),
-                            generation,
-                            &event,
-                        ) {
-                            continue;
+                tokio::select! {
+                    event = application_events.recv() => {
+                        match event {
+                            Ok(event) => {
+                                if let Some(observation) =
+                                    ApplicationWorkflowRuntimeFactory::supervisor_todo_observation(
+                                        &event,
+                                        &mut todo_pending,
+                                    )
+                                {
+                                    let _ = forward_supervisor
+                                        .observe_todo_observation(generation, observation)
+                                        .await;
+                                }
+                                if let Some((kind, delta)) =
+                                    ApplicationWorkflowRuntimeFactory::supervisor_activity_delta(&event)
+                                {
+                                    // Tool calls are milestones: flush any
+                                    // accumulated text and deliver them
+                                    // immediately. Thinking/text chunks
+                                    // accumulate until a flush boundary.
+                                    if kind == crate::WorkflowSupervisorActivityKind::Tool {
+                                        // Remember the delivered start summary
+                                        // so the tool's end can append ok/err.
+                                        if let ApplicationEvent::Agent(AgentEvent::ToolExecutionStart { tool_call_id, .. }) = &event {
+                                            tool_pending.insert(tool_call_id.clone(), delta.clone());
+                                        }
+                                        if !activity_buffer.is_empty() {
+                                            let _ = forward_supervisor
+                                                .observe_activity(generation, activity_kind, std::mem::take(&mut activity_buffer))
+                                                .await;
+                                        }
+                                        let _ = forward_supervisor
+                                            .observe_activity(generation, kind, delta)
+                                            .await;
+                                    } else {
+                                        activity_kind = kind;
+                                        activity_buffer.push_str(&delta);
+                                        if activity_buffer.chars().count() >= ACTIVITY_CHUNK_CHARS {
+                                            let _ = forward_supervisor
+                                                .observe_activity(generation, activity_kind, std::mem::take(&mut activity_buffer))
+                                                .await;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if let Some(outcome) = ApplicationWorkflowRuntimeFactory::supervisor_tool_end_activity(&event, &mut tool_pending) {
+                                    let _ = forward_supervisor
+                                        .observe_activity(generation, crate::WorkflowSupervisorActivityKind::Tool, outcome)
+                                        .await;
+                                    continue;
+                                }
+                                if !activity_buffer.is_empty() {
+                                    let _ = forward_supervisor
+                                        .observe_activity(generation, activity_kind, std::mem::take(&mut activity_buffer))
+                                        .await;
+                                }
+                                if !ApplicationWorkflowRuntimeFactory::supervisor_relevant_event(
+                                    workflow_id.as_str(),
+                                    generation,
+                                    &event,
+                                ) {
+                                    continue;
+                                }
+                                let _ = forward_supervisor
+                                    .observe_application_event(generation, event)
+                                    .await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                        let _ = forward_supervisor
-                            .observe_application_event(generation, event)
-                            .await;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ = flush_ticker.tick() => {
+                        if !activity_buffer.is_empty() {
+                            let _ = forward_supervisor
+                                .observe_activity(generation, activity_kind, std::mem::take(&mut activity_buffer))
+                                .await;
+                        }
+                    }
                 }
             }
         });
@@ -569,6 +887,19 @@ impl WorkflowRuntimeFactory for ApplicationWorkflowRuntimeFactory {
         let (identity, cwd) = self.worktrees.verify_owned_current(request.workflow_id.as_str()).map_err(|_| anyhow!("workflow worktree recovery failed"))?;
         Self::validate_snapshot_identity(snapshot, &identity)?;
         let entry = self.build_child(request, identity, cwd, Some(snapshot)).await?;
+        // A restored non-Paused runtime must never come back frozen: Planning
+        // continues the bounded planning flow, Running re-arms Todo DAG
+        // execution over the stored tasks, Queued starts. The supervisor's
+        // event loop pushes the resulting status/todo through the projection
+        // sink, so the durable record updates without blocking restore.
+        if !matches!(snapshot.status, WorkflowStatus::Paused) {
+            if let Some(runtime) = entry.runtime() {
+                let supervisor = runtime.supervisor.clone();
+                tokio::spawn(async move {
+                    let _ = supervisor.continue_restored().await;
+                });
+            }
+        }
         Ok(Self::runtime_identity(&entry))
     }
 
@@ -647,8 +978,28 @@ impl Application {
             auth_resolver: snapshot.auth_resolver,
         };
         let max_concurrency = self.runtime_settings().orchestration_max_concurrency;
+        let isolation = self.runtime_settings().orchestration_isolation;
+        let managed_root = managed_root.into();
+        // Isolation backend selection (`settings.orchestration.isolation`):
+        // git worktree (default), overlayfs (source repo as the read-only
+        // lower layer), or none (workflows operate directly on the source
+        // working tree).
+        let worktrees: Arc<dyn WorkflowIsolation> = match isolation {
+            crate::WorkflowIsolationSetting::Worktree => {
+                Arc::new(WorkflowWorktreeManager::new(source_cwd.clone()))
+            }
+            crate::WorkflowIsolationSetting::Overlayfs => Arc::new(
+                crate::workflow_worktree::OverlayWorkflowManager::new(
+                    source_cwd.clone(),
+                    managed_root.clone(),
+                ),
+            ),
+            crate::WorkflowIsolationSetting::None => Arc::new(
+                crate::workflow_worktree::NoopWorkflowIsolation::new(source_cwd.clone()),
+            ),
+        };
         let factory = Arc::new(ApplicationWorkflowRuntimeFactory::new(
-            WorkflowWorktreeManager::new(source_cwd),
+            worktrees,
             managed_root,
             runtime_factory,
             session_options,
@@ -661,6 +1012,44 @@ impl Application {
         *self.inner.workflow_runtime_factory.lock() = Some(Arc::downgrade(&factory));
         manager.restore_all().await?;
         Ok(factory)
+    }
+
+    /// Rebind the canonical workflow manager + worktree roots to a new
+    /// session identity. Shuts down the current manager and runtime factory
+    /// (cancelling/cleaning every live child runtime), then re-runs
+    /// [`Self::setup_workflows`] against the given roots.
+    ///
+    /// Session-scoped isolation: `new_session`/`switch`/`fork` change the
+    /// session id, and the workflow store + managed worktrees are namespaced
+    /// by that id — a fresh session must start with an empty workflow list
+    /// while a resumed session (same id) restores its own workflows. Call
+    /// this after the session cutover commits with roots computed from the
+    /// NEW session id (see `workflow_storage_roots` in pi-cli).
+    pub async fn rebind_workflows(
+        &self,
+        store_root: impl Into<PathBuf>,
+        managed_root: impl Into<PathBuf>,
+    ) -> Result<Arc<ApplicationWorkflowRuntimeFactory>> {
+        // Teardown mirrors `Application::cleanup`: abort the manager event
+        // forwarder first, then shut down every live child runtime through
+        // the factory, then drop the manager so a rebind never restores the
+        // old session's workflows or leaks its runtimes.
+        if let Some(task) = self.inner.workflow_events.lock().take() {
+            task.abort();
+        }
+        let workflow_factory = self
+            .inner
+            .workflow_runtime_factory
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(factory) = workflow_factory {
+            factory.shutdown_all().await;
+        }
+        *self.inner.workflow_runtime_factory.lock() = None;
+        *self.inner.workflow_manager.lock() = None;
+        let source_cwd = self.runtime().session().cwd().to_path_buf();
+        self.setup_workflows(source_cwd, store_root, managed_root).await
     }
 
     pub fn attach_workflow_manager(&self, manager: crate::WorkflowManager) -> Result<()> {
@@ -811,5 +1200,117 @@ impl Application {
         generation: u64,
     ) -> Result<crate::WorkflowSnapshot> {
         self.workflow_manager()?.remove(workflow_id, generation).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pi_agent::AgentToolResult;
+    use serde_json::json;
+
+    fn tool_start(tool_call_id: &str, tool_name: &str, arguments: Value) -> ApplicationEvent {
+        ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            arguments,
+        })
+    }
+
+    fn tool_end(tool_call_id: &str, tool_name: &str, is_error: bool) -> ApplicationEvent {
+        ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            result: AgentToolResult::default(),
+            is_error,
+        })
+    }
+
+    /// The delta text of a tool-start event, panicking unless it is one.
+    fn tool_delta(event: &ApplicationEvent) -> String {
+        match ApplicationWorkflowRuntimeFactory::supervisor_activity_delta(event) {
+            Some((crate::WorkflowSupervisorActivityKind::Tool, text)) => text,
+            other => panic!("expected a tool delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bash_tool_start_records_bounded_command_summary() {
+        // A short command is shown verbatim after the leading `$`.
+        let short = tool_start("call-1", "bash", json!({ "command": "$cargo build --release" }));
+        assert_eq!(tool_delta(&short), "bash · cargo build --release");
+
+        // A long command is cut to the first ~40 chars with an ellipsis.
+        let long = tool_start(
+            "call-2",
+            "bash",
+            json!({ "command": "$cargo +1.88.0 test -p pi-coding --lib --quiet && cargo +1.88.0 test -p pi-cli --lib --quiet && git diff --check" }),
+        );
+        assert_eq!(tool_delta(&long), "bash · cargo +1.88.0 test -p pi-coding --lib...");
+    }
+
+    #[test]
+    fn tool_start_summary_redacts_secrets_and_strips_control() {
+        // Credential-shaped content is redacted before it reaches the page.
+        let token = ["s", "k-", "abc1234567890def"].concat();
+        let secret = tool_start(
+            "call-1",
+            "bash",
+            json!({ "command": format!("$curl -H 'Authorization: Bearer {token}' https://api.example.com") }),
+        );
+        let summary = tool_delta(&secret);
+        assert!(summary.contains("[REDACTED]"), "secret must be redacted: {summary}");
+        assert!(!summary.contains(token.as_str()), "token must not leak: {summary}");
+
+        // Control characters are blanked so the row stays on one line.
+        let control = tool_start("call-2", "bash", json!({ "command": "$printf 'a\\nb'" }));
+        let summary = tool_delta(&control);
+        assert!(!summary.contains('\n'), "control chars must not reach the feed: {summary:?}");
+        assert!(summary.contains(' '), "control chars must be blanked: {summary:?}");
+    }
+
+    #[test]
+    fn tool_start_summary_read_path_and_todo_op() {
+        let read = tool_start("call-1", "read", json!({ "path": "crates/pi-cli/src/workflow_panel.rs" }));
+        assert_eq!(tool_delta(&read), "read · crates/pi-cli/src/workflow_panel.rs");
+
+        let write = tool_start("call-2", "write", json!({ "path": "src/lib.rs" }));
+        assert_eq!(tool_delta(&write), "write · src/lib.rs");
+
+        let todo = tool_start("call-3", "todo", json!({ "op": "add", "task": "design-id" }));
+        assert_eq!(tool_delta(&todo), "todo · add");
+
+        let goal = tool_start("call-4", "goal", json!({ "op": "extend" }));
+        assert_eq!(tool_delta(&goal), "goal · extend");
+
+        // Tools without a user-visible argument fragment keep the plain name.
+        let generic = tool_start("call-5", "web_search", json!({ "query": "rust" }));
+        assert_eq!(tool_delta(&generic), "web_search");
+    }
+
+    #[test]
+    fn tool_end_pairs_start_summary_with_ok_err_outcome() {
+        let mut pending = HashMap::new();
+        pending.insert("call-1".to_owned(), "bash · cargo build --release".to_owned());
+
+        let ok = tool_end("call-1", "bash", false);
+        assert_eq!(
+            ApplicationWorkflowRuntimeFactory::supervisor_tool_end_activity(&ok, &mut pending).as_deref(),
+            Some("bash · cargo build --release · ok"),
+        );
+        assert!(pending.is_empty(), "paired end must remove the start");
+
+        // Errors are marked, and unpaired ends yield nothing.
+        pending.insert("call-2".to_owned(), "read · src/lib.rs".to_owned());
+        let err = tool_end("call-2", "read", true);
+        assert_eq!(
+            ApplicationWorkflowRuntimeFactory::supervisor_tool_end_activity(&err, &mut pending).as_deref(),
+            Some("read · src/lib.rs · err"),
+        );
+        let orphan = tool_end("call-3", "bash", false);
+        assert_eq!(
+            ApplicationWorkflowRuntimeFactory::supervisor_tool_end_activity(&orphan, &mut pending),
+            None,
+        );
     }
 }

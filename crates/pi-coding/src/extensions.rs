@@ -15,17 +15,24 @@ use parking_lot::Mutex;
 use pi_agent::{
     AbortSignal, AgentTool, AgentToolResult, ThinkingLevel, ToolCapability, ToolExecutionMode,
 };
-use pi_ai::{ContentBlock, CustomMessageContent, Message, Model, Schema};
+use pi_ai::{
+    ApiProvider, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
+    ContentBlock, Context, CustomMessageContent, Message, Model, Schema, SimpleStreamFn,
+    SimpleStreamOptions, StopReason, StreamFn, StreamOptions, ToolCall,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{Child, ChildStdin, ChildStdout},
     sync::{Mutex as AsyncMutex, OwnedMutexGuard, broadcast, mpsc},
     task::JoinHandle,
     time::{sleep, timeout},
 };
 use uuid::Uuid;
+
+use crate::quickjs_host::QuickJsExtensionHost;
 
 pub const EXTENSION_PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_MAX_EXTENSION_FRAME_BYTES: usize = 1024 * 1024;
@@ -43,19 +50,27 @@ pub enum ExtensionCapability {
     EventHooks,
     MessageRenderers,
     ProviderMetadata,
+    Provider,
     SessionActions,
     Ui,
+    /// Overlay registration (`pi.registerOverlay`): the extension supplies a
+    /// render function whose returned content rows the host displays inside
+    /// its own bordered overlay panel. Content only — the host draws the
+    /// border and owns focus/key routing.
+    Overlays,
 }
 
 impl ExtensionCapability {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Commands,
         Self::Tools,
         Self::EventHooks,
         Self::MessageRenderers,
         Self::ProviderMetadata,
+        Self::Provider,
         Self::SessionActions,
         Self::Ui,
+        Self::Overlays,
     ];
 }
 
@@ -76,10 +91,14 @@ pub enum ExtensionUiCapability {
     HiddenThinking,
     Theme,
     ToolsExpanded,
+    /// `ctx.overlay.open` / `ctx.overlay.setRows`: opening an extension
+    /// overlay from an event handler and pushing dynamic content rows into
+    /// the currently displayed panel.
+    Overlay,
 }
 
 impl ExtensionUiCapability {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Select,
         Self::Confirm,
         Self::Input,
@@ -94,6 +113,7 @@ impl ExtensionUiCapability {
         Self::HiddenThinking,
         Self::Theme,
         Self::ToolsExpanded,
+        Self::Overlay,
     ];
 }
 
@@ -184,13 +204,12 @@ impl ExtensionPermissionSet {
 
 pub const PROCESS_EXTENSION_MANIFEST_VERSION: u32 = 1;
 pub const PROCESS_EXTENSION_MANIFEST_FILE: &str = "pi-extension.json";
-const BUN_EXTENSION_HOST_SOURCE: &str = include_str!("bun_extension_host.mjs");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ManifestRuntimeTag {
     Process,
-    Bun,
+    QuickJs,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,7 +218,7 @@ pub enum ExtensionManifestRuntime {
         executable: PathBuf,
         arguments: Vec<String>,
     },
-    Bun {
+    QuickJs {
         entry: PathBuf,
     },
 }
@@ -208,6 +227,9 @@ pub enum ExtensionManifestRuntime {
 pub struct ProcessExtensionManifest {
     pub schema_version: u32,
     pub id: String,
+    /// Package version consumed by the plugin marketplace (`rpi plugin`).
+    /// Optional so pre-marketplace manifests keep loading unchanged.
+    pub version: Option<String>,
     pub runtime: ExtensionManifestRuntime,
     pub capabilities: BTreeSet<ExtensionCapability>,
     pub ui_capabilities: BTreeSet<ExtensionUiCapability>,
@@ -219,6 +241,8 @@ struct ProcessExtensionManifestWire {
     #[serde(rename = "schemaVersion")]
     schema_version: u32,
     id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime: Option<ManifestRuntimeTag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,26 +280,27 @@ impl<'de> Deserialize<'de> for ProcessExtensionManifest {
                     arguments: wire.arguments,
                 }
             }
-            ManifestRuntimeTag::Bun => {
+            ManifestRuntimeTag::QuickJs => {
                 if wire.executable.is_some() {
                     return Err(serde::de::Error::custom(
-                        "Bun extension manifest must not set executable",
+                        "QuickJS extension manifest must not set executable",
                     ));
                 }
                 if !wire.arguments.is_empty() {
                     return Err(serde::de::Error::custom(
-                        "Bun extension manifest does not support arguments",
+                        "QuickJS extension manifest does not support arguments",
                     ));
                 }
                 let entry = wire.entry.ok_or_else(|| {
-                    serde::de::Error::custom("Bun extension manifest requires entry")
+                    serde::de::Error::custom("QuickJS extension manifest requires entry")
                 })?;
-                ExtensionManifestRuntime::Bun { entry }
+                ExtensionManifestRuntime::QuickJs { entry }
             }
         };
         Ok(Self {
             schema_version: wire.schema_version,
             id: wire.id,
+            version: wire.version,
             runtime,
             capabilities: wire.capabilities,
             ui_capabilities: wire.ui_capabilities,
@@ -298,8 +323,8 @@ impl Serialize for ProcessExtensionManifest {
                 None,
                 arguments.clone(),
             ),
-            ExtensionManifestRuntime::Bun { entry } => (
-                ManifestRuntimeTag::Bun,
+            ExtensionManifestRuntime::QuickJs { entry } => (
+                ManifestRuntimeTag::QuickJs,
                 None,
                 Some(entry.clone()),
                 Vec::new(),
@@ -308,6 +333,7 @@ impl Serialize for ProcessExtensionManifest {
         ProcessExtensionManifestWire {
             schema_version: self.schema_version,
             id: self.id.clone(),
+            version: self.version.clone(),
             runtime: Some(runtime),
             executable,
             entry,
@@ -320,7 +346,11 @@ impl Serialize for ProcessExtensionManifest {
 }
 
 impl ProcessExtensionManifest {
-    fn validate(&self, manifest_path: &Path) -> Result<()> {
+    /// Validate the manifest schema (version, id, version text, runtime path
+    /// shape, capability coherence). Public so marketplace tooling
+    /// (`rpi plugin`) can validate a staged package without resolving the
+    /// runtime path.
+    pub fn validate(&self, manifest_path: &Path) -> Result<()> {
         if self.schema_version != PROCESS_EXTENSION_MANIFEST_VERSION {
             bail!(
                 "unsupported process extension manifest version {} in {}; expected {}",
@@ -330,9 +360,12 @@ impl ProcessExtensionManifest {
             );
         }
         validate_identifier(&self.id, "process extension manifest id")?;
+        if let Some(version) = &self.version {
+            validate_text(version, "process extension manifest version", 128)?;
+        }
         let configured_path = match &self.runtime {
             ExtensionManifestRuntime::Process { executable, .. } => executable,
-            ExtensionManifestRuntime::Bun { entry } => entry,
+            ExtensionManifestRuntime::QuickJs { entry } => entry,
         };
         if configured_path.as_os_str().is_empty() {
             bail!(
@@ -348,18 +381,18 @@ impl ProcessExtensionManifest {
                 manifest_path.display()
             );
         }
-        if matches!(self.runtime, ExtensionManifestRuntime::Bun { .. }) {
+        if matches!(self.runtime, ExtensionManifestRuntime::QuickJs { .. }) {
             if self
                 .capabilities
                 .contains(&ExtensionCapability::MessageRenderers)
             {
-                bail!("Bun extensions do not support the message_renderers capability");
+                bail!("QuickJS extensions do not support the message_renderers capability");
             }
             if self
                 .capabilities
                 .contains(&ExtensionCapability::ProviderMetadata)
             {
-                bail!("Bun extensions do not support the provider_metadata capability");
+                bail!("QuickJS extensions do not support the provider_metadata capability");
             }
         }
         Ok(())
@@ -418,11 +451,11 @@ pub fn extension_spec_from_package_resource(
             },
             arguments,
         ),
-        ExtensionManifestRuntime::Bun { entry } => {
-            validate_bun_entry_extension(&entry)?;
+        ExtensionManifestRuntime::QuickJs { entry } => {
+            validate_quickjs_entry_extension(&entry)?;
             (
-                ExtensionSpecRuntime::Bun {
-                    entry: resolve_manifest_path(root, &entry, "Bun extension entry")?,
+                ExtensionSpecRuntime::QuickJs {
+                    entry: resolve_manifest_path(root, &entry, "QuickJS extension entry")?,
                 },
                 Vec::new(),
             )
@@ -449,13 +482,15 @@ pub fn extension_spec_from_package_resource(
         .insert("PI_EXTENSION_PACKAGE_ID".to_owned(), resource.package_id.clone());
     Ok(spec)
 }
-fn validate_bun_entry_extension(entry: &Path) -> Result<()> {
+fn validate_quickjs_entry_extension(entry: &Path) -> Result<()> {
     let supported = entry
         .extension()
         .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|extension| matches!(extension, "ts" | "js" | "mjs" | "cjs"));
+        .is_some_and(|extension| matches!(extension, "js" | "mjs"));
     if !supported {
-        bail!("Bun extension entry must end in .ts, .js, .mjs, or .cjs");
+        bail!(
+            "QuickJS extension entry must end in .js or .mjs; TypeScript is not supported by the in-process QuickJS runtime"
+        );
     }
     Ok(())
 }
@@ -513,14 +548,14 @@ pub enum ExtensionOrigin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtensionSpecRuntime {
     Process { executable: PathBuf },
-    Bun { entry: PathBuf },
+    QuickJs { entry: PathBuf },
 }
 
 impl ExtensionSpecRuntime {
     fn path(&self) -> &Path {
         match self {
             Self::Process { executable } => executable,
-            Self::Bun { entry } => entry,
+            Self::QuickJs { entry } => entry,
         }
     }
 }
@@ -583,7 +618,7 @@ impl ExtensionSpec {
         }
     }
 
-    fn validate_before_launch(&self) -> Result<()> {
+    pub(crate) fn validate_before_launch(&self) -> Result<()> {
         validate_identifier(&self.id, "extension id")?;
         if self.origin == ExtensionOrigin::Project && !self.project_trusted {
             bail!("refusing to execute untrusted project extension {}", self.id);
@@ -591,42 +626,34 @@ impl ExtensionSpec {
         if self.working_directory.as_os_str().is_empty() {
             bail!("extension {} has an empty working directory", self.id);
         }
-        if matches!(self.runtime, ExtensionSpecRuntime::Bun { .. }) {
+        if matches!(self.runtime, ExtensionSpecRuntime::QuickJs { .. }) {
             if self
                 .permissions
                 .capabilities
                 .contains(&ExtensionCapability::MessageRenderers)
             {
-                bail!("Bun extensions do not support the message_renderers capability");
+                bail!("QuickJS extensions do not support the message_renderers capability");
             }
             if self
                 .permissions
                 .capabilities
                 .contains(&ExtensionCapability::ProviderMetadata)
             {
-                bail!("Bun extensions do not support the provider_metadata capability");
+                bail!("QuickJS extensions do not support the provider_metadata capability");
             }
         }
-        if let ExtensionSpecRuntime::Bun { .. } = &self.runtime {
-            if let Some(configured) = self.environment.get("PI_BUN_EXECUTABLE")
-                && !Path::new(configured).is_file()
-            {
-                bail!("Bun runtime is unavailable; install Bun or set PI_BUN_EXECUTABLE");
-            }
-        }
-        const RESERVED_ENV: [&str; 7] = [
+        const RESERVED_ENV: [&str; 6] = [
             "PI_EXTENSION_PROTOCOL_VERSION",
             "PI_EXTENSION_ID",
             "PI_EXTENSION_ENTRY",
             "PI_EXTENSION_CAPABILITIES",
             "PI_EXTENSION_UI_CAPABILITIES",
             "PI_EXTENSION_MAX_FRAME_BYTES",
-            "PI_BUN_EXECUTABLE",
         ];
         if let Some(name) = self
             .environment
             .keys()
-            .find(|name| RESERVED_ENV.contains(&name.as_str()) && name.as_str() != "PI_BUN_EXECUTABLE")
+            .find(|name| RESERVED_ENV.contains(&name.as_str()))
         {
             bail!("extension {} cannot override reserved environment variable {name}", self.id);
         }
@@ -755,6 +782,24 @@ pub struct ExtensionProviderMetadata {
     #[serde(default)]
     pub metadata: Value,
 }
+
+/// A runtime provider registered through the load-phase `registerProvider`
+/// extension API. The `stream` callable itself stays JS-side (QuickJS) or
+/// process-side; the host only records the identity used for resolution and
+/// invocation routing: models whose `api` equals [`Self::api`] (which defaults
+/// to the provider `id`) are routed to the extension's stream.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionProviderDescriptor {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub api: String,
+    /// Optional provider feature flags (validated identifiers; informational —
+    /// the host does not interpret them yet).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtensionFlagType {
@@ -781,6 +826,158 @@ pub struct ExtensionFlagDescriptor {
     pub default: Option<Value>,
 }
 
+/// An overlay registered through the load-phase `registerOverlay` extension
+/// API. The `render` callable itself stays JS-side (QuickJS) or process-side;
+/// the host records the identity used for `/overlay <id>` resolution and
+/// render invocation routing, plus the static editor declaration for
+/// interactive overlays.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionOverlayDescriptor {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<OverlayInputDeclaration>,
+}
+
+/// Hard cap on the number of content rows one overlay may render (render
+/// function output or `ctx.overlay.setRows` payloads). Excess rows are
+/// dropped deterministically.
+pub const OVERLAY_MAX_ROWS: usize = 100;
+/// Hard cap on the length (in characters) of one overlay content row, applied
+/// after secret redaction. Longer rows are truncated deterministically.
+pub const OVERLAY_MAX_ROW_CHARS: usize = 200;
+/// Style names accepted by overlay content rows. Anything else is dropped
+/// (the row still renders with the default text style). Kept in sync with the
+/// TUI renderer's style mapping.
+pub const OVERLAY_STYLES: [&str; 8] = [
+    "default", "bold", "dim", "italic", "accent", "error", "success", "warning",
+];
+
+/// One content row of an extension overlay: either plain text or a simple
+/// `{ text, style? }` object. The host draws the border and routes keys; the
+/// extension supplies content only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OverlayRow {
+    Plain(String),
+    Styled {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<String>,
+    },
+}
+
+impl OverlayRow {
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Plain(text) | Self::Styled { text, .. } => text,
+        }
+    }
+}
+
+/// Enforce the overlay content contract on `rows`: at most [`OVERLAY_MAX_ROWS`]
+/// rows, each row's text redacted (via [`crate::redact::redact_secrets`]) and
+/// truncated to [`OVERLAY_MAX_ROW_CHARS`] characters, and only known styles
+/// retained. Applied at every boundary where extension-supplied rows become
+/// displayable: the render-invocation path and the `ctx.overlay.setRows` UI
+/// request path.
+#[must_use]
+pub fn sanitize_overlay_rows(rows: Vec<OverlayRow>) -> Vec<OverlayRow> {
+    rows.into_iter()
+        .take(OVERLAY_MAX_ROWS)
+        .map(|row| match row {
+            OverlayRow::Plain(text) => OverlayRow::Plain(bound_overlay_text(&text)),
+            OverlayRow::Styled { text, style } => OverlayRow::Styled {
+                text: bound_overlay_text(&text),
+                style: style.filter(|style| OVERLAY_STYLES.contains(&style.as_str())),
+            },
+        })
+        .collect()
+}
+
+fn bound_overlay_text(text: &str) -> String {
+    let redacted = crate::redact::redact_secrets(text);
+    redacted.chars().take(OVERLAY_MAX_ROW_CHARS).collect()
+}
+
+/// Static editor declaration of an interactive extension overlay, given at
+/// registration time (`pi.registerOverlay({ ..., input: { placeholder,
+/// multiline } })`). The host owns the editor and cursor (like the composer
+/// editor); the extension only declares the placeholder and whether the
+/// editor accepts multiple lines. Initial draft text is NOT declared here —
+/// it is the render result's open-time `input.value`, seeded once when the
+/// overlay opens and never re-applied while the overlay is open, so a
+/// streaming `setRows` update can never overwrite text the user is typing.
+/// `onSubmit(text)` / `onKey(action)` are the registration-time callbacks
+/// the host invokes for editor submits and for keys the editor does not
+/// consume.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayInputDeclaration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub multiline: bool,
+}
+
+/// Open-time initial draft of an interactive overlay, returned by the
+/// overlay's `render(ctx)` function as part of [`OverlayRenderOutput`]. The
+/// host seeds the editor ONCE when the overlay opens; subsequent `setRows`
+/// updates replace rows only and never touch the draft or cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayRenderInput {
+    #[serde(default)]
+    pub value: String,
+}
+
+/// The full result of one overlay `render(ctx)` invocation: content rows plus
+/// an optional open-time initial draft. A bare rows array (the original
+/// contract) is accepted as `{ rows, input: None }`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayRenderOutput {
+    #[serde(default)]
+    pub rows: Vec<OverlayRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<OverlayRenderInput>,
+}
+
+/// Limited action ids delivered to an overlay's `onKey(action)` callback for
+/// keys the host-owned editor does not consume. Deliberately NOT raw terminal
+/// key events: the sandbox boundary stays declarative, so extensions can
+/// react (re-render rows, toggle tool mode, abort streaming) without touching
+/// the terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayKeyAction {
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Submit,
+    Abort,
+    ToggleMode,
+}
+
+/// An interactive overlay event dispatched back to the extension:
+/// `Submit { text }` runs the registration-time `onSubmit(text, ctx)`,
+/// `Key { action }` runs `onKey(action, ctx)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum OverlayEvent {
+    Submit {
+        text: String,
+    },
+    Key {
+        action: OverlayKeyAction,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum ExtensionRegistration {
@@ -799,11 +996,22 @@ pub enum ExtensionRegistration {
     ProviderMetadata {
         provider: ExtensionProviderMetadata,
     },
+    /// Runtime provider registration (`pi.registerProvider`): models whose
+    /// `api` matches the provider's api route to the extension's JS stream.
+    Provider {
+        provider: ExtensionProviderDescriptor,
+    },
     Shortcut {
         shortcut: ExtensionShortcutDescriptor,
     },
     Flag {
         flag: ExtensionFlagDescriptor,
+    },
+    /// Overlay registration (`pi.registerOverlay`): the extension supplies a
+    /// render function (kept JS-side) that the host invokes to obtain the
+    /// content rows for the bordered overlay panel.
+    Overlay {
+        overlay: ExtensionOverlayDescriptor,
     },
 }
 
@@ -815,7 +1023,9 @@ impl ExtensionRegistration {
             Self::EventHook { .. } => ExtensionCapability::EventHooks,
             Self::MessageRenderer { .. } => ExtensionCapability::MessageRenderers,
             Self::ProviderMetadata { .. } => ExtensionCapability::ProviderMetadata,
+            Self::Provider { .. } => ExtensionCapability::Provider,
             Self::Shortcut { .. } | Self::Flag { .. } => ExtensionCapability::Commands,
+            Self::Overlay { .. } => ExtensionCapability::Overlays,
         }
     }
 }
@@ -877,11 +1087,38 @@ pub enum ExtensionInvocation {
     Event {
         event: ExtensionEvent,
     },
+    /// A provider stream call (`pi.registerProvider`): runs the registered JS
+    /// stream function with `(session_id, messages, options)` and forwards the
+    /// yielded events to the host as `ExtensionFrame::Update` frames.
+    Provider {
+        provider_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default)]
+        messages: Vec<Message>,
+        #[serde(default)]
+        options: Value,
+    },
     RenderMessage {
         request: MessageRenderRequest,
     },
     Shortcut {
         key: String,
+    },
+    /// Render one registered overlay: the extension's JS `render(ctx)`
+    /// function runs and returns the content rows (and an optional
+    /// declarative input section); the host sanitizes the rows (bounds +
+    /// redaction) before they become displayable.
+    OverlayRender {
+        id: String,
+    },
+    /// Deliver an interactive overlay event back to the extension: runs the
+    /// registration-time `onSubmit(text, ctx)` / `onKey(action, ctx)`
+    /// callback. The host owns the editor, so only sanitized text and the
+    /// limited action ids cross the boundary.
+    OverlayEvent {
+        id: String,
+        event: OverlayEvent,
     },
 }
 
@@ -1000,6 +1237,30 @@ pub enum ExtensionUiRequest {
     SetToolsExpanded {
         expanded: bool,
     },
+    /// `ctx.overlay.setRows(id, rows)`: push dynamic content rows into the
+    /// overlay with `id`. The rows are sanitized (bounds + redaction) before
+    /// they become displayable; the overlay does not need to be open.
+    OverlaySetRows {
+        id: String,
+        rows: Vec<OverlayRow>,
+    },
+    /// `ctx.overlay.open(id, { nonCapturing? })`: open the overlay with `id`
+    /// (auto-open from an event handler). The host renders the overlay's
+    /// current rows inside its bordered panel; an unknown id fails
+    /// actionably. `title` and `input` are filled in by the runtime from the
+    /// registered descriptor before the request reaches the UI host.
+    /// `nonCapturing` opens the overlay unfocused (drawn but not capturing
+    /// keys); the focus-toggle action (default Alt+/) then flips focus
+    /// between the overlay and the composer.
+    OverlayOpen {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default)]
+        non_capturing: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<OverlayInputDeclaration>,
+    },
 }
 
 impl ExtensionUiRequest {
@@ -1027,6 +1288,9 @@ impl ExtensionUiRequest {
             }
             Self::GetToolsExpanded { .. } | Self::SetToolsExpanded { .. } => {
                 ExtensionUiCapability::ToolsExpanded
+            }
+            Self::OverlaySetRows { .. } | Self::OverlayOpen { .. } => {
+                ExtensionUiCapability::Overlay
             }
         }
     }
@@ -1078,6 +1342,8 @@ pub enum ExtensionUiResponse {
     ToolsExpanded {
         expanded: bool,
     },
+    /// `ctx.overlay.open(id)` succeeded: the host opened the overlay panel.
+    OverlayOpened,
 }
 
 impl ExtensionUiResponse {
@@ -1119,6 +1385,12 @@ impl ExtensionUiResponse {
             ) | (
                 ExtensionUiRequest::SetTheme { .. },
                 Self::ThemeSet { .. }
+            ) | (
+                ExtensionUiRequest::OverlaySetRows { .. },
+                Self::Acknowledged
+            ) | (
+                ExtensionUiRequest::OverlayOpen { .. },
+                Self::OverlayOpened
             ) | (
                 ExtensionUiRequest::Notify { .. }
                     | ExtensionUiRequest::Status { .. }
@@ -1294,13 +1566,13 @@ pub enum ProtocolResult {
 }
 
 impl ProtocolResult {
-    fn success(value: impl Into<Value>) -> Self {
+    pub(crate) fn success(value: impl Into<Value>) -> Self {
         Self::Success {
             value: value.into(),
         }
     }
 
-    fn failure(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn failure(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Failure {
             error: ProtocolError {
                 code: code.into(),
@@ -1354,6 +1626,11 @@ pub enum ExtensionFrame {
     Register {
         registration: ExtensionRegistration,
     },
+    /// Load-phase unregistration (`pi.unregisterProvider`): removes a provider
+    /// registered earlier in the same load phase. Any other phase rejects it.
+    UnregisterProvider {
+        id: String,
+    },
     Response {
         id: String,
         result: ProtocolResult,
@@ -1371,10 +1648,17 @@ pub enum ExtensionFrame {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ExtensionLaunch {
     pub spec: ExtensionSpec,
     pub max_frame_bytes: usize,
+    /// Runtime-wide timeouts; hosts that own their own event loop (e.g. the
+    /// in-process QuickJS runtime) use these to bound load and invocation work.
+    pub timeouts: ExtensionRuntimeOptions,
+    /// Live `settings.sandbox` resolver for process-extension spawns; `None`
+    /// runs the extension child unsandboxed. QuickJS in-process extensions
+    /// ignore this (they share the host process by design).
+    pub sandbox: Option<crate::SandboxConfigFn>,
 }
 
 pub trait ExtensionTransport: Send + Sync {
@@ -1391,35 +1675,6 @@ pub trait ExtensionHost: Send + Sync {
     ) -> ExtensionFuture<'_, Result<Arc<dyn ExtensionTransport>>>;
 }
 
-fn resolve_bun_executable(spec: &ExtensionSpec) -> Option<PathBuf> {
-    if let Some(configured) = spec.environment.get("PI_BUN_EXECUTABLE") {
-        let configured = PathBuf::from(configured);
-        return configured.is_file().then_some(configured);
-    }
-    if let Some(configured) = std::env::var_os("PI_BUN_EXECUTABLE") {
-        let configured = PathBuf::from(configured);
-        return configured.is_file().then_some(configured);
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join(if cfg!(windows) { "bun.exe" } else { "bun" }))
-        .find(|candidate| candidate.is_file())
-}
-
-fn write_bun_bridge() -> Result<(PathBuf, PathBuf)> {
-    let directory = std::env::temp_dir().join(format!(
-        "rpi-extension-host-v1-{}",
-        Uuid::new_v4()
-    ));
-    std::fs::create_dir(&directory)
-        .context("preparing bundled Bun extension host directory")?;
-    let path = directory.join("host.mjs");
-    if let Err(error) = std::fs::write(&path, BUN_EXTENSION_HOST_SOURCE) {
-        let _ = std::fs::remove_dir_all(&directory);
-        return Err(error).context("writing bundled Bun extension host");
-    }
-    Ok((path, directory))
-}
 #[derive(Clone, Debug, Default)]
 pub struct ProcessExtensionHost;
 
@@ -1431,90 +1686,77 @@ impl ExtensionHost for ProcessExtensionHost {
         Box::pin(async move {
             let spec = launch.spec;
             spec.validate_before_launch()?;
+            if matches!(spec.runtime, ExtensionSpecRuntime::QuickJs { .. }) {
+                let quickjs = QuickJsExtensionHost;
+                return quickjs
+                    .launch(ExtensionLaunch {
+                        spec,
+                        max_frame_bytes: launch.max_frame_bytes,
+                        timeouts: launch.timeouts,
+                        sandbox: launch.sandbox,
+                    })
+                    .await;
+            }
             let mut child_environment = spec.environment.clone();
-            child_environment.remove("PI_BUN_EXECUTABLE");
             let working_directory = spec
                 .working_directory
                 .canonicalize()
                 .with_context(|| format!("resolving working directory for extension {}", spec.id))?;
-            let (mut command, cleanup_directory) = match &spec.runtime {
-                ExtensionSpecRuntime::Process { executable } => {
-                    let executable = executable.canonicalize().with_context(|| {
-                        format!("resolving executable for extension {}", spec.id)
-                    })?;
-                    let metadata = executable.metadata().with_context(|| {
-                        format!("reading extension executable for {}", spec.id)
-                    })?;
-                    if !metadata.is_file() {
-                        bail!("extension executable is not a file");
-                    }
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if metadata.permissions().mode() & 0o111 == 0 {
-                            bail!("extension executable is not executable");
-                        }
-                    }
-                    let mut command = Command::new(executable);
-                    command.env_clear();
-                    command.args(&spec.arguments);
-                    (command, None)
-                }
-                ExtensionSpecRuntime::Bun { entry } => {
-                    validate_bun_entry_extension(entry)?;
-                    let entry = entry.canonicalize().context("resolving Bun extension entry")?;
-                    if !entry.starts_with(&working_directory) || !entry.is_file() {
-                        bail!("Bun extension entry must remain inside its working directory");
-                    }
-                    let bun = resolve_bun_executable(&spec).ok_or_else(|| {
-                        anyhow!(
-                            "Bun runtime is unavailable; install Bun or set PI_BUN_EXECUTABLE"
-                        )
-                    })?;
-                    let (bridge, directory) = write_bun_bridge()?;
-                    let mut command = Command::new(bun);
-                    command.env_clear();
-                    command
-                        .arg("run")
-                        .arg(&bridge)
-                        .env("PI_EXTENSION_ENTRY", &entry)
-                        .env(
-                            "PI_EXTENSION_CAPABILITIES",
-                            serde_json::to_string(&spec.permissions.capabilities)
-                                .context("encoding Bun extension capabilities")?,
-                        )
-                        .env(
-                            "PI_EXTENSION_UI_CAPABILITIES",
-                            serde_json::to_string(&spec.permissions.ui_capabilities)
-                                .context("encoding Bun extension UI capabilities")?,
-                        )
-                        .env(
-                            "PI_EXTENSION_MAX_FRAME_BYTES",
-                            launch.max_frame_bytes.max(1024).to_string(),
-                        );
-                    (command, Some(directory))
+            let executable = match &spec.runtime {
+                ExtensionSpecRuntime::Process { executable } => executable,
+                ExtensionSpecRuntime::QuickJs { .. } => {
+                    unreachable!("QuickJS runtimes dispatch to QuickJsExtensionHost before this match")
                 }
             };
-            command
-                .current_dir(&working_directory)
-                .envs(&child_environment)
-                .env(
-                    "PI_EXTENSION_PROTOCOL_VERSION",
-                    EXTENSION_PROTOCOL_VERSION.to_string(),
-                )
-                .env("PI_EXTENSION_ID", &spec.id)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
+            let executable = executable.canonicalize().with_context(|| {
+                format!("resolving executable for extension {}", spec.id)
+            })?;
+            let metadata = executable.metadata().with_context(|| {
+                format!("reading extension executable for {}", spec.id)
+            })?;
+            if !metadata.is_file() {
+                bail!("extension executable is not a file");
+            }
             #[cfg(unix)]
             {
-                use std::os::unix::process::CommandExt;
-                command.as_std_mut().process_group(0);
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    bail!("extension executable is not executable");
+                }
             }
-            let mut child = command
-                .spawn()
-                .with_context(|| format!("starting extension {}", spec.id))?;
+            // Route the spawn through the filesystem sandbox when
+            // `settings.sandbox.enabled` is set: the same allowed/denied path
+            // semantics as the bash tool, with the extension's own working
+            // directory and the agent directory always visible. Fail-closed
+            // validation surfaces an actionable error before the child starts
+            // (e.g. the working directory inside a denied path).
+            let mut argv = Vec::with_capacity(1 + spec.arguments.len());
+            argv.push(executable.to_string_lossy().into_owned());
+            argv.extend(spec.arguments.iter().cloned());
+            let mut sandbox_config = launch
+                .sandbox
+                .as_ref()
+                .and_then(|resolve| resolve())
+                .filter(|config| config.enabled);
+            if let Some(config) = &mut sandbox_config {
+                for path in [working_directory.clone(), crate::agent_dir_path()] {
+                    if !config.allowed_paths.iter().any(|allowed| allowed == &path) {
+                        config.allowed_paths.push(path);
+                    }
+                }
+            }
+            child_environment.insert(
+                "PI_EXTENSION_PROTOCOL_VERSION".to_owned(),
+                EXTENSION_PROTOCOL_VERSION.to_string(),
+            );
+            child_environment.insert("PI_EXTENSION_ID".to_owned(), spec.id.clone());
+            let mut child = crate::sandbox::spawn_piped(
+                sandbox_config.as_ref(),
+                &working_directory,
+                &argv,
+                child_environment,
+            )
+            .with_context(|| format!("starting extension {}", spec.id))?;
             let stdin = child
                 .stdin
                 .take()
@@ -1536,7 +1778,7 @@ impl ExtensionHost for ProcessExtensionHost {
                 stderr_tail,
                 stderr_task: Mutex::new(Some(stderr_task)),
                 max_frame_bytes: launch.max_frame_bytes.max(1024),
-                cleanup_directory,
+                cleanup_directory: None,
             }) as Arc<dyn ExtensionTransport>)
         })
     }
@@ -1925,21 +2167,16 @@ pub enum ExtensionInputReduction {
     Handled,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ExtensionResourcePaths {
-    pub skill_paths: Vec<String>,
-    pub prompt_paths: Vec<String>,
-    pub theme_paths: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExtensionProjectTrustDecision { Yes, No, Undecided }
-
+/// Recommendation collected from the `trust_decision` event.
+///
+/// Fail-open by contract: an extension may only recommend approval
+/// (`approve: true`), which the host applies via
+/// [`crate::trust::apply_trust_hook_outcomes`] — it upgrades an undecided
+/// (`ask`) tentative decision to trusted and is inert otherwise, so a stored
+/// denial is never weakened by an extension recommendation.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ExtensionProjectTrustReduction {
-    pub trusted: ExtensionProjectTrustDecision,
-    pub remember: bool,
+pub struct ExtensionTrustDecisionReduction {
+    pub approve: bool,
 }
 
 #[derive(Deserialize)]
@@ -2016,18 +2253,9 @@ enum InputWire {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ResourcesDiscoverWire {
-    #[serde(default)] skill_paths: Vec<String>,
-    #[serde(default)] prompt_paths: Vec<String>,
-    #[serde(default)] theme_paths: Vec<String>,
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProjectTrustWire {
-    trusted: ExtensionProjectTrustDecision,
-    #[serde(default)] remember: bool,
+struct TrustDecisionWire {
+    #[serde(default)] approve: bool,
 }
 
 #[derive(Clone)]
@@ -2043,6 +2271,17 @@ struct RuntimeInner {
     reload_lock: Arc<AsyncMutex<()>>,
     events: broadcast::Sender<ExtensionRuntimeEvent>,
     action_host: Arc<Mutex<Option<Arc<dyn ExtensionActionHost>>>>,
+    /// Stable per-runtime identity used to namespace this runtime's provider
+    /// registrations in the shared pi-ai registry. Concurrent runtimes
+    /// registering the same api never collide (each owns a distinct
+    /// namespace), and unregistration on shutdown/reload only ever removes
+    /// this runtime's entries.
+    provider_namespace: String,
+    /// Resolves the live `settings.sandbox` for process-extension spawns
+    /// (RELOAD semantics: consulted per launch). `None` means process
+    /// extensions run unsandboxed. QuickJS in-process extensions never go
+    /// through this path — they share the host process by design.
+    process_sandbox: Mutex<Option<crate::SandboxConfigFn>>,
 }
 
 struct RuntimeState {
@@ -2072,8 +2311,18 @@ impl ExtensionRuntime {
                 reload_lock: Arc::new(AsyncMutex::new(())),
                 events,
                 action_host: Arc::new(Mutex::new(None)),
+                provider_namespace: format!("extension-runtime:{}", Uuid::now_v7()),
+                process_sandbox: Mutex::new(None),
             }),
         }
+    }
+
+    /// The namespace this runtime owns in the shared pi-ai provider registry.
+    /// Unique per runtime instance: two runtimes registering the same api
+    /// coexist, and sessions scoped to this runtime resolve its entries.
+    #[must_use]
+    pub fn provider_namespace(&self) -> &str {
+        &self.inner.provider_namespace
     }
 
     pub fn set_action_host(&self, host: Arc<dyn ExtensionActionHost>) -> Result<()> {
@@ -2085,15 +2334,33 @@ impl ExtensionRuntime {
         Ok(())
     }
 
-    async fn context_snapshot(&self) -> Option<ExtensionContextSnapshot> {
-        let host = self.inner.action_host.lock().clone()?;
-        host.context_snapshot().await.ok()
+    /// Configures the live `settings.sandbox` resolver used for process
+    /// extension spawns. Consulted per launch, so a settings reload applies to
+    /// the next extension spawn. When set and resolving to an enabled config,
+    /// process extensions run inside the filesystem sandbox (same
+    /// allowed/denied semantics as the bash tool, plus the extension's own
+    /// working directory); when absent or disabled they run unsandboxed.
+    pub fn set_process_sandbox(&self, sandbox: Option<crate::SandboxConfigFn>) {
+        *self.inner.process_sandbox.lock() = sandbox;
     }
 
-    async fn invocation_context(&self) -> Option<ExtensionContextSnapshot> {
-        let mut context = self.context_snapshot().await?;
+    async fn context_snapshot(&self) -> Result<Option<ExtensionContextSnapshot>> {
+        let Some(host) = self.inner.action_host.lock().clone() else {
+            return Ok(None);
+        };
+        host.context_snapshot()
+            .await
+            .map(Some)
+            .context("capturing extension context snapshot from the action host")
+    }
+
+    async fn invocation_context(&self) -> Result<Option<ExtensionContextSnapshot>> {
+        let mut context = match self.context_snapshot().await? {
+            Some(context) => context,
+            None => return Ok(None),
+        };
         context.flag_values = BTreeMap::new();
-        Some(context)
+        Ok(Some(context))
     }
 
     fn action_host(&self) -> Option<Arc<dyn ExtensionActionHost>> {
@@ -2142,7 +2409,10 @@ impl ExtensionRuntime {
                 failures: vec![ExtensionLoadFailure {
                     extension_id: "runtime".to_owned(),
                     path: PathBuf::new(),
-                    message: error.to_string(),
+                    // Full chain: sandbox validation and spawn failures keep
+                    // their actionable inner messages (e.g. which path is
+                    // denied) instead of collapsing to the outer context.
+                    message: format!("{error:#}"),
                 }],
             },
         }
@@ -2175,7 +2445,9 @@ impl ExtensionRuntime {
                 match result {
                     Ok(instance) => staged_by_index[index] = Some(instance),
                     Err(error) => {
-                        let message = error.to_string();
+                        // Full chain: launch/sandbox failures surface their
+                        // actionable inner message (e.g. the denied path).
+                        let message = format!("{error:#}");
                         failures_by_index[index] = Some(ExtensionLoadFailure {
                             extension_id: extension_id.clone(),
                             path: path.clone(),
@@ -2287,6 +2559,9 @@ impl ExtensionRuntime {
             state.instances = candidate.staged.clone();
             state.registry = candidate.registry.clone();
         }
+        // Publish the committed provider surface into the shared pi-ai
+        // registry (drop entries of retired providers, (re)register the rest).
+        self.sync_provider_registrations(&candidate.registry);
         for instance in &candidate.staged {
             let _ = self.inner.events.send(ExtensionRuntimeEvent::Loaded {
                 instance: instance.id.clone(),
@@ -2312,12 +2587,15 @@ impl ExtensionRuntime {
             extension_id: spec.id.clone(),
             generation,
         };
+        let sandbox = self.inner.process_sandbox.lock().clone();
         let transport = self
             .inner
             .host
             .launch(ExtensionLaunch {
                 spec: spec.clone(),
                 max_frame_bytes: self.inner.options.max_frame_bytes,
+                timeouts: self.inner.options.clone(),
+                sandbox,
             })
             .await
             .with_context(|| format!("launching extension {}", spec.id))?;
@@ -2424,6 +2702,9 @@ impl ExtensionRuntime {
                     ExtensionFrame::Register { registration } => {
                         registrations.register(registration)?;
                     }
+                    ExtensionFrame::UnregisterProvider { id } => {
+                        registrations.unregister_provider(&id)?;
+                    }
                     ExtensionFrame::Response { id, result } if id == load_id => {
                         result.into_result()?;
                         return registrations.finish();
@@ -2524,6 +2805,64 @@ impl ExtensionRuntime {
             .collect()
     }
 
+    /// Providers registered through the load-phase `registerProvider` API.
+    /// Each resolves by its `api` (defaults to the provider `id`): a model
+    /// configured with `api: <id>` streams through the extension's JS stream.
+    #[must_use]
+    pub fn providers(&self) -> Vec<ExtensionProviderDescriptor> {
+        self.inner
+            .state
+            .lock()
+            .registry
+            .provider_streams
+            .values()
+            .map(|registered| registered.descriptor.clone())
+            .collect()
+    }
+
+    /// Run a registered extension provider's JS stream. Each event the JS
+    /// stream yields is delivered to `on_event` (as `ExtensionFrame::Update`
+    /// values, in order) before the final result resolves; an unresolved id
+    /// fails actionably.
+    pub async fn invoke_provider(
+        &self,
+        provider_id: &str,
+        session_id: Option<String>,
+        messages: Vec<Message>,
+        options: Value,
+        cancellation: Option<ExtensionCancellation>,
+        on_event: Option<UpdateHandler>,
+    ) -> Result<Value> {
+        let registered = self
+            .inner
+            .state
+            .lock()
+            .registry
+            .provider_streams
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown extension provider {provider_id:?}"))?;
+        registered
+            .instance
+            .request_value(
+                ExtensionHostRequest::Invoke {
+                    invocation: ExtensionInvocation::Provider {
+                        provider_id: provider_id.to_owned(),
+                        session_id,
+                        messages,
+                        options,
+                    },
+                    context: self.invocation_context().await?,
+                },
+                self.inner.options.invocation_timeout,
+                cancellation,
+                None,
+                on_event,
+            )
+            .await
+            .with_context(|| format!("running extension provider {provider_id}"))
+    }
+
     #[must_use]
     pub fn shortcuts(&self) -> Vec<ExtensionShortcutDescriptor> {
         self.inner
@@ -2546,6 +2885,159 @@ impl ExtensionRuntime {
             .values()
             .map(|registered| registered.descriptor.clone())
             .collect()
+    }
+
+    /// Overlays registered through the load-phase `registerOverlay` API.
+    #[must_use]
+    pub fn overlays(&self) -> Vec<ExtensionOverlayDescriptor> {
+        self.inner
+            .state
+            .lock()
+            .registry
+            .overlays
+            .values()
+            .map(|registered| registered.descriptor.clone())
+            .collect()
+    }
+
+    /// The owning extension instance of the overlay with `id`, used by the
+    /// TUI to correlate `ExtensionCleared` cleanup with open overlay panels.
+    #[must_use]
+    pub fn overlay_instance(&self, id: &str) -> Option<ExtensionInstanceId> {
+        self.inner
+            .state
+            .lock()
+            .registry
+            .overlays
+            .get(id)
+            .map(|registered| registered.instance.id.clone())
+    }
+
+    /// Run one registered overlay's JS `render(ctx)` function and return the
+    /// sanitized content rows plus the optional declarative input section
+    /// (bounds + redaction applied host-side to the rows). A bare rows array
+    /// (the original contract) is accepted as `{ rows, input: None }`. An
+    /// unknown id fails actionably.
+    pub async fn invoke_overlay_render(&self, id: &str) -> Result<OverlayRenderOutput> {
+        let registered = self
+            .inner
+            .state
+            .lock()
+            .registry
+            .overlays
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown extension overlay {id:?}"))?;
+        let value = registered
+            .instance
+            .request_value(
+                ExtensionHostRequest::Invoke {
+                    invocation: ExtensionInvocation::OverlayRender {
+                        id: id.to_owned(),
+                    },
+                    context: self.invocation_context().await?,
+                },
+                self.inner.options.invocation_timeout,
+                None,
+                None,
+                None,
+            )
+            .await
+            .with_context(|| format!("rendering extension overlay {id}"))?;
+        let output = if value.is_array() {
+            OverlayRenderOutput {
+                rows: serde_json::from_value(value)
+                    .with_context(|| format!("extension overlay {id} returned invalid rows"))?,
+                input: None,
+            }
+        } else {
+            serde_json::from_value(value)
+                .with_context(|| format!("extension overlay {id} returned invalid output"))?
+        };
+        Ok(OverlayRenderOutput {
+            rows: sanitize_overlay_rows(output.rows),
+            input: output.input,
+        })
+    }
+
+    /// Deliver an interactive overlay event to the extension's registration-time
+    /// `onSubmit(text, ctx)` / `onKey(action, ctx)` callback. The host owns the
+    /// editor and cursor; only the sanitized submitted text and the limited
+    /// action ids cross the boundary. An unknown id fails actionably; a
+    /// callback that rejects surfaces its exception.
+    pub async fn invoke_overlay_event(
+        &self,
+        id: &str,
+        event: OverlayEvent,
+    ) -> Result<serde_json::Value> {
+        let registered = self
+            .inner
+            .state
+            .lock()
+            .registry
+            .overlays
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown extension overlay {id:?}"))?;
+        registered
+            .instance
+            .request_value(
+                ExtensionHostRequest::Invoke {
+                    invocation: ExtensionInvocation::OverlayEvent {
+                        id: id.to_owned(),
+                        event,
+                    },
+                    context: self.invocation_context().await?,
+                },
+                self.inner.options.invocation_timeout,
+                None,
+                None,
+                None,
+            )
+            .await
+            .with_context(|| format!("dispatching overlay event to extension overlay {id}"))
+    }
+
+    /// Open the overlay with `id` through the host UI adapter (auto-open from
+    /// an event handler). The overlay must be registered and the host must
+    /// have an extension UI adapter; failures are actionable.
+    pub async fn open_overlay(&self, id: &str) -> Result<()> {
+        let registered = self
+            .inner
+            .state
+            .lock()
+            .registry
+            .overlays
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown extension overlay {id:?}"))?;
+        let instance = registered.instance;
+        let ui_host = instance
+            .ui
+            .clone()
+            .ok_or_else(|| anyhow!("the current host has no extension UI adapter"))?;
+        let response = ui_host
+            .request(
+                ExtensionUiContext {
+                    instance: instance.id.clone(),
+                    mode: instance.options.mode,
+                },
+                ExtensionUiRequest::OverlayOpen {
+                    id: id.to_owned(),
+                    title: Some(registered.descriptor.title.clone()),
+                    non_capturing: false,
+                    input: registered.descriptor.input.clone(),
+                },
+                ExtensionCancellation::new(),
+            )
+            .await?;
+        response.validate_for(&ExtensionUiRequest::OverlayOpen {
+            id: id.to_owned(),
+            title: None,
+            non_capturing: false,
+            input: None,
+        })?;
+        Ok(())
     }
 
     pub async fn invoke_command(
@@ -2572,7 +3064,7 @@ impl ExtensionRuntime {
                         name: name.to_owned(),
                         arguments,
                     },
-                    context: self.invocation_context().await,
+                    context: self.invocation_context().await?,
                 },
                 timeout_override.unwrap_or(self.inner.options.invocation_timeout),
                 cancellation,
@@ -2638,7 +3130,7 @@ impl ExtensionRuntime {
                         call_id,
                         arguments,
                     },
-                    context: self.invocation_context().await,
+                    context: self.invocation_context().await?,
                 },
                 self.inner.options.invocation_timeout,
                 None,
@@ -2677,7 +3169,7 @@ impl ExtensionRuntime {
             .request_value(
                 ExtensionHostRequest::Invoke {
                     invocation: ExtensionInvocation::RenderMessage { request },
-                    context: self.invocation_context().await,
+                    context: self.invocation_context().await?,
                 },
                 self.inner.options.invocation_timeout,
                 cancellation,
@@ -2695,7 +3187,7 @@ impl ExtensionRuntime {
         for instance in instances {
             let result = instance.request_value(ExtensionHostRequest::Invoke {
                 invocation: ExtensionInvocation::Event { event: ExtensionEvent::new(name, event_data(state)?) },
-                context: self.invocation_context().await,
+                context: self.invocation_context().await?,
             }, self.inner.options.hook_timeout, None, None, None).await
                 .with_context(|| format!("extension {} generation {} failed {name} hook", instance.id.extension_id, instance.id.generation))?;
             if !result.is_null() { apply(state, result).with_context(|| format!("extension {} generation {} returned invalid {name} hook result", instance.id.extension_id, instance.id.generation))?; }
@@ -2717,7 +3209,7 @@ impl ExtensionRuntime {
         for instance in instances {
             let result = instance.request_value(ExtensionHostRequest::Invoke {
                 invocation: ExtensionInvocation::Event { event: ExtensionEvent::new(name, event_data(state)?) },
-                context: self.invocation_context().await,
+                context: self.invocation_context().await?,
             }, self.inner.options.hook_timeout, None, None, None).await
                 .with_context(|| format!("extension {} generation {} failed {name} hook", instance.id.extension_id, instance.id.generation))?;
             if !result.is_null() && apply(state, result)
@@ -2872,15 +3364,25 @@ impl ExtensionRuntime {
         }).await?;
         Ok(reduction)
     }
-    pub async fn reduce_project_trust(&self, event: Value) -> Result<Option<ExtensionProjectTrustReduction>> {
-        let mut decision = None;
-        self.reduce_event_until("project_trust", &mut decision, |_| Ok(event.clone()), |decision, value| {
-            let wire: ProjectTrustWire = serde_json::from_value(value)?;
-            let decided = wire.trusted != ExtensionProjectTrustDecision::Undecided;
-            if decided { *decision = Some(ExtensionProjectTrustReduction { trusted: wire.trusted, remember: wire.remember }); }
-            Ok(decided)
+    /// Consult the `trust_decision` event: extensions observe the tentative
+    /// trust decision for a path (payload `{path, decision, isNew}`) and may
+    /// recommend approval (`{approve: true}`).
+    ///
+    /// Fail-open by contract: the event never carries a deny surface, and the
+    /// approval can only upgrade an undecided (`ask`) tentative decision —
+    /// the host applies it through [`crate::trust::apply_trust_hook_outcomes`]
+    /// so a stored denial is never weakened. Returns `None` when no extension
+    /// approved.
+    pub async fn reduce_trust_decision(&self, event: Value) -> Result<Option<ExtensionTrustDecisionReduction>> {
+        let mut reduction = None;
+        self.reduce_event("trust_decision", &mut reduction, |_| Ok(event.clone()), |reduction, value| {
+            let wire: TrustDecisionWire = serde_json::from_value(value)?;
+            if wire.approve {
+                *reduction = Some(ExtensionTrustDecisionReduction { approve: true });
+            }
+            Ok(())
         }).await?;
-        Ok(decision)
+        Ok(reduction)
     }
 
     pub async fn reduce_tool_result(&self, tool_call_id:&str, tool_name:&str, input:Value, content:Vec<ContentBlock>, details:Option<Value>, is_error:bool) -> Result<ExtensionToolResultReduction> {
@@ -2894,20 +3396,6 @@ impl ExtensionRuntime {
         self.reduce_event("message_end", &mut state, |v| Ok(serde_json::json!({"message":v})), |state,value| {if let Some(next)=serde_json::from_value::<MessageEndWire>(value)?.message{if std::mem::discriminant(&next)!=role{bail!("message_end replacement must preserve the original message role");}*state=next;}Ok(())}).await?;
         Ok(state)
     }
-
-
-    pub async fn reduce_resources_discover(&self, event: Value) -> Result<ExtensionResourcePaths> {
-        let mut paths = ExtensionResourcePaths::default();
-        self.reduce_event("resources_discover", &mut paths, |_| Ok(event.clone()), |paths, value| {
-            let wire: ResourcesDiscoverWire = serde_json::from_value(value)?;
-            paths.skill_paths.extend(wire.skill_paths);
-            paths.prompt_paths.extend(wire.prompt_paths);
-            paths.theme_paths.extend(wire.theme_paths);
-            Ok(())
-        }).await?;
-        Ok(paths)
-    }
-
 
     pub async fn emit_checked(&self, event: ExtensionEvent) -> Result<()> {
         for outcome in self.emit(event.clone()).await {
@@ -2940,13 +3428,33 @@ impl ExtensionRuntime {
             .unwrap_or_default();
         let mut outcomes = Vec::with_capacity(instances.len());
         for instance in instances {
+            let context = match self.invocation_context().await {
+                Ok(context) => context,
+                Err(error) => {
+                    // A real host context error is an explicit per-hook
+                    // failure, never a silent None context.
+                    let _ = self
+                        .inner
+                        .events
+                        .send(ExtensionRuntimeEvent::InvocationFailed {
+                            instance: instance.id.clone(),
+                            operation: format!("event:{}", event.name),
+                            message: error.to_string(),
+                        });
+                    outcomes.push(ExtensionHookOutcome {
+                        instance: instance.id.clone(),
+                        result: Err(error.to_string()),
+                    });
+                    continue;
+                }
+            };
             let result = instance
                 .request_value(
                     ExtensionHostRequest::Invoke {
                         invocation: ExtensionInvocation::Event {
                             event: event.clone(),
                         },
-                        context: self.invocation_context().await,
+                        context,
                     },
                     self.inner.options.hook_timeout,
                     None,
@@ -2989,9 +3497,454 @@ impl ExtensionRuntime {
         for instance in &instances {
             instance.invalidate_now("extension runtime shut down");
         }
+        // Drop every provider entry this runtime registered in the shared
+        // pi-ai registry so future resolution fails actionably.
+        self.unregister_provider_registrations();
         for instance in instances {
             instance.finish_invalidate(reason).await;
         }
+    }
+
+    /// Drop every provider entry this runtime registered in the shared pi-ai
+    /// registry so future resolution fails actionably. Namespace-scoped: only
+    /// this runtime's entries are removed — concurrent runtimes that
+    /// registered the same api are untouched.
+    fn unregister_provider_registrations(&self) {
+        pi_ai::unregister_extension_providers(&self.inner.provider_namespace);
+    }
+
+    /// Keep the shared pi-ai provider registry aligned with the committed
+    /// extension registry: entries for providers that left are dropped, and
+    /// every committed provider is (re)registered. Runs on every commit
+    /// (startup and reload), so re-registration within this runtime's
+    /// namespace replaces the previous generation's entry while stale entries
+    /// are removed.
+    fn sync_provider_registrations(&self, new: &RuntimeRegistry) {
+        self.unregister_provider_registrations();
+        for registered in new.provider_streams.values() {
+            let descriptor = registered.descriptor.clone();
+            let namespace = self.inner.provider_namespace.clone();
+            let api = descriptor.api.clone();
+            let provider_id = descriptor.id.clone();
+
+            let stream_runtime = self.clone();
+            let stream_provider_id = provider_id.clone();
+            let stream: StreamFn = Arc::new(move |model, context, options| {
+                let runtime = stream_runtime.clone();
+                let provider_id = stream_provider_id.clone();
+                Box::pin(async move {
+                    extension_provider_stream(&runtime, &provider_id, &model, &context, options)
+                        .await
+                })
+            });
+
+            let simple_runtime = self.clone();
+            let simple_provider_id = provider_id.clone();
+            let simple: SimpleStreamFn = Arc::new(move |model, context, options| {
+                let runtime = simple_runtime.clone();
+                let provider_id = simple_provider_id.clone();
+                Box::pin(async move {
+                    extension_provider_stream(
+                        &runtime,
+                        &provider_id,
+                        &model,
+                        &context,
+                        options.stream,
+                    )
+                    .await
+                })
+            });
+            pi_ai::register_extension_provider(
+                ApiProvider {
+                    api,
+                    stream,
+                    stream_simple: simple,
+                    generate_image: None,
+                },
+                namespace,
+            );
+        }
+    }
+}
+
+/// The `options` argument handed to the extension's JS stream function. The
+/// bridge deliberately forwards only the portable subset of [`StreamOptions`];
+/// transport details and hooks stay host-side.
+fn provider_stream_options_json(options: &StreamOptions) -> Value {
+    let mut map = serde_json::Map::new();
+    if let Some(temperature) = options.temperature {
+        map.insert("temperature".to_owned(), json!(temperature));
+    }
+    if let Some(max_tokens) = options.max_tokens {
+        map.insert("maxTokens".to_owned(), json!(max_tokens));
+    }
+    if let Some(timeout_ms) = options.timeout_ms {
+        map.insert("timeoutMs".to_owned(), json!(timeout_ms));
+    }
+    map.insert(
+        "metadata".to_owned(),
+        options.metadata.clone().unwrap_or(Value::Null),
+    );
+    Value::Object(map)
+}
+
+/// Stream bridge for extension-registered providers: calls the extension's JS
+/// stream through [`ExtensionRuntime::invoke_provider`] and translates the
+/// events it yields into an [`AssistantMessageEventStream`] (the vocabulary
+/// the agent loop consumes). JS stream failures surface as typed `Error`
+/// events — never a crashed session — with secret-looking text redacted via
+/// [`crate::redact::redact_secrets`].
+///
+/// JS event vocabulary (compact; the bridge maintains the partial message):
+/// - `{ type: "start" }` — opens the stream (optional; a `Start` event is
+///   always emitted first anyway).
+/// - `{ type: "text", text }` — a complete text block.
+/// - `{ type: "text_delta", delta }` — appends to the most recent text block.
+/// - `{ type: "thinking", thinking }` — a complete thinking block.
+/// - `{ type: "tool_call", id?, name, arguments }` — a tool-call block.
+/// - `{ type: "done", stopReason?, message? }` — terminal; `message` may carry
+///   the final [`AssistantMessage`], otherwise it is synthesized.
+/// - `{ type: "error", error? }` — typed stream error.
+///
+/// Any other shape fails the invocation (and becomes a typed stream error).
+async fn extension_provider_stream(
+    runtime: &ExtensionRuntime,
+    provider_id: &str,
+    model: &Model,
+    context: &Context,
+    options: StreamOptions,
+) -> AssistantMessageEventStream {
+    let stream = pi_ai::new_assistant_message_event_stream();
+    let returned = stream.clone();
+    let task_writer = stream.clone();
+    let runtime = runtime.clone();
+    let provider_id = provider_id.to_owned();
+    let session_id = options.session_id.clone();
+    let messages = context.messages.clone();
+    let options_json = provider_stream_options_json(&options);
+    // The invocation's `on_event` bridge is a plain `Fn`, so translated events
+    // hop through an unbounded channel and the spawned task pushes them into
+    // the stream (order preserved, nothing blocks the extension host).
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = Arc::new(Mutex::new(ProviderStreamTranslator::new(
+        stream,
+        model.clone(),
+    )));
+    let event_state = state.clone();
+    let on_event: UpdateHandler = Arc::new(move |value: Value| -> Result<()> {
+        let mut translator = event_state.lock();
+        for event in translator.apply_event(value)? {
+            let _ = event_tx.send(event);
+        }
+        Ok(())
+    });
+    tokio::spawn(async move {
+        let invocation = runtime.invoke_provider(
+            &provider_id,
+            session_id,
+            messages,
+            options_json,
+            None,
+            Some(on_event),
+        );
+        tokio::pin!(invocation);
+        let mut outcome = None;
+        loop {
+            tokio::select! {
+                biased;
+                event = event_rx.recv() => match event {
+                    Some(event) => task_writer.push(event).await,
+                    None => break,
+                },
+                result = &mut invocation => {
+                    outcome = Some(result);
+                    break;
+                }
+            }
+        }
+        // Drop the completed invocation so its `on_event` sender goes away,
+        // then drain events that raced the completion in order.
+        drop(invocation);
+        while let Some(event) = event_rx.recv().await {
+            task_writer.push(event).await;
+        }
+        let (stream, terminal) = {
+            let mut translator = state.lock();
+            let stream = translator.stream.clone();
+            let terminal = match outcome {
+                Some(Ok(_)) => translator.finish_terminal(),
+                Some(Err(error)) => translator.error_terminal(&format!("{error:#}")),
+                None => translator.error_terminal("extension provider channel closed"),
+            };
+            // The parking_lot guard is not Send; drop it before any await.
+            drop(translator);
+            (stream, terminal)
+        };
+        // Push the terminal event after releasing the (non-Send) guard.
+        let (message, is_error) = terminal;
+        if is_error {
+            stream
+                .push(AssistantMessageEvent::Error {
+                    reason: StopReason::Error,
+                    error: message.clone(),
+                })
+                .await;
+        } else {
+            stream
+                .push(AssistantMessageEvent::Done {
+                    reason: message.stop_reason,
+                    message: message.clone(),
+                })
+                .await;
+        }
+        stream.end(Some(message)).await;
+    });
+    returned
+}
+
+/// Keeps the accumulated [`AssistantMessage`] while translating compact JS
+/// stream events into [`AssistantMessageEvent`]s. All mutation happens
+/// synchronously (the `on_event` bridge is a plain `Fn`), so the lock is
+/// never held across an await.
+struct ProviderStreamTranslator {
+    stream: AssistantMessageEventStream,
+    partial: AssistantMessage,
+    started: bool,
+    stop_reason: StopReason,
+    terminal_message: Option<AssistantMessage>,
+    error_message: Option<String>,
+}
+
+impl ProviderStreamTranslator {
+    fn new(stream: AssistantMessageEventStream, model: Model) -> Self {
+        Self {
+            stream,
+            partial: AssistantMessage::pending(&model),
+            started: false,
+            stop_reason: StopReason::Stop,
+            terminal_message: None,
+            error_message: None,
+        }
+    }
+
+    /// Translate one JS event into zero or more [`AssistantMessageEvent`]s.
+    fn apply_event(&mut self, value: Value) -> Result<Vec<AssistantMessageEvent>> {
+        let Some(event) = value.as_object() else {
+            bail!("provider stream event must be an object");
+        };
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            bail!("provider stream event is missing a string \"type\"");
+        };
+        match event_type {
+            "start" => {
+                if self.started {
+                    return Ok(Vec::new());
+                }
+                self.started = true;
+                Ok(vec![AssistantMessageEvent::Start {
+                    partial: self.partial.clone(),
+                }])
+            }
+            "text" => {
+                let text = required_event_string(event, "text")?;
+                let mut events = self.ensure_started();
+                let index = self.partial.content.len();
+                self.partial.content.push(ContentBlock::text(""));
+                events.extend([
+                    AssistantMessageEvent::TextStart {
+                        content_index: index,
+                        partial: self.partial.clone(),
+                    },
+                    AssistantMessageEvent::TextDelta {
+                        content_index: index,
+                        delta: text.clone(),
+                        partial: self.partial.clone(),
+                    },
+                ]);
+                self.partial.content[index] = ContentBlock::text(text.clone());
+                events.push(AssistantMessageEvent::TextEnd {
+                    content_index: index,
+                    content: text,
+                    partial: self.partial.clone(),
+                });
+                Ok(events)
+            }
+            "text_delta" => {
+                let delta = required_event_string(event, "delta")?;
+                let index = self
+                    .partial
+                    .content
+                    .iter()
+                    .rposition(|block| matches!(block, ContentBlock::Text { .. }))
+                    .ok_or_else(|| anyhow!("text_delta before any text block"))?;
+                let accumulated = match &self.partial.content[index] {
+                    ContentBlock::Text { text, .. } => format!("{text}{delta}"),
+                    _ => unreachable!("rposition matched a text block"),
+                };
+                self.partial.content[index] = ContentBlock::text(accumulated);
+                Ok(vec![AssistantMessageEvent::TextDelta {
+                    content_index: index,
+                    delta,
+                    partial: self.partial.clone(),
+                }])
+            }
+            "thinking" => {
+                let thinking = required_event_string(event, "thinking")?;
+                let mut events = self.ensure_started();
+                let index = self.partial.content.len();
+                self.partial.content.push(ContentBlock::thinking(""));
+                events.extend([
+                    AssistantMessageEvent::ThinkingStart {
+                        content_index: index,
+                        partial: self.partial.clone(),
+                    },
+                    AssistantMessageEvent::ThinkingDelta {
+                        content_index: index,
+                        delta: thinking.clone(),
+                        partial: self.partial.clone(),
+                    },
+                ]);
+                self.partial.content[index] = ContentBlock::thinking(thinking.clone());
+                events.push(AssistantMessageEvent::ThinkingEnd {
+                    content_index: index,
+                    content: thinking,
+                    partial: self.partial.clone(),
+                });
+                Ok(events)
+            }
+            "tool_call" => {
+                let name = required_event_string(event, "name")?;
+                let id = event
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("call_extension")
+                    .to_owned();
+                let arguments = event
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default()));
+                let mut events = self.ensure_started();
+                let index = self.partial.content.len();
+                self.partial
+                    .content
+                    .push(ContentBlock::ToolCall(ToolCall {
+                        id,
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                        thought_signature: None,
+                    }));
+                events.extend([
+                    AssistantMessageEvent::ToolCallStart {
+                        content_index: index,
+                        partial: self.partial.clone(),
+                    },
+                    AssistantMessageEvent::ToolCallDelta {
+                        content_index: index,
+                        delta: arguments.to_string(),
+                        partial: self.partial.clone(),
+                    },
+                ]);
+                let tool_call = match &self.partial.content[index] {
+                    ContentBlock::ToolCall(call) => call.clone(),
+                    _ => unreachable!("content block was just pushed as a tool call"),
+                };
+                events.push(AssistantMessageEvent::ToolCallEnd {
+                    content_index: index,
+                    tool_call,
+                    partial: self.partial.clone(),
+                });
+                Ok(events)
+            }
+            "done" => {
+                if let Some(message) = event.get("message") {
+                    let message: AssistantMessage = serde_json::from_value(message.clone())
+                        .context("provider done message must be an AssistantMessage")?;
+                    self.terminal_message = Some(message);
+                }
+                if let Some(stop_reason) = event.get("stopReason").and_then(Value::as_str) {
+                    self.stop_reason = parse_stop_reason(stop_reason)?;
+                }
+                Ok(Vec::new())
+            }
+            "error" => {
+                self.error_message = Some(
+                    event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("extension provider stream failed")
+                        .to_owned(),
+                );
+                self.stop_reason = StopReason::Error;
+                Ok(Vec::new())
+            }
+            other => bail!("unknown provider stream event type {other:?}"),
+        }
+    }
+
+    /// Emit the opening `Start` event on first content; returns it so the
+    /// caller folds it into its translated event batch.
+    fn ensure_started(&mut self) -> Vec<AssistantMessageEvent> {
+        if self.started {
+            return Vec::new();
+        }
+        self.started = true;
+        vec![AssistantMessageEvent::Start {
+            partial: self.partial.clone(),
+        }]
+    }
+
+    /// Terminal state on normal completion: `Done` (or `Error` when the JS
+    /// emitted an error event) with the accumulated/overridden message.
+    fn finish_terminal(&self) -> (AssistantMessage, bool) {
+        self.terminal()
+    }
+
+    /// Terminal state after a JS-side failure (invocation error): a typed
+    /// error message with the redacted failure text.
+    fn error_terminal(&self, message: &str) -> (AssistantMessage, bool) {
+        let mut error = self.partial.clone();
+        error.stop_reason = StopReason::Error;
+        error.error_message = Some(crate::redact::redact_secrets(message));
+        (error, true)
+    }
+
+    fn terminal(&self) -> (AssistantMessage, bool) {
+        let mut message = self
+            .terminal_message
+            .clone()
+            .unwrap_or_else(|| self.partial.clone());
+        if message.stop_reason == StopReason::Pending {
+            message.stop_reason = self.stop_reason;
+        }
+        let is_error = self.error_message.is_some() || message.stop_reason == StopReason::Error;
+        if is_error {
+            message.stop_reason = StopReason::Error;
+            message.error_message = Some(crate::redact::redact_secrets(
+                self.error_message
+                    .as_deref()
+                    .unwrap_or("extension provider stream failed"),
+            ));
+        }
+        (message, is_error)
+    }
+}
+
+fn required_event_string(event: &serde_json::Map<String, Value>, field: &str) -> Result<String> {
+    event
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("provider stream event is missing a string {field:?}"))
+}
+
+fn parse_stop_reason(value: &str) -> Result<StopReason> {
+    match value {
+        "stop" => Ok(StopReason::Stop),
+        "length" => Ok(StopReason::Length),
+        "tool_use" => Ok(StopReason::ToolUse),
+        "error" => Ok(StopReason::Error),
+        "aborted" => Ok(StopReason::Aborted),
+        other => bail!("unknown provider stream stopReason {other:?}"),
     }
 }
 fn spawn_discarded_instances(instances: Vec<Arc<ExtensionInstance>>) {
@@ -3003,16 +3956,44 @@ fn spawn_discarded_instances(instances: Vec<Arc<ExtensionInstance>>) {
             instance.finish_invalidate("candidate_rejected").await;
         }
     };
+    run_cleanup_future(cleanup, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    });
+}
+
+/// Runs a cleanup future, preferring the ambient Tokio runtime when one is
+/// available. Otherwise the future runs on a fresh current-thread runtime on
+/// a spawned thread; when that runtime cannot be built (e.g. resource
+/// exhaustion), the failure is handled explicitly with a fixed-level warning
+/// and best-available synchronous cleanup: the future's captured resources
+/// (extension instances and their transports) drop here, which cancels
+/// invalidation and reaps sandbox-spawned children (`kill_on_drop`). The
+/// warning carries no instance data, so cleanup/resource exhaustion can never
+/// panic the process or leak secrets into diagnostics. `build_runtime` is
+/// injectable so the failure path is unit-testable without a panic.
+fn run_cleanup_future<F>(
+    cleanup: F,
+    build_runtime: impl FnOnce() -> std::io::Result<tokio::runtime::Runtime>,
+) where
+    F: Future<Output = ()> + Send + 'static,
+{
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(cleanup);
-    } else {
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("building extension cleanup runtime");
-            runtime.block_on(cleanup);
-        });
+        return;
+    }
+    match build_runtime() {
+        Ok(runtime) => {
+            std::thread::spawn(move || runtime.block_on(cleanup));
+        }
+        Err(error) => {
+            eprintln!(
+                "extensions: cleanup runtime construction failed ({error}); \
+                 dropping extension instances for best-effort cleanup"
+            );
+            drop(cleanup);
+        }
     }
 }
 fn agent_tools_from_registry(
@@ -3062,8 +4043,10 @@ struct RuntimeRegistry {
     hooks: BTreeMap<String, Vec<Arc<ExtensionInstance>>>,
     renderers: BTreeMap<String, RegisteredRenderer>,
     providers: BTreeMap<String, RegisteredProvider>,
+    provider_streams: BTreeMap<String, RegisteredProviderStream>,
     shortcuts: BTreeMap<String, RegisteredShortcut>,
     flags: BTreeMap<String, RegisteredFlag>,
+    overlays: BTreeMap<String, RegisteredOverlay>,
 }
 
 impl RuntimeRegistry {
@@ -3136,6 +4119,20 @@ impl RuntimeRegistry {
                     |registered| &registered.instance,
                 );
             }
+            for descriptor in &instance.registrations.provider_streams {
+                insert_unique(
+                    &mut registry.provider_streams,
+                    descriptor.id.clone(),
+                    RegisteredProviderStream {
+                        descriptor: descriptor.clone(),
+                        instance: instance.clone(),
+                    },
+                    ExtensionCapability::Provider,
+                    instance,
+                    &mut collisions,
+                    |registered| &registered.instance,
+                );
+            }
             for descriptor in &instance.registrations.shortcuts {
                 insert_unique(
                     &mut registry.shortcuts,
@@ -3159,6 +4156,20 @@ impl RuntimeRegistry {
                         instance: instance.clone(),
                     },
                     ExtensionCapability::Commands,
+                    instance,
+                    &mut collisions,
+                    |registered| &registered.instance,
+                );
+            }
+            for descriptor in &instance.registrations.overlays {
+                insert_unique(
+                    &mut registry.overlays,
+                    descriptor.id.clone(),
+                    RegisteredOverlay {
+                        descriptor: descriptor.clone(),
+                        instance: instance.clone(),
+                    },
+                    ExtensionCapability::Overlays,
                     instance,
                     &mut collisions,
                     |registered| &registered.instance,
@@ -3217,6 +4228,12 @@ struct RegisteredProvider {
 }
 
 #[derive(Clone)]
+struct RegisteredProviderStream {
+    descriptor: ExtensionProviderDescriptor,
+    instance: Arc<ExtensionInstance>,
+}
+
+#[derive(Clone)]
 struct RegisteredShortcut {
     descriptor: ExtensionShortcutDescriptor,
     instance: Arc<ExtensionInstance>,
@@ -3228,6 +4245,12 @@ struct RegisteredFlag {
     instance: Arc<ExtensionInstance>,
 }
 
+#[derive(Clone)]
+struct RegisteredOverlay {
+    descriptor: ExtensionOverlayDescriptor,
+    instance: Arc<ExtensionInstance>,
+}
+
 #[derive(Clone, Default)]
 struct ExtensionRegistrations {
     commands: Vec<ExtensionCommandDescriptor>,
@@ -3235,8 +4258,10 @@ struct ExtensionRegistrations {
     hooks: Vec<ExtensionEventHookDescriptor>,
     renderers: Vec<ExtensionMessageRendererDescriptor>,
     providers: Vec<ExtensionProviderMetadata>,
+    provider_streams: Vec<ExtensionProviderDescriptor>,
     shortcuts: Vec<ExtensionShortcutDescriptor>,
     flags: Vec<ExtensionFlagDescriptor>,
+    overlays: Vec<ExtensionOverlayDescriptor>,
 }
 
 struct RegistrationBuilder<'a> {
@@ -3248,8 +4273,10 @@ struct RegistrationBuilder<'a> {
     hooks: BTreeSet<String>,
     renderers: BTreeSet<String>,
     providers: BTreeSet<String>,
+    provider_streams: BTreeSet<String>,
     shortcuts: BTreeSet<String>,
     flags: BTreeSet<String>,
+    overlays: BTreeSet<String>,
 }
 
 impl<'a> RegistrationBuilder<'a> {
@@ -3266,8 +4293,10 @@ impl<'a> RegistrationBuilder<'a> {
             hooks: BTreeSet::new(),
             renderers: BTreeSet::new(),
             providers: BTreeSet::new(),
+            provider_streams: BTreeSet::new(),
             shortcuts: BTreeSet::new(),
             flags: BTreeSet::new(),
+            overlays: BTreeSet::new(),
         }
     }
 
@@ -3320,6 +4349,22 @@ impl<'a> RegistrationBuilder<'a> {
                 insert_local(&mut self.providers, &provider.id, "provider metadata")?;
                 self.registrations.providers.push(provider);
             }
+            ExtensionRegistration::Provider { provider } => {
+                validate_identifier(&provider.id, "provider id")?;
+                validate_identifier(&provider.api, "provider api")?;
+                if let Some(label) = &provider.label {
+                    validate_text(label, "provider label", 256)?;
+                }
+                for capability in &provider.capabilities {
+                    validate_identifier(capability, "provider capability")?;
+                }
+                insert_local(
+                    &mut self.provider_streams,
+                    &provider.id,
+                    "provider",
+                )?;
+                self.registrations.provider_streams.push(provider);
+            }
             ExtensionRegistration::Shortcut { shortcut } => {
                 validate_text(&shortcut.key, "shortcut key", 128)?;
                 if let Some(description) = &shortcut.description {
@@ -3346,12 +4391,31 @@ impl<'a> RegistrationBuilder<'a> {
                 insert_local(&mut self.flags, &flag.name, "flag")?;
                 self.registrations.flags.push(flag);
             }
+            ExtensionRegistration::Overlay { overlay } => {
+                validate_identifier(&overlay.id, "overlay id")?;
+                validate_text(&overlay.title, "overlay title", 256)?;
+                insert_local(&mut self.overlays, &overlay.id, "overlay")?;
+                self.registrations.overlays.push(overlay);
+            }
         }
         Ok(())
     }
 
     fn finish(self) -> Result<ExtensionRegistrations> {
         Ok(self.registrations)
+    }
+
+    /// Load-phase `pi.unregisterProvider`: drop a provider registered earlier
+    /// in the same load phase. Unregistering an unknown id fails actionably;
+    /// re-registering the id afterwards works again (last registration wins).
+    fn unregister_provider(&mut self, id: &str) -> Result<()> {
+        if !self.provider_streams.remove(id) {
+            bail!("extension cannot unregister unknown provider {id:?}");
+        }
+        self.registrations
+            .provider_streams
+            .retain(|provider| provider.id != id);
+        Ok(())
     }
 }
 
@@ -3515,6 +4579,9 @@ impl ExtensionInstance {
             }
             ExtensionFrame::Register { .. } => {
                 bail!("registration is only allowed during the load phase")
+            }
+            ExtensionFrame::UnregisterProvider { .. } => {
+                bail!("provider unregistration is only allowed during the load phase")
             }
             ExtensionFrame::Hello { .. } => bail!("duplicate hello frame"),
         }
@@ -4040,5 +5107,253 @@ mod tool_capability_tests {
         };
         assert_eq!(tool.capability, ToolCapability::Exec);
         assert!(serde_json::from_value::<ExtensionRegistration>(tool_registration(Some("network"))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod trust_decision_hook_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Registers the `trust_decision` handler (which only loads if the event
+    /// is allow-listed) and asserts the payload contract before recommending.
+    const TRUST_DECISION_SOURCE: &str = r#"export default function (pi) {
+        pi.on("trust_decision", (event) => {
+            if (typeof event.path !== "string" || event.path.length === 0) {
+                throw new Error("missing path");
+            }
+            if (!["trusted", "untrusted", "ask"].includes(event.decision)) {
+                throw new Error("unexpected decision: " + event.decision);
+            }
+            if (typeof event.isNew !== "boolean") {
+                throw new Error("missing isNew");
+            }
+            return { approve: event.decision === "ask" };
+        });
+    }"#;
+
+    async fn trust_decision_runtime(source: &str) -> (ExtensionRuntime, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("extension dir");
+        let entry = dir.path().join("trust-decision.mjs");
+        std::fs::write(&entry, source).expect("write extension source");
+        let permissions = ExtensionPermissionSet {
+            capabilities: BTreeSet::from([ExtensionCapability::EventHooks]),
+            ui_capabilities: BTreeSet::new(),
+        };
+        let spec = ExtensionSpec::new_runtime(
+            "trust-decision",
+            ExtensionSpecRuntime::QuickJs { entry: entry.clone() },
+            dir.path(),
+            ExtensionOrigin::Project,
+            true,
+            permissions,
+        );
+        let runtime = ExtensionRuntime::new(
+            Arc::new(QuickJsExtensionHost),
+            None,
+            ExtensionRuntimeOptions {
+                mode: ExtensionMode::Tui,
+                hook_timeout: Duration::from_secs(10),
+                ..ExtensionRuntimeOptions::default()
+            },
+        );
+        let report = runtime.load(vec![spec]).await;
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        (runtime, dir)
+    }
+
+    #[tokio::test]
+    async fn trust_decision_event_is_allow_listed_and_delivers_payload() {
+        let (runtime, _dir) = trust_decision_runtime(TRUST_DECISION_SOURCE).await;
+        // Loading the extension registers `pi.on("trust_decision", ...)`. If
+        // the event were missing from the allow-list, the load would fail
+        // with "unsupported extension event trust_decision".
+        let reduction = runtime
+            .reduce_trust_decision(json!({
+                "path": "/tmp/project",
+                "decision": "ask",
+                "isNew": true,
+            }))
+            .await
+            .expect("trust_decision hook runs");
+        assert_eq!(
+            reduction,
+            Some(ExtensionTrustDecisionReduction { approve: true })
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trust_decision_approval_never_approves_a_denial_or_a_trust() {
+        let (runtime, _dir) = trust_decision_runtime(TRUST_DECISION_SOURCE).await;
+        // The fixture approves only `ask`; a denial (or an existing trust)
+        // must come back without a recommendation so the host cannot weaken it.
+        for decision in ["trusted", "untrusted"] {
+            let reduction = runtime
+                .reduce_trust_decision(json!({
+                    "path": "/tmp/project",
+                    "decision": decision,
+                    "isNew": false,
+                }))
+                .await
+                .expect("trust_decision hook runs");
+            assert_eq!(reduction, None, "approval must not apply to {decision}");
+        }
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trust_decision_without_handlers_returns_none() {
+        let (runtime, _dir) = trust_decision_runtime("export default function (pi) {}").await;
+        let reduction = runtime
+            .reduce_trust_decision(json!({
+                "path": "/tmp/project",
+                "decision": "ask",
+                "isNew": true,
+            }))
+            .await
+            .expect("no handlers is fine");
+        assert_eq!(reduction, None);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trust_decision_wire_rejects_unknown_fields() {
+        let wire: std::result::Result<TrustDecisionWire, serde_json::Error> =
+            serde_json::from_value(json!({
+                "approve": true,
+                "deny": false,
+            }));
+        assert!(wire.is_err(), "extensions cannot veto via unknown fields");
+        let wire: TrustDecisionWire =
+            serde_json::from_value(json!({ "approve": true })).expect("approve wire");
+        assert!(wire.approve);
+        let wire: TrustDecisionWire = serde_json::from_value(json!({})).expect("empty wire");
+        assert!(!wire.approve);
+    }
+}
+
+#[cfg(test)]
+mod context_snapshot_failure_tests {
+    use super::*;
+
+    /// An action host whose context snapshot always fails: the invocation
+    /// path must surface the host error instead of silently invoking with a
+    /// None context.
+    struct FailingSnapshotHost;
+
+    impl ExtensionActionHost for FailingSnapshotHost {
+        fn context_snapshot(&self) -> ExtensionFuture<'_, Result<ExtensionContextSnapshot>> {
+            Box::pin(async { Err(anyhow!("host context snapshot exploded")) })
+        }
+
+        fn request(
+            &self,
+            _instance: ExtensionInstanceId,
+            _action: ExtensionRuntimeAction,
+            _cancellation: ExtensionCancellation,
+        ) -> ExtensionFuture<'_, Result<Value>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+    }
+
+    #[tokio::test]
+    async fn context_snapshot_error_reaches_invocation_caller() {
+        let runtime = ExtensionRuntime::new(
+            Arc::new(ProcessExtensionHost),
+            None,
+            ExtensionRuntimeOptions::default(),
+        );
+        runtime
+            .set_action_host(Arc::new(FailingSnapshotHost))
+            .expect("action host configured");
+        let error = runtime
+            .invocation_context()
+            .await
+            .expect_err("host snapshot errors must reach the caller, not become None");
+        // `to_string()` shows only the top-level context; the host's error
+        // must survive in the full chain (`{:#}`).
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("host context snapshot exploded"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("capturing extension context snapshot"),
+            "got: {message}"
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn context_snapshot_without_action_host_is_none() {
+        let runtime = ExtensionRuntime::new(
+            Arc::new(ProcessExtensionHost),
+            None,
+            ExtensionRuntimeOptions::default(),
+        );
+        let context = runtime
+            .invocation_context()
+            .await
+            .expect("missing action host is not an error");
+        assert!(context.is_none(), "no action host yields no context");
+        runtime.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod cleanup_runtime_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// Sets a flag when dropped: proves the runtime-build-failure fallback
+    /// drops the future's captured cleanup resources (best-available
+    /// synchronous cleanup) instead of panicking the process.
+    struct SetOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cleanup_runtime_build_failure_drops_resources_without_panic() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = SetOnDrop(dropped.clone());
+        let cleanup = async move {
+            let _kept_alive = guard;
+            pending::<()>().await
+        };
+        run_cleanup_future(cleanup, || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "injected runtime exhaustion",
+            ))
+        });
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "captured cleanup resources must drop on runtime-build failure"
+        );
+    }
+
+    #[test]
+    fn cleanup_runtime_build_success_runs_future_on_fresh_thread() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let cleanup = async move { flag.store(true, Ordering::SeqCst) };
+        run_cleanup_future(cleanup, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ran.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "cleanup future must run on the fresh runtime"
+        );
     }
 }

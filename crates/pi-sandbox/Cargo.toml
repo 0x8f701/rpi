@@ -1,0 +1,38 @@
+[package]
+name = "pi-sandbox"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pi_sandbox"
+path = "src/lib.rs"
+doctest = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# libc is the smallest maintained interface to prctl/fcntl. It is MIT OR
+# Apache-2.0 and adds no native build step; unsafe use is isolated in two
+# reviewed syscall wrappers.
+libc.workspace = true
+# seccompiler (Apache-2.0 OR BSD-3-Clause, AWS Firecracker) safely assembles
+# classic BPF. Reimplementing its verifier-sensitive compiler would be a larger
+# security and maintenance risk.
+seccompiler.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The workspace forbids unsafe code. This crate needs two direct Linux syscalls;
+# lib.rs re-enables deny-by-default and permits unsafe only on those wrappers.
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

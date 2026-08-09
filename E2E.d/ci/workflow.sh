@@ -89,6 +89,8 @@ required = {
     "generation-field-typed-when-present",
     "workflow-events-generation-gated",
     "workflow-events-public-wire-only",
+    "no-failed-after-planner-release",
+    "planner-provider-engaged",
 }
 missing = sorted(required - set(summary.get("checks") or []))
 if missing:

@@ -5,9 +5,9 @@ use chrono::{TimeZone, Utc};
 use pi_ai::{AssistantMessage, ContentBlock, Message, StopReason};
 use pi_coding::{
     GOAL_SESSION_CUSTOM_TYPE, Goal, GoalContinuationDecision, GoalError, GoalEvent, GoalEventKind,
-    GoalLifecycle, GoalPauseReason, GoalRuntime, GoalSessionEntry, GoalUsage, GoalUsageDelta,
-    MAX_GOAL_OBJECTIVE_BYTES, SessionRecorder, goal_events_from_session_tree, load_session_tree,
-    resume_session, start_session_in,
+    GoalLifecycle, GoalPauseReason, GoalRuntime, GoalSessionEntry, GoalState, GoalUsage,
+    GoalUsageDelta, MAX_GOAL_OBJECTIVE_BYTES, MAX_GOAL_PIN_CHARS, MAX_GOAL_PINS, SessionRecorder,
+    goal_events_from_session_tree, load_session_tree, resume_session, start_session_in,
 };
 use serde_json::{Value, json};
 
@@ -812,6 +812,7 @@ fn replay_rejects_created_objective_over_byte_cap() {
             origin_goal_id: None,
             objective: "G".repeat(MAX_GOAL_OBJECTIVE_BYTES + 1),
             token_budget: Some(10),
+            pins: Vec::new(),
             lifecycle: GoalLifecycle::Active,
             pause_reason: None,
             created_at: timestamp,
@@ -1478,4 +1479,319 @@ fn fork_clone_transitions_a_copied_source_journal_to_new_lineage() {
     assert_eq!(restored.get(), copied.get());
     assert_eq!(restored.get().revision, 3);
     resumed.close().expect("close restored fork session");
+}
+
+#[test]
+fn pins_lifecycle_pin_list_unpin_and_replay() {
+    let events = Arc::new(Mutex::new(Vec::<GoalEvent>::new()));
+    let captured = events.clone();
+    let runtime = GoalRuntime::with_persistence(Arc::new(move |event| {
+        captured.lock().expect("event lock").push(event.clone());
+        Ok(())
+    }));
+    runtime.create("pin the workflow", Some(100)).expect("create");
+    assert!(runtime.pins().is_empty());
+    assert_eq!(runtime.get().current.expect("goal").pins, Vec::<String>::new());
+
+    let pinned = runtime.pin("keep the release checklist in scope").expect("pin");
+    assert_eq!(pinned.pins, vec!["keep the release checklist in scope".to_owned()]);
+    assert_eq!(runtime.pins(), vec!["keep the release checklist in scope".to_owned()]);
+    assert_eq!(runtime.get().revision, 2);
+    assert!(matches!(
+        &events.lock().expect("events")[1].kind,
+        GoalEventKind::PinsUpdated { pins } if pins == &vec!["keep the release checklist in scope".to_owned()]
+    ));
+
+    runtime.pin("reference the omp skill-card style").expect("second pin");
+    assert_eq!(runtime.pins().len(), 2);
+
+    let unpinned = runtime.unpin(0).expect("unpin first");
+    assert_eq!(unpinned.pins, vec!["reference the omp skill-card style".to_owned()]);
+    assert_eq!(runtime.pins(), vec!["reference the omp skill-card style".to_owned()]);
+    assert_eq!(runtime.get().revision, 4);
+    assert!(matches!(
+        &events.lock().expect("events")[3].kind,
+        GoalEventKind::PinsUpdated { pins } if pins == &vec!["reference the omp skill-card style".to_owned()]
+    ));
+
+    let replayed = GoalRuntime::from_events(&events.lock().expect("events")).expect("replay");
+    assert_eq!(replayed.get(), runtime.get());
+    assert_eq!(replayed.pins(), runtime.pins());
+    assert_eq!(
+        replayed.continuation_decision(),
+        runtime.continuation_decision()
+    );
+}
+
+#[test]
+fn pins_validate_empty_length_limit_and_index_bounds() {
+    let runtime = GoalRuntime::memory();
+    assert_eq!(runtime.pin("no goal yet"), Err(GoalError::NoCurrentGoal));
+    runtime.create("bounded pins", Some(50)).expect("create");
+    assert_eq!(runtime.pin("   "), Err(GoalError::EmptyPin));
+    assert_eq!(
+        runtime.pin("G".repeat(MAX_GOAL_PIN_CHARS + 1)),
+        Err(GoalError::PinTooLong {
+            max_chars: MAX_GOAL_PIN_CHARS,
+        })
+    );
+    for index in 0..MAX_GOAL_PINS {
+        runtime.pin(format!("pin {index}")).expect("pin within limit");
+    }
+    assert_eq!(runtime.pins().len(), MAX_GOAL_PINS);
+    assert_eq!(
+        runtime.pin("overflow"),
+        Err(GoalError::PinLimitReached {
+            max_pins: MAX_GOAL_PINS,
+        })
+    );
+    assert_eq!(
+        runtime.unpin(MAX_GOAL_PINS),
+        Err(GoalError::PinIndexOutOfRange {
+            index: MAX_GOAL_PINS,
+            len: MAX_GOAL_PINS,
+        })
+    );
+    let after_unpin = runtime.unpin(0).expect("unpin");
+    assert_eq!(after_unpin.pins.len(), MAX_GOAL_PINS - 1);
+    assert_eq!(
+        runtime.unpin(MAX_GOAL_PINS - 1),
+        Err(GoalError::PinIndexOutOfRange {
+            index: MAX_GOAL_PINS - 1,
+            len: MAX_GOAL_PINS - 1,
+        })
+    );
+    // Rejected mutations must not advance the journal.
+    assert_eq!(runtime.get().revision, 2 + MAX_GOAL_PINS as u64);
+}
+
+#[test]
+fn pins_are_terminal_gated_and_forged_pin_events_fail_closed() {
+    let terminal = GoalRuntime::memory();
+    terminal.create("terminal pins", None).expect("create");
+    terminal.complete().expect("complete");
+    assert!(matches!(
+        terminal.pin("late pin"),
+        Err(GoalError::InvalidTransition {
+            operation: "pin",
+            lifecycle: GoalLifecycle::Completed,
+        })
+    ));
+    assert!(matches!(
+        terminal.unpin(0),
+        Err(GoalError::InvalidTransition {
+            operation: "unpin",
+            lifecycle: GoalLifecycle::Completed,
+        })
+    ));
+    assert_eq!(terminal.get().revision, 2, "rejected pin must not advance the journal");
+
+    let runtime = GoalRuntime::with_clock_and_persistence(clock_at(100), Arc::new(|_| Ok(())));
+    let created = runtime.create("forge pins", None).expect("create");
+    let base = GoalEvent {
+        revision: 1,
+        timestamp: created.updated_at,
+        kind: GoalEventKind::Created,
+        goal: created.clone(),
+    };
+
+    // A PinsUpdated event whose snapshot did not change the pins is a no-op
+    // journal write and must fail closed.
+    let noop_pins = GoalEvent {
+        revision: 2,
+        timestamp: at(110),
+        kind: GoalEventKind::PinsUpdated { pins: Vec::new() },
+        goal: {
+            let mut goal = created.clone();
+            goal.updated_at = at(110);
+            goal
+        },
+    };
+    assert!(matches!(
+        GoalRuntime::from_events(&[base.clone(), noop_pins]),
+        Err(GoalError::InvalidJournal(message)) if message.contains("invalid pins transition")
+    ));
+
+    // A Paused event may not smuggle pins in alongside the lifecycle change.
+    let mut pause_with_pins = GoalEvent {
+        revision: 2,
+        timestamp: at(110),
+        kind: GoalEventKind::Paused {
+            reason: GoalPauseReason::Manual,
+        },
+        goal: {
+            let mut goal = created.clone();
+            goal.lifecycle = GoalLifecycle::Paused;
+            goal.pause_reason = Some(GoalPauseReason::Manual);
+            goal.updated_at = at(110);
+            goal
+        },
+    };
+    pause_with_pins.goal.pins = vec!["forged".to_owned()];
+    assert!(matches!(
+        GoalRuntime::from_events(&[base.clone(), pause_with_pins]),
+        Err(GoalError::InvalidJournal(message)) if message.contains("invalid pause transition")
+    ));
+
+    // A legal pins update replays, and its snapshot list must match the event.
+    let legal_pins = GoalEvent {
+        revision: 2,
+        timestamp: at(110),
+        kind: GoalEventKind::PinsUpdated {
+            pins: vec!["legal pin".to_owned()],
+        },
+        goal: {
+            let mut goal = created.clone();
+            goal.pins = vec!["legal pin".to_owned()];
+            goal.updated_at = at(110);
+            goal
+        },
+    };
+    let replayed = GoalRuntime::from_events(&[base, legal_pins]).expect("legal pins replay");
+    assert_eq!(replayed.pins(), vec!["legal pin".to_owned()]);
+}
+
+#[test]
+fn pins_survive_session_resume_and_fork_clone_copies_them() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let recorder = recorder_in(&directory);
+    let path = recorder.path();
+    let runtime = GoalRuntime::from_session_recorder(recorder.clone()).expect("goal runtime");
+    runtime.create("durable pins", Some(40)).expect("create");
+    runtime.pin("role model example").expect("pin");
+    runtime.pin("second example").expect("second pin");
+    let expected = runtime.get();
+    persist_session(&recorder);
+
+    let resumed = resume_session(&path).expect("resume session");
+    let restored = GoalRuntime::from_session_recorder(resumed.clone()).expect("restore goal");
+    assert_eq!(restored.get(), expected);
+    assert_eq!(restored.pins(), vec!["role model example".to_owned(), "second example".to_owned()]);
+
+    // Fork clones carry the pinned role-model context into the new lineage.
+    let source = restored.get().current.expect("restored goal");
+    let cloned = GoalRuntime::memory().fork_clone(&source).expect("fork clone");
+    assert_eq!(cloned.pins, source.pins);
+    resumed.close().expect("close resumed session");
+}
+
+#[test]
+fn pins_serialize_under_camel_case_and_skip_when_empty() {
+    let runtime = GoalRuntime::memory();
+    runtime.create("pin schema", None).expect("create");
+    let empty_state = runtime.get();
+    let empty = serde_json::to_value(&empty_state).expect("serialize empty");
+    assert!(
+        empty["current"].get("pins").is_none(),
+        "empty pins must be omitted from the wire schema"
+    );
+    assert_eq!(
+        serde_json::from_value::<GoalState>(empty).expect("empty round trip"),
+        empty_state,
+        "empty-pins goals must round trip through the wire schema"
+    );
+    runtime.pin("role model example").expect("pin");
+    let with_pins = serde_json::to_value(runtime.get()).expect("serialize with pins");
+    assert_eq!(with_pins["current"]["pins"], json!(["role model example"]));
+    let round_tripped: GoalState =
+        serde_json::from_value(with_pins).expect("with-pins round trip");
+    assert_eq!(round_tripped, runtime.get());
+    assert_eq!(
+        round_tripped.current.expect("goal").pins,
+        vec!["role model example".to_owned()]
+    );
+}
+
+#[test]
+fn pin_and_unpin_enforce_all_boundaries_and_reject_illegal_transitions() {
+    let runtime = GoalRuntime::memory();
+    // No goal yet: pin/unpin fail with the same typed error as every mutation.
+    assert_eq!(runtime.pin("nope"), Err(GoalError::NoCurrentGoal));
+    assert_eq!(runtime.unpin(0), Err(GoalError::NoCurrentGoal));
+
+    runtime.create("bounded pins", None).expect("create");
+
+    // Empty and over-long pins are rejected at the exact boundary.
+    assert_eq!(runtime.pin("   "), Err(GoalError::EmptyPin));
+    assert!(matches!(
+        runtime.pin("x".repeat(MAX_GOAL_PIN_CHARS + 1)),
+        Err(GoalError::PinTooLong { max_chars }) if max_chars == MAX_GOAL_PIN_CHARS
+    ));
+    runtime
+        .pin("x".repeat(MAX_GOAL_PIN_CHARS))
+        .expect("boundary-length pin accepted");
+
+    // Unpin out of range is a typed error, not a silent no-op.
+    assert!(matches!(
+        runtime.unpin(99),
+        Err(GoalError::PinIndexOutOfRange { index: 99, len: 1 })
+    ));
+
+    // The pin cap is enforced at exactly MAX_GOAL_PINS (one over fails).
+    for i in 0..MAX_GOAL_PINS - 1 {
+        runtime.pin(format!("pin {i}")).expect("pin under the cap");
+    }
+    assert!(matches!(
+        runtime.pin("one over the cap"),
+        Err(GoalError::PinLimitReached { max_pins }) if max_pins == MAX_GOAL_PINS
+    ));
+
+    // Unpin restores capacity and removes exactly the indexed pin (list shifts).
+    runtime.unpin(0).expect("unpin first");
+    runtime.pin("freed slot").expect("pin after unpin");
+    let pins = runtime.pins();
+    assert_eq!(pins.len(), MAX_GOAL_PINS, "unpin must restore one slot");
+    assert_eq!(
+        pins.last().map(String::as_str),
+        Some("freed slot"),
+        "unpinned slot must be refilled by the new pin"
+    );
+    assert!(!pins.iter().any(|pin| pin.len() == MAX_GOAL_PIN_CHARS && pin.chars().all(|c| c == 'x')));
+
+    // Pinning a completed goal is an illegal transition.
+    let done = GoalRuntime::memory();
+    done.create("finished", None).expect("create");
+    done.complete().expect("complete");
+    assert!(matches!(
+        done.pin("late pin"),
+        Err(GoalError::InvalidTransition { operation, .. }) if operation == "pin"
+    ));
+    assert!(matches!(
+        done.unpin(0),
+        Err(GoalError::InvalidTransition { operation, .. }) if operation == "unpin"
+    ));
+}
+
+#[test]
+fn pins_updated_events_replay_through_the_journal() {
+    let events = Arc::new(Mutex::new(Vec::<GoalEvent>::new()));
+    let captured = events.clone();
+    let runtime = GoalRuntime::with_persistence(Arc::new(move |event| {
+        captured.lock().expect("event lock").push(event.clone());
+        Ok(())
+    }));
+    runtime.create("journal pins", None).expect("create");
+    runtime.pin("first pin").expect("pin one");
+    runtime.pin("second pin").expect("pin two");
+    runtime.unpin(0).expect("unpin one");
+    let expected = runtime.get();
+    let events = events.lock().expect("event lock").clone();
+
+    // Exactly one PinsUpdated per mutation, each carrying the resulting list.
+    let pins_updates: Vec<&GoalEvent> = events
+        .iter()
+        .filter(|event| matches!(event.kind, GoalEventKind::PinsUpdated { .. }))
+        .collect();
+    assert_eq!(pins_updates.len(), 3, "every pin/unpin must journal a PinsUpdated");
+    for event in &pins_updates {
+        let GoalEventKind::PinsUpdated { pins } = &event.kind else {
+            unreachable!("filtered");
+        };
+        assert_eq!(pins, &event.goal.pins, "journal pins must match the resulting goal");
+    }
+
+    // Replay restores the exact pinned state (the resume path relies on it).
+    let replayed = GoalRuntime::from_events(&events).expect("replay");
+    assert_eq!(replayed.get(), expected);
+    assert_eq!(replayed.pins(), runtime.pins());
 }

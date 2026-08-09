@@ -20,6 +20,13 @@ pub struct TodoItem {
     #[serde(default)] pub depends_on: Vec<String>,
     #[serde(default)] pub ready: bool,
     #[serde(default)] pub blocked_by: Vec<TodoBlockedReason>,
+    /// Optional explicit agent (workflow role) that must execute this task.
+    /// `None` lets routing resolve from the task content (exact agent
+    /// mention first, then ranked metadata selection / default). Persisted
+    /// with the Todo state and validated against the orchestration catalog
+    /// when the DAG is executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,7 +54,15 @@ impl<'de> Deserialize<'de> for TodoState {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TodoInitPhase { pub phase: String, pub items: Vec<String> }
+pub struct TodoInitPhase {
+    pub phase: String,
+    pub items: Vec<String>,
+    /// Optional per-item explicit agent names, parallel to `items`
+    /// (`agents[i]` names the agent for `items[i]`). When present its length
+    /// must equal `items.len()`; each entry must be a non-empty agent name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<String>>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -182,7 +197,7 @@ fn assign_missing_ids(phases: &mut [TodoPhase]) {
     for (pi, phase) in phases.iter_mut().enumerate() { for (ti, task) in phase.tasks.iter_mut().enumerate() { if !task.id.is_empty() { continue; } let mut hasher = Sha256::new(); hasher.update(b"pi-todo-legacy-v1\0"); hasher.update(pi.to_le_bytes()); hasher.update(phase.name.as_bytes()); hasher.update([0]); hasher.update(ti.to_le_bytes()); hasher.update(task.content.as_bytes()); let digest = hasher.finalize(); let base = format!("task-{}", hex_prefix(&digest, 10)); let mut candidate = base.clone(); let mut suffix = 2; while used.contains(&candidate) { candidate = format!("{base}-{suffix}"); suffix += 1; } used.insert(candidate.clone()); task.id = candidate; } }
 }
 fn hex_prefix(bytes: &[u8], count: usize) -> String { const HEX: &[u8; 16] = b"0123456789abcdef"; let mut output = String::with_capacity(count * 2); for byte in bytes.iter().take(count) { output.push(char::from(HEX[usize::from(byte >> 4)])); output.push(char::from(HEX[usize::from(byte & 0x0f)])); } output }
-fn new_task(content: String) -> TodoItem { TodoItem { id: format!("task-{}", Uuid::new_v4().simple()), content, status: TodoStatus::Pending, depends_on: Vec::new(), ready: false, blocked_by: Vec::new() } }
+fn new_task(content: String, agent: Option<String>) -> TodoItem { TodoItem { id: format!("task-{}", Uuid::new_v4().simple()), content, status: TodoStatus::Pending, depends_on: Vec::new(), ready: false, blocked_by: Vec::new(), agent } }
 fn normalize_ready_pointer(phases: &mut [TodoPhase]) {
     let mut saw_ready_active = false;
     for task in phases.iter_mut().flat_map(|phase| phase.tasks.iter_mut()) {
@@ -208,10 +223,20 @@ fn project_readiness(phases: &mut [TodoPhase]) { let tasks = phases.iter().flat_
 fn apply_operation(phases: &mut Vec<TodoPhase>, op: &TodoOp, errors: &mut Vec<String>) {
     match op {
         TodoOp::Init { list, items, phase } => {
-            let init = list.clone().or_else(|| items.as_ref().filter(|items| !items.is_empty()).map(|items| vec![TodoInitPhase { phase: phase.clone().unwrap_or_else(|| "Tasks".to_owned()), items: items.clone() }]));
+            let init = list.clone().or_else(|| items.as_ref().filter(|items| !items.is_empty()).map(|items| vec![TodoInitPhase { phase: phase.clone().unwrap_or_else(|| "Tasks".to_owned()), items: items.clone(), agents: None }]));
             let Some(init) = init else { errors.push("Missing list for init operation".to_owned()); return; };
             for entry in &init { if entry.items.is_empty() { errors.push(format!("Missing items for phase \"{}\" in init list", entry.phase)); } }
-            errors.extend(validate_init_list(&init)); *phases = init.into_iter().map(|entry| TodoPhase { name: entry.phase, tasks: entry.items.into_iter().map(new_task).collect() }).collect();
+            errors.extend(validate_init_list(&init));
+            if !errors.is_empty() { return; }
+            // A semantically identical re-init (same phase names, task
+            // contents, and per-item agents, in the same order) is a no-op
+            // that PRESERVES the stable task IDs, dependency edges, and
+            // statuses. Retrying a rejected plan must never invalidate the
+            // IDs a previous call returned (P1-3).
+            if init_matches_phases(phases, &init) {
+                return;
+            }
+            *phases = init.into_iter().map(|entry| TodoPhase { name: entry.phase, tasks: entry.items.into_iter().enumerate().map(|(index, content)| { let agent = entry.agents.as_ref().and_then(|agents| agents.get(index)).cloned(); new_task(content, agent) }).collect() }).collect();
         }
         TodoOp::Start { task } => {
             let Some((pi, ti)) = resolve_task(phases, task, errors) else { return; }; let target = &phases[pi].tasks[ti];
@@ -221,7 +246,7 @@ fn apply_operation(phases: &mut Vec<TodoPhase>, op: &TodoOp, errors: &mut Vec<St
         TodoOp::Done { task, phase } => for (pi, ti) in resolve_targets(phases, task, phase, errors) { phases[pi].tasks[ti].status = TodoStatus::Completed; },
         TodoOp::Drop { task, phase } => for (pi, ti) in resolve_targets(phases, task, phase, errors) { phases[pi].tasks[ti].status = TodoStatus::Abandoned; },
         TodoOp::Rm { task, phase, cascade } => remove_tasks(phases, task, phase, *cascade, errors),
-        TodoOp::Append { phase, items } => { validate_append(phases, phase, items, errors); if !errors.is_empty() { return; } let pi = phases.iter().position(|candidate| candidate.name == *phase).unwrap_or_else(|| { phases.push(TodoPhase { name: phase.clone(), tasks: Vec::new() }); phases.len() - 1 }); phases[pi].tasks.extend(items.iter().cloned().map(new_task)); }
+        TodoOp::Append { phase, items } => { validate_append(phases, phase, items, errors); if !errors.is_empty() { return; } let pi = phases.iter().position(|candidate| candidate.name == *phase).unwrap_or_else(|| { phases.push(TodoPhase { name: phase.clone(), tasks: Vec::new() }); phases.len() - 1 }); phases[pi].tasks.extend(items.iter().cloned().map(|content| new_task(content, None))); }
         TodoOp::AddDependency { task, depends_on } => update_dependencies(phases, task, depends_on, DependencyMutation::Add, errors),
         TodoOp::RemoveDependency { task, depends_on } => update_dependencies(phases, task, depends_on, DependencyMutation::Remove, errors),
         TodoOp::UpdateDependencies { task, depends_on } => update_dependencies(phases, task, depends_on, DependencyMutation::Replace, errors), TodoOp::View => {}
@@ -257,7 +282,48 @@ fn resolve_task(phases: &[TodoPhase], reference: &str, errors: &mut Vec<String>)
 }
 fn resolve_task_id(phases: &[TodoPhase], id: &str, errors: &mut Vec<String>) -> Option<(usize, usize)> { if id.is_empty() { errors.push("Missing task ID".to_owned()); return None; } for (pi, phase) in phases.iter().enumerate() { if let Some(ti) = phase.tasks.iter().position(|task| task.id == id) { return Some((pi, ti)); } } errors.push(format!("Task ID \"{id}\" not found")); None }
 fn resolve_phase(phases: &[TodoPhase], name: &str, errors: &mut Vec<String>) -> Option<usize> { if name.is_empty() { errors.push("Missing phase name".to_owned()); return None; } let index = phases.iter().position(|phase| phase.name == name); if index.is_none() { errors.push(format!("Phase \"{name}\" not found")); } index }
-fn validate_init_list(list: &[TodoInitPhase]) -> Vec<String> { validate_unique_phases(&list.iter().map(|entry| TodoPhase { name: entry.phase.clone(), tasks: entry.items.iter().cloned().map(|content| TodoItem { id: String::new(), content, status: TodoStatus::Pending, depends_on: Vec::new(), ready: false, blocked_by: Vec::new() }).collect() }).collect::<Vec<_>>(), " in init list") }
+fn validate_init_list(list: &[TodoInitPhase]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for entry in list {
+        if let Some(agents) = &entry.agents {
+            if agents.len() != entry.items.len() {
+                errors.push(format!("Agent count {} does not match item count {} for phase \"{}\" in init list", agents.len(), entry.items.len(), entry.phase));
+            }
+            for (index, agent) in agents.iter().enumerate() {
+                if agent.trim().is_empty() {
+                    errors.push(format!("Agent name at index {index} for phase \"{}\" must not be empty", entry.phase));
+                }
+            }
+        }
+    }
+    errors.extend(validate_unique_phases(&list.iter().map(|entry| TodoPhase { name: entry.phase.clone(), tasks: entry.items.iter().cloned().enumerate().map(|(index, content)| TodoItem { id: String::new(), content, status: TodoStatus::Pending, depends_on: Vec::new(), ready: false, blocked_by: Vec::new(), agent: entry.agents.as_ref().and_then(|agents| agents.get(index)).cloned() }).collect() }).collect::<Vec<_>>(), " in init list"));
+    errors
+}
+
+/// Whether an `init` request describes exactly the current plan: same phase
+/// names, task contents, and per-item agents in the same order. IDs,
+/// dependency edges, and statuses are deliberately not compared — an
+/// identical re-init preserves them instead of regenerating IDs (P1-3).
+fn init_matches_phases(phases: &[TodoPhase], init: &[TodoInitPhase]) -> bool {
+    if phases.len() != init.len() {
+        return false;
+    }
+    for (phase, entry) in phases.iter().zip(init) {
+        if phase.name != entry.phase || phase.tasks.len() != entry.items.len() {
+            return false;
+        }
+        for (index, (task, content)) in phase.tasks.iter().zip(&entry.items).enumerate() {
+            if &task.content != content {
+                return false;
+            }
+            let init_agent = entry.agents.as_ref().and_then(|agents| agents.get(index));
+            if task.agent.as_deref() != init_agent.map(String::as_str) {
+                return false;
+            }
+        }
+    }
+    true
+}
 fn validate_unique_phases(phases: &[TodoPhase], suffix: &str) -> Vec<String> {
     let mut errors = Vec::new();
     let mut names = HashSet::new();
@@ -298,7 +364,7 @@ fn completion_transitions(previous: &[TodoPhase], updated: &[TodoPhase]) -> Vec<
 pub fn todo_phases_to_markdown(phases: &[TodoPhase]) -> String { if phases.is_empty() { return "# Todos\n".to_owned(); } let mut lines = Vec::new(); for (index, phase) in phases.iter().enumerate() { if index > 0 { lines.push(String::new()); } lines.push(format!("# {}", phase.name)); for task in &phase.tasks { let marker = match task.status { TodoStatus::Pending => " ", TodoStatus::InProgress => "/", TodoStatus::Completed => "x", TodoStatus::Abandoned => "-" }; lines.push(format!("- [{marker}] {}", task.content)); } } format!("{}\n", lines.join("\n")) }
 pub fn parse_todo_markdown(markdown: &str) -> Result<Vec<TodoPhase>> {
     let mut phases: Vec<TodoPhase> = Vec::new(); let mut current = None; let mut errors = Vec::new();
-    for (line_index, raw) in markdown.lines().enumerate() { let line = raw.trim(); if line.is_empty() { continue; } if let Some(name) = parse_heading(line) { phases.push(TodoPhase { name: name.to_owned(), tasks: Vec::new() }); current = Some(phases.len() - 1); continue; } if let Some((marker, content)) = parse_check_item(line) { let status = match marker { "" | " " => Some(TodoStatus::Pending), "x" | "X" => Some(TodoStatus::Completed), "/" | ">" => Some(TodoStatus::InProgress), "-" | "~" => Some(TodoStatus::Abandoned), _ => None }; let Some(status) = status else { errors.push(format!("Line {}: unknown status marker \"[{marker}]\" (use [ ], [x], [/], [-])", line_index + 1)); continue; }; let pi = current.unwrap_or_else(|| { phases.push(TodoPhase { name: "Todos".to_owned(), tasks: Vec::new() }); current = Some(phases.len() - 1); phases.len() - 1 }); phases[pi].tasks.push(TodoItem { id: String::new(), content: content.to_owned(), status, depends_on: Vec::new(), ready: false, blocked_by: Vec::new() }); continue; } errors.push(format!("Line {}: expected a heading or checklist item", line_index + 1)); }
+    for (line_index, raw) in markdown.lines().enumerate() { let line = raw.trim(); if line.is_empty() { continue; } if let Some(name) = parse_heading(line) { phases.push(TodoPhase { name: name.to_owned(), tasks: Vec::new() }); current = Some(phases.len() - 1); continue; } if let Some((marker, content)) = parse_check_item(line) { let status = match marker { "" | " " => Some(TodoStatus::Pending), "x" | "X" => Some(TodoStatus::Completed), "/" | ">" => Some(TodoStatus::InProgress), "-" | "~" => Some(TodoStatus::Abandoned), _ => None }; let Some(status) = status else { errors.push(format!("Line {}: unknown status marker \"[{marker}]\" (use [ ], [x], [/], [-])", line_index + 1)); continue; }; let pi = current.unwrap_or_else(|| { phases.push(TodoPhase { name: "Todos".to_owned(), tasks: Vec::new() }); current = Some(phases.len() - 1); phases.len() - 1 }); phases[pi].tasks.push(TodoItem { id: String::new(), content: content.to_owned(), status, depends_on: Vec::new(), ready: false, blocked_by: Vec::new(), agent: None }); continue; } errors.push(format!("Line {}: expected a heading or checklist item", line_index + 1)); }
     errors.extend(validate_unique_phases(&phases, "")); if !errors.is_empty() { return Err(TodoOperationError::new(errors).into()); } normalize_todo_phases(&mut phases); Ok(phases)
 }
 fn parse_heading(line: &str) -> Option<&str> { let hashes = line.bytes().take_while(|byte| *byte == b'#').count(); if !(1..=6).contains(&hashes) { return None; } line.get(hashes..)?.strip_prefix(' ').map(str::trim) }
@@ -319,13 +385,87 @@ pub(crate) fn deserialize_todo_op(value: serde_json::Value) -> Result<TodoOp> { 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn item(content: &str, status: TodoStatus) -> TodoItem { TodoItem { id: String::new(), content: content.to_owned(), status, depends_on: Vec::new(), ready: false, blocked_by: Vec::new() } }
-    fn graph_item(id: &str, content: &str, status: TodoStatus, depends_on: &[&str]) -> TodoItem { TodoItem { id: id.to_owned(), content: content.to_owned(), status, depends_on: depends_on.iter().map(|id| (*id).to_owned()).collect(), ready: false, blocked_by: Vec::new() } }
+    fn item(content: &str, status: TodoStatus) -> TodoItem { TodoItem { id: String::new(), content: content.to_owned(), status, depends_on: Vec::new(), ready: false, blocked_by: Vec::new(), agent: None } }
+    fn graph_item(id: &str, content: &str, status: TodoStatus, depends_on: &[&str]) -> TodoItem { TodoItem { id: id.to_owned(), content: content.to_owned(), status, depends_on: depends_on.iter().map(|id| (*id).to_owned()).collect(), ready: false, blocked_by: Vec::new(), agent: None } }
     fn phase(name: &str, tasks: Vec<TodoItem>) -> TodoPhase { TodoPhase { name: name.to_owned(), tasks } }
-    fn init(list: Vec<(&str, Vec<&str>)>) -> TodoOp { TodoOp::Init { list: Some(list.into_iter().map(|(phase, items)| TodoInitPhase { phase: phase.to_owned(), items: items.into_iter().map(str::to_owned).collect() }).collect()), items: None, phase: None } }
+    fn init(list: Vec<(&str, Vec<&str>)>) -> TodoOp { TodoOp::Init { list: Some(list.into_iter().map(|(phase, items)| TodoInitPhase { phase: phase.to_owned(), items: items.into_iter().map(str::to_owned).collect(), agents: None }).collect()), items: None, phase: None } }
     #[test] fn normalization_preserves_parallel_active_tasks_and_promotes_when_none_remain() { let mut phases = vec![phase("One", vec![item("closed", TodoStatus::Completed), item("first", TodoStatus::InProgress)]), phase("Two", vec![item("second", TodoStatus::InProgress), item("third", TodoStatus::Pending)])]; normalize_todo_phases(&mut phases); assert_eq!(phases[0].tasks[1].status, TodoStatus::InProgress); assert_eq!(phases[1].tasks[0].status, TodoStatus::InProgress); phases[0].tasks[1].status = TodoStatus::Completed; phases[1].tasks[0].status = TodoStatus::Completed; normalize_todo_phases(&mut phases); assert_eq!(phases[1].tasks[1].status, TodoStatus::InProgress); }
     #[test] fn all_target_operations_update_or_remove_every_task() { let runtime = TodoRuntime::memory(); runtime.apply(init(vec![("One", vec!["a", "b"]), ("Two", vec!["c"])] )).unwrap(); runtime.apply(TodoOp::Done { task: None, phase: None }).unwrap(); assert!(runtime.state().phases.iter().flat_map(|phase| &phase.tasks).all(|task| task.status == TodoStatus::Completed)); runtime.apply(TodoOp::Drop { task: None, phase: None }).unwrap(); assert!(runtime.state().phases.iter().flat_map(|phase| &phase.tasks).all(|task| task.status == TodoStatus::Abandoned)); runtime.apply(TodoOp::Rm { task: None, phase: None, cascade: false }).unwrap(); assert!(runtime.state().phases.iter().all(|phase| phase.tasks.is_empty())); }
     #[test] fn init_and_append_reject_global_duplicates() { let runtime = TodoRuntime::memory(); assert_eq!(runtime.apply(init(vec![("Build", vec!["same", "first"]), ("Build", vec!["same"])] )).unwrap_err().to_string(), "Errors: Duplicate phase \"Build\" in init list; Duplicate task \"same\" in init list"); assert!(runtime.state().phases.is_empty()); runtime.apply(init(vec![("Build", vec!["same"])] )).unwrap(); assert_eq!(runtime.apply(TodoOp::Append { phase: "Later".to_owned(), items: vec!["same".to_owned(), "same".to_owned()] }).unwrap_err().to_string(), "Errors: Task \"same\" already exists; Task \"same\" already exists"); assert_eq!(runtime.state().phases.len(), 1); }
+    #[test]
+    fn identical_init_preserves_ids_dependencies_and_status() {
+        // P1-3: re-initializing with a semantically identical plan (same
+        // phase names and task contents) is a no-op that preserves the
+        // stable task IDs, dependency edges, and statuses — retries must
+        // never invalidate the IDs a previous call returned.
+        let runtime = TodoRuntime::memory();
+        let first = runtime.apply(init(vec![("Build", vec!["one", "two"])])).unwrap();
+        let ids = first
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.tasks)
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        runtime
+            .apply(TodoOp::UpdateDependencies {
+                task: ids[1].clone(),
+                depends_on: vec![ids[0].clone()],
+            })
+            .unwrap();
+        runtime
+            .apply(TodoOp::Done {
+                task: Some(ids[0].clone()),
+                phase: None,
+            })
+            .unwrap();
+
+        // Identical re-init: every ID, the dependency edge, and the
+        // Completed status survive untouched.
+        let second = runtime.apply(init(vec![("Build", vec!["one", "two"])])).unwrap();
+        assert_eq!(
+            second
+                .phases
+                .iter()
+                .flat_map(|phase| &phase.tasks)
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>(),
+            ids,
+            "identical re-init must preserve task IDs"
+        );
+        let state = runtime.state();
+        let tasks = state
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.tasks)
+            .collect::<Vec<_>>();
+        assert_eq!(tasks[1].depends_on, vec![ids[0].clone()]);
+        assert_eq!(tasks[0].status, TodoStatus::Completed);
+        // Task 1's only dependency is Completed, so the runtime promotes it
+        // to the active pointer (InProgress) — the identical re-init must
+        // preserve that status too.
+        assert_eq!(tasks[1].status, TodoStatus::InProgress);
+
+        // A CHANGED plan replaces atomically (fresh IDs, old state dropped).
+        let replaced = runtime
+            .apply(init(vec![("Build", vec!["one", "two", "three"])]))
+            .unwrap();
+        assert_eq!(replaced.phases[0].tasks.len(), 3);
+        assert!(
+            replaced
+                .phases
+                .iter()
+                .flat_map(|phase| &phase.tasks)
+                .all(|task| task.status != TodoStatus::Completed),
+            "a changed plan replaces the previous DAG atomically (fresh statuses)"
+        );
+        assert_eq!(
+            replaced.phases[0].tasks[0].status,
+            TodoStatus::InProgress,
+            "the replacement DAG normalizes its active pointer"
+        );
+    }
+
     #[test]
     fn invalid_identifiers_are_accumulated_and_rolled_back() {
         let runtime = TodoRuntime::memory();
@@ -370,4 +510,82 @@ mod tests {
     #[test] fn durable_graph_persists_and_reloads_with_projection() { let persisted = Arc::new(Mutex::new(None::<String>)); let seen = persisted.clone(); let runtime = TodoRuntime::with_persistence(Arc::new(|| TodoStorage::Session), Arc::new(move |state| { *seen.lock() = Some(serde_json::to_string(state)?); Ok(()) })); runtime.set_phases(vec![phase("Graph", vec![graph_item("a", "root", TodoStatus::InProgress, &[]), graph_item("b", "dependent", TodoStatus::Pending, &["a"])])]).unwrap(); runtime.apply(TodoOp::Done { task: Some("a".to_owned()), phase: None }).unwrap(); let json = persisted.lock().clone().expect("snapshot"); let restored: TodoState = serde_json::from_str(&json).unwrap(); assert_eq!(restored.phases[0].tasks[1].depends_on, vec!["a"]); assert!(restored.phases[0].tasks[1].ready); assert_eq!(restored.phases[0].tasks[1].status, TodoStatus::InProgress); }
     #[test] fn legacy_state_migration_assigns_deterministic_ids() { let legacy = serde_json::json!({"phases":[{"name":"Build","tasks":[{"content":"compile","status":"in_progress"},{"content":"test","status":"pending"}]}],"storage":"session"}); let first: TodoState = serde_json::from_value(legacy.clone()).unwrap(); let second: TodoState = serde_json::from_value(legacy).unwrap(); assert_eq!(first.phases[0].tasks[0].id, second.phases[0].tasks[0].id); assert_eq!(first.phases[0].tasks[1].id, second.phases[0].tasks[1].id); assert_ne!(first.phases[0].tasks[0].id, first.phases[0].tasks[1].id); assert!(first.phases[0].tasks.iter().all(|task| task.id.starts_with("task-"))); assert!(first.phases[0].tasks.iter().all(|task| task.ready)); }
     #[test] fn dependency_wire_names_are_public() { assert_eq!(serde_json::to_value(TodoOp::UpdateDependencies { task: "task-b".to_owned(), depends_on: vec!["task-a".to_owned()] }).unwrap(), serde_json::json!({"op":"update_dependencies","task":"task-b","dependsOn":["task-a"]})); let mut phases = vec![phase("Graph", vec![graph_item("a", "root", TodoStatus::Pending, &[]), graph_item("b", "child", TodoStatus::Pending, &["a"])])]; prepare_todo_phases(&mut phases).unwrap(); let value = serde_json::to_value(&phases[0].tasks[1]).unwrap(); assert_eq!(value["dependsOn"], serde_json::json!(["a"])); assert_eq!(value["ready"], false); assert_eq!(value["blockedBy"][0]["taskId"], "a"); }
+    #[test] fn init_carries_optional_per_item_agents_and_persists_them() {
+        let runtime = TodoRuntime::memory();
+        let result = runtime.apply(TodoOp::Init {
+            list: Some(vec![TodoInitPhase {
+                phase: "Plan".to_owned(),
+                items: vec!["仔细调研pi-coding-agent".to_owned(), "write summary".to_owned()],
+                agents: Some(vec!["researcher".to_owned(), "writer".to_owned()]),
+            }]),
+            items: None,
+            phase: None,
+        }).unwrap();
+        assert_eq!(result.phases[0].tasks[0].agent.as_deref(), Some("researcher"));
+        assert_eq!(result.phases[0].tasks[1].agent.as_deref(), Some("writer"));
+        // The typed agent survives a full serialize/deserialize round trip.
+        let wire = serde_json::to_value(&result.phases[0].tasks[0]).unwrap();
+        assert_eq!(wire["agent"], "researcher");
+        let restored: TodoItem = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.agent.as_deref(), Some("researcher"));
+        // Legacy wire states without an agent field deserialize as None.
+        let legacy = serde_json::json!({"id":"task-x","content":"plain","status":"pending","dependsOn":[],"ready":true,"blockedBy":[]});
+        let legacy_item: TodoItem = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy_item.agent, None);
+        // A task with no agent omits the field from the wire (compact).
+        let without = serde_json::to_value(phase("Plan", vec![item("plain", TodoStatus::Pending)])).unwrap();
+        assert!(without["tasks"][0].get("agent").is_none());
+    }
+    #[test] fn init_agent_count_mismatch_is_rejected_atomically() {
+        let runtime = TodoRuntime::memory();
+        let error = runtime.apply(TodoOp::Init {
+            list: Some(vec![TodoInitPhase {
+                phase: "Plan".to_owned(),
+                items: vec!["a".to_owned(), "b".to_owned()],
+                agents: Some(vec!["researcher".to_owned()]),
+            }]),
+            items: None,
+            phase: None,
+        }).unwrap_err().to_string();
+        assert!(error.contains("Agent count 1 does not match item count 2"), "{error}");
+        assert!(runtime.state().phases.is_empty(), "rejected init must roll back");
+    }
+    #[test] fn agent_typed_reinit_with_same_contents_preserves_ids_and_agent_change_regenerates() {
+        let runtime = TodoRuntime::memory();
+        let first = runtime.apply(TodoOp::Init {
+            list: Some(vec![TodoInitPhase {
+                phase: "Plan".to_owned(),
+                items: vec!["调研".to_owned()],
+                agents: Some(vec!["researcher".to_owned()]),
+            }]),
+            items: None,
+            phase: None,
+        }).unwrap();
+        let id = first.phases[0].tasks[0].id.clone();
+        // Identical re-init (same content + same agent) is a no-op: the
+        // stable task ID is preserved.
+        let second = runtime.apply(TodoOp::Init {
+            list: Some(vec![TodoInitPhase {
+                phase: "Plan".to_owned(),
+                items: vec!["调研".to_owned()],
+                agents: Some(vec!["researcher".to_owned()]),
+            }]),
+            items: None,
+            phase: None,
+        }).unwrap();
+        assert_eq!(second.phases[0].tasks[0].id, id);
+        // A re-init that drops or changes the typed agent is a NEW plan and
+        // regenerates the task.
+        let third = runtime.apply(TodoOp::Init {
+            list: Some(vec![TodoInitPhase {
+                phase: "Plan".to_owned(),
+                items: vec!["调研".to_owned()],
+                agents: None,
+            }]),
+            items: None,
+            phase: None,
+        }).unwrap();
+        assert_ne!(third.phases[0].tasks[0].id, id);
+        assert_eq!(third.phases[0].tasks[0].agent, None);
+    }
 }

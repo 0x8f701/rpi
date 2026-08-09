@@ -38,6 +38,7 @@ fn run_json_mode(prompt: &str) -> (Vec<Value>, Output) {
         .env("PI_SKIP_VERSION_CHECK", "1")
         .env("PI_FAUX_RESPONSE", FAUX_TEXT)
         .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("PI_PROFILE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

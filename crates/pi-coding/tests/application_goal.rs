@@ -344,6 +344,38 @@ async fn active_goal_is_projected_once_to_provider_but_never_persisted_or_displa
 }
 
 #[tokio::test]
+async fn goal_pins_are_projected_into_the_goal_turn_context() {
+    let _registry_guard = FAUX_REGISTRY_LOCK.lock().expect("faux registry lock");
+    let directory = tempfile::tempdir().expect("cwd");
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let (session, registration) = capturing_session(directory.path(), contexts.clone(), 1);
+    let runtime = session.goal_runtime();
+    runtime.create("pinned change", Some(100)).expect("create goal");
+    runtime.pin("keep <safely> & in scope").expect("pin with escapes");
+    runtime.pin("follow the omp skill-card style").expect("second pin");
+    session.run("work", Vec::new()).await.expect("pinned turn");
+
+    let contexts = contexts.lock().expect("contexts");
+    assert_eq!(contexts.len(), 1);
+    let provider_text = context_text(&contexts[0]);
+    assert!(
+        provider_text.contains("Role-model pins:"),
+        "pins must be projected into the goal turn context: {provider_text}"
+    );
+    assert!(
+        provider_text.contains("1. keep &lt;safely&gt; &amp; in scope"),
+        "pins must be XML-escaped like the objective: {provider_text}"
+    );
+    assert!(
+        provider_text.contains("2. follow the omp skill-card style"),
+        "numbered pin listing: {provider_text}"
+    );
+    assert_eq!(provider_text.matches("Role-model pins:").count(), 1);
+    drop(contexts);
+    registration.unregister();
+}
+
+#[tokio::test]
 async fn goal_projection_refreshes_lifecycle_revision_and_usage_on_each_provider_call() {
     let _registry_guard = FAUX_REGISTRY_LOCK.lock().expect("faux registry lock");
     let directory = tempfile::tempdir().expect("cwd");

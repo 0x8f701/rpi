@@ -6,5 +6,7 @@ printf '%s\n' '[CI deterministic]'
 "$SCRIPT_DIR/ci.sh" list
 printf '%s\n' '[Release]'
 "$SCRIPT_DIR/release.sh" list
+printf '%s\n' '[Web client (playwright-only hard gate)]'
+"$SCRIPT_DIR/web/run.sh" list
 printf '%s\n' '[Nightly/manual live model]'
 "$SCRIPT_DIR/nightly.sh" list

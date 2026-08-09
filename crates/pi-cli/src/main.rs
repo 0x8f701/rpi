@@ -10,6 +10,11 @@ use pi_cli::Cli;
 
 #[tokio::main]
 async fn main() {
+    // Best-effort parent-process hardening (non-dumpable, no core dumps) runs
+    // before anything else so no path — panic hook, arg parsing, dispatch —
+    // executes in an unprotected state. cfg-guarded and failure-ignored, so
+    // unsupported platforms start normally.
+    pi_cli::harden_process();
     // Install the terminal-restoring panic hook before any dispatch so every
     // path (TUI, RPC, JSON, print, subcommands) is covered. It is a no-op
     // outside the TUI: `TUI_ACTIVE` stays false for structured-output modes,

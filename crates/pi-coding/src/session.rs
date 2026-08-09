@@ -11,12 +11,13 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use parking_lot::{Mutex, RwLock};
+use sha2::{Digest, Sha256};
 use pi_agent::{
     AbortController, AbortSignal, AfterToolCallFn, AfterToolCallResult, Agent, AgentEvent,
-    AgentOptions, AgentState, AgentTool, BeforeToolCallFn, QueueMode, StreamFn, Subscription,
-    ThinkingLevel,
+    AgentOptions, AgentState, AgentTool, BeforeToolCallFn, QueueMode, ShouldStopAfterTurnFn,
+    StreamFn, Subscription, ThinkingLevel,
 };
 use pi_ai::{
     AssistantMessageEvent, BashExecutionMessage, CacheRetention, ContentBlock, Context,
@@ -28,13 +29,17 @@ use uuid::Uuid;
 
 use crate::system_prompt::BuildSystemPromptOptions;
 use crate::{
-    BashProcessContext, CompactionDetails, CompactionResult, CompactionSettings, GoalLifecycle,
-    GoalRuntime, GoalState, ProcessManager, ProcessOwnerId, RequestAuth, ResourceManager,
-    SessionRecorder,
+    AskRuntime, BashProcessContext, CompactionDetails, CompactionResult, CompactionSettings,
+    GoalLifecycle, GoalRuntime, GoalState, HANDOFF_PROSE_RESERVE_TOKENS,
+    HANDOFF_SUMMARIZE_TIMEOUT, HANDOFF_SYSTEM_PROMPT, Handoff, HostHooks, JobSnapshot,
+    ProcessManager, ProcessOwnerId, RequestAuth, ResourceManager, SessionEntry, SessionRecorder,
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
     UPDATE_SUMMARIZATION_PROMPT, TodoApplyResult, TodoOp, TodoPhase, TodoRuntime, TodoState,
-    TodoStorage, apply_checkpoint, build_system_prompt, compute_file_lists, create_todo_tool,
-    estimate_context_tokens_usage_aware, find_cut_point, format_file_operations,
+    TodoStorage, apply_checkpoint, build_snapcompact_summary, build_system_prompt,
+    compute_file_lists, create_todo_tool, elide_useless_results, elided_note,
+    estimate_context_tokens, estimate_context_tokens_usage_aware, find_cut_point,
+    find_snap_cut_point,
+    format_file_operations, handoff_envelope, handoff_prose_prompt,
     ActiveRetryFallbackState, CatalogModelLookup, RetryFallbackModelLookup,
     RetryFallbackResolutionContext, aggregate_retry_diagnostics, find_retry_fallback_candidates,
     format_retry_fallback_selector, is_context_overflow, is_hard_error_fallback_eligible,
@@ -158,15 +163,137 @@ struct SessionRuntime {
     recorded_count: AtomicUsize,
     stream_fn: StreamFn,
     auth_resolver: Option<SessionAuthResolver>,
+    /// Namespace of the extension runtime bound to this session (set by the
+    /// Application when it attaches the runtime). Stream dispatch resolves
+    /// extension-owned provider apis strictly within this namespace. Shared
+    /// with the namespace-aware stream wrapper built before construction.
+    provider_namespace: Arc<RwLock<Option<String>>>,
     selector_settings: RwLock<crate::SelectorSettings>,
     selector_skills: RwLock<Vec<crate::Skill>>,
     selector_agents: RwLock<Vec<crate::AgentDefinition>>,
     branch_summary: RwLock<crate::EffectiveBranchSummarySettings>,
     expose_session_environment: AtomicBool,
     last_selection: RwLock<Option<crate::SelectionPlan>>,
+    /// One-entry cache for hindsight memory injection. The key is a stable
+    /// SHA-256 fingerprint of the normalized request and every effective
+    /// memory setting that can affect recall or its security boundary. Secret
+    /// material is retained only inside the digest, never in cache state.
+    hindsight_injection_cache: RwLock<Option<HindsightInjectionCacheEntry>>,
+    session_id: String,
+    host_hooks: RwLock<Option<Arc<HostHooks>>>,
+    extension_tool_names: RwLock<HashSet<String>>,
+    session_started: AtomicBool,
     /// Detached bash success-path spill files owned by this session.
     /// Cleaned via [`Session::cleanup_bash_spills`] / Drop — never process-wide drain.
     bash_spill_paths: Mutex<HashSet<String>>,
+    /// Interactive `ask` tool round trip (single-pending question slot).
+    ask: AskRuntime,
+    /// Doom-loop recovery: consecutive identical tool failures end the turn
+    /// instead of letting the model retry the same failing call forever.
+    doom_loop: Mutex<DoomLoopTracker>,
+}
+struct HindsightInjectionCacheEntry {
+    key: [u8; 32],
+    body: String,
+}
+
+fn hindsight_injection_cache_key(config: &crate::MemoryConfig, request: &str) -> [u8; 32] {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(value);
+    }
+    fn optional_field(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                field(hasher, value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"pi-hindsight-injection-cache-v1\0");
+    hasher.update([match config.backend {
+        crate::MemoryBackend::Off => 0,
+        crate::MemoryBackend::Local => 1,
+        crate::MemoryBackend::Hindsight => 2,
+    }]);
+    optional_field(&mut hasher, config.hindsight_api_url.as_deref());
+    optional_field(&mut hasher, config.hindsight_api_token.as_deref());
+    hasher.update([u8::from(config.hindsight_allow_insecure)]);
+    field(&mut hasher, config.hindsight_bank_id.as_bytes());
+    optional_field(&mut hasher, config.hindsight_bank_id_prefix.as_deref());
+    hasher.update([match config.hindsight_scoping {
+        crate::HindsightScoping::Global => 0,
+        crate::HindsightScoping::PerProject => 1,
+        crate::HindsightScoping::PerProjectTagged => 2,
+    }]);
+    optional_field(&mut hasher, config.hindsight_bank_mission.as_deref());
+    optional_field(&mut hasher, config.hindsight_retain_mission.as_deref());
+    hasher.update([u8::from(config.hindsight_injection)]);
+    hasher.update([match config.hindsight_recall_budget {
+        crate::HindsightBudget::Low => 0,
+        crate::HindsightBudget::Mid => 1,
+        crate::HindsightBudget::High => 2,
+    }]);
+    hasher.update(config.hindsight_recall_max_tokens.to_le_bytes());
+    hasher.update(u64::try_from(config.hindsight_recall_types.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for recall_type in &config.hindsight_recall_types {
+        field(&mut hasher, recall_type.as_bytes());
+    }
+    hasher.update(config.hindsight_request_timeout_ms.to_le_bytes());
+    hasher.update(config.hindsight_recall_timeout_ms.to_le_bytes());
+    hasher.update(config.hindsight_retain_timeout_ms.to_le_bytes());
+    hasher.update(config.hindsight_reflect_timeout_ms.to_le_bytes());
+    field(&mut hasher, request.trim().as_bytes());
+    hasher.finalize().into()
+}
+
+/// Consecutive identical (tool, error-prefix) tool failures required to stop
+/// a turn as a doom loop.
+const DOOM_LOOP_THRESHOLD: usize = 3;
+/// Character budget used to fingerprint a tool error for repetition matching.
+const DOOM_LOOP_ERROR_PREFIX_CHARS: usize = 80;
+
+/// Tool errors that look transient (network/timeout blips) never trip the
+/// doom-loop detector: the same call may legitimately succeed on the next
+/// attempt, so they must not count toward the threshold.
+const TRANSIENT_TOOL_ERROR_MARKERS: &[&str] = &[
+    "timed out",
+    "timeout",
+    "failed to connect",
+    "unable to access",
+    "connection reset",
+    "connection refused",
+    "network",
+    "temporarily",
+    "transient",
+];
+
+/// Identity of the run of identical failures currently being tracked.
+struct DoomLoopState {
+    tool: String,
+    error_prefix: String,
+    count: usize,
+}
+
+/// Per-turn doom-loop recovery state. Reset at the start of every turn.
+#[derive(Default)]
+struct DoomLoopTracker {
+    /// The consecutive identical (tool, error-prefix) failure run, if any.
+    current: Option<DoomLoopState>,
+    /// Set once the threshold trips: every further tool outcome in this turn
+    /// terminates with this message (so a parallel batch cannot escape the
+    /// stop), and the turn errors out with it.
+    triggered_message: Option<String>,
+}
+
+impl DoomLoopTracker {
+    fn reset(&mut self) {
+        self.current = None;
+        self.triggered_message = None;
+    }
 }
 
 struct CompactionActivityGuard {
@@ -186,6 +313,16 @@ impl Drop for CompactionActivityGuard {
     }
 }
 
+/// Upper bound for a single compaction/branch summarization provider call.
+///
+/// Provider SSE bodies are intentionally uncapped in `pi-ai` (only
+/// time-to-headers is bounded), so a server that sends headers and then never
+/// terminates the body would otherwise hang `/compact` and automatic
+/// compaction forever while holding the session's exclusive run slot. A
+/// legitimately long summary of a huge conversation finishes well inside this
+/// bound; a stalled provider fails with an actionable error instead.
+const COMPACTION_SUMMARIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 struct SessionInner {
     cwd: PathBuf,
     session_dir: RwLock<PathBuf>,
@@ -201,7 +338,16 @@ struct SessionInner {
     run_slot: Mutex<RunSlot>,
     idle: Notify,
     abort_notify: Notify,
-    resources: RwLock<Option<ResourceManager>>,
+    /// Arc-shared so the bash sandbox resolver can read live settings from the
+    /// current resource snapshot on every spawn (RELOAD semantics).
+    resources: Arc<RwLock<Option<ResourceManager>>>,
+    /// Live path-permission-rule source for file-touching tools (the `lsp`
+    /// tool's rename preflight). Set from the attached resource manager on
+    /// `attach_resources` (same live data the host approval hook consults);
+    /// orchestration children inherit the parent's source explicitly.
+    permission_rules: RwLock<Option<crate::PermissionRulesSource>>,
+    /// Resolves `settings.sandbox` for bash spawns (tool and RPC paths).
+    sandbox_resolver: crate::SandboxConfigFn,
     bash_controller: Mutex<Option<ActiveBash>>,
     bash_generation: AtomicU64,
     bash_append_lock: tokio::sync::Mutex<()>,
@@ -210,6 +356,9 @@ struct SessionInner {
     process_owner_id: ProcessOwnerId,
     skill_snapshot: Arc<RwLock<Vec<crate::Skill>>>,
     todo: TodoRuntime,
+    /// Session-scoped MCP server registry; configured from settings on every
+    /// resource load so `mcpServers` changes take effect on reload.
+    mcp: crate::mcp::McpRegistry,
 }
 
 struct ActiveBash {
@@ -333,6 +482,7 @@ pub(crate) struct SessionResourceUpdate {
     agents: Vec<crate::AgentDefinition>,
     selector_settings: crate::SelectorSettings,
     runtime_settings: crate::RuntimeSettingsSnapshot,
+    hooks: Vec<crate::HookConfig>,
 }
 
 pub struct PreparedSessionReplacement {
@@ -432,6 +582,8 @@ pub enum SessionEvent {
     SummarizationRetryAttemptStart { source: SummarizationSource, #[serde(skip_serializing_if = "Option::is_none")] reason: Option<CompactionReason> },
     SummarizationRetryFinished,
     QueueUpdate { steering: Vec<Message>, follow_up: Vec<Message> },
+    AskUser { id: String, prompt: String },
+    AskUserResolved { id: String },
     EntryAppended { entry: crate::SessionEntry },
     SessionInfoChanged { name: Option<String> },
     ThinkingLevelChanged { thinking_level: ThinkingLevel },
@@ -500,6 +652,50 @@ pub struct NavigateTreeResult {
     pub cancelled: bool,
 }
 
+/// Where a `/rewind` rolls the session back to.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RewindTarget {
+    /// Keep the first `index` records (drop record `index` and everything
+    /// after it). `index` is the 0-based position in the session record file
+    /// as shown by the bare `/rewind` listing.
+    Index(usize),
+    /// Roll back to the record the named checkpoint points at (the position
+    /// that was current when `/checkpoint <name>` was recorded).
+    Checkpoint(String),
+}
+
+/// Outcome of a session-level rewind.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindOutcome {
+    /// Sidecar JSONL file holding the truncated tail records.
+    pub archive_path: PathBuf,
+    /// Number of records dropped by the truncation.
+    pub dropped_entries: usize,
+    /// Number of records retained after the truncation.
+    pub retained_entries: usize,
+    /// The resolved checkpoint name when the rewind targeted a checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// One row of the bare `/rewind` picker: record index plus a first-line
+/// preview so the user can choose an entry to roll back to.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindEntryPreview {
+    pub index: usize,
+    pub entry_type: String,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_target_id: Option<String>,
+}
+
 
 fn goal_context_message(state: &GoalState) -> Option<Message> {
     let goal = state
@@ -516,10 +712,17 @@ fn goal_context_message(state: &GoalState) -> Option<Message> {
     let budget = goal
         .token_budget
         .map_or_else(|| "unlimited".to_owned(), |budget| budget.to_string());
-    let content = format!(
-        "<system-reminder>\nActive session goal (revision {}, lifecycle {lifecycle}).\nObjective: {objective}\nToken budget: {}/{budget}.\nKeep this goal in scope. Use the goal tool to inspect, pause, or complete it when appropriate.\n</system-reminder>",
+    let mut content = format!(
+        "<system-reminder>\nActive session goal (revision {}, lifecycle {lifecycle}).\nObjective: {objective}\nToken budget: {}/{budget}.\n",
         state.revision, goal.usage.tokens_used
     );
+    if !goal.pins.is_empty() {
+        content.push_str("Role-model pins:\n");
+        for (index, pin) in goal.pins.iter().enumerate() {
+            content.push_str(&format!("{}. {}\n", index + 1, escape_goal_objective(pin)));
+        }
+    }
+    content.push_str("Keep this goal in scope. Use the goal tool to inspect, pause, or complete it when appropriate.\n</system-reminder>");
     Some(Message::Custom(CustomMessage {
         custom_type: ACTIVE_GOAL_CUSTOM_TYPE.to_owned(),
         content: content.into(),
@@ -573,6 +776,16 @@ pub struct ChildSessionOptionsSnapshot {
     pub stream_options: SimpleStreamOptions,
     pub stream_fn: StreamFn,
     pub auth_resolver: Option<SessionAuthResolver>,
+    /// Resolves the sandbox configuration for subagent children's process
+    /// spawns from live settings (`settings.orchestration.sandboxed` plus
+    /// `settings.sandbox`). `None` keeps children unsandboxed (the default).
+    pub sandbox: Option<crate::SandboxConfigFn>,
+    /// Resolves the parent's live memory backend for future child spawns.
+    pub memory: Option<crate::MemoryConfigFn>,
+    /// The session's live path-permission-rule source, inherited by children
+    /// so their `lsp` tool's rename preflight obeys the same rules as the
+    /// parent's host approval.
+    pub permission_rules: Option<crate::PermissionRulesSource>,
 }
 
 #[derive(Clone)]
@@ -767,6 +980,7 @@ impl Session {
         let cwd = workspace.cwd().to_path_buf();
         let cwd_text = cwd.to_string_lossy().into_owned();
         let custom_tools = options.tools;
+        let ambient_tool_set = custom_tools.is_none();
         let custom_prompt = options.system_prompt;
         let before_tool_call = options.before_tool_call;
         let after_tool_call = if todo_enabled {
@@ -778,6 +992,39 @@ impl Session {
         let effective_stream_fn = options
             .stream_fn
             .unwrap_or_else(|| AgentOptions::default().stream_fn);
+        // Namespace-aware provider dispatch: when an extension runtime is
+        // bound to this session (`Session::set_provider_namespace`), a model
+        // whose api is owned by an extension runtime resolves strictly within
+        // that runtime's namespace — its own closure, or a contextual
+        // fail-closed error, never another runtime's registration. Apis that
+        // are not extension-owned (builtins, unknown) fall through to the
+        // base stream function unchanged, so builtin credential resolution
+        // and custom stream fns keep their exact behavior. The namespace cell
+        // is shared with `SessionRuntime`, so the wrapper is built here —
+        // before the shared runtime — and `SessionRuntime.stream_fn` (the
+        // child-session snapshot path) carries it too.
+        let provider_namespace: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+        let namespace_cell = provider_namespace.clone();
+        let base_stream = effective_stream_fn.clone();
+        let effective_stream_fn: StreamFn = Arc::new(
+            move |model: Model, context: Context, options: SimpleStreamOptions| {
+                let Some(namespace) = namespace_cell.read().clone() else {
+                    return base_stream(model, context, options);
+                };
+                let base_stream = base_stream.clone();
+                Box::pin(async move {
+                    match pi_ai::resolve_extension_provider(&model.api, Some(&namespace)) {
+                        Ok(Some(provider)) => {
+                            (provider.stream_simple)(model, context, options).await
+                        }
+                        Ok(None) => base_stream(model, context, options).await,
+                        Err(scope_error) => {
+                            provider_scope_error_stream(&model, &scope_error).await
+                        }
+                    }
+                })
+            },
+        );
         let model = options.model;
         let api_key = options.api_key;
         let compaction = options.compaction;
@@ -793,6 +1040,7 @@ impl Session {
         let process_manager = ProcessManager::new();
         let process_owner_id = ProcessOwnerId::new(session_id.clone());
         let (events, _) = broadcast::channel(512);
+        let ask_runtime = AskRuntime::new(events.clone());
         let shared = Arc::new(SessionRuntime {
             state: RwLock::new(SessionState {
                 model: model.clone(),
@@ -815,11 +1063,13 @@ impl Session {
             retry_attempt: AtomicUsize::new(0),
             active_retry_fallback: Mutex::new(None),
             fallback_attempt_errors: Mutex::new(Vec::new()),
+            doom_loop: Mutex::new(DoomLoopTracker::default()),
             events,
             stream_options: RwLock::new(stream_options.clone()),
             recorded_count: AtomicUsize::new(0),
             stream_fn: effective_stream_fn.clone(),
             auth_resolver: auth_resolver.clone(),
+            provider_namespace: provider_namespace.clone(),
             selector_settings: RwLock::new(crate::SelectorSettings::default()),
             selector_skills: RwLock::new(Vec::new()),
             selector_agents: RwLock::new(Vec::new()),
@@ -829,7 +1079,13 @@ impl Session {
             }),
             expose_session_environment: AtomicBool::new(true),
             last_selection: RwLock::new(None),
+            hindsight_injection_cache: RwLock::new(None),
+            session_id: session_id.clone(),
+            host_hooks: RwLock::new(None),
+            extension_tool_names: RwLock::new(HashSet::new()),
+            session_started: AtomicBool::new(false),
             bash_spill_paths: Mutex::new(HashSet::new()),
+            ask: ask_runtime,
         });
         let storage_shared = shared.clone();
         let persist_shared = shared.clone();
@@ -848,6 +1104,9 @@ impl Session {
                 Ok(())
             }),
         );
+        // Session-scoped MCP server registry: spawn on first use, kill on
+        // drop. Resource loads call `configure` from `settings.mcpServers`.
+        let mcp_registry = crate::mcp::McpRegistry::new();
         let env_runtime = shared.clone();
         let session_env: crate::SessionEnvFn = Arc::new(move || {
             if !env_runtime.expose_session_environment.load(Ordering::Acquire) {
@@ -872,6 +1131,28 @@ impl Session {
             }
             env
         });
+        // Bash sandbox resolver: reads the live settings snapshot on every
+        // spawn so `sandbox.enabled/network/allowedPaths/deniedPaths` changes
+        // apply to the next command (RELOAD apply behavior — sandbox flags
+        // apply per spawn). Tool sets built without a resolver (standalone
+        // construction) still support the per-call `sandboxed` parameter with
+        // default allowed paths (cwd + agent dir).
+        let resources_cell: Arc<RwLock<Option<crate::ResourceManager>>> =
+            Arc::new(RwLock::new(None));
+        let sandbox_runtime = resources_cell.clone();
+        let sandbox_cwd = cwd.clone();
+        let sandbox_resolver: crate::SandboxConfigFn = Arc::new(move || {
+            let resources = sandbox_runtime.read();
+            let Some(resources) = resources.as_ref() else {
+                return None;
+            };
+            let snapshot = resources.snapshot();
+            crate::sandbox::resolve(
+                snapshot.settings.sandbox.as_ref(),
+                &sandbox_cwd,
+                &crate::agent_dir_path(),
+            )
+        });
         let include_project_resources = resource_discovery == ResourceDiscovery::TrustedProject;
         let initial_skills = match resource_discovery {
             ResourceDiscovery::Disabled => Vec::new(),
@@ -891,6 +1172,78 @@ impl Session {
         let skill_provider: crate::SkillSnapshotFn =
             Arc::new(move || skills_runtime.read().clone());
 
+        // Memory backend resolver: reads the live settings snapshot so
+        // `settings.memory.backend/hindsight*` changes apply to the next tool
+        // rebuild (RELOAD) and to turn-start injection. Before resources are
+        // attached the resolver returns `None` and the built-in `local`
+        // backend is used; `attach_resources` reconciles the tool set against
+        // the actual settings.
+        let memory_runtime = resources_cell.clone();
+        let memory_resolver: crate::MemoryConfigFn = Arc::new(move || {
+            let resources = memory_runtime.read();
+            let resources = resources.as_ref()?;
+            Some(resources.snapshot().settings.memory_config())
+        });
+
+        // Image-generation resolver: resolves the `generate_image` tool's
+        // model, endpoint overrides, and credential from live settings
+        // (`images.genModel`/`genBaseUrl`/`genApiKey`), the active session
+        // model, and the session auth resolver — mirroring how streaming
+        // resolves its model + key. Reads settings per call so a settings
+        // reload applies to the next generation. Before resources are
+        // attached the resolver falls back to the session model + auth.
+        let image_gen_runtime = shared.clone();
+        let image_gen_auth = auth_resolver.clone();
+        let image_gen_settings = resources_cell.clone();
+        let image_gen_resolver: crate::ImageGenConfigFn = Arc::new(move |spec: Option<String>| {
+            let state = image_gen_runtime.clone();
+            let auth = image_gen_auth.clone();
+            let settings = image_gen_settings.clone();
+            Box::pin(async move {
+                let runtime = settings.read().as_ref().map(|resources| {
+                    resources.snapshot().settings.image_gen_runtime()
+                });
+                // Model: explicit `model` argument > settings images.genModel
+                // > the active session model.
+                let model = if let Some(spec) = spec {
+                    crate::resolve_model(&spec)
+                        .map_err(|error| anyhow!("{error}"))?
+                } else if let Some(spec) = runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.gen_model.clone())
+                {
+                    crate::resolve_model(&spec)
+                        .map_err(|error| anyhow!("{error}"))?
+                } else {
+                    state.state.read().model.clone()
+                };
+                // Credential: settings images.genApiKey > session auth
+                // resolver > the session's last resolved api key.
+                let api_key = if let Some(key) = runtime
+                    .as_ref()
+                    .map(|runtime| runtime.gen_api_key.clone())
+                    .filter(|key| !key.trim().is_empty())
+                {
+                    Some(key)
+                } else if let Some(resolver) = auth.as_ref() {
+                    let auth = resolver(model.clone()).await?;
+                    Some(auth.api_key)
+                } else if !state.state.read().api_key.trim().is_empty() {
+                    Some(state.state.read().api_key.clone())
+                } else {
+                    None
+                };
+                Ok(crate::ImageGenConfig {
+                    model,
+                    base_url: runtime
+                        .as_ref()
+                        .map(|runtime| runtime.gen_base_url.clone())
+                        .filter(|base| !base.trim().is_empty()),
+                    api_key,
+                })
+            })
+        });
+
         let base_tools = custom_tools.unwrap_or_else(|| {
             crate::create_coding_tools_for_workspace_with_context_and_resolver(
                 workspace.clone(),
@@ -901,11 +1254,27 @@ impl Session {
                     owner_id: process_owner_id.clone(),
                 }),
                 uri_resolver,
+                Some(sandbox_resolver.clone()),
+                Some(memory_resolver.clone()),
+                Some(image_gen_resolver.clone()),
             )
         });
         let mut available_tools = merge_tools(&base_tools, additional_tools)?;
         if todo_enabled {
             available_tools.push(create_todo_tool(todo.clone()));
+        }
+        // The interactive `ask` tool joins ambient (default) tool sets only.
+        // Callers that pass an explicit `options.tools` list keep full control
+        // and opt into `ask` themselves: background subagents and read-only
+        // forks shouldn't carry an interactive question tool. Non-interactive
+        // frontends reject it up front regardless.
+        if ambient_tool_set && !available_tools.iter().any(|tool| tool.name == "ask") {
+            available_tools.push(crate::tools::ask::session_ask_tool(shared.ask.clone()));
+        }
+        // The `mcp` tool joins ambient tool sets bound to a session-scoped
+        // registry; resource loads configure it from `settings.mcpServers`.
+        if ambient_tool_set && !available_tools.iter().any(|tool| tool.name == "mcp") {
+            available_tools.push(crate::mcp::mcp_tool(mcp_registry.clone()));
         }
         let process_requested = selection.enable_process
             || selection
@@ -988,6 +1357,8 @@ impl Session {
             effective_stream_fn.clone()
         };
         let goal_runtime = shared.clone();
+        let before_tool_call = compose_host_pre_tool_call(shared.clone(), before_tool_call);
+        let after_tool_call = compose_host_post_tool_call(shared.clone(), after_tool_call);
         let agent = Agent::new(AgentOptions {
             initial_state: AgentState {
                 system_prompt: system_prompt.clone(),
@@ -1042,7 +1413,9 @@ impl Session {
                 _history_subscription: history_subscription,
                 run_slot: Mutex::new(RunSlot::default()),
                 idle: Notify::new(),
-                resources: RwLock::new(None),
+                resources: resources_cell,
+                permission_rules: RwLock::new(None),
+                sandbox_resolver,
                 bash_controller: Mutex::new(None),
                 bash_generation: AtomicU64::new(0),
                 bash_append_lock: tokio::sync::Mutex::new(()),
@@ -1051,6 +1424,7 @@ impl Session {
                 process_owner_id,
                 skill_snapshot,
                 todo,
+                mcp: mcp_registry,
             }),
         })
     }
@@ -1112,7 +1486,55 @@ impl Session {
             stream_options: self.inner.shared.stream_options.read().clone(),
             stream_fn: self.inner.shared.stream_fn.clone(),
             auth_resolver: self.inner.shared.auth_resolver.clone(),
+            sandbox: self.child_sandbox_resolver(),
+            memory: Some(self.memory_config_resolver()),
+            permission_rules: self.permission_rules_source(),
         }
+    }
+
+    /// Resolver that confines subagent children's process spawns (their bash
+    /// tool) to the filesystem sandbox when `settings.orchestration.sandboxed`
+    /// is enabled. Allowed paths are the workspace (`cwd`), the agent
+    /// directory, and `settings.sandbox.allowedPaths`; denied paths and the
+    /// network flag come from `settings.sandbox`. Reads live settings per
+    /// spawn (RELOAD semantics, like the bash sandbox resolver); returns
+    /// `None` when the flag is off or no resource manager is attached, which
+    /// keeps the current unsandboxed behavior.
+    fn child_sandbox_resolver(&self) -> Option<crate::SandboxConfigFn> {
+        let resources = self.inner.resources.clone();
+        let cwd = self.inner.cwd.clone();
+        let agent_dir = crate::agent_dir_path();
+        Some(Arc::new(move || {
+            let resources = resources.read();
+            let Some(resources) = resources.as_ref() else {
+                return None;
+            };
+            let snapshot = resources.snapshot();
+            let orchestration = snapshot.settings.orchestration.as_ref()?;
+            if !orchestration.sandboxed.unwrap_or(false) {
+                return None;
+            }
+            let mut config = crate::sandbox::resolve(
+                snapshot.settings.sandbox.as_ref(),
+                &cwd,
+                &agent_dir,
+            )
+            .unwrap_or_else(|| crate::SandboxConfig::default_for(&cwd, &agent_dir));
+            // Union semantics: the workspace and agent directory are always
+            // visible to children, on top of any configured allowedPaths.
+            for path in [&cwd, &agent_dir] {
+                if !config.allowed_paths.iter().any(|allowed| allowed == path) {
+                    config.allowed_paths.push(path.clone());
+                }
+            }
+            config.enabled = true;
+            Some(config)
+        }))
+    }
+
+    fn memory_config_resolver(&self) -> crate::MemoryConfigFn {
+        let resources = self.inner.resources.clone();
+        Arc::new(move || resources.read().as_ref().map(|manager| manager.snapshot().settings.memory_config()))
     }
 
 
@@ -1156,6 +1578,12 @@ impl Session {
             .is_some_and(|settings| settings.enabled)
     }
 
+    /// Current selector settings, including the auto-mode classifier knob.
+    #[must_use]
+    pub fn selector_settings(&self) -> crate::SelectorSettings {
+        self.inner.shared.selector_settings.read().clone()
+    }
+
     #[must_use]
     pub fn session_name(&self) -> Option<String> {
         self.inner.shared.session_name.read().clone()
@@ -1166,7 +1594,8 @@ impl Session {
         if let Some(recorder) = self.inner.shared.recorder.lock().as_ref().cloned() {
             recorder.record_session_name(normalized.as_deref().unwrap_or_default())?;
         }
-        *self.inner.shared.session_name.write() = normalized;
+        *self.inner.shared.session_name.write() = normalized.clone();
+        self.publish_session_event(SessionEvent::SessionInfoChanged { name: normalized });
         Ok(())
     }
 
@@ -1268,6 +1697,23 @@ impl Session {
         let id = recorder.record_custom_entry(custom_type, data)?;
         self.publish_recorded_entry(&recorder, &id)?;
         Ok(id)
+    }
+
+    /// Recorder-authoritative bounded snapshot for live collaboration guests.
+    ///
+    /// Reads the current recorder's full session tree (the same authoritative
+    /// history the session is built from) and projects it through
+    /// [`crate::collab::public_snapshot`]: the most recent entries bounded by
+    /// `max_entries`/`max_bytes`, with the host filesystem path and other
+    /// host-side metadata excluded. Errors are path-free and secret-free.
+    pub fn collab_public_snapshot(
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<serde_json::Value> {
+        let recorder = self.current_recorder()?;
+        let tree = recorder.tree()?;
+        crate::collab::public_snapshot(&tree, max_entries, max_bytes)
     }
 
     async fn append_idle_message(&self, message: Message) -> Result<()> {
@@ -1372,8 +1818,31 @@ impl Session {
         let tools = self.inner.tools.read().clone();
         let update = self.prepare_resource_update_with_tools(resources.snapshot(), tools)?;
         self.commit_resource_update(update).await;
+        // The permission-rule source reads the live settings manager on every
+        // call — the same live data the host approval hook consults — so
+        // `permissionRules` changes apply on reload without a session restart.
+        let rules_resources = resources.clone();
+        *self.inner.permission_rules.write() = Some(Arc::new(move || {
+            rules_resources.settings_manager().permission_rules()
+        }));
         *self.inner.resources.write() = Some(resources);
         Ok(())
+    }
+
+    /// Replaces the session's live permission-rule source. Orchestration
+    /// children inherit the parent's source this way when they never attach a
+    /// resource manager of their own, so their `lsp` rename preflight obeys
+    /// the same rules as the parent's host approval.
+    pub fn set_permission_rules(&self, source: Option<crate::PermissionRulesSource>) {
+        *self.inner.permission_rules.write() = source;
+    }
+
+    /// The session's live path-permission-rule source (the data the host
+    /// approval hook and the `lsp` tool's rename preflight consult), or `None`
+    /// before resources attach / when no source was inherited.
+    #[must_use]
+    pub fn permission_rules_source(&self) -> Option<crate::PermissionRulesSource> {
+        self.inner.permission_rules.read().clone()
     }
 
     #[must_use]
@@ -1468,7 +1937,21 @@ impl Session {
                 self.inner.workspace.clone(),
             ));
         }
+        if !additional_tools.iter().any(|tool| tool.name == "mcp")
+            && !self.inner.base_tools.iter().any(|tool| tool.name == "mcp")
+        {
+            additional_tools.push(crate::mcp::mcp_tool(self.inner.mcp.clone()));
+        }
         let all_tools = merge_tools(&self.inner.base_tools, additional_tools)?;
+        // Memory tools follow the live `settings.memory.backend` (off/local/
+        // hindsight); the base tools built before resources attach default to
+        // `local`, so reconcile here and on reload.
+        let all_tools = reconcile_memory_tools(
+            all_tools,
+            snapshot.settings.memory_config(),
+            &self.inner.cwd,
+            Some(self.session_env()),
+        );
         let tools = select_tools(all_tools.clone(), &self.inner.tool_selection)?;
         self.prepare_resource_update_with_runtime(
             snapshot,
@@ -1484,6 +1967,12 @@ impl Session {
         tools: Vec<AgentTool>,
     ) -> Result<SessionResourceUpdate> {
         let runtime_settings = snapshot.settings.runtime_settings()?;
+        let tools = reconcile_memory_tools(
+            tools,
+            snapshot.settings.memory_config(),
+            &self.inner.cwd,
+            Some(self.session_env()),
+        );
         self.prepare_resource_update_with_runtime(snapshot, tools, None, runtime_settings)
     }
 
@@ -1497,6 +1986,9 @@ impl Session {
         if self.inner.run_slot.lock().active {
             return Err(anyhow!("cannot reload resources while session is processing"));
         }
+        // Reflect settings.mcpServers into the session-scoped registry; live
+        // sessions with unchanged configuration survive the reload.
+        self.inner.mcp.configure(snapshot.settings.mcp_servers.clone());
         let custom_prompt = snapshot
             .system_prompt
             .clone()
@@ -1546,6 +2038,7 @@ impl Session {
             agents,
             selector_settings: snapshot.settings.selector.clone().unwrap_or_default(),
             runtime_settings,
+            hooks: snapshot.settings.hooks.clone().unwrap_or_default(),
         })
     }
 
@@ -1567,6 +2060,7 @@ impl Session {
         stream_options.stream.max_retry_delay_ms = desired.stream.max_retry_delay_ms;
         stream_options.reasoning = desired.reasoning;
         stream_options.thinking_budgets = desired.thinking_budgets;
+        stream_options.responses_stateful_chain = desired.responses_stateful_chain;
         self.set_stream_options(stream_options).await;
         *self.inner.shared.branch_summary.write() = settings.branch_summary;
         self.inner
@@ -1595,6 +2089,11 @@ impl Session {
         *self.inner.shared.selector_skills.write() = update.skills;
         *self.inner.shared.selector_agents.write() = update.agents;
         *self.inner.shared.selector_settings.write() = update.selector_settings;
+        self.set_host_hooks(if update.hooks.is_empty() {
+            None
+        } else {
+            Some(update.hooks)
+        });
     }
     #[must_use]
     pub fn get_active_tool_names(&self) -> Vec<String> {
@@ -1658,7 +2157,10 @@ impl Session {
 
     pub fn set_model(&self, model: Model, api_key: String) -> ThinkingLevelChange {
         self.clear_active_retry_fallback();
-        self.set_model_internal(model, api_key)
+        let event_model = model.clone();
+        let change = self.set_model_internal(model, api_key);
+        self.publish_session_event(SessionEvent::ModelSelect { model: event_model });
+        change
     }
 
     fn set_model_internal(&self, model: Model, api_key: String) -> ThinkingLevelChange {
@@ -1722,6 +2224,9 @@ impl Session {
         if let Some(recorder) = self.inner.shared.recorder.lock().as_ref() {
             let _ = recorder.record_thinking_level(thinking_level_name(change.effective));
         }
+        self.publish_session_event(SessionEvent::ThinkingLevelSelect {
+            thinking_level: change.effective,
+        });
         change
     }
 
@@ -1730,6 +2235,9 @@ impl Session {
         self.inner.agent.set_messages(messages.clone()).await;
         self.inner.agent.clear_all_queues().await;
         self.inner.shared.state.write().messages = messages;
+        // The transcript was replaced wholesale; a stored Responses chain id
+        // would reference a conversation that no longer matches it.
+        pi_ai::providers::reset_responses_chain(&self.inner.shared.session_id);
         *self.inner.shared.compaction_runtime.lock() = CompactionRuntime::default();
         self.inner.shared.compaction_active.store(false, Ordering::Release);
         guard.release();
@@ -1745,6 +2253,9 @@ impl Session {
         let mut guard = self.claim_exclusive()?;
         self.inner.agent.reset().await;
         self.inner.shared.state.write().messages.clear();
+        // The conversation is discarded; a stored Responses chain id would
+        // reference a conversation that no longer exists.
+        pi_ai::providers::reset_responses_chain(&self.inner.shared.session_id);
         *self.inner.shared.compaction_runtime.lock() = CompactionRuntime::default();
         self.inner.shared.compaction_active.store(false, Ordering::Release);
         *self.inner.shared.session_name.write() = None;
@@ -1764,9 +2275,95 @@ impl Session {
 
     pub async fn compact(&self, custom_instructions: Option<&str>) -> Result<CompactionResult> {
         let mut guard = self.claim_exclusive()?;
-        let result = self.perform_compaction(CompactionReason::Manual, false, custom_instructions).await;
+        let result = self.perform_compaction(CompactionReason::Manual, false, custom_instructions, None).await;
         guard.release();
         result
+    }
+
+    /// Deterministic context archive with no provider call: all turns except
+    /// the last `settings.snap_keep_turns` are replaced by a compacted summary
+    /// block built from message statistics ([`build_snapcompact_summary`]),
+    /// and the original entries are preserved in a
+    /// `<session-file>.snapcompact-<rfc3339-millis>.jsonl` sidecar next to the
+    /// session file (mirroring the rewind archive convention). The
+    /// before-compaction extension hook is intentionally skipped: this path
+    /// must stay offline and deterministic.
+    pub async fn compact_snap(&self) -> Result<CompactionResult> {
+        let mut guard = self.claim_exclusive()?;
+        let result = self.perform_snap_compaction(CompactionReason::Manual).await;
+        guard.release();
+        result
+    }
+
+    async fn perform_snap_compaction(&self, reason: CompactionReason) -> Result<CompactionResult> {
+        self.publish_session_event(SessionEvent::CompactionStart { reason });
+        let _activity = CompactionActivityGuard::begin(self.inner.shared.clone());
+        let result = self.generate_snap_compaction().await;
+        match &result {
+            Ok(compaction) => self.publish_session_event(SessionEvent::CompactionEnd {
+                reason,
+                result: Some(compaction.clone()),
+                aborted: false,
+                will_retry: false,
+                error_message: None,
+            }),
+            Err(error) => self.publish_session_event(SessionEvent::CompactionEnd {
+                reason,
+                result: None,
+                aborted: false,
+                will_retry: false,
+                error_message: Some(error.to_string()),
+            }),
+        }
+        result
+    }
+
+    /// Builds the deterministic handoff envelope (goal, todo counts, active
+    /// jobs, environment, recent asks, next-step hints). No model call.
+    ///
+    /// `jobs` are the orchestration job snapshots (usually
+    /// `OrchestrationRuntime::jobs(None)`); only queued and running jobs are
+    /// retained. The envelope is always well-formed, including for an empty
+    /// session.
+    #[must_use]
+    pub fn generate_handoff(&self, jobs: &[JobSnapshot]) -> Handoff {
+        Handoff {
+            envelope: handoff_envelope(self, jobs),
+            prose: None,
+        }
+    }
+
+    /// Envelope plus a prose handoff paragraph from the existing summarization
+    /// path — a single bounded provider call with no retries
+    /// ([`HANDOFF_SUMMARIZE_TIMEOUT`]). The envelope itself is deterministic;
+    /// only the prose paragraph is model-generated.
+    pub async fn generate_handoff_with_prose(&self, jobs: &[JobSnapshot]) -> Result<Handoff> {
+        let envelope = handoff_envelope(self, jobs);
+        let transcript = {
+            let state = self.inner.shared.state.read();
+            serialize_conversation(&messages_as_llm(&state.messages))
+        };
+        let prompt = handoff_prose_prompt(&envelope, &transcript);
+        let (_, abort) = AbortController::new();
+        let prose = match run_summary_provider_call(
+            &self.inner.shared,
+            &prompt,
+            HANDOFF_SYSTEM_PROMPT,
+            HANDOFF_PROSE_RESERVE_TOKENS,
+            1.0,
+            abort,
+            HANDOFF_SUMMARIZE_TIMEOUT,
+        )
+        .await
+        {
+            SummaryAttemptOutcome::Done(text) => text,
+            SummaryAttemptOutcome::Cancelled => return Err(anyhow!("Handoff cancelled")),
+            SummaryAttemptOutcome::Failed { message, .. } => return Err(anyhow!(message)),
+        };
+        Ok(Handoff {
+            envelope,
+            prose: Some(prose),
+        })
     }
 
     async fn perform_compaction(
@@ -1774,6 +2371,7 @@ impl Session {
         reason: CompactionReason,
         will_retry: bool,
         custom_instructions: Option<&str>,
+        summarize_timeout: Option<std::time::Duration>,
     ) -> Result<CompactionResult> {
         if let Some(hook) = self.before_compaction() {
             let reduction = hook(BeforeCompactionContext {
@@ -1815,7 +2413,7 @@ impl Session {
         *self.inner.shared.compaction_controller.lock() = Some(controller);
         self.publish_session_event(SessionEvent::CompactionStart { reason });
         let _activity = CompactionActivityGuard::begin(self.inner.shared.clone());
-        let result = self.generate_compaction(reason, custom_instructions, abort.clone()).await;
+        let result = self.generate_compaction(reason, custom_instructions, abort.clone(), summarize_timeout).await;
         self.inner.shared.compaction_controller.lock().take();
         match &result {
             Ok(compaction) => self.publish_session_event(SessionEvent::CompactionEnd {
@@ -1878,6 +2476,9 @@ impl Session {
         }
         self.inner.agent.set_messages(compacted.clone()).await;
         self.inner.shared.state.write().messages = compacted;
+        // Compaction replaced the transcript; the stored Responses chain id no
+        // longer matches it, so the next turn sends full history again.
+        pi_ai::providers::reset_responses_chain(&self.inner.shared.session_id);
         Ok(())
     }
 
@@ -1886,7 +2487,9 @@ impl Session {
         reason: CompactionReason,
         custom_instructions: Option<&str>,
         abort: AbortSignal,
+        summarize_timeout: Option<std::time::Duration>,
     ) -> Result<CompactionResult> {
+        let summarize_timeout = summarize_timeout.unwrap_or(COMPACTION_SUMMARIZE_TIMEOUT);
         let messages = self.inner.agent.state().await.messages;
         let settings = self.inner.shared.compaction.read().unwrap_or(crate::DEFAULT_COMPACTION_SETTINGS);
         let (prefix_len, previous_summary, mut read_files, mut modified_files) = {
@@ -1902,13 +2505,20 @@ impl Session {
         let history_end = if cut.is_split_turn { cut.turn_start_index.unwrap_or(cut.first_kept_index) } else { cut.first_kept_index };
         let history = &messages[prefix_len..history_end];
         let turn_prefix = if cut.is_split_turn { &messages[history_end..cut.first_kept_index] } else { &[] };
+        // Useless-result elision applies to every compaction (LLM and snap):
+        // empty/whitespace results and exact duplicates of the preceding tool
+        // call's error text never reach the summarizer, and the summary notes
+        // how many were dropped.
+        let (history_elided, history_elided_count) = elide_useless_results(history);
+        let (turn_prefix_elided, turn_prefix_elided_count) = elide_useless_results(turn_prefix);
+        let elided_count = history_elided_count + turn_prefix_elided_count;
         let mut summary = if turn_prefix.is_empty() {
-            summarize_messages(&self.inner.shared, history, &previous_summary, custom_instructions, settings.reserve_tokens, 0.8, abort.clone(), Some(reason)).await?
+            summarize_messages(&self.inner.shared, &history_elided, &previous_summary, custom_instructions, settings.reserve_tokens, 0.8, abort.clone(), Some(reason), summarize_timeout).await?
         } else {
-            let history_summary = if history.is_empty() { "No prior history.".to_owned() } else {
-                summarize_messages(&self.inner.shared, history, &previous_summary, custom_instructions, settings.reserve_tokens, 0.8, abort.clone(), Some(reason)).await?
+            let history_summary = if history_elided.is_empty() { "No prior history.".to_owned() } else {
+                summarize_messages(&self.inner.shared, &history_elided, &previous_summary, custom_instructions, settings.reserve_tokens, 0.8, abort.clone(), Some(reason), summarize_timeout).await?
             };
-            let prefix_summary = summarize_turn_prefix(&self.inner.shared, turn_prefix, settings.reserve_tokens, abort.clone(), reason).await?;
+            let prefix_summary = summarize_turn_prefix(&self.inner.shared, &turn_prefix_elided, settings.reserve_tokens, abort.clone(), reason, summarize_timeout).await?;
             format!("{history_summary}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix_summary}")
         };
         if abort.is_aborted() { return Err(anyhow!("Compaction cancelled")); }
@@ -1918,12 +2528,20 @@ impl Session {
         let all_read_files = read_files.iter().cloned().collect::<Vec<_>>();
         let all_modified_files = modified_files.iter().cloned().collect::<Vec<_>>();
         summary.push_str(&format_file_operations(&all_read_files, &all_modified_files));
+        summary.push_str(&elided_note(elided_count));
         let recorder = self.inner.shared.recorder.lock().as_ref().cloned();
         let first_kept_entry_id = recorder.as_ref().and_then(|recorder| recorder.tree().ok()).and_then(|tree| {
             tree.branch(None).into_iter().filter(|entry| entry.entry_type == "message").nth(cut.first_kept_index).map(|entry| entry.id.clone())
         }).unwrap_or_else(|| Uuid::now_v7().to_string());
         let compacted = apply_checkpoint(&summary, &messages, cut.first_kept_index);
-        let estimated_tokens_after = estimate_context_tokens_usage_aware(&compacted);
+        // Post-compaction context: the summary plus the verbatim kept tail. The
+        // usage-aware estimator must NOT be used here — it anchors on the last
+        // assistant turn's real usage, measured against the FULL pre-compaction
+        // context, and that turn plus its tail survive the cut, so it would
+        // report `tokens_before` unchanged. No assistant turn has run against
+        // the new context yet, so the pure heuristic (summary + kept tail) is
+        // the honest estimate.
+        let estimated_tokens_after = estimate_context_tokens(&compacted);
         if abort.is_aborted() { return Err(anyhow!("Compaction cancelled")); }
         if let Some(recorder) = recorder {
             let details = serde_json::to_value(CompactionDetails {
@@ -1949,6 +2567,101 @@ impl Session {
         }
         self.inner.agent.set_messages(compacted.clone()).await;
         self.inner.shared.state.write().messages = compacted;
+        // Compaction replaced the transcript; the stored Responses chain id no
+        // longer matches it, so the next turn sends full history again.
+        pi_ai::providers::reset_responses_chain(&self.inner.shared.session_id);
+        Ok(CompactionResult {
+            summary,
+            first_kept_entry_id,
+            tokens_before,
+            estimated_tokens_after: Some(estimated_tokens_after),
+            usage: None,
+            details: Some(CompactionDetails { read_files: all_read_files, modified_files: all_modified_files }),
+        })
+    }
+
+    async fn generate_snap_compaction(&self) -> Result<CompactionResult> {
+        let messages = self.inner.agent.state().await.messages;
+        let settings = self.inner.shared.compaction.read().unwrap_or(crate::DEFAULT_COMPACTION_SETTINGS);
+        let (prefix_len, previous_summary, mut read_files, mut modified_files) = {
+            let state = self.inner.shared.compaction_runtime.lock();
+            (state.prefix_len.min(messages.len()), state.summary.clone(), state.read_files.clone(), state.modified_files.clone())
+        };
+        let current = if previous_summary.is_empty() { messages.clone() } else { apply_checkpoint(&previous_summary, &messages, prefix_len) };
+        let tokens_before = estimate_context_tokens_usage_aware(&current);
+        let keep_turns = settings.snap_keep_turns.max(1);
+        let Some(cut) = find_snap_cut_point(&messages, prefix_len, keep_turns) else {
+            return Err(anyhow!("Nothing to compact (session too small)"));
+        };
+        let history = &messages[prefix_len..cut];
+        let (history_elided, elided_count) = elide_useless_results(history);
+        let mut summary = build_snapcompact_summary(&history_elided, elided_count);
+        let (new_read_files, new_modified_files) = compute_file_lists(history);
+        for path in new_modified_files { read_files.remove(&path); modified_files.insert(path); }
+        for path in new_read_files { if !modified_files.contains(&path) { read_files.insert(path); } }
+        let all_read_files = read_files.iter().cloned().collect::<Vec<_>>();
+        let all_modified_files = modified_files.iter().cloned().collect::<Vec<_>>();
+        summary.push_str(&format_file_operations(&all_read_files, &all_modified_files));
+        summary.push_str(&elided_note(elided_count));
+        let recorder = self.inner.shared.recorder.lock().as_ref().cloned();
+        let first_kept_entry_id = recorder.as_ref().and_then(|recorder| recorder.tree().ok()).and_then(|tree| {
+            tree.branch(None).into_iter().filter(|entry| entry.entry_type == "message").nth(cut).map(|entry| entry.id.clone())
+        }).unwrap_or_else(|| Uuid::now_v7().to_string());
+        let compacted = apply_checkpoint(&summary, &messages, cut);
+        // Same as the LLM path: estimate the summary + kept tail heuristically.
+        // The usage-aware estimator anchors on the last assistant turn's usage
+        // (measured against the full pre-compaction context), which survives
+        // the cut, so it would report `tokens_before` unchanged.
+        let estimated_tokens_after = estimate_context_tokens(&compacted);
+        if let Some(recorder) = &recorder {
+            let details = serde_json::to_value(CompactionDetails {
+                read_files: all_read_files.clone(),
+                modified_files: all_modified_files.clone(),
+            })?;
+            // Lossless sidecar archive FIRST: the original replaced entries
+            // (before elision) are preserved as plain JSONL records next to the
+            // session file so nothing is destroyed by the deterministic
+            // archive. The archive is created and fsynced before the compaction
+            // record is appended: a committed compaction record must never
+            // exist without its sidecar, because resume would otherwise
+            // reconstruct summarized context with no recoverable original.
+            let tree = recorder.tree()?;
+            let entries = tree
+                .branch(None)
+                .into_iter()
+                .filter(|entry| entry.entry_type == "message")
+                .skip(prefix_len)
+                .take(cut - prefix_len)
+                .collect::<Vec<_>>();
+            let archive_path = write_snapcompact_archive(&recorder.path(), &entries)?;
+            if let Err(error) = recorder.record_compaction_metadata(
+                &summary,
+                Some(&first_kept_entry_id),
+                tokens_before,
+                &messages[cut..],
+                Some(&details),
+                None,
+                None,
+            ) {
+                // The archive exists but no compaction record commits it:
+                // remove the orphan (best-effort — without a record it is
+                // inert) so a later successful compaction starts clean.
+                let _ = std::fs::remove_file(&archive_path);
+                return Err(error);
+            }
+        }
+        {
+            let mut state = self.inner.shared.compaction_runtime.lock();
+            state.prefix_len = 1;
+            state.summary.clone_from(&summary);
+            state.read_files = read_files;
+            state.modified_files = modified_files;
+        }
+        self.inner.agent.set_messages(compacted.clone()).await;
+        self.inner.shared.state.write().messages = compacted;
+        // Compaction replaced the transcript; the stored Responses chain id no
+        // longer matches it, so the next turn sends full history again.
+        pi_ai::providers::reset_responses_chain(&self.inner.shared.session_id);
         Ok(CompactionResult {
             summary,
             first_kept_entry_id,
@@ -1985,9 +2698,7 @@ impl Session {
         let goal = GoalRuntime::from_session_recorder(recorder.clone())
             .map_err(|error| anyhow!(error.to_string()))?;
         let phases = recorder
-            .latest_todo_state()
-            .ok()
-            .flatten()
+            .latest_todo_state()?
             .map_or_else(Vec::new, |state| state.phases);
         self.inner.todo.restore_state(phases)?;
         *self.inner.shared.session_name.write() = recorder.session_name();
@@ -2162,7 +2873,15 @@ impl Session {
     pub(crate) async fn commit_session_replacement(
         &self,
         replacement: PreparedSessionReplacement,
-    ) {
+    ) -> Result<()> {
+        // The outgoing logical session's MCP clients must be gone before the
+        // replacement is committed: this is the shared same-CWD cutover
+        // choke point (new/fresh/resume/switch/fork/clone all route through
+        // it), and without the awaited reset the new session would inherit
+        // the old stdio children, initialized protocol state, and external
+        // auth. A server that refuses to die fails the cutover with context
+        // instead of leaking its process across the boundary.
+        self.inner.mcp.reset_live_sessions().await?;
         let PreparedSessionReplacement {
             recorder,
             messages,
@@ -2191,6 +2910,9 @@ impl Session {
             }
             state.thinking_level = thinking_level;
         }
+        // Fork/clone replacement swapped the transcript and recorder; drop any
+        // stored Responses chain id from the prior conversation.
+        pi_ai::providers::reset_responses_chain(&self.inner.shared.session_id);
         *self.inner.shared.compaction_runtime.lock() = CompactionRuntime::default();
         self.inner.shared.compaction_active.store(false, Ordering::Release);
         *self.inner.shared.session_name.write() = session_name;
@@ -2200,6 +2922,7 @@ impl Session {
             .restore_state(todo_phases)
             .expect("prepared todo state remains valid");
         *self.inner.shared.goal.write() = goal;
+        Ok(())
     }
 
     pub fn start_new_recording(&self) -> Result<()> {
@@ -2351,7 +3074,7 @@ impl Session {
                 None => None,
             };
             let (controller, abort) = AbortController::new();
-            let operation = summarize_messages(&self.inner.shared, &abandoned, "", custom_prompt, settings.reserve_tokens, 0.5, abort, None);
+            let operation = summarize_messages(&self.inner.shared, &abandoned, "", custom_prompt, settings.reserve_tokens, 0.5, abort, None, COMPACTION_SUMMARIZE_TIMEOUT);
             let mut operation = Box::pin(operation);
             let notified = self.inner.abort_notify.notified();
             if self.inner.run_slot.lock().abort_requested {
@@ -2385,6 +3108,9 @@ impl Session {
         self.inner.agent.set_messages(context.messages.clone()).await;
         self.inner.shared.state.write().messages = context.messages;
         self.inner.todo.restore_state(todo_phases)?;
+        // Navigation swapped the transcript; drop any stored Responses chain id
+        // so the next turn sends full history from the new checkpoint.
+        pi_ai::providers::reset_responses_chain(&self.inner.shared.session_id);
         *self.inner.shared.compaction_runtime.lock() = CompactionRuntime::default();
         self.inner.shared.compaction_active.store(false, Ordering::Release);
         *self.inner.shared.goal.write() = GoalRuntime::from_session_recorder((*recorder).clone())
@@ -2396,6 +3122,134 @@ impl Session {
         let normalized = label.map(str::trim).filter(|label| !label.is_empty());
         self.current_recorder()?.record_label(target_id, normalized)?;
         Ok(())
+    }
+
+    /// Mark the current position as a named rewind target.
+    ///
+    /// Appends a `checkpoint` journal record pointing at the current leaf.
+    /// The marker is a side record: it never joins the linear record chain,
+    /// never appears in the transcript, and is itself removed when a rewind
+    /// rolls back past it. Recording a name that already exists shadows the
+    /// older marker (the newest wins on resolve).
+    pub fn set_checkpoint(&self, name: &str) -> Result<String> {
+        let recorder = self.current_recorder()?;
+        let id = recorder.record_checkpoint(name)?;
+        self.publish_recorded_entry(&recorder, &id)?;
+        Ok(id)
+    }
+
+    /// Render the last `limit` records (index + first-line preview) for the
+    /// bare `/rewind` picker. Checkpoint markers are annotated with their name
+    /// and target so they are discoverable rewind targets.
+    pub fn rewind_preview(&self, limit: usize) -> Result<Vec<crate::RewindEntryPreview>> {
+        let tree = self.current_recorder()?.tree()?;
+        let start = tree.entries.len().saturating_sub(limit);
+        let mut previews = Vec::with_capacity(tree.entries.len() - start);
+        for (offset, entry) in tree.entries[start..].iter().enumerate() {
+            let is_checkpoint = entry.entry_type == "checkpoint";
+            previews.push(crate::RewindEntryPreview {
+                index: start + offset,
+                entry_type: entry.entry_type.clone(),
+                timestamp: entry.timestamp.clone(),
+                preview: entry.message.as_ref().and_then(message_first_line),
+                checkpoint_name: (is_checkpoint).then(|| entry.name.clone()).flatten(),
+                checkpoint_target_id: (is_checkpoint).then(|| entry.target_id.clone()).flatten(),
+            });
+        }
+        Ok(previews)
+    }
+
+    /// Roll the session back to a rewind target.
+    ///
+    /// The session file is truncated at the target record (the dropped tail is
+    /// archived to a `.rewind-<timestamp>.jsonl` sidecar first), then the
+    /// in-memory transcript, todo list, goal state, session name, and model
+    /// chain are rebuilt from the retained journal. Refuses to rewind past the
+    /// first record, and refuses while a prompt is processing (the exclusive
+    /// run slot is held by the live turn).
+    pub async fn rewind(&self, target: RewindTarget) -> Result<RewindOutcome> {
+        let mut guard = self.claim_exclusive()?;
+        let outcome = self.rewind_claimed(target).await;
+        guard.release();
+        outcome
+    }
+
+    async fn rewind_claimed(&self, target: RewindTarget) -> Result<RewindOutcome> {
+        let recorder = self.current_recorder()?;
+        let tree = recorder.tree()?;
+        let (keep, checkpoint_name) = match target {
+            RewindTarget::Index(index) => {
+                anyhow::ensure!(
+                    index >= 1,
+                    "rewind refused: cannot rewind past the first entry (entry index 0 is the earliest record)"
+                );
+                anyhow::ensure!(
+                    index < tree.entries.len(),
+                    "nothing to rewind: the session has {} record(s); entry index {index} is at or beyond the end",
+                    tree.entries.len()
+                );
+                (index, None)
+            }
+            RewindTarget::Checkpoint(name) => {
+                let checkpoint = tree
+                    .entries
+                    .iter()
+                    .rev()
+                    .find(|entry| {
+                        entry.entry_type == "checkpoint" && entry.name.as_deref() == Some(name.as_str())
+                    })
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "checkpoint {name:?} not found — use /checkpoint <name> to mark the current position, or /rewind to list entry indices"
+                        )
+                    })?;
+                let target_id = checkpoint
+                    .target_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("checkpoint {name:?} is missing its target entry"))?;
+                let target_index = tree
+                    .entries
+                    .iter()
+                    .position(|entry| entry.id == target_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "checkpoint {name:?} targets entry {target_id} which is no longer in the session (it was rewound away); mark a fresh checkpoint"
+                        )
+                    })?;
+                (target_index + 1, Some(name))
+            }
+        };
+        let store_outcome = recorder.rewind_to(keep)?;
+        // Rebuild the in-memory transcript, todo list, goal state, and session
+        // name from the truncated journal. `GoalRuntime::from_session_recorder`
+        // replays the goal journal up to the cut point, so a rewind that cuts
+        // through the journal re-derives the goal state (including dropping the
+        // goal when its creation event was cut away).
+        let tree = recorder.tree()?;
+        let context = tree.build_context(None);
+        self.inner.agent.set_messages(context.messages.clone()).await;
+        self.inner.agent.clear_all_queues().await;
+        self.inner.shared.state.write().messages = context.messages;
+        let todo_phases = tree.latest_todo_state().map_or_else(Vec::new, |state| state.phases);
+        self.inner.todo.restore_state(todo_phases)?;
+        // The transcript was replaced wholesale; drop any stored Responses
+        // chain id so the next turn sends full history from the rewind point.
+        pi_ai::providers::reset_responses_chain(&self.inner.shared.session_id);
+        *self.inner.shared.compaction_runtime.lock() = CompactionRuntime::default();
+        self.inner.shared.compaction_active.store(false, Ordering::Release);
+        *self.inner.shared.goal.write() = GoalRuntime::from_session_recorder((*recorder).clone())
+            .map_err(|error| anyhow!(error.to_string()))?;
+        *self.inner.shared.session_name.write() = recorder.session_name();
+        self.inner
+            .shared
+            .recorded_count
+            .store(tree.entries.len(), Ordering::Release);
+        Ok(RewindOutcome {
+            archive_path: store_outcome.archive_path,
+            dropped_entries: store_outcome.dropped_entries,
+            retained_entries: store_outcome.retained_entries,
+            checkpoint: checkpoint_name,
+        })
     }
 
     pub async fn fork_session(&self, entry_id: &str, restore_conversation: bool) -> Result<String> {
@@ -2514,6 +3368,15 @@ impl Session {
         self.inner.shared.goal.read().clone()
     }
 
+    /// Replays the goal journal from the active session branch, oldest event
+    /// first. Read-only: the in-memory goal runtime is untouched.
+    pub fn goal_journal(&self) -> Result<Vec<crate::GoalEvent>> {
+        let recorder = self.current_recorder()?;
+        let tree = recorder.tree()?;
+        crate::goal_events_from_session_tree(&tree)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
     pub fn rebuild_goal_runtime(&self) -> Result<()> {
         let recorder = self.current_recorder()?;
         let runtime = GoalRuntime::from_session_recorder((*recorder).clone())
@@ -2610,16 +3473,95 @@ impl Session {
         self.inner.agent.before_tool_call()
     }
 
+    /// Replace the host-level hook configuration for this session.
+    ///
+    /// Hooks are external commands fired at session, turn, and tool-call
+    /// events (see [`crate::HostHooks`]). The configuration is read live, so
+    /// this may be called after the session starts; the previous config is
+    /// replaced wholesale.
+    pub fn set_host_hooks(&self, hooks: Option<Vec<crate::HookConfig>>) {
+        let hooks = hooks.map(|entries| {
+            Arc::new(crate::HostHooks::new(
+                entries,
+                self.inner.cwd.clone(),
+                self.inner.shared.session_id.clone(),
+            ))
+        });
+        *self.inner.shared.host_hooks.write() = hooks;
+    }
+
+    /// Names of tools supplied by the extension runtime.
+    ///
+    /// Host hooks do not fire for extension tool calls in the MVP.
+    pub fn set_extension_tool_names(&self, names: impl IntoIterator<Item = String>) {
+        *self.inner.shared.extension_tool_names.write() = names.into_iter().collect();
+    }
+
+    /// Bind the extension runtime namespace this session's stream dispatch
+    /// resolves extension-owned provider apis within. The Application calls
+    /// this when it attaches an [`ExtensionRuntime`]; sessions without a
+    /// runtime keep `None` and resolve exactly as before (global builtins and
+    /// unscoped extension entries).
+    pub fn set_provider_namespace(&self, namespace: Option<String>) {
+        *self.inner.shared.provider_namespace.write() = namespace;
+    }
+
+    async fn fire_host_hook(
+        &self,
+        event: crate::HookEvent,
+        subject: Option<&str>,
+        tool: Option<crate::HookToolPayload<'_>>,
+    ) -> crate::HookDecision {
+        let Some(hooks) = self.inner.shared.host_hooks.read().clone() else {
+            return crate::HookDecision::allow();
+        };
+        hooks.fire(event, subject, tool.as_ref()).await
+    }
+
+    /// Fire the configured `pre_trust_decision` host hooks for a tentative
+    /// trust decision (canonical project path, wire decision, new-to-store
+    /// flag) before the stored decision is consulted/recorded. Fail-open:
+    /// no hooks configured yields an allow decision, and hook failures deny
+    /// only when the entry sets `fail_closed` (see
+    /// [`crate::HostHooks::fire_trust_decision`]).
+    pub async fn fire_trust_decision_hook(
+        &self,
+        path: &str,
+        decision: &str,
+        is_new: bool,
+    ) -> crate::HookDecision {
+        let Some(hooks) = self.inner.shared.host_hooks.read().clone() else {
+            return crate::HookDecision::allow();
+        };
+        hooks.fire_trust_decision(path, decision, is_new).await
+    }
+
     pub fn set_before_tool_call(&self, hook: Option<BeforeToolCallFn>) {
-        self.inner.agent.set_before_tool_call(hook);
+        self.inner
+            .agent
+            .set_before_tool_call(compose_host_pre_tool_call(self.inner.shared.clone(), hook));
     }
 
     pub fn set_after_tool_call(&self, hook: Option<AfterToolCallFn>) {
         // Compose with spill tracking so agent `bash` tool success paths are
         // registered even when Application/extensions replace the after-hook.
         self.inner.agent.set_after_tool_call(Some(
-            compose_bash_spill_after_tool_call(self.inner.shared.clone(), hook),
+            compose_bash_spill_after_tool_call(
+                self.inner.shared.clone(),
+                compose_host_post_tool_call(self.inner.shared.clone(), hook),
+            ),
         ));
+    }
+
+    /// Install a per-turn stop hook consulted after each assistant turn.
+    ///
+    /// Returning `true` ends the run cleanly after the current turn with the
+    /// partial result and accumulated usage preserved — used by orchestration
+    /// to implement soft budgets and yield-driving for subagents. The hook is
+    /// consulted on every turn including the final one; returning `true` there
+    /// does not change the outcome. Set to `None` to disable.
+    pub fn set_should_stop_after_turn(&self, hook: Option<ShouldStopAfterTurnFn>) {
+        self.inner.agent.set_should_stop_after_turn(hook);
     }
 
     pub async fn execute_bash(&self, command: &str, exclude_from_context: bool) -> Result<crate::BashResult> {
@@ -2656,6 +3598,7 @@ impl Session {
             &self.inner.cwd,
             command,
             Some(self.session_env()),
+            Some(self.inner.sandbox_resolver.clone()),
             on_chunk,
             signal,
         )
@@ -2816,6 +3759,12 @@ impl Session {
         if active {
             self.inner.abort_notify.notify_waiters();
             self.inner.agent.abort().await;
+            // `Agent::abort` clears both pending queues; publish so the
+            // composer count/preview drop immediately. The aborted turn's
+            // `finish_run` republishes on settle, but an abort that never
+            // settles a run (or settles after a long cleanup) would otherwise
+            // leave a stale pending count.
+            self.publish_queue_update().await;
         }
     }
 
@@ -2842,7 +3791,7 @@ impl Session {
             content: Vec::new(),
             timestamp: pi_ai::now_millis(),
         })];
-        let claim = self.begin_run().await?;
+        let claim = self.begin_run("user").await?;
         let mut content = Vec::with_capacity(images.len() + usize::from(!prompt.is_empty()));
         if !prompt.is_empty() {
             content.push(ContentBlock::text(prompt));
@@ -2942,13 +3891,13 @@ impl Session {
             return Err(anyhow!("messages must not be empty"));
         }
         let messages = self.inject_selection_messages(messages).await;
-        let claim = self.begin_run().await?;
+        let claim = self.begin_run("user").await?;
         let operation = self.execute_with_retries(Some(messages)).await;
         self.finish_run(claim, operation).await
     }
 
     pub async fn continue_run(&self) -> Result<RunResult> {
-        let claim = self.begin_run().await?;
+        let claim = self.begin_run("assistant").await?;
         let operation = self.execute_with_retries(None).await;
         self.finish_run(claim, operation).await
     }
@@ -2963,6 +3912,7 @@ impl Session {
     }
 
     async fn inject_selection_messages(&self, mut messages: Vec<Message>) -> Vec<Message> {
+        messages = self.inject_hindsight_memory(messages).await;
         let request = messages.iter().rev().find_map(|message| match message {
             Message::User(user) => Some(content_text(&user.content)),
             _ => None,
@@ -3007,6 +3957,67 @@ impl Session {
         messages
     }
 
+    /// Turn-start hindsight memory injection: when `settings.memory.backend`
+    /// is `hindsight` and `settings.memory.hindsightInjection` is on, recall
+    /// the memories related to the latest user ask and prepend the bounded,
+    /// redacted output to the system context as a hidden custom message
+    /// (`display: false` — never auto-submitted). One rendered body is cached
+    /// by a stable fingerprint of the trimmed ask and complete effective
+    /// memory configuration, so unchanged input hits while a settings change
+    /// performs a fresh recall. Configuration, network, HTTP-status,
+    /// response-bound, and timeout failures silently skip injection: advisory
+    /// memory can never fail a turn.
+    async fn inject_hindsight_memory(&self, mut messages: Vec<Message>) -> Vec<Message> {
+        let resources = self.inner.resources.read().clone();
+        let Some(resources) = resources else {
+            return messages;
+        };
+        let config = resources.snapshot().settings.memory_config();
+        if config.backend != crate::MemoryBackend::Hindsight || !config.hindsight_injection {
+            *self.inner.shared.hindsight_injection_cache.write() = None;
+            return messages;
+        }
+        let Some(request) = messages.iter().rev().find_map(|message| match message {
+            Message::User(user) => Some(content_text(&user.content)),
+            _ => None,
+        }) else {
+            return messages;
+        };
+        let request = request.trim().to_owned();
+        if request.is_empty() {
+            return messages;
+        }
+        let key = hindsight_injection_cache_key(&config, &request);
+        if let Some(cached) = self.inner.shared.hindsight_injection_cache.read().as_ref() {
+            if cached.key == key {
+                return if cached.body.is_empty() {
+                    messages
+                } else {
+                    prepend_hindsight_memory(messages, &cached.body)
+                };
+            }
+        }
+        // A different effective configuration/request invalidates the previous
+        // entry before I/O. A failed fresh recall must not leave an older key
+        // available to become a hit after another reload.
+        *self.inner.shared.hindsight_injection_cache.write() = None;
+        let fetched = match crate::memory::HindsightClient::new(&config, &self.inner.cwd) {
+            Ok(client) => client.recall(&request, &pi_agent::AbortSignal::none()).await,
+            Err(error) => Err(error),
+        };
+        let body = match fetched {
+            Ok(body) => body,
+            Err(_) => {
+                // Fail open: injection is best-effort context, never an error
+                // surface for the turn.
+                return messages;
+            }
+        };
+        let mut cache = self.inner.shared.hindsight_injection_cache.write();
+        *cache = Some(HindsightInjectionCacheEntry { key, body: body.clone() });
+        prepend_hindsight_memory(messages, &body)
+    }
+
     fn prepare_initial_messages(&self, mut messages: Vec<Message>) -> Vec<Message> {
         if messages.iter().any(|message| matches!(message, Message::User(_)))
             && self.inner.todo.take_reminder()
@@ -3034,6 +4045,9 @@ impl Session {
     async fn execute_with_retries(&self, initial: Option<Vec<Message>>) -> Result<()> {
         self.inner.shared.overflow_recovery_attempted.store(false, Ordering::Release);
         self.inner.shared.fallback_attempt_errors.lock().clear();
+        // Doom-loop detection is scoped to the current turn: the run of
+        // identical consecutive tool failures starts fresh on every turn.
+        self.inner.shared.doom_loop.lock().reset();
         let mut operation = match initial {
             Some(messages) => {
                 self.settle_operation(
@@ -3047,6 +4061,11 @@ impl Session {
         };
         let mut attempt = 0usize;
         loop {
+            // A doom loop tripped inside the previous settle: the turn stops
+            // with the actionable message instead of retrying/falling back.
+            if let Some(message) = self.inner.shared.doom_loop.lock().triggered_message.clone() {
+                return Err(anyhow!("{message}"));
+            }
             let state = self.inner.agent.state().await;
             let Some(Message::Assistant(failure)) = state.messages.last().cloned() else {
                 self.finish_retry_success(attempt);
@@ -3074,7 +4093,7 @@ impl Session {
                 let mut live_messages = state.messages;
                 live_messages.pop();
                 self.inner.agent.set_messages(live_messages).await;
-                self.perform_compaction(CompactionReason::Overflow, true, None)
+                self.perform_compaction(CompactionReason::Overflow, true, None, None)
                     .await
                     .map_err(|error| anyhow!("Context overflow recovery failed: {error}"))?;
                 operation = self.settle_operation(self.inner.agent.continue_run()).await;
@@ -3217,6 +4236,12 @@ impl Session {
                 _ => None,
             });
             if retry_failed.is_none_or(|assistant| assistant.stop_reason != StopReason::Error) {
+                // A retry that "succeeded" may actually have been stopped by
+                // doom-loop recovery (terminated tool loop): surface the
+                // actionable message instead of reporting a normal success.
+                if let Some(message) = self.inner.shared.doom_loop.lock().triggered_message.clone() {
+                    return Err(anyhow!("{message}"));
+                }
                 self.finish_retry_success(attempt);
                 return operation;
             }
@@ -3392,6 +4417,40 @@ impl Session {
         self.publish_queue_update().await;
     }
 
+    /// Arm (or disarm) the interactive `ask` round trip. Only interactive
+    /// frontends (the TUI) call this with `true`; print/JSON/RPC/REPL keep
+    /// `ask` rejecting with "ask requires an interactive session".
+    pub fn set_ask_interactive(&self, interactive: bool) {
+        self.inner.shared.ask.set_interactive(interactive);
+    }
+
+    /// Override the answer-wait bound for pending `ask` questions (default 60s).
+    pub fn set_ask_timeout(&self, timeout: Duration) {
+        self.inner.shared.ask.set_timeout(timeout);
+    }
+
+    /// The currently pending `ask` as `(id, prompt)`, if any.
+    #[must_use]
+    pub fn pending_ask(&self) -> Option<(String, String)> {
+        self.inner.shared.ask.pending()
+    }
+
+    /// Deliver the user's answer to the pending `ask` question.
+    pub fn answer_ask(&self, id: &str, answer: String) -> Result<()> {
+        self.inner.shared.ask.answer(id, answer)
+    }
+
+    /// Cancel the pending `ask` question (Esc / shutdown).
+    pub fn cancel_ask(&self, id: &str) -> Result<()> {
+        self.inner.shared.ask.cancel(id)
+    }
+
+    /// Cancel whatever question is pending, regardless of id (TUI shutdown).
+    /// Returns whether a pending ask was cancelled.
+    pub fn cancel_pending_ask(&self) -> bool {
+        self.inner.shared.ask.cancel_pending()
+    }
+
     pub async fn follow_up(&self, message: Message) {
         self.inner.agent.follow_up(message).await;
         self.publish_queue_update().await;
@@ -3410,8 +4469,24 @@ impl Session {
         }
     }
 
-    async fn begin_run(&self) -> Result<ClaimedRun> {
+    async fn begin_run(&self, subject: &str) -> Result<ClaimedRun> {
+        // Claim first so lifecycle hooks only fire for runs that actually start.
         let guard = self.claim_exclusive()?;
+        if self
+            .inner
+            .shared
+            .session_started
+            .swap(true, Ordering::AcqRel)
+            == false
+        {
+            // First activity of this session: fire the session_start hook once.
+            // Session::new is synchronous, so the hook cannot fire until the
+            // session actually begins processing.
+            self.fire_host_hook(crate::HookEvent::SessionStart, Some("session"), None)
+                .await;
+        }
+        self.fire_host_hook(crate::HookEvent::TurnStart, Some(subject), None)
+            .await;
         let _ = &guard;
         let (before_count, model, thinking_level, messages) = {
             let state = self.inner.shared.state.read();
@@ -3430,12 +4505,25 @@ impl Session {
         self.inner.agent.set_thinking_level(thinking_level).await;
         self.inner.agent.set_messages(messages).await;
         let shared = self.inner.shared.clone();
+        let session = self.clone();
         let recorder_subscription = self
             .inner
             .agent
             .subscribe_simple(move |event| {
                 let shared = shared.clone();
+                let session = session.clone();
                 async move {
+                    // The agent loop re-polls the steering/follow-up queues at
+                    // every turn boundary (`get_steering_messages` is drained
+                    // after each `TurnEnd`), so a queued message handed to the
+                    // running turn leaves the pending queue exactly when the
+                    // next `TurnEnd` fires. Publish the live queue here so the
+                    // composer's `⟦steering⟧` preview and `⚙ N` count drop
+                    // immediately on consumption instead of lingering until
+                    // `finish_run` (which republishes once more on settle).
+                    if matches!(event, AgentEvent::TurnEnd { .. }) {
+                        session.publish_queue_update().await;
+                    }
                     if let AgentEvent::MessageEnd { message } = event {
                         if let Some(recorder) = shared.recorder.lock().as_ref().cloned() {
                             let id = match &message {
@@ -3465,6 +4553,8 @@ impl Session {
         let final_state = self.inner.agent.state().await;
         let new_start = claim.before_count.min(final_state.messages.len());
         let messages = final_state.messages[new_start..].to_vec();
+        self.fire_host_hook(crate::HookEvent::TurnEnd, Some("assistant"), None)
+            .await;
         let threshold_compaction = operation.is_ok() && {
             let settings = self.inner.shared.compaction.read();
             settings.is_some_and(|settings| {
@@ -3479,7 +4569,7 @@ impl Session {
         let finalized = Ok(build_run_result(messages, final_state.error_message));
         drop(claim.recorder_subscription.take());
         if threshold_compaction {
-            let _ = self.perform_compaction(CompactionReason::Threshold, false, None).await;
+            let _ = self.perform_compaction(CompactionReason::Threshold, false, None, None).await;
         }
         if let Some(mut guard) = claim.guard.take() {
             guard.release();
@@ -3501,8 +4591,34 @@ impl Session {
 
 impl Drop for SessionInner {
     fn drop(&mut self) {
+        // Last Session clone dropped: drop the process-global Responses chain
+        // entry for this session. The stored previous_response_id references a
+        // conversation that no longer has a live session; the bounded chain
+        // map in pi-ai would evict it eventually, but removing it now makes
+        // the lifecycle deterministic and keeps a recreated session with the
+        // same id from chaining from a stale response.
+        pi_ai::providers::reset_responses_chain(&self.shared.session_id);
         // Last Session clone dropped: release any remaining detached spills.
         cleanup_bash_spills(&self.shared);
+        // Fire the session_end hook asynchronously. Drop cannot await, so run
+        // the hook on a dedicated thread; `HostHooks` is self-contained (cwd,
+        // session id, entries), so it is safe after the session runtime drops.
+        // If no runtime can be built (process teardown), the hook is skipped.
+        if let Some(hooks) = self.shared.host_hooks.read().clone() {
+            std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(hooks.fire(
+                    crate::HookEvent::SessionEnd,
+                    Some("session"),
+                    None,
+                ));
+            });
+        }
     }
 }
 
@@ -3549,6 +4665,234 @@ fn compose_bash_spill_after_tool_call(
             }
         })
     })
+}
+
+/// Wrap a before-tool-call hook so host `pre_tool_call` hooks fire first.
+///
+/// The host hook is composed ahead of the supplied hook: when it blocks, the
+/// chained hook never runs and its reason becomes the tool's rejection reason.
+/// Extension tool calls (recorded in `extension_tool_names`) are excluded from
+/// host hooks in the MVP and pass straight through.
+fn compose_host_pre_tool_call(
+    shared: Arc<SessionRuntime>,
+    hook: Option<BeforeToolCallFn>,
+) -> Option<BeforeToolCallFn> {
+    let host: BeforeToolCallFn = Arc::new(move |context| {
+        let shared = shared.clone();
+        Box::pin(async move {
+            let Some(hooks) = shared.host_hooks.read().clone() else {
+                return Ok(pi_agent::BeforeToolCallResult::default());
+            };
+            if shared.extension_tool_names.read().contains(&context.tool_call.name) {
+                return Ok(pi_agent::BeforeToolCallResult::default());
+            }
+            let payload = crate::HookToolPayload {
+                name: &context.tool_call.name,
+                arguments: Some(&context.arguments),
+                result_text: None,
+                is_error: false,
+            };
+            let decision = hooks
+                .fire(
+                    crate::HookEvent::PreToolCall,
+                    Some(&context.tool_call.name),
+                    Some(&payload),
+                )
+                .await;
+            Ok(pi_agent::BeforeToolCallResult {
+                block: decision.block,
+                reason: decision.reason,
+                arguments: None,
+            })
+        }) as pi_agent::BoxFuture<anyhow::Result<pi_agent::BeforeToolCallResult>>
+    });
+    pi_agent::compose_before_tool_call(Some(host), hook)
+}
+
+/// Wrap an after-tool-call hook so host `post_tool_call` hooks fire last.
+///
+/// The host hook observes the final result (after extension reduction) and is
+/// advisory: its output never mutates the tool result (except for doom-loop
+/// recovery, which replaces the result with an actionable stop message).
+/// Extension tool calls are excluded from host hooks in the MVP.
+fn compose_host_post_tool_call(
+    shared: Arc<SessionRuntime>,
+    hook: Option<AfterToolCallFn>,
+) -> Option<AfterToolCallFn> {
+    let host: AfterToolCallFn = Arc::new(move |context| {
+        let shared = shared.clone();
+        Box::pin(async move {
+            // Clone the host hooks out of the read lock so no guard is held
+            // across the await below.
+            let hooks = shared.host_hooks.read().clone();
+            if let Some(hooks) = hooks {
+                let is_extension =
+                    shared.extension_tool_names.read().contains(&context.tool_call.name);
+                if !is_extension {
+                    let result_text = summarize_tool_result(&context.result);
+                    let payload = crate::HookToolPayload {
+                        name: &context.tool_call.name,
+                        arguments: Some(&context.arguments),
+                        result_text: result_text.as_deref(),
+                        is_error: context.is_error,
+                    };
+                    hooks
+                        .fire(
+                            crate::HookEvent::PostToolCall,
+                            Some(&context.tool_call.name),
+                            Some(&payload),
+                        )
+                        .await;
+                }
+            }
+            doom_loop_recovery(&shared, &context).await
+        }) as pi_agent::BoxFuture<anyhow::Result<pi_agent::AfterToolCallResult>>
+    });
+    compose_after_tool_call(hook, Some(host))
+}
+
+/// Observe one executed tool outcome for doom-loop recovery and return the
+/// `AfterToolCallResult` to apply. Once the same tool fails identically
+/// `DOOM_LOOP_THRESHOLD` times in a row the result is replaced with an
+/// actionable stop message and the batch terminates, ending the turn instead
+/// of letting the model retry the same failing call forever.
+async fn doom_loop_recovery(
+    shared: &SessionRuntime,
+    context: &pi_agent::AfterToolCallContext,
+) -> Result<pi_agent::AfterToolCallResult> {
+    let mut tracker = shared.doom_loop.lock();
+    // Once tripped, every further tool outcome in this turn terminates with
+    // the same message so a parallel batch cannot escape the stop.
+    if let Some(message) = &tracker.triggered_message {
+        return Ok(pi_agent::AfterToolCallResult {
+            content: Some(vec![ContentBlock::text(message.clone())]),
+            terminate: Some(true),
+            ..Default::default()
+        });
+    }
+    let Some(prefix) = doom_loop_error_prefix(&context.result) else {
+        tracker.current = None;
+        return Ok(pi_agent::AfterToolCallResult::default());
+    };
+    if !context.is_error {
+        // Any success breaks the failure run.
+        tracker.current = None;
+        return Ok(pi_agent::AfterToolCallResult::default());
+    }
+    if TRANSIENT_TOOL_ERROR_MARKERS
+        .iter()
+        .any(|marker| prefix.contains(marker))
+    {
+        // Transient network/timeout blips are not doom loops: the same call
+        // may succeed on the next attempt, so they never count toward the
+        // threshold (and reset any prior run).
+        tracker.current = None;
+        return Ok(pi_agent::AfterToolCallResult::default());
+    }
+    let tool = context.tool_call.name.clone();
+    let same_run = tracker
+        .current
+        .as_ref()
+        .is_some_and(|state| state.tool == tool && state.error_prefix == prefix);
+    if same_run
+        && let Some(state) = tracker.current.as_mut()
+    {
+        state.count += 1;
+        if state.count >= DOOM_LOOP_THRESHOLD {
+            let message = doom_loop_message(&tool, state.count);
+            tracker.triggered_message = Some(message.clone());
+            tracker.current = None;
+            return Ok(pi_agent::AfterToolCallResult {
+                content: Some(vec![ContentBlock::text(message)]),
+                terminate: Some(true),
+                ..Default::default()
+            });
+        }
+    } else {
+        tracker.current = Some(DoomLoopState {
+            tool,
+            error_prefix: prefix,
+            count: 1,
+        });
+    }
+    Ok(pi_agent::AfterToolCallResult::default())
+}
+
+/// Stable fingerprint of a tool failure: whitespace-collapsed, lowercased,
+/// prefix-capped error text. Identical fingerprints count as the same
+/// failure; only the leading text matters, so trailing variable details (e.g.
+/// paths in later sentences) do not defeat detection.
+fn doom_loop_error_prefix(result: &pi_agent::AgentToolResult) -> Option<String> {
+    let text = summarize_tool_result(result)?;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let mut prefix: String = collapsed
+        .chars()
+        .take(DOOM_LOOP_ERROR_PREFIX_CHARS)
+        .collect();
+    prefix.make_ascii_lowercase();
+    Some(prefix)
+}
+
+fn doom_loop_message(tool: &str, count: usize) -> String {
+    format!(
+        "repeated failure ({count}× identical /{tool} errors) — stopping; try a different approach or /undo"
+    )
+}
+
+/// Compose two after-tool-call hooks: `first` runs, then `second` observes the
+/// possibly-modified result; later fields win.
+fn compose_after_tool_call(
+    first: Option<AfterToolCallFn>,
+    second: Option<AfterToolCallFn>,
+) -> Option<AfterToolCallFn> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(hook), None) | (None, Some(hook)) => Some(hook),
+        (Some(first), Some(second)) => Some(Arc::new(move |context| {
+            let first = first.clone();
+            let second = second.clone();
+            Box::pin(async move {
+                let mut update = first(context.clone()).await?;
+                let mut next = context;
+                if let Some(content) = update.content.take() {
+                    next.result.content = content;
+                }
+                if let Some(details) = update.details.take() {
+                    next.result.details = details;
+                }
+                if let Some(is_error) = update.is_error.take() {
+                    next.is_error = is_error;
+                }
+                let later = second(next).await?;
+                Ok(AfterToolCallResult {
+                    content: later.content,
+                    details: later.details,
+                    is_error: later.is_error,
+                    usage: later.usage.or(update.usage),
+                    terminate: later.terminate.or(update.terminate),
+                })
+            })
+        })),
+    }
+}
+
+/// Plain-text summary of a tool result for the `post_tool_call` payload.
+fn summarize_tool_result(result: &pi_agent::AgentToolResult) -> Option<String> {
+    let mut text = String::new();
+    for block in &result.content {
+        if let pi_ai::ContentBlock::Text { text: block_text, .. } = block {
+            text.push_str(block_text);
+            text.push('\n');
+        }
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn todo_after_tool_call(callback: Option<AfterToolCallFn>) -> AfterToolCallFn {
@@ -3641,6 +4985,40 @@ fn merge_tools(base: &[AgentTool], additional: Vec<AgentTool>) -> Result<Vec<Age
     Ok(tools)
 }
 
+/// The built-in memory tool names across backends.
+const MEMORY_TOOL_NAMES: [&str; 4] = ["memory", "recall", "retain", "reflect"];
+
+/// Replaces the memory tools in `tools` with the set for the effective memory
+/// backend: `off` removes every memory tool, `local` keeps only the built-in
+/// `memory` tool, `hindsight` swaps in `recall`/`retain`/`reflect`. Runs on
+/// resource attach and reload so `settings.memory.backend` changes take
+/// effect on the next turn. Tools named after memory built-ins but added by an
+/// extension are left alone when no built-in memory tool is present.
+fn reconcile_memory_tools(
+    mut tools: Vec<AgentTool>,
+    config: crate::MemoryConfig,
+    cwd: &Path,
+    session_env: Option<crate::SessionEnvFn>,
+) -> Vec<AgentTool> {
+    if !tools
+        .iter()
+        .any(|tool| MEMORY_TOOL_NAMES.contains(&tool.name.as_str()))
+    {
+        return tools;
+    }
+    tools.retain(|tool| !MEMORY_TOOL_NAMES.contains(&tool.name.as_str()));
+    let cwd = cwd.to_string_lossy();
+    tools.extend(crate::memory::memory_tools_for(&cwd, session_env, Some(config)));
+    tools
+}
+
+/// Prepends the hindsight memory injection message (hidden custom context) to
+/// the turn's messages.
+fn prepend_hindsight_memory(mut messages: Vec<Message>, body: &str) -> Vec<Message> {
+    messages.insert(0, crate::memory::hindsight_injection_message(body));
+    messages
+}
+
 struct SessionSubscribeWake;
 
 impl Wake for SessionSubscribeWake {
@@ -3721,6 +5099,17 @@ async fn auth_error_stream(model: &Model, message: String) -> pi_ai::AssistantMe
     stream
 }
 
+/// Fail-closed stream for a provider lookup that could not resolve within the
+/// session's extension runtime namespace. The error names the api and the
+/// owning runtimes, so a misconfigured session fails actionably instead of
+/// silently streaming through another runtime.
+async fn provider_scope_error_stream(
+    model: &Model,
+    error: &pi_ai::ProviderScopeError,
+) -> pi_ai::AssistantMessageEventStream {
+    auth_error_stream(model, format!("{error:#}")).await
+}
+
 fn render_print_event<W: Write>(
     writer: &mut W,
     event: AgentEvent,
@@ -3779,6 +5168,69 @@ fn compact_tool_arguments(arguments: &serde_json::Value) -> String {
     format!("{}...", &value[..boundary])
 }
 
+/// Writes the lossless snapcompact archive: the original replaced transcript
+/// entries as plain JSONL records (same serialization as the session file, no
+/// header) to `<session-file-name>.snapcompact-<utc-rfc3339-millis>.jsonl` in
+/// the session file's directory — the same sidecar convention as the rewind
+/// archive (`.rewind-` prefix). The file is created exclusively and fsynced
+/// before returning, so a completed compaction always has a recoverable copy
+/// of the archived region.
+fn write_snapcompact_archive(session_path: &Path, entries: &[&SessionEntry]) -> Result<PathBuf> {
+    write_snapcompact_archive_at(session_path, entries, || {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    })
+}
+
+/// Backing implementation of [`write_snapcompact_archive`] with an injectable
+/// stamp source so tests can force a same-millisecond name collision
+/// deterministically. On collision the stamp is refreshed (bounded attempts)
+/// instead of failing: `create_new` guarantees an existing archive — a stale
+/// one from a crashed run or a same-millisecond sibling — is never
+/// overwritten.
+fn write_snapcompact_archive_at<F>(
+    session_path: &Path,
+    entries: &[&SessionEntry],
+    mut stamp: F,
+) -> Result<PathBuf>
+where
+    F: FnMut() -> String,
+{
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+
+    let file_name = session_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session");
+    let mut last_collision = None;
+    for _ in 0..3 {
+        let archive_path =
+            session_path.with_file_name(format!("{file_name}.snapcompact-{}.jsonl", stamp()));
+        let mut file = match OpenOptions::new().create_new(true).write(true).open(&archive_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_collision = Some(error);
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating snapcompact archive {}", archive_path.display()));
+            }
+        };
+        for entry in entries {
+            serde_json::to_writer(&mut file, entry)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        file.sync_all()?;
+        return Ok(archive_path);
+    }
+    Err(anyhow!(
+        "creating snapcompact archive for {}: exhausted name collisions ({last_collision:?})",
+        session_path.display()
+    ))
+}
+
 
 async fn summarize_messages(
     inner: &SessionRuntime,
@@ -3789,6 +5241,7 @@ async fn summarize_messages(
     fraction: f64,
     abort: AbortSignal,
     reason: Option<CompactionReason>,
+    timeout: std::time::Duration,
 ) -> Result<String> {
     let mut prompt = format!(
         "<conversation>\n{}\n</conversation>\n\n",
@@ -3805,7 +5258,7 @@ async fn summarize_messages(
         prompt.push_str("\n\nAdditional focus: ");
         prompt.push_str(instructions);
     }
-    complete_summary(inner, prompt, reserve_tokens, fraction, abort, reason).await
+    complete_summary(inner, prompt, reserve_tokens, fraction, abort, reason, timeout).await
 }
 
 async fn summarize_turn_prefix(
@@ -3814,12 +5267,131 @@ async fn summarize_turn_prefix(
     reserve_tokens: i64,
     abort: AbortSignal,
     reason: CompactionReason,
+    timeout: std::time::Duration,
 ) -> Result<String> {
     let prompt = format!(
         "<conversation>\n{}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}",
         serialize_conversation(&messages_as_llm(messages))
     );
-    complete_summary(inner, prompt, reserve_tokens, 0.5, abort, Some(reason)).await
+    complete_summary(inner, prompt, reserve_tokens, 0.5, abort, Some(reason), timeout).await
+}
+
+/// Outcome of a single summarization provider call (no retry logic).
+enum SummaryAttemptOutcome {
+    /// Provider returned a usable summary.
+    Done(String),
+    /// The call was cancelled (abort or provider-aborted stop reason).
+    Cancelled,
+    /// The call failed. `retryable` mirrors the compaction retry policy:
+    /// provider-returned error stop reasons may be retried; transport
+    /// timeouts and empty responses are hard failures.
+    Failed { message: String, retryable: bool },
+}
+
+/// Runs a single bounded summarization provider call — no retries.
+///
+/// Shared by the compaction/branch-summary retry loop and the one-shot
+/// handoff-prose path. The whole provider exchange (stream creation + drain +
+/// result) is bounded by `timeout`: provider SSE bodies are intentionally
+/// uncapped in `pi-ai` (only time-to-headers is bounded), so a server that
+/// sends headers and then never terminates the body would otherwise hang the
+/// caller forever.
+async fn run_summary_provider_call(
+    inner: &SessionRuntime,
+    prompt: &str,
+    system_prompt: &str,
+    reserve_tokens: i64,
+    fraction: f64,
+    abort: AbortSignal,
+    timeout: std::time::Duration,
+) -> SummaryAttemptOutcome {
+    let (model, thinking_level, fallback_api_key) = {
+        let state = inner.state.read();
+        (state.model.clone(), state.thinking_level, state.api_key.clone())
+    };
+    let reasoning = if model.reasoning {
+        match thinking_level {
+            ThinkingLevel::Off => None,
+            ThinkingLevel::Minimal => Some(pi_ai::ThinkingLevel::Minimal),
+            ThinkingLevel::Low => Some(pi_ai::ThinkingLevel::Low),
+            ThinkingLevel::Medium => Some(pi_ai::ThinkingLevel::Medium),
+            ThinkingLevel::High => Some(pi_ai::ThinkingLevel::High),
+            ThinkingLevel::Xhigh => Some(pi_ai::ThinkingLevel::XHigh),
+            ThinkingLevel::Max => Some(pi_ai::ThinkingLevel::Max),
+        }
+    } else { None };
+    let requested_max = (reserve_tokens as f64 * fraction).floor() as i64;
+    let max_tokens = if model.max_tokens > 0 { requested_max.min(model.max_tokens).max(1) } else { requested_max.max(1) };
+    let mut stream_options = inner.stream_options.read().clone();
+    if let Some(resolver) = &inner.auth_resolver {
+        let auth = match resolver(model.clone()).await {
+            Ok(auth) => auth,
+            Err(error) => {
+                return SummaryAttemptOutcome::Failed {
+                    message: format!("{error:#}"),
+                    retryable: false,
+                };
+            }
+        };
+        stream_options.stream.api_key = Some(auth.api_key);
+        merge_headers_case_insensitive(&mut stream_options.stream.headers, auth.headers);
+        stream_options.stream.env.extend(auth.env);
+    } else {
+        stream_options.stream.api_key = Some(fallback_api_key);
+    }
+    stream_options.stream.max_tokens = Some(max_tokens);
+    stream_options.stream.cache_retention = CacheRetention::None;
+    stream_options.stream.session_id = Some(Uuid::now_v7().to_string());
+    stream_options.stream.abort_signal = Some(abort.cancellation_token());
+    stream_options.reasoning = reasoning;
+    // Bound the whole provider exchange (stream creation + drain + result).
+    // Without this a stalled provider (headers received, body never
+    // terminated — the SSE body is uncapped by design) hangs compaction
+    // forever while the session's exclusive run slot stays held.
+    let produced = tokio::time::timeout(timeout, async {
+        let stream = (inner.stream_fn)(
+            model,
+            Context {
+                system_prompt: system_prompt.to_owned(),
+                messages: vec![Message::user_text(prompt.to_owned(), pi_ai::now_millis())],
+                tools: Vec::new(),
+            },
+            stream_options,
+        )
+        .await;
+        while stream.next().await.is_some() {}
+        stream.result().await
+    })
+    .await;
+    match produced {
+        Ok(Some(response)) => {
+            if abort.is_aborted() || response.stop_reason == StopReason::Aborted {
+                return SummaryAttemptOutcome::Cancelled;
+            }
+            if response.stop_reason != StopReason::Error {
+                return SummaryAttemptOutcome::Done(response.text());
+            }
+            let message = response
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "summarization failed".to_owned());
+            SummaryAttemptOutcome::Failed {
+                message,
+                retryable: is_retryable_assistant_error(&response),
+            }
+        }
+        Ok(None) => SummaryAttemptOutcome::Failed {
+            message: "summarization returned no message".to_owned(),
+            retryable: false,
+        },
+        Err(_) => SummaryAttemptOutcome::Failed {
+            message: format!(
+                "summarization timed out after {}s: the provider did not finish its response (is it still reachable?)",
+                timeout.as_secs()
+            ),
+            retryable: false,
+        },
+    }
 }
 
 async fn complete_summary(
@@ -3829,6 +5401,7 @@ async fn complete_summary(
     fraction: f64,
     abort: AbortSignal,
     reason: Option<CompactionReason>,
+    timeout: std::time::Duration,
 ) -> Result<String> {
     let settings = inner.retry_settings.read().clone();
     let mut attempt = 0usize;
@@ -3839,75 +5412,46 @@ async fn complete_summary(
                 reason,
             });
         }
-        let (model, thinking_level, fallback_api_key) = {
-            let state = inner.state.read();
-            (state.model.clone(), state.thinking_level, state.api_key.clone())
-        };
-        let reasoning = if model.reasoning {
-            match thinking_level {
-                ThinkingLevel::Off => None,
-                ThinkingLevel::Minimal => Some(pi_ai::ThinkingLevel::Minimal),
-                ThinkingLevel::Low => Some(pi_ai::ThinkingLevel::Low),
-                ThinkingLevel::Medium => Some(pi_ai::ThinkingLevel::Medium),
-                ThinkingLevel::High => Some(pi_ai::ThinkingLevel::High),
-                ThinkingLevel::Xhigh => Some(pi_ai::ThinkingLevel::XHigh),
-                ThinkingLevel::Max => Some(pi_ai::ThinkingLevel::Max),
+        let outcome = run_summary_provider_call(
+            inner,
+            &prompt,
+            SUMMARIZATION_SYSTEM_PROMPT,
+            reserve_tokens,
+            fraction,
+            abort.clone(),
+            timeout,
+        )
+        .await;
+        match outcome {
+            SummaryAttemptOutcome::Done(text) => {
+                if attempt > 0 { let _ = inner.events.send(SessionEvent::SummarizationRetryFinished); }
+                return Ok(text);
             }
-        } else { None };
-        let requested_max = (reserve_tokens as f64 * fraction).floor() as i64;
-        let max_tokens = if model.max_tokens > 0 { requested_max.min(model.max_tokens).max(1) } else { requested_max.max(1) };
-        let mut stream_options = inner.stream_options.read().clone();
-        if let Some(resolver) = &inner.auth_resolver {
-            let auth = resolver(model.clone()).await?;
-            stream_options.stream.api_key = Some(auth.api_key);
-            merge_headers_case_insensitive(&mut stream_options.stream.headers, auth.headers);
-            stream_options.stream.env.extend(auth.env);
-        } else {
-            stream_options.stream.api_key = Some(fallback_api_key);
-        }
-        stream_options.stream.max_tokens = Some(max_tokens);
-        stream_options.stream.cache_retention = CacheRetention::None;
-        stream_options.stream.session_id = Some(Uuid::now_v7().to_string());
-        stream_options.stream.abort_signal = Some(abort.cancellation_token());
-        stream_options.reasoning = reasoning;
-        let stream = (inner.stream_fn)(
-            model,
-            Context {
-                system_prompt: SUMMARIZATION_SYSTEM_PROMPT.to_owned(),
-                messages: vec![Message::user_text(prompt.clone(), pi_ai::now_millis())],
-                tools: Vec::new(),
-            },
-            stream_options,
-        ).await;
-        while stream.next().await.is_some() {}
-        let response = stream.result().await.ok_or_else(|| anyhow!("compaction summarization returned no message"))?;
-        if abort.is_aborted() || response.stop_reason == StopReason::Aborted {
-            if attempt > 0 { let _ = inner.events.send(SessionEvent::SummarizationRetryFinished); }
-            return Err(anyhow!("Compaction cancelled"));
-        }
-        if response.stop_reason != StopReason::Error {
-            if attempt > 0 { let _ = inner.events.send(SessionEvent::SummarizationRetryFinished); }
-            return Ok(response.text());
-        }
-        let error_message = response.error_message.clone().unwrap_or_else(|| "compaction summarization failed".to_owned());
-        if abort.is_aborted() || !settings.enabled || !is_retryable_assistant_error(&response) || attempt >= settings.max_retries {
-            if attempt > 0 { let _ = inner.events.send(SessionEvent::SummarizationRetryFinished); }
-            return Err(anyhow!(error_message));
-        }
-        attempt += 1;
-        let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX).min(63);
-        let delay_ms = settings.base_delay_ms.saturating_mul(1u64 << shift);
-        let _ = inner.events.send(SessionEvent::SummarizationRetryScheduled {
-            attempt,
-            max_attempts: settings.max_retries,
-            delay_ms,
-            error_message,
-        });
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
-            () = abort.cancelled() => {
-                let _ = inner.events.send(SessionEvent::SummarizationRetryFinished);
+            SummaryAttemptOutcome::Cancelled => {
+                if attempt > 0 { let _ = inner.events.send(SessionEvent::SummarizationRetryFinished); }
                 return Err(anyhow!("Compaction cancelled"));
+            }
+            SummaryAttemptOutcome::Failed { message, retryable } => {
+                if !retryable || !settings.enabled || attempt >= settings.max_retries {
+                    if attempt > 0 { let _ = inner.events.send(SessionEvent::SummarizationRetryFinished); }
+                    return Err(anyhow!(message));
+                }
+                attempt += 1;
+                let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX).min(63);
+                let delay_ms = settings.base_delay_ms.saturating_mul(1u64 << shift);
+                let _ = inner.events.send(SessionEvent::SummarizationRetryScheduled {
+                    attempt,
+                    max_attempts: settings.max_retries,
+                    delay_ms,
+                    error_message: message,
+                });
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                    () = abort.cancelled() => {
+                        let _ = inner.events.send(SessionEvent::SummarizationRetryFinished);
+                        return Err(anyhow!("Compaction cancelled"));
+                    }
+                }
             }
         }
     }
@@ -3968,6 +5512,23 @@ fn content_text(content: &[ContentBlock]) -> String {
             _ => None,
         })
         .collect()
+}
+
+/// First line of a user/assistant message's text, capped for the `/rewind`
+/// picker listing. Tool and system messages have no picker preview.
+fn message_first_line(message: &Message) -> Option<String> {
+    let text = match message {
+        Message::User(user) => content_text(&user.content),
+        Message::Assistant(assistant) => content_text(&assistant.content),
+        _ => String::new(),
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let first_line = text.lines().next().unwrap_or(text).trim();
+    let capped = first_line.chars().take(80).collect::<String>();
+    (!capped.is_empty()).then_some(capped)
 }
 
 fn parse_recorded_thinking_level(level: &str) -> ThinkingLevel {
@@ -4260,6 +5821,7 @@ mod todo_persistence_tests {
                         depends_on: Vec::new(),
                         ready: false,
                         blocked_by: Vec::new(),
+                        agent: None,
                     },
                     crate::TodoItem {
                         id: "task-child".to_owned(),
@@ -4268,6 +5830,7 @@ mod todo_persistence_tests {
                         depends_on: vec!["task-root".to_owned()],
                         ready: true,
                         blocked_by: Vec::new(),
+                        agent: None,
                     },
                 ],
             }],
@@ -4519,5 +6082,3013 @@ mod session_label_tests {
             "whitespace clear must survive resume/read resolution"
         );
         resumed.close().expect("close resumed");
+    }
+}
+
+#[cfg(test)]
+mod host_hooks_firing_tests {
+    use std::fs;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use pi_ai::providers::{
+        FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
+    };
+    use serde_json::Map;
+
+    use super::*;
+    use crate::{HookConfig, HookEvent};
+
+    /// Write an executable fixture hook that echoes a fixed JSON decision.
+    fn write_decision_hook(dir: &Path, name: &str, body: &str) -> String {
+        let tmp = dir.join(format!("{name}.tmp-{}", Uuid::now_v7()));
+        fs::write(&tmp, body).expect("write hook script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&tmp).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&tmp, permissions).expect("chmod hook");
+        }
+        let path = dir.join(name);
+        // Atomic rename so the exec'd path was never itself open for writing
+        // (avoids transient ETXTBSY under parallel test load).
+        fs::rename(&tmp, &path).expect("rename hook into place");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Hook that records its stdin payload into the file given as `$1`.
+    fn write_recording_hook(dir: &Path, name: &str) -> String {
+        write_decision_hook(
+            dir,
+            name,
+            "#!/bin/sh\nread -r payload\nprintf '%s' \"$payload\" > \"$1\"\n",
+        )
+    }
+
+    fn faux_session(cwd: &Path, tag: &str) -> (Session, FauxProviderRegistration) {
+        let suffix = Uuid::now_v7().to_string();
+        let api = format!("hooks-{tag}-api-{suffix}");
+        let provider = format!("hooks-{tag}-provider-{suffix}");
+        let model = Model {
+            id: format!("hooks-{tag}-model"),
+            name: format!("Hooks {tag} Model"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..Model::default()
+        };
+        let registration = register_faux_provider(FauxProviderOptions {
+            api,
+            provider,
+            models: vec![model.clone()],
+            chunk_size: 1,
+        });
+        let session = Session::new(SessionOptions {
+            model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("build session");
+        (session, registration)
+    }
+
+    fn read_call(id: &str, path: &str) -> FauxResponse {
+        FauxResponse {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: id.to_owned(),
+                name: "read".to_owned(),
+                arguments: serde_json::json!({ "path": path }),
+                thought_signature: None,
+            })],
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+        }
+    }
+
+    fn settle() -> FauxResponse {
+        FauxResponse::text("settled")
+    }
+
+    fn message_texts(messages: &[Message]) -> Vec<String> {
+        let mut texts = Vec::new();
+        for message in messages {
+            if let Message::ToolResult(result) = message {
+                let mut text = String::new();
+                for block in &result.content {
+                    if let ContentBlock::Text { text: block_text, .. } = block {
+                        text.push_str(block_text);
+                    }
+                }
+                if !text.is_empty() {
+                    texts.push(text);
+                }
+            }
+        }
+        texts
+    }
+
+    #[tokio::test]
+    async fn pre_tool_call_hook_blocks_read_tool() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(cwd.path().join("notes.txt"), "hello").expect("write notes");
+        let hook = write_decision_hook(
+            cwd.path(),
+            "block-read.sh",
+            "#!/bin/sh\nread -r payload\necho '{\"decision\":\"block\",\"reason\":\"denied by fixture\"}'\n",
+        );
+        let (session, registration) = faux_session(cwd.path(), "block-read");
+        session.set_host_hooks(Some(vec![HookConfig {
+            event: HookEvent::PreToolCall,
+            matcher: Some("read".to_owned()),
+            command: vec![hook],
+            timeout_ms: Some(2_000),
+            enabled: None,
+            fail_closed: None,
+            extra: Map::new(),
+        }]));
+        registration.set_responses(vec![
+            read_call("call-blocked-read", "notes.txt"),
+            settle(),
+        ]);
+
+        let result = session.run("read the file", Vec::new()).await.expect("run");
+
+        let texts = message_texts(&result.messages);
+        assert!(
+            texts.iter().any(|text| text.contains("denied by fixture")),
+            "blocked tool must surface the hook reason, got: {texts:?}"
+        );
+        // The tool must never have executed: the result is the hook decision.
+        assert!(
+            !texts.iter().any(|text| text.contains("hello")),
+            "read must not execute when the pre_tool_call hook blocks: {texts:?}"
+        );
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn pre_tool_call_hook_allows_other_tools() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(cwd.path().join("notes.txt"), "hello").expect("write notes");
+        let hook = write_decision_hook(
+            cwd.path(),
+            "block-read.sh",
+            "#!/bin/sh\nread -r payload\necho '{\"decision\":\"block\",\"reason\":\"denied by fixture\"}'\n",
+        );
+        let (session, registration) = faux_session(cwd.path(), "allow-other");
+        session.set_host_hooks(Some(vec![HookConfig {
+            event: HookEvent::PreToolCall,
+            matcher: Some("read".to_owned()),
+            command: vec![hook],
+            timeout_ms: Some(2_000),
+            enabled: None,
+            fail_closed: None,
+            extra: Map::new(),
+        }]));
+        // bash is not matched by the "read" matcher, so the tool runs normally.
+        registration.set_responses(vec![
+            FauxResponse {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call-bash-cat".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: serde_json::json!({ "command": "cat notes.txt" }),
+                    thought_signature: None,
+                })],
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+            },
+            settle(),
+        ]);
+
+        let result = session.run("show the file", Vec::new()).await.expect("run");
+
+        let texts = message_texts(&result.messages);
+        assert!(
+            texts.iter().any(|text| text.contains("hello")),
+            "bash must execute when the matcher does not match, got: {texts:?}"
+        );
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn post_tool_call_receives_result_payload() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(cwd.path().join("notes.txt"), "hello world").expect("write notes");
+        let hook = write_recording_hook(cwd.path(), "record-post.sh");
+        let out_file = cwd.path().join("post-payload.json");
+        let out_file_text = out_file.to_string_lossy().into_owned();
+        let (session, registration) = faux_session(cwd.path(), "post-result");
+        session.set_host_hooks(Some(vec![HookConfig {
+            event: HookEvent::PostToolCall,
+            matcher: None,
+            command: vec![hook, out_file_text],
+            timeout_ms: Some(2_000),
+            enabled: None,
+            fail_closed: None,
+            extra: Map::new(),
+        }]));
+        registration.set_responses(vec![
+            read_call("call-read-ok", "notes.txt"),
+            settle(),
+        ]);
+
+        session.run("read the file", Vec::new()).await.expect("run");
+
+        let captured = fs::read_to_string(&out_file).expect("post payload captured");
+        let payload: serde_json::Value =
+            serde_json::from_str(&captured).expect("post payload is JSON");
+        assert_eq!(payload["event"], "post_tool_call");
+        assert_eq!(payload["subject"], "read");
+        assert_eq!(payload["toolName"], "read");
+        assert_eq!(payload["isError"], false);
+        let result = payload["result"].as_str().expect("result summary");
+        assert!(
+            result.contains("hello world"),
+            "post hook must observe the tool result, got: {result:?}"
+        );
+        assert!(payload["sessionId"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(payload["cwd"].as_str().is_some_and(|cwd| !cwd.is_empty()));
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn extension_tool_names_exclude_host_hooks() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(cwd.path().join("notes.txt"), "hello").expect("write notes");
+        let hook = write_decision_hook(
+            cwd.path(),
+            "block-read.sh",
+            "#!/bin/sh\nread -r payload\necho '{\"decision\":\"block\",\"reason\":\"denied by fixture\"}'\n",
+        );
+        let (session, registration) = faux_session(cwd.path(), "exclude-ext");
+        session.set_host_hooks(Some(vec![HookConfig {
+            event: HookEvent::PreToolCall,
+            matcher: None,
+            command: vec![hook],
+            timeout_ms: Some(2_000),
+            enabled: None,
+            fail_closed: None,
+            extra: Map::new(),
+        }]));
+        // Mark `read` as extension-provided: host hooks must not fire for it.
+        session.set_extension_tool_names(["read".to_owned()]);
+        registration.set_responses(vec![
+            read_call("call-ext-read", "notes.txt"),
+            settle(),
+        ]);
+
+        let result = session.run("read the file", Vec::new()).await.expect("run");
+
+        let texts = message_texts(&result.messages);
+        assert!(
+            texts.iter().any(|text| text.contains("hello")),
+            "extension-tool calls must bypass host hooks, got: {texts:?}"
+        );
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_hooks_fire_in_order() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let events_file = cwd.path().join("events.log");
+        let events_text = events_file.to_string_lossy().into_owned();
+        let hook = write_decision_hook(
+            cwd.path(),
+            "record-event.sh",
+            &format!(
+                "#!/bin/sh\nread -r payload\nevent=$(printf '%s' \"$payload\" | sed -n 's/.*\"event\":\"\\([^\"]*\\)\".*/\\1/p')\nsubject=$(printf '%s' \"$payload\" | sed -n 's/.*\"subject\":\"\\([^\"]*\\)\".*/\\1/p')\necho \"$event:$subject\" >> \"{}\"\n",
+                events_text
+            ),
+        );
+        let (session, registration) = faux_session(cwd.path(), "lifecycle");
+        let entries = [
+            HookEvent::SessionStart,
+            HookEvent::TurnStart,
+            HookEvent::TurnEnd,
+            HookEvent::SessionEnd,
+        ]
+        .into_iter()
+        .map(|event| HookConfig {
+            event,
+            matcher: None,
+            command: vec![hook.clone()],
+            timeout_ms: Some(2_000),
+            enabled: None,
+            fail_closed: None,
+            extra: Map::new(),
+        })
+        .collect();
+        session.set_host_hooks(Some(entries));
+        registration.set_responses(vec![FauxResponse::text("done")]);
+
+        session.run("hello", Vec::new()).await.expect("run");
+        // session_end fires from Drop on a detached thread.
+        drop(session);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(log) = fs::read_to_string(&events_file) {
+                let lines: Vec<&str> = log.lines().collect();
+                if lines.len() >= 4 {
+                    assert_eq!(lines[0], "session_start:session");
+                    assert_eq!(lines[1], "turn_start:user");
+                    assert_eq!(lines[2], "turn_end:assistant");
+                    assert_eq!(lines[3], "session_end:session");
+                    registration.unregister();
+                    return;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                let log = fs::read_to_string(&events_file).unwrap_or_default();
+                panic!("lifecycle hooks did not all fire, log: {log:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_call_fail_closed_blocks_end_to_end() {
+        // The HostHooks unit tests cover failClosed at the runtime level; this
+        // test proves the semantics through the real firing site: a
+        // pre_tool_call hook that fails (non-zero exit) with `failClosed: true`
+        // must block the tool inside a session run.
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(cwd.path().join("notes.txt"), "hello").expect("write notes");
+        let hook = write_decision_hook(
+            cwd.path(),
+            "fail-closed.sh",
+            "#!/bin/sh\nread -r payload\nprintf '%s' \"$payload\" > \"$1\"\necho '{\"decision\":\"block\"}'\nexit 3\n",
+        );
+        let out_file = cwd.path().join("pre-payload.json");
+        let out_file_text = out_file.to_string_lossy().into_owned();
+        let (session, registration) = faux_session(cwd.path(), "fail-closed");
+        session.set_host_hooks(Some(vec![HookConfig {
+            event: HookEvent::PreToolCall,
+            matcher: Some("read".to_owned()),
+            command: vec![hook, out_file_text],
+            timeout_ms: Some(2_000),
+            enabled: None,
+            fail_closed: Some(true),
+            extra: Map::new(),
+        }]));
+        registration.set_responses(vec![
+            read_call("call-fail-closed", "notes.txt"),
+            settle(),
+        ]);
+
+        let result = session.run("read the file", Vec::new()).await.expect("run");
+
+        let texts = message_texts(&result.messages);
+        assert!(
+            texts.iter().any(|text| text.contains("failClosed")),
+            "failClosed must surface as the block reason, got: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("hello")),
+            "read must not execute when the failClosed hook fails: {texts:?}"
+        );
+        // The failing hook still observed the standard pre_tool_call payload
+        // before it failed (event, subject, tool name, arguments summary).
+        let captured = fs::read_to_string(&out_file).expect("pre payload captured");
+        let payload: serde_json::Value =
+            serde_json::from_str(&captured).expect("pre payload is JSON");
+        assert_eq!(payload["event"], "pre_tool_call");
+        assert_eq!(payload["subject"], "read");
+        assert_eq!(payload["toolName"], "read");
+        assert_eq!(payload["isError"], false);
+        assert!(payload["sessionId"].as_str().is_some_and(|id| !id.is_empty()));
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn session_start_fires_exactly_once_across_turns() {
+        // session_start is guarded by a one-shot flag in begin_run: across
+        // several turns of one session it must fire exactly once, while
+        // turn_start/turn_end fire per turn.
+        let cwd = tempfile::tempdir().expect("cwd");
+        let events_file = cwd.path().join("events.log");
+        let events_text = events_file.to_string_lossy().into_owned();
+        let hook = write_decision_hook(
+            cwd.path(),
+            "record-event.sh",
+            &format!(
+                "#!/bin/sh\nread -r payload\nevent=$(printf '%s' \"$payload\" | sed -n 's/.*\"event\":\"\\([^\"]*\\)\".*/\\1/p')\nsubject=$(printf '%s' \"$payload\" | sed -n 's/.*\"subject\":\"\\([^\"]*\\)\".*/\\1/p')\necho \"$event:$subject\" >> \"{}\"\n",
+                events_text
+            ),
+        );
+        let (session, registration) = faux_session(cwd.path(), "lifecycle-once");
+        let entries = [
+            HookEvent::SessionStart,
+            HookEvent::TurnStart,
+            HookEvent::TurnEnd,
+            HookEvent::SessionEnd,
+        ]
+        .into_iter()
+        .map(|event| HookConfig {
+            event,
+            matcher: None,
+            command: vec![hook.clone()],
+            timeout_ms: Some(2_000),
+            enabled: None,
+            fail_closed: None,
+            extra: Map::new(),
+        })
+        .collect();
+        session.set_host_hooks(Some(entries));
+        registration.set_responses(vec![
+            FauxResponse::text("first"),
+            FauxResponse::text("second"),
+        ]);
+
+        session.run("first turn", Vec::new()).await.expect("first run");
+        session.run("second turn", Vec::new()).await.expect("second run");
+        // session_end fires from Drop on a detached thread.
+        drop(session);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(log) = fs::read_to_string(&events_file) {
+                let lines: Vec<&str> = log.lines().collect();
+                if lines.len() >= 6 {
+                    assert_eq!(lines[0], "session_start:session");
+                    assert_eq!(lines[1], "turn_start:user");
+                    assert_eq!(lines[2], "turn_end:assistant");
+                    assert_eq!(lines[3], "turn_start:user");
+                    assert_eq!(lines[4], "turn_end:assistant");
+                    assert_eq!(lines[5], "session_end:session");
+                    assert_eq!(
+                        lines.len(),
+                        6,
+                        "session_start must not re-fire on the second turn: {lines:?}"
+                    );
+                    registration.unregister();
+                    return;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                let log = fs::read_to_string(&events_file).unwrap_or_default();
+                panic!("lifecycle hooks did not all fire, log: {log:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_backend_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use pi_ai::providers::{
+        FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    fn serve_hindsight_recall(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind Hindsight mock");
+        let address = listener.local_addr().expect("mock address");
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept Hindsight request");
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).expect("read Hindsight request");
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(response.as_bytes()).expect("write Hindsight response");
+        });
+        format!("http://{address}")
+    }
+
+    fn recall_messages(messages: Vec<Message>) -> Vec<String> {
+        messages
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Custom(custom) if custom.custom_type == "hindsight_memory" => {
+                    Some(match custom.content {
+                        pi_ai::CustomMessageContent::Text(text) => text,
+                        pi_ai::CustomMessageContent::Blocks(blocks) => blocks
+                            .into_iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text, .. } => Some(text),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn faux_session(cwd: &Path, tag: &str) -> (Session, FauxProviderRegistration) {
+        let suffix = Uuid::now_v7().to_string();
+        let api = format!("memory-{tag}-api-{suffix}");
+        let provider = format!("memory-{tag}-provider-{suffix}");
+        let model = Model {
+            id: format!("memory-{tag}-model"),
+            name: format!("Memory {tag} Model"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..Model::default()
+        };
+        let registration = register_faux_provider(FauxProviderOptions {
+            api,
+            provider,
+            models: vec![model.clone()],
+            chunk_size: 1,
+        });
+        let session = Session::new(SessionOptions {
+            model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("build session");
+        (session, registration)
+    }
+
+    /// Writes `settings.memory` into the agent dir's global settings.json and
+    /// attaches the resource manager so the session reconciles its tool set.
+    async fn attach_memory_settings(
+        session: &Session,
+        agent_dir: &Path,
+        cwd: &Path,
+        memory: serde_json::Value,
+    ) {
+        fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::to_string(&json!({ "memory": memory })).expect("settings json"),
+        )
+        .expect("write settings");
+        let mut options = crate::ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent_dir.to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = ResourceManager::new(options).expect("resource manager");
+        session.attach_resources(resources).await.expect("attach resources");
+    }
+
+    #[tokio::test]
+    async fn backend_off_hides_memory_tools_after_attach() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, registration) = faux_session(cwd.path(), "off");
+        attach_memory_settings(&session, agent.path(), cwd.path(), json!({ "backend": "off" }))
+            .await;
+        // The model's tool set is the contract: every memory-family tool must
+        // be gone with backend=off. (The system-prompt string may still carry
+        // a loaded prompt template's stale tool list; the tool set is what the
+        // agent executes.)
+        let tools = session.get_active_tool_names();
+        for hidden in ["memory", "recall", "retain", "reflect"] {
+            assert!(!tools.iter().any(|name| name == hidden), "{hidden} must be hidden: {tools:?}");
+        }
+        registration.unregister();
+    }
+
+    /// Attaches a resource manager whose global settings.json carries `settings`.
+    async fn attach_settings(session: &Session, agent_dir: &Path, cwd: &Path, settings: serde_json::Value) {
+        fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::to_string(&settings).expect("settings json"),
+        )
+        .expect("write settings");
+        let mut options = crate::ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent_dir.to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = ResourceManager::new(options).expect("resource manager");
+        session.attach_resources(resources).await.expect("attach resources");
+    }
+
+    #[tokio::test]
+    async fn permission_rules_source_tracks_live_settings() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, registration) = faux_session(cwd.path(), "rules-live");
+        let target = cwd.path().join("lib.rs");
+        attach_settings(
+            &session,
+            agent.path(),
+            cwd.path(),
+            json!({
+                "permissionRules": [{
+                    "action": "deny",
+                    "path": target.display().to_string(),
+                    "tools": ["lsp"]
+                }]
+            }),
+        )
+        .await;
+
+        // After attach, the session exposes a live source carrying the rule.
+        let source = session
+            .permission_rules_source()
+            .expect("rules source after attach");
+        let rules = source();
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules[0].action, crate::settings::PermissionRuleAction::Deny);
+        assert!(
+            rules[0]
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.contains(&crate::settings::PermissionTool::Lsp)),
+            "{rules:?}"
+        );
+
+        // Live update (reload semantics): rewrite settings and reload the
+        // resource manager — the SAME source closure now yields the new rules.
+        fs::write(
+            agent.path().join("settings.json"),
+            serde_json::to_string(&json!({ "permissionRules": [] })).expect("settings json"),
+        )
+        .expect("write settings");
+        session
+            .resource_manager()
+            .expect("resource manager")
+            .reload()
+            .expect("reload");
+        assert!(
+            source().is_empty(),
+            "live source must reflect the reloaded rules"
+        );
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn child_sandbox_resolver_confines_children_only_when_orchestration_sandboxed() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, registration) = faux_session(cwd.path(), "child-sandbox");
+
+        // Default (no orchestration.sandboxed): children stay unsandboxed.
+        attach_settings(&session, agent.path(), cwd.path(), json!({})).await;
+        let resolver = session.child_sandbox_resolver();
+        assert!(
+            resolver.as_ref().and_then(|resolve| resolve()).is_none(),
+            "subagent children must remain unsandboxed when orchestration.sandboxed is unset"
+        );
+
+        // orchestration.sandboxed=true: every child process is confined, with
+        // the workspace, the agent dir, and settings.sandbox.allowedPaths all
+        // visible (union semantics) and network off by default.
+        let extra = cwd.path().join("extra");
+        attach_settings(
+            &session,
+            agent.path(),
+            cwd.path(),
+            json!({
+                "orchestration": { "sandboxed": true },
+                "sandbox": { "allowedPaths": [extra] },
+            }),
+        )
+        .await;
+        let resolver = session.child_sandbox_resolver();
+        let config = resolver
+            .as_ref()
+            .and_then(|resolve| resolve())
+            .expect("orchestration.sandboxed must confine children");
+        assert!(config.enabled, "children must run inside the sandbox");
+        assert!(!config.network, "children must be network-off unless sandbox.network is set");
+        let agent_dir = crate::agent_dir_path();
+        for expected in [cwd.path(), agent_dir.as_path(), extra.as_path()] {
+            assert!(
+                config.allowed_paths.iter().any(|allowed| allowed == expected),
+                "child sandbox must allow {expected:?}; got {:?}",
+                config.allowed_paths
+            );
+        }
+
+        // The resolver reads live settings per spawn (RELOAD): turning the
+        // flag off again removes confinement without rebuilding the session.
+        attach_settings(
+            &session,
+            agent.path(),
+            cwd.path(),
+            json!({ "orchestration": { "sandboxed": false } }),
+        )
+        .await;
+        let resolver = session.child_sandbox_resolver();
+        assert!(
+            resolver.as_ref().and_then(|resolve| resolve()).is_none(),
+            "disabling orchestration.sandboxed must lift child confinement"
+        );
+
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn backend_hindsight_swaps_memory_tool_for_trio() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, registration) = faux_session(cwd.path(), "trio");
+        attach_memory_settings(
+            &session,
+            agent.path(),
+            cwd.path(),
+            json!({ "backend": "hindsight", "hindsightApiUrl": "http://127.0.0.1:9", "hindsightAllowInsecure": true, "hindsightBankId": "pi-test" }),
+        )
+        .await;
+        let tools = session.get_active_tool_names();
+        assert!(!tools.iter().any(|name| name == "memory"), "local memory tool hidden in hindsight mode: {tools:?}");
+        for present in ["recall", "retain", "reflect"] {
+            assert!(tools.iter().any(|name| name == present), "{present} must be present: {tools:?}");
+        }
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn injection_prepends_bounded_memory_to_turn_context() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let api_url = serve_hindsight_recall(
+            r#"{"results":[{"text":"the release script lives in scripts/release.sh","type":"world"}]}"#,
+        );
+        let (session, registration) = faux_session(cwd.path(), "inject");
+        attach_memory_settings(
+            &session,
+            agent.path(),
+            cwd.path(),
+            json!({
+                "backend": "hindsight",
+                "hindsightApiUrl": api_url,
+                "hindsightAllowInsecure": true,
+                "hindsightInjection": true,
+            }),
+        )
+        .await;
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel::<AgentEvent>();
+        let subscription = session
+            .subscribe(move |event| {
+                let event_sender = event_sender.clone();
+                async move {
+                    let _ = event_sender.send(event);
+                    Ok(())
+                }
+            })
+            .await;
+        registration.set_responses(vec![FauxResponse::text("ok")]);
+        session.run("where is the release script?", Vec::new()).await.expect("run");
+        drop(subscription);
+        let mut saw_injection = false;
+        while let Ok(event) = event_receiver.try_recv() {
+            if let AgentEvent::MessageStart { message: Message::Custom(custom) } = event {
+                if custom.custom_type == "hindsight_memory" {
+                    saw_injection = true;
+                    let text = match &custom.content {
+                        pi_ai::CustomMessageContent::Text(text) => text.clone(),
+                        pi_ai::CustomMessageContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text, .. } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    };
+                    assert!(
+                        text.contains("scripts/release.sh"),
+                        "injected body must carry the recalled memory: {text}"
+                    );
+                }
+            }
+        }
+        assert!(saw_injection, "turn must carry the hindsight_memory injection message");
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn injection_cache_hits_for_normalized_ask_and_unchanged_config() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let api_url = serve_hindsight_recall(r#"{"results":[{"text":"cached recall"}]}"#);
+        let (session, registration) = faux_session(cwd.path(), "inject-cache-hit");
+        attach_memory_settings(
+            &session,
+            agent.path(),
+            cwd.path(),
+            json!({
+                "backend": "hindsight",
+                "hindsightApiUrl": api_url,
+                "hindsightAllowInsecure": true,
+                "hindsightInjection": true,
+            }),
+        )
+        .await;
+
+        let first = session
+            .inject_hindsight_memory(vec![Message::User(UserMessage {
+                content: vec![ContentBlock::text("  same ask  ")],
+                timestamp: 1,
+            })])
+            .await;
+        let second = session
+            .inject_hindsight_memory(vec![Message::User(UserMessage {
+                content: vec![ContentBlock::text("same ask")],
+                timestamp: 2,
+            })])
+            .await;
+
+        assert_eq!(recall_messages(first), ["Related memories from the Hindsight backend for the latest user request:\n- cached recall"]);
+        assert_eq!(recall_messages(second), ["Related memories from the Hindsight backend for the latest user request:\n- cached recall"]);
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn injection_cache_misses_after_relevant_config_reload() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let first_api_url = serve_hindsight_recall(r#"{"results":[{"text":"first recall"}]}"#);
+        let second_api_url = serve_hindsight_recall(r#"{"results":[{"text":"fresh recall"}]}"#);
+        let (session, registration) = faux_session(cwd.path(), "inject-cache-miss");
+        attach_memory_settings(
+            &session,
+            agent.path(),
+            cwd.path(),
+            json!({
+                "backend": "hindsight",
+                "hindsightApiUrl": first_api_url,
+                "hindsightAllowInsecure": true,
+                "hindsightInjection": true,
+                "hindsightRecallMaxTokens": 64,
+            }),
+        )
+        .await;
+
+        let first = session
+            .inject_hindsight_memory(vec![Message::User(UserMessage {
+                content: vec![ContentBlock::text("same ask")],
+                timestamp: 1,
+            })])
+            .await;
+        fs::write(
+            agent.path().join("settings.json"),
+            serde_json::to_string(&json!({
+                "memory": {
+                    "backend": "hindsight",
+                    "hindsightApiUrl": second_api_url,
+                    "hindsightAllowInsecure": true,
+                    "hindsightInjection": true,
+                    "hindsightRecallMaxTokens": 128,
+                }
+            }))
+            .expect("settings json"),
+        )
+        .expect("write settings");
+        session
+            .resource_manager()
+            .expect("resource manager")
+            .reload()
+            .expect("reload");
+        let second = session
+            .inject_hindsight_memory(vec![Message::User(UserMessage {
+                content: vec![ContentBlock::text("same ask")],
+                timestamp: 2,
+            })])
+            .await;
+
+        assert!(recall_messages(first)[0].contains("first recall"));
+        assert!(recall_messages(second)[0].contains("fresh recall"));
+        registration.unregister();
+    }
+
+    #[test]
+    fn injection_cache_key_covers_every_memory_config_field_and_request() {
+        let base = crate::MemoryConfig {
+            backend: crate::MemoryBackend::Hindsight,
+            hindsight_api_url: Some("https://memory.invalid/api".to_owned()),
+            hindsight_api_token: Some("alpha".repeat(2)),
+            hindsight_allow_insecure: true,
+            hindsight_bank_id: "bank-a".to_owned(),
+            hindsight_bank_id_prefix: Some("prefix-a".to_owned()),
+            hindsight_scoping: crate::HindsightScoping::PerProject,
+            hindsight_bank_mission: Some("bank mission".to_owned()),
+            hindsight_retain_mission: Some("retain mission".to_owned()),
+            hindsight_injection: true,
+            hindsight_recall_budget: crate::HindsightBudget::High,
+            hindsight_recall_max_tokens: 2048,
+            hindsight_recall_types: vec!["world".to_owned(), "experience".to_owned()],
+            hindsight_request_timeout_ms: 101,
+            hindsight_recall_timeout_ms: 102,
+            hindsight_retain_timeout_ms: 103,
+            hindsight_reflect_timeout_ms: 104,
+        };
+        let base_key = hindsight_injection_cache_key(&base, "ask");
+        let mut changed = Vec::new();
+        let mut push = |config: crate::MemoryConfig| {
+            changed.push(hindsight_injection_cache_key(&config, "ask"));
+        };
+
+        let mut config = base.clone(); config.backend = crate::MemoryBackend::Local; push(config);
+        let mut config = base.clone(); config.hindsight_api_url = Some("https://other.invalid".to_owned()); push(config);
+        let mut config = base.clone(); config.hindsight_api_token = Some("beta".repeat(2)); push(config);
+        let mut config = base.clone(); config.hindsight_allow_insecure = false; push(config);
+        let mut config = base.clone(); config.hindsight_bank_id = "bank-b".to_owned(); push(config);
+        let mut config = base.clone(); config.hindsight_bank_id_prefix = None; push(config);
+        let mut config = base.clone(); config.hindsight_scoping = crate::HindsightScoping::Global; push(config);
+        let mut config = base.clone(); config.hindsight_bank_mission = None; push(config);
+        let mut config = base.clone(); config.hindsight_retain_mission = None; push(config);
+        let mut config = base.clone(); config.hindsight_injection = false; push(config);
+        let mut config = base.clone(); config.hindsight_recall_budget = crate::HindsightBudget::Low; push(config);
+        let mut config = base.clone(); config.hindsight_recall_max_tokens += 1; push(config);
+        let mut config = base.clone(); config.hindsight_recall_types.reverse(); push(config);
+        let mut config = base.clone(); config.hindsight_request_timeout_ms += 1; push(config);
+        let mut config = base.clone(); config.hindsight_recall_timeout_ms += 1; push(config);
+        let mut config = base.clone(); config.hindsight_retain_timeout_ms += 1; push(config);
+        let mut config = base.clone(); config.hindsight_reflect_timeout_ms += 1; push(config);
+        changed.push(hindsight_injection_cache_key(&base, "other ask"));
+
+        assert!(changed.iter().all(|key| key != &base_key));
+        assert_eq!(hindsight_injection_cache_key(&base, "  ask  "), base_key);
+    }
+
+    #[test]
+    fn reconcile_memory_tools_replaces_only_builtin_memory_tools() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let local = crate::memory::memory_tools_for(
+            &cwd.path().to_string_lossy(),
+            None,
+            Some(crate::MemoryConfig::default()),
+        );
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].name, "memory");
+        let names = |tools: Vec<AgentTool>| {
+            tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>()
+        };
+        // local backend keeps the built-in memory tool.
+        let kept = reconcile_memory_tools(
+            local.clone(),
+            crate::MemoryConfig::default(),
+            cwd.path(),
+            None,
+        );
+        assert_eq!(names(kept), vec!["memory".to_owned()]);
+        // hindsight swaps memory → recall/retain/reflect.
+        let swapped = reconcile_memory_tools(
+            local.clone(),
+            crate::MemoryConfig {
+                backend: crate::MemoryBackend::Hindsight,
+                ..Default::default()
+            },
+            cwd.path(),
+            None,
+        );
+        assert_eq!(names(swapped), vec!["recall".to_owned(), "retain".to_owned(), "reflect".to_owned()]);
+        // off removes every memory tool.
+        let removed = reconcile_memory_tools(
+            local,
+            crate::MemoryConfig {
+                backend: crate::MemoryBackend::Off,
+                ..Default::default()
+            },
+            cwd.path(),
+            None,
+        );
+        assert!(removed.is_empty());
+        // A tool set without memory-family built-ins is left untouched (an
+        // extension's own tool is not clobbered).
+        let extension_tool = AgentTool::new(
+            "custom_note",
+            "extension tool",
+            crate::tools::s_object(vec![], vec![]),
+            |_ctx| async move { Ok(crate::tools::text_result("ext")) },
+        );
+        let untouched = reconcile_memory_tools(
+            vec![extension_tool],
+            crate::MemoryConfig {
+                backend: crate::MemoryBackend::Off,
+                ..Default::default()
+            },
+            cwd.path(),
+            None,
+        );
+        assert_eq!(names(untouched), vec!["custom_note".to_owned()]);
+        // Memory-family names are reserved for the backend: with backend=off a
+        // lone family-named tool is removed too (reconcile keeps the family in
+        // sync with settings.memory.backend across reloads).
+        let family_tool = AgentTool::new(
+            "recall",
+            "extension squatting on a builtin name",
+            crate::tools::s_object(vec![], vec![]),
+            |_ctx| async move { Ok(crate::tools::text_result("ext")) },
+        );
+        let family_removed = reconcile_memory_tools(
+            vec![family_tool],
+            crate::MemoryConfig {
+                backend: crate::MemoryBackend::Off,
+                ..Default::default()
+            },
+            cwd.path(),
+            None,
+        );
+        assert!(family_removed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn injection_skips_when_disabled_or_non_hindsight() {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let api_url = serve_hindsight_recall(
+            r#"{"results":[{"text":"leak-me-marker"}]}"#,
+        );
+        let (session, registration) = faux_session(cwd.path(), "noinject");
+        // backend=local with injection on → no hindsight fetch, no injection.
+        attach_memory_settings(
+            &session,
+            agent.path(),
+            cwd.path(),
+            json!({
+                "backend": "local",
+                "hindsightApiUrl": api_url,
+                "hindsightAllowInsecure": true,
+                "hindsightInjection": true,
+            }),
+        )
+        .await;
+        let (event_sender, mut event_receiver) = mpsc::unbounded_channel::<AgentEvent>();
+        let subscription = session
+            .subscribe(move |event| {
+                let event_sender = event_sender.clone();
+                async move {
+                    let _ = event_sender.send(event);
+                    Ok(())
+                }
+            })
+            .await;
+        registration.set_responses(vec![FauxResponse::text("ok")]);
+        session.run("hello", Vec::new()).await.expect("run");
+        drop(subscription);
+        while let Ok(event) = event_receiver.try_recv() {
+            if let AgentEvent::MessageStart { message: Message::Custom(custom) } = event {
+                assert_ne!(custom.custom_type, "hindsight_memory");
+                let text = match &custom.content {
+                    pi_ai::CustomMessageContent::Text(text) => text.clone(),
+                    pi_ai::CustomMessageContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text, .. } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                assert!(!text.contains("leak-me-marker"), "no injection with local backend");
+            }
+        }
+        registration.unregister();
+    }
+}
+
+#[cfg(test)]
+mod compact_timeout_tests {
+    use super::*;
+
+    /// A provider stream that never pushes an event and never ends — the exact
+    /// shape of a stalled SSE body (headers received, then silence). Without
+    /// the summarization deadline this hangs `/compact` (and automatic
+    /// compaction) forever while the exclusive run slot stays held.
+    fn stalled_stream_fn() -> pi_agent::StreamFn {
+        std::sync::Arc::new(|_model, _context, _options| {
+            Box::pin(async move { pi_ai::new_assistant_message_event_stream() })
+        })
+    }
+
+    fn compactable_session(cwd: &std::path::Path) -> Session {
+        Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: Some(CompactionSettings {
+                enabled: true,
+                reserve_tokens: 10,
+                keep_recent_tokens: 4,
+                snap_keep_turns: 10,
+            }),
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stalled_stream_fn()),
+            auth_resolver: None,
+        })
+        .expect("session")
+    }
+
+    #[tokio::test]
+    async fn stalled_summarization_times_out_with_actionable_error() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = compactable_session(cwd.path());
+        session
+            .load_history(vec![
+                Message::user_text("older context ".repeat(60), 1),
+                Message::user_text("middle context ".repeat(60), 2),
+                Message::user_text("recent context ".repeat(60), 3),
+                Message::user_text("newest context ".repeat(60), 4),
+            ])
+            .await
+            .expect("load history");
+
+        // The stalled provider must fail the compaction via the summarization
+        // deadline instead of hanging the session forever.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            session.perform_compaction(
+                CompactionReason::Manual,
+                false,
+                None,
+                Some(std::time::Duration::from_secs(1)),
+            ),
+        )
+        .await
+        .expect("compaction must not hang: stalled provider never terminates");
+
+        let error = result.expect_err("stalled provider must fail the compaction");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("timed out after 1s"),
+            "error must name the deadline and be actionable: {message}"
+        );
+        assert!(
+            message.contains("provider"),
+            "error must point at the provider, not the session: {message}"
+        );
+        // The exclusive run slot / compaction activity must be released so the
+        // session stays usable after a timed-out compaction.
+        assert!(!session.is_compacting(), "compaction activity must be cleared");
+        assert!(
+            session.history().len() >= 4,
+            "a timed-out compaction must not destroy the conversation"
+        );
+    }
+}
+
+#[cfg(test)]
+mod llm_compact_elision_tests {
+    use pi_ai::providers::{
+        FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
+    };
+
+    use super::*;
+
+    /// A session with an enabled LLM compaction path backed by a faux
+    /// provider, so the summarization call is deterministic and offline.
+    fn faux_compact_session(
+        cwd: &std::path::Path,
+        tag: &str,
+    ) -> (Session, FauxProviderRegistration) {
+        let suffix = Uuid::now_v7().to_string();
+        let api = format!("compact-{tag}-api-{suffix}");
+        let provider = format!("compact-{tag}-provider-{suffix}");
+        let model = Model {
+            id: format!("compact-{tag}-model"),
+            name: format!("Compact {tag} Model"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..Model::default()
+        };
+        let registration = register_faux_provider(FauxProviderOptions {
+            api,
+            provider,
+            models: vec![model.clone()],
+            chunk_size: 1,
+        });
+        let session = Session::new(SessionOptions {
+            model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: Some(CompactionSettings {
+                enabled: true,
+                reserve_tokens: 10,
+                keep_recent_tokens: 4,
+                snap_keep_turns: 10,
+            }),
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        (session, registration)
+    }
+
+    fn tool_result(text: &str, is_error: bool, ts: i64) -> Message {
+        Message::ToolResult(pi_ai::ToolResultMessage {
+            tool_call_id: "t".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                text_signature: None,
+            }],
+            usage: None,
+            details: None,
+            added_tool_names: Vec::new(),
+            is_error,
+            timestamp: ts,
+        })
+    }
+
+    #[tokio::test]
+    async fn llm_compact_elides_useless_results_and_notes_them() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, registration) = faux_compact_session(cwd.path(), "elide");
+        registration.set_responses(vec![FauxResponse::text("Summarized history.")]);
+        // Turn 1: an empty result + a duplicate error (useless); turns 2-3: clean.
+        let history = vec![
+            Message::user_text("first ask", 1),
+            tool_result("   ", false, 2),
+            tool_result("read failed: missing", true, 3),
+            tool_result("read failed: missing", true, 4),
+            Message::user_text("second ask", 5),
+            tool_result("ok", false, 6),
+            Message::user_text("third ask", 7),
+            tool_result("done", false, 8),
+        ];
+        session.load_history(history).await.expect("load history");
+        let result = session.compact(None).await.expect("llm compact");
+        assert!(
+            result.summary.contains("[elided 2 useless results]"),
+            "the LLM compaction summary must note the elided count: {}",
+            result.summary,
+        );
+        // The archived turn 1 was elided; the kept tail (turn 3) is untouched.
+        let kept = session.history();
+        assert!(
+            kept.iter().any(|m| matches!(
+                m,
+                Message::ToolResult(tr)
+                    if tr.content.first().is_some_and(|b| matches!(b, ContentBlock::Text { text, .. } if text == "done"))
+            )),
+            "the kept tail must retain the final tool result"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_compact_reports_shrinking_counts_when_usage_anchors_before() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, registration) = faux_compact_session(cwd.path(), "counts");
+        registration.set_responses(vec![FauxResponse::text("Summarized history.")]);
+        let mut history = vec![
+            Message::user_text("first ask with context", 1),
+            tool_result("ok", false, 2),
+            Message::user_text("second ask with context", 3),
+            tool_result("ok", false, 4),
+            Message::user_text("third ask with context", 5),
+        ];
+        // The live session's final assistant turn carries the real context
+        // usage the provider reported; the pre-compaction count anchors on it,
+        // so the after-count must come from the summary + kept tail rather
+        // than the stale total (which would report no shrink at all).
+        let mut assistant = pi_ai::AssistantMessage::pending(&Model::default());
+        assistant.content = vec![ContentBlock::text("answer three")];
+        assistant.stop_reason = StopReason::Stop;
+        assistant.usage = Usage { total_tokens: 64_154, ..Usage::default() };
+        assistant.timestamp = 6;
+        history.push(Message::Assistant(assistant));
+        session.load_history(history).await.expect("load history");
+        let result = session.compact(None).await.expect("llm compact");
+        assert_eq!(
+            result.tokens_before, 64_154,
+            "pre-compaction count anchors on the last real usage"
+        );
+        assert!(
+            result.estimated_tokens_after.is_some_and(|after| after < result.tokens_before),
+            "post-compaction estimate must cover summary + kept tail, not the stale anchor: before={} after={:?}",
+            result.tokens_before,
+            result.estimated_tokens_after,
+        );
+    }
+}
+
+#[cfg(test)]
+mod snap_compact_tests {
+    use super::*;
+
+    /// A stream function that records every invocation. Snap compact must
+    /// never call the provider, so the counter stays at zero.
+    fn counting_stream_fn() -> (pi_agent::StreamFn, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let captured = count.clone();
+        let stream_fn: pi_agent::StreamFn = std::sync::Arc::new(move |_model, _context, _options| {
+            captured.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { pi_ai::new_assistant_message_event_stream() })
+        });
+        (stream_fn, count)
+    }
+
+    fn snap_session(cwd: &std::path::Path, keep_turns: i64) -> (Session, Arc<AtomicUsize>) {
+        let (stream_fn, count) = counting_stream_fn();
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: Some(CompactionSettings {
+                enabled: true,
+                reserve_tokens: 10,
+                keep_recent_tokens: 4,
+                snap_keep_turns: keep_turns,
+            }),
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver: None,
+        })
+        .expect("session");
+        (session, count)
+    }
+
+    /// `count` user turns, each a large user ask + a large assistant reply, so
+    /// archiving older turns measurably shrinks the context.
+    fn dense_history(count: usize) -> Vec<Message> {
+        let padding = "x".repeat(200);
+        let mut messages = Vec::new();
+        for turn in 0..count {
+            messages.push(Message::user_text(format!("ask number {turn}: {padding}"), turn as i64 * 2));
+            let mut assistant = pi_ai::AssistantMessage::pending(&Model::default());
+            assistant.content = vec![ContentBlock::text(format!("answer {turn}: {padding}"))];
+            assistant.stop_reason = StopReason::Stop;
+            assistant.timestamp = turn as i64 * 2 + 1;
+            messages.push(Message::Assistant(assistant));
+        }
+        messages
+    }
+
+    /// First text block of a user message, if any.
+    fn user_text_of(message: &Message) -> Option<String> {
+        let Message::User(user) = message else { return None };
+        user.content.iter().find_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn snap_compact_replaces_dense_history_without_provider_call() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, count) = snap_session(cwd.path(), 2);
+        session.load_history(dense_history(12)).await.expect("load history");
+        let result = session.compact_snap().await.expect("snap compact");
+        assert_eq!(count.load(Ordering::SeqCst), 0, "snap compact must not call the provider");
+
+        let history = session.history();
+        assert!(
+            matches!(history.first(), Some(Message::CompactionSummary(_))),
+            "the compacted summary block leads the transcript"
+        );
+        assert!(
+            result.estimated_tokens_after.is_some_and(|after| after < result.tokens_before),
+            "snap compact must shrink the context: before={} after={:?}",
+            result.tokens_before,
+            result.estimated_tokens_after,
+        );
+        // 12 turns archived down to the last 2 user turns: the kept region
+        // starts at "ask number 10".
+        let kept_user_texts: Vec<String> = history.iter().filter_map(user_text_of).collect();
+        assert_eq!(kept_user_texts.len(), 2, "exactly the last 2 user turns are kept");
+        assert!(kept_user_texts.first().is_some_and(|t| t.contains("ask number 10")), "archiving starts at turn 10");
+    }
+
+    #[tokio::test]
+    async fn snap_compact_keeps_last_k_turns_setting_honored() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, _count) = snap_session(cwd.path(), 2);
+        session.load_history(dense_history(5)).await.expect("load history");
+        session.compact_snap().await.expect("snap compact");
+        let kept_user_texts: Vec<String> = session.history().iter().filter_map(user_text_of).collect();
+        assert_eq!(kept_user_texts.len(), 2, "keep-turns setting is honored");
+        assert!(kept_user_texts.first().is_some_and(|t| t.contains("ask number 3")));
+        assert!(kept_user_texts.last().is_some_and(|t| t.contains("ask number 4")));
+    }
+
+    #[tokio::test]
+    async fn snap_compact_reports_shrinking_counts_when_usage_anchors_before() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, _count) = snap_session(cwd.path(), 2);
+        let mut history = dense_history(12);
+        // Every live session's final assistant turn carries the real context
+        // usage the provider reported. Without it the usage-aware pre-count
+        // falls back to the pure heuristic, masking the stale-anchor bug where
+        // the after-count reused the same usage total and reported no shrink.
+        if let Some(Message::Assistant(assistant)) = history.last_mut() {
+            assistant.usage = Usage { total_tokens: 64_154, ..Usage::default() };
+        }
+        session.load_history(history).await.expect("load history");
+        let result = session.compact_snap().await.expect("snap compact");
+        assert_eq!(
+            result.tokens_before, 64_154,
+            "pre-compaction count anchors on the last real usage"
+        );
+        assert!(
+            result.estimated_tokens_after.is_some_and(|after| after < result.tokens_before),
+            "post-compaction estimate must cover summary + kept tail, not the stale anchor: before={} after={:?}",
+            result.tokens_before,
+            result.estimated_tokens_after,
+        );
+    }
+
+    fn tool_result(text: &str, is_error: bool, ts: i64) -> Message {
+        Message::ToolResult(pi_ai::ToolResultMessage {
+            tool_call_id: "t".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text { text: text.to_string(), text_signature: None }],
+            usage: None,
+            details: None,
+            added_tool_names: Vec::new(),
+            is_error,
+            timestamp: ts,
+        })
+    }
+
+    #[tokio::test]
+    async fn snap_compact_elides_useless_results_and_notes_them() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, count) = snap_session(cwd.path(), 2);
+        // Turn 1: an empty result + a duplicate error (useless); turns 2-3: clean.
+        let history = vec![
+            Message::user_text("first ask", 1),
+            tool_result("   ", false, 2),
+            tool_result("read failed: missing", true, 3),
+            tool_result("read failed: missing", true, 4),
+            Message::user_text("second ask", 5),
+            tool_result("ok", false, 6),
+            Message::user_text("third ask", 7),
+            tool_result("done", false, 8),
+        ];
+        session.load_history(history).await.expect("load history");
+        let result = session.compact_snap().await.expect("snap compact");
+        assert_eq!(count.load(Ordering::SeqCst), 0, "no provider call");
+        assert!(
+            result.summary.contains("[elided 2 useless results]"),
+            "summary must note the elided count: {}",
+            result.summary,
+        );
+        // The kept tail (turn 2) is untouched; only the archived turn 1 was elided.
+        let kept = session.history();
+        assert!(kept.iter().any(|m| matches!(m, Message::ToolResult(tr) if tr.content.first().is_some_and(|b| matches!(b, ContentBlock::Text { text, .. } if text == "ok")))));
+    }
+
+    #[tokio::test]
+    async fn snap_compact_nothing_to_compact_when_too_small() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, _count) = snap_session(cwd.path(), 10);
+        session.load_history(dense_history(5)).await.expect("load history");
+        let error = session.compact_snap().await.expect_err("too few turns to archive");
+        assert!(
+            format!("{error:#}").contains("Nothing to compact"),
+            "expected an actionable too-small error: {error:#}"
+        );
+        // The transcript is untouched on failure.
+        assert_eq!(session.history().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn snap_compact_transcript_stays_well_formed_for_replay() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, _count) = snap_session(cwd.path(), 3);
+        session.load_history(dense_history(6)).await.expect("load history");
+        session.compact_snap().await.expect("snap compact");
+        let history = session.history();
+        // Replay projection never panics and folds the summary into user text.
+        let llm = messages_as_llm(&history);
+        assert!(!llm.is_empty());
+        assert!(
+            matches!(llm.first(), Some(Message::User(_))),
+            "the compaction summary projects to a user message for the provider"
+        );
+        let first_text = llm
+            .first()
+            .and_then(|m| match m { Message::User(u) => u.content.iter().find_map(|b| if let ContentBlock::Text { text, .. } = b { Some(text.clone()) } else { None }), _ => None })
+            .unwrap_or_default();
+        assert!(first_text.contains("compacted into the following summary"), "replay wraps the summary: {first_text}");
+    }
+
+    #[tokio::test]
+    async fn snap_compact_writes_lossless_archive_sidecar() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, _count) = snap_session(cwd.path(), 2);
+        let recorder = crate::start_session_in(
+            cwd.path(), None, None, Some(cwd.path()), Some("snapcompact-archive-test"), None,
+        )
+        .expect("start recorder");
+        // Record the messages into the session file so the recorder tree and the
+        // live transcript agree (the real run loop records each message; tests
+        // using load_history bypass that, so populate the journal explicitly).
+        let history = dense_history(4);
+        for message in &history {
+            recorder.record_message(message).expect("record message");
+        }
+        let session_path = recorder.path();
+        session.record(recorder).expect("attach recorder");
+        session.load_history(history).await.expect("load history");
+        session.compact_snap().await.expect("snap compact");
+
+        let sidecars = std::fs::read_dir(session_path.parent().expect("session dir"))
+            .expect("read session dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".snapcompact-"))
+            .collect::<Vec<_>>();
+        assert_eq!(sidecars.len(), 1, "exactly one snapcompact sidecar: {sidecars:?}");
+        let sidecar_path = session_path.parent().unwrap().join(&sidecars[0]);
+        let records = std::fs::read_to_string(&sidecar_path).expect("read sidecar");
+        let archived = records.lines().filter(|line| !line.is_empty()).count();
+        // Turn 1 + turn 2 (2 user + 2 assistant) archived; the last 2 turns stay.
+        assert_eq!(archived, 4, "the original archived entries are preserved verbatim: {records}");
+        assert!(records.contains("\"type\":\"message\""), "sidecar records use the session-file shape");
+    }
+
+    /// True when the test process runs as root (uid 0), which bypasses
+    /// directory write permissions — the unwritable-dir scenario cannot be
+    /// constructed, so the test is skipped there.
+    fn running_as_root() -> bool {
+        std::fs::read_to_string("/proc/self/status")
+            .map(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Uid:"))
+                    .is_some_and(|line| line.split_whitespace().next() == Some("0"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Counts committed compaction records in the session journal file.
+    fn compaction_record_count(session_path: &std::path::Path) -> usize {
+        std::fs::read_to_string(session_path)
+            .expect("read session journal")
+            .lines()
+            .filter(|line| !line.trim().is_empty() && line.contains("\"type\":\"compaction\""))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn snap_compact_archive_failure_commits_no_compaction_record() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, _count) = snap_session(cwd.path(), 2);
+        let recorder = crate::start_session_in(
+            cwd.path(), None, None, Some(cwd.path()), Some("snapcompact-unwritable-test"), None,
+        )
+        .expect("start recorder");
+        let history = dense_history(4);
+        for message in &history {
+            recorder.record_message(message).expect("record message");
+        }
+        let session_path = recorder.path();
+        session.record(recorder).expect("attach recorder");
+        session.load_history(history).await.expect("load history");
+        let dir = session_path.parent().expect("session dir");
+
+        if running_as_root() {
+            eprintln!("skipping unwritable-dir scenario: running as root");
+            return;
+        }
+        // Make the session directory unwritable: archive creation must fail
+        // BEFORE any compaction record is committed, so the journal never
+        // carries a compaction without its lossless sidecar.
+        let previous = std::fs::metadata(dir).expect("dir metadata").permissions();
+        let mut readonly = previous.clone();
+        use std::os::unix::fs::PermissionsExt;
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(dir, readonly).expect("make session dir read-only");
+        let error = session.compact_snap().await.expect_err("archive creation must fail");
+        std::fs::set_permissions(dir, previous).expect("restore session dir permissions");
+        assert!(
+            format!("{error:#}").contains("snapcompact archive"),
+            "error must name the failing archive: {error:#}"
+        );
+        assert_eq!(
+            compaction_record_count(&session_path),
+            0,
+            "a failed compaction must not commit a journal record without its archive"
+        );
+
+        // The same compaction succeeds once the directory is writable again,
+        // committing exactly one record and one sidecar.
+        session.compact_snap().await.expect("snap compact after restore");
+        assert_eq!(compaction_record_count(&session_path), 1);
+        let sidecars = std::fs::read_dir(dir)
+            .expect("read session dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".snapcompact-"))
+            .collect::<Vec<_>>();
+        assert_eq!(sidecars.len(), 1, "exactly one sidecar after retry: {sidecars:?}");
+    }
+
+    #[test]
+    fn snap_compact_archive_name_collision_retries_with_fresh_stamp() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let recorder = crate::start_session_in(
+            cwd.path(), None, None, Some(cwd.path()), Some("snapcompact-collision-test"), None,
+        )
+        .expect("start recorder");
+        recorder
+            .record_message(&Message::user_text("archived", 1))
+            .expect("record message");
+        let session_path = recorder.path();
+        let tree = recorder.tree().expect("recorder tree");
+        let entries = tree
+            .branch(None)
+            .into_iter()
+            .filter(|entry| entry.entry_type == "message")
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "one archived entry");
+
+        // A stale archive already occupies the first candidate name: the
+        // writer must refresh the stamp and succeed instead of failing, and
+        // must never overwrite the existing archive.
+        let file_name = session_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("session");
+        let stale = session_path.with_file_name(format!("{file_name}.snapcompact-same.jsonl"));
+        std::fs::write(&stale, "stale archive payload\n").expect("pre-create colliding archive");
+
+        let mut stamps = ["same".to_owned(), "fresh".to_owned()].into_iter();
+        let written = write_snapcompact_archive_at(&session_path, &entries, || {
+            stamps.next().expect("stamp sequence exhausted").clone()
+        })
+        .expect("collision retry must succeed");
+        let written_name = written
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .expect("archive file name");
+        assert!(
+            written_name.ends_with(".snapcompact-fresh.jsonl"),
+            "the archive must be written under the retried stamp: {written_name}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stale).expect("read stale archive"),
+            "stale archive payload\n",
+            "an existing archive must never be overwritten"
+        );
+        let records = std::fs::read_to_string(&written).expect("read written archive");
+        assert!(records.contains("\"type\":\"message\""), "archive holds the session-file shape");
+    }
+}
+
+#[cfg(test)]
+mod ask_tool_round_trip_tests {
+    use super::*;
+
+    fn ask_session(cwd: &std::path::Path) -> Session {
+        Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session")
+    }
+
+    fn ask_tool(session: &Session) -> AgentTool {
+        session
+            .get_all_tools()
+            .into_iter()
+            .find(|tool| tool.name == "ask")
+            .expect("session tool set includes ask")
+    }
+
+    fn tool_context(question: serde_json::Value) -> (pi_agent::ToolCallContext, pi_agent::AbortController) {
+        let (controller, abort) = AbortController::new();
+        let context = pi_agent::ToolCallContext {
+            tool_call_id: "call-ask".to_owned(),
+            arguments: question,
+            on_update: Arc::new(|_| {}),
+            abort,
+            model: None,
+        };
+        (context, controller)
+    }
+
+    /// Waits for the application to publish the `AskUser` event for the
+    /// pending question and returns its id.
+    async fn await_ask_event(application: &crate::Application) -> String {
+        let mut events = application.subscribe();
+        loop {
+            match events.recv().await.expect("application events") {
+                crate::ApplicationEvent::Session(SessionEvent::AskUser { id, prompt }) => {
+                    assert!(!prompt.is_empty());
+                    return id;
+                }
+                crate::ApplicationEvent::Agent(AgentEvent::ToolExecutionStart { .. }) => continue,
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_round_trip_answer_flows_back_as_tool_result() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = crate::Application::new(session.clone()).await;
+        application.set_ask_interactive(true);
+        let tool = ask_tool(&session);
+        let (context, _controller) = tool_context(serde_json::json!({ "question": "continue?" }));
+        let run = tokio::spawn(async move { (tool.execute)(context).await });
+        let id = await_ask_event(&application).await;
+        assert_eq!(
+            application.pending_ask().as_ref().map(|(pending_id, _)| pending_id),
+            Some(&id)
+        );
+        application
+            .answer_ask(&id, "yes, please".to_owned())
+            .expect("answer delivered");
+        let result = run.await.expect("join").expect("ask succeeds");
+        assert_eq!(result.content, vec![ContentBlock::text("yes, please")]);
+        assert!(application.pending_ask().is_none());
+    }
+
+    #[tokio::test]
+    async fn ask_requires_interactive_session_in_other_modes() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = crate::Application::new(session.clone()).await;
+        // Interactive flag never armed: print/JSON/RPC/REPL behavior.
+        let tool = ask_tool(&session);
+        let (context, _controller) = tool_context(serde_json::json!({ "question": "continue?" }));
+        let error = (tool.execute)(context)
+            .await
+            .expect_err("non-interactive ask must reject");
+        assert!(
+            error.to_string().contains("ask requires an interactive session"),
+            "{error}"
+        );
+        assert!(application.pending_ask().is_none());
+    }
+
+    #[tokio::test]
+    async fn ask_times_out_when_unanswered() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = crate::Application::new(session.clone()).await;
+        application.set_ask_interactive(true);
+        application.set_ask_timeout(Duration::from_millis(50));
+        let tool = ask_tool(&session);
+        let (context, _controller) = tool_context(serde_json::json!({ "question": "continue?" }));
+        let run = tokio::spawn(async move { (tool.execute)(context).await });
+        let id = await_ask_event(&application).await;
+        let error = run.await.expect("join").expect_err("timeout must reject");
+        assert!(
+            error.to_string().contains("timed out waiting for user"),
+            "{error}"
+        );
+        assert!(
+            application.pending_ask().is_none(),
+            "timeout must free the pending slot"
+        );
+        let _ = id;
+    }
+
+    #[tokio::test]
+    async fn concurrent_asks_reject_second_with_busy_error() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = crate::Application::new(session.clone()).await;
+        application.set_ask_interactive(true);
+        let tool = ask_tool(&session);
+        let (first_context, _first_controller) =
+            tool_context(serde_json::json!({ "question": "first?" }));
+        let (second_context, _second_controller) =
+            tool_context(serde_json::json!({ "question": "second?" }));
+        let first_tool = tool.clone();
+        let first = tokio::spawn(async move { (first_tool.execute)(first_context).await });
+        let second_tool = tool.clone();
+        let second = tokio::spawn(async move { (second_tool.execute)(second_context).await });
+        let id = await_ask_event(&application).await;
+        // Answer before awaiting the joins: the winner's request only resolves
+        // once the answer is delivered, and on a single-thread test runtime
+        // joining first would deadlock the answer path.
+        application.answer_ask(&id, "first".to_owned()).expect("answer");
+        let first = first.await.expect("join");
+        let second = second.await.expect("join");
+        let (winner, loser) = match (first, second) {
+            (Ok(_), Err(error)) => (None, Some(error)),
+            (Err(error), Ok(_)) => (Some(error), None),
+            other => panic!("expected exactly one busy rejection, got {other:?}"),
+        };
+        let loser = loser.or(winner).expect("one busy error");
+        assert!(
+            loser.to_string().contains("another question is already pending"),
+            "{loser}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_ask_aborts_with_cancelled_result() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = crate::Application::new(session.clone()).await;
+        application.set_ask_interactive(true);
+        let tool = ask_tool(&session);
+        let (context, _controller) = tool_context(serde_json::json!({ "question": "continue?" }));
+        let run = tokio::spawn(async move { (tool.execute)(context).await });
+        let id = await_ask_event(&application).await;
+        application.cancel_ask(&id).expect("cancel");
+        let error = run.await.expect("join").expect_err("cancel must reject");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(application.pending_ask().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancel_pending_ask_aborts_with_cancelled_result() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = ask_session(cwd.path());
+        let application = crate::Application::new(session.clone()).await;
+        application.set_ask_interactive(true);
+        let tool = ask_tool(&session);
+        let (context, _controller) = tool_context(serde_json::json!({ "question": "continue?" }));
+        let run = tokio::spawn(async move { (tool.execute)(context).await });
+        let _id = await_ask_event(&application).await;
+        // TUI shutdown cancels whatever is pending without an id; the awaiting
+        // tool call resolves as cancelled and the slot frees.
+        assert!(application.cancel_pending_ask(), "a pending ask was cancelled");
+        assert!(!application.cancel_pending_ask(), "no second pending ask");
+        let error = run.await.expect("join").expect_err("cancel must reject");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(application.pending_ask().is_none());
+    }
+
+    #[tokio::test]
+    async fn standalone_ask_tool_rejects_without_session_binding() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let tool = crate::tools::ask::standalone_ask_tool();
+        let (context, _controller) = tool_context(serde_json::json!({ "question": "continue?" }));
+        let error = (tool.execute)(context)
+            .await
+            .expect_err("standalone ask must reject");
+        assert!(error.to_string().contains("interactive session"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod doom_loop_recovery_tests {
+    use std::fs;
+
+    use pi_ai::providers::{FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider};
+
+    use super::*;
+
+    fn faux_session(cwd: &std::path::Path, tag: &str) -> (Session, FauxProviderRegistration) {
+        let suffix = Uuid::now_v7().to_string();
+        let api = format!("doom-{tag}-api-{suffix}");
+        let provider = format!("doom-{tag}-provider-{suffix}");
+        let model = Model {
+            id: format!("doom-{tag}-model"),
+            name: format!("Doom {tag} Model"),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..Model::default()
+        };
+        let registration = register_faux_provider(FauxProviderOptions {
+            api,
+            provider,
+            models: vec![model.clone()],
+            chunk_size: 1,
+        });
+        let session = Session::new(SessionOptions {
+            model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("build session");
+        (session, registration)
+    }
+
+    fn read_call(id: &str, path: &str) -> FauxResponse {
+        FauxResponse {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: id.to_owned(),
+                name: "read".to_owned(),
+                arguments: serde_json::json!({ "path": path }),
+                thought_signature: None,
+            })],
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+        }
+    }
+
+    fn bash_call(id: &str, command: &str) -> FauxResponse {
+        FauxResponse {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: id.to_owned(),
+                name: "bash".to_owned(),
+                arguments: serde_json::json!({ "command": command }),
+                thought_signature: None,
+            })],
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+        }
+    }
+
+    fn settle() -> FauxResponse {
+        FauxResponse::text("settled")
+    }
+
+    fn error_texts(messages: &[Message]) -> Vec<String> {
+        let mut texts = Vec::new();
+        for message in messages {
+            if let Message::ToolResult(result) = message
+                && result.is_error
+            {
+                let mut text = String::new();
+                for block in &result.content {
+                    if let ContentBlock::Text { text: block_text, .. } = block {
+                        text.push_str(block_text);
+                    }
+                }
+                texts.push(text);
+            }
+        }
+        texts
+    }
+
+    #[tokio::test]
+    async fn identical_consecutive_tool_failures_stop_the_turn() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let missing = cwd.path().join("does-not-exist.txt");
+        let (session, registration) = faux_session(cwd.path(), "triple-fail");
+        registration.set_responses(vec![
+            read_call("call-1", missing.to_string_lossy().as_ref()),
+            read_call("call-2", missing.to_string_lossy().as_ref()),
+            read_call("call-3", missing.to_string_lossy().as_ref()),
+        ]);
+
+        let error = session
+            .run("read the file", Vec::new())
+            .await
+            .expect_err("three identical failures must stop the turn");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("repeated failure") && message.contains("/read") && message.contains("/undo"),
+            "doom-loop message must be actionable, got: {message}"
+        );
+        let texts = error_texts(&session.history());
+        assert!(
+            texts.iter().any(|text| text.contains("repeated failure")),
+            "the final tool result must carry the doom-loop message, got: {texts:?}"
+        );
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn interleaved_success_resets_the_failure_run() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        fs::write(cwd.path().join("notes.txt"), "hello world").expect("write notes");
+        let missing = cwd.path().join("does-not-exist.txt");
+        let (session, registration) = faux_session(cwd.path(), "interleaved");
+        registration.set_responses(vec![
+            read_call("call-1", missing.to_string_lossy().as_ref()),
+            read_call("call-2", missing.to_string_lossy().as_ref()),
+            read_call("call-ok", "notes.txt"),
+            read_call("call-4", missing.to_string_lossy().as_ref()),
+            read_call("call-5", missing.to_string_lossy().as_ref()),
+            settle(),
+        ]);
+
+        // Two failures, then a success, then two more failures: the run of
+        // identical failures never reaches the threshold, so the turn settles
+        // normally instead of being stopped as a doom loop.
+        let result = session
+            .run("read some files", Vec::new())
+            .await
+            .expect("run must settle normally");
+        assert!(result.text.contains("settled"), "{}", result.text);
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn differing_error_text_resets_the_failure_run() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, registration) = faux_session(cwd.path(), "diff-errors");
+        registration.set_responses(vec![
+            bash_call("call-1", "printf 'boom one\\n'; exit 1"),
+            bash_call("call-2", "printf 'boom one\\n'; exit 1"),
+            bash_call("call-3", "printf 'boom two\\n'; exit 1"),
+            bash_call("call-4", "printf 'boom two\\n'; exit 1"),
+            settle(),
+        ]);
+
+        let result = session
+            .run("run some commands", Vec::new())
+            .await
+            .expect("different errors are not a doom loop");
+        assert!(result.text.contains("settled"), "{}", result.text);
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn transient_network_errors_never_trip_the_doom_loop() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (session, registration) = faux_session(cwd.path(), "transient");
+        registration.set_responses(vec![
+            bash_call("net-1", "printf 'network timed out\\n'; exit 1"),
+            bash_call("net-2", "printf 'network timed out\\n'; exit 1"),
+            bash_call("net-3", "printf 'network timed out\\n'; exit 1"),
+            bash_call("net-4", "printf 'network timed out\\n'; exit 1"),
+            settle(),
+        ]);
+
+        // Four identical transient-looking failures: well past the threshold,
+        // but transient network blips must never count toward a doom loop.
+        let result = session
+            .run("ping the registry", Vec::new())
+            .await
+            .expect("transient errors are not a doom loop");
+        assert!(result.text.contains("settled"), "{}", result.text);
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn doom_loop_detection_is_scoped_to_the_current_turn() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let missing = cwd.path().join("does-not-exist.txt");
+        let (session, registration) = faux_session(cwd.path(), "per-turn");
+        registration.set_responses(vec![
+            // Turn 1: three identical failures -> doom loop stops the turn.
+            read_call("t1-call-1", missing.to_string_lossy().as_ref()),
+            read_call("t1-call-2", missing.to_string_lossy().as_ref()),
+            read_call("t1-call-3", missing.to_string_lossy().as_ref()),
+            // Turn 2: same failures, but the counter starts fresh per turn,
+            // so two identical failures plus a settle end normally.
+            read_call("t2-call-1", missing.to_string_lossy().as_ref()),
+            read_call("t2-call-2", missing.to_string_lossy().as_ref()),
+            settle(),
+        ]);
+
+        let first = session
+            .run("first turn", Vec::new())
+            .await
+            .expect_err("turn 1 must trip the doom loop");
+        assert!(first.to_string().contains("repeated failure"), "{first}");
+
+        let second = session
+            .run("second turn", Vec::new())
+            .await
+            .expect("turn 2 starts with a fresh counter");
+        assert!(second.text.contains("settled"), "{}", second.text);
+        registration.unregister();
+    }
+
+    #[test]
+    fn error_prefix_is_lowercase_collapsed_and_capped() {
+        let result = pi_agent::AgentToolResult::text("ERROR:   no such  file\n(system message)");
+        let prefix = doom_loop_error_prefix(&result).expect("prefix");
+        assert_eq!(prefix, "error: no such file (system message)");
+        let long = pi_agent::AgentToolResult::text("x".repeat(300));
+        let prefix = doom_loop_error_prefix(&long).expect("prefix");
+        assert_eq!(prefix.len(), DOOM_LOOP_ERROR_PREFIX_CHARS);
+        assert!(prefix.chars().all(|c| c == 'x'));
+        assert!(doom_loop_error_prefix(&pi_agent::AgentToolResult::default()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rewind_tests {
+    use super::*;
+
+    fn test_session(cwd: &Path) -> Session {
+        Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session")
+    }
+
+    fn user_text(message: &Message) -> String {
+        match message {
+            Message::User(user) => content_text(&user.content),
+            _ => String::new(),
+        }
+    }
+
+    fn phase(name: &str, depends_on: &[&str]) -> TodoPhase {
+        TodoPhase {
+            name: name.to_owned(),
+            tasks: vec![crate::TodoItem {
+                id: format!("task-{name}"),
+                content: name.to_owned(),
+                status: crate::TodoStatus::Pending,
+                depends_on: depends_on.iter().map(|dep| format!("task-{dep}")).collect(),
+                ready: true,
+                blocked_by: Vec::new(),
+                agent: None,
+            }],
+        }
+    }
+
+    fn recorder_with(cwd: &Path, id: &str, texts: &[&str]) -> crate::SessionRecorder {
+        let recorder = crate::start_session_in(cwd, None, None, Some(cwd), Some(id), None)
+            .expect("start recorder");
+        for text in texts {
+            recorder
+                .record_message(&Message::user_text(*text, 0))
+                .expect("record message");
+        }
+        recorder.persist_now().expect("persist recorder");
+        recorder
+    }
+
+    #[tokio::test]
+    async fn rewind_truncates_archives_rebuilds_transcript_and_resets_chain() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session_id = "rewind-chain-test".to_owned();
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: SimpleStreamOptions {
+                stream: pi_ai::StreamOptions {
+                    session_id: Some(session_id.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+
+        let recorder =
+            recorder_with(cwd.path(), "rewind-session", &["one", "two", "three", "four"]);
+        let ids = recorder
+            .tree()
+            .expect("tree")
+            .entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        session.record(recorder).expect("attach recorder");
+
+        // Seed the Responses chain for this session; rewind must clear it.
+        pi_ai::providers::responses_chain_note_success(&session_id, "resp_test");
+        assert_eq!(
+            pi_ai::providers::responses_chain_previous_id(&session_id).as_deref(),
+            Some("resp_test")
+        );
+
+        let outcome = session
+            .rewind(RewindTarget::Index(2))
+            .await
+            .expect("rewind");
+        assert_eq!(outcome.retained_entries, 2);
+        assert_eq!(outcome.dropped_entries, 2);
+        assert!(outcome.checkpoint.is_none());
+        assert!(outcome.archive_path.exists(), "archive sidecar must exist");
+
+        // In-memory transcript rebuilt from the retained journal.
+        let history = session.history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(user_text(&history[0]), "one");
+        assert_eq!(user_text(&history[1]), "two");
+
+        // Chain reset: the stored previous response id is gone.
+        assert_eq!(
+            pi_ai::providers::responses_chain_previous_id(&session_id),
+            None
+        );
+
+        // Session file truncated; recorder leaf is the last kept entry.
+        let (_, session_path) = session.recorder_info().expect("recorder info");
+        let tree = crate::load_session_tree(&session_path).expect("load truncated tree");
+        assert_eq!(tree.entries.len(), 2);
+        assert_eq!(tree.entries[0].id, ids[0]);
+        assert_eq!(tree.entries[1].id, ids[1]);
+        assert_eq!(tree.leaf_id.as_deref(), Some(ids[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn session_drop_resets_the_responses_chain() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session_id = "chain-drop-test".to_owned();
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: SimpleStreamOptions {
+                stream: pi_ai::StreamOptions {
+                    session_id: Some(session_id.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+
+        // Seed a Responses chain for this session.
+        pi_ai::providers::responses_chain_note_success(&session_id, "resp_turn_one");
+        assert_eq!(
+            pi_ai::providers::responses_chain_previous_id(&session_id).as_deref(),
+            Some("resp_turn_one")
+        );
+
+        // The last Session clone dropping must synchronously remove the
+        // process-global chain entry: the id can be reused (resumed) without
+        // chaining from a stale response.
+        drop(session);
+        assert_eq!(
+            pi_ai::providers::responses_chain_previous_id(&session_id),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_restores_todo_and_goal_from_journal_up_to_cut() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let recorder = crate::start_session_in(
+            cwd.path(),
+            None,
+            None,
+            Some(cwd.path()),
+            Some("rewind-goal"),
+            None,
+        )
+        .expect("start recorder");
+        recorder
+            .record_message(&Message::user_text("one", 0))
+            .expect("record one");
+        recorder
+            .record_todo_snapshot(&TodoState {
+                phases: vec![phase("A", &[])],
+                storage: TodoStorage::Session,
+            })
+            .expect("snapshot A");
+        recorder
+            .record_message(&Message::user_text("two", 0))
+            .expect("record two");
+        recorder
+            .record_message(&Message::user_text("three", 0))
+            .expect("record three");
+        recorder.persist_now().expect("persist");
+        session.record(recorder).expect("attach recorder");
+
+        // Journal layout: 0=one, 1=todo A, 2=two, 3=three, 4=goal, 5=todo A+B.
+        session
+            .goal_runtime()
+            .create("ship rewind", None)
+            .expect("create goal");
+        session
+            .set_todos(vec![phase("A+B", &[])])
+            .expect("set todos after goal");
+
+        // Cut between the goal and the second todo snapshot: the later todo is
+        // dropped but the goal journal survives the cut intact.
+        let outcome = session
+            .rewind(RewindTarget::Index(5))
+            .await
+            .expect("rewind to keep goal");
+        assert_eq!(outcome.retained_entries, 5);
+        assert_eq!(session.todo_state().phases.len(), 1);
+        assert_eq!(session.todo_state().phases[0].name, "A");
+        let goal = session.goal_runtime().get().current.expect("goal survives");
+        assert_eq!(goal.objective, "ship rewind");
+
+        // Cut through the goal journal: the goal is re-derived away.
+        session
+            .rewind(RewindTarget::Index(4))
+            .await
+            .expect("rewind through goal journal");
+        assert!(session.goal_runtime().get().current.is_none());
+        assert_eq!(session.todo_state().phases.len(), 1);
+        assert_eq!(session.todo_state().phases[0].name, "A");
+
+        // Cut past every todo snapshot: the todo list falls back to empty.
+        session
+            .rewind(RewindTarget::Index(1))
+            .await
+            .expect("rewind past todo snapshots");
+        assert!(session.todo_state().phases.is_empty());
+        let history = session.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(user_text(&history[0]), "one");
+    }
+
+    #[tokio::test]
+    async fn rewind_refuses_past_first_entry_unknown_checkpoint_and_beyond_end() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let recorder = recorder_with(cwd.path(), "rewind-refuse", &["one"]);
+        session.record(recorder).expect("attach recorder");
+
+        let error = session
+            .rewind(RewindTarget::Index(0))
+            .await
+            .expect_err("rewinding past the first entry must be refused");
+        assert!(format!("{error:#}").contains("past the first entry"));
+
+        let error = session
+            .rewind(RewindTarget::Index(7))
+            .await
+            .expect_err("rewinding beyond the end must be refused");
+        assert!(format!("{error:#}").contains("nothing to rewind"));
+
+        let error = session
+            .rewind(RewindTarget::Checkpoint("missing".to_owned()))
+            .await
+            .expect_err("unknown checkpoint must be refused");
+        assert!(format!("{error:#}").contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_marks_position_and_rewind_targets_it() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let recorder = recorder_with(cwd.path(), "rewind-checkpoint", &["one", "two"]);
+        session.record(recorder.clone()).expect("attach recorder");
+
+        session.set_checkpoint("mid").expect("mark checkpoint");
+        recorder
+            .record_message(&Message::user_text("three", 0))
+            .expect("record three");
+        recorder
+            .record_message(&Message::user_text("four", 0))
+            .expect("record four");
+        recorder.persist_now().expect("persist");
+
+        let outcome = session
+            .rewind(RewindTarget::Checkpoint("mid".to_owned()))
+            .await
+            .expect("rewind to checkpoint");
+        assert_eq!(outcome.checkpoint.as_deref(), Some("mid"));
+        assert_eq!(outcome.retained_entries, 2);
+        // The dropped tail is the marker itself plus the two later messages.
+        assert_eq!(outcome.dropped_entries, 3);
+        let history = session.history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(user_text(&history[0]), "one");
+        assert_eq!(user_text(&history[1]), "two");
+    }
+
+    #[tokio::test]
+    async fn rewind_preview_lists_indices_and_checkpoints() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let recorder = recorder_with(cwd.path(), "rewind-preview", &["one", "two", "three", "four"]);
+        session.record(recorder).expect("attach recorder");
+        session.set_checkpoint("mid").expect("mark checkpoint");
+
+        let previews = session.rewind_preview(20).expect("preview");
+        assert_eq!(previews.len(), 5);
+        assert_eq!(previews[0].index, 0);
+        assert_eq!(previews[0].entry_type, "message");
+        assert_eq!(previews[0].preview.as_deref(), Some("one"));
+        let last = previews.last().expect("last preview");
+        assert_eq!(last.entry_type, "checkpoint");
+        assert_eq!(last.checkpoint_name.as_deref(), Some("mid"));
+        assert!(last.preview.is_none(), "checkpoint markers have no text preview");
+
+        // A limit keeps the most recent records only.
+        let limited = session.rewind_preview(2).expect("limited preview");
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].index, 3);
+        assert_eq!(limited[0].preview.as_deref(), Some("four"));
+        assert_eq!(limited[1].entry_type, "checkpoint");
+    }
+}
+
+#[cfg(test)]
+mod queued_message_consumption_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Scripted provider: pops one assistant message per stream invocation, so
+    /// the loop's turn count is deterministic.
+    fn scripted(messages: Vec<pi_ai::AssistantMessage>) -> pi_agent::StreamFn {
+        let messages = Arc::new(Mutex::new(VecDeque::from(messages)));
+        Arc::new(move |model: Model, _context: Context, _options: SimpleStreamOptions| {
+            let messages = messages.clone();
+            Box::pin(async move {
+                let message = messages.lock().pop_front().unwrap_or_else(|| {
+                    let mut fallback = pi_ai::AssistantMessage::pending(&model);
+                    fallback.content = vec![ContentBlock::text("done")];
+                    fallback.stop_reason = StopReason::Stop;
+                    fallback
+                });
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                let model = model.clone();
+                tokio::spawn(async move {
+                    producer
+                        .push(pi_ai::AssistantMessageEvent::Start {
+                            partial: pi_ai::AssistantMessage::pending(&model),
+                        })
+                        .await;
+                    let terminal = if matches!(
+                        message.stop_reason,
+                        StopReason::Error | StopReason::Aborted
+                    ) {
+                        pi_ai::AssistantMessageEvent::Error {
+                            reason: message.stop_reason,
+                            error: message.clone(),
+                        }
+                    } else {
+                        pi_ai::AssistantMessageEvent::Done {
+                            reason: message.stop_reason,
+                            message: message.clone(),
+                        }
+                    };
+                    producer.push(terminal).await;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    /// Regression: a queued steering message must leave the pending queue the
+    /// moment the running turn consumes it — the count/preview cannot linger
+    /// until the whole turn settles. The turn boundary re-polls the queue
+    /// (`get_steering_messages` drains after every `TurnEnd`), so each
+    /// consumed message decrements the published count while the turn is
+    /// still in flight; `finish_run` republishes the final empty state.
+    #[tokio::test]
+    async fn steering_consumption_publishes_queue_update_at_turn_boundaries() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let gate_started = Arc::new(Notify::new());
+        let gate_release = Arc::new(Notify::new());
+        let tool_started = gate_started.clone();
+        let tool_release = gate_release.clone();
+        // Turn 1 blocks on the gate tool until the test has queued its
+        // steering, making the steer deterministically land between the run's
+        // initial drain and the first turn boundary.
+        let gate = AgentTool::new("gate", "gate", pi_ai::Schema::default(), move |_context| {
+            let started = tool_started.clone();
+            let release = tool_release.clone();
+            async move {
+                started.notify_waiters();
+                release.notified().await;
+                Ok(pi_agent::AgentToolResult::text("gated"))
+            }
+        });
+        let stream = scripted(vec![
+            assistant(
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "c1".to_owned(),
+                    name: "gate".to_owned(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                })],
+                StopReason::ToolUse,
+            ),
+            assistant(vec![ContentBlock::text("two")], StopReason::Stop),
+            assistant(vec![ContentBlock::text("three")], StopReason::Stop),
+        ]);
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(vec![gate]),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream),
+            auth_resolver: None,
+        })
+        .expect("session");
+        let mut events = session.subscribe_session_events();
+        let mut run = tokio::spawn({
+            let session = session.clone();
+            async move { session.run("first", Vec::new()).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate_started.notified())
+            .await
+            .expect("gate tool must start");
+        session.steer(Message::user_text("steer one", 1)).await;
+        session.steer(Message::user_text("steer two", 2)).await;
+        gate_release.notify_waiters();
+
+        // Collect every QueueUpdate while the turn is in flight, then drain
+        // whatever the channel still holds after the run resolves.
+        let mut counts = Vec::new();
+        let mut run_result = None;
+        loop {
+            tokio::select! {
+                biased;
+                event = events.recv() => match event {
+                    Ok(SessionEvent::QueueUpdate { steering, follow_up }) => {
+                        counts.push((steering.len(), follow_up.len()));
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+                result = &mut run => {
+                    run_result = Some(result);
+                    break;
+                }
+            }
+        }
+        while let Ok(SessionEvent::QueueUpdate { steering, follow_up }) = events.try_recv() {
+            counts.push((steering.len(), follow_up.len()));
+        }
+        let result = run_result.expect("run resolves");
+        result.expect("run succeeds");
+
+        // Steer publishes 1 then 2; the two turn boundaries republish 2 → 1 →
+        // 0 as the loop drains one message per boundary; finish_run
+        // republishes 0 on settle. Without the boundary publishes the
+        // sequence would stop at [1, 2, 0] — the consumed messages would stay
+        // visible until the turn settled.
+        assert_eq!(
+            counts,
+            vec![(1, 0), (2, 0), (2, 0), (1, 0), (0, 0), (0, 0)],
+            "queue counts must drop as each steering message is consumed, not only at settle"
+        );
+        let (steering, follow_up) = session.queued_messages().await;
+        assert!(
+            steering.is_empty() && follow_up.is_empty(),
+            "queue must be fully drained after the run"
+        );
+    }
+
+    fn assistant(content: Vec<ContentBlock>, stop_reason: StopReason) -> pi_ai::AssistantMessage {
+        let mut message = pi_ai::AssistantMessage::pending(&Model::default());
+        message.content = content;
+        message.stop_reason = stop_reason;
+        message
+    }
+}
+
+/// Session-to-session todo isolation. Todos are per-session state, held in the
+/// session's own [`TodoRuntime`] and persisted to the session's own JSONL
+/// `todo_snapshot` records — there is no global or project-level todo store.
+/// A fresh recording starts empty, and a fork copies the todo at the fork
+/// point into an independent file whose later mutations never touch the
+/// source session.
+#[cfg(test)]
+mod todo_session_isolation_tests {
+    use super::*;
+
+    fn test_session(cwd: &Path, sessions: &Path) -> Session {
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.set_session_dir(sessions.to_path_buf());
+        session
+    }
+
+    fn phase(name: &str, task_id: &str, content: &str) -> TodoPhase {
+        TodoPhase {
+            name: name.to_owned(),
+            tasks: vec![crate::TodoItem {
+                id: task_id.to_owned(),
+                content: content.to_owned(),
+                status: crate::TodoStatus::Pending,
+                depends_on: Vec::new(),
+                ready: true,
+                blocked_by: Vec::new(),
+                agent: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn new_recording_starts_empty_even_after_prior_session_had_todos() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session = test_session(cwd.path(), sessions.path());
+
+        // A brand-new session has no recorder and an empty in-memory todo.
+        assert_eq!(
+            session.todo_state(),
+            TodoState {
+                phases: Vec::new(),
+                storage: TodoStorage::Memory
+            }
+        );
+
+        // Attaching a fresh (never-written) recorder keeps the todo empty; the
+        // storage tag flips to Session because a recorder now exists.
+        let recorder = crate::start_session_in(
+            cwd.path(),
+            None,
+            Some("off"),
+            Some(sessions.path()),
+            Some("fresh-empty"),
+            None,
+        )
+        .expect("start recorder");
+        session.record(recorder).expect("attach fresh recorder");
+        assert_eq!(
+            session.todo_state(),
+            TodoState {
+                phases: Vec::new(),
+                storage: TodoStorage::Session
+            }
+        );
+
+        // Session A now has its own todos, persisted into its own file.
+        session
+            .set_todos(vec![phase("A", "task-a", "session A task")])
+            .expect("set todos on session A");
+        assert_eq!(session.todo_state().phases[0].tasks[0].id, "task-a");
+
+        // A new recording must start empty: no shared todo store carries
+        // session A's tasks over to the next session.
+        session.start_new_recording().expect("start new recording");
+        assert_eq!(
+            session.todo_state(),
+            TodoState {
+                phases: Vec::new(),
+                storage: TodoStorage::Session
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_copies_todo_at_fork_point_and_mutations_diverge() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session = test_session(cwd.path(), sessions.path());
+        let recorder = crate::start_session_in(
+            cwd.path(),
+            None,
+            Some("off"),
+            Some(sessions.path()),
+            Some("fork-todo-source"),
+            None,
+        )
+        .expect("start recorder");
+        session.record(recorder.clone()).expect("attach recorder");
+
+        // Journal: m1 (message) -> t1 (todo snapshot task-a) -> m2 (message).
+        let first = recorder
+            .record_message(&Message::user_text("first", 0))
+            .expect("record first");
+        assert_eq!(first, recorder.last_entry_id().expect("leaf after first"));
+        session
+            .set_todos(vec![phase("Build", "task-a", "source task")])
+            .expect("set source todos");
+        let second = recorder
+            .record_message(&Message::user_text("second", 1))
+            .expect("record second");
+        recorder.persist_now().expect("persist source");
+        let source_path = recorder.path();
+        assert!(source_path.is_file());
+
+        // Fork at "second": the fork copies the branch up to its parent (the
+        // todo snapshot), so the fork's todo equals the source's at the fork
+        // point — and the fork lives in its own file.
+        session.fork_session(&second, true).await.expect("fork");
+        let (_, fork_path) = session.recorder_info().expect("fork recorder info");
+        assert_ne!(fork_path, source_path, "fork must be a new session file");
+        assert_eq!(
+            session.todo_state().phases[0].tasks[0].id,
+            "task-a",
+            "fork must copy the source todo at the fork point"
+        );
+
+        // The fork is an independent copy: mutating the fork's todo must
+        // never rewrite the source session's journal.
+        session
+            .set_todos(vec![phase("Fork", "task-fork-only", "fork task")])
+            .expect("set fork todos");
+        let fork_journal = session.session_entries(None).expect("fork journal");
+        assert_eq!(
+            fork_journal
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.entry_type == "todo_snapshot")
+                .and_then(|entry| entry.todo_state.clone())
+                .expect("fork todo snapshot")
+                .phases[0]
+                .tasks[0]
+                .id,
+            "task-fork-only",
+            "fork journal must carry the fork's own snapshot"
+        );
+        assert_eq!(
+            crate::load_session_tree(&source_path)
+                .expect("reload source")
+                .latest_todo_state()
+                .expect("source snapshot")
+                .phases[0]
+                .tasks[0]
+                .id,
+            "task-a",
+            "source session must keep the fork-point todo"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP cross-session isolation (P1: same-CWD cutover must reap old clients)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod mcp_session_reset_tests {
+    use super::*;
+
+    use crate::settings::{McpServerConfig, McpTransport};
+
+    fn mcp_test_session(cwd: &Path, session_dir: &Path) -> Session {
+        let session = Session::new(SessionOptions {
+            model: Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        session.set_session_dir(session_dir.to_path_buf());
+        session
+    }
+
+    /// A recorder with one recorded user message (fork/clone prepare against
+    /// the recorded tree).
+    fn seeded_recorder(cwd: &Path, dir: &Path, id: &str) -> crate::SessionRecorder {
+        let recorder = crate::start_session_in(cwd, None, None, Some(dir), Some(id), None)
+            .expect("start recorder");
+        recorder
+            .record_message(&Message::user_text("seed message", 0))
+            .expect("record message");
+        recorder.persist_now().expect("persist recorder");
+        recorder
+    }
+
+    /// Configures the session-scoped registry with the stateful fake server:
+    /// every spawn appends its pid to `pid_file`.
+    fn configure_fake_mcp(session: &Session, pid_file: &Path) {
+        let exe = crate::mcp::fake_server_exe();
+        session.inner.mcp.configure(vec![McpServerConfig {
+            name: "fake".to_owned(),
+            disabled: false,
+            transport: McpTransport::Stdio,
+            command: Some(exe.to_string_lossy().into_owned()),
+            args: Some(vec![
+                "mcp::tests::fake_mcp_server_process".to_owned(),
+                "--nocapture".to_owned(),
+            ]),
+            url: None,
+            env: Some(BTreeMap::from([
+                ("PI_FAKE_MCP_SERVER".to_owned(), "1".to_owned()),
+                (
+                    "PI_FAKE_MCP_PID_FILE".to_owned(),
+                    pid_file.to_string_lossy().into_owned(),
+                ),
+            ])),
+            extra: Default::default(),
+        }]);
+    }
+
+    /// Runs one `mcp call echo` against the session's live registry and
+    /// returns the rendered text.
+    async fn mcp_echo(session: &Session, message: &str) -> String {
+        let result = crate::mcp::run_mcp(
+            &session.inner.mcp,
+            serde_json::json!({
+                "action": "call",
+                "server": "fake",
+                "tool": "echo",
+                "args": { "message": message },
+            }),
+            AbortSignal::none(),
+        )
+        .await
+        .expect("mcp echo call succeeds");
+        result_text(&result)
+    }
+
+    /// Runs `mcp list_servers` against the session's live registry.
+    async fn mcp_list_servers(session: &Session) -> String {
+        let result = crate::mcp::run_mcp(
+            &session.inner.mcp,
+            serde_json::json!({ "action": "list_servers" }),
+            AbortSignal::none(),
+        )
+        .await
+        .expect("mcp list_servers succeeds");
+        result_text(&result)
+    }
+
+    /// Concatenates the text blocks of a tool result.
+    fn result_text(result: &pi_agent::AgentToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                pi_ai::ContentBlock::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pids recorded by the fake server (one line per spawn).
+    fn read_pid_lines(path: &Path) -> Vec<u32> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+
+    /// True when a process with `pid` exists (Linux procfs).
+    fn process_alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// The four logical session replacements that route through the shared
+    /// same-CWD cutover (`commit_session_replacement`).
+    #[derive(Clone, Copy, Debug)]
+    enum ReplacementKind {
+        New,
+        Resume,
+        Fork,
+        Clone,
+    }
+
+    const ALL_REPLACEMENT_KINDS: [ReplacementKind; 4] = [
+        ReplacementKind::New,
+        ReplacementKind::Resume,
+        ReplacementKind::Fork,
+        ReplacementKind::Clone,
+    ];
+
+    async fn prepare_and_commit(session: &Session, kind: ReplacementKind) {
+        let replacement = match kind {
+            ReplacementKind::New => session
+                .prepare_new_session_replacement(None)
+                .expect("prepare new replacement"),
+            ReplacementKind::Resume => {
+                let path = session.current_recorder().expect("recorder").path();
+                let prepared =
+                    crate::PreparedSessionResume::prepare_path(&path).expect("prepare resume path");
+                session
+                    .prepare_resume_replacement(prepared)
+                    .await
+                    .expect("prepare resume replacement")
+            }
+            ReplacementKind::Fork => {
+                let recorder = session.current_recorder().expect("recorder");
+                let tree = recorder.tree().expect("recorder tree");
+                let entry_id = tree
+                    .entries
+                    .iter()
+                    .find(|entry| matches!(entry.message, Some(Message::User(_))))
+                    .map(|entry| entry.id.clone())
+                    .expect("a user entry exists after seeding");
+                let (replacement, _) = session
+                    .prepare_fork_replacement(&entry_id, false)
+                    .expect("prepare fork replacement");
+                replacement
+            }
+            ReplacementKind::Clone => {
+                let leaf_id = session
+                    .current_recorder()
+                    .expect("recorder")
+                    .active_leaf_id()
+                    .expect("active leaf after seeding");
+                session
+                    .prepare_clone_replacement(&leaf_id, false)
+                    .expect("prepare clone replacement")
+            }
+        };
+        session
+            .commit_session_replacement(replacement)
+            .await
+            .expect("commit replacement");
+    }
+
+    /// Regression (P1): every logical same-CWD session replacement must reap
+    /// the outgoing session's live MCP client before the cutover returns, the
+    /// new logical session must lazily spawn a fresh client process, and the
+    /// server configuration must survive.
+    #[tokio::test]
+    async fn same_cwd_cutover_reaps_mcp_client_for_every_replacement_kind() {
+        for kind in ALL_REPLACEMENT_KINDS {
+            let cwd = tempfile::tempdir().expect("cwd");
+            let sessions = tempfile::tempdir().expect("sessions");
+            let trace_dir = tempfile::tempdir().expect("trace dir");
+            let pid_file = trace_dir.path().join("pids.txt");
+            let session = mcp_test_session(cwd.path(), sessions.path());
+            let recorder = seeded_recorder(cwd.path(), sessions.path(), "seed");
+            session.record(recorder).expect("attach seeded recorder");
+            configure_fake_mcp(&session, &pid_file);
+
+            // First mcp call spawns a live client; capture its pid.
+            let text = mcp_echo(&session, "before").await;
+            assert!(text.contains("before"), "kind={kind:?}: {text}");
+            let pids = read_pid_lines(&pid_file);
+            assert_eq!(pids.len(), 1, "kind={kind:?}: one spawn so far: {pids:?}");
+            let old_pid = pids[0];
+            assert!(process_alive(old_pid), "kind={kind:?}: client must be running before the cutover");
+
+            // The same-CWD cutover must reap the old client before returning.
+            prepare_and_commit(&session, kind).await;
+            assert!(
+                !process_alive(old_pid),
+                "kind={kind:?}: old MCP client must be dead before the cutover returns"
+            );
+
+            // The new logical session lazily spawns a fresh client...
+            let text = mcp_echo(&session, "after").await;
+            assert!(text.contains("after"), "kind={kind:?}: {text}");
+            let pids = read_pid_lines(&pid_file);
+            assert_eq!(
+                pids.len(),
+                2,
+                "kind={kind:?}: cutover must force a fresh spawn: {pids:?}"
+            );
+            assert_ne!(
+                pids[1], old_pid,
+                "kind={kind:?}: new session must get a fresh client process"
+            );
+            assert!(process_alive(pids[1]), "kind={kind:?}: fresh client must be running");
+
+            // ...and the configured server is still listed.
+            let listed = mcp_list_servers(&session).await;
+            assert!(
+                listed.contains("fake"),
+                "kind={kind:?}: server config must survive the cutover: {listed}"
+            );
+        }
     }
 }

@@ -663,5 +663,33 @@ fn hostile_hooks_and_config_do_not_execute_during_worktree_creation() {
         .expect("integrate");
     assert!(matches!(outcome, IntegrateOutcome::Applied { .. }));
     assert!(!marker_default.exists(), "integrate must not run post-merge/post-commit hooks");
-    assert!(!marker_redirect.exists(), "integrate must not honor hostile core.hooksPath");
+    assert!(!marker_redirect.exists(), "integrate must not honor hostile core.hooksPath redirect");
+}
+
+#[test]
+fn session_namespace_encoding_is_collision_free_and_stable() {
+    let fixture = Fixture::new("source", "managed");
+    let manager = fixture.manager();
+    // `proj/abc`, `proj\abc` (on unix a backslash is a legal id char), and
+    // `proj:abc` all mapped to `proj-abc` before the digest disambiguator;
+    // each must now get its own namespace.
+    let slash = manager.session_namespace("proj/abc");
+    let backslash = manager.session_namespace("proj\\abc");
+    let colon = manager.session_namespace("proj:abc");
+    let dash = manager.session_namespace("proj-abc");
+    let mut namespaces = vec![slash.clone(), backslash, colon, dash];
+    for (index, namespace) in namespaces.iter().enumerate() {
+        assert!(
+            !namespaces[..index].contains(&namespace),
+            "distinct session ids must not share a namespace: {namespace}"
+        );
+    }
+    // The same id resolves deterministically.
+    assert_eq!(manager.session_namespace("proj/abc"), slash);
+    // Native UUID ids carry no separators and pass through unchanged.
+    let uuid = "123e4567-e89b-12d3-a456-426614174000";
+    let repo = manager.repository_namespace().expect("git discovery");
+    assert_eq!(manager.session_namespace(uuid), format!("{repo}/{uuid}"));
+    // Empty id falls back to the stable placeholder.
+    assert_eq!(manager.session_namespace(""), format!("{repo}/session"));
 }

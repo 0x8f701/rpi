@@ -5,6 +5,7 @@
 //! never enters the main transcript, status history, or structured stdout.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,8 +15,9 @@ use parking_lot::Mutex;
 use pi_agent::{Agent, AgentEvent, AgentTool, ThinkingLevel, ToolCapability};
 use pi_ai::{AssistantMessageEvent, ContentBlock, Message, Model};
 use pi_coding::{
-    Application, SideChatFork, SideChatMainPeek, create_all_tools, create_peek_main_tool,
-    create_read_only_tools, filter_tools_by_capabilities, tools_include_mutation,
+    Application, SideChatFork, SideChatMainPeek, create_all_tools, create_all_tools_with_rules,
+    create_peek_main_tool, create_read_only_tools, filter_tools_by_capabilities,
+    tools_include_mutation,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -244,8 +246,13 @@ impl SideChatController {
             SideChatToolMode::Edit => {
                 // Build fresh workspace-scoped tools. Never clone the main
                 // Session's stateful todo/process/task/hub/goal/extension
-                // closures into the detached side agent.
-                wrap_mutation_tools_with_warning(create_all_tools(&cwd), tracker)
+                // closures into the detached side agent. The main session's
+                // live permission-rule source is threaded into the lsp tool so
+                // its rename preflight obeys the same rules as host approval.
+                wrap_mutation_tools_with_warning(
+                    create_all_tools_with_rules(&cwd, fork.permission_rules.clone()),
+                    tracker,
+                )
             }
         };
         if mode == SideChatToolMode::ReadOnly {
@@ -998,6 +1005,239 @@ impl SideChatController {
     }
 }
 
+/// Maximum number of named side-chat tabs in one [`SideChatTabs`] container.
+pub const MAX_SIDE_CHAT_TABS: usize = 8;
+
+/// Name of the tab created for a legacy single `/btw` session. Old sessions
+/// remain readable under this default tab.
+pub const DEFAULT_SIDE_CHAT_TAB: &str = "default";
+
+/// `/btw` command words that cannot be used as tab names.
+const RESERVED_SIDE_CHAT_TAB_WORDS: [&str; 3] = ["new", "list", "close"];
+
+/// One named tab: a full side-chat session record (fork + agent + transcript).
+struct SideChatTab {
+    name: String,
+    controller: SideChatController,
+}
+
+/// Multi-tab container for parallel `/btw` side-chat sessions.
+///
+/// Each tab owns its own [`SideChatController`] — its own fork, agent,
+/// transcript, editor, scroll, tool mode, and streaming state. Switching tabs
+/// only moves the `active` index: it never forks, never calls a model, and
+/// never touches the main session. The main conversation is deliberately not
+/// a tab; tabs are parallel conversations only.
+///
+/// The container always holds at least one tab. `new_default` (used by the
+/// first `/btw` open) creates the legacy single-session tab named
+/// [`DEFAULT_SIDE_CHAT_TAB`], so old `/btw` behavior is preserved unchanged.
+/// Closing the last tab replaces it with a fresh default tab.
+///
+/// Read/write accessors delegate to the active tab via [`Deref`]/[`DerefMut`];
+/// container-wide concerns (`poll_events`, `observe_main_agent_event`,
+/// `shutdown`) cover every tab so a background tab keeps streaming after a
+/// switch.
+pub struct SideChatTabs {
+    tabs: Vec<SideChatTab>,
+    active: usize,
+}
+
+impl SideChatTabs {
+    /// Hard bound on open tabs.
+    #[must_use]
+    pub const fn max_tabs() -> usize {
+        MAX_SIDE_CHAT_TABS
+    }
+
+    /// Validate a tab name: 1..=32 ASCII word characters (`[A-Za-z0-9_]`),
+    /// and not a reserved `/btw` command word (`new`, `list`, `close`).
+    pub fn validate_tab_name(name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(anyhow!("tab name must not be empty"));
+        }
+        if name.len() > 32 {
+            return Err(anyhow!(
+                "tab name {name:?} exceeds 32 characters ({} given)",
+                name.len()
+            ));
+        }
+        if !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(anyhow!(
+                "tab name {name:?} must use only letters, digits, and underscores"
+            ));
+        }
+        if RESERVED_SIDE_CHAT_TAB_WORDS.contains(&name) {
+            return Err(anyhow!(
+                "tab name {name:?} is reserved for /btw commands (new, list, close)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create the container with a single default tab — the legacy single
+    /// `/btw` session, readable exactly as before.
+    pub async fn new_default(application: &Application) -> Result<Self> {
+        let controller = SideChatController::fork_from(application).await?;
+        Ok(Self::from_single(DEFAULT_SIDE_CHAT_TAB, controller))
+    }
+
+    /// Wrap one existing controller as a single-tab container. Used by tests
+    /// and embedders that already own a controller.
+    #[must_use]
+    pub fn from_single(name: impl Into<String>, controller: SideChatController) -> Self {
+        Self {
+            tabs: vec![SideChatTab {
+                name: name.into(),
+                controller,
+            }],
+            active: 0,
+        }
+    }
+
+    /// Number of open tabs.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tabs.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    /// Name of the active tab.
+    #[must_use]
+    pub fn active_name(&self) -> &str {
+        &self.tabs[self.active].name
+    }
+
+    /// Names of all open tabs, in order.
+    #[must_use]
+    pub fn tab_names(&self) -> Vec<&str> {
+        self.tabs.iter().map(|tab| tab.name.as_str()).collect()
+    }
+
+    /// Iterate (name, controller) pairs for every open tab, in order. The
+    /// active tab is not special-cased; callers compare against
+    /// [`SideChatTabs::active_name`]. Used by embedders (RPC/web) to snapshot
+    /// every parallel session, including tabs that are streaming in the
+    /// background after a switch.
+    pub fn tabs(&self) -> impl Iterator<Item = (&str, &SideChatController)> {
+        self.tabs.iter().map(|tab| (tab.name.as_str(), &tab.controller))
+    }
+
+    /// True when a tab with this name exists.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.tabs.iter().any(|tab| tab.name == name)
+    }
+
+    /// Fork a new named tab and make it active. Validates the name, enforces
+    /// the [`MAX_SIDE_CHAT_TABS`] bound, and forks a fresh side agent — no
+    /// model call happens until the user submits a prompt.
+    pub async fn new_tab(&mut self, application: &Application, name: &str) -> Result<()> {
+        Self::validate_tab_name(name)?;
+        if self.contains(name) {
+            return Err(anyhow!("a side tab named {name:?} is already open"));
+        }
+        if self.tabs.len() >= MAX_SIDE_CHAT_TABS {
+            return Err(anyhow!(
+                "maximum of {MAX_SIDE_CHAT_TABS} side tabs reached"
+            ));
+        }
+        let controller = SideChatController::fork_from(application).await?;
+        self.tabs.push(SideChatTab {
+            name: name.to_owned(),
+            controller,
+        });
+        self.active = self.tabs.len() - 1;
+        Ok(())
+    }
+
+    /// Switch to an existing tab by name. Instant: no fork, no model call.
+    pub fn switch_to(&mut self, name: &str) -> Result<()> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.name == name) else {
+            return Err(anyhow!("no side tab named {name:?}"));
+        };
+        self.active = index;
+        Ok(())
+    }
+
+    /// Close a tab by name, shutting down its agent. When the last tab is
+    /// closed it is replaced by a fresh default tab so the container never
+    /// drops to zero tabs (the legacy single `/btw` session is always one
+    /// `/btw` away). The active index moves to a surviving neighbor.
+    pub async fn close_tab(&mut self, application: &Application, name: &str) -> Result<()> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.name == name) else {
+            return Err(anyhow!("no side tab named {name:?}"));
+        };
+        if self.tabs.len() == 1 {
+            // Create the replacement first so the ≥1-tab invariant holds even
+            // if the fork fails (the close then aborts and keeps the old tab).
+            let controller = SideChatController::fork_from(application).await?;
+            self.tabs.push(SideChatTab {
+                name: DEFAULT_SIDE_CHAT_TAB.to_owned(),
+                controller,
+            });
+            self.active = 1;
+            let mut removed = self.tabs.remove(index);
+            removed.controller.shutdown().await;
+            self.active = 0;
+            return Ok(());
+        }
+        let mut removed = self.tabs.remove(index);
+        removed.controller.shutdown().await;
+        if index < self.active {
+            self.active -= 1;
+        } else if index == self.active {
+            self.active = self.active.min(self.tabs.len() - 1);
+        }
+        Ok(())
+    }
+
+    /// Poll agent events for every tab (a background tab may still be
+    /// streaming after a switch). Returns true when any tab changed.
+    pub fn poll_events(&mut self) -> bool {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            changed |= tab.controller.poll_events();
+        }
+        changed
+    }
+
+    /// Observe main agent events for every tab's advisory file tracker.
+    pub fn observe_main_agent_event(&self, event: &AgentEvent) {
+        for tab in &self.tabs {
+            tab.controller.observe_main_agent_event(event);
+        }
+    }
+
+    /// Shut down every tab's agent/subscription. TUI exit must call this.
+    pub async fn shutdown(&mut self) {
+        for tab in &mut self.tabs {
+            tab.controller.shutdown().await;
+        }
+    }
+}
+
+impl Deref for SideChatTabs {
+    type Target = SideChatController;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tabs[self.active].controller
+    }
+}
+
+impl DerefMut for SideChatTabs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tabs[self.active].controller
+    }
+}
+
 fn content_text(content: &[ContentBlock]) -> String {
     content
         .iter()
@@ -1307,6 +1547,224 @@ mod tests {
     fn command_registration_contract_name() {
         assert_eq!(SideChatToolMode::ReadOnly.label(), "read-only");
         assert_eq!(SideChatToolMode::Edit.label(), "edit");
+    }
+
+    #[tokio::test]
+    async fn tabs_default_opens_legacy_single_session() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let application = Application::new(session).await;
+        let mut tabs = SideChatTabs::new_default(&application)
+            .await
+            .expect("default container");
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs.active_name(), DEFAULT_SIDE_CHAT_TAB);
+        assert_eq!(tabs.tab_names(), vec![DEFAULT_SIDE_CHAT_TAB]);
+        assert!(tabs.entries().is_empty(), "fresh default tab is empty");
+
+        // Legacy `/btw <prompt>` behavior: submit goes to the active tab.
+        tabs.submit_prompt("legacy prompt");
+        assert_eq!(tabs.entries().len(), 1);
+        assert_eq!(tabs.entries()[0].role, SideChatRole::User);
+        assert_eq!(tabs.entries()[0].text, "legacy prompt");
+        tabs.shutdown().await;
+        assert!(!tabs.is_streaming());
+    }
+
+    #[tokio::test]
+    async fn tabs_write_switch_round_trip_preserves_transcripts() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let application = Application::new(session).await;
+        let mut tabs = SideChatTabs::new_default(&application)
+            .await
+            .expect("default container");
+
+        // Write in the default tab.
+        tabs.submit_prompt("draft in default");
+        assert_eq!(tabs.active_name(), DEFAULT_SIDE_CHAT_TAB);
+        let default_entries = tabs
+            .entries()
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(default_entries, vec!["draft in default"]);
+
+        // New tab is active and starts empty; write there too.
+        tabs.new_tab(&application, "alpha").await.expect("alpha tab");
+        assert_eq!(tabs.active_name(), "alpha");
+        assert!(tabs.entries().is_empty());
+        tabs.submit_prompt("draft in alpha");
+        let alpha_entries = tabs
+            .entries()
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(alpha_entries, vec!["draft in alpha"]);
+
+        // Switch back to default: its transcript is preserved in its own record.
+        tabs.switch_to(DEFAULT_SIDE_CHAT_TAB).expect("switch to default");
+        assert_eq!(tabs.active_name(), DEFAULT_SIDE_CHAT_TAB);
+        let default_again = tabs
+            .entries()
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(default_again, vec!["draft in default"]);
+        assert_eq!(
+            tabs.entries().len(),
+            1,
+            "switching must not mix transcripts"
+        );
+
+        // And back to alpha.
+        tabs.switch_to("alpha").expect("switch to alpha");
+        let alpha_again = tabs
+            .entries()
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(alpha_again, vec!["draft in alpha"]);
+
+        tabs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tabs_list_and_close() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let application = Application::new(session).await;
+        let mut tabs = SideChatTabs::new_default(&application)
+            .await
+            .expect("default container");
+        tabs.new_tab(&application, "alpha").await.expect("alpha");
+        tabs.new_tab(&application, "beta").await.expect("beta");
+        tabs.switch_to(DEFAULT_SIDE_CHAT_TAB).expect("switch to default");
+
+        // list
+        assert_eq!(tabs.tab_names(), vec!["default", "alpha", "beta"]);
+        assert!(tabs.contains("alpha"));
+        assert!(!tabs.contains("nope"));
+        assert_eq!(tabs.active_name(), "default");
+
+        // close an inactive tab: active stays put
+        tabs.close_tab(&application, "alpha").await.expect("close alpha");
+        assert_eq!(tabs.tab_names(), vec!["default", "beta"]);
+        assert_eq!(tabs.active_name(), "default");
+
+        // close the active tab: active moves to the neighbor
+        tabs.close_tab(&application, "default").await.expect("close default");
+        assert_eq!(tabs.tab_names(), vec!["beta"]);
+        assert_eq!(tabs.active_name(), "beta");
+
+        // close unknown: error, no mutation
+        let error = tabs.close_tab(&application, "missing").await.expect_err("unknown tab");
+        assert!(error.to_string().contains("no side tab named"));
+        assert_eq!(tabs.tab_names(), vec!["beta"]);
+
+        tabs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tabs_max_bound_rejects_overflow() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let application = Application::new(session).await;
+        let mut tabs = SideChatTabs::new_default(&application)
+            .await
+            .expect("default container");
+        for index in 1..MAX_SIDE_CHAT_TABS {
+            tabs.new_tab(&application, &format!("tab{index}"))
+                .await
+                .expect("tab within bound");
+        }
+        assert_eq!(tabs.len(), MAX_SIDE_CHAT_TABS);
+        assert_eq!(tabs.active_name(), format!("tab{}", MAX_SIDE_CHAT_TABS - 1));
+        let error = tabs
+            .new_tab(&application, "overflow")
+            .await
+            .expect_err("bound must reject");
+        assert!(
+            error.to_string().contains("maximum"),
+            "bound error must explain the limit: {error}"
+        );
+        assert_eq!(tabs.len(), MAX_SIDE_CHAT_TABS, "bound must not mutate state");
+
+        // Duplicate names are rejected too.
+        let duplicate = tabs
+            .new_tab(&application, "tab1")
+            .await
+            .expect_err("duplicate must be rejected");
+        assert!(duplicate.to_string().contains("already open"));
+        tabs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tabs_close_last_replaces_with_fresh_default() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let application = Application::new(session).await;
+        let mut tabs = SideChatTabs::new_default(&application)
+            .await
+            .expect("default container");
+        tabs.submit_prompt("old default content");
+        assert_eq!(tabs.entries().len(), 1);
+
+        tabs.close_tab(&application, DEFAULT_SIDE_CHAT_TAB)
+            .await
+            .expect("close last tab");
+        assert_eq!(tabs.len(), 1, "container must never drop to zero tabs");
+        assert_eq!(tabs.active_name(), DEFAULT_SIDE_CHAT_TAB);
+        assert!(
+            tabs.entries().is_empty(),
+            "replacement default tab must be a fresh session"
+        );
+        tabs.shutdown().await;
+    }
+
+    #[test]
+    fn tabs_name_validation() {
+        for bad in [
+            "",
+            "has space",
+            "tab/name",
+            "tab-name",
+            "new",
+            "list",
+            "close",
+        ] {
+            assert!(
+                SideChatTabs::validate_tab_name(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        let too_long = "a".repeat(33);
+        assert!(SideChatTabs::validate_tab_name(&too_long).is_err());
+        let max_len = "b".repeat(32);
+        assert!(SideChatTabs::validate_tab_name(&max_len).is_ok());
+        for good in ["a", "tab_1", "Z9", DEFAULT_SIDE_CHAT_TAB, "Tab"] {
+            assert!(
+                SideChatTabs::validate_tab_name(good).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tabs_poll_events_and_observe_cover_every_tab() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = test_session(cwd.path());
+        let application = Application::new(session).await;
+        let mut tabs = SideChatTabs::new_default(&application)
+            .await
+            .expect("default container");
+        tabs.new_tab(&application, "alpha").await.expect("alpha");
+
+        // Polling is container-wide: no panic with multiple live tabs, and a
+        // background tab still drains its events.
+        let _ = tabs.poll_events();
+        tabs.observe_main_agent_event(&AgentEvent::AgentStart);
+        tabs.shutdown().await;
     }
 
     async fn fresh_side() -> (tempfile::TempDir, SideChatController) {

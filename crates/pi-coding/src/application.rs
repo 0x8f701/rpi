@@ -14,7 +14,7 @@ pub use workflows::ApplicationWorkflowRuntimeFactory;
 
 use std::{path::{Path, PathBuf}, sync::{Arc, Weak, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
 use pi_agent::{AgentEvent, AgentTool, AgentToolResult, ThinkingLevel, ToolCapability, compose_before_tool_call};
 use pi_ai::{ContentBlock, CustomMessage, Message, Model, Schema};
@@ -26,9 +26,10 @@ use crate::{
     CompactionReason, ExtensionActionHost, ExtensionCancellation, ExtensionCommandDescriptor,
     ExtensionContextSnapshot, ExtensionContextUsage, ExtensionEvent, ExtensionFuture,
     ExtensionInstanceId, ExtensionMessageDelivery, ExtensionPermissionSet, ExtensionRuntime,
-    ExtensionRuntimeAction, Goal, GoalContinuationDecision, GoalError, GoalState, GoalUsageDelta,
-    MessageDelivery, ProcessEvent, ProcessId, ProcessInfo, ProcessKey, ProcessLogs, ProcessManager,
-    ProcessOwnerId, ProcessSignal, ProcessSpawnSpec, ProcessTerminalSize, Session, SessionEvent,
+    ExtensionRuntimeAction, Goal, GoalContinuationDecision, GoalError, GoalEvent, GoalState,
+    GoalUsageDelta, Handoff, MessageDelivery, ProcessEvent, ProcessId, ProcessInfo, ProcessKey,
+    ProcessLogs, ProcessManager, ProcessOwnerId, ProcessSignal, ProcessSpawnSpec, ProcessTerminalSize,
+    Session, SessionEvent,
 };
 
 const EVENT_BUFFER_CAPACITY: usize = 512;
@@ -221,6 +222,13 @@ pub enum ApplicationEvent {
     SessionForked(SessionForkedEvent),
     Process(ProcessEvent),
     Selection(crate::SelectionPlan),
+    /// Deterministic auto-mode classification of the last user prompt,
+    /// published before the run starts when `selector.autoMode` is enabled
+    /// and the classifier detected a code task or long-running goal.
+    ModeDetected {
+        mode: crate::PromptMode,
+        hint: String,
+    },
     Loop(crate::LoopEvent),
     Orchestration(crate::OrchestrationEvent),
     Workflow(crate::WorkflowEvent),
@@ -287,6 +295,10 @@ impl Serialize for ApplicationEvent {
             Self::Process(event) => event.serialize(serializer),
             Self::Selection(plan) => {
                 serde_json::json!({ "type": "selection", "selection": plan }).serialize(serializer)
+            }
+            Self::ModeDetected { mode, hint } => {
+                serde_json::json!({ "type": "mode_detected", "mode": mode, "hint": hint })
+                    .serialize(serializer)
             }
             Self::Loop(event) => event.serialize(serializer),
             Self::Orchestration(event) => event.serialize(serializer),
@@ -560,6 +572,10 @@ impl Application {
             .bind_runtime_generation(&generation)
             .await
             .expect("fresh runtime generation must bind");
+        // Hook-wire the initial trust decision: resolve it through the
+        // fail-open host hook and extension event, and re-stage the resources
+        // with the composed decision when it differs from the initial build.
+        application.resolve_startup_trust(&generation).await;
         let loop_runner_inner = Arc::downgrade(&application.inner);
         let loop_runner: crate::LoopTurnRunner = Arc::new(move |request, cancel| {
             let inner = loop_runner_inner.clone();
@@ -589,9 +605,22 @@ impl Application {
         let session = generation.session();
         let extension = generation.extension_runtime().map(|(runtime, _)| runtime);
         if let Some(runtime) = &extension {
+            // Route this session's extension-owned provider lookups through
+            // this runtime's namespace (fail closed on any other runtime's
+            // registration of the same api).
+            session.set_provider_namespace(Some(runtime.provider_namespace().to_owned()));
             runtime.set_action_host(Arc::new(ApplicationExtensionHost {
                 application: Arc::downgrade(&self.inner),
             }))?;
+            // Host hooks (Settings.hooks) exclude extension tool calls in the
+            // MVP: record the extension-provided tool names so the session's
+            // pre/post_tool_call firing points can skip them.
+            session.set_extension_tool_names(
+                runtime
+                    .agent_tools()
+                    .into_iter()
+                    .map(|tool| tool.name),
+            );
             let before_start_runtime = runtime.clone();
             session.set_before_agent_start(Some(Arc::new(move |context| {
                 let runtime = before_start_runtime.clone();
@@ -708,6 +737,38 @@ impl Application {
                 })
             })));
         }
+        let todo_gate = generation.todo_dag.lock().reconcile_gate.clone();
+        let todo_check_inner = Arc::downgrade(&self.inner);
+        let todo_commit_inner = Arc::downgrade(&self.inner);
+        session.set_todo_mutation_transaction(crate::todo::TodoMutationTransaction {
+            gate: todo_gate,
+            check: Arc::new(move || {
+                let inner = todo_check_inner
+                    .upgrade()
+                    .ok_or_else(|| anyhow!("application stopped"))?;
+                if inner.runtime().todo_transition_active.load(Ordering::Acquire) {
+                    return Err(anyhow!("Todo mutation rejected during session transition"));
+                }
+                Ok(())
+            }),
+            commit: Arc::new(move || {
+                let Some(inner) = todo_commit_inner.upgrade() else { return; };
+                // Workflow children: the supervisor owns canonical Todo DAG
+                // execution (BUG-1), so a session set_todos/apply_todo mutation
+                // must never auto-arm the DAG. Only the parent/main application
+                // arms through the mutation-transaction commit hook.
+                let workflow_owned = inner
+                    .runtime()
+                    .orchestration_runtime()
+                    .is_some_and(|runtime| runtime.workflow_scope().is_some());
+                if workflow_owned {
+                    return;
+                }
+                if let Err(error) = inner.arm_todo_dag_after_mutation_locked() {
+                    inner.todo_dag_failed(&error);
+                }
+            }),
+        });
         if let Some(binding) = generation.goal_tool_binding() {
             binding.bind(self)?;
         }
@@ -1044,6 +1105,35 @@ impl Application {
         self.runtime().session.goal_runtime().get()
     }
 
+    /// Replays the goal journal (every goal event on the active session
+    /// branch) for the panel's history view. Fails when the session has no
+    /// recorder attached (e.g. an unrecorded bare session).
+    pub fn goal_journal(&self) -> Result<Vec<GoalEvent>> {
+        self.runtime().session.goal_journal()
+    }
+
+    /// Deterministic handoff envelope (goal, todo counts, active orchestration
+    /// jobs, environment, recent asks, next-step hints). No model call; the
+    /// envelope is well-formed even for an empty session.
+    #[must_use]
+    pub fn generate_handoff(&self) -> Handoff {
+        let jobs = self
+            .orchestration_runtime()
+            .map(|runtime| runtime.jobs(None))
+            .unwrap_or_default();
+        self.runtime().session.generate_handoff(&jobs)
+    }
+
+    /// Envelope plus a prose handoff paragraph from the existing summarization
+    /// path (one bounded provider call, no retries).
+    pub async fn generate_handoff_with_prose(&self) -> Result<Handoff> {
+        let jobs = self
+            .orchestration_runtime()
+            .map(|runtime| runtime.jobs(None))
+            .unwrap_or_default();
+        self.runtime().session.generate_handoff_with_prose(&jobs).await
+    }
+
     pub fn goal_create(&self, objective: impl Into<String>, token_budget: Option<u64>) -> Result<Goal> {
         self.goal_mutation("create", |runtime| runtime.create(objective, token_budget))
     }
@@ -1077,6 +1167,16 @@ impl Application {
 
     pub fn goal_complete(&self) -> Result<Goal> {
         self.goal_mutation("complete", |runtime| runtime.complete())
+    }
+
+    /// Appends a role-model pin shown in the goal turn's system context.
+    pub fn goal_pin(&self, text: impl Into<String>) -> Result<Goal> {
+        self.goal_mutation("pin", |runtime| runtime.pin(text))
+    }
+
+    /// Removes the role-model pin at `index` (0-based).
+    pub fn goal_unpin(&self, index: usize) -> Result<Goal> {
+        self.goal_mutation("unpin", |runtime| runtime.unpin(index))
     }
 
     pub fn goal_drop(&self) -> Result<Goal> {
@@ -1399,6 +1499,51 @@ impl Application {
         let session = active.session.clone();
         let inner = self.inner.clone();
         let selection = session.select_for_request(&message).await;
+        // Deterministic auto-mode classifier (`selector.autoMode`):
+        // - off: nothing.
+        // - suggest: publish a status hint when a code task / goal is detected.
+        // - auto: additionally seed and start a todo DAG for code tasks,
+        //   bounded to orchestration being enabled and no todo list existing.
+        // The parent turn always runs as usual; the mode drives hints and
+        // optional todo orchestration, never the model loop itself.
+        // Workflow-owned runs (supervisor prompts) never classify: the
+        // workflow supervisor owns the canonical Todo DAG and user-facing
+        // hints would be noise for internal prompts.
+        let auto_mode = session.selector_settings().auto_mode;
+        let workflow_owned = self
+            .runtime()
+            .orchestration_runtime()
+            .is_some_and(|runtime| runtime.workflow_scope().is_some());
+        if !workflow_owned && auto_mode.is_enabled() {
+            let mode = crate::selector::classify_prompt(&message);
+            if let Some(hint) = crate::selector::mode_hint(mode) {
+                inner.publish(ApplicationEvent::ModeDetected {
+                    mode,
+                    hint: hint.to_owned(),
+                });
+            }
+            if auto_mode.is_auto()
+                && mode == crate::PromptMode::CodeTask
+                && session.todo_state().phases.is_empty()
+                && active.runtime_settings.lock().orchestration_enabled
+                && self.runtime().orchestration_runtime().is_some()
+            {
+                match self
+                    .set_todos(crate::selector::auto_create_todo_phases(&message))
+                    .and_then(|_| self.execute_todo_dag())
+                {
+                    Ok(_) => {
+                        // DAG armed; reconcile spawned child jobs that run the
+                        // task. TodoUpdated/orchestration events surface them.
+                    }
+                    Err(error) => {
+                        inner.publish(ApplicationEvent::RunFailed {
+                            message: format!("auto todo DAG creation failed: {error}"),
+                        });
+                    }
+                }
+            }
+        }
         // Exact trusted agent mention + delegation verb spawns through the
         // normal orchestration path (AgentUpdated/JobUpdated). Generic skill
         // or semantic text stays a selection recommendation only.
@@ -1459,6 +1604,30 @@ impl Application {
         active.session.follow_up(user_message(message, images)).await;
     }
 
+    /// Task-scoped interrupt: cancels the active agent turn, its in-flight tool
+    /// calls, and the turn's foreground commands — WITHOUT stopping supervised
+    /// `/ps` processes.
+    ///
+    /// This is the single choke point every turn-cancel path funnels through
+    /// (TUI Esc/Ctrl-C, loop task cancel, human-mode Ctrl-C, extension Abort).
+    /// The boundary follows Codex `Op::Interrupt` semantics ("abort the current
+    /// task without killing background terminals"):
+    /// - Killed: the active turn's foreground commands — the foreground bash
+    ///   abort arm in `run_bash_core` kills the child process group
+    ///   (`tools.rs`), and any user-initiated foreground bash is aborted via
+    ///   `abort_bash`. Retry/compaction work and the active loop iteration are
+    ///   cancelled as well.
+    /// - Kept alive: every process supervised by the per-session
+    ///   [`crate::ProcessManager`] (`process/manager.rs`), regardless of which
+    ///   turn started it — including `bash background=true` and `/ps`
+    ///   processes. In-flight `process` tool `wait`/`logs`/`stop` calls observe
+    ///   the abort signal and return "Operation aborted" (`process/tool.rs`)
+    ///   without signalling the supervised child.
+    /// - The manager is never dropped or `shutdown_owner`'d here: it is owned
+    ///   by [`ApplicationRuntime`] (and the `Session`), which task interrupts
+    ///   never replace. Only explicit `/ps` stop/signal, session switches
+    ///   (`new_session`/`switch_session`/fork/goal), or application teardown
+    ///   (`cleanup`/`shutdown`) stop supervised processes.
     pub async fn abort(&self) {
         let active = self.runtime();
         active.todo_resume_requested.store(false, Ordering::Release);
@@ -1487,6 +1656,39 @@ impl Application {
 
     pub fn abort_compaction(&self) {
         self.runtime().session.abort_compaction();
+    }
+
+    /// Arm (or disarm) the interactive `ask` round trip. Only interactive
+    /// frontends (the TUI) arm it; every other mode keeps `ask` rejecting.
+    pub fn set_ask_interactive(&self, interactive: bool) {
+        self.runtime().session.set_ask_interactive(interactive);
+    }
+
+    /// Override the answer-wait bound for pending `ask` questions (default 60s).
+    pub fn set_ask_timeout(&self, timeout: std::time::Duration) {
+        self.runtime().session.set_ask_timeout(timeout);
+    }
+
+    /// The currently pending `ask` as `(id, prompt)`, if any.
+    #[must_use]
+    pub fn pending_ask(&self) -> Option<(String, String)> {
+        self.runtime().session.pending_ask()
+    }
+
+    /// Deliver the user's answer to the pending `ask` question.
+    pub fn answer_ask(&self, id: &str, answer: String) -> Result<()> {
+        self.runtime().session.answer_ask(id, answer)
+    }
+
+    /// Cancel the pending `ask` question (Esc / shutdown).
+    pub fn cancel_ask(&self, id: &str) -> Result<()> {
+        self.runtime().session.cancel_ask(id)
+    }
+
+    /// Cancel whatever question is pending, regardless of id (TUI shutdown).
+    /// Returns whether a pending ask was cancelled.
+    pub fn cancel_pending_ask(&self) -> bool {
+        self.runtime().session.cancel_pending_ask()
     }
 
     pub fn set_auto_retry_enabled(&self, enabled: bool) {
@@ -1591,9 +1793,49 @@ impl Application {
             return Ok(());
         };
         orchestration.cancel_jobs_result(&job_ids)?;
+        self.wait_todo_jobs_settled(&orchestration, job_ids).await
+    }
+
+    /// One fixed deadline for orchestration jobs to settle during a same-CWD
+    /// session transition (switch/new/fork/navigate/clone): a wedged job must
+    /// not block the transition forever.
+    const TRANSITION_JOB_WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    async fn wait_todo_jobs_settled(
+        &self,
+        orchestration: &crate::OrchestrationRuntime,
+        job_ids: Vec<String>,
+    ) -> Result<()> {
+        self.wait_todo_jobs_settled_with_deadline(
+            orchestration,
+            job_ids,
+            Self::TRANSITION_JOB_WAIT_DEADLINE,
+        )
+        .await
+    }
+
+    /// Waits for `job_ids` to leave the queued/running states with one fixed
+    /// deadline covering the whole wait (never reset inside the loop). On
+    /// expiry the error names the unsettled job ids so the user can cancel
+    /// them explicitly.
+    async fn wait_todo_jobs_settled_with_deadline(
+        &self,
+        orchestration: &crate::OrchestrationRuntime,
+        job_ids: Vec<String>,
+        deadline: std::time::Duration,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
         let mut remaining = job_ids;
         while !remaining.is_empty() {
-            orchestration.wait_jobs(&remaining, None, None).await?;
+            let elapsed = start.elapsed();
+            let Some(timeout) = deadline.checked_sub(elapsed) else {
+                return Err(anyhow!(
+                    "timed out after {}s waiting for orchestration jobs to settle before the session transition: {} — cancel them explicitly and retry",
+                    deadline.as_secs_f64(),
+                    remaining.join(", "),
+                ));
+            };
+            orchestration.wait_jobs(&remaining, Some(timeout), None).await?;
             remaining.retain(|job_id| {
                 orchestration
                     .jobs(Some(std::slice::from_ref(job_id)))
@@ -1671,16 +1913,29 @@ impl Application {
         &self,
         active: &runtime::ApplicationRuntime,
         prepared: PreparedSameCwdCutover,
-    ) {
-        active.session.commit_session_replacement(prepared.session).await;
-        if let Some((orchestration, binding)) = prepared.orchestration {
+    ) -> Result<()> {
+        let PreparedSameCwdCutover {
+            session,
+            orchestration,
+            loop_handle,
+            loops,
+        } = prepared;
+        // The replacement commit reaps the outgoing session's MCP clients
+        // (awaited shutdown) before swapping any state. If that fails nothing
+        // was committed, so restore the suspended loop schedule and drop the
+        // prepared orchestration binding, keeping the current session fully
+        // operational instead of half-switched.
+        if let Err(error) = active.session.commit_session_replacement(session).await {
+            loop_handle.restore_prepared_session(loops);
+            return Err(error);
+        }
+        if let Some((orchestration, binding)) = orchestration {
             orchestration.commit_prepared_parent(binding);
         }
-        prepared
-            .loop_handle
-            .commit_prepared_session_switch(prepared.loops);
+        loop_handle.commit_prepared_session_switch(loops);
         active.charged_goal_jobs.lock().clear();
         self.finish_todo_session_transition();
+        Ok(())
     }
 
     pub async fn switch_session(&self, path: &Path) -> Result<SessionChangeOutcome> {
@@ -1739,7 +1994,10 @@ impl Application {
                 }
             };
             active.process_manager.shutdown_owner(&active.process_owner_id).await;
-            self.commit_same_cwd_cutover(&active, prepared).await;
+            if let Err(error) = self.commit_same_cwd_cutover(&active, prepared).await {
+                self.finish_todo_session_transition();
+                return Err(error);
+            }
             return Ok(SessionChangeOutcome::COMPLETED);
         }
 
@@ -1842,7 +2100,10 @@ impl Application {
             }
         };
         active.process_manager.shutdown_owner(&active.process_owner_id).await;
-        self.commit_same_cwd_cutover(&active, prepared).await;
+        if let Err(error) = self.commit_same_cwd_cutover(&active, prepared).await {
+            self.finish_todo_session_transition();
+            return Err(error);
+        }
         Ok(SessionChangeOutcome::COMPLETED)
     }
 
@@ -1852,6 +2113,14 @@ impl Application {
     ) -> Result<crate::CompactionResult> {
         self.wait_for_idle().await;
         self.runtime().session.compact(custom_instructions).await
+    }
+
+    /// Deterministic context archive without any provider call (snapcompact):
+    /// older turns are replaced by a statistics block and the original entries
+    /// are preserved in a `.snapcompact-<timestamp>.jsonl` sidecar.
+    pub async fn compact_snap(&self) -> Result<crate::CompactionResult> {
+        self.wait_for_idle().await;
+        self.runtime().session.compact_snap().await
     }
 
     pub async fn fork_session(&self, entry_id: &str) -> Result<SessionForkOutcome> {
@@ -1904,7 +2173,10 @@ impl Application {
             }
         };
         active.process_manager.shutdown_owner(&active.process_owner_id).await;
-        self.commit_same_cwd_cutover(&active, prepared).await;
+        if let Err(error) = self.commit_same_cwd_cutover(&active, prepared).await {
+            self.finish_todo_session_transition();
+            return Err(error);
+        }
         if goal.get().current.is_some() {
             self.inner.publish(ApplicationEvent::GoalUpdated {
                 operation: "fork_clone",
@@ -1967,12 +2239,104 @@ impl Application {
             }
         };
         self.inner.publish(ApplicationEvent::SessionTree(SessionTreeEvent { target_id: entry_id.to_owned(), active_leaf_id: result.active_leaf_id.clone(), editor_text: result.editor_text.clone(), summary_entry_id: result.summary_entry_id.clone(), changed: result.changed, cancelled: result.cancelled }));
+        if let Some(runtime) = self.extension_runtime() {
+            let _ = runtime
+                .emit(ExtensionEvent::new(
+                    "session_tree",
+                    serde_json::json!({
+                        "targetId": entry_id,
+                        "activeLeafId": result.active_leaf_id,
+                        "editorText": result.editor_text,
+                        "summaryEntryId": result.summary_entry_id,
+                        "changed": result.changed,
+                        "cancelled": result.cancelled,
+                    }),
+                ))
+                .await;
+        }
         self.finish_todo_session_transition();
         Ok(result)
     }
 
     pub fn set_session_label(&self, target_id: &str, label: Option<&str>) -> Result<()> {
         self.runtime().session.set_session_label(target_id, label)
+    }
+
+    /// Mark the current position as a named rewind target.
+    pub fn set_checkpoint(&self, name: &str) -> Result<String> {
+        self.runtime().session.set_checkpoint(name)
+    }
+
+    /// Render the last `limit` records (index + preview) for the `/rewind`
+    /// picker.
+    pub fn rewind_preview(&self, limit: usize) -> Result<Vec<crate::RewindEntryPreview>> {
+        self.runtime().session.rewind_preview(limit)
+    }
+
+    /// Roll the session back to a rewind target.
+    ///
+    /// Safety rules enforced here, on top of the session-level guards:
+    /// rewinding is refused while orchestration jobs are queued/running, while
+    /// any workflow is active, or while bash is still executing — truncating
+    /// the journal under live work would orphan running jobs and corrupt the
+    /// state those jobs keep reading from. The active turn is drained first
+    /// via [`Application::wait_for_idle`]; the session-level exclusive run
+    /// slot additionally refuses a rewind issued while a prompt is running.
+    pub async fn rewind(&self, target: crate::RewindTarget) -> Result<crate::RewindOutcome> {
+        let _operation = self.inner.operation_gate.lock().await;
+        // Drain the active turn first so the safety checks below observe the
+        // post-turn state (a running turn may spawn orchestration jobs).
+        self.wait_for_idle().await;
+        let active = self.runtime();
+        let jobs = active
+            .orchestration_runtime()
+            .map(|runtime| runtime.jobs(None))
+            .unwrap_or_default();
+        let workflows = self.workflow_list();
+        if let Some(refusal) = Self::rewind_refusal(&jobs, &workflows) {
+            bail!("{refusal}");
+        }
+        if active.session.is_bash_running() {
+            bail!("rewind refused: bash is still running — cancel it first");
+        }
+        active.session.rewind(target).await
+    }
+
+    /// Pure refusal predicate for the rewind safety rules, factored out so it
+    /// is unit-testable with snapshot vectors: refuses while any orchestration
+    /// job is queued/running or any workflow is active. Returns the actionable
+    /// message to surface, or `None` when rewinding is safe.
+    fn rewind_refusal(
+        jobs: &[crate::JobSnapshot],
+        workflows: &[crate::WorkflowSnapshot],
+    ) -> Option<String> {
+        let running_jobs = jobs
+            .iter()
+            .filter(|job| {
+                matches!(job.status, crate::JobStatus::Queued | crate::JobStatus::Running)
+            })
+            .count();
+        if running_jobs > 0 {
+            return Some(format!(
+                "rewind refused: {running_jobs} orchestration job(s) are still queued or running — wait for them to finish, or cancel them first (orchestration /queue cancel, workflow /workflow cancel)"
+            ));
+        }
+        let active_workflows = workflows
+            .iter()
+            .filter(|workflow| workflow.status.is_active())
+            .collect::<Vec<_>>();
+        if !active_workflows.is_empty() {
+            return Some(format!(
+                "rewind refused: {} workflow(s) are still active ({}) — cancel or wait for them before rewinding",
+                active_workflows.len(),
+                active_workflows
+                    .iter()
+                    .map(|workflow| workflow.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        None
     }
 
     pub async fn clone_session(&self) -> Result<SessionChangeOutcome> {
@@ -2028,7 +2392,10 @@ impl Application {
             }
         };
         active.process_manager.shutdown_owner(&active.process_owner_id).await;
-        self.commit_same_cwd_cutover(&active, prepared).await;
+        if let Err(error) = self.commit_same_cwd_cutover(&active, prepared).await {
+            self.finish_todo_session_transition();
+            return Err(error);
+        }
         if goal.get().current.is_some() {
             self.inner.publish(ApplicationEvent::GoalUpdated {
                 operation: "fork_clone",
@@ -2203,6 +2570,12 @@ impl Application {
         config.max_recursion_depth = settings.orchestration_max_recursion_depth;
         config.mailbox_capacity = settings.orchestration_mailbox_capacity;
         config.max_tools_per_agent = settings.orchestration_max_tools_per_agent;
+        config.soft_budget = settings.orchestration_soft_budget;
+        config.preferred_agent = snapshot
+            .settings
+            .orchestration
+            .as_ref()
+            .and_then(|orchestration| orchestration.preferred_agent.clone());
         config = config.with_selector_settings(snapshot.settings.selector.clone().unwrap_or_default());
         config.agent_settings = snapshot.settings.agents.clone();
         if let Some(model) = active.session.model() {
@@ -2337,15 +2710,154 @@ impl Application {
         Ok(())
     }
 
-    /// The resource snapshot, extension registry, and agent tool set are all staged
-    /// before the active resource and extension generations are replaced.
-    pub async fn reload(&self) -> Result<crate::ReloadResult> {
-        self.wait_for_idle().await;
+    /// Resolve project trust for the active session through the fail-open
+    /// hook surfaces — the `pre_trust_decision` host hook and the
+    /// `trust_decision` extension event — and compose their outcomes with
+    /// [`crate::trust::apply_trust_hook_outcomes`] before the decision is
+    /// recorded in a resource build.
+    ///
+    /// The observation fires exactly when a stored decision is consulted: a
+    /// project with trust-gated resources and no one-run override. The host
+    /// hook is fail-open by contract (`fail_closed` entries deny on failure);
+    /// extension errors also fail open — no approval — so hook failures never
+    /// crash trust resolution. The never-weaken invariant holds: a stored or
+    /// default denial survives every hook recommendation, an extension
+    /// approval upgrades only an undecided (`ask`) tentative decision, and a
+    /// host block always denies.
+    pub async fn resolve_project_trust_with_hooks(&self) -> Result<crate::TrustResolution> {
         let active = self.runtime();
         let resources = active
             .session
             .resource_manager()
             .ok_or_else(|| anyhow!("session has no resource manager"))?;
+        let options = resources.options();
+        let default_trust = resources
+            .settings_manager()
+            .settings()
+            .default_project_trust
+            .unwrap_or(crate::DefaultProjectTrust::Ask);
+        let (mut resolution, observation) = crate::trust::resolve_project_trust_with_observation(
+            &resources.trust_store(),
+            &options.cwd,
+            options.project_trust_override,
+            default_trust,
+            options.headless,
+        )?;
+        let Some(observation) = observation else {
+            // Override or resource-less project: no stored decision is
+            // consulted, so no hook observation fires.
+            return Ok(resolution);
+        };
+        let payload = observation.to_payload();
+        let host_blocked = active
+            .session
+            .fire_trust_decision_hook(
+                &observation.path.to_string_lossy(),
+                observation.decision.as_str(),
+                observation.is_new,
+            )
+            .await
+            .block;
+        let extension_runtime = active.extension_runtime.lock().clone();
+        let extension_approved = match extension_runtime {
+            Some((runtime, _)) => match runtime.reduce_trust_decision(payload).await {
+                Ok(reduction) => reduction.is_some_and(|reduction| reduction.approve),
+                Err(error) => {
+                    eprintln!(
+                        "extensions: trust_decision reduction failed, failing open: {error:#}"
+                    );
+                    false
+                }
+            },
+            None => false,
+        };
+        resolution.decision = crate::trust::apply_trust_hook_outcomes(
+            observation.decision,
+            host_blocked,
+            extension_approved,
+        );
+        Ok(resolution)
+    }
+
+    /// Resolve the initial trust decision through the fail-open hook surfaces
+    /// and, when the composed decision differs from the initial resource
+    /// build, re-stage the resources with it so the snapshot records exactly
+    /// what the hooks decided. Never crashes startup: hook failures fail
+    /// open, and a session without attached resources has nothing to resolve.
+    ///
+    /// The session blueprint fires the host `pre_trust_decision` hook BEFORE
+    /// loading any project extension (P0 ordering) and records the composed
+    /// decision here; when present, the host hook has already fired once at
+    /// startup and must not re-fire. The extension `trust_decision` event is
+    /// still skipped in that case: project extensions only load after the
+    /// host boundary passed, and a trusted store decision (the only case that
+    /// loads them) cannot be upgraded by an extension approval.
+    async fn resolve_startup_trust(&self, generation: &runtime::ApplicationRuntime) {
+        let Some(resources) = generation.session.resource_manager() else {
+            return;
+        };
+        let composed = match resources.take_startup_composed_trust() {
+            Some(composed) => composed,
+            None => match self.resolve_project_trust_with_hooks().await {
+                Ok(composed) => composed,
+                Err(error) => {
+                    eprintln!(
+                        "trust: resolving startup trust through hook surfaces failed, \
+                         keeping the initial resource build: {error:#}"
+                    );
+                    return;
+                }
+            },
+        };
+        if composed.decision == resources.snapshot().trust.decision {
+            return;
+        }
+        resources.set_composed_trust(Some(composed));
+        let candidate = match resources.stage_reload() {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                eprintln!(
+                    "trust: re-staging resources for the hook-composed startup decision: {error:#}"
+                );
+                return;
+            }
+        };
+        if let Err(error) = resources.commit_reload(candidate) {
+            eprintln!(
+                "trust: committing the hook-composed startup decision: {error:#}"
+            );
+            return;
+        }
+        let session = generation.session.clone();
+        if let Err(error) = session.attach_resources(resources).await {
+            eprintln!(
+                "trust: re-attaching resources after the hook-composed startup decision: {error:#}"
+            );
+        }
+    }
+
+    /// The resource snapshot, extension registry, and agent tool set are all staged
+    /// before the active resource and extension generations are replaced.
+    pub async fn reload(&self) -> Result<crate::ReloadResult> {
+        self.wait_for_idle().await;
+        let composed = self.resolve_project_trust_with_hooks().await?;
+        self.reload_with_composed_trust(composed).await
+    }
+
+    /// Continue a reload with an already-composed trust decision whose hook
+    /// surfaces have already fired. The decision is fed into the resource
+    /// build so `build_candidate` records exactly what the fail-open hook
+    /// surfaces decided without re-firing them.
+    async fn reload_with_composed_trust(
+        &self,
+        composed: crate::TrustResolution,
+    ) -> Result<crate::ReloadResult> {
+        let active = self.runtime();
+        let resources = active
+            .session
+            .resource_manager()
+            .ok_or_else(|| anyhow!("session has no resource manager"))?;
+        resources.set_composed_trust(Some(composed));
         let resource_candidate = resources.stage_reload()?;
         let next_runtime_settings = Arc::new(resource_candidate.snapshot().settings.runtime_settings()?);
         let orchestration_candidate =
@@ -2551,6 +3063,42 @@ impl Application {
                 }
             }
         });
+    }
+
+    /// Encrypt the current session (JSONL branch) with `passphrase` and write
+    /// `<name>.jsonl.enc` locally. See [`crate::encrypt`] for the scheme.
+    ///
+    /// The passphrase is never stored or logged; the plaintext JSONL is staged
+    /// in the system temp dir and removed after encryption.
+    pub fn share_encrypted_to_file(
+        &self,
+        passphrase: &str,
+        output: Option<&Path>,
+    ) -> Result<crate::EncryptedShareResult> {
+        crate::share::encrypt_session_share_to_file(&self.runtime().session, passphrase, output)
+    }
+
+    /// Encrypt the current session to a local `.jsonl.enc` file and, when the
+    /// `gh` CLI is available and authenticated, also upload the ciphertext to
+    /// a secret gist (non-fatal when `gh` is missing).
+    pub async fn share_session_encrypted(
+        &self,
+        passphrase: &str,
+        output: Option<&Path>,
+    ) -> Result<crate::EncryptedShareResult> {
+        crate::share::share_session_encrypted(&self.runtime().session, passphrase, output).await
+    }
+
+    /// Recorder-authoritative bounded snapshot for live collaboration guests
+    /// (see [`Session::collab_public_snapshot`]).
+    pub fn collab_public_snapshot(
+        &self,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<serde_json::Value> {
+        self.runtime()
+            .session
+            .collab_public_snapshot(max_entries, max_bytes)
     }
 
     /// Share the current live session to a secret GitHub gist.
@@ -2811,6 +3359,14 @@ impl ApplicationInner {
         let Some(runtime) = runtime else {
             return Ok(());
         };
+        // Workflow children own their canonical Todo DAG through the
+        // supervisor: a todo mutation must never silently arm DAG execution
+        // (that raced the supervisor's own task-tool delegation, executing
+        // every ready task twice — see BUG-1). The supervisor actor drives
+        // DAG execution explicitly (start/resume/restore continuation).
+        if runtime.workflow_scope().is_some() {
+            return Ok(());
+        }
         if self.has_ready_open_todo() {
             active.todo_cycle_pending.store(true, Ordering::Release);
             self.arm_todo_dag_locked(&runtime, true)?;
@@ -2820,10 +3376,28 @@ impl ApplicationInner {
         self.finish_todo_cycle_if_idle(Some(&runtime), false);
         Ok(())
     }
+    /// Advisory `agent_settled` extension event: the agent has no pending
+    /// parent turn, todo cycle, or orchestration jobs. Fired exactly where
+    /// `ApplicationEvent::AgentSettled` is published (the parent turn end and
+    /// the todo-cycle drain), so extensions observe the same settle moments
+    /// as the TUI/RPC stream. Best-effort: emitted on a spawned task because
+    /// the settle points are synchronous.
+    fn emit_agent_settled(&self) {
+        let Some(runtime) = self.runtime().extension_runtime().map(|(runtime, _)| runtime) else {
+            return;
+        };
+        let _ = tokio::spawn(async move {
+            runtime
+                .emit(ExtensionEvent::new("agent_settled", serde_json::json!({})))
+                .await;
+        });
+    }
+
     fn finish_parent_turn(&self) {
         let active = self.runtime();
         if !active.todo_cycle_pending.load(Ordering::Acquire) {
             self.publish(ApplicationEvent::AgentSettled);
+            self.emit_agent_settled();
             return;
         }
         if active.todo_resume_requested.swap(false, Ordering::AcqRel) {
@@ -2895,6 +3469,7 @@ impl ApplicationInner {
         }
         if active.todo_cycle_pending.swap(false, Ordering::AcqRel) {
             self.publish(ApplicationEvent::AgentSettled);
+            self.emit_agent_settled();
         }
     }
 
@@ -3209,6 +3784,18 @@ fn session_extension_event(event: &SessionEvent) -> Option<ExtensionEvent> {
                 "willRetry": will_retry,
             }),
         ),
+        SessionEvent::SessionInfoChanged { name } => (
+            "session_info_changed",
+            serde_json::json!({ "name": name }),
+        ),
+        SessionEvent::ModelSelect { model } => (
+            "model_select",
+            serde_json::json!({ "model": model }),
+        ),
+        SessionEvent::ThinkingLevelSelect { thinking_level } => (
+            "thinking_level_select",
+            serde_json::json!({ "thinkingLevel": thinking_level }),
+        ),
         _ => return None,
     };
     Some(ExtensionEvent::new(name, data))
@@ -3321,7 +3908,7 @@ fn user_message(text: String, images: Vec<ContentBlock>) -> Message {
 
 #[cfg(test)]
 mod tests {
-    use super::{Application, public_extension_model};
+    use super::{Application, ApplicationEvent, public_extension_model};
     use pi_ai::Model;
     use std::collections::HashMap;
 
@@ -3433,6 +4020,149 @@ mod tests {
     }
 
     #[test]
+    fn responses_stateful_chain_setting_reaches_runtime_and_session_stream_options() {
+        // Regression: commit_runtime_settings reported success while the live
+        // session kept the old chain mode (responses_stateful_chain was never
+        // copied into the session stream options).
+        let (_agent, _cwd, application) = resource_application("{}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut draft = application.settings_draft(crate::SettingsScope::Global).expect("draft");
+            draft
+                .set("responsesStatefulChain", serde_json::json!(true))
+                .expect("set chain true");
+            let applied = application.apply_settings_draft(draft).await.expect("apply");
+            assert!(applied.applied_live, "chain flag is a live setting");
+            assert!(
+                application.runtime_settings().stream_options.responses_stateful_chain,
+                "runtime settings must carry the enabled chain flag"
+            );
+            assert!(
+                application.runtime().session.stream_options().responses_stateful_chain,
+                "the live session stream options must enable the chain"
+            );
+
+            let mut draft = application.settings_draft(crate::SettingsScope::Global).expect("draft");
+            draft
+                .set("responsesStatefulChain", serde_json::json!(false))
+                .expect("set chain false");
+            let applied = application.apply_settings_draft(draft).await.expect("apply");
+            assert!(applied.applied_live);
+            assert!(
+                !application.runtime_settings().stream_options.responses_stateful_chain,
+                "runtime settings must clear the chain flag"
+            );
+            assert!(
+                !application.runtime().session.stream_options().responses_stateful_chain,
+                "the live session stream options must clear the chain flag"
+            );
+        });
+    }
+
+    #[test]
+    fn todo_transition_wait_bounds_wedged_jobs_with_deadline() {
+        // Regression: the same-CWD session transition waited on orchestration
+        // jobs with no deadline, so a wedged job blocked switch/new/fork/
+        // navigate/clone forever. The fixed deadline must fire and the error
+        // must name the unsettled job id.
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = crate::Session::new(crate::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: "test".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        let task = crate::AgentDefinition {
+            name: "task".to_owned(),
+            description: "background task".to_owned(),
+            system_prompt: "prompt".to_owned(),
+            tools: None,
+            autoload_skills: Vec::new(),
+            model: None,
+            thinking_level: None,
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
+            source: crate::AgentDefinitionSource::Bundled,
+            path: None,
+            trusted: true,
+            kind: crate::AgentDefinitionKind::Agent,
+            personality: None,
+            soft_budget: None,
+        };
+        let mut config = crate::OrchestrationConfig::new(
+            crate::AgentCatalog::from_agents(vec![task]),
+            cwd.path().join("artifacts"),
+        );
+        config.idle_ttl = None;
+        // The child factory never resolves: the spawned job stays running
+        // forever, simulating a wedged orchestration job.
+        let factory: crate::ChildSessionFactory =
+            std::sync::Arc::new(|_request| Box::pin(async move { std::future::pending().await }));
+        let orchestration = crate::OrchestrationRuntime::new(config, factory).expect("orchestration");
+
+        current_thread_runtime().block_on(async {
+            let application =
+                Application::new_with_orchestration(session, orchestration).await;
+            let runtime = application.orchestration_runtime().expect("orchestration attached");
+            let spawn = runtime
+                .spawn_tasks(
+                    "Main",
+                    0,
+                    vec![crate::TaskItem {
+                        index: 0,
+                        id: "Wedged".to_owned(),
+                        agent: "task".to_owned(),
+                        assignment: "never settles".to_owned(),
+                        todo_task_id: None,
+                        ..Default::default()
+                    }],
+                )
+                .expect("spawn wedged job")
+                .remove(0);
+            let job_id = spawn.job_id;
+            // Let the spawned child task progress past job registration so the
+            // job is observably queued/running when the wait starts.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let start = std::time::Instant::now();
+            let error = application
+                .wait_todo_jobs_settled_with_deadline(
+                    &runtime,
+                    vec![job_id.clone()],
+                    std::time::Duration::from_millis(200),
+                )
+                .await
+                .expect_err("a wedged job must hit the transition deadline");
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "the fixed deadline must bound the whole wait: {elapsed:?}"
+            );
+            let message = format!("{error:#}");
+            assert!(message.contains("timed out"), "actionable timeout error: {message}");
+            assert!(
+                message.contains(&job_id),
+                "the error must list the unsettled job id: {message}"
+            );
+        });
+    }
+
+    #[test]
     fn failed_settings_reload_never_claims_live_application() {
         let (_agent, cwd, application) = resource_application("{}");
         let project_settings = cwd.path().join(".pi/settings.json");
@@ -3452,5 +4182,321 @@ mod tests {
             .expect_err("reload must fail");
         assert!(!error.to_string().is_empty());
         assert_eq!(application.resource_generation(), generation);
+    }
+
+    /// Application with orchestration enabled in the global settings file and
+    /// a real [`crate::OrchestrationRuntime`] attached (stub child factory —
+    /// the DAG-creation contract is synchronous; child turns are never run).
+    fn orchestration_application(
+        global_settings: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Application) {
+        let agent = tempfile::tempdir().expect("agent dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(agent.path().join("settings.json"), global_settings)
+            .expect("global settings");
+        let mut options = crate::ResourceManagerOptions::new(cwd.path());
+        options.agent_dir = agent.path().to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = crate::ResourceManager::new(options).expect("resources");
+        let session = crate::Session::new(crate::SessionOptions {
+            model: Model::default(),
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: "test".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(session.attach_resources(resources))
+            .expect("attach resources");
+        let task = crate::AgentDefinition {
+            name: "task".to_owned(),
+            description: "background task".to_owned(),
+            system_prompt: "prompt".to_owned(),
+            tools: None,
+            autoload_skills: Vec::new(),
+            model: None,
+            thinking_level: None,
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
+            source: crate::AgentDefinitionSource::Bundled,
+            path: None,
+            trusted: true,
+            kind: crate::AgentDefinitionKind::Agent,
+            personality: None,
+            soft_budget: None,
+        };
+        let mut config =
+            crate::OrchestrationConfig::new(crate::AgentCatalog::from_agents(vec![task]), cwd.path().join("artifacts"));
+        config.idle_ttl = None;
+        let factory: crate::ChildSessionFactory = std::sync::Arc::new(|_request| {
+            Box::pin(async move { Err(anyhow::anyhow!("child factory is not exercised")) })
+        });
+        let orchestration = crate::OrchestrationRuntime::new(config, factory).expect("orchestration");
+        let application = runtime.block_on(Application::new_with_orchestration(session, orchestration));
+        (agent, cwd, application)
+    }
+
+    #[test]
+    fn orchestration_reload_candidate_keeps_persisted_preferred_agent() {
+        let (_agent, _cwd, application) = orchestration_application(
+            r#"{"orchestration":{"tasks":true,"preferredAgent":"task"}}"#,
+        );
+        let active = application.runtime();
+        let snapshot = active
+            .session
+            .resource_manager()
+            .expect("resources")
+            .snapshot();
+        let settings = snapshot.settings.runtime_settings().expect("runtime settings");
+        let candidate = application
+            .orchestration_candidate(&snapshot, &settings)
+            .expect("candidate")
+            .expect("orchestration candidate");
+        assert_eq!(candidate.preferred_agent().as_deref(), Some("task"));
+    }
+
+    /// Wait (bounded) for the next `ModeDetected` event on the stream.
+    async fn wait_for_mode_detected(
+        events: &mut tokio::sync::broadcast::Receiver<ApplicationEvent>,
+    ) -> Option<(crate::PromptMode, String)> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Ok(ApplicationEvent::ModeDetected { mode, hint })) => {
+                    return Some((mode, hint));
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    #[test]
+    fn auto_mode_suggest_publishes_hint_without_creating_todos() {
+        let (_agent, _cwd, application) = resource_application("{}");
+        current_thread_runtime().block_on(async {
+            let mut events = application.subscribe();
+            application
+                .prompt("implement a parser in src/lib.rs".to_owned(), Vec::new(), None)
+                .await
+                .expect("prompt");
+            let (mode, hint) = wait_for_mode_detected(&mut events)
+                .await
+                .expect("suggest must publish a mode hint");
+            assert_eq!(mode, crate::PromptMode::CodeTask);
+            assert_eq!(hint, "Detected: code task — /todo to plan");
+            assert!(
+                application.todo_state().phases.is_empty(),
+                "suggest must not create todos"
+            );
+        });
+    }
+
+    #[test]
+    fn auto_mode_auto_creates_and_starts_todo_dag_for_code_task() {
+        let (_agent, _cwd, application) = orchestration_application(
+            r#"{"orchestration": {"tasks": true, "todo": true}, "selector": {"autoMode": "auto"}}"#,
+        );
+        current_thread_runtime().block_on(async {
+            assert!(application.runtime_settings().orchestration_enabled);
+            let mut events = application.subscribe();
+            application
+                .prompt("implement a parser in src/lib.rs".to_owned(), Vec::new(), None)
+                .await
+                .expect("prompt");
+            let (mode, hint) = wait_for_mode_detected(&mut events)
+                .await
+                .expect("auto mode still publishes the hint");
+            assert_eq!(mode, crate::PromptMode::CodeTask);
+            assert_eq!(hint, "Detected: code task — /todo to plan");
+            let phases = application.todo_state().phases;
+            assert_eq!(phases.len(), 1, "auto mode must seed a todo DAG");
+            assert_eq!(phases[0].name, "Plan");
+            assert_eq!(phases[0].tasks.len(), 1);
+            assert_eq!(phases[0].tasks[0].content, "implement a parser in src/lib.rs");
+            let jobs = application
+                .orchestration_runtime()
+                .expect("orchestration attached")
+                .jobs(None);
+            assert!(
+                !jobs.is_empty(),
+                "auto mode must spawn orchestration jobs for the seeded task"
+            );
+        });
+    }
+
+    #[test]
+    fn auto_mode_auto_respects_existing_todos() {
+        let (_agent, _cwd, application) = orchestration_application(
+            r#"{"orchestration": {"tasks": true, "todo": true}, "selector": {"autoMode": "auto"}}"#,
+        );
+        current_thread_runtime().block_on(async {
+            application
+                .set_todos(vec![crate::TodoPhase {
+                    name: "Existing".to_owned(),
+                    tasks: vec![crate::TodoItem {
+                        id: "existing-1".to_owned(),
+                        content: "keep this task".to_owned(),
+                        status: crate::TodoStatus::Pending,
+                        depends_on: Vec::new(),
+                        ready: true,
+                        blocked_by: Vec::new(),
+                        agent: None,
+                    }],
+                }])
+                .expect("seed existing todos");
+            let mut events = application.subscribe();
+            application
+                .prompt("implement a parser in src/lib.rs".to_owned(), Vec::new(), None)
+                .await
+                .expect("prompt");
+            let (mode, _) = wait_for_mode_detected(&mut events)
+                .await
+                .expect("hint still fires");
+            assert_eq!(mode, crate::PromptMode::CodeTask);
+            let phases = application.todo_state().phases;
+            assert_eq!(phases.len(), 1, "existing todos must not be replaced");
+            assert_eq!(phases[0].name, "Existing");
+            assert_eq!(phases[0].tasks[0].content, "keep this task");
+        });
+    }
+
+    #[test]
+    fn auto_mode_off_publishes_no_mode_event() {
+        let (_agent, _cwd, application) =
+            resource_application(r#"{"selector": {"autoMode": "off"}}"#);
+        current_thread_runtime().block_on(async {
+            let mut events = application.subscribe();
+            application
+                .prompt("implement a parser in src/lib.rs".to_owned(), Vec::new(), None)
+                .await
+                .expect("prompt");
+            assert!(
+                wait_for_mode_detected(&mut events).await.is_none(),
+                "off must not publish mode events"
+            );
+            assert!(application.todo_state().phases.is_empty());
+        });
+    }
+
+    #[test]
+    fn question_prompt_publishes_no_mode_event() {
+        let (_agent, _cwd, application) = resource_application("{}");
+        current_thread_runtime().block_on(async {
+            let mut events = application.subscribe();
+            application
+                .prompt("what is rust?".to_owned(), Vec::new(), None)
+                .await
+                .expect("prompt");
+            assert!(
+                wait_for_mode_detected(&mut events).await.is_none(),
+                "questions must not fire the classifier hint"
+            );
+        });
+    }
+
+    fn job(id: &str, status: crate::JobStatus) -> crate::JobSnapshot {
+        crate::JobSnapshot {
+            id: id.to_owned(),
+            agent_id: "agent".to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "main".to_owned(),
+            description: None,
+            todo_task_id: None,
+            workflow_id: None,
+            workflow_generation: None,
+            status,
+            created_at: 1,
+            started_at: None,
+            finished_at: None,
+            result: None,
+            soft_budget_exhausted: false,
+        }
+    }
+
+    fn workflow(name: &str, status: crate::WorkflowStatus) -> crate::WorkflowSnapshot {
+        crate::WorkflowSnapshot {
+            workflow_id: crate::WorkflowId::new(format!("workflow-{name}")),
+            name: name.to_owned(),
+            objective: "objective".to_owned(),
+            status,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            generation: 1,
+            todo: crate::TodoState {
+                phases: Vec::new(),
+                storage: crate::TodoStorage::Memory,
+            },
+            worktree_label: None,
+            branch: None,
+            supervisor_agent_id: None,
+            supervisor_job_id: None,
+            failure: None,
+            integration: crate::WorkflowIntegration::None,
+        }
+    }
+
+    #[test]
+    fn rewind_refusal_blocks_live_orchestration_jobs_and_active_workflows() {
+        // No live work: rewinding is safe.
+        assert_eq!(Application::rewind_refusal(&[], &[]), None);
+        assert_eq!(
+            Application::rewind_refusal(
+                &[job("settled", crate::JobStatus::Completed)],
+                &[workflow("done", crate::WorkflowStatus::Completed)],
+            ),
+            None
+        );
+
+        // Queued or running orchestration jobs refuse with an actionable
+        // message naming the count.
+        for status in [crate::JobStatus::Queued, crate::JobStatus::Running] {
+            let refusal = Application::rewind_refusal(&[job("live", status)], &[]).expect("refusal");
+            assert!(refusal.contains("rewind refused"), "{refusal}");
+            assert!(refusal.contains("orchestration job(s)"), "{refusal}");
+            assert!(refusal.contains('1'), "{refusal}");
+        }
+
+        // Active workflows refuse even when no orchestration job is queued.
+        for status in [
+            crate::WorkflowStatus::Queued,
+            crate::WorkflowStatus::Planning,
+            crate::WorkflowStatus::Running,
+            crate::WorkflowStatus::Paused,
+            crate::WorkflowStatus::Integrating,
+        ] {
+            let refusal = Application::rewind_refusal(&[], &[workflow("live", status)]).expect("refusal");
+            assert!(refusal.contains("rewind refused"), "{refusal}");
+            assert!(refusal.contains("workflow(s)"), "{refusal}");
+            assert!(refusal.contains("live"), "{refusal}");
+        }
     }
 }

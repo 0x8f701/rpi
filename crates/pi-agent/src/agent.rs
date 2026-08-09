@@ -21,9 +21,9 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use crate::{
     AbortController, AbortSignal, AfterToolCallFn, AgentContext, AgentEvent, AgentLoopConfig,
     AgentMessage, AgentTool, BeforeAgentStartContext, BeforeAgentStartFn, BeforeToolCallFn,
-    ConvertToLlmFn, GetApiKeyFn, Listener, PrepareNextTurnFn, QueueMode, StreamFn, ThinkingLevel,
-    ToolExecutionMode, TransformContextFn, TransformMessageFn, queue::PendingQueue, run_agent_loop,
-    run_agent_loop_continue,
+    ConvertToLlmFn, GetApiKeyFn, Listener, PrepareNextTurnFn, QueueMode, ShouldStopAfterTurnFn,
+    StreamFn, ThinkingLevel, ToolExecutionMode, TransformContextFn, TransformMessageFn,
+    queue::PendingQueue, run_agent_loop, run_agent_loop_continue,
 };
 
 #[derive(Clone, Debug)]
@@ -121,6 +121,11 @@ struct Inner {
     transform_context: StdRwLock<Option<TransformContextFn>>,
     before_tool_call: StdRwLock<Option<BeforeToolCallFn>>,
     after_tool_call: StdRwLock<Option<AfterToolCallFn>>,
+    /// Optional per-turn stop hook consulted by the agent loop after each
+    /// assistant turn. When it returns true the run ends cleanly after the
+    /// current turn (partial result, accumulated usage), which orchestration
+    /// uses to implement soft budgets and yield-driving for subagents.
+    should_stop_after_turn: StdRwLock<Option<ShouldStopAfterTurnFn>>,
     /// Test seam: when set, `release_claim_owned` notifies `parked` and then
     /// awaits `gate` after verifying ownership and before clearing state, so
     /// tests can synchronously know a release is in flight and cancel it
@@ -256,6 +261,7 @@ impl Agent {
                 transform_context: StdRwLock::new(options.transform_context.clone()),
                 before_tool_call: StdRwLock::new(options.before_tool_call.clone()),
                 after_tool_call: StdRwLock::new(options.after_tool_call.clone()),
+                should_stop_after_turn: StdRwLock::new(None),
                 options,
                 #[cfg(test)]
                 release_gate: StdRwLock::new(None),
@@ -425,6 +431,17 @@ impl Agent {
 
     pub fn set_after_tool_call(&self, hook: Option<AfterToolCallFn>) {
         *self.inner.after_tool_call.write() = hook;
+    }
+
+    /// Install a per-turn stop hook consulted after each assistant turn.
+    ///
+    /// Returning `true` ends the run cleanly after the current turn — the last
+    /// assistant message, executed tool results, and accumulated usage are
+    /// preserved in the final state. The hook is consulted on every turn
+    /// including the final one; returning `true` there is a no-op for the
+    /// outcome. Set to `None` to disable.
+    pub fn set_should_stop_after_turn(&self, hook: Option<ShouldStopAfterTurnFn>) {
+        *self.inner.should_stop_after_turn.write() = hook;
     }
 
     pub async fn set_system_prompt(&self, prompt: impl Into<String>) {
@@ -786,6 +803,7 @@ impl Agent {
             get_api_key: self.inner.options.get_api_key.clone(),
             before_tool_call: self.inner.before_tool_call.read().clone(),
             after_tool_call: self.inner.after_tool_call.read().clone(),
+            should_stop_after_turn: self.inner.should_stop_after_turn.read().clone(),
             prepare_next_turn: self.inner.options.prepare_next_turn.clone(),
             get_steering_messages: Some(Arc::new(move || {
                 let inner = steering_inner.clone();

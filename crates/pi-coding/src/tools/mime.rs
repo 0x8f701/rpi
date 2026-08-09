@@ -9,6 +9,12 @@ use std::path::Path;
 const IMAGE_TYPE_SNIFF_BYTES: usize = 4100;
 const PNG_SIGNATURE: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
+/// Sniff window for the PDF header (matches the image sniffers' file-window
+/// approach; `read_to_cap` fills it across short reads).
+const PDF_SNIFF_BYTES: usize = 1024;
+/// PDF header magic: `%PDF-` followed by a version (e.g. `%PDF-1.7`).
+const PDF_SIGNATURE: &[u8] = b"%PDF-";
+
 fn bytes_start_with(buf: &[u8], prefix: &[u8]) -> bool {
     if buf.len() < prefix.len() {
         return false;
@@ -141,6 +147,24 @@ pub(crate) fn detect_supported_image_mime_type_from_file(path: &Path) -> Option<
     detect_supported_image_mime_type(&buf)
 }
 
+/// Sniffs whether `path` is a PDF: the file must begin with the `%PDF-`
+/// header (ISO 32000 requires it on the first line). Returns `false` when the
+/// file cannot be read.
+pub(crate) fn is_pdf(path: &Path) -> bool {
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; PDF_SNIFF_BYTES];
+    // Fill the sniff window across short reads (pipes, network FS) — same
+    // contract as `detect_supported_image_mime_type_from_file`.
+    let n = match read_to_cap(&mut f, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    buf[..n].starts_with(PDF_SIGNATURE)
+}
+
 /// Reads into `buf` until it is full or EOF, retrying short reads. Returns the
 /// number of bytes placed in `buf` (0..=buf.len()). Mirrors `io.ReadFull` with
 /// EOF/ErrUnexpectedEOF treated as a successful short fill.
@@ -257,5 +281,29 @@ mod tests {
         let n = read_to_cap(&mut r, &mut buf).unwrap();
         assert_eq!(n, IMAGE_TYPE_SNIFF_BYTES);
         assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn detect_pdf_from_file_path() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"%PDF-1.7\n%%EOF\n").unwrap();
+        assert!(is_pdf(f.path()));
+
+        // Header must be the first bytes; an earlier offset is not a PDF
+        // (nonconforming files with prepended junk read as text instead).
+        let mut g = tempfile::NamedTempFile::new().unwrap();
+        g.write_all(b"junk before header %PDF-1.4\n").unwrap();
+        assert!(!is_pdf(g.path()));
+
+        let mut h = tempfile::NamedTempFile::new().unwrap();
+        h.write_all(b"plain text, no header\n").unwrap();
+        assert!(!is_pdf(h.path()));
+    }
+
+    #[test]
+    fn detect_pdf_is_false_for_unreadable_file() {
+        let missing = std::env::temp_dir().join(format!("pi-mime-missing-{}", std::process::id()));
+        assert!(!is_pdf(&missing));
     }
 }
