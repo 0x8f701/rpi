@@ -2,6 +2,20 @@
 
 All notable changes to `rpi` are documented in this file.
 
+## [0.2.5] - 2026-08-09
+
+### Changed
+
+- The embedded Web client now auto-connects without a token file. Local use
+  needs only `rpi --listen 127.0.0.1:8765`; explicit LAN use needs only
+  `rpi --listen 0.0.0.0:8765 --listen-allow-insecure-remote`. A configured
+  `--listen-token-file` still makes authentication mandatory, and ACP browser
+  restrictions remain unchanged.
+- Tokenless browser requests use ordinary same-origin validation (`Origin`
+  authority equals HTTP `Host`) while native clients without `Origin` remain
+  supported. `--listen-advertised-origin` is now limited to collaboration
+  links and the reachable URL printed for wildcard binds.
+
 ## [0.2.4] - 2026-08-09
 
 ### Added
@@ -325,6 +339,7 @@ All notable changes to `rpi` are documented in this file.
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
 
+[0.2.5]: https://github.com/0x8f701/rpi/releases/tag/v0.2.5
 [0.2.4]: https://github.com/0x8f701/rpi/releases/tag/v0.2.4
 [0.2.3]: https://github.com/0x8f701/rpi/releases/tag/v0.2.3
 [0.2.2]: https://github.com/0x8f701/rpi/releases/tag/v0.2.2

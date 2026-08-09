@@ -9,7 +9,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
-#   sh install.sh --version v0.2.4      # pin a specific release
+#   sh install.sh --version v0.2.5      # pin a specific release
 #
 # Environment:
 #   PI_HOME                install root (default: ~/.rpi)
