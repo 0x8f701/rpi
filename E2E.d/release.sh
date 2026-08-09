@@ -5,11 +5,13 @@ list() {
     "$SCRIPT_DIR/release/archive-inventory.sh" list
     "$SCRIPT_DIR/release/archive-fixture-smoke.sh" list
     "$SCRIPT_DIR/release/install-self-update.sh" list
+    "$SCRIPT_DIR/release/listen-web-smoke.sh" list
 }
 case "${1:-list}" in
     list|--list|--dry-run) list ;;
     archive-fixture) "$SCRIPT_DIR/release/archive-fixture-smoke.sh" run ;;
     install-smoke) "$SCRIPT_DIR/release/install-self-update.sh" run ;;
+    listen-web) "$SCRIPT_DIR/release/listen-web-smoke.sh" run ;;
     lock-smoke) RUN_LOCK_TIMEOUT=1 "$SCRIPT_DIR/release/install-self-update.sh" run ;;
     archives)
         [ "$#" -eq 3 ] || { printf 'usage: %s archives VERSION DIST_DIR\n' "$0" >&2; exit 2; }
@@ -17,6 +19,7 @@ case "${1:-list}" in
         ;;
     run)
         "$SCRIPT_DIR/release/install-self-update.sh" run
+        "$SCRIPT_DIR/release/listen-web-smoke.sh" run
         if [ "${RELEASE_FIXTURE_ARCHIVES:-0}" = 1 ]; then
             "$SCRIPT_DIR/release/archive-fixture-smoke.sh" run
         fi
@@ -26,5 +29,5 @@ case "${1:-list}" in
             printf 'release.sh: archive inventory skipped; set RELEASE_VERSION and RELEASE_DIST_DIR\n'
         fi
         ;;
-    *) printf 'usage: %s [list|--dry-run|archive-fixture|install-smoke|lock-smoke|archives VERSION DIST_DIR|run]\n' "$0" >&2; exit 2 ;;
+    *) printf 'usage: %s [list|--dry-run|archive-fixture|install-smoke|lock-smoke|listen-web|archives VERSION DIST_DIR|run]\n' "$0" >&2; exit 2 ;;
 esac

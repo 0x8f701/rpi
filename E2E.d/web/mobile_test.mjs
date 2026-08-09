@@ -9,11 +9,16 @@
 //
 // Asserts the phone-width shell contract (styles.css media queries):
 //   1. core flow works at 375×667: connect, prompt round-trip, panel opens
-//   2. no horizontal page overflow (page and with the drawer open)
-//   3. the drawer is full-screen width (== viewport)
-//   4. the composer sits above the fold (bottom <= innerHeight)
-//   5. touch targets are >= 44px (send/connect/abort/panel-toggle)
-//   6. #thinking-select is hidden at phone width (CSS media query)
+//   2. while the run streams: primary submit reads "Steer", #abort-btn is
+//      rendered and >= 44px, no horizontal overflow, composer on-screen
+//   3. no horizontal page overflow (page and with the drawer open)
+//   4. the drawer is full-screen width (== viewport)
+//   5. the composer sits above the fold (bottom <= innerHeight)
+//   6. idle composer: #abort-btn is NOT rendered (active-only), the textarea
+//      is the dominant element (usable width >= 240px, height >= 44px)
+//   7. touch targets are >= 44px (send/connect/panel-toggle; abort is
+//      checked while streaming in #2)
+//   8. #thinking-select is hidden at phone width (CSS media query)
 
 import { chromium } from 'playwright';
 
@@ -63,8 +68,45 @@ async function main() {
       () => document.getElementById('conn-state').dataset.state === 'on',
       'WS did not reach "connected"'
     );
+    // 1a. While the first (slow) stream is in flight, the active-only
+    // composer contract holds: the primary submit reads "Steer", the Abort
+    // control is rendered and meets the 44px touch target, and the composer
+    // stays on-screen with no horizontal overflow.
     await page.fill('#prompt-input', 'hello from a phone');
     await page.press('#prompt-input', 'Enter');
+    await waitFor(page, () => document.getElementById('stream-badge').hidden === false, 'streaming never started');
+    const streaming = await page.evaluate(() => {
+      const rect = (sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { top: r.top, bottom: r.bottom, left: r.left, width: r.width, height: r.height };
+      };
+      const send = document.querySelector('#send-btn');
+      const abort = rect('#abort-btn');
+      const footer = rect('footer');
+      return {
+        sendLabel: send ? send.textContent.trim() : '',
+        abortH: abort ? abort.height : -1,
+        footerBottom: footer ? footer.bottom : -1,
+        scrollWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+      };
+    });
+    if (streaming.sendLabel !== 'Steer') {
+      fail(`primary submit did not switch to Steer while streaming: "${streaming.sendLabel}"`);
+    }
+    if (streaming.abortH < 44) {
+      fail(`#abort-btn touch target is ${streaming.abortH}px while streaming (must be >= 44px)`);
+    }
+    if (streaming.scrollWidth > streaming.innerWidth + 1) {
+      fail(`horizontal overflow while streaming: scrollWidth ${streaming.scrollWidth} > viewport ${streaming.innerWidth}`);
+    }
+    if (streaming.footerBottom < 0 || streaming.footerBottom > streaming.innerHeight) {
+      fail(`composer sits below the fold while streaming: bottom ${streaming.footerBottom} > innerHeight ${streaming.innerHeight}`);
+    }
+    await page.screenshot({ path: `${evidence}/mobile-streaming.png`, fullPage: true });
     await waitFor(
       page,
       (tail) => document.body.textContent.includes(tail),
@@ -108,7 +150,7 @@ async function main() {
     await waitFor(page, () => document.getElementById('todo-panel') !== null, 'todo panel did not open');
     await page.screenshot({ path: `${evidence}/mobile-panel.png`, fullPage: true });
 
-    // 2-6. Shell contract at 375×667.
+    // 2-6. Shell contract at 375×667 (idle state — the run has finished).
     const metrics = await page.evaluate(() => {
       const rect = (sel) => {
         const el = document.querySelector(sel);
@@ -116,9 +158,12 @@ async function main() {
         const r = el.getBoundingClientRect();
         return { top: r.top, bottom: r.bottom, left: r.left, width: r.width, height: r.height };
       };
-      const composer = rect('#composer-buttons');
+      const footer = rect('footer');
+      const ta = rect('#prompt-input');
       const drawer = rect('#todo-panel');
-      const targets = ['#send-btn', '#connect-btn', '#abort-btn', '#todos-toggle-btn'].map((sel) => ({
+      // #abort-btn is active-only, so it is NOT in the DOM while idle; it is
+      // asserted separately while streaming above.
+      const targets = ['#send-btn', '#connect-btn', '#todos-toggle-btn'].map((sel) => ({
         sel,
         height: rect(sel) ? rect(sel).height : -1,
       }));
@@ -128,9 +173,12 @@ async function main() {
         innerWidth: window.innerWidth,
         innerHeight: window.innerHeight,
         scrollWidth: document.documentElement.scrollWidth,
-        composerBottom: composer ? composer.bottom : -1,
+        composerBottom: footer ? footer.bottom : -1,
+        textareaW: ta ? ta.width : -1,
+        textareaH: ta ? ta.height : -1,
         drawerWidth: drawer ? drawer.width : -1,
         targets,
+        abortPresent: document.querySelector('#abort-btn') !== null,
         thinkingDisplay,
       };
     });
@@ -144,6 +192,19 @@ async function main() {
     if (metrics.composerBottom < 0 || metrics.composerBottom > metrics.innerHeight) {
       fail(`composer sits below the fold: bottom ${metrics.composerBottom} > innerHeight ${metrics.innerHeight}`);
     }
+    // Idle usable composer: with the dedicated Steer/Follow up controls gone
+    // and Abort active-only, the textarea must be the dominant composer
+    // element on a phone (materially more usable width than the old 4-button
+    // row) and keep a usable entry height.
+    if (metrics.textareaW < 240) {
+      fail(`#prompt-input usable width is ${metrics.textareaW}px at 375px (must be >= 240px after removing dedicated Steer/Follow up)`);
+    }
+    if (metrics.textareaH < 44) {
+      fail(`#prompt-input usable height is ${metrics.textareaH}px (must be >= 44px)`);
+    }
+    if (metrics.abortPresent) {
+      fail('#abort-btn must not render while idle (active-only composer); found in DOM');
+    }
     for (const t of metrics.targets) {
       if (t.height < 44) fail(`touch target ${t.sel} is ${t.height}px (must be >= 44px)`);
     }
@@ -152,7 +213,7 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/mobile-contract.png`, fullPage: true });
 
-    console.log('web-mobile: PASSED (core flow + no overflow + full-screen drawer + 44px targets + composer on-screen)');
+    console.log('web-mobile: PASSED (core flow + no overflow + full-screen drawer + 44px targets + composer on-screen + usable mobile textarea + active-only abort)');
   } finally {
     await browser.close().catch(() => {});
   }

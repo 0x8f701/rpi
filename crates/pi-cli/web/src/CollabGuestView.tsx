@@ -15,6 +15,13 @@ import {
 } from './App';
 import type { ContentBlock } from './types';
 import {
+  boundOutput,
+  customToItem,
+  applyToolSnapshot,
+  BASH_OUTPUT_LINE_LIMIT,
+  TOOL_OUTPUT_LINE_LIMIT,
+} from './transcript';
+import {
   CollabGuest,
   type ParsedCollabLink,
   type CollabSnapshot,
@@ -33,25 +40,7 @@ function snapshotToItems(snapshot: CollabSnapshot): Item[] {
   const messages = entries
     .map((e) => (e as { message?: unknown } | null | undefined)?.message)
     .filter((m): m is NonNullable<typeof m> => m != null);
-  const items = messagesToItems(messages);
-  for (const raw of messages) {
-    const message = raw as { role?: string; content?: unknown };
-    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      const tool = block as { type?: string; id?: string; name?: string; arguments?: unknown };
-      if (tool?.type !== 'toolCall') continue;
-      items.push({
-        kind: 'toolCard',
-        id: nextId('tc'),
-        toolCallId: tool.id || '',
-        toolName: safeText(tool.name || 'tool'),
-        args: tool.arguments,
-        status: 'done',
-        result: '',
-      });
-    }
-  }
-  return items;
+  return messagesToItems(messages);
 }
 
 /** A toast surfaced to the guest. */
@@ -139,11 +128,26 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
         return;
       }
       case 'toolResult':
-        pushItem({ kind: 'toolResult', id: nextId('r'), text: contentText(message.content) });
+        pushItem({ kind: 'toolResult', id: nextId('r'), text: boundOutput(contentText(message.content), TOOL_OUTPUT_LINE_LIMIT).text });
         return;
       case 'bashExecution': {
         const m = message as { command?: string; output?: string };
-        pushItem({ kind: 'bash', id: nextId('b'), command: m.command || '', output: m.output || '' });
+        pushItem({
+          kind: 'bash',
+          id: nextId('b'),
+          command: m.command || '',
+          output: boundOutput(m.output || '', BASH_OUTPUT_LINE_LIMIT).text,
+        });
+        return;
+      }
+      case 'custom': {
+        // Mirrors messagesToItems so the guest transcript matches the host:
+        // display:false customs never render; display:true customs surface as
+        // a labeled card, with typed IRC customs showing their parsed view.
+        const item = customToItem(
+          message as { display?: boolean; customType?: string; content?: unknown; details?: unknown },
+        );
+        if (item) pushItem(item);
         return;
       }
       default:
@@ -224,26 +228,14 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
     const toolCallId = (frame.toolCallId as string) || '';
     const text = contentText((frame.partialResult as { content?: unknown } | undefined)?.content);
     if (!text) return;
-    updateItems((prev) =>
-      prev.map((item) =>
-        item.kind === 'toolCard' && item.toolCallId === toolCallId
-          ? { ...item, result: item.result === '' ? text : `${item.result}\n${text}` }
-          : item,
-      ),
-    );
+    updateItems((prev) => applyToolSnapshot(prev, toolCallId, text));
   }, [updateItems]);
 
   const onToolEnd = useCallback((frame: CollabEventFrame) => {
     const toolCallId = (frame.toolCallId as string) || '';
     const text = contentText((frame.result as { content?: unknown } | undefined)?.content);
     const isError = !!frame.isError;
-    updateItems((prev) =>
-      prev.map((item) =>
-        item.kind === 'toolCard' && item.toolCallId === toolCallId
-          ? { ...item, status: isError ? 'error' : 'done', result: text }
-          : item,
-      ),
-    );
+    updateItems((prev) => applyToolSnapshot(prev, toolCallId, text, isError ? 'error' : 'done'));
   }, [updateItems]);
 
   /** D94-style projected extension UI requests. Interactive asks (confirm/

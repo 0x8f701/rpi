@@ -24,14 +24,14 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
 ```
 
-Pin both the installer source and selected release to `v0.2.6`:
+Pin both the installer source and selected release to `v0.2.7`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.6/install.sh | bash -s -- --version v0.2.6
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.7/install.sh | bash -s -- --version v0.2.7
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.6/install.ps1))) -Version v0.2.6
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.7/install.ps1))) -Version v0.2.7
 ```
 
 The release archive contains the compiled `rpi` executable; users do not need
@@ -165,8 +165,11 @@ See [`docs/src/user-guide/cli-modes.md`](docs/src/user-guide/cli-modes.md) for d
 
 ## Web control plane
 
-`rpi --listen` serves the web client at `/web` on the control-plane listener.
-The listener defaults to loopback and authentication is optional.
+`rpi --listen` runs a headless Web-only backend and serves the embedded client
+at `/web`. It never starts the TUI or line REPL, stays alive with closed stdin
+until Ctrl-C/SIGTERM, and records Web conversations in the normal session store
+so `--continue`/`--resume` restore them after restart. The listener defaults to
+loopback and authentication is optional.
 
 **Local, no token** — the default, one command:
 

@@ -1,6 +1,6 @@
 # rpi End-to-End Verification
 
-This handbook defines the release verification contract for `rpi` 0.2.4. It uses repository-relative paths and isolated temporary homes. Do not record local absolute paths, private endpoints, credential filenames, or credential values in committed evidence.
+This handbook defines the release verification contract for `rpi` 0.2.7. It uses repository-relative paths and isolated temporary homes. Do not record local absolute paths, private endpoints, credential filenames, or credential values in committed evidence.
 
 All prose, fixtures, agent definitions, skill bodies, and faux responses used by deterministic campaigns are English-only.
 
@@ -106,7 +106,7 @@ RPI_BIN=target/release-dist/rpi bash E2E.d/release/archive-fixture-smoke.sh run
 The archive gate verifies:
 
 - exactly five platform archives
-- exact `rpi-0.2.4-<target-triple>` names
+- exact `rpi-0.2.7-<target-triple>` names
 - a single root-level `rpi` or `rpi.exe`
 - a root-level `LICENSE`
 - a complete and valid `SHA256SUMS`
@@ -118,6 +118,19 @@ RPI_BIN=target/release-dist/rpi bash E2E.d/release/install-self-update.sh run
 ```
 
 This lane starts a loopback release fixture and verifies download, checksum validation, smoke testing, atomic activation, managed legacy `pi` cleanup, unmanaged `pi` preservation, and current-version self-update behavior.
+
+### Headless Web listener release smoke
+
+```sh
+cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
+RPI_BIN=target/release-dist/rpi bash E2E.d/release/listen-web-smoke.sh run
+```
+
+This focused release-binary gate starts `rpi --listen` with closed stdin,
+proves it stays alive and serves the embedded `/web` page plus tokenless
+`/rpc`, rejects TUI/cursor-probe output, submits a Web RPC prompt, stops on
+SIGTERM, restarts with `--continue`, and verifies the recorded user and
+assistant turns are restored from the normal session store.
 
 ### Live-model lanes
 
@@ -140,9 +153,9 @@ The separate hosted Test workflow (`test.yml`) gates focused Rust 1.88.0 checks
 for workspace compilation, provider and agent contracts, coding tools, todo DAG
 behavior, process/session lifecycles, structured output modes, trusted QuickJS
 extensions, self-update, installers, and the release-dist binary. The release
-workflow (`release.yml`) invokes the reusable `test.yml` `verify-tag-commit`
-job to re-run those tests against the exact tag commit before building archives
-and publishing them.
+workflow (`release.yml`) invokes reusable `test.yml` before validating the tag,
+building archives, and publishing them, so those tests run against the exact
+tag commit.
 
 Before a tag is created, also run the complete library suites serially, plus the Codex provider loopback integration tests (the only tests covering `openai-codex-responses`):
 
@@ -291,8 +304,8 @@ Cleanup: `tmux kill-session` for the unique session name; outer `cleanup_e2e` re
 
 ### Workflow campaigns (`E2E.d/ci/workflow.sh`)
 
-**Execution status: passed for 0.2.4.**
-The full workflow campaign passed for 0.2.4 with `workflow.rpc`,
+**Execution status: passed for 0.2.7.**
+The full workflow campaign passed for 0.2.7 with `workflow.rpc`,
 `workflow.tmux`, and `workflow.goal-tmux` execution statuses all set to
 `passed` (evidence under `$EVIDENCE_ROOT`). Releases re-verify with the hard
 `release` mode below: tmux is required, and `workflow campaigns passed` is
@@ -832,13 +845,13 @@ Any `timeout` kill is a hard failure. Evidence directories MUST remain for diagn
 | Clipboard image in tmux | Optional/best-effort; rust fixture authoritative. |
 | Sparse palette / code highlighting / user no-indent | Covered by focused `cargo +1.88.0` tests, not `orchestration.sh`. |
 | Skills loading beyond routing | Resource/selector cargo tests; not a separate E2E.d shell scenario. |
-| Multi-workflow campaign (`E2E.d/ci/workflow.sh release`) | Hard gate: requires tmux; `workflow campaigns passed` only after `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` all record `execution_status=passed`; absence or failure of any lane fails. Passed for 0.2.4 (all three statuses `passed`). Default `E2E.d/ci.sh` includes the user-perspective workflow TUI scenario on tmux hosts; the authoritative RPC/tmux/goal lanes run separately (and are gated by the hosted Test workflow). |
+| Multi-workflow campaign (`E2E.d/ci/workflow.sh release`) | Hard gate: requires tmux; `workflow campaigns passed` only after `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` all record `execution_status=passed`; absence or failure of any lane fails. Passed for 0.2.7 (all three statuses `passed`). Default `E2E.d/ci.sh` includes the user-perspective workflow TUI scenario on tmux hosts; the authoritative RPC/tmux/goal lanes run separately (and are gated by the hosted Test workflow). |
 
 ## Release checklist
 
-1. Workspace version and lockfile workspace packages are `0.2.4`.
+1. Workspace version and lockfile workspace packages are `0.2.7`.
 2. `cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked` succeeds.
-3. `target/release-dist/rpi --version` prints `rpi 0.2.4`.
+3. `target/release-dist/rpi --version` prints `rpi 0.2.7`.
 4. Complete library suites pass, including `cargo +1.88.0 test -p pi-ai --test codex_transport --locked` (Codex WS/SSE loopback contracts).
 5. `bash E2E.d/ci.sh` passes (includes orchestration umbrella after core campaigns).
 6. `bash E2E.d/ci/orchestration.sh run` passes on a tmux-capable host (or rpc+rust with explicit tmux skip log).
@@ -847,11 +860,9 @@ Any `timeout` kill is a hard failure. Evidence directories MUST remain for diagn
 9. Installer and self-update fixtures pass.
 10. README installation commands match `install.sh`, `install.ps1`, and the published archive names.
 11. The release commit contains no credentials, local paths, build artifacts, exported sessions, or generated diagrams.
-12. Tag `v0.2.4` points exactly at the verified release commit.
-    — Tagging is not performed locally per repository policy (`AGENTS.md` push
-      prohibition); left for the release manager after final review.
-13. Push the release commit, then push `v0.2.4` to the GitHub remote.
-    — **Not performed locally** per `AGENTS.md`; this agent does not push.
+12. Tag `v0.2.7` points exactly at the verified release commit.
+    — Tagging is performed only after the release commit's hosted Test workflow passes.
+13. Push the release commit, wait for its hosted Test workflow, then push `v0.2.7` to the GitHub remote.
 14. Confirm every hosted build and the GitHub Release publication job succeeds.
     — Depends on step 13, which is not performed locally.
 15. Confirm regression matrix rows 1–12 either passed or are explicitly listed under Known gaps for this tag.

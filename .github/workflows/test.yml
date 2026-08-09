@@ -35,6 +35,19 @@ jobs:
           test -f crates/pi-cli/web/dist/index.html
           test "$(git ls-files crates/pi-cli/web/dist)" = "crates/pi-cli/web/dist/index.html"
 
+      - name: Set up Node for Web build
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+
+      - name: Verify embedded Web bundle matches source
+        shell: bash
+        run: |
+          cd crates/pi-cli/web
+          npm ci --no-audit --no-fund
+          npm run build
+          git diff --exit-code -- dist/index.html
+
       - name: Install Rust 1.88.0
         shell: bash
         run: |
@@ -163,6 +176,12 @@ jobs:
           cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
           target/release-dist/rpi --version
 
+      - name: Smoke-test Web-only listener lifecycle
+        shell: bash
+        env:
+          RPI_BIN: target/release-dist/rpi
+        run: E2E.d/release.sh listen-web
+
       - name: Run deterministic product E2E
         env:
           RPI_BIN: target/release-dist/rpi
@@ -179,11 +198,6 @@ jobs:
       # chromium SETUP below is likewise a hard gate: if the npm registry or
       # the chromium download is unreachable the job FAILS — the web suite is
       # a release gate, not an optional extra.
-      - name: Set up Node for web E2E suite
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 20
-
       - name: Run web client E2E suite
         shell: bash
         env:

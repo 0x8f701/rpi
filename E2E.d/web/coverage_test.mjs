@@ -1348,25 +1348,17 @@ async function main() {
     );
     record('maintenance.queue-cancel');
 
-    // ---- App coverage: maintenance panel close (onClosePanel) + composer
-    // steer/follow-up button clicks ----
+    // ---- App coverage: maintenance panel close (onClosePanel) ----
     // Close the maintenance panel via its own close button (covers App's
     // maintenance onClosePanel callback, distinct from a panel-toggle swap).
     await page.click('.maintenance .panel-close');
     await waitFor(page, () => document.querySelector('.maintenance') === null, 'maintenance panel did not close via its close button');
     record('app.maintenance-close');
-    // Clear the composer so Steer/Follow up hit submit's empty-input guard
-    // (no RPC, no side effects) — the onClick handlers still execute.
-    await page.fill('#prompt-input', '');
-    await page.click('#steer-btn');
-    await page.click('#followup-btn');
-    await waitFor(
-      page,
-      () => Array.from(document.querySelectorAll('#toasts .toast--error')).length === 0,
-      'empty steer/follow-up click produced an unexpected error toast'
-    );
-    record('app.steer-btn');
-    record('app.followup-btn');
+    // The dedicated Steer/Follow up composer controls were removed (the
+    // primary Send/Steer button + Enter already cover both verbs, and Abort
+    // is active-only), so there are no #steer-btn/#followup-btn clicks to
+    // record here. The primary submit's send/steer labels are asserted in
+    // Phase A (app.primary-submit-send / app.primary-submit-steer).
 
     // ==================== Phase M: mobile viewport ====================
     const mobile = await browser.newPage({ viewport: { width: 375, height: 667 } });
@@ -1380,6 +1372,12 @@ async function main() {
         return nodes.length > 0 && (nodes[nodes.length - 1]?.textContent || '').trim() !== '';
       },
       'mobile prompt never round-tripped',
+      60000
+    );
+    await waitFor(
+      mobile,
+      () => document.getElementById('send-btn')?.textContent?.trim() === 'Send' && document.getElementById('abort-btn') === null,
+      'mobile composer never returned to idle after prompt',
       60000
     );
     const toggleDisplay = await mobile.evaluate(
@@ -1407,6 +1405,16 @@ async function main() {
       'session sidebar drawer never opened from the hamburger'
     );
     record('mobile.drawer-opens');
+    // The mobile drawer overlays the app while open. Close it before measuring
+    // the composer's usable width; the dedicated mobile lane separately checks
+    // the full-screen drawer contract while measuring the idle composer from
+    // the Todo panel overlay.
+    await mobile.evaluate(() => document.getElementById('sidebar-toggle-btn')?.click());
+    await waitFor(
+      mobile,
+      () => !document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'),
+      'session sidebar drawer never closed before composer measurement'
+    );
     const metrics = await mobile.evaluate(() => {
       const rect = (sel) => {
         const el = document.querySelector(sel);
@@ -1414,8 +1422,11 @@ async function main() {
         const r = el.getBoundingClientRect();
         return { top: r.top, bottom: r.bottom, left: r.left, width: r.width, height: r.height };
       };
-      const composer = rect('#composer-buttons');
-      const targets = ['#send-btn', '#connect-btn', '#abort-btn', '#todos-toggle-btn'].map((sel) => ({
+      const footer = rect('footer');
+      const ta = rect('#prompt-input');
+      // #abort-btn is active-only, so it is NOT in the DOM while idle; its
+      // 44px touch target is exercised while streaming (Phase A abort path).
+      const targets = ['#send-btn', '#connect-btn', '#todos-toggle-btn'].map((sel) => ({
         sel,
         height: rect(sel) ? rect(sel).height : -1,
       }));
@@ -1424,8 +1435,11 @@ async function main() {
         innerWidth: window.innerWidth,
         innerHeight: window.innerHeight,
         scrollWidth: document.documentElement.scrollWidth,
-        composerBottom: composer ? composer.bottom : -1,
+        composerBottom: footer ? footer.bottom : -1,
+        textareaW: ta ? ta.width : -1,
+        textareaH: ta ? ta.height : -1,
         targets,
+        abortPresent: document.querySelector('#abort-btn') !== null,
         thinkingDisplay: thinking ? getComputedStyle(thinking).display : 'missing',
       };
     });
@@ -1437,6 +1451,18 @@ async function main() {
       fail(`composer sits below the fold: bottom ${metrics.composerBottom} > innerHeight ${metrics.innerHeight}`);
     }
     record('mobile.composer-above-fold');
+    // Idle usable composer: with the dedicated Steer/Follow up controls gone
+    // and Abort active-only, the textarea must be the dominant composer
+    // element on a phone and keep a usable entry height.
+    if (metrics.textareaW < 240) {
+      fail(`#prompt-input usable width is ${metrics.textareaW}px at 375px (must be >= 240px)`);
+    }
+    if (metrics.textareaH < 44) {
+      fail(`#prompt-input usable height is ${metrics.textareaH}px (must be >= 44px)`);
+    }
+    if (metrics.abortPresent) {
+      fail('#abort-btn must not render while idle (active-only composer); found in DOM');
+    }
     for (const t of metrics.targets) {
       if (t.height < 44) fail(`touch target ${t.sel} is ${t.height}px (must be >= 44px)`);
     }

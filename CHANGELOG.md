@@ -2,6 +2,24 @@
 
 All notable changes to `rpi` are documented in this file.
 
+## [0.2.7] - 2026-08-09
+
+### Changed
+
+- `rpi --listen` is now a Web-only, signal-owned service: it never acquires
+  raw terminal state or starts the TUI/REPL, remains alive with closed stdin,
+  rejects positional prompts, and shuts down cleanly on Ctrl-C or SIGTERM.
+- The Web composer uses one primary Send/Steer action, keeps Abort active-only,
+  and gives the textarea usable space on phone viewports.
+
+### Fixed
+
+- Web session switching consumes authoritative backend history for loaded and
+  disk-resumed sessions; recorded Web conversations survive listener restarts.
+- Web transcripts hide `display: false` internal custom messages, render typed
+  orchestration notices without raw scaffolding, and bound bash/tool output to
+  compact failure-tail views consistent with the TUI.
+
 ## [0.2.6] - 2026-08-09
 
 ### Fixed
@@ -344,8 +362,8 @@ All notable changes to `rpi` are documented in this file.
 
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
-- `npm:` package sources are not implemented; attempting to install one fails
-  with a clear error.
+
+[0.2.7]: https://github.com/0x8f701/rpi/releases/tag/v0.2.7
 
 [0.2.6]: https://github.com/0x8f701/rpi/releases/tag/v0.2.6
 [0.2.5]: https://github.com/0x8f701/rpi/releases/tag/v0.2.5

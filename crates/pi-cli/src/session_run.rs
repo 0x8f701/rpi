@@ -51,8 +51,8 @@ pub struct RunSession {
     /// collected for interactive TUI display. Empty for non-interactive modes
     /// where warnings are emitted directly to stderr instead.
     pub startup_warnings: Vec<String>,
-    /// Cloneable factory for building additional session runtimes for the Web
-    /// control plane (`session_run::build_session` policy from a sanitized
+    /// Cloneable factory for building additional session runtimes for the
+    /// Web-only listener (`session_run::build_session` policy from a sanitized
     /// clone of the startup CLI). Consumed by `modes::listen`.
     pub spawner: RunSessionSpawner,
 }
@@ -318,6 +318,7 @@ pub(crate) fn extension_mode(cli: &Cli) -> ExtensionMode {
     match cli.mode {
         Some(crate::args::Mode::Json) => ExtensionMode::Json,
         Some(crate::args::Mode::Rpc) => ExtensionMode::Rpc,
+        _ if cli.listen.is_some() => ExtensionMode::Rpc,
         Some(crate::args::Mode::Text) => ExtensionMode::Print,
         None if cli.is_print_mode() => ExtensionMode::Print,
         None => ExtensionMode::Tui,
@@ -791,8 +792,8 @@ pub(crate) async fn load_startup_catalogs(cli: &Cli) -> Result<()> {
 }
 
 /// Resolve the canonical working directory and the resource-manager options
-/// for a run, honoring CLI flags. `headless` is caller-supplied: interactive
-/// TUI runs pass false, protocol modes (rpc/json/acp) pass true.
+/// for a run. Interactive TUI runs pass false; protocol, print, and Web-only
+/// listener modes pass true.
 pub(crate) fn startup_resource_options(cli: &Cli, headless: bool) -> Result<(PathBuf, ResourceManagerOptions)> {
     let mut cwd: PathBuf = match &cli.cwd {
         Some(cwd) => cwd.clone(),
@@ -831,7 +832,8 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     load_startup_catalogs(cli).await?;
     let stdin_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let stdout_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let headless = matches!(cli.mode, Some(crate::args::Mode::Json | crate::args::Mode::Rpc))
+    let headless = cli.listen.is_some()
+        || matches!(cli.mode, Some(crate::args::Mode::Json | crate::args::Mode::Rpc))
         || cli.is_print_mode()
         || !stdin_tty
         || !stdout_tty;

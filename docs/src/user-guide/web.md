@@ -24,8 +24,14 @@ built page from disk instead, for iterating without recompiling Rust.
 
 ## Starting the listener
 
-The web client connects to the control-plane listener that `rpi --listen`
-serves. Authentication is **optional**: a tokenless listener accepts browser
+`rpi --listen` is a headless Web-only backend. It never initializes terminal
+raw mode, cursor probing, a TUI, or a line REPL. Standard input may be closed;
+the service stays alive until Ctrl-C or SIGTERM, then flushes the active session
+and shuts down its listener and runtime manager cleanly. Web prompts use the
+normal session recorder, so restarting with `--continue`, `--resume`,
+`--session`, or `--session-id` restores the recorded conversation.
+
+Authentication is **optional**: a tokenless listener accepts browser
 connections directly, and a configured token makes authentication mandatory.
 
 **One-command local startup** (loopback, no token — the browser auto-connects):
@@ -124,22 +130,24 @@ handshake header and kept in `sessionStorage` by the page.
 - **Prompt box** — while idle, Enter and the primary **Send** button send
   `prompt`; while a run is active, both switch to **Steer** and send `steer`,
   avoiding a rejected second prompt. Shift+Enter inserts a newline; Esc (or
-  **Abort**) stops the active run. Dedicated **Steer** and **Follow up** buttons
-  remain available for explicit queue control.
+  the active-only **Abort** button) stops the run. Redundant dedicated Steer
+  and Follow up buttons are intentionally absent, leaving the textarea usable
+  on phone-width screens.
 - **Streaming transcript** — assistant turns render live from the event
-  stream: text deltas, collapsible `thinking` blocks, tool-call cards with
-  arguments and results, bash/tool-result blocks, and final text rendered as
-  markdown (headings, lists, code fences, blockquotes, links, images with
-  MIME-whitelisted `data:` URIs).
+  stream: text deltas, collapsible `thinking` blocks, compact tool-call cards,
+  bash/tool-result blocks, and final markdown. Internal `display: false`
+  system scaffolding is hidden like the TUI; bash output keeps the last 10
+  lines and other tool output keeps the last 6 with an omitted-line count.
 - **Model / thinking switch** — model and thinking-level dropdowns populated
   from `get_available_models` / `get_available_thinking_levels`, applying
   `set_model` and `set_thinking_level`; the session name comes from
   `get_state`.
 - **Status line** — a pulsing "streaming" badge while a run is in flight and
   error toasts for failed commands, failed runs, and connection problems.
-- **Multi-session authoritative restore** — reloading `/web` restores the
-  active session's transcript, goal, todo, and running jobs from the server
-  (`get_entries`, `get_state`, `get_tree`) rather than starting empty.
+- **Multi-session authoritative restore** — switching sessions consumes the
+  target runtime's backend snapshot; closed sessions resume from disk, and a
+  listener restart rebinds before controls become active. Web prompts use the
+  normal session recorder and remain available after restart.
 - **Panels** — dedicated views for todo, goal, workflow, session tree,
   settings, subagent jobs, side chat, and maintenance, each driven by the same
   JSONL RPC control plane.
@@ -181,13 +189,10 @@ handshake header and kept in `sessionStorage` by the page.
   `cargo test -p pi-cli --test listen_control_plane` (GET /web route, positive
   and negative subprotocol auth, existing routes unchanged).
 - Browser E2E (playwright-only hard gate): `bash E2E.d/web/run.sh` spawns the
-  real binary with the loopback mock provider and runs 11 lanes: core
-  (load/auth/stream/abort/todo/rich/workflow/settings/session/subagents),
-  goal, xss, abort, reconnect, mobile, auth (tokened listener: no-token
-  silent probe, wrong-token error toast, good-token connect), auth_tokenless
-  (tokenless listener: empty-token boot auto-connect reaches `connected` and a
-  prompt round-trips), and extras/sessions. Most lanes start the listener with a
-  token file; the `auth_tokenless` lane starts it without one. Playwright is
-  installed ephemerally via npm over a system Chrome/Chromium binary or
-  playwright's bundled chromium; a lane with no usable browser driver FAILS —
-  there is no skip and no fallback to the `agent-browser` CDP tool.
+  real binary with the loopback mock provider and runs 12 lanes: core, goal,
+  xss, abort, reconnect, switch, mobile, auth, auth_tokenless, extras,
+  sessions, and session_restore. The final lane proves loaded switching,
+  close/resume from disk, and listener-restart history restoration. Most lanes
+  use a token file; auth_tokenless starts without one. Playwright uses a system
+  Chrome/Chromium binary or its bundled Chromium; an unavailable browser or
+  failed assertion fails the lane with no skip or fallback.

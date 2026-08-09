@@ -2,8 +2,8 @@
 
 One command runs the complete web regression suite against the REAL `rpi
 --listen` binary (loopback mock provider + real browser). The suite is
-10 lanes — `core goal xss abort reconnect switch mobile auth extras
-sessions` (mirroring `LANES` in `E2E.d/web/run.sh`):
+12 lanes — `core goal xss abort reconnect switch mobile auth auth_tokenless
+extras sessions session_restore` (mirroring `LANES` in `E2E.d/web/run.sh`):
 
 ```sh
 bash E2E.d/web/run.sh          # run every lane
@@ -40,7 +40,7 @@ exits non-zero when any lane failed.
 | todo panel (create/complete/live) | `core` | add → complete → reopen via `todo_op`; live counts + detail pane |
 | goal panel (create/pin/pause/resume/journal) | `goal` | empty state, create, pin, live pause event from a second WS client, resume, journal replay order |
 | workflow panel (create/cancel/live workers) | `core` | create → live status row → cancel → cancelled |
-| session panel (new/switch/fork) | `core` | info renders, rename (panel + header), saved list, new session id; session cutover clears the transcript to the empty new-session view (server has no replay) |
+| session panel (new/switch/fork) | `core` | info renders, rename (panel + header), saved list, new session id; lifecycle responses restore the target session from the authoritative backend snapshot |
 | settings panel (browse/edit/apply/secret refusal) | `core` | category browse, secret key redacted + not editable, theme draft → apply → persisted |
 | subagents (spawn/live/cancel/output) | `core` | task_spawn → live card + activity → hub_send receipt → job_output pane → job_cancel |
 | side chat (multi-tab) | `extras` | default tab, new tab via form, prompt round-trip into the tab transcript |
@@ -49,8 +49,9 @@ exits non-zero when any lane failed.
 | secret redaction | `xss` | `sk-*` credential renders as `[REDACTED]`; raw secret never in the page |
 | extension_ui_request approval card | `xss` | fixture QuickJS extension's input hook issues an interactive confirm: card renders hostile title/message as inert text, no toast carries the payload, no error toast, embedded credential redacted |
 | WS auth (no/wrong/good token) | `auth` | silent no-token probe, wrong-token error toast, good-token connect |
-| mobile viewport (375×667) | `mobile` | core flow at phone width, no horizontal overflow, full-screen drawer, composer above the fold, 44px touch targets, `#thinking-select` hidden, `#sidebar-toggle-btn` visible + clickable and the session sidebar drawer opens |
-| multi-session (concurrent runtimes) | `sessions` | **playwright-only** (no agent-browser fallback, no skip): slow A keeps streaming while B's prompt completes; source-session event routing; background unread badge + clear-on-switch; authoritative A/B transcript restore; abort + toast isolation; close busy refusal then idle close success (`loaded` marker drops); 8-session cap with no eviction; Todo/Goal/Workflow never leak across sessions; desktop rail collapse → compact reopen rail; sidebar New/Manage/switch; Android 390×844 drawer opens and closes after a session pick; header has no feature buttons (they live in the sidebar nav) |
+| mobile viewport (375×667) | `mobile` | core flow at phone width, no horizontal overflow, full-screen drawer, composer above the fold, ≥44px touch targets, dominant ≥240px textarea, one dynamic Send/Steer action, active-only Abort, hidden `#thinking-select`, and a working session drawer toggle |
+| multi-session (concurrent runtimes) | `sessions` | **playwright-only** (no fallback/skip): slow A continues while B completes; source-session routing; unread clear-on-switch; authoritative A/B restore; abort/toast isolation; busy-close refusal then idle close; 8-session cap; Todo/Goal/Workflow isolation; desktop rail and Android drawer behavior |
+| session persistence and restore | `session_restore` | Web prompt records normally; loaded switch restores backend history; close/reopen resumes from disk; listener SIGTERM/restart rebinds to the new primary and restores the persisted session |
 
 ## CI wiring
 

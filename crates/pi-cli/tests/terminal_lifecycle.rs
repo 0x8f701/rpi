@@ -313,6 +313,129 @@ fn pty_clean_exit_restores_terminal() {
     assert!(!after_clear.contains("ready"));
 }
 
+/// `--listen` is a Web-only service even when stdout/stderr are attached to a
+/// terminal. Closed stdin cannot end it, no TUI terminal sequence is emitted,
+/// `/web` and tokenless `/rpc` remain available, and SIGTERM shuts it down.
+#[test]
+fn pty_listener_is_headless_and_signal_owned_with_closed_stdin() {
+    use std::net::{TcpListener as StdTcpListener, TcpStream};
+
+    let home = TempDir::new().expect("temp HOME");
+    let cwd = TempDir::new().expect("temp cwd");
+    let port_probe = StdTcpListener::bind("127.0.0.1:0").expect("probe listener port");
+    let address = port_probe.local_addr().expect("probe address");
+    drop(port_probe);
+
+    let winsize = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = openpty(Some(&winsize), None::<&Termios>).expect("openpty");
+    let slave_out = pty.slave.try_clone().expect("clone slave stdout");
+    let slave_err = pty.slave;
+    let mut child = Command::new(rpi_bin())
+        .args([
+            "--listen",
+            &address.to_string(),
+            "--model",
+            "faux/faux-1",
+            "--api-key",
+            "faux",
+        ])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("PI_CODING_AGENT_DIR", home.path().join(".pi"))
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("TERM", "xterm-256color")
+        .env("PI_OFFLINE", "1")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("PI_FAUX_RESPONSE", "headless-listener-reply")
+        .current_dir(cwd.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(slave_out))
+        .stderr(Stdio::from(slave_err))
+        .spawn()
+        .expect("spawn listener");
+    let reader = std::fs::File::from(pty.master);
+    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let captured = buffer.clone();
+    let reader_task = thread::spawn(move || {
+        let mut reader = reader;
+        let mut chunk = [0u8; 8192];
+        while let Ok(count) = reader.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            captured.lock().expect("capture lock").extend_from_slice(&chunk[..count]);
+        }
+    });
+
+    let rpc_body = br#"{"type":"get_state","id":"headless-state"}"#;
+    let rpc_request = format!(
+        "POST /rpc HTTP/1.1\r\nhost: {address}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        rpc_body.len()
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut rpc_response = Vec::new();
+    while Instant::now() < deadline {
+        if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(200)) {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            if stream.write_all(rpc_request.as_bytes()).is_ok()
+                && stream.write_all(rpc_body).is_ok()
+                && stream.read_to_end(&mut rpc_response).is_ok()
+                && rpc_response.windows(b"\"success\":true".len()).any(|part| part == b"\"success\":true")
+            {
+                break;
+            }
+            rpc_response.clear();
+        }
+        assert!(child.try_wait().expect("poll listener").is_none(), "closed stdin must not stop listener");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        rpc_response.windows(b"headless-state".len()).any(|part| part == b"headless-state"),
+        "tokenless RPC must be served"
+    );
+
+    let mut web = TcpStream::connect(address).expect("connect /web");
+    web.write_all(format!("GET /web HTTP/1.1\r\nhost: {address}\r\nconnection: close\r\n\r\n").as_bytes())
+        .expect("write /web request");
+    let mut web_response = Vec::new();
+    web.read_to_end(&mut web_response).expect("read /web response");
+    assert!(web_response.starts_with(b"HTTP/1.1 200"), "/web must return 200");
+    assert!(web_response.windows(b"<!doctype html".len()).any(|part| part == b"<!doctype html"));
+    assert!(child.try_wait().expect("poll after Web probes").is_none(), "listener must remain alive");
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).expect("send SIGTERM");
+    let exit_deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll SIGTERM exit") {
+            break status;
+        }
+        assert!(Instant::now() < exit_deadline, "listener did not stop after SIGTERM");
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(status.success(), "SIGTERM listener exit: {status:?}");
+    reader_task.join().expect("join PTY reader");
+
+    let output = String::from_utf8_lossy(&buffer.lock().expect("capture lock")).into_owned();
+    assert!(output.contains("Control plane listening"), "startup URL missing: {output}");
+    for forbidden in [
+        ENTER_ALT,
+        HIDE_CURSOR,
+        ENABLE_BRACKETED_PASTE,
+        DISABLE_LINE_WRAP,
+        "\x1b[6n",
+        "Recent sessions",
+        "cursor position could not be read",
+    ] {
+        assert!(!output.contains(forbidden), "headless listener emitted terminal/TUI marker {forbidden:?}: {output}");
+    }
+}
+
 #[test]
 fn pty_startup_preserves_input_sent_after_terminal_acquisition() {
     let mut probe = PtyProbe::spawn(&["--model", "faux/faux-1"], &[]);

@@ -97,8 +97,8 @@ pub fn harden_process() {
     }
 }
 
-/// Dispatch a parsed [`Cli`]. Subcommands run synchronously; the top-level
-/// flags drive print mode or the interactive REPL.
+/// Dispatch a parsed [`Cli`]. Subcommands run synchronously; top-level flags
+/// select structured, print, Web-listener, TUI, or line-REPL execution.
 pub async fn run(cli: Cli) -> Result<()> {
     cli.validate().map_err(anyhow::Error::msg)?;
     session_run::set_offline(cli.offline);
@@ -240,30 +240,16 @@ async fn main_run(cli: &Cli) -> Result<()> {
         {
             session_run::print_mode(cli).await
         }
+        Some(Mode::Text) | None if cli.listen.is_some() => run_listener_mode(cli).await,
         Some(Mode::Text) | None => {
             let session_run::RunSession {
                 application,
                 extension_ui,
                 scoped_models,
                 startup_warnings,
-                spawner,
                 ..
             } = session_run::build_session(cli).await?;
             let initial_prompts = cli.prompt.clone();
-            // Interactive terminal users get the TUI; non-TTY contexts (piped
-            // stdout, subprocesses, CI) get the line REPL, which runs any
-            // initial prompts then exits cleanly on EOF and honors the
-            // /help /model ... slash-command contract.
-            let listen_handle = match start_listen(cli, &application, &extension_ui, spawner).await {
-                Ok(handle) => handle,
-                Err(error) => {
-                    application.cleanup().await;
-                    return Err(error.context("starting control plane listener"));
-                }
-            };
-            let collab_host = listen_handle.as_ref().map(|handle| {
-                collab_commands::CollabHost::new(handle.collab_service(), handle.base_url())
-            });
             let result = if stdin_tty && stdout_tty {
                 tui::interactive(
                     application.clone(),
@@ -271,39 +257,86 @@ async fn main_run(cli: &Cli) -> Result<()> {
                     scoped_models,
                     initial_prompts,
                     startup_warnings,
-                    collab_host,
+                    None,
                 )
                 .await
             } else {
-                // REPL: settings warnings were already emitted to stderr during
-                // build_session (capture was not armed for non-TUI modes).
-                repl::interactive(application.clone(), initial_prompts, collab_host).await
-            };
-            let stop_result = match listen_handle {
-                Some(handle) => handle.stop().await.context("stopping control plane listener"),
-                None => Ok(()),
+                repl::interactive(application.clone(), initial_prompts, None).await
             };
             application.cleanup().await;
-            combine_run_and_stop_results(result, stop_result)
+            result
         }
     }
 }
 
-fn combine_run_and_stop_results(run_result: Result<()>, stop_result: Result<()>) -> Result<()> {
-    match (run_result, stop_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(run_error), Ok(())) => Err(run_error),
-        (Ok(()), Err(stop_error)) => Err(stop_error),
-        (Err(run_error), Err(stop_error)) => Err(run_error.context(format!(
-            "control plane listener also failed during shutdown: {stop_error:#}"
-        ))),
+/// Run `--listen` as a Web-only backend. Standard input is deliberately never
+/// read: a closed pipe must not stop the service, and a terminal must never be
+/// acquired. The listener owns the live application until a process signal.
+async fn run_listener_mode(cli: &Cli) -> Result<()> {
+    let mut shutdown = ListenerShutdownSignals::new()?;
+    let session_run::RunSession {
+        application,
+        extension_ui,
+        spawner,
+        ..
+    } = session_run::build_session(cli).await?;
+    let handle = match start_listen(cli, &application, &extension_ui, spawner).await {
+        Ok(Some(handle)) => handle,
+        Ok(None) => unreachable!("listener mode requires --listen"),
+        Err(error) => {
+            application.cleanup().await;
+            return Err(error.context("starting control plane listener"));
+        }
+    };
+    shutdown.wait().await;
+    let stop_result = handle.stop().await.context("stopping control plane listener");
+    application.cleanup().await;
+    stop_result
+}
+
+#[cfg(unix)]
+struct ListenerShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ListenerShutdownSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("installing SIGINT handler")?,
+            terminate: signal(SignalKind::terminate()).context("installing SIGTERM handler")?,
+        })
+    }
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
     }
 }
 
-/// Start the opt-in `--listen` control plane when requested.
+#[cfg(not(unix))]
+struct ListenerShutdownSignals;
+
+#[cfg(not(unix))]
+impl ListenerShutdownSignals {
+    fn new() -> Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Start the opt-in `--listen` control plane.
 ///
-/// The listener shares the same live [`Application`] used by the TUI/REPL and
-/// is stopped after the UI exits, before `application.cleanup`. The startup
+/// The listener shares the Web-only mode's live [`Application`] and remains
+/// active until a process signal, then stops before `application.cleanup`.
 /// [`RunSessionSpawner`] builds manager-owned session runtimes for the Web
 /// control plane. Bind, auth, and read failures are startup errors.
 async fn start_listen(

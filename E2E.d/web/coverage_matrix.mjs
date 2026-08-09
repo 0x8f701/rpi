@@ -142,8 +142,8 @@ export const MATRIX = [
     ],
   },
   {
-    // The real sessions lane (E2E.d/web/sessions.sh -> sessions_test.mjs,
-    // the 10th web lane). Its evidence file is written by the lane itself at
+    // The real sessions lane (E2E.d/web/sessions.sh -> sessions_test.mjs).
+    // Its evidence file is written by the lane itself at
     // $EVIDENCE_ROOT/web-sessions/coverage-assertions.json; the gate fails if
     // any of these T0.1-T7.4 contracts did not execute.
     feature: 'multi-session',
@@ -206,10 +206,8 @@ export const MATRIX = [
     ids: [
       'app.tool-card',
       'app.tool-card-done',
-      'app.steer-btn',
       'app.primary-submit-send',
       'app.primary-submit-steer',
-      'app.followup-btn',
       'app.maintenance-close',
     ],
   },

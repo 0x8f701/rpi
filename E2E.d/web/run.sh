@@ -41,6 +41,8 @@
 #                                         collapse/reopen, Android 390x844
 #                                         drawer pick-close, header has no
 #                                         feature buttons
+#   session_restore session_restore.sh       authoritative loaded/disk/restart
+#                                         transcript restoration
 #
 # Every lane is a playwright-only hard gate: it requires node and a usable
 # Chromium path (system Chrome/Chromium or playwright's bundled chromium) and
@@ -65,7 +67,7 @@ E2E_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
 export E2E_RUN_ID EVIDENCE_ROOT WORK_ROOT RPI_BIN
 
 # Every lane script in the suite (core.sh = the shared core lane).
-LANES="core goal xss abort reconnect switch mobile auth auth_tokenless extras sessions"
+LANES="core goal xss abort reconnect switch mobile auth auth_tokenless extras sessions session_restore"
 
 list_lanes() {
     local lane

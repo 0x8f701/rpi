@@ -1923,167 +1923,177 @@ fn binary_listen_rejects_list_models_combination() {
         "must not start the listener: {combined}"
     );
 }
-
-/// Public binary: non-TTY `--listen addr prompt` stays on the line REPL path
-/// (not silent print mode). Hold stdin open, prove the listener answers RPC,
-/// then close stdin and assert cleanup.
+/// Public binary: `--listen` + `--export` rejects two competing top-level modes.
 #[test]
-fn binary_listen_with_prompt_serves_rpc_on_nontty_repl() {
-    use std::io::Write;
-    use std::net::TcpStream as StdTcpStream;
+fn binary_listen_rejects_export_combination() {
+    let (code, stdout, stderr) = run_rpi_binary(&[
+        "--listen",
+        "127.0.0.1:0",
+        "--export",
+        "missing-session.jsonl",
+    ]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.contains("--listen") && combined.contains("--export"),
+        "error must mention both flags: {combined}"
+    );
+    assert!(
+        !combined.contains("loading session"),
+        "must reject before running export: {combined}"
+    );
+    assert!(
+        !combined.contains("Control plane listening"),
+        "must not start the listener: {combined}"
+    );
+}
+
+/// Public binary: `--listen` rejects positional prompts instead of starting a
+/// second terminal input path beside the Web service.
+#[test]
+fn binary_listen_rejects_positional_prompt() {
+    let (code, stdout, stderr) = run_rpi_binary(&[
+        "--listen",
+        "127.0.0.1:0",
+        "--model",
+        "faux/faux-1",
+        "prompt belongs on Web RPC",
+    ]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(combined.contains("Web-only"), "error must explain listener mode: {combined}");
+    assert!(combined.contains("/web") && combined.contains("/rpc"), "error must name prompt surfaces: {combined}");
+    assert!(!combined.contains("Control plane listening"), "invalid combination must not bind: {combined}");
+}
+
+#[cfg(unix)]
+fn signal_and_collect_listener(
+    mut child: std::process::Child,
+    stdout: std::thread::JoinHandle<Vec<u8>>,
+    stderr: std::thread::JoinHandle<Vec<u8>>,
+) -> (i32, String, String) {
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("signal listener");
+    finish_child_bounded(child, stdout, stderr, Duration::from_secs(20), "signaled listener")
+}
+
+fn http_rpc_binary(address: std::net::SocketAddr, command: &Value) -> Value {
+    use std::io::{Read as _, Write as _};
+
+    let body = serde_json::to_vec(command).expect("encode RPC command");
+    let request = format!(
+        "POST /rpc HTTP/1.1\r\nhost: {address}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))
+        .expect("connect binary listener RPC");
+    stream.set_read_timeout(Some(Duration::from_secs(30))).expect("RPC read timeout");
+    stream.write_all(request.as_bytes()).expect("write RPC headers");
+    stream.write_all(&body).expect("write RPC body");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read RPC response");
+    let body = parse_body(&response).expect("parse RPC response body");
+    serde_json::from_slice(&body).expect("parse RPC JSON")
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_web_prompt_persists_and_restores_after_listener_restart() {
     use std::process::{Command, Stdio};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let home = tempfile::tempdir().expect("home");
     let cwd = tempfile::tempdir().expect("cwd");
-    // Bind a concrete loopback port so the child and parent share the address.
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
-    let addr = probe.local_addr().expect("probe addr");
-    drop(probe);
+    let sessions = tempfile::tempdir().expect("sessions");
+    let port_probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+    let address = port_probe.local_addr().expect("probe address");
+    drop(port_probe);
 
-    let mut child = Command::new(rpi_bin())
-        .args([
-            "--listen",
-            &addr.to_string(),
-            "--model",
-            "faux/faux-1",
-            "--api-key",
-            "faux",
-            "hello from non-tty prompt",
-        ])
-        .current_dir(cwd.path())
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
-        .env("PI_CODING_AGENT_DIR", home.path().join(".pi"))
-        .env("PI_SKIP_VERSION_CHECK", "1")
-        .env("PI_OFFLINE", "1")
-        .env("PI_FAUX_RESPONSE", "listen-cli-should-not-run")
-        .env_remove("PI_PROFILE")
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("OPENAI_API_KEY")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn rpi");
-    let stdout_reader = spawn_pipe_drain(child.stdout.take().expect("stdout pipe"));
-    let stderr_reader = spawn_pipe_drain(child.stderr.take().expect("stderr pipe"));
+    let spawn = |resume: bool| {
+        let mut command = Command::new(rpi_bin());
+        command
+            .args([
+                "--listen",
+                &address.to_string(),
+                "--model",
+                "faux/faux-1",
+                "--api-key",
+                "faux",
+                "--session-dir",
+                sessions.path().to_str().expect("session path UTF-8"),
+            ])
+            .current_dir(cwd.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("PI_CODING_AGENT_DIR", home.path().join(".pi"))
+            .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("PI_OFFLINE", "1")
+            .env("PI_FAUX_RESPONSE", "persisted Web assistant reply")
+            .env_remove("PI_PROFILE")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("OPENAI_API_KEY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if resume {
+            command.arg("--continue");
+        }
+        let mut child = command.spawn().expect("spawn listener");
+        let stdout = spawn_pipe_drain(child.stdout.take().expect("stdout pipe"));
+        let stderr = spawn_pipe_drain(child.stderr.take().expect("stderr pipe"));
+        (child, stdout, stderr)
+    };
 
-    let body = br#"{"type":"get_state","id":"binary-listen-1"}"#;
-    let request = format!(
-        "POST /rpc HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
+    let wait_until_ready = |child: &mut std::process::Child| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(value) = std::panic::catch_unwind(|| {
+                http_rpc_binary(address, &json!({"type":"get_state","id":"ready"}))
+            }) {
+                if value["success"] == true {
+                    break;
+                }
+            }
+            assert!(child.try_wait().expect("poll listener").is_none(), "listener exited before ready");
+            assert!(Instant::now() < deadline, "listener did not become ready");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let (mut first, first_stdout, first_stderr) = spawn(false);
+    wait_until_ready(&mut first);
+    let prompt_text = "persist this Web-only conversation";
+    let prompted = http_rpc_binary(
+        address,
+        &json!({"type":"prompt","id":"persist-prompt","message":prompt_text}),
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut rpc_ok = false;
-    while Instant::now() < deadline {
-        match StdTcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-            Ok(mut stream) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .ok();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .ok();
-                if stream.write_all(request.as_bytes()).is_err() {
-                    thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                if stream.write_all(body).is_err() {
-                    thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                let mut response = Vec::new();
-                let _ = std::io::Read::read_to_end(&mut stream, &mut response);
-                if let Ok(text) = std::str::from_utf8(&response) {
-                    if text.contains("\"success\":true") && text.contains("binary-listen-1") {
-                        rpc_ok = true;
-                        break;
-                    }
-                }
-            }
-            Err(_) => thread::sleep(Duration::from_millis(50)),
+    assert_eq!(prompted["success"], true, "prompt response: {prompted}");
+    let entries_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let entries = http_rpc_binary(address, &json!({"type":"get_entries","id":"persist-entries"}));
+        let serialized = entries.to_string();
+        if serialized.contains(prompt_text) && serialized.contains("persisted Web assistant reply") {
+            break;
         }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = join_pipe_text(stdout_reader);
-                let stderr = join_pipe_text(stderr_reader);
-                panic!(
-                    "rpi exited before listener served RPC: status={status:?} stdout={stdout} stderr={stderr}"
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                kill_wait_join_panic(
-                    child,
-                    stdout_reader,
-                    stderr_reader,
-                    format!("try_wait rpi during RPC probe: {error}"),
-                );
-            }
-        }
+        assert!(Instant::now() < entries_deadline, "Web prompt did not reach recorded entries: {entries}");
+        thread::sleep(Duration::from_millis(50));
     }
-    if !rpc_ok {
-        kill_wait_join_panic(
-            child,
-            stdout_reader,
-            stderr_reader,
-            "non-TTY --listen with prompt must serve control-plane RPC (not silent print mode)"
-                .into(),
-        );
-    }
+    let (first_code, first_out, first_err) = signal_and_collect_listener(first, first_stdout, first_stderr);
+    assert_eq!(first_code, 0, "first shutdown stdout={first_out} stderr={first_err}");
 
-    drop(child.stdin.take());
-    let exit_deadline = Instant::now() + Duration::from_secs(20);
-    let mut exited = false;
-    while Instant::now() < exit_deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                exited = true;
-                break;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                kill_wait_join_panic(
-                    child,
-                    stdout_reader,
-                    stderr_reader,
-                    format!("try_wait rpi during exit poll: {error}"),
-                );
-            }
-        }
-    }
-    if !exited {
-        kill_wait_join_panic(
-            child,
-            stdout_reader,
-            stderr_reader,
-            "rpi did not exit within 20s after REPL EOF".into(),
-        );
-    }
-    // Child is dead: safe to join pipe readers.
-    let stdout = join_pipe_text(stdout_reader);
-    let stderr = join_pipe_text(stderr_reader);
-    let combined = format!("{stdout}\n{stderr}");
-    assert!(
-        combined.contains("Control plane listening") || rpc_ok,
-        "listener should have started: {combined}"
-    );
-
-    // After exit the port must be free again (listener stopped + cleanup).
-    let closed = Instant::now() + Duration::from_secs(5);
-    let mut port_free = false;
-    while Instant::now() < closed {
-        match StdTcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
-            Err(_) => {
-                port_free = true;
-                break;
-            }
-            Ok(_) => thread::sleep(Duration::from_millis(50)),
-        }
-    }
-    assert!(port_free, "listener port should close after REPL EOF/cleanup");
+    let (mut second, second_stdout, second_stderr) = spawn(true);
+    wait_until_ready(&mut second);
+    let restored = http_rpc_binary(address, &json!({"type":"get_entries","id":"restored-entries"}));
+    let serialized = restored.to_string();
+    assert!(serialized.contains(prompt_text), "restored entries missing user prompt: {restored}");
+    assert!(serialized.contains("persisted Web assistant reply"), "restored entries missing assistant reply: {restored}");
+    let (second_code, second_out, second_err) =
+        signal_and_collect_listener(second, second_stdout, second_stderr);
+    assert_eq!(second_code, 0, "second shutdown stdout={second_out} stderr={second_err}");
 }
 
 #[tokio::test]

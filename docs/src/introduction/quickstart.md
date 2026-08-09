@@ -45,10 +45,11 @@ rpi --print "Explain this crate" -m anthropic/claude-sonnet-4-5
 rpi --mode json -m openai/gpt-5.5 "List all unfinished task markers in src/"
 ```
 
-Positional prompts initialize the interactive session on a terminal. They select
-print mode only when stdin or stdout is not a terminal and `--listen` is absent;
-with `--listen`, a non-terminal run stays on the live line REPL path. Use
-`--print` when a script must be non-interactive:
+Positional prompts initialize the interactive session on a terminal and select
+print mode when stdin or stdout is not a terminal. `--listen` is a separate
+headless Web-only service and rejects positional prompts; submit Web prompts
+through `/web`, `/ws`, or `/rpc`. Use `--print` when a script must be
+non-interactive:
 
 ```sh
 rpi -m openai/gpt-5.5 "Review this repository"

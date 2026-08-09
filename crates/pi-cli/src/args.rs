@@ -205,8 +205,8 @@ pub struct Cli {
     #[arg(value_name = "PROMPT")]
     pub prompt: Vec<String>,
 
-    /// Bind an HTTP/WebSocket control plane sharing the live application.
-    /// Loopback is the default and requires no remote-exposure opt-in.
+    /// Run a headless Web-only HTTP/WebSocket service. This never starts the
+    /// TUI or line REPL and remains alive independently of standard input.
     #[arg(long, value_name = "SOCKET_ADDR")]
     pub listen: Option<std::net::SocketAddr>,
 
@@ -795,6 +795,9 @@ impl Cli {
         if self.listen.is_some() && self.command.is_some() {
             return Err("--listen cannot be combined with subcommands".to_owned());
         }
+        if self.listen.is_some() && self.export.is_some() {
+            return Err("--listen cannot be combined with --export".to_owned());
+        }
         if self.export.is_some() && self.command.is_some() {
             return Err("--export cannot be combined with subcommands".to_owned());
         }
@@ -813,10 +816,13 @@ impl Cli {
         if self.listen.is_some()
             && matches!(self.mode, Some(Mode::Json) | Some(Mode::Rpc))
         {
-            return Err("--listen is only supported on the text/TUI/REPL path".to_owned());
+            return Err("--listen selects the Web-only service and cannot be combined with JSON/RPC modes".to_owned());
         }
         if self.listen.is_some() && self.is_print_mode() {
-            return Err("--listen is only supported on the text/TUI/REPL path (not print mode)".to_owned());
+            return Err("--listen selects the Web-only service and cannot be combined with print mode".to_owned());
+        }
+        if self.listen.is_some() && !self.prompt.is_empty() {
+            return Err("--listen is Web-only and cannot be combined with positional prompts; submit prompts through /web, /ws, or /rpc".to_owned());
         }
         if self.listen.is_some() && self.list_models.is_some() {
             return Err("--listen cannot be combined with --list-models".to_owned());
@@ -1396,6 +1402,19 @@ mod tests {
         assert_eq!(
             cli.listen.as_ref().map(std::net::SocketAddr::to_string),
             Some("127.0.0.1:0".to_owned())
+        );
+        cli.validate().expect("loopback listener validates");
+
+        let prompt = Cli::try_parse_from([
+            "rpi",
+            "--listen",
+            "127.0.0.1:0",
+            "prompt must use Web RPC",
+        ])
+        .expect("parse listener prompt rejection fixture");
+        assert_eq!(
+            prompt.validate().expect_err("listener positional prompt must fail"),
+            "--listen is Web-only and cannot be combined with positional prompts; submit prompts through /web, /ws, or /rpc"
         );
         assert!(cli.listen_token_file.is_none());
         assert!(!cli.listen_allow_insecure_remote);

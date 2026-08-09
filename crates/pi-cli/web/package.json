@@ -6,7 +6,7 @@
   "description": "rpi web client — vite + react + typescript, built into the rpi binary via build.rs",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && rm -rf .transcript-test-build && esbuild scripts/transcript.test.ts --bundle --platform=node --format=esm --outfile=.transcript-test-build/transcript.test.mjs && node .transcript-test-build/transcript.test.mjs && rm -rf .transcript-test-build && vite build && node scripts/trim-dist.mjs",
     "preview": "vite preview",
     "coverage:build": "vite build --config vite.coverage.config.ts",
     "coverage:report": "node scripts/coverage-report.mjs",

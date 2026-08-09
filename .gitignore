@@ -8,6 +8,7 @@ dist
 crates/pi-cli/web/dist/*
 !crates/pi-cli/web/dist/index.html
 node_modules
+crates/pi-cli/web/.transcript-test-build/
 /examples/target
 *.log
 /.pi/artifacts/

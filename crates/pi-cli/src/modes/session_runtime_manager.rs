@@ -26,8 +26,8 @@
 //!
 //! The manager is owned by [`crate::modes::listen::ListenHandle`]: listener
 //! shutdown aborts every fan-in forwarder, then cleans manager-owned
-//! non-primary runtimes. The primary TUI [`Application`] remains owned and
-//! cleaned by `lib.rs`.
+//! non-primary runtimes. The primary Web listener [`Application`] remains
+//! owned and cleaned by `lib.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -461,7 +461,29 @@ impl SessionRuntimeManager {
     /// two recorders never append one JSONL.
     async fn open_persisted(self: &Arc<Self>, source: &Arc<SessionRuntime>, session_path: &str) -> Result<Arc<SessionRuntime>> {
         let _guard = self.create_lock.lock().await;
-        let prepared = pi_coding::PreparedSessionResume::prepare_path(Path::new(session_path))
+        let raw = Path::new(session_path);
+        // Dedup to an already-loaded runtime BEFORE requiring the file to
+        // exist on disk. A session that is loaded but whose recorder has not
+        // yet flushed its first assistant message has NO file on disk (the
+        // lazy recorder holds the header in memory), so `prepare_path` would
+        // reject its valid path and `switch_session` to it would fail with
+        // "invalid session path". The `by_path` registry keys the runtime by
+        // its recorder path from the moment it is loaded, so a loaded target
+        // (flushed or not) always dedups here; `prepare_path` only runs for a
+        // genuinely-not-loaded resume, which requires the persisted file.
+        // Both the canonical key (matches a flushed, canonical-registered
+        // runtime) and the raw key (matches a runtime registered while its
+        // file was still unflushed) are checked so a flush after load cannot
+        // split one physical session into two recorders.
+        let existing = {
+            let by_path = self.by_path.read().await;
+            by_path.get(&Self::canonical_session_key(raw)).cloned()
+                .or_else(|| by_path.get(raw).cloned())
+        };
+        if let Some(runtime) = existing {
+            return Ok(runtime);
+        }
+        let prepared = pi_coding::PreparedSessionResume::prepare_path(raw)
             .with_context(|| format!("invalid session path {session_path:?}"))?;
         let canonical = Self::canonical_session_key(prepared.path());
         if let Some(runtime) = self.by_path.read().await.get(&canonical).cloned() {
@@ -635,7 +657,7 @@ impl SessionRuntimeManager {
 
     /// Listener shutdown: abort EVERY fan-in forwarder (primary + children),
     /// then clean manager-owned non-primary runtimes. The primary Application
-    /// stays alive — `lib.rs` owns and cleans it after the TUI/REPL exits.
+    /// stays alive — `lib.rs` owns and cleans it after the listener stops.
     pub(crate) async fn shutdown(&self) {
         let runtimes = {
             let by_id = self.by_id.read().await;

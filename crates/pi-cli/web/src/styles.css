@@ -1783,8 +1783,6 @@ footer {
   /* Touch targets ≥44px (product requirement; exceeds WCAG 2.5.8 24px) */
   #connect-btn,
   #send-btn,
-  #steer-btn,
-  #followup-btn,
   #abort-btn,
   .panel-toggle,
   select,

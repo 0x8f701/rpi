@@ -10,12 +10,14 @@ rpi [OPTIONS] [PROMPT]...
 
 When no subcommand is given, a top-level run is selected by the flags and terminal:
 
-1. `--mode json` or `--mode rpc` → headless structured I/O.
-2. `-p` / `--print` → print mode.
-3. A non-empty positional prompt with non-terminal stdin or stdout → print mode, unless `--listen` is active.
-4. Both stdin and stdout are terminals → TUI, with positional prompts submitted as initial turns.
-5. Otherwise → line REPL, with positional prompts submitted as initial turns. `--listen` keeps non-terminal prompt runs on this live REPL path so the listener shares the running `Application` until EOF.
-
+1. `--listen` → headless Web-only service. It does not start or display a TUI
+   or line REPL, ignores terminal interactivity, and remains alive until
+   Ctrl-C/SIGTERM even when standard input is closed.
+2. `--mode json` or `--mode rpc` → headless structured I/O.
+3. `-p` / `--print` → print mode.
+4. A non-empty positional prompt with non-terminal stdin or stdout → print mode.
+5. Both stdin and stdout are terminals → TUI, with positional prompts submitted as initial turns.
+6. Otherwise → line REPL, with positional prompts submitted as initial turns.
 Multiple positional `[PROMPT]` arguments are separate initial turns in JSON,
 print, TUI, and REPL modes. An empty prompt is skipped by structured modes and
 does not force print mode.
@@ -62,7 +64,7 @@ does not force print mode.
 | `--approve` | `-a` | | Trust project-local `.pi` settings/resources for this run only. |
 | `--no-approve` | | | Refuse project-local `.pi` settings/resources for this run only. |
 | `--approval-mode <MODE>` | | `yolo\|write\|ask` | Host tool approval policy. `yolo` allows all capabilities, `write` confirms Exec, and `ask` confirms every tool call. Non-interactive confirmation fails closed. This is separate from project trust flags. |
-| `--listen <SOCKET_ADDR>` | | e.g. `127.0.0.1:8765` | Bind a plaintext HTTP/WebSocket control plane around the live TUI/REPL application. Loopback is the default. Authentication is optional: a tokenless loopback bind accepts same-origin browsers and native clients; non-loopback binds require `--listen-allow-insecure-remote` (token optional there too). Only valid on the text path. |
+| `--listen <SOCKET_ADDR>` | | e.g. `127.0.0.1:8765` | Start the headless Web-only HTTP/WebSocket service. Serves `/web`, `/ws`, and `/rpc`; never starts a TUI or REPL and stays alive with closed stdin until Ctrl-C/SIGTERM. Positional prompts are rejected; submit them through the Web/RPC API. Loopback is the default. Authentication is optional: a tokenless loopback bind accepts same-origin browsers and native clients; non-loopback binds require `--listen-allow-insecure-remote` (token optional there too). |
 | `--listen-token-file <PATH>` | | token file | Optional Bearer token file. When set, the token is mandatory on every bind (browsers present `rpi-auth.<token>`; `/rpc` requires `Authorization: Bearer`). When unset, the listener is tokenless: loopback accepts same-origin browsers, and `--listen-allow-insecure-remote` accepts same-origin LAN browsers (browser `Origin` authority equals HTTP `Host`). |
 | `--listen-allow-insecure-remote` | | | Permit a non-loopback `--listen` address (token optional). Plaintext HTTP/WebSocket exposes any bearer token and control traffic to passive network observers. |
 | `--listen-advertised-origin <URL>` | | http(s) origin | Advertised origin for collaboration links (`/collab`, `collab_start` without an explicit `baseUrl`) and the reachable `/web` URL printed at startup. Not required for ordinary `/web`, `/ws`, or `/rpc`: tokenless browser access uses ordinary same-origin (`Origin` authority equals HTTP `Host`). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing `/` is normalized away). Loopback and other specific binds advertise their bound address automatically; a wildcard bind (0.0.0.0 or `::`) without this flag prints no reachable URL and `/collab` fails closed instead of synthesizing links from an unreachable wildcard. |
@@ -179,13 +181,15 @@ Manage a llama.cpp router and local GGUF downloads:
 | `download OWNER/REPO [-q QUANT]` | Download one quantization atomically |
 | `installed` | List local downloads |
 
-## Interactive modes
+## Interactive and service modes
 
-1. **Headless JSON/RPC** — when `--mode json` or `--mode rpc` is passed.
-2. **Print mode** — when `-p` / `--print` is set, or a positional prompt is
+1. **Web-only listener** — when `--listen` is passed. This service is headless
+   and signal-driven; standard input is not an input or lifetime owner.
+2. **Headless JSON/RPC** — when `--mode json` or `--mode rpc` is passed.
+3. **Print mode** — when `-p` / `--print` is set, or a positional prompt is
    supplied while stdin or stdout is not a terminal.
-3. **TUI** — when both stdin and stdout are terminals.
-4. **Line REPL** — fallback for non-terminal text sessions.
+4. **TUI** — when both stdin and stdout are terminals.
+5. **Line REPL** — fallback for non-terminal text sessions.
 
 All share the same session engine; only the input and rendering differ.
 

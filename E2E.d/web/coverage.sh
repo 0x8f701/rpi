@@ -385,7 +385,7 @@ EOF
     # ---- payload verification: every lane must have produced coverage ----
     local lanes
     lanes="$(sed -n 's/^LANES="\(.*\)"/\1/p' "$SCRIPT_DIR/run.sh")"
-    [ -n "$lanes" ] || lanes="core goal xss abort reconnect switch mobile auth extras sessions"
+    [ -n "$lanes" ] || lanes="core goal xss abort reconnect switch mobile auth auth_tokenless extras sessions session_restore"
     local lane testfile missing=0
     for lane in $lanes; do
         testfile="$(sed -n "s#.*web_run_playwright [^ ]* [^ ]* [^ ]* \"\$SCRIPT_DIR/\([a-z0-9_]*\.mjs\)\".*#\1#p" "$SCRIPT_DIR/$lane.sh" | head -1)"
@@ -413,9 +413,9 @@ EOF
         --out "$report_dir"
 
     # ---- 7. matrix validation ----
-    # The sessions lane (10th web lane) writes its own executed-assertion
-    # evidence ($EVIDENCE_ROOT/web-sessions/coverage-assertions.json) during
-    # the step-5 real lane suite; it is gated here like the two drivers.
+    # The sessions lane writes its own executed-assertion evidence
+    # ($EVIDENCE_ROOT/web-sessions/coverage-assertions.json) during the
+    # step-5 real lane suite; it is gated here like the two drivers.
     node "$SCRIPT_DIR/coverage_matrix.mjs" \
         --evidence "$EVIDENCE_DIR/driver-steering/coverage-assertions.json" \
         --evidence "$EVIDENCE_DIR/driver-xss/coverage-assertions.json" \

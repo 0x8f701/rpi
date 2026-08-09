@@ -14,6 +14,18 @@ import { SessionPanel } from './panels/SessionPanel';
 import { SettingsPanel } from './panels/SettingsPanel';
 import { SessionSidebar } from './panels/SessionSidebar';
 import type { ContentBlock, EventFrame, RpcResponse } from './types';
+import {
+  type Item,
+  nextId,
+  contentText,
+  messagesToItems,
+  boundOutput,
+  customToItem,
+  applyToolSnapshot,
+  shouldRestoreStreamingAssistant,
+  BASH_OUTPUT_LINE_LIMIT,
+  TOOL_OUTPUT_LINE_LIMIT,
+} from './transcript';
 
 const RPI_AUTH_PREFIX = 'rpi-auth.';
 const TOKEN_STORAGE_KEY = 'rpi-web-token';
@@ -22,17 +34,10 @@ const COMMAND_TIMEOUT_MS = 30000;
 
 type ConnState = 'off' | 'connecting' | 'on' | 'reconnecting';
 
-export type Item =
-  | { kind: 'user'; id: string; text: string; optimistic: boolean }
-  | { kind: 'assistant'; id: string; status: 'streaming' | 'final'; blocks: ContentBlock[] }
-  | { kind: 'toolCard'; id: string; toolCallId: string; toolName: string; args: unknown; status: 'running' | 'done' | 'error'; result: string }
-  | { kind: 'toolResult'; id: string; text: string }
-  | { kind: 'bash'; id: string; command: string; output: string }
-  // Custom display:true backend messages (loops, projected notices).
-  | { kind: 'custom'; id: string; label: string; text: string }
-  // branchSummary / compactionSummary backend messages (system notices).
-  | { kind: 'summary'; id: string; label: string; text: string }
-  | { kind: 'approval'; id: string; method: string; title: string; message: string; extensionId?: string };
+// The Item shape, nextId/contentText helpers, and messagesToItems live in
+// ./transcript (shared with CollabGuestView) and are re-exported here so
+// existing `import { … } from './App'` callers keep compiling.
+export { nextId, contentText, messagesToItems, type Item } from './transcript';
 
 interface Pending {
   resolve: (value: unknown) => void;
@@ -113,99 +118,9 @@ const UNREAD_EVENT_TYPES: Record<string, true> = {
   extension_ui_request: true,
 };
 
-export function nextId(prefix: string): string {
-  return `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-}
-
-export function contentText(content: unknown): string {
-  if (!Array.isArray(content)) return '';
-  return content
-    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
-    .map((b) => b.text as string)
-    .join('\n');
-}
-
-/** Convert backend-authoritative lifecycle messages (Vec<Message> with
- *  role/content blocks) into renderable Items, reusing the same role/content
- *  rules as the live event stream. Deterministic per message.
- *
- *  Covers every `pi_ai::Message` role: user, assistant (text/thinking/image/
- *  toolCall blocks), toolResult, bashExecution, custom (rendered only when
- *  `display: true` — hidden internal messages never render), branchSummary
- *  and compactionSummary (system notices). Unknown/malformed records are
- *  skipped defensively; one bad record never breaks the transcript restore. */
-export function messagesToItems(messages: unknown): Item[] {
-  const list = Array.isArray(messages) ? messages : [];
-  const out: Item[] = [];
-  for (const raw of list) {
-    try {
-      const m = (raw || {}) as {
-        role?: string;
-        content?: unknown;
-        display?: boolean;
-        customType?: string;
-        summary?: string;
-        command?: string;
-        output?: string;
-      };
-      switch (m.role) {
-        case 'user':
-          out.push({ kind: 'user', id: nextId('u'), text: contentText(m.content), optimistic: false });
-          break;
-        case 'assistant':
-          out.push({
-            kind: 'assistant',
-            id: nextId('a'),
-            status: 'final',
-            blocks: (Array.isArray(m.content) ? m.content : []) as ContentBlock[],
-          });
-          break;
-        case 'toolResult':
-          out.push({ kind: 'toolResult', id: nextId('r'), text: contentText(m.content) });
-          break;
-        case 'bashExecution': {
-          const cmd = (m.content || {}) as { command?: string; output?: string };
-          out.push({ kind: 'bash', id: nextId('b'), command: cmd.command || '', output: cmd.output || '' });
-          break;
-        }
-        case 'custom':
-          // display:false custom messages are internal (loop scheduling,
-          // orchestration IRC) and NEVER render; display:true ones surface as
-          // a labeled notice card, mirroring the TUI's push_message rules.
-          if (m.display === true) {
-            out.push({
-              kind: 'custom',
-              id: nextId('c'),
-              label: typeof m.customType === 'string' ? m.customType : 'notice',
-              text: contentText(m.content),
-            });
-          }
-          break;
-        case 'branchSummary':
-          out.push({
-            kind: 'summary',
-            id: nextId('s'),
-            label: 'Branch summary',
-            text: typeof m.summary === 'string' ? m.summary : '',
-          });
-          break;
-        case 'compactionSummary':
-          out.push({
-            kind: 'summary',
-            id: nextId('s'),
-            label: 'Compaction summary',
-            text: typeof m.summary === 'string' ? m.summary : '',
-          });
-          break;
-        default:
-          break; // unknown roles are ignored safely
-      }
-    } catch {
-      /* one malformed record never breaks the whole transcript restore */
-    }
-  }
-  return out;
-}
+// nextId, contentText, and messagesToItems (plus the output-bounding and
+// custom-visibility helpers used by the live handlers below) live in
+// ./transcript so live events and restored entries share one normalization.
 
 /* ------------------------------------------------------------------ *
  * Small presentational components
@@ -826,29 +741,103 @@ export function App() {
 
   const onOpen = useCallback(() => {
     delayRef.current = 1000;
-    setConnState('on');
+    // Bootstrap the authoritative active session BEFORE exposing the
+    // connected UI. The first get_state probes with the current (possibly
+    // stale) active session id; on a server restart the stale id is rejected
+    // ("unknown session"), so the fallback re-probes with NO sessionId to
+    // route to the authoritative primary. A second state snapshot after
+    // get_messages closes the settlement race: settled sessions replace the
+    // transcript outright, while a still-running session preserves or
+    // recreates its streaming assistant so later deltas/message_end remain
+    // routable.
+    const rebindToPrimary = () => {
+      sessionIdRef.current = null;
+      return sendCommand({ type: 'get_state' });
+    };
     sendCommand({ type: 'get_state' })
-      .then((data) => {
-        applyState(data);
-        // Goal snapshot + journal for the now-known session (the sid is
+      .catch(rebindToPrimary)
+      .then((state) => {
+        applyState(state);
+        const target = sessionIdRef.current;
+        if (!target) throw new Error('state response did not bind a session');
+        return sendCommand({ type: 'get_messages', sessionId: target }).then((data) => {
+          if (!data || typeof data !== 'object' || !('messages' in data) || !Array.isArray(data.messages)) {
+            throw new Error('messages response missing messages');
+          }
+          const messages = data.messages;
+          return sendCommand({ type: 'get_state', sessionId: target }).then((latestState) => {
+            const latest = (latestState || {}) as { isStreaming?: boolean };
+            applyState(latestState, target);
+            if (latest.isStreaming === true) {
+              const shouldRestoreAssistant = shouldRestoreStreamingAssistant(messages);
+              setItemsBySessionId((prev) => {
+                const history = messagesToItems(messages);
+                let assistantId = activeAssistantBySessionIdRef.current[target];
+                const streamingItem = (prev[target] ?? []).find(
+                  (item) => item.kind === 'assistant' && item.status === 'streaming' && item.id === assistantId,
+                );
+                if (streamingItem) return { ...prev, [target]: [...history, streamingItem] };
+                // Application::is_streaming covers the whole run, including
+                // tool execution. Only synthesize an assistant when durable
+                // history says the next missing record is an assistant; an
+                // assistant/toolCall tail needs no empty streaming shell.
+                if (!shouldRestoreAssistant) {
+                  return { ...prev, [target]: history };
+                }
+                assistantId = nextId('a');
+                activeAssistantBySessionIdRef.current[target] = assistantId;
+                return {
+                  ...prev,
+                  [target]: [...history, { kind: 'assistant', id: assistantId, status: 'streaming', blocks: [] }],
+                };
+              });
+              delete optimisticQueueBySessionIdRef.current[target];
+              return;
+            }
+            // MessageEnd may have committed between the first get_messages
+            // and this settled state snapshot. Re-fetch after observing idle
+            // so the replacement cannot use pre-settlement history.
+            return sendCommand({ type: 'get_messages', sessionId: target }).then((settledData) => {
+              if (!settledData || typeof settledData !== 'object' || !('messages' in settledData) || !Array.isArray(settledData.messages)) {
+                throw new Error('settled messages response missing messages');
+              }
+              setItemsBySessionId((prev) => ({ ...prev, [target]: messagesToItems(settledData.messages) }));
+              delete optimisticQueueBySessionIdRef.current[target];
+              delete activeAssistantBySessionIdRef.current[target];
+              const prefix = `${target}\u0000`;
+              for (const key of streamBuf.keys()) {
+                if (key.startsWith(prefix)) streamBuf.delete(key);
+              }
+              for (const key of liveNodes.keys()) {
+                if (key.startsWith(prefix)) liveNodes.delete(key);
+              }
+            });
+          });
+        });
+      })
+      .then(() => {
+        setConnState('on');
+        // Goal snapshot + journal for the now-bound session (the sid is
         // derived from the state response, so the refresh targets the right
         // runtime even on the very first connect).
         refreshGoal(sessionIdRef.current);
+        sendCommand({ type: 'get_available_models' })
+          .then((data) => {
+            const list = (data as { models?: Array<{ id: string; name: string; provider: string }> }).models || [];
+            setModels(list.filter((m) => m && m.id && m.provider));
+          })
+          .catch(() => {});
+        sendCommand({ type: 'get_available_thinking_levels' })
+          .then((data) => {
+            const list = (data as { levels?: string[] }).levels || [];
+            setLevels(list);
+          })
+          .catch(() => {});
       })
-      .catch(() => {});
-    sendCommand({ type: 'get_available_models' })
-      .then((data) => {
-        const list = (data as { models?: Array<{ id: string; name: string; provider: string }> }).models || [];
-        setModels(list.filter((m) => m && m.id && m.provider));
-      })
-      .catch(() => {});
-    sendCommand({ type: 'get_available_thinking_levels' })
-      .then((data) => {
-        const list = (data as { levels?: string[] }).levels || [];
-        setLevels(list);
-      })
-      .catch(() => {});
-  }, [applyState, refreshGoal, sendCommand]);
+      .catch(() => {
+        scheduleReconnect();
+      });
+  }, [applyState, refreshGoal, scheduleReconnect, sendCommand]);
 
   const connect = useCallback(() => {
     if (retryTimerRef.current !== null) {
@@ -945,12 +934,31 @@ export function App() {
       return;
     }
     if (role === 'toolResult') {
-      pushItemFor(sid, { kind: 'toolResult', id: nextId('r'), text: contentText(message.content) });
+      pushItemFor(sid, { kind: 'toolResult', id: nextId('r'), text: boundOutput(contentText(message.content), TOOL_OUTPUT_LINE_LIMIT).text });
       return;
     }
     if (role === 'bashExecution') {
       const m = message as { command?: string; output?: string };
-      pushItemFor(sid, { kind: 'bash', id: nextId('b'), command: m.command || '', output: m.output || '' });
+      pushItemFor(sid, {
+        kind: 'bash',
+        id: nextId('b'),
+        command: m.command || '',
+        output: boundOutput(m.output || '', BASH_OUTPUT_LINE_LIMIT).text,
+      });
+      return;
+    }
+    if (role === 'custom') {
+      // Mirrors messagesToItems so live events and restored entries stay
+      // identical: display:false customs (internal system reminders /
+      // orchestration scaffolding) never render; display:true customs surface
+      // as a labeled card, with typed IRC customs showing their parsed view
+      // (never the raw <orchestration-message> XML wrapper). The custom
+      // message also arrives as message_end; onMessageEnd ignores non-assistant
+      // roles, so this pushes exactly once.
+      const item = customToItem(
+        message as { display?: boolean; customType?: string; content?: unknown; details?: unknown },
+      );
+      if (item) pushItemFor(sid, item);
     }
   }, [frameSession, patchItemFor, pushItemFor]);
 
@@ -1041,25 +1049,18 @@ export function App() {
     const toolCallId = (frame.toolCallId as string) || '';
     const text = contentText((frame.partialResult as { content?: unknown } | undefined)?.content);
     if (!text) return;
-    updateItemsFor(frameSession(frame), (prev) =>
-      prev.map((item) =>
-        item.kind === 'toolCard' && item.toolCallId === toolCallId
-          ? { ...item, result: item.result === '' ? text : `${item.result}\n${text}` }
-          : item
-      )
-    );
+    updateItemsFor(frameSession(frame), (prev) => applyToolSnapshot(prev, toolCallId, text));
   }, [frameSession, updateItemsFor]);
 
   const onToolEnd = useCallback((frame: EventFrame) => {
     const toolCallId = (frame.toolCallId as string) || '';
     const text = contentText((frame.result as { content?: unknown } | undefined)?.content);
     const isError = !!frame.isError;
+    // Bound the rendered result to its tail like the TUI compact tool card so
+    // a huge tool output never dominates the transcript while the error
+    // status and trailing lines stay visible.
     updateItemsFor(frameSession(frame), (prev) =>
-      prev.map((item) =>
-        item.kind === 'toolCard' && item.toolCallId === toolCallId
-          ? { ...item, status: isError ? 'error' : 'done', result: text }
-          : item
-      )
+      applyToolSnapshot(prev, toolCallId, text, isError ? 'error' : 'done')
     );
   }, [frameSession, updateItemsFor]);
 
@@ -1246,7 +1247,7 @@ export function App() {
 
   /* ---------------- composer ---------------- */
 
-  const submit = useCallback((kind: 'prompt' | 'steer' | 'followup') => {
+  const submit = useCallback((kind: 'prompt' | 'steer') => {
     const input = promptInputRef.current;
     if (!input) return;
     const text = input.value.trim();
@@ -1257,12 +1258,12 @@ export function App() {
     if (sid) (optimisticQueueBySessionIdRef.current[sid] ??= []).push(bubbleId);
     input.value = '';
     autoResize(input);
-    const command =
-      kind === 'steer'
-        ? { type: 'steer', message: text }
-        : kind === 'followup'
-          ? { type: 'follow_up', message: text }
-          : { type: 'prompt', message: text };
+    // Enter and the primary button both resolve to the active run's verb: a
+    // fresh prompt while idle, a steering message while a stream is in flight.
+    // The dedicated Steer/Follow up controls were removed so the phone-width
+    // composer's textarea stays dominant; queued follow-up is intentionally
+    // dropped in favor of this simple default send/steer flow.
+    const command = kind === 'steer' ? { type: 'steer', message: text } : { type: 'prompt', message: text };
     sendCommand(command, bubbleId).catch((err: Error & { rpc?: boolean }) => {
       if (!err.rpc) toast(`send failed: ${err.message}`, true);
     });
@@ -1686,18 +1687,14 @@ export function App() {
           <button id="send-btn" type="button" onClick={() => submit(activeStreaming ? 'steer' : 'prompt')}>
             {activeStreaming ? 'Steer' : 'Send'}
           </button>
-          <button id="steer-btn" type="button" title="Queue a steering message for the active run" onClick={() => submit('steer')}>
-            Steer
-          </button>
-          <button id="followup-btn" type="button" title="Queue a follow-up message for the active run" onClick={() => submit('followup')}>
-            Follow up
-          </button>
-          <button id="abort-btn" type="button" disabled={!activeStreaming} title="Abort the active run (Esc)" onClick={() => {
-            if (sessionId) abortPendingBySessionIdRef.current[sessionId] = true;
-            sendCommand({ type: 'abort' }).catch(() => {});
-          }}>
-            Abort
-          </button>
+          {activeStreaming && (
+            <button id="abort-btn" type="button" title="Abort the active run (Esc)" onClick={() => {
+              if (sessionId) abortPendingBySessionIdRef.current[sessionId] = true;
+              sendCommand({ type: 'abort' }).catch(() => {});
+            }}>
+              Abort
+            </button>
+          )}
         </div>
       </footer>
 
