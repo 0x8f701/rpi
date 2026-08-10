@@ -1314,9 +1314,10 @@ fn pty_todo_overview_detail_navigation() {
     );
 }
 
-/// Contract: deprecated `subagents.agentOverrides` diagnostics captured during
-/// session build are shown on the TUI after launch (composer error / status),
-/// not only lost on pre-TUI stderr.
+/// Contract: `subagents.agentOverrides` migration is silent — the TUI starts
+/// without a deprecation warning toast, and the composer is immediately
+/// usable. (Previously the warning was shown and dismissed with Esc; now the
+/// migration runs silently per the silenced-deprecated-warnings change.)
 #[test]
 fn pty_startup_warnings_surface_after_tui_launch() {
     let mut probe = PtyProbe::spawn_seeded(&["--model", "faux/faux-1"], 28, 100, |home, _cwd| {
@@ -1328,47 +1329,15 @@ fn pty_startup_warnings_surface_after_tui_launch() {
         probe.snapshot()
     );
 
-    // The deprecation string is stable in settings.rs warn_legacy_agent_migration.
-    // Assert it is currently visible on the live screen — a raw-history search
-    // would also match a pre-TUI stderr line that never reached the surface.
-    assert!(
-        probe
-            .wait_for_live(Duration::from_secs(25), |live| {
-                live.contains("deprecated subagents.agentOverrides")
-                    || live.contains("subagents.agentOverrides")
-            })
-            .is_some(),
-        "startup warning must appear on the live TUI surface after launch.\nhome={}\nlive={}",
-        probe.home_path().display(),
-        probe.live_screen()
-    );
-
-    // Settings file path should be referenced for actionability when present.
+    // The deprecation warning must NOT appear on the live screen.
     let live = probe.live_screen();
     assert!(
-        live.contains("deprecated") || live.contains("agentOverrides"),
-        "warning text must be user-visible on the live screen: {live}"
+        !live.contains("deprecated subagents.agentOverrides")
+            && !live.contains("subagents.agentOverrides"),
+        "agentOverrides migration is silent — no warning on TUI: {live}"
     );
 
-    // Esc dismisses the ephemeral composer error toast without exiting. The
-    // warning must actually leave the live screen, not merely be followed by a
-    // later paint that a raw search would still find.
-    let dismiss_at = probe.len();
-    probe.send(&[ESC]);
-    assert!(
-        probe
-            .wait_for_live_after(dismiss_at, Duration::from_secs(8), |live| {
-                !live.contains("deprecated subagents.agentOverrides")
-                    && !live.contains("subagents.agentOverrides")
-            })
-            .is_some(),
-        "Esc must dismiss the startup warning toast on the live screen: {}",
-        probe.live_screen()
-    );
-
-    // Composer still works after dismissing the toast (bracketed paste → one
-    // contiguous live render; per-key typing interleaves cursor cells in the
-    // raw stream).
+    // Composer is immediately usable (no warning toast to dismiss).
     let focus_start = probe.len();
     probe.bracketed_paste("after-warning");
     assert!(

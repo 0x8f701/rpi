@@ -1729,8 +1729,8 @@ fn startup_warning_stays_on_stderr_and_json_stdout_stays_pure() {
     );
     assert!(ok, "json mode failed: stderr={err}");
     assert!(
-        err.contains("deprecated subagents.agentOverrides"),
-        "startup warning must remain visible on stderr: {err}"
+        !err.contains("deprecated subagents.agentOverrides"),
+        "agentOverrides migration is silent: no stderr warning: {err}"
     );
     assert!(
         !out.contains("deprecated subagents.agentOverrides"),

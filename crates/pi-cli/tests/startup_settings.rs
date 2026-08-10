@@ -533,7 +533,7 @@ fn session_dir_settings_diagnostics_do_not_pollute_json_stdout() {
         None,
     );
     assert!(ok, "JSON startup failed: {err}");
-    assert!(err.contains("deprecated subagents.agentOverrides"), "missing stderr diagnostic: {err}");
+    assert!(!err.contains("deprecated subagents.agentOverrides"), "agentOverrides migration is silent: {err}");
     for line in out.lines().filter(|line| !line.trim().is_empty()) {
         serde_json::from_str::<serde_json::Value>(line)
             .unwrap_or_else(|error| panic!("diagnostic polluted JSON stdout ({error}): {line}"));
