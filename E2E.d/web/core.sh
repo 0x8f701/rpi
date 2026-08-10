@@ -73,6 +73,7 @@ spawn_rpi() {
         RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
         "$RPI_BIN" --offline \
         --listen 127.0.0.1:0 \
+        --listen-plaintext \
         --listen-token-file "$root/token" \
         --model user-steering/mock --api-key user-mock-key \
         <"$root/stdin" >"$evidence/rpi.stdout" 2>"$evidence/rpi.stderr" &

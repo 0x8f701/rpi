@@ -39,6 +39,7 @@ spawn_rpi() {
         PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
         "$RPI_BIN" --offline \
         --listen 127.0.0.1:0 \
+        --listen-plaintext \
         --listen-token-file "$root/token" \
         --model user-steering/mock --api-key user-mock-key \
         <"$root/stdin" >"$evidence/rpi.stdout" 2>"$evidence/rpi.stderr" &

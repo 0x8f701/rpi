@@ -131,6 +131,7 @@ web_spawn_rpi() {
             RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
             "$RPI_BIN" --offline "${extra_args[@]}" \
             --listen "127.0.0.1:$listen_port" \
+            --listen-plaintext \
             "${token_args[@]}" \
             --model user-steering/mock --api-key user-mock-key \
             <"$root/stdin$tag" >"$evidence/rpi$tag.stdout" 2>"$evidence/rpi$tag.stderr"

@@ -28,7 +28,7 @@ start_listener() {
         PI_CODING_AGENT_DIR="$root/home/.pi/agent" PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
         PI_FAUX_RESPONSE='release Web persisted reply' \
         "$RPI_BIN" --offline -C "$root/workspace" --listen "127.0.0.1:$port" \
-        --model faux/faux-1 --api-key faux --session-dir "$session_dir" "$@" \
+        --listen-plaintext --model faux/faux-1 --api-key faux --session-dir "$session_dir" "$@" \
         </dev/null >"$evidence/stdout$tag.log" 2>"$evidence/stderr$tag.log" &
     RPI_PID=$!
     register_pid "$RPI_PID"

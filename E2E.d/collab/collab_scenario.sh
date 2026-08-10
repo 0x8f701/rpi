@@ -142,6 +142,7 @@ EOF
         RPI_WEB_DEV_DIR="${RPI_WEB_DEV_DIR:-}" \
         "$RPI_BIN" --offline \
         --listen "127.0.0.1:$listen_port" \
+        --listen-plaintext \
         --model user-bash-card/mock --api-key user-mock-key \
         </dev/null >"$COLLAB_PRIV_CAPTURE" 2>"$evidence/rpi.stderr" &
     RPI_PID=$!
