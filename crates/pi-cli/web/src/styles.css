@@ -2173,8 +2173,11 @@ footer {
   .msg--user,
   .msg--bash,
   .tool-card { max-width: 96%; }
-  #prompt-input { min-height: 44px; }
-  #composer-buttons { gap: 4px; }
+  #prompt-input { min-height: 44px; width: 100%; }
+  /* Stack the composer so the textarea keeps a usable width on phones
+   * (attach/mic/send used to sit beside it and left only ~195px at 375px). */
+  footer { flex-direction: column; align-items: stretch; }
+  #composer-buttons { width: 100%; justify-content: flex-end; gap: 4px; }
   #composer-buttons button { padding: 8px 10px; }
 
   /* Rows get slightly larger hit areas on small screens */

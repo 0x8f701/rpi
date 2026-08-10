@@ -2427,12 +2427,7 @@ export function App() {
                 <FinalAssistant key={item.id} blocks={item.blocks} />
               );
             case 'toolCard':
-              if (item.toolName.toLowerCase() === 'bash' && item.args && typeof item.args === 'object' && 'command' in (item.args as Record<string, unknown>)) {
-                const cmd = String((item.args as Record<string, unknown>).command || '');
-                return <BashCard key={item.id} command={cmd} output={item.result} />;
-              }
-              // Non-bash tools: show tool name as label + result as output (no JSON args).
-              return <BashCard key={item.id} label={item.toolName} output={item.result} status={item.status} />;
+              return <ToolCard key={item.id} item={item} />;
             case 'toolResult':
               return (
                 <BashCard

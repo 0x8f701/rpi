@@ -146,14 +146,14 @@ async function closeRow(page, sid, label) {
   await waitFor(
     page,
     (s) => {
-      const btn = document.querySelector(`#session-row-close-btn-${s}`);
+      const btn = document.querySelector(`.session-sidebar__close[data-session-id="${s}"]`);
       return !!btn && !btn.disabled;
     },
     `${label}: close button for ${sid} not available`,
     30000,
     sid
   );
-  await page.click(`#session-row-close-btn-${sid}`);
+  await page.click(`.session-sidebar__close[data-session-id="${sid}"]`);
 }
 
 async function assertTranscriptHas(page, needle, label) {
