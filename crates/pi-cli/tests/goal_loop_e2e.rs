@@ -899,6 +899,7 @@ fn repl_goal_budget_usage_crossing_pauses_and_blocks_resume() {
             "faux/faux-1",
             "--listen",
             "127.0.0.1:0",
+            "--listen-plaintext",
         ],
     );
     repl.ready();
@@ -1055,6 +1056,7 @@ fn repl_goal_active_restart_resumes_session_restores_usage_budget_and_lifecycle(
                 "faux/faux-1",
                 "--listen",
                 "127.0.0.1:0",
+                "--listen-plaintext",
             ],
         );
         repl.ready();
@@ -1104,6 +1106,7 @@ fn repl_goal_active_restart_resumes_session_restores_usage_budget_and_lifecycle(
             "--continue",
             "--listen",
             "127.0.0.1:0",
+            "--listen-plaintext",
         ],
     );
     resumed.ready();

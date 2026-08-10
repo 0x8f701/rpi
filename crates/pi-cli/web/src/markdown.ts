@@ -1,8 +1,37 @@
 import { escapeHtml, redactSecrets, safeImage } from './redact';
 import katex from 'katex';
 import mermaid from 'mermaid';
+// highlight.js core build + a focused language subset (tree-shakeable
+// per-language imports; auto-detection uses only the registered set).
+import hljs from 'highlight.js/lib/core';
+import bash from 'highlight.js/lib/languages/bash';
+import c from 'highlight.js/lib/languages/c';
+import cpp from 'highlight.js/lib/languages/cpp';
+import css from 'highlight.js/lib/languages/css';
+import diff from 'highlight.js/lib/languages/diff';
+import go from 'highlight.js/lib/languages/go';
+import java from 'highlight.js/lib/languages/java';
+import javascript from 'highlight.js/lib/languages/javascript';
+import json from 'highlight.js/lib/languages/json';
+import markdown from 'highlight.js/lib/languages/markdown';
+import plaintext from 'highlight.js/lib/languages/plaintext';
+import python from 'highlight.js/lib/languages/python';
+import rust from 'highlight.js/lib/languages/rust';
+import sql from 'highlight.js/lib/languages/sql';
+import typescript from 'highlight.js/lib/languages/typescript';
+import xml from 'highlight.js/lib/languages/xml';
+import yaml from 'highlight.js/lib/languages/yaml';
+import 'highlight.js/styles/github-dark.css';
 import 'katex/dist/katex.min.css';
 import type { ContentBlock } from './types';
+
+const hljsLanguages = {
+  bash, c, cpp, css, diff, go, java, javascript, json, markdown,
+  plaintext, python, rust, sql, typescript, xml, yaml,
+};
+for (const [name, def] of Object.entries(hljsLanguages)) {
+  hljs.registerLanguage(name, def);
+}
 
 // Markdown renderer for assistant text. The input is RAW model text; the
 // pipeline guarantees no model characters reach the HTML surface unescaped:
@@ -157,12 +186,25 @@ function renderFence(lang: string, source: string): string {
     // here, decoded back by the browser), replaced by SVG in hydrateMermaid().
     return `<div class="md-mermaid-host">${escapeHtml(source)}</div>`;
   }
+  let highlighted: string;
+  try {
+    // hljs.highlight throws on unregistered languages and illegal lexemes;
+    // fall back to auto-detection (and finally plain escaping) so a fence
+    // can never break rendering. hljs output is already HTML-escaped; the
+    // copy button reads textContent, which stays the plain source.
+    highlighted =
+      lang !== '' && hljs.getLanguage(lang)
+        ? hljs.highlight(source, { language: lang }).value
+        : hljs.highlightAuto(source).value;
+  } catch {
+    highlighted = escapeHtml(source);
+  }
   const label = lang !== '' ? lang : 'text';
   return (
     `<div class="md-fence">` +
     `<div class="md-fence__head"><span class="md-fence__lang">${escapeHtml(label)}</span>` +
     `<button type="button" class="md-fence__copy">copy</button></div>` +
-    `<pre class="md-fence__pre"><code class="md-code">${escapeHtml(source)}</code></pre>` +
+    `<pre class="md-fence__pre"><code class="md-code hljs">${highlighted}</code></pre>` +
     `</div>`
   );
 }
@@ -203,7 +245,7 @@ function imageSrc(raw: string): string {
 
 function inlineMd(escaped: string): string {
   let s = escaped;
-  s = s.replace(/`([^`]+)`/g, (_m, t: string) => `<code class="md-inline-code">${t}</code>`);
+  s = s.replace(/`([^`]+)`/g, (_m, t: string) => `<code class="md-code">${t}</code>`);
   // Images before links: ![alt](url) must not be consumed by the link rule.
   s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (m, alt: string, url: string) => {
     const src = imageSrc(url);

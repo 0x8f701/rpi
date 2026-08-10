@@ -339,6 +339,7 @@ fn pty_listener_is_headless_and_signal_owned_with_closed_stdin() {
         .args([
             "--listen",
             &address.to_string(),
+            "--listen-plaintext",
             "--model",
             "faux/faux-1",
             "--api-key",

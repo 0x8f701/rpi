@@ -191,3 +191,61 @@ async fn bash_brush_timeout_reaps_descendants() {
     let result = call(&tool, json!({ "command": "printf ok" })).await;
     assert_eq!(text_of(&result), "ok");
 }
+
+/// Contract: `pty: true` runs a simple command in a pseudo-terminal and
+/// returns its merged stdout+stderr through the normal success path. The PTY
+/// line discipline may fold newlines (`\n` → `\r\n`), so the assertion uses
+/// `contains` rather than exact text.
+#[tokio::test]
+async fn bash_pty_runs_simple_command() {
+    let cwd = TempDir::new().expect("cwd");
+    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
+    let result = call(&tool, json!({ "command": "printf 'pty-ok'", "pty": true })).await;
+    assert!(
+        text_of(&result).contains("pty-ok"),
+        "pty command output: {:?}",
+        text_of(&result)
+    );
+}
+
+/// Contract: `input` is delivered to the PTY's stdin (followed by a newline)
+/// before output is read, so an interactive command that reads stdin sees it —
+/// the sudo-password path. PTY echo is on by default, so the input may appear
+/// in the merged output as well; the assertion targets the command's own
+/// reply.
+#[tokio::test]
+async fn bash_pty_forwards_input_to_stdin() {
+    let cwd = TempDir::new().expect("cwd");
+    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
+    let result = call(
+        &tool,
+        json!({
+            "command": "read line; printf 'got:%s' \"$line\"",
+            "pty": true,
+            "input": "secret-line",
+            "timeout": 10
+        }),
+    )
+    .await;
+    assert!(
+        text_of(&result).contains("got:secret-line"),
+        "pty input reply: {:?}",
+        text_of(&result)
+    );
+}
+
+/// Contract: with no `input`, the PTY's stdin still reaches EOF, so a command
+/// that reads stdin to EOF (`cat`) completes instead of hanging until the
+/// timeout. A regression surfaces as a "timed out" error — never a suite
+/// hang.
+#[tokio::test]
+async fn bash_pty_stdin_reaches_eof_without_input() {
+    let cwd = TempDir::new().expect("cwd");
+    let tool = create_tool("bash", cwd.path().to_str().expect("utf8")).expect("bash tool builds");
+    let result = call(&tool, json!({ "command": "cat", "pty": true, "timeout": 10 })).await;
+    assert!(
+        text_of(&result).trim().is_empty(),
+        "cat with closed stdin must produce no output: {:?}",
+        text_of(&result)
+    );
+}

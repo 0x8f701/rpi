@@ -327,6 +327,9 @@ async fn harness(label: &str) -> Harness {
             token_file: None,
             allow_insecure_remote: false,
             advertised_origin: None,
+            plaintext: true,
+            tls_cert: None,
+            tls_key: None,
             session_factory: Some(Arc::new(spawner.clone())),
         },
     )

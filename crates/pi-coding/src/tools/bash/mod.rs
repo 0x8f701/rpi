@@ -11,6 +11,10 @@
 
 pub(crate) mod brush;
 
+/// Opt-in PTY execution for the bash tool (`pty: true`): spawns the command
+/// in a pseudo-terminal so interactive programs like `sudo` can prompt.
+pub(crate) mod pty;
+
 use crate::truncate::{truncate_tail, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use parking_lot::Mutex;
 use std::collections::HashSet;

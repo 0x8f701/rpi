@@ -338,8 +338,8 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
 
       {!enabled && (
         <div className="subagents-panel__empty">
-          Orchestration is not enabled in this session (settings: orchestration.tasks).
-          Subagent spawn / hub features are unavailable until it is.
+          Orchestration not enabled. Run <code>/settings set --project orchestration.tasks true</code>{' '}
+          to enable subagents (spawn / hub features are unavailable until it is).
         </div>
       )}
 

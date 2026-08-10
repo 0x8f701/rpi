@@ -232,6 +232,25 @@ pub struct Cli {
     /// wildcard binds fail closed without this flag.
     #[arg(long, value_name = "URL", requires = "listen")]
     pub listen_advertised_origin: Option<String>,
+
+    /// Explicitly disable TLS on --listen and serve plaintext HTTP/WebSocket
+    /// instead. Without this flag the listener terminates HTTPS: with a real
+    /// certificate pair (--listen-cert/--listen-key) or with a self-signed
+    /// certificate auto-generated and cached under ~/.pi/agent/. Plaintext
+    /// exposes control traffic to network observers; use it only on a
+    /// trusted network, ideally with --listen-token-file.
+    #[arg(long, requires = "listen", conflicts_with_all = ["listen_cert", "listen_key"])]
+    pub listen_plaintext: bool,
+
+    /// TLS certificate file (PEM) for HTTPS. When paired with --listen-key,
+    /// the listener uses TLS. When both are absent, a self-signed cert is
+    /// auto-generated and cached under ~/.pi/agent/.
+    #[arg(long, value_name = "PATH", requires_all = ["listen", "listen_key"])]
+    pub listen_cert: Option<PathBuf>,
+
+    /// TLS private key file (PEM) for HTTPS. Must be paired with --listen-cert.
+    #[arg(long, value_name = "PATH", requires_all = ["listen", "listen_cert"])]
+    pub listen_key: Option<PathBuf>,
 }
 
 /// Headless application adapters.
@@ -1470,6 +1489,78 @@ mod tests {
             direct.validate().expect_err("validation must require listen"),
             "--listen-allow-insecure-remote requires --listen"
         );
+    }
+
+    #[test]
+    fn listen_tls_flags_enforce_pairing_and_plaintext_conflicts() {
+        // Default (no TLS flags): HTTPS with an auto-generated self-signed
+        // certificate.
+        let cli = Cli::try_parse_from(["rpi", "--listen", "127.0.0.1:0"])
+            .expect("parse listen loopback");
+        assert!(!cli.listen_plaintext);
+        assert!(cli.listen_cert.is_none());
+        assert!(cli.listen_key.is_none());
+        cli.validate().expect("default listener validates");
+
+        // --listen-plaintext is the explicit HTTP opt-out.
+        let plaintext = Cli::try_parse_from([
+            "rpi",
+            "--listen",
+            "127.0.0.1:0",
+            "--listen-plaintext",
+        ])
+        .expect("parse plaintext listener");
+        assert!(plaintext.listen_plaintext);
+        plaintext
+            .validate()
+            .expect("plaintext listener validates");
+
+        // A certificate pair is consumed as a unit.
+        let tls = Cli::try_parse_from([
+            "rpi",
+            "--listen",
+            "127.0.0.1:0",
+            "--listen-cert",
+            "cert.pem",
+            "--listen-key",
+            "key.pem",
+        ])
+        .expect("parse TLS listener");
+        assert_eq!(
+            tls.listen_cert.as_deref(),
+            Some(PathBuf::from("cert.pem").as_path())
+        );
+        assert_eq!(
+            tls.listen_key.as_deref(),
+            Some(PathBuf::from("key.pem").as_path())
+        );
+        assert!(!tls.listen_plaintext);
+        tls.validate().expect("TLS listener validates");
+
+        // A lone cert or key is rejected, as is combining the explicit
+        // plaintext opt-out with a certificate pair, and the certificate
+        // pair requires --listen (these flags only govern the listener).
+        for args in [
+            ["rpi", "--listen", "127.0.0.1:0", "--listen-cert", "cert.pem"].as_slice(),
+            ["rpi", "--listen", "127.0.0.1:0", "--listen-key", "key.pem"].as_slice(),
+            [
+                "rpi",
+                "--listen",
+                "127.0.0.1:0",
+                "--listen-plaintext",
+                "--listen-cert",
+                "cert.pem",
+                "--listen-key",
+                "key.pem",
+            ]
+            .as_slice(),
+            ["rpi", "--listen-cert", "cert.pem", "--listen-key", "key.pem"].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "accepted invalid TLS listen flag set: {args:?}"
+            );
+        }
     }
 
     #[test]

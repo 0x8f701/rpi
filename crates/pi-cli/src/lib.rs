@@ -354,6 +354,9 @@ async fn start_listen(
         token_file: cli.listen_token_file.clone(),
         allow_insecure_remote: cli.listen_allow_insecure_remote,
         advertised_origin: cli.listen_advertised_origin.clone(),
+        plaintext: cli.listen_plaintext,
+        tls_cert: cli.listen_cert.clone(),
+        tls_key: cli.listen_key.clone(),
         session_factory: Some(std::sync::Arc::new(spawner)),
     };
     let handle = modes::listen::start(application.clone(), extension_ui, config).await?;
@@ -363,30 +366,15 @@ async fn start_listen(
     // binds without `--listen-advertised-origin` have no reachable URL.
     let web_url = handle.base_url().map(|base| format!("{base}/web"));
     let web_line = web_url.as_deref().map_or_else(String::new, |url| format!(" Web UI: {url}"));
-    if cli.listen_allow_insecure_remote {
-        let mode = if cli.listen_token_file.is_some() {
-            "authentication enabled"
-        } else {
-            "tokenless, unauthenticated"
-        };
-        let token_warning = if cli.listen_token_file.is_some() {
-            " The bearer token travels in cleartext on every request."
-        } else {
-            ""
-        };
-        eprintln!(
-            "WARNING: insecure remote control plane enabled on http://{addr} ({mode}).{web_line} Plaintext HTTP/WebSocket exposes control traffic to passive network observers.{token_warning}"
-        );
+    let auth = if cli.listen_token_file.is_some() {
+        "authentication enabled"
     } else {
-        let auth = if cli.listen_token_file.is_some() {
-            "authentication enabled"
-        } else {
-            "tokenless"
-        };
-        eprintln!(
-            "Control plane listening on http://{addr} (loopback, {auth}).{web_line}"
-        );
-    }
+        "tokenless"
+    };
+    let scheme = if cli.listen_plaintext { "http" } else { "https" };
+    eprintln!(
+        "Control plane listening on {scheme}://{addr} ({auth}).{web_line}"
+    );
     Ok(Some(handle))
 }
 

@@ -3,7 +3,7 @@ members = ["crates/pi-ai", "crates/pi-agent", "crates/pi-coding", "crates/pi-cli
 resolver = "2"
 
 [workspace.package]
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -35,6 +35,10 @@ pi-agent = { path = "crates/pi-agent" }
 pi-coding = { path = "crates/pi-coding" }
 pi-sandbox = { path = "crates/pi-sandbox" }
 nix = { version = "0.29", default-features = false, features = ["signal", "process", "term", "resource", "poll"] }
+# Self-signed certificate generation for --listen HTTPS when no real
+# certificate pair is configured. Default features use the ring backend
+# (already in the tree via rustls).
+rcgen = "0.14"
 regex = "1.11"
 portable-pty = "0.9"
 # AES-256-GCM for passphrase-encrypted session shares (`/share --encrypt`).
@@ -43,6 +47,9 @@ portable-pty = "0.9"
 ring = "0.17"
 ratatui = { version = "0.29", default-features = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# PEM decoding for --listen-cert/--listen-key (user-provided real
+# certificates and the cached self-signed pair).
+rustls-pemfile = "2"
 semver = "1.0"
 sha2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
@@ -53,6 +60,9 @@ toml = "0.9"
 tempfile = "3"
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+# Async TLS termination for the --listen control plane (server side of the
+# rustls stack tokio-tungstenite already pulls in for WebSocket clients).
+tokio-rustls = "0.26"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

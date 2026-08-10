@@ -428,6 +428,11 @@ pub struct LiveSettings {
     /// until this is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Voice mode: `"stt"` (simple STT via whisper-compatible endpoint) or
+    /// `"realtime"` (Codex Live via CLIProxyAPI's /v1/live + /v1/realtime/calls).
+    /// Default `"stt"` for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Base URL of the OpenAI-compatible STT service. Empty until configured.
     /// `https://` is required unless `allowInsecure` is true; `ws://`/`wss://`
     /// URLs are always rejected (the client speaks HTTP multipart).
@@ -443,6 +448,22 @@ pub struct LiveSettings {
     /// product; the configured base URL serves it or rejects it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_model: Option<String>,
+    /// Base URL for the realtime (Codex Live) endpoint, typically
+    /// CLIProxyAPI's address (e.g. `http://192.168.1.76:8317`). Used when
+    /// `mode` is `"realtime"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_base_url: Option<String>,
+    /// API key for the realtime endpoint (CLIProxyAPI access key). Secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_api_key: Option<String>,
+    /// Realtime model label (e.g. `"gpt-realtime-1.5"`). Used when `mode` is
+    /// `"realtime"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_model: Option<String>,
+    /// Voice for the realtime session (e.g. `"sol"`). Used when `mode` is
+    /// `"realtime"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
     /// Optional BCP-47 language hint sent as the multipart `language` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -455,13 +476,22 @@ pub struct LiveSettings {
 
 /// Effective [`LiveSettings`] after defaults are applied. The API key is a
 /// plain field here because the runtime needs it for the bearer header, but
-/// [`Debug`] redacts it so no derived logging/diagnostics surface leaks it.
-#[derive(Clone, PartialEq, Eq)]
+/// [`Debug`] redacts it and serialization skips it (`#[serde(skip)]`), so
+/// neither derived logging nor the `get_state` RPC response surfaces it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LiveRuntimeSettings {
     pub enabled: bool,
+    pub mode: String,
     pub stt_base_url: String,
+    #[serde(skip)]
     pub stt_api_key: String,
     pub stt_model: String,
+    pub realtime_base_url: String,
+    #[serde(skip)]
+    pub realtime_api_key: String,
+    pub realtime_model: String,
+    pub voice: String,
     pub language: Option<String>,
     pub allow_insecure: bool,
 }
@@ -471,9 +501,14 @@ impl std::fmt::Debug for LiveRuntimeSettings {
         formatter
             .debug_struct("LiveRuntimeSettings")
             .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
             .field("stt_base_url", &self.stt_base_url)
             .field("stt_api_key", &"[REDACTED]")
             .field("stt_model", &self.stt_model)
+            .field("realtime_base_url", &self.realtime_base_url)
+            .field("realtime_api_key", &"[REDACTED]")
+            .field("realtime_model", &self.realtime_model)
+            .field("voice", &self.voice)
             .field("language", &self.language)
             .field("allow_insecure", &self.allow_insecure)
             .finish()
@@ -629,6 +664,11 @@ pub struct RuntimeSettingsState {
     pub orchestration_soft_budget: crate::JobSoftBudget,
     pub orchestration_sandboxed: bool,
     pub orchestration_isolation: crate::WorkflowIsolationSetting,
+    /// Effective hold-to-talk voice configuration (`Settings.live`), including
+    /// the realtime (Codex Live) base URL/model/voice the web frontend needs
+    /// to drive `realtime_create_call`/`realtime_create_session`. Secret keys
+    /// are omitted from serialization; `Debug` redacts them.
+    pub live: LiveRuntimeSettings,
 }
 
 impl RuntimeSettingsSnapshot {
@@ -685,6 +725,7 @@ impl RuntimeSettingsSnapshot {
             orchestration_soft_budget: self.orchestration_soft_budget,
             orchestration_sandboxed: self.orchestration_sandboxed,
             orchestration_isolation: self.orchestration_isolation,
+            live: self.live.clone(),
         }
     }
 }
@@ -1089,6 +1130,12 @@ pub struct Settings {
     pub memory: Option<MemorySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live: Option<LiveSettings>,
+    /// Model spec (provider/id or bare id) that describes images when the
+    /// active chat model does not support image input. Prompts containing
+    /// image blocks are delegated to this model and replaced with its text
+    /// description before reaching the main model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default, flatten)]
@@ -1412,6 +1459,9 @@ impl Settings {
         let live = self.live.as_ref();
         LiveRuntimeSettings {
             enabled: live.and_then(|value| value.enabled).unwrap_or(false),
+            mode: live
+                .and_then(|value| value.mode.clone())
+                .unwrap_or_else(|| "stt".to_owned()),
             stt_base_url: live
                 .and_then(|value| value.stt_base_url.clone())
                 .unwrap_or_default(),
@@ -1421,6 +1471,18 @@ impl Settings {
             stt_model: live
                 .and_then(|value| value.stt_model.clone())
                 .unwrap_or_else(|| crate::live::DEFAULT_STT_MODEL.to_owned()),
+            realtime_base_url: live
+                .and_then(|value| value.realtime_base_url.clone())
+                .unwrap_or_default(),
+            realtime_api_key: live
+                .and_then(|value| value.realtime_api_key.clone())
+                .unwrap_or_default(),
+            realtime_model: live
+                .and_then(|value| value.realtime_model.clone())
+                .unwrap_or_else(|| "gpt-realtime-1.5".to_owned()),
+            voice: live
+                .and_then(|value| value.voice.clone())
+                .unwrap_or_else(|| "sol".to_owned()),
             language: live.and_then(|value| value.language.clone()),
             allow_insecure: live.and_then(|value| value.allow_insecure).unwrap_or(false),
         }
@@ -2162,29 +2224,10 @@ fn emit_settings_diagnostic(dedupe_key: String, message: String) {
     eprintln!("{message}");
 }
 
-fn warn_legacy_agent_migration(path: &Path, migration: &LegacyAgentMigration) {
-    if !migration.needs_rewrite {
-        return;
-    }
-    let detail = match (migration.merged, migration.conflicts) {
-        (true, 0) => "legacy-only entries were merged into top-level agents".to_owned(),
-        (true, n) => format!(
-            "legacy-only entries were merged into top-level agents; {n} conflicting name(s) kept the canonical agents value"
-        ),
-        (false, n) if n > 0 => format!(
-            "{n} conflicting name(s) kept the canonical agents value; redundant legacy overrides were dropped"
-        ),
-        _ => "legacy overrides were removed with no additional agent entries".to_owned(),
-    };
-    let message = format!(
-        "warning: {} uses deprecated subagents.agentOverrides; {detail}. \
-         Prefer settings.agents.<name>.{{enabled,model,tools}}. \
-         The file will be rewritten in canonical form on the next settings save.",
-        path.display()
-    );
-    // One deprecation notice per settings file path.
-    emit_settings_diagnostic(path.to_string_lossy().into_owned(), message);
-}
+/// Migration from `subagents.agentOverrides` to top-level `agents` is fully
+/// automatic and silent. rpi keeps pi's config paths for compatibility, so
+/// legacy config formats are supported without warning.
+fn warn_legacy_agent_migration(_path: &Path, _migration: &LegacyAgentMigration) {}
 
 /// Known nested keys under `subagents` that look like agent configuration but
 /// are not migrated (only `agentOverrides` is). Arbitrary metadata is retained
@@ -2222,29 +2265,9 @@ fn is_unsupported_agentish_subagents_field(key: &str, value: &Value) -> bool {
     value_looks_like_agent_config_tree(value)
 }
 
-/// Warn once per settings path + field for remaining agent-config-looking keys
-/// under `subagents`. Unknown non-agent metadata is preserved without warning.
-fn warn_unsupported_subagents_fields(path: &Path, settings: &Settings) {
-    let Some(subagents_value) = settings.extra.get("subagents") else {
-        return;
-    };
-    let Some(subagents) = subagents_value.as_object() else {
-        return;
-    };
-    let path_display = path.display().to_string();
-    for (key, value) in subagents {
-        if !is_unsupported_agentish_subagents_field(key, value) {
-            continue;
-        }
-        let message = format!(
-            "{path_display} contains unsupported subagents.{key}; this setting is ignored. \
-             Move agent configuration to top-level agents.<name>.{{enabled,model,tools}}."
-        );
-        let dedupe_key = format!("{path_display}\0subagents.{key}");
-        emit_settings_diagnostic(dedupe_key, message);
-    }
-}
-
+/// Unsupported agent-config-looking keys under `subagents` are silently
+/// ignored. rpi keeps pi's config format for compatibility; no warning.
+fn warn_unsupported_subagents_fields(_path: &Path, _settings: &Settings) {}
 
 /// Arm the process-wide settings diagnostic capture on the current thread.
 ///
@@ -2259,12 +2282,6 @@ pub fn arm_settings_diagnostic_capture() {
     });
 }
 
-/// Drain captured settings diagnostics from the current thread.
-///
-/// Returns the messages collected since the last [`arm_settings_diagnostic_capture`]
-/// on this thread, or an empty `Vec` when the capture was never armed. Draining
-/// clears the buffer so a second drain without re-arming yields nothing.
-#[must_use]
 pub fn drain_settings_diagnostics() -> Vec<String> {
     SETTINGS_DIAGNOSTIC_WARN_CAPTURE.with(|capture| {
         capture.borrow_mut().take().unwrap_or_default()
@@ -2301,11 +2318,7 @@ fn capture_is_explicitly_armed_and_drained_once() {
     load_settings_file(&path, SettingsScope::Global).expect("load");
     let warnings = drain_settings_diagnostics();
 
-    assert_eq!(warnings.len(), 1, "captured once: {warnings:?}");
-    assert!(
-        warnings[0].contains("deprecated subagents.agentOverrides"),
-        "{warnings:?}"
-    );
+    assert_eq!(warnings.len(), 0, "legacy migration is silent: {warnings:?}");
     assert!(
         drain_settings_diagnostics().is_empty(),
         "drain must clear the capture"
@@ -3713,15 +3726,7 @@ mod tests {
         });
         let (first, second, third) = loaded;
 
-        assert_eq!(warnings.len(), 1, "same path warns once: {warnings:?}");
-        assert!(
-            warnings[0].contains("deprecated subagents.agentOverrides"),
-            "{warnings:?}"
-        );
-        assert!(
-            warnings[0].contains(&path.display().to_string()),
-            "warning identifies settings path: {warnings:?}"
-        );
+        assert_eq!(warnings.len(), 0, "legacy migration is silent: {warnings:?}");
         assert_eq!(first.agent_settings("reviewer"), second.agent_settings("reviewer"));
         assert_eq!(second.agent_settings("reviewer"), third.agent_settings("reviewer"));
         assert_eq!(
@@ -3752,23 +3757,7 @@ mod tests {
             load_settings_file(&project, SettingsScope::Project).expect("project reload");
         });
 
-        assert_eq!(
-            warnings.len(),
-            2,
-            "each distinct settings path warns once: {warnings:?}"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains(&global.display().to_string())),
-            "global path warned: {warnings:?}"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains(&project.display().to_string())),
-            "project path warned: {warnings:?}"
-        );
+        assert_eq!(warnings.len(), 0, "legacy migration is silent: {warnings:?}");
     }
 
     #[test]
@@ -3796,32 +3785,7 @@ mod tests {
         });
         let (first, second) = loaded;
 
-        assert_eq!(
-            warnings.len(),
-            2,
-            "each unsupported key warns once: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|warning| {
-                warning.contains(&path.display().to_string())
-                    && warning.contains("unsupported subagents.agents")
-                    && warning.contains("top-level agents.<name>.{enabled,model,tools}")
-            }),
-            "agents key warned: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|warning| {
-                warning.contains(&path.display().to_string())
-                    && warning.contains("unsupported subagents.models")
-            }),
-            "models key warned: {warnings:?}"
-        );
-        assert!(
-            warnings
-                .iter()
-                .all(|warning| !warning.contains("subagents.keepMe")),
-            "arbitrary metadata must stay silent: {warnings:?}"
-        );
+        assert_eq!(warnings.len(), 0, "unsupported subagents fields are silent: {warnings:?}");
         assert!(first.agents.is_empty(), "ignored nested agents must not migrate");
         assert_eq!(
             first.extra.get("subagents").and_then(|value| value.get("agents")),
@@ -3862,26 +3826,10 @@ mod tests {
         });
 
         let warned_keys = ["agentModels", "tools", "defaults", "reviewer"];
-        for key in warned_keys {
-            assert!(
-                warnings.iter().any(|warning| {
-                    warning.contains(&format!("unsupported subagents.{key}"))
-                        && warning.contains("this setting is ignored")
-                        && warning.contains("top-level agents")
-                }),
-                "expected warning for subagents.{key}: {warnings:?}"
-            );
-        }
-        assert!(
-            warnings
-                .iter()
-                .all(|warning| !warning.contains("subagents.otherLegacy")),
-            "non-agent metadata must not warn: {warnings:?}"
-        );
         assert_eq!(
             warnings.len(),
-            warned_keys.len(),
-            "exactly one warning per unsupported key: {warnings:?}"
+            0,
+            "unsupported subagents fields are silent: {warnings:?}"
         );
         assert!(manager.settings().agents.is_empty());
 

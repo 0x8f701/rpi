@@ -29,8 +29,22 @@ import {
 
 const RPI_AUTH_PREFIX = 'rpi-auth.';
 const TOKEN_STORAGE_KEY = 'rpi-web-token';
+const RECENT_HOSTS_STORAGE_KEY = 'rpi-web-recent-hosts';
+const RECENT_HOSTS_MAX = 10;
+const RECONNECT_INITIAL_DELAY = 1000;
 const RECONNECT_MAX_DELAY = 15000;
 const COMMAND_TIMEOUT_MS = 30000;
+// Heartbeat: a `{type:"ping"}` JSON frame every 30s keeps the connection
+// honest. The backend replies to every text frame (unknown types get an error
+// `response` frame, which the RPC plumbing ignores for lack of a pending id),
+// so a probe reliably produces an inbound message. If no message of ANY kind
+// arrives for 60s the socket is presumed dead — silent drops never fire
+// onclose — and is proactively closed so the existing reconnect path takes
+// over. The reconnect backoff resets only after the connection has stayed up
+// for >5s, so flapping connections keep backing off.
+const HEARTBEAT_PING_INTERVAL_MS = 30000;
+const HEARTBEAT_TIMEOUT_MS = 60000;
+const HEARTBEAT_STABILITY_MS = 5000;
 
 type ConnState = 'off' | 'connecting' | 'on' | 'reconnecting';
 
@@ -196,6 +210,58 @@ export function ToolCard({ item }: { item: Extract<Item, { kind: 'toolCard' }> }
   );
 }
 
+/** Bash / tool-output card: command in a header bar (green `$` prompt + copy
+ *  button), output in a scrollable mono body — the web mirror of the TUI tool
+ *  card (crates/pi-cli/src/tool_card_adapter.rs). Shared by the session
+ *  transcript and the collab guest view. `command` omitted renders a bare
+ *  output card (unmatched toolResult) with a muted label. */
+export function BashCard({ command, label, output, status }: { command?: string; label?: string; output: string; status?: string }) {
+  const [copied, setCopied] = useState(false);
+  const copyOutput = () => {
+    const flash = () => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    };
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(output).then(flash, flash);
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = output;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      try {
+        document.execCommand('copy');
+      } catch {
+        /* clipboard unavailable — nothing else to do */
+      }
+      document.body.removeChild(textarea);
+      flash();
+    }
+  };
+  const head = command !== undefined ? (
+    <span className="bash-cmd">
+      <span className="bash-prompt">$</span>
+      {command}
+    </span>
+  ) : (
+    <span className="bash-cmd bash-cmd--label">{label ?? 'output'}</span>
+  );
+  return (
+    <div className="msg msg--bash">
+      <div className="bash-head">
+        {head}
+        {status && <span className={`tool-card__state tool-card__state--${status}`}>{status === 'running' ? 'running…' : status}</span>}
+        <button type="button" className="bash-copy" onClick={copyOutput}>
+          {copied ? 'copied' : 'copy'}
+        </button>
+      </div>
+      <pre className="bash-output">{output}</pre>
+    </div>
+  );
+}
+
 export function ToastList({ toasts, dismiss }: { toasts: Array<{ id: string; message: string; error: boolean }>; dismiss: (id: string) => void }) {
   return (
     <div id="toasts">
@@ -206,6 +272,131 @@ export function ToastList({ toasts, dismiss }: { toasts: Array<{ id: string; mes
       ))}
     </div>
   );
+}
+
+/* ------------------------------------------------------------------ *
+ * Composer attachments + voice (file upload / hold-to-talk)
+ * ------------------------------------------------------------------ */
+
+/** A file attached in the composer. Images ride the prompt command's `images`
+ *  ContentBlock array; PDFs become a text note prepended to the message.
+ *  `dataBase64` is the raw base64 WITHOUT the `data:...;base64,` prefix. */
+interface ComposerAttachment {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  kind: 'image' | 'pdf';
+  dataBase64: string;
+  /** Full data URL for the thumbnail chip (images only). */
+  previewUrl?: string;
+}
+
+/** Image ContentBlock wire shape — mirrors pi_ai::ContentBlock::Image, which
+ *  is internally tagged with camelCase keys: `{"type":"image","data":…,
+ *  "mimeType":…}` (the `source`-nested Anthropic shape is NOT what the RPC
+ *  parses). */
+interface ImageContentBlock {
+  type: 'image';
+  data: string;
+  mimeType: string;
+}
+
+/** Live/STT settings, read defensively from get_state (`runtimeSettings.live`)
+ *  when the backend exposes them. `mode` switches the mic between the
+ *  hold-to-talk STT flow and the Codex Live realtime (WebRTC) flow; the
+ *  secret keys (sttApiKey/realtimeApiKey) are redacted server-side, so the
+ *  STT path probes `settings_inspect` at record time when base URL is
+ *  missing. */
+interface LiveSettingsWire {
+  enabled?: boolean;
+  mode?: string;
+  sttBaseUrl?: string;
+  sttApiKey?: string;
+  sttModel?: string;
+  realtimeBaseUrl?: string;
+  realtimeApiKey?: string;
+  realtimeModel?: string;
+  voice?: string;
+}
+
+/** ASCII header chunks for the WAV RIFF container. */
+const ASCII_ENC = new TextEncoder();
+
+/** 16-bit PCM mono WAV from a decoded AudioBuffer (the same container the
+ *  backend's SttClient sends to /v1/audio/transcriptions). */
+function encodeWavPcm16(buffer: AudioBuffer): ArrayBuffer {
+  const numChannels = 1;
+  const sampleRate = Math.max(1, Math.round(buffer.sampleRate));
+  const channel = buffer.getChannelData(0);
+  const bytesPerSample = 2;
+  const blockAlign = numChannels * bytesPerSample;
+  const dataSize = channel.length * blockAlign;
+  const out = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(out);
+  const bytes = new Uint8Array(out);
+  bytes.set(ASCII_ENC.encode('RIFF'), 0);
+  view.setUint32(4, 36 + dataSize, true);
+  bytes.set(ASCII_ENC.encode('WAVE'), 8);
+  bytes.set(ASCII_ENC.encode('fmt '), 12);
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  bytes.set(ASCII_ENC.encode('data'), 36);
+  view.setUint32(40, dataSize, true);
+  let offset = 44;
+  for (let i = 0; i < channel.length; i++) {
+    const s = Math.max(-1, Math.min(1, channel[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return out;
+}
+
+/** Convert a MediaRecorder blob to WAV; returns null when the container is
+ *  undecodable so the caller falls back to the raw recording. */
+async function blobToWav(blob: Blob): Promise<Blob | null> {
+  try {
+    // webkitAudioContext: Safari's prefixed constructor (same shape).
+    const webkitWindow = window as unknown as { webkitAudioContext?: typeof AudioContext };
+    const AudioCtor = window.AudioContext ?? webkitWindow.webkitAudioContext;
+    if (!AudioCtor) return null;
+    const ctx = new AudioCtor();
+    try {
+      const audioBuffer = await ctx.decodeAudioData(await blob.arrayBuffer());
+      return new Blob([encodeWavPcm16(audioBuffer)], { type: 'audio/wav' });
+    } finally {
+      void ctx.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** First non-empty string among `values` (empty strings and non-strings are
+ *  skipped) — used to read defensive field variants off realtime sideband
+ *  events without guessing the exact key the backend chose. */
+function firstString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+/** Sideband WebSocket URL for a realtime call: CLIProxyAPI serves
+ *  `/v1/realtime?call_id=...` under the configured base. An http(s) base is
+ *  converted to ws(s), a scheme-less host is assumed http, and a trailing
+ *  `/v1` is de-duplicated (Hyper parity, mirroring `transcriptions_url`). */
+function sidebandRealtimeWsUrl(baseUrl: string, callId: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, '');
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  const origin = withScheme.replace(/^https?:\/\//i, '').replace(/\/v1$/i, '');
+  const scheme = /^https:/i.test(withScheme) ? 'wss' : 'ws';
+  return `${scheme}://${origin}/v1/realtime?call_id=${encodeURIComponent(callId)}`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -234,6 +425,25 @@ export function App() {
   const [models, setModels] = useState<Array<{ id: string; name: string; provider: string }>>([]);
   const [levels, setLevels] = useState<string[]>([]);
   const [token, setToken] = useState('');
+  // Host shown in the header input (controlled): defaults to the host that
+  // served the page; commitHost() keeps it in sync with hostRef.
+  const [hostInput, setHostInput] = useState(() => (typeof window !== 'undefined' ? window.location.host : ''));
+  // Recently connected hosts (most recent first, capped) — the header input's
+  // datalist suggestions. Persisted under `rpi-web-recent-hosts`.
+  const [recentHosts, setRecentHosts] = useState<string[]>(() => {
+    try {
+      const raw = window.localStorage.getItem(RECENT_HOSTS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed.filter((h) => typeof h === 'string' && h !== '').slice(0, RECENT_HOSTS_MAX);
+        }
+      }
+    } catch {
+      /* private mode or corrupt storage */
+    }
+    return [];
+  });
   const [toasts, setToasts] = useState<Array<{ id: string; message: string; error: boolean }>>([]);
   // D89: Todo DAG panel. `activePanel` is the single shared panel-name state;
   // each web panel registers its own name + a mount-point render line below.
@@ -274,11 +484,39 @@ export function App() {
   const activeGoalJournal = sessionId ? (goalJournalBySessionId[sessionId] ?? []) : [];
   const activeSideChat = sessionId ? (sideChatBySessionId[sessionId] ?? null) : null;
 
+  // Composer file attachments (images -> ContentBlocks, PDFs -> text note).
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  // Hold-to-talk voice: recording flag drives the pulsing mic indicator;
+  // transcribing blocks a second capture while the STT round-trip runs.
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  // Live/STT settings surfaced by get_state (`runtimeSettings.live`) when the
+  // backend exposes them; null means "not advertised" (mic still shown).
+  const [liveSettings, setLiveSettings] = useState<LiveSettingsWire | null>(null);
+
   const wsRef = useRef<WebSocket | null>(null);
+  // The target rpi instance (host:port). Defaults to the host that served the
+  // page; commitHost() updates it (and the header input) on change. The
+  // token comes from the Settings panel (rpi-web-token in localStorage).
+  // Both are refs so connect() reads them synchronously (React state lags one
+  // render).
+  const hostRef = useRef(typeof window !== 'undefined' ? window.location.host : '');
+  const tokenRef = useRef(token);
   const pendingRef = useRef(new Map<string, Pending>());
   const seqRef = useRef(0);
-  const delayRef = useRef(1000);
+  const delayRef = useRef(RECONNECT_INITIAL_DELAY);
   const retryTimerRef = useRef<number | null>(null);
+  // Heartbeat bookkeeping: lastMessageAtRef is touched on EVERY inbound frame
+  // (event, response, or the ping probe's error-response); the silence timer
+  // fires exactly HEARTBEAT_TIMEOUT_MS after the last message and closes the
+  // socket when nothing has arrived. pingTimerRef drives the 30s probe. All
+  // three live only while a socket is open (armed in onOpen, cleared on
+  // close/replace/unload), plus the stability timer that resets the backoff
+  // once a fresh connection has stayed alive >5s.
+  const lastMessageAtRef = useRef(0);
+  const pingTimerRef = useRef<number | null>(null);
+  const silenceTimerRef = useRef<number | null>(null);
+  const stabilityTimerRef = useRef<number | null>(null);
   // Per-session streaming assistant id + optimistic bubble queue: switching
   // sessions swaps the bucket, so each session's in-flight state is isolated.
   const activeAssistantBySessionIdRef = useRef<Record<string, string>>({});
@@ -290,6 +528,30 @@ export function App() {
   const transcriptRef = useRef<HTMLDivElement>(null);
   const nearBottomRef = useRef(true);
   const promptInputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<number | null>(null);
+  // Codex Live realtime voice (WebRTC): active while the call is up; the
+  // sideband WS delivers transcript/delegation events for the overlay. The
+  // transcript text is accumulated in a ref and written straight into the
+  // overlay node (no React re-render per delta — same hot-path decision as
+  // the streaming transcript); realtimeDelegation is a rare state change.
+  const [realtimeActive, setRealtimeActive] = useState(false);
+  const [realtimeDelegation, setRealtimeDelegation] = useState<string | null>(null);
+  const realtimePcRef = useRef<RTCPeerConnection | null>(null);
+  const realtimeWsRef = useRef<WebSocket | null>(null);
+  // Synchronous start-guard: getUserMedia/offer/answer is async, so a quick
+  // double-click could race two call setups before realtimeActive re-renders.
+  const realtimeBusyRef = useRef(false);
+  const realtimeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const realtimeTranscriptRef = useRef('');
+  const realtimeTranscriptNodeRef = useRef<HTMLDivElement | null>(null);
+  // Suppresses RPC error toasts during the reconnection bootstrap sequence
+  // (get_state rebind) so a phone waking from sleep doesn't spam "command
+  // get_state failed" before the rebind-to-primary lands.
+  const bootRef = useRef(false);
   // D93: orchestration event handlers registered by the Subagents panel
   // (job_updated / agent_updated / message_delivered). A Set keeps the panel
   // subscription additive alongside other live panels.
@@ -404,7 +666,7 @@ export function App() {
       pending.resolve(frame.data || {});
     } else {
       if (pending.bubbleId) removeItem(pending.bubbleId);
-      toast(`command ${frame.command} failed: ${frame.error || 'unknown error'}`, true);
+      if (!bootRef.current) toast(`command ${frame.command} failed: ${frame.error || 'unknown error'}`, true);
       const error = new Error(frame.error || 'rpc failed');
       (error as Error & { rpc?: boolean }).rpc = true;
       pending.reject(error);
@@ -546,6 +808,7 @@ export function App() {
       sessionId?: string | null;
       todoPhases?: TodoPhaseWire[];
       goal?: GoalStateWire;
+      runtimeSettings?: { live?: LiveSettingsWire };
     };
     const target =
       targetSid && targetSid !== ''
@@ -571,6 +834,12 @@ export function App() {
     }
     if (d.goal && typeof d.goal === 'object') {
       setGoalStateBySessionId((prev) => ({ ...prev, [target]: d.goal as GoalStateWire }));
+    }
+    // Live/STT settings are global (not per-session); advertise them to the
+    // composer's mic when the backend includes them in get_state.
+    const live = d.runtimeSettings && typeof d.runtimeSettings === 'object' ? d.runtimeSettings.live : undefined;
+    if (live && typeof live === 'object') {
+      setLiveSettings(live);
     }
     // Session cutover (previous non-empty id -> DIFFERENT non-empty id): the
     // active view switches to the new session's cache. Same-id refreshes
@@ -726,6 +995,44 @@ export function App() {
     [removeSessionState, sendCommand, toast]
   );
 
+  /** Full app reset for a host switch: reject in-flight commands, drop every
+   *  session's cached items/streaming/unread/shell state, close panels, and
+   *  clear the module streaming registries so the app renders as freshly
+   *  loaded against the new host. */
+  const resetAllState = useCallback(() => {
+    // Reject in-flight commands as transport errors (rpc=true so the generic
+    // catch handlers stay quiet) — their responses must never repaint the
+    // new host's session state.
+    for (const [, pending] of pendingRef.current) {
+      window.clearTimeout(pending.timer);
+      const error = new Error('host switched');
+      (error as Error & { rpc?: boolean }).rpc = true;
+      pending.reject(error);
+    }
+    pendingRef.current.clear();
+    streamBuf.clear();
+    liveNodes.clear();
+    optimisticQueueBySessionIdRef.current = {};
+    activeAssistantBySessionIdRef.current = {};
+    abortPendingBySessionIdRef.current = {};
+    sessionIdRef.current = null;
+    setSessionId(null);
+    setItemsBySessionId({});
+    setStreamingBySessionId({});
+    setUnreadBySessionId({});
+    setSessionNameBySessionId({});
+    setModelKeyBySessionId({});
+    setThinkingLevelBySessionId({});
+    setTodoPhasesBySessionId({});
+    setGoalStateBySessionId({});
+    setGoalJournalBySessionId({});
+    setSideChatBySessionId({});
+    setModels([]);
+    setLevels([]);
+    setToasts([]);
+    setActivePanel('');
+  }, []);
+
   /* ---------------- connection ---------------- */
 
   const scheduleReconnect = useCallback(() => {
@@ -739,8 +1046,63 @@ export function App() {
     }, delay);
   }, []);
 
+  /** Restart the silence window from the last received message. */
+  const rescheduleSilenceTimer = useCallback(() => {
+    if (silenceTimerRef.current !== null) window.clearTimeout(silenceTimerRef.current);
+    const remaining = Math.max(HEARTBEAT_TIMEOUT_MS - (Date.now() - lastMessageAtRef.current), 1);
+    silenceTimerRef.current = window.setTimeout(() => {
+      silenceTimerRef.current = null;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastMessageAtRef.current >= HEARTBEAT_TIMEOUT_MS) {
+        // No message of any kind for the whole window: the socket is silently
+        // dead (no onclose fires). Close it so the existing onclose path
+        // schedules the reconnect with the current backoff.
+        ws.close(4000, 'heartbeat timeout');
+        return;
+      }
+      // A message arrived after this timer was scheduled; slide the window.
+      rescheduleSilenceTimer();
+    }, remaining);
+  }, []);
+
+  /** Stop every heartbeat/stability timer (socket closed or being replaced). */
+  const clearHeartbeatTimers = useCallback(() => {
+    if (pingTimerRef.current !== null) window.clearInterval(pingTimerRef.current);
+    pingTimerRef.current = null;
+    if (silenceTimerRef.current !== null) window.clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = null;
+    if (stabilityTimerRef.current !== null) window.clearTimeout(stabilityTimerRef.current);
+    stabilityTimerRef.current = null;
+  }, []);
+
   const onOpen = useCallback(() => {
-    delayRef.current = 1000;
+    // Heartbeat: arm the 30s ping probe and the 60s silence window from the
+    // open moment; every inbound frame slides the window (see connect).
+    bootRef.current = true;
+    lastMessageAtRef.current = Date.now();
+    rescheduleSilenceTimer();
+    if (pingTimerRef.current === null) {
+      pingTimerRef.current = window.setInterval(() => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.send(JSON.stringify({ type: 'ping' }));
+        } catch {
+          /* socket died between the check and the send; onclose handles it */
+        }
+      }, HEARTBEAT_PING_INTERVAL_MS);
+    }
+    // The reconnect backoff resets ONLY after the connection has proven
+    // stable for >5s; a connection that dies inside the window keeps its
+    // accumulated delay so flapping connections keep backing off.
+    stabilityTimerRef.current = window.setTimeout(() => {
+      stabilityTimerRef.current = null;
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        delayRef.current = RECONNECT_INITIAL_DELAY;
+      }
+    }, HEARTBEAT_STABILITY_MS);
     // Bootstrap the authoritative active session BEFORE exposing the
     // connected UI. The first get_state probes with the current (possibly
     // stale) active session id; on a server restart the stale id is rejected
@@ -817,6 +1179,7 @@ export function App() {
       })
       .then(() => {
         setConnState('on');
+        bootRef.current = false;
         // Goal snapshot + journal for the now-bound session (the sid is
         // derived from the state response, so the refresh targets the right
         // runtime even on the very first connect).
@@ -835,15 +1198,19 @@ export function App() {
           .catch(() => {});
       })
       .catch(() => {
+        bootRef.current = false;
         scheduleReconnect();
       });
-  }, [applyState, refreshGoal, scheduleReconnect, sendCommand]);
+  }, [applyState, refreshGoal, rescheduleSilenceTimer, scheduleReconnect, sendCommand]);
 
   const connect = useCallback(() => {
     if (retryTimerRef.current !== null) {
       window.clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
     }
+    // Any timers still running belong to the previous socket (its onclose was
+    // detached below); stop them so they can neither ping nor kill the new one.
+    clearHeartbeatTimers();
     const old = wsRef.current;
     wsRef.current = null;
     if (old) {
@@ -854,21 +1221,17 @@ export function App() {
         /* already closed */
       }
     }
-    let tokenValue = '';
-    const tokenInput = document.getElementById('token-input') as HTMLInputElement | null;
-    if (tokenInput) tokenValue = tokenInput.value.trim();
-    setToken(tokenValue);
-    try {
-      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, tokenValue);
-    } catch {
-      /* private mode: token lives in the field only */
-    }
+    // The host comes from the header input (hostRef) and the token from the
+    // Settings panel (tokenRef) — both kept in sync with React state so this
+    // callback never re-creates across renders.
+    const tokenValue = tokenRef.current;
+    const hostValue = hostRef.current;
     setConnState('connecting');
     const protocols = tokenValue ? [`${RPI_AUTH_PREFIX}${tokenValue}`] : [];
     let ws: WebSocket;
     try {
       const scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
-      ws = new WebSocket(`${scheme}${location.host}/ws`, protocols);
+      ws = new WebSocket(`${scheme}${hostValue}/ws`, protocols);
     } catch (err) {
       setConnState('off');
       toast(`cannot open WebSocket: ${(err as Error).message} — token must be a single token without spaces`, true);
@@ -877,10 +1240,16 @@ export function App() {
     }
     wsRef.current = ws;
     ws.onopen = onOpen;
-    ws.onmessage = (event) => onMessage(event.data as string);
+    ws.onmessage = (event) => {
+      // Any inbound frame is proof of life: slide the silence window.
+      lastMessageAtRef.current = Date.now();
+      rescheduleSilenceTimer();
+      onMessage(event.data as string);
+    };
     ws.onclose = (event) => {
       if (event.target !== wsRef.current) return; // superseded by a newer socket
       wsRef.current = null;
+      clearHeartbeatTimers();
       setConnState('off');
       if (event.code === 1006) {
         // The boot auto-connect with no token is an expected probe on a fresh
@@ -889,7 +1258,7 @@ export function App() {
         // listener it is the expected "no token yet" refusal — stay quiet and
         // let the empty-hint explain the optional-token policy.
         if (!(bootProbeRef.current && !tokenValue)) {
-          toast('connection failed (wrong or missing token?). Enter the token and press Connect.', true);
+          toast('connection failed (wrong or missing token?). Set the token in the Settings panel.', true);
         }
       } else if (event.code !== 1000) {
         toast(`connection closed (code ${event.code})${event.reason ? `: ${event.reason}` : ''}`, true);
@@ -899,7 +1268,46 @@ export function App() {
     ws.onerror = () => {
       /* the close event carries the failure */
     };
-  }, [onOpen, scheduleReconnect, toast]);
+  }, [clearHeartbeatTimers, onOpen, rescheduleSilenceTimer, scheduleReconnect, toast]);
+
+  /** Commit a host typed in the header: persist to recent hosts (max 10,
+   *  most recent first) and, on a real change, fully reset the app and
+   *  reconnect to the new host. */
+  const commitHost = useCallback((raw: string) => {
+    const next = raw.trim();
+    if (!next) return;
+    setRecentHosts((prev) => {
+      const list = [next, ...prev.filter((h) => h !== next)].slice(0, RECENT_HOSTS_MAX);
+      try {
+        window.localStorage.setItem(RECENT_HOSTS_STORAGE_KEY, JSON.stringify(list));
+      } catch {
+        /* private mode: recents live in state only */
+      }
+      return list;
+    });
+    if (next === hostRef.current) return;
+    bootProbeRef.current = false;
+    resetAllState();
+    hostRef.current = next;
+    setHostInput(next);
+    connect();
+  }, [connect, resetAllState]);
+
+  /** Settings-panel token commit: persist under `rpi-web-token` and reconnect
+   *  so the new token takes effect (rpi-auth.<token> subprotocol). */
+  const handleTokenChange = useCallback((nextToken: string) => {
+    const trimmed = nextToken.trim();
+    if (trimmed === tokenRef.current) return; // same token: nothing to reconnect
+    bootProbeRef.current = false;
+    tokenRef.current = trimmed;
+    setToken(trimmed);
+    try {
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, trimmed);
+    } catch {
+      /* private mode: token lives in state only */
+    }
+    connect();
+  }, [connect]);
 
   /* ---------------- event dispatch ---------------- */
   //
@@ -934,7 +1342,22 @@ export function App() {
       return;
     }
     if (role === 'toolResult') {
-      pushItemFor(sid, { kind: 'toolResult', id: nextId('r'), text: boundOutput(contentText(message.content), TOOL_OUTPUT_LINE_LIMIT).text });
+      // The toolCard (tool_execution_start/end) already renders this result
+      // inline — tool_execution_end carries the same AgentToolResult the
+      // toolResult message does, bounded identically. Suppress the separate
+      // toolResult card when a matching card exists so the transcript never
+      // shows the same tool output twice (restored transcripts merge the
+      // same way in messagesToItems); unmatched results stay readable.
+      const text = boundOutput(contentText(message.content), TOOL_OUTPUT_LINE_LIMIT).text;
+      if (message && typeof message === 'object' && 'toolCallId' in message && typeof message.toolCallId === 'string' && message.toolCallId !== '') {
+        updateItemsFor(sid, (prev) =>
+          prev.some((i) => i.kind === 'toolCard' && i.toolCallId === message.toolCallId)
+            ? prev
+            : [...prev, { kind: 'toolResult', id: nextId('r'), text }]
+        );
+      } else {
+        pushItemFor(sid, { kind: 'toolResult', id: nextId('r'), text });
+      }
       return;
     }
     if (role === 'bashExecution') {
@@ -960,7 +1383,7 @@ export function App() {
       );
       if (item) pushItemFor(sid, item);
     }
-  }, [frameSession, patchItemFor, pushItemFor]);
+  }, [frameSession, patchItemFor, pushItemFor, updateItemsFor]);
 
   const onMessageUpdate = useCallback((frame: EventFrame) => {
     const ev = (frame.assistantMessageEvent || {}) as { type?: string; delta?: string; content?: string };
@@ -1251,28 +1674,478 @@ export function App() {
     const input = promptInputRef.current;
     if (!input) return;
     const text = input.value.trim();
-    if (!text) return;
+    // Attached images become ContentBlocks; PDFs become a text note prepended
+    // to the message so the model still sees the attachment context.
+    const images: ImageContentBlock[] = [];
+    const pdfNotes: string[] = [];
+    for (const attachment of attachments) {
+      if (attachment.kind === 'image') {
+        images.push({ type: 'image', data: attachment.dataBase64, mimeType: attachment.mimeType });
+      } else {
+        pdfNotes.push(`[Attached PDF: ${attachment.name}, ${attachment.size} bytes]`);
+      }
+    }
+    if (!text && images.length === 0 && pdfNotes.length === 0) return;
+    const message = pdfNotes.length === 0 ? text : text ? `${pdfNotes.join('\n')}\n\n${text}` : pdfNotes.join('\n');
     const bubbleId = nextId('u');
     const sid = sessionIdRef.current;
-    pushItemFor(sid, { kind: 'user', id: bubbleId, text, optimistic: true });
+    pushItemFor(sid, {
+      kind: 'user',
+      id: bubbleId,
+      text: message || (images.length > 0 ? '(image attached)' : ''),
+      optimistic: true,
+    });
     if (sid) (optimisticQueueBySessionIdRef.current[sid] ??= []).push(bubbleId);
     input.value = '';
     autoResize(input);
+    if (attachments.length > 0) setAttachments([]);
     // Enter and the primary button both resolve to the active run's verb: a
     // fresh prompt while idle, a steering message while a stream is in flight.
     // The dedicated Steer/Follow up controls were removed so the phone-width
     // composer's textarea stays dominant; queued follow-up is intentionally
     // dropped in favor of this simple default send/steer flow.
-    const command = kind === 'steer' ? { type: 'steer', message: text } : { type: 'prompt', message: text };
+    const command: Record<string, unknown> =
+      kind === 'steer' ? { type: 'steer', message } : { type: 'prompt', message };
+    if (images.length > 0) command.images = images;
     sendCommand(command, bubbleId).catch((err: Error & { rpc?: boolean }) => {
       if (!err.rpc) toast(`send failed: ${err.message}`, true);
     });
-  }, [pushItemFor, sendCommand, toast]);
+  }, [attachments, pushItemFor, sendCommand, toast]);
 
+  // Single-line composer: grow only to ~3 lines (measured from the input's
+  // own line-height + vertical padding, so the cap stays right at any font
+  // size) and collapse back to 1 line whenever the content shrinks.
   const autoResize = useCallback((input: HTMLTextAreaElement) => {
     input.style.height = 'auto';
-    input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+    const style = window.getComputedStyle(input);
+    const lineHeight = parseFloat(style.lineHeight) || 20;
+    const pad = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+    input.style.height = `${Math.min(input.scrollHeight, Math.round(lineHeight * 3 + pad))}px`;
   }, []);
+
+  /* ---------------- composer: file attachments ---------------- */
+
+  const onFilesChosen = useCallback((fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    let skipped = 0;
+    for (const file of Array.from(fileList)) {
+      const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+      const isImage = !isPdf && file.type.startsWith('image/');
+      if (!isImage && !isPdf) {
+        skipped += 1;
+        continue;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+        const comma = dataUrl.indexOf(',');
+        const dataBase64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+        setAttachments((prev) => [
+          ...prev,
+          {
+            id: nextId('a'),
+            name: file.name,
+            size: file.size,
+            mimeType: isPdf ? 'application/pdf' : file.type || 'image/png',
+            kind: isImage ? 'image' : 'pdf',
+            dataBase64,
+            previewUrl: isImage ? dataUrl : undefined,
+          },
+        ]);
+      };
+      reader.readAsDataURL(file);
+    }
+    if (skipped > 0) toast(`${skipped} file(s) skipped — attach images or PDFs only`, true);
+  }, [toast]);
+
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
+  }, []);
+
+  /* ---------------- composer: hold-to-talk voice ---------------- */
+
+  /** Resolve STT endpoint settings: prefer what get_state advertised, then
+   *  probe the settings catalog (`live.sttBaseUrl` / `live.sttModel` are
+   *  non-secret; `live.sttApiKey` is redacted server-side, so an endpoint
+   *  requiring auth must have its key set elsewhere). */
+  const resolveSttSettings = useCallback(async (): Promise<{ baseUrl: string; apiKey: string; model: string } | null> => {
+    let baseUrl = (liveSettings?.sttBaseUrl ?? '').trim();
+    const apiKey = (liveSettings?.sttApiKey ?? '').trim();
+    let model = (liveSettings?.sttModel ?? '').trim();
+    if (!baseUrl) {
+      try {
+        // RPC responses mirror SettingsPanel's SettingsCatalogWire.
+        const catalog = (await sendCommand({ type: 'settings_inspect' })) as {
+          values?: Array<{ definition?: { key?: string }; effectiveValue?: unknown }>;
+        };
+        const views = Array.isArray(catalog?.values) ? catalog.values : [];
+        for (const view of views) {
+          const key = view?.definition?.key;
+          if (key === 'live.sttBaseUrl' && typeof view.effectiveValue === 'string') {
+            baseUrl = view.effectiveValue.trim();
+          } else if (key === 'live.sttModel' && typeof view.effectiveValue === 'string') {
+            model = view.effectiveValue.trim();
+          }
+        }
+      } catch {
+        // Catalog unavailable (older backend): fall through to the error path.
+      }
+    }
+    if (!baseUrl) return null;
+    return { baseUrl, apiKey, model: model || 'whisper-1' };
+  }, [liveSettings, sendCommand]);
+
+  const transcribeAudio = useCallback(
+    async (audioBlob: Blob) => {
+      const settings = await resolveSttSettings();
+      if (!settings) {
+        toast(
+          'Live voice is not configured — set Settings.live.sttBaseUrl (and sttApiKey if the endpoint requires it) in the terminal',
+          true
+        );
+        return;
+      }
+      setTranscribing(true);
+      try {
+        // Prefer the WAV container the backend's SttClient sends; fall back to
+        // the recorder's native container when decoding is unavailable.
+        const wav = await blobToWav(audioBlob);
+        const fileBlob = wav ?? audioBlob;
+        const form = new FormData();
+        form.append('file', fileBlob, wav ? 'voice.wav' : 'voice.webm');
+        form.append('model', settings.model);
+        const headers: Record<string, string> = {};
+        if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
+        const base = settings.baseUrl.replace(/\/+$/, '');
+        const response = await fetch(`${base}/v1/audio/transcriptions`, { method: 'POST', headers, body: form });
+        if (!response.ok) {
+          const body = (await response.text().catch(() => '')).slice(0, 300);
+          toast(`transcription failed (${response.status}): ${body || response.statusText}`, true);
+          return;
+        }
+        // The transcript lands in the composer for review before sending.
+        const payload = (await response.json().catch(() => null)) as { text?: unknown } | null;
+        const text = payload && typeof payload === 'object' && typeof payload.text === 'string' ? payload.text : '';
+        const input = promptInputRef.current;
+        if (input && text) {
+          const current = input.value;
+          const separator = current.trim() ? (current.endsWith('\n') ? '' : '\n') : '';
+          input.value = `${current}${separator}${text}`;
+          autoResize(input);
+          input.focus();
+        }
+      } catch (err) {
+        // A fetch TypeError ("Failed to fetch") usually means CORS or an
+        // unreachable endpoint — the STT server must allow this web origin.
+        toast(`transcription failed: ${err instanceof Error ? err.message : String(err)}`, true);
+      } finally {
+        setTranscribing(false);
+      }
+    },
+    [resolveSttSettings, toast, autoResize]
+  );
+
+  const stopRecording = useCallback(() => {
+    if (recordingTimerRef.current !== null) {
+      window.clearTimeout(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    const recorder = mediaRecorderRef.current;
+    mediaRecorderRef.current = null;
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+    if (recorder && recorder.state !== 'inactive') {
+      try {
+        recorder.stop();
+      } catch {
+        setRecording(false);
+      }
+    } else {
+      setRecording(false);
+    }
+  }, []);
+
+  const startRecording = useCallback(async () => {
+    if (recording || transcribing) return;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      toast('microphone requires HTTPS (or localhost). Use https:// or connect via 127.0.0.1.', true);
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const supported = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].filter(
+        (mime) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(mime)
+      );
+      const recorder = new MediaRecorder(stream, supported.length > 0 ? { mimeType: supported[0] } : undefined);
+      mediaStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      mediaChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) mediaChunksRef.current.push(e.data);
+      };
+      recorder.onstop = () => {
+        setRecording(false);
+        const chunks = mediaChunksRef.current;
+        mediaChunksRef.current = [];
+        if (chunks.length === 0) return;
+        const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+        void transcribeAudio(blob);
+      };
+      recorder.start();
+      setRecording(true);
+      // Safety cap: auto-release a stuck press after 60s instead of recording
+      // forever.
+      recordingTimerRef.current = window.setTimeout(() => stopRecording(), 60000);
+    } catch (err) {
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+      }
+      toast(`microphone unavailable: ${err instanceof Error ? err.message : String(err)}`, true);
+    }
+  }, [recording, transcribing, stopRecording, transcribeAudio, toast]);
+
+  /* ---------------- composer: realtime voice (Codex Live WebRTC) ---------------- */
+
+  /** True when the backend advertises realtime mode; the mic becomes a
+   *  click-to-toggle call button instead of hold-to-talk STT. */
+  const isRealtimeMode = liveSettings?.mode === 'realtime';
+
+  /** Commit a final transcript to the composer textarea, mirroring the STT
+   *  flow's commit so both voice paths land the draft the same way. */
+  const commitTranscriptToComposer = useCallback(
+    (text: string) => {
+      const input = promptInputRef.current;
+      if (!input || !text) return;
+      const current = input.value;
+      const separator = current.trim() ? (current.endsWith('\n') ? '' : '\n') : '';
+      input.value = `${current}${separator}${text}`;
+      autoResize(input);
+      input.focus();
+    },
+    [autoResize]
+  );
+
+  /** Sideband event dispatch: transcript deltas stream into the overlay, a
+   *  final transcript commits to the composer, delegations get a notification
+   *  row, errors surface as toasts. Output audio is delivered over WebRTC
+   *  (not this socket), so output_audio.delta is intentionally a no-op. */
+  const handleRealtimeFrame = useCallback(
+    (frame: Record<string, unknown>) => {
+      const type = typeof frame.type === 'string' ? frame.type : '';
+      switch (type) {
+        case 'transcript.delta': {
+          const delta = firstString(frame.delta);
+          if (!delta) return;
+          realtimeTranscriptRef.current += delta;
+          const node = realtimeTranscriptNodeRef.current;
+          if (node) node.textContent = realtimeTranscriptRef.current;
+          break;
+        }
+        case 'transcript.done': {
+          const text = firstString(frame.transcript, frame.text, frame.delta);
+          if (text) commitTranscriptToComposer(text);
+          break;
+        }
+        case 'delegation.created': {
+          const d = frame.delegation;
+          const delegationText =
+            typeof d === 'string'
+              ? firstString(d)
+              : d && typeof d === 'object'
+                ? firstString(
+                    (d as Record<string, unknown>).description,
+                    (d as Record<string, unknown>).task,
+                    (d as Record<string, unknown>).id
+                  )
+                : '';
+          setRealtimeDelegation(delegationText || 'Delegation created');
+          break;
+        }
+        case 'error': {
+          toast(firstString(frame.message) || 'realtime session error', true);
+          break;
+        }
+        case 'output_audio.delta':
+          // Played by WebRTC automatically — nothing to render here.
+          break;
+        default:
+          break;
+      }
+    },
+    [commitTranscriptToComposer, toast]
+  );
+
+  /** Tear down the realtime call: close the sideband WS, close the
+   *  RTCPeerConnection, stop the mic tracks, and tell the backend the session
+   *  is over. Idempotent; `silent` skips the realtime_stop RPC (unmount path,
+   *  where the main socket is already gone). */
+  const stopRealtime = useCallback(
+    (opts?: { silent?: boolean }) => {
+      const hadSession = realtimePcRef.current !== null || realtimeWsRef.current !== null;
+      const ws = realtimeWsRef.current;
+      realtimeWsRef.current = null;
+      if (ws) {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        try {
+          ws.close();
+        } catch {
+          /* already closed */
+        }
+      }
+      const pc = realtimePcRef.current;
+      realtimePcRef.current = null;
+      if (pc) {
+        pc.ontrack = null;
+        pc.onconnectionstatechange = null;
+        try {
+          pc.close();
+        } catch {
+          /* already closed */
+        }
+      }
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+      }
+      const audio = realtimeAudioRef.current;
+      if (audio) audio.srcObject = null;
+      realtimeTranscriptRef.current = '';
+      const node = realtimeTranscriptNodeRef.current;
+      if (node) node.textContent = '';
+      setRealtimeDelegation(null);
+      setRealtimeActive(false);
+      if (hadSession && !opts?.silent) {
+        sendCommand({ type: 'realtime_stop' }).catch(() => {});
+      }
+    },
+    [sendCommand]
+  );
+
+  /** Start a Codex Live realtime call: mic track -> RTCPeerConnection ->
+   *  SDP offer over the realtime_create_call RPC -> answer -> sideband WS for
+   *  transcript/delegation events (incoming audio rides the WebRTC track). */
+  const startRealtime = useCallback(async () => {
+    if (realtimeActive || realtimeBusyRef.current) return;
+    const baseUrl = (liveSettings?.realtimeBaseUrl ?? '').trim();
+    if (!baseUrl) {
+      toast(
+        'Realtime voice is not configured — set Settings.live.realtimeBaseUrl (and realtimeModel/voice) in the terminal',
+        true
+      );
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      toast('microphone requires HTTPS (or localhost). Use https:// or connect via 127.0.0.1.', true);
+      return;
+    }
+    if (typeof RTCPeerConnection === 'undefined') {
+      toast('This browser does not support WebRTC (RTCPeerConnection)', true);
+      return;
+    }
+    const model = (liveSettings?.realtimeModel ?? '').trim() || 'gpt-realtime-1.5';
+    const voice = (liveSettings?.voice ?? '').trim() || 'sol';
+    let stream: MediaStream | null = null;
+    let pc: RTCPeerConnection | null = null;
+    let ws: WebSocket | null = null;
+    realtimeBusyRef.current = true;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      pc = new RTCPeerConnection();
+      realtimePcRef.current = pc;
+      mediaStreamRef.current = stream;
+      for (const track of stream.getTracks()) pc.addTrack(track, stream);
+      pc.ontrack = (event) => {
+        const audio = realtimeAudioRef.current;
+        if (audio && event.streams.length > 0) {
+          audio.srcObject = event.streams[0];
+          void audio.play().catch(() => {});
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) {
+          stopRealtime();
+        }
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const result = (await sendCommand({ type: 'realtime_create_call', sdpOffer: offer.sdp ?? '' })) as {
+        sdp?: unknown;
+        callId?: unknown;
+      };
+      const sdp = typeof result?.sdp === 'string' ? result.sdp : '';
+      const callId = typeof result?.callId === 'string' ? result.callId : '';
+      if (!sdp || !callId) {
+        throw new Error('realtime_create_call returned no SDP answer or call id');
+      }
+      await pc.setRemoteDescription({ type: 'answer', sdp });
+      // Sideband events (transcript/delegation) ride a separate WS; audio
+      // flows over the WebRTC connection itself.
+      const socket = new WebSocket(sidebandRealtimeWsUrl(baseUrl, callId));
+      ws = socket;
+      realtimeWsRef.current = socket;
+      socket.onopen = () => {
+        // Advertise the session config the backend negotiated for.
+        socket.send(JSON.stringify({ type: 'session.update', session: { model, voice } }));
+      };
+      socket.onmessage = (event) => {
+        try {
+          const frame = JSON.parse(String(event.data)) as Record<string, unknown>;
+          if (frame && typeof frame === 'object') handleRealtimeFrame(frame);
+        } catch {
+          // Non-JSON frames (pings/heartbeats) are ignored.
+        }
+      };
+      socket.onerror = () => {
+        if (realtimeWsRef.current === socket) toast('realtime sideband connection failed', true);
+      };
+      socket.onclose = () => {
+        if (realtimeWsRef.current === socket) realtimeWsRef.current = null;
+      };
+      realtimeTranscriptRef.current = '';
+      const node = realtimeTranscriptNodeRef.current;
+      if (node) node.textContent = '';
+      setRealtimeDelegation(null);
+      setRealtimeActive(true);
+    } catch (err) {
+      if (ws) {
+        realtimeWsRef.current = null;
+        try {
+          ws.onclose = null;
+          ws.close();
+        } catch {
+          /* already closed */
+        }
+      }
+      if (pc) {
+        realtimePcRef.current = null;
+        try {
+          pc.ontrack = null;
+          pc.close();
+        } catch {
+          /* already closed */
+        }
+      }
+      if (stream) {
+        mediaStreamRef.current = null;
+        stream.getTracks().forEach((track) => track.stop());
+      }
+      toast(`realtime call failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    } finally {
+      realtimeBusyRef.current = false;
+    }
+  }, [realtimeActive, liveSettings, sendCommand, handleRealtimeFrame, toast, stopRealtime]);
+
+  // If the backend stops advertising realtime mode while a call is up
+  // (settings changed), tear the call down cleanly.
+  useEffect(() => {
+    if (realtimeActive && !isRealtimeMode) stopRealtime();
+  }, [realtimeActive, isRealtimeMode, stopRealtime]);
 
   const onModelChange = useCallback((key: string) => {
     if (!key) return;
@@ -1299,18 +2172,23 @@ export function App() {
   useEffect(() => {
     let saved = '';
     try {
-      saved = window.sessionStorage.getItem(TOKEN_STORAGE_KEY) || '';
+      saved = window.localStorage.getItem(TOKEN_STORAGE_KEY) || '';
     } catch {
       /* private mode */
     }
     if (saved) {
-      setToken(saved);
-      const input = document.getElementById('token-input') as HTMLInputElement | null;
-      if (input) input.value = saved;
+      // Set the ref synchronously so the very first connection already uses
+      // the saved token (React state would lag one render).
+      tokenRef.current = saved.trim();
+      setToken(tokenRef.current);
     }
     connect();
     return () => {
       if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current);
+      clearHeartbeatTimers();
+      // Release the mic/WebRTC/sideband resources; the realtime_stop RPC is
+      // skipped (silent) because the main socket is closing underneath us.
+      stopRealtime({ silent: true });
       const ws = wsRef.current;
       wsRef.current = null;
       if (ws) ws.close(1000, 'unload');
@@ -1377,29 +2255,31 @@ export function App() {
           ))}
         </select>
         <input
-          id="token-input"
-          type="password"
-          placeholder="token (optional)"
-          title="Optional: leave blank when the listener runs without --listen-token-file; enter the token only when the listener was started with one (sent as the rpi-auth.<token> WebSocket subprotocol)"
+          id="host-input"
+          type="text"
+          list="recent-hosts"
+          placeholder="host:port"
+          title="rpi listener host:port — the page auto-connects on load; Enter or blur reconnects to the typed host"
           autoComplete="off"
           spellCheck={false}
-          defaultValue={token}
-          onChange={() => {
-            bootProbeRef.current = false;
-          }}
+          value={hostInput}
+          onChange={(e) => setHostInput(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
-              bootProbeRef.current = false;
-              connect();
+              commitHost(hostInput);
+              e.currentTarget.blur();
             }
           }}
+          onBlur={() => {
+            if (hostInput.trim() === '') setHostInput(hostRef.current);
+            commitHost(hostInput);
+          }}
         />
-        <button id="connect-btn" type="button" onClick={() => {
-          bootProbeRef.current = false;
-          connect();
-        }}>
-          Connect
-        </button>
+        <datalist id="recent-hosts">
+          {recentHosts.map((host) => (
+            <option key={host} value={host} />
+          ))}
+        </datalist>
         <button
           id="sidebar-toggle-btn"
           type="button"
@@ -1413,6 +2293,9 @@ export function App() {
       </header>
 
       <div className={`app-layout${sidebarOpen ? ' app-layout--drawer-open' : ''}`}>
+        {sidebarOpen && (
+          <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />
+        )}
         <SessionSidebar
           sendCommand={sendCommand}
           onLifecycleResult={onLifecycleResult}
@@ -1521,10 +2404,10 @@ export function App() {
               <>Send a prompt to start the session.</>
             ) : (
               <>
-                Connecting to the control plane… The token field is optional: leave it
-                blank when the listener runs without <code>--listen-token-file</code> (the
-                page auto-connects); if the listener was started with a token, enter it above
-                and press <b>Connect</b>.
+                Connecting to the control plane… The token is optional: leave it blank when
+                the listener runs without <code>--listen-token-file</code> (the page
+                auto-connects); if the listener was started with a token, set it under
+                Settings → Connection and the page reconnects immediately.
               </>
             )}
           </div>
@@ -1544,20 +2427,22 @@ export function App() {
                 <FinalAssistant key={item.id} blocks={item.blocks} />
               );
             case 'toolCard':
-              return <ToolCard key={item.id} item={item} />;
+              if (item.toolName.toLowerCase() === 'bash' && item.args && typeof item.args === 'object' && 'command' in (item.args as Record<string, unknown>)) {
+                const cmd = String((item.args as Record<string, unknown>).command || '');
+                return <BashCard key={item.id} command={cmd} output={item.result} />;
+              }
+              // Non-bash tools: show tool name as label + result as output (no JSON args).
+              return <BashCard key={item.id} label={item.toolName} output={item.result} status={item.status} />;
             case 'toolResult':
               return (
-                <div key={item.id} className="msg msg--bash">
-                  <pre className="bash-output">{item.text === '' ? '(empty tool result)' : item.text}</pre>
-                </div>
+                <BashCard
+                  key={item.id}
+                  label="tool output"
+                  output={item.text === '' ? '(empty tool result)' : item.text}
+                />
               );
             case 'bash':
-              return (
-                <div key={item.id} className="msg msg--bash">
-                  <div className="bash-cmd">$ {item.command}</div>
-                  <pre className="bash-output">{item.output}</pre>
-                </div>
-              );
+              return <BashCard key={item.id} command={item.command} output={item.output} />;
             case 'custom':
               return (
                 <div key={item.id} className="msg msg--custom" role="note">
@@ -1660,30 +2545,151 @@ export function App() {
           key={`settings:${sessionId ?? ''}`}
           sendCommand={sendCommand}
           refreshState={refreshState}
+          token={token}
+          onTokenChange={handleTokenChange}
           onClose={() => setActivePanel('')}
         />
       )}
 
       <footer>
-        <textarea
-          id="prompt-input"
-          ref={promptInputRef}
-          rows={3}
-          placeholder="Message the agent… (Enter to send, Shift+Enter for a newline, Esc to abort)"
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              submit(activeStreaming ? 'steer' : 'prompt');
-            } else if (e.key === 'Escape') {
-              if (activeStreaming && sessionId) {
-                abortPendingBySessionIdRef.current[sessionId] = true;
-                sendCommand({ type: 'abort' }).catch(() => {});
+        <div id="composer-main">
+          {attachments.length > 0 && (
+            <div id="composer-attachments" aria-label="Attached files">
+              {attachments.map((attachment) => (
+                <span key={attachment.id} className="composer-attachment" title={attachment.name}>
+                  {attachment.kind === 'image' && attachment.previewUrl ? (
+                    <img className="composer-attachment__thumb" src={attachment.previewUrl} alt="" />
+                  ) : (
+                    <span className="composer-attachment__badge">PDF</span>
+                  )}
+                  <span className="composer-attachment__meta">
+                    <span className="composer-attachment__name">{safeText(attachment.name)}</span>
+                    <span className="composer-attachment__size">{attachment.size} bytes</span>
+                  </span>
+                  <button
+                    type="button"
+                    className="composer-attachment__remove"
+                    title="Remove attachment"
+                    aria-label={`Remove ${attachment.name}`}
+                    onClick={() => removeAttachment(attachment.id)}
+                  >
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          {isRealtimeMode && realtimeActive && (
+            <div id="realtime-transcript" role="status" aria-live="polite">
+              <div className="realtime-transcript__head">
+                <span className="realtime-transcript__dot" aria-hidden="true" />
+                <span className="realtime-transcript__label">realtime voice</span>
+                {(liveSettings?.realtimeModel || liveSettings?.voice) && (
+                  <span className="realtime-transcript__model">
+                    {[liveSettings?.realtimeModel, liveSettings?.voice].filter(Boolean).join(' · ')}
+                  </span>
+                )}
+              </div>
+              {realtimeDelegation && (
+                <div className="realtime-transcript__delegation">delegation created: {safeText(realtimeDelegation)}</div>
+              )}
+              <div
+                ref={(node) => {
+                  realtimeTranscriptNodeRef.current = node;
+                  if (node) node.textContent = realtimeTranscriptRef.current;
+                }}
+                className="realtime-transcript__text"
+              />
+            </div>
+          )}
+          <textarea
+            id="prompt-input"
+            ref={promptInputRef}
+            rows={1}
+            placeholder="Message the agent… (Enter to send, Shift+Enter for a newline, Esc to abort)"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                submit(activeStreaming ? 'steer' : 'prompt');
+              } else if (e.key === 'Escape') {
+                if (activeStreaming && sessionId) {
+                  abortPendingBySessionIdRef.current[sessionId] = true;
+                  sendCommand({ type: 'abort' }).catch(() => {});
+                }
               }
-            }
-          }}
-          onInput={(e) => autoResize(e.currentTarget)}
-        />
+            }}
+            onInput={(e) => autoResize(e.currentTarget)}
+          />
+        </div>
         <div id="composer-buttons">
+          <button
+            id="attach-btn"
+            type="button"
+            title="Attach an image or PDF"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            📎
+          </button>
+          <button
+            id="mic-btn"
+            type="button"
+            aria-pressed={isRealtimeMode ? realtimeActive : recording}
+            disabled={!isRealtimeMode && transcribing}
+            className={
+              isRealtimeMode
+                ? realtimeActive
+                  ? 'recording'
+                  : ''
+                : recording
+                  ? 'recording'
+                  : transcribing
+                    ? 'transcribing'
+                    : ''
+            }
+            title={
+              isRealtimeMode
+                ? realtimeActive
+                  ? 'Realtime voice on — click to stop'
+                  : 'Realtime voice — click to talk'
+                : recording
+                  ? 'Recording… release to transcribe'
+                  : transcribing
+                    ? 'Transcribing…'
+                    : 'Hold to talk (voice to text)'
+            }
+            onClick={
+              isRealtimeMode
+                ? () => {
+                    if (realtimeActive) stopRealtime();
+                    else void startRealtime();
+                  }
+                : undefined
+            }
+            onPointerDown={
+              isRealtimeMode
+                ? undefined
+                : (e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault();
+                    void startRecording();
+                  }
+            }
+            onPointerUp={
+              isRealtimeMode
+                ? undefined
+                : (e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault();
+                    stopRecording();
+                  }
+            }
+            onPointerLeave={isRealtimeMode ? undefined : stopRecording}
+            onPointerCancel={isRealtimeMode ? undefined : stopRecording}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            🎤
+            {(isRealtimeMode ? realtimeActive : recording) && <span className="mic-indicator" aria-hidden="true" />}
+          </button>
           <button id="send-btn" type="button" onClick={() => submit(activeStreaming ? 'steer' : 'prompt')}>
             {activeStreaming ? 'Steer' : 'Send'}
           </button>
@@ -1698,8 +2704,24 @@ export function App() {
         </div>
       </footer>
 
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*,application/pdf"
+        multiple
+        hidden
+        onChange={(e) => {
+          onFilesChosen(e.target.files);
+          e.target.value = '';
+        }}
+      />
+
         </div>
       </div>
+
+      {/* Remote audio for the realtime call: ontrack wires the WebRTC stream
+          into this hidden element (play() is called on the click gesture). */}
+      <audio ref={realtimeAudioRef} autoPlay playsInline hidden />
 
       <ToastList
         toasts={toasts}

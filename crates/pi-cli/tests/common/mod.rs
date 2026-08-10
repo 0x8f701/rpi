@@ -114,6 +114,9 @@ pub async fn listen(application: Application) -> (ListenHandle, ExtensionUiAdapt
             token_file: None,
             allow_insecure_remote: false,
             advertised_origin: None,
+            plaintext: true,
+            tls_cert: None,
+            tls_key: None,
             session_factory: None,
         },
     )
@@ -139,6 +142,9 @@ pub async fn listen_with_token(
             token_file: Some(token_path),
             allow_insecure_remote: false,
             advertised_origin: None,
+            plaintext: true,
+            tls_cert: None,
+            tls_key: None,
             session_factory: None,
         },
     )

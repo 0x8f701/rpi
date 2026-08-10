@@ -323,6 +323,18 @@ impl Drop for CompactionActivityGuard {
 /// bound; a stalled provider fails with an actionable error instead.
 const COMPACTION_SUMMARIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// System prompt for the one-shot vision delegation call
+/// (`settings.visionModel`): non-vision models get a text description of the
+/// prompt's image blocks instead of the images themselves.
+const VISION_DELEGATION_SYSTEM_PROMPT: &str =
+    "You are a vision assistant. Describe the images in detail, focusing on code, UI, diagrams, and technical content. Be concise but thorough.";
+
+/// Bounds the whole vision-delegation provider exchange (stream creation +
+/// drain + result), mirroring the summarization timeout: provider SSE bodies
+/// are uncapped in `pi-ai` (only time-to-headers is bounded), so a stalled
+/// vision provider would otherwise hang the turn forever.
+const VISION_DELEGATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 struct SessionInner {
     cwd: PathBuf,
     session_dir: RwLock<PathBuf>,
@@ -1490,6 +1502,116 @@ impl Session {
             memory: Some(self.memory_config_resolver()),
             permission_rules: self.permission_rules_source(),
         }
+    }
+
+    /// When the active model lacks image support and `settings.visionModel` is
+    /// configured, sends image ContentBlocks to the vision model for a text
+    /// description and replaces them in the prompt. Falls back to the original
+    /// content on any error or when delegation is not needed.
+    async fn delegate_vision_images(&self, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+        // Only delegate when there are image blocks.
+        let has_images = content.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+        if !has_images {
+            return content;
+        }
+        // Check the active model's image support.
+        let active_model = self.inner.shared.state.read().model.clone();
+        if active_model.input.iter().any(|m| m == "image") {
+            return content;
+        }
+        // Read visionModel from live settings.
+        let vision_spec = self
+            .inner
+            .resources
+            .read()
+            .as_ref()
+            .and_then(|r| r.snapshot().settings.vision_model.clone());
+        let Some(vision_spec) = vision_spec.filter(|s| !s.trim().is_empty()) else {
+            return content;
+        };
+        // Resolve the vision model.
+        let vision_model = match crate::resolve_model(&vision_spec) {
+            Ok(m) => m,
+            Err(_) => {
+                return content;
+            }
+        };
+        // Extract image blocks and text blocks separately.
+        let images: Vec<ContentBlock> = content
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .cloned()
+            .collect();
+        let image_count = images.len();
+        let _ = image_count;
+        let inner = &self.inner.shared;
+        let mut stream_options = inner.stream_options.read().clone();
+        let api_key = inner.state.read().api_key.clone();
+        stream_options.stream.api_key = Some(api_key);
+        stream_options.stream.max_tokens = Some(4096);
+        stream_options.stream.cache_retention = CacheRetention::None;
+        stream_options.stream.session_id = Some(uuid::Uuid::now_v7().to_string());
+        stream_options.reasoning = None;
+        let context = Context {
+            system_prompt: VISION_DELEGATION_SYSTEM_PROMPT.to_owned(),
+            messages: vec![Message::User(UserMessage {
+                content: {
+                    let mut blocks = images;
+                    blocks.push(ContentBlock::text("Describe these images in detail, focusing on code, UI, diagrams, and technical content."));
+                    blocks
+                },
+                timestamp: pi_ai::now_millis(),
+            })],
+            tools: Vec::new(),
+        };
+        // Bound the vision call like compaction's summarize.
+        let stream_fn = inner.stream_fn.clone();
+        let produced = tokio::time::timeout(VISION_DELEGATION_TIMEOUT, async {
+            let stream = (stream_fn)(vision_model, context, stream_options).await;
+            while stream.next().await.is_some() {}
+            stream.result().await
+        })
+        .await;
+        let description = match produced {
+            Ok(Some(response)) => {
+                let text: String = response
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.trim().is_empty() {
+                    return content;
+                }
+                text
+            }
+            Ok(None) => {
+                return content;
+            }
+            Err(_) => {
+                return content;
+            }
+        };
+        // Replace image blocks with the text description.
+        let mut new_content = Vec::with_capacity(content.len());
+        let mut description_inserted = false;
+        for block in content {
+            if matches!(block, ContentBlock::Image { .. }) {
+                if !description_inserted {
+                    new_content.push(ContentBlock::text(format!(
+                        "[Image analyzed by {vision_model_id}: {description}]",
+                        vision_model_id = self.inner.shared.state.read().model.id
+                    )));
+                    description_inserted = true;
+                }
+            } else {
+                new_content.push(block);
+            }
+        }
+        new_content
     }
 
     /// Resolver that confines subagent children's process spawns (their bash
@@ -3797,6 +3919,7 @@ impl Session {
             content.push(ContentBlock::text(prompt));
         }
         content.extend(images);
+        let content = self.delegate_vision_images(content).await;
         messages[0] = Message::User(UserMessage {
             content,
             timestamp: pi_ai::now_millis(),

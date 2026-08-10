@@ -75,6 +75,10 @@ interface SettingsPanelProps {
   sendCommand: (command: Record<string, unknown>) => Promise<unknown>;
   /** Re-fetch get_state into the app shell after apply (runtime settings). */
   refreshState: () => Promise<unknown>;
+  /** Current connection token (rpi-auth.<token> subprotocol). */
+  token: string;
+  /** Persist a new token (localStorage rpi-web-token) and reconnect. */
+  onTokenChange: (token: string) => void;
   onClose: () => void;
 }
 
@@ -159,7 +163,7 @@ function parseTypedValue(kind: string, raw: string): { ok: boolean; value?: unkn
   }
 }
 
-export function SettingsPanel({ sendCommand, refreshState, onClose }: SettingsPanelProps) {
+export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange, onClose }: SettingsPanelProps) {
   const [catalog, setCatalog] = useState<SettingsCatalogWire | null>(null);
   const [draftId, setDraftId] = useState<string | null>(null);
   const [draftDirty, setDraftDirty] = useState(false);
@@ -167,6 +171,9 @@ export function SettingsPanel({ sendCommand, refreshState, onClose }: SettingsPa
   const [selectedCategory, setSelectedCategory] = useState('models');
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
+  // Connection token draft: edited locally, committed via onTokenChange
+  // (Save/Enter) so typing never reconnects mid-keystroke.
+  const [tokenDraft, setTokenDraft] = useState(token);
   const mountedRef = useRef(true);
 
   const loadCatalog = useCallback(async () => {
@@ -193,6 +200,12 @@ export function SettingsPanel({ sendCommand, refreshState, onClose }: SettingsPa
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Keep the draft in sync when the saved token changes elsewhere (boot
+  // restore from localStorage, a commit from this panel after a reconnect).
+  useEffect(() => {
+    setTokenDraft(token);
+  }, [token]);
 
   const applyDraftSnapshot = useCallback((data: unknown) => {
     const snapshot = data as DraftSnapshotWire;
@@ -364,6 +377,41 @@ export function SettingsPanel({ sendCommand, refreshState, onClose }: SettingsPa
       )}
 
       <div className="panel__body settings-body">
+        <section className="settings-connection" aria-label="Connection settings">
+          <div className="settings-connection__title">Connection</div>
+          <div className="settings-connection__row">
+            <label className="settings-connection__label" htmlFor="settings-token-input">
+              Token
+            </label>
+            <input
+              id="settings-token-input"
+              type="password"
+              value={tokenDraft}
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="rpi-auth token (optional)"
+              title="Sent as the rpi-auth.<token> WebSocket subprotocol. Saved to localStorage (rpi-web-token); Save/Enter reconnects."
+              onChange={(e) => setTokenDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') onTokenChange(tokenDraft);
+              }}
+            />
+            <button
+              id="settings-token-save-btn"
+              type="button"
+              onClick={() => onTokenChange(tokenDraft)}
+              disabled={busy}
+              title="Save the token and reconnect"
+            >
+              Save
+            </button>
+          </div>
+          <div className="settings-connection__hint">
+            Leave blank when the listener runs without <code>--listen-token-file</code>. When the
+            listener was started with a token, enter it here and press Save — the page saves it to
+            localStorage (rpi-web-token) and reconnects immediately.
+          </div>
+        </section>
         <nav className="settings-categories" aria-label="Settings categories">
           {grouped.map((group) => (
             <button

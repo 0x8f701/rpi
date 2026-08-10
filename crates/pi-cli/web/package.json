@@ -13,6 +13,7 @@
     "coverage": "bash ../../../E2E.d/web/coverage.sh"
   },
   "dependencies": {
+    "highlight.js": "^11.11.1",
     "katex": "^0.18.2",
     "mermaid": "^11.16.1",
     "react": "^18.3.1",

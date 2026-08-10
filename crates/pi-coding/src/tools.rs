@@ -1743,11 +1743,13 @@ fn bash_tool(
             ("timeout", s_number("Timeout in seconds (optional, no default timeout)")),
             ("background", s_boolean("Start the command under the supervised process manager, return immediately, and list it in /ps")),
             ("sandboxed", s_boolean("Run this command inside the Linux filesystem sandbox (filesystem confined to sandbox.allowedPaths, network off unless sandbox.network). Overrides the sandbox.enabled setting for this call; unsupported on non-Linux platforms.")),
+            ("pty", s_boolean("When true, run the command in a pseudo-terminal (PTY) so interactive programs like sudo can prompt for input (e.g. a password). The PTY merges stdout and stderr; provide stdin up front via the input parameter. Not available with background=true or inside the sandbox.")),
+            ("input", s_string("Optional stdin written to the command (followed by a newline) before its output is read. Intended for interactive commands with pty=true (e.g. a sudo password); ignored otherwise.")),
         ],
         vec!["command"],
     );
     let description = format!(
-        "Execute a bash command in the current working directory. Finite commands run in the foreground and return stdout and stderr exactly as before. Output is truncated to last {} lines or {}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds. For servers, watchers, and other long-running commands, set background=true to return a stable supervised process id visible in /ps. Unsupervised nohup, setsid, disown, and shell '&' detachment are rejected.",
+        "Execute a bash command in the current working directory. Finite commands run in the foreground and return stdout and stderr exactly as before. Output is truncated to last {} lines or {}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds. For interactive commands that prompt (e.g. sudo), set pty=true and pass stdin via the input parameter. For servers, watchers, and other long-running commands, set background=true to return a stable supervised process id visible in /ps. Unsupervised nohup, setsid, disown, and shell '&' detachment are rejected.",
         DEFAULT_MAX_LINES,
         DEFAULT_MAX_BYTES / 1024
     );
@@ -1765,6 +1767,7 @@ fn bash_tool(
         "Inspect PI_* environment variables for current model and session details.".to_string(),
         "Use foreground bash only for finite commands. For servers, watchers, or commands intended to outlive the tool call, set background=true; never use nohup, setsid, disown, or shell '&'. Supervised commands are visible in /ps with logs, signal, stop, and wait controls.".to_string(),
         "When the sandbox is enabled (sandbox.enabled or the sandboxed parameter), commands see only sandbox.allowedPaths; system binaries are read-only; the network is loopback-only unless sandbox.network is true.".to_string(),
+        "Interactive commands that prompt for input (e.g. sudo) run with pty=true; provide the stdin (e.g. a password) via the input parameter. pty is a foreground-only mode and cannot be combined with background=true or the sandbox.".to_string(),
     ])
 }
 
@@ -1951,8 +1954,13 @@ struct BashRunOutput {
 /// Runs `command` in `cwd`, streaming merged stdout+stderr through the
 /// accumulator (and the optional callbacks), enforcing the optional timeout and
 /// abort. Shared by the bash tool (`on_update` + timeout) and `execute_bash`
-/// (`on_chunk`, no timeout). Returns the bounded output snapshot and exit
-/// status; abort wins over timeout.
+/// (`on_chunk`, no timeout). With `pty` set, the command runs in an opt-in
+/// pseudo-terminal (`bash::pty`) so interactive programs like sudo can prompt,
+/// with `pty_input` written to the PTY's stdin; a PTY spawn failure without
+/// input falls back to the standard paths with a note, while one with input
+/// configured errors the call (the fallback could not deliver the input).
+/// Returns the bounded output snapshot and exit status; abort wins over
+/// timeout.
 async fn run_bash_core(
     cwd: &str,
     command: &str,
@@ -1962,6 +1970,8 @@ async fn run_bash_core(
     on_chunk: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
     on_update: Option<ToolUpdateFn>,
     sandbox: Option<&SandboxConfig>,
+    pty: bool,
+    pty_input: Option<String>,
 ) -> Result<BashRunOutput> {
     let (shell, shell_args) = get_shell_config();
     let mut argv = Vec::with_capacity(shell_args.len() + 2);
@@ -2012,62 +2022,135 @@ async fn run_bash_core(
         let state = state.clone();
         Arc::new(move |data: &[u8]| state.lock().append(data))
     };
-    let outcome = match sandbox {
-        // Sandboxed invocations keep the subprocess path (sandbox wins): the
-        // in-process brush shell cannot be wrapped by `unshare`.
-        Some(config) => crate::sandbox::run_in_sandbox(
-            Some(config),
+    // PTY mode (opt-in, `pty: true`) runs the command in a pseudo-terminal so
+    // interactive programs like sudo can prompt. The PTY environment keeps the
+    // normal command contract except TERM: NON_INTERACTIVE_COMMAND_ENV sets
+    // TERM=dumb, which breaks interactive rendering — a PTY needs a real
+    // terminal type. Built up front because `run_normal` below takes
+    // ownership of `env`; `run_bash` rejects pty with background=true and with
+    // an active sandbox, so pty is only ever reached in the unsandboxed
+    // branch.
+    let pty_env: Vec<(String, String)> = if pty {
+        let mut pty_env = env.clone();
+        pty_env.retain(|(key, _)| key != "TERM");
+        pty_env.push(("TERM".to_owned(), "xterm-256color".to_owned()));
+        pty_env
+    } else {
+        Vec::new()
+    };
+    let pty_abort = abort.clone();
+    let pty_stream = stream.clone();
+    let fallback_stream = stream.clone();
+
+    // The standard execution paths (sandboxed subprocess, or the embedded
+    // brush shell with the plain /bin/bash fallback). Shared by the default
+    // path and the PTY spawn-failure fallback so both behave identically.
+    let run_normal = async {
+        Ok::<SandboxRunOutcome, anyhow::Error>(match sandbox {
+            // Sandboxed invocations keep the subprocess path (sandbox wins):
+            // the in-process brush shell cannot be wrapped by `unshare`.
+            Some(config) => crate::sandbox::run_in_sandbox(
+                Some(config),
+                Path::new(cwd),
+                &argv,
+                env,
+                timeout_duration,
+                abort,
+                Some(stream),
+            )
+            .await?,
+            // Unsandboxed default: the embedded brush shell. If brush cannot
+            // parse the command (or descendant reaping is unavailable), fall
+            // back to the plain /bin/bash subprocess path for an identical
+            // observable result (documented policy in `tools/bash/brush.rs`).
+            None => {
+                use bash::brush::BrushRunOutcome;
+                match bash::brush::run_brush_command(
+                    Path::new(cwd),
+                    command,
+                    &env,
+                    timeout_duration,
+                    abort.clone(),
+                    stream.clone(),
+                )
+                .await?
+                {
+                    BrushRunOutcome::Executed { exit_code } => SandboxRunOutcome {
+                        exit_code,
+                        timed_out: false,
+                        cancelled: false,
+                    },
+                    BrushRunOutcome::TimedOut => SandboxRunOutcome {
+                        exit_code: None,
+                        timed_out: true,
+                        cancelled: false,
+                    },
+                    BrushRunOutcome::Cancelled => SandboxRunOutcome {
+                        exit_code: None,
+                        timed_out: false,
+                        cancelled: true,
+                    },
+                    BrushRunOutcome::Fallback => crate::sandbox::run_in_sandbox(
+                        None,
+                        Path::new(cwd),
+                        &argv,
+                        env,
+                        timeout_duration,
+                        abort,
+                        Some(stream),
+                    )
+                    .await?,
+                }
+            }
+        })
+    };
+
+    let outcome = if pty {
+        // The PTY merges stdout+stderr; `pty_input` (e.g. a sudo password) is
+        // written to the PTY's stdin up front (see `bash::pty`).
+        match bash::pty::run_pty_command(
             Path::new(cwd),
             &argv,
-            env,
+            &pty_env,
+            pty_input.as_deref(),
             timeout_duration,
-            abort,
-            Some(stream),
+            pty_abort,
+            pty_stream,
         )
-        .await?,
-        // Unsandboxed default: the embedded brush shell. If brush cannot
-        // parse the command (or descendant reaping is unavailable), fall back
-        // to the plain /bin/bash subprocess path for an identical observable
-        // result (documented policy in `tools/bash/brush.rs`).
-        None => {
-            use bash::brush::BrushRunOutcome;
-            match bash::brush::run_brush_command(
-                Path::new(cwd),
-                command,
-                &env,
-                timeout_duration,
-                abort.clone(),
-                stream.clone(),
-            )
-            .await?
-            {
-                BrushRunOutcome::Executed { exit_code } => SandboxRunOutcome {
-                    exit_code,
-                    timed_out: false,
-                    cancelled: false,
-                },
-                BrushRunOutcome::TimedOut => SandboxRunOutcome {
-                    exit_code: None,
-                    timed_out: true,
-                    cancelled: false,
-                },
-                BrushRunOutcome::Cancelled => SandboxRunOutcome {
-                    exit_code: None,
-                    timed_out: false,
-                    cancelled: true,
-                },
-                BrushRunOutcome::Fallback => crate::sandbox::run_in_sandbox(
-                    None,
-                    Path::new(cwd),
-                    &argv,
-                    env,
-                    timeout_duration,
-                    abort,
-                    Some(stream),
-                )
-                .await?,
+        .await
+        {
+            bash::pty::PtyRunOutcome::Executed { exit_code } => SandboxRunOutcome {
+                exit_code,
+                timed_out: false,
+                cancelled: false,
+            },
+            bash::pty::PtyRunOutcome::TimedOut => SandboxRunOutcome {
+                exit_code: None,
+                timed_out: true,
+                cancelled: false,
+            },
+            bash::pty::PtyRunOutcome::Cancelled => SandboxRunOutcome {
+                exit_code: None,
+                timed_out: false,
+                cancelled: true,
+            },
+            bash::pty::PtyRunOutcome::SpawnFailed(err) => {
+                if pty_input.is_some() {
+                    // The input was meant for the PTY's stdin; the normal
+                    // paths wire stdin to /dev/null, so a fallback would
+                    // leave the command hanging on input that never arrives.
+                    // Fail the call instead.
+                    anyhow::bail!("pty spawn failed with input configured: {err}");
+                }
+                fallback_stream(
+                    format!("[PTY spawn failed: {err}; falling back to normal execution]\n")
+                        .as_bytes(),
+                );
+                run_normal.await?
             }
         }
+    } else {
+        run_normal.await?
     };
 
     let snap = state.lock().finish();
@@ -2588,6 +2671,11 @@ async fn run_bash(
     }
     check_aborted(&abort)?;
     let background = arg_bool(&args, "background");
+    let pty = arg_bool(&args, "pty");
+    let pty_input = arg_str(&args, "input");
+    // An absent/empty `input` means "no stdin"; only non-empty strings are
+    // written to the PTY.
+    let pty_input = (!pty_input.is_empty()).then_some(pty_input);
     // Per-call `sandboxed` overrides the `sandbox.enabled` setting; missing
     // falls back to the setting. Resolution happens per spawn so a settings
     // reload takes effect on the next command (RELOAD apply behavior).
@@ -2612,6 +2700,16 @@ async fn run_bash(
         }
     }
     let detach = shell_detach_analysis(&command);
+    if pty && background {
+        return Err(anyhow!(
+            "pty bash is not supported with background=true: PTY input and output are only available in the foreground. Run the interactive command without background=true."
+        ));
+    }
+    if pty && sandbox_config.is_some() {
+        return Err(anyhow!(
+            "pty bash is not supported inside the sandbox: the PTY child cannot be wrapped by unshare. Run the interactive command without sandboxed=true (or disable sandbox.enabled)."
+        ));
+    }
     if contains_detaching_shell_substitution(&command) {
         return Err(anyhow!(
             "Cannot safely determine supervision for shell substitution containing background or control syntax. Move the long-lived command out of the substitution and run it with background=true so it remains visible in /ps."
@@ -2678,6 +2776,8 @@ async fn run_bash(
         None,
         Some(on_update),
         sandbox_config.as_ref(),
+        pty,
+        pty_input,
     )
     .await?;
 
@@ -2826,6 +2926,8 @@ pub async fn execute_bash(
         Some(raw),
         None,
         sandbox_config.as_ref(),
+        false,
+        None,
     )
     .await?;
     Ok(BashResult {

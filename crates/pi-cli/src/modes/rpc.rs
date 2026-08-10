@@ -614,6 +614,36 @@ pub enum RpcCommand {
         #[serde(default)]
         id: Option<String>,
     },
+    /// Exchange a WebRTC SDP offer for a Codex Live realtime call by proxying
+    /// `POST {realtimeBaseUrl}/v1/realtime/calls` on the backend (avoids CORS
+    /// and keeps the API key server-side). Returns
+    /// `{ "sdp": "<answer>", "callId": "<call id>" }` for the browser's
+    /// `RTCPeerConnection` plus the sideband `WS /v1/realtime?call_id=…`.
+    /// Wire shape: `{ "type": "realtime_create_call", "id"?: string, "sdpOffer": string }`.
+    RealtimeCreateCall {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "sdpOffer")]
+        sdp_offer: String,
+    },
+    /// Create a Codex Live realtime session by proxying
+    /// `POST {realtimeBaseUrl}/v1/live` on the backend (the browser never
+    /// holds the API key). Returns the upstream session payload (token/headers
+    /// are passed through verbatim).
+    /// Wire shape: `{ "type": "realtime_create_session", "id"?: string }`.
+    RealtimeCreateSession {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Notify the backend that the Codex Live realtime session ended. The
+    /// browser tears down its own `RTCPeerConnection` and sideband WebSocket;
+    /// this command is an acknowledgment so the RPC owner can release any
+    /// server-side bookkeeping. Returns `{ "stopped": true }`.
+    /// Wire shape: `{ "type": "realtime_stop", "id"?: string }`.
+    RealtimeStop {
+        #[serde(default)]
+        id: Option<String>,
+    },
 }
 impl RpcCommand {
     pub(crate) fn id(&self) -> Option<String> {
@@ -714,7 +744,10 @@ impl RpcCommand {
             | Self::CollabStart { id, .. }
             | Self::CollabStatus { id, .. }
             | Self::CollabStop { id, .. }
-            | Self::CloseSession { id } => id.clone(),
+            | Self::CloseSession { id }
+            | Self::RealtimeCreateCall { id, .. }
+            | Self::RealtimeCreateSession { id }
+            | Self::RealtimeStop { id } => id.clone(),
         }
     }
     pub(crate) const fn command_name(&self) -> &'static str {
@@ -816,6 +849,9 @@ impl RpcCommand {
             Self::CollabStatus { .. } => "collab_status",
             Self::CollabStop { .. } => "collab_stop",
             Self::CloseSession { .. } => "close_session",
+            Self::RealtimeCreateCall { .. } => "realtime_create_call",
+            Self::RealtimeCreateSession { .. } => "realtime_create_session",
+            Self::RealtimeStop { .. } => "realtime_stop",
         }
     }
 
@@ -867,6 +903,7 @@ impl RpcCommand {
                 | Self::CollabStatus { .. }
                 | Self::CollabStop { .. }
                 | Self::CloseSession { .. }
+                | Self::RealtimeStop { .. }
         )
     }
 
@@ -881,6 +918,7 @@ impl RpcCommand {
                 | Self::ProcessStop { .. }
                 | Self::CollabStop { .. }
                 | Self::CloseSession { .. }
+                | Self::RealtimeStop { .. }
         )
     }
 }
@@ -2527,6 +2565,19 @@ async fn handle_command_inner(
         | RpcCommand::CollabStop { .. } => {
             bail!("collaboration room commands require the listen control plane")
         }
+        // Codex Live realtime proxy commands. The browser owns WebRTC and the
+        // sideband WS; these only relay signaling/session HTTP calls to
+        // CLIProxyAPI with the server-held API key (never exposed to the
+        // frontend).
+        RpcCommand::RealtimeCreateCall { sdp_offer, .. } => {
+            let live = app.runtime_settings().live.clone();
+            Ok(Some(realtime_create_call(&live, &sdp_offer).await?))
+        }
+        RpcCommand::RealtimeCreateSession { .. } => {
+            let live = app.runtime_settings().live.clone();
+            Ok(Some(realtime_create_session(&live).await?))
+        }
+        RpcCommand::RealtimeStop { .. } => Ok(Some(json!({"stopped": true}))),
         // The Web control plane's session runtime manager intercepts
         // close_session before any dispatcher sees it; stdio RPC has one
         // Application and nothing to close.
@@ -2535,6 +2586,137 @@ async fn handle_command_inner(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Codex Live realtime proxy (CLIProxyAPI)
+//
+// The web frontend drives WebRTC directly, but all HTTP signaling goes through
+// these RPC commands so the CLIProxyAPI access key never leaves the backend.
+// ---------------------------------------------------------------------------
+
+/// Bounded timeout for the realtime proxy round trips; a hung CLIProxyAPI
+/// must not wedge the RPC dispatcher indefinitely.
+const REALTIME_PROXY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Builds `{base}/v1{path}` for a realtime endpoint, de-duplicating a
+/// trailing `/v1` on the configured base (Hyper parity, mirroring
+/// `pi_coding::live::transcriptions_url`).
+fn realtime_endpoint(base: &str, path: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{base}/v1{path}")
+}
+
+/// Validates that `settings` can drive the realtime proxy commands, mirroring
+/// `pi_coding::live::validate_live_settings`: the CLIProxyAPI base URL and
+/// access key must be configured, and plaintext bearer credentials are
+/// rejected unless `allowInsecure` is set.
+fn validate_realtime_proxy(settings: &pi_coding::LiveRuntimeSettings) -> Result<()> {
+    if settings.realtime_base_url.trim().is_empty() {
+        bail!(
+            "Realtime voice is not configured — set `Settings.live.realtimeBaseUrl` to your CLIProxyAPI base URL (e.g. http://host:port)"
+        );
+    }
+    if settings.realtime_api_key.trim().is_empty() {
+        bail!(
+            "Realtime voice is not configured — set `Settings.live.realtimeApiKey` (the CLIProxyAPI access key) in settings.json; it is secret and cannot be written through /settings"
+        );
+    }
+    let parsed = reqwest::Url::parse(settings.realtime_base_url.trim()).with_context(|| {
+        format!(
+            "`Settings.live.realtimeBaseUrl` is not a valid URL: {}",
+            settings.realtime_base_url
+        )
+    })?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if settings.allow_insecure => Ok(()),
+        "http" => bail!(
+            "Refusing to send realtime bearer credentials over plaintext: `Settings.live.realtimeBaseUrl` uses http:// but `Settings.live.allowInsecure` is false. Use https://, or set `Settings.live.allowInsecure = true` for a loopback/self-hosted CLIProxyAPI"
+        ),
+        other => bail!(
+            "Unsupported `Settings.live.realtimeBaseUrl` scheme `{other}://` — use https:// (or http:// with `Settings.live.allowInsecure = true`)"
+        ),
+    }
+}
+
+/// Proxies `POST {realtimeBaseUrl}/v1/realtime/calls` with the SDP offer and
+/// the configured model, returning the answer as `{"sdp": ..., "callId": ...}`
+/// for the browser's `RTCPeerConnection` and sideband WebSocket.
+async fn realtime_create_call(
+    settings: &pi_coding::LiveRuntimeSettings,
+    sdp_offer: &str,
+) -> Result<Value> {
+    validate_realtime_proxy(settings)?;
+    let url = realtime_endpoint(&settings.realtime_base_url, "/realtime/calls");
+    let client = reqwest::Client::builder()
+        .timeout(REALTIME_PROXY_TIMEOUT)
+        .build()
+        .context("building realtime proxy client")?;
+    let response = client
+        .post(&url)
+        .bearer_auth(settings.realtime_api_key.trim())
+        .json(&json!({ "sdp": sdp_offer, "model": settings.realtime_model }))
+        .send()
+        .await
+        .with_context(|| format!("POST {url} (realtime_create_call) failed"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "realtime_create_call: {url} returned {status}: {}",
+            body.chars().take(300).collect::<String>()
+        );
+    }
+    let payload: Value = response
+        .json()
+        .await
+        .context("realtime_create_call: parsing /v1/realtime/calls response")?;
+    let sdp = payload
+        .get("sdp")
+        .and_then(Value::as_str)
+        .filter(|sdp| !sdp.is_empty())
+        .context("realtime_create_call: /v1/realtime/calls response has no non-empty `sdp` answer")?;
+    let call_id = payload
+        .get("call_id")
+        .or_else(|| payload.get("callId"))
+        .and_then(Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+        .context("realtime_create_call: /v1/realtime/calls response has no non-empty `call_id`")?;
+    Ok(json!({ "sdp": sdp, "callId": call_id }))
+}
+
+/// Proxies `POST {realtimeBaseUrl}/v1/live` with the configured model and
+/// voice, passing the upstream session payload (token/headers) through
+/// verbatim.
+async fn realtime_create_session(settings: &pi_coding::LiveRuntimeSettings) -> Result<Value> {
+    validate_realtime_proxy(settings)?;
+    let url = realtime_endpoint(&settings.realtime_base_url, "/live");
+    let client = reqwest::Client::builder()
+        .timeout(REALTIME_PROXY_TIMEOUT)
+        .build()
+        .context("building realtime proxy client")?;
+    let response = client
+        .post(&url)
+        .bearer_auth(settings.realtime_api_key.trim())
+        .json(&json!({ "model": settings.realtime_model, "voice": settings.voice }))
+        .send()
+        .await
+        .with_context(|| format!("POST {url} (realtime_create_session) failed"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "realtime_create_session: {url} returned {status}: {}",
+            body.chars().take(300).collect::<String>()
+        );
+    }
+    response
+        .json()
+        .await
+        .with_context(|| format!("realtime_create_session: parsing {url} response"))
+}
+
 pub(crate) fn public_message(message: Message) -> Message {
     let Message::Custom(custom) = message else {
         return message;

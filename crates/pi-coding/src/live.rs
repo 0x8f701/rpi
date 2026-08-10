@@ -910,9 +910,14 @@ mod tests {
     fn settings(base: &str) -> LiveRuntimeSettings {
         LiveRuntimeSettings {
             enabled: true,
+            mode: "stt".to_owned(),
             stt_base_url: base.to_owned(),
             stt_api_key: "test-live-key".to_owned(),
             stt_model: "whisper-1".to_owned(),
+            realtime_base_url: String::new(),
+            realtime_api_key: String::new(),
+            realtime_model: "gpt-realtime-1.5".to_owned(),
+            voice: "sol".to_owned(),
             language: None,
             allow_insecure: true,
         }

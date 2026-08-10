@@ -708,6 +708,9 @@ async fn non_loopback_policy_requires_explicit_opt_in() {
                 token_file,
                 allow_insecure_remote: false,
                 advertised_origin: None,
+                plaintext: true,
+                tls_cert: None,
+                tls_key: None,
                 session_factory: None,
             },
         )
@@ -740,6 +743,9 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
             token_file: None,
             allow_insecure_remote: true,
             advertised_origin: None,
+            plaintext: true,
+            tls_cert: None,
+            tls_key: None,
             session_factory: None,
         },
     )
@@ -882,6 +888,9 @@ async fn wildcard_listener_with_opt_in_enforces_token_over_loopback_connection()
             token_file: Some(token_path),
             allow_insecure_remote: true,
             advertised_origin: None,
+            plaintext: true,
+            tls_cert: None,
+            tls_key: None,
             session_factory: None,
         },
     )
@@ -935,6 +944,9 @@ async fn loopback_listen_accepts_v4_and_v6_with_and_without_token() {
                     token_file: token_file.as_deref().map(std::path::PathBuf::from),
                     allow_insecure_remote: false,
                     advertised_origin: None,
+                    plaintext: true,
+                    tls_cert: None,
+                    tls_key: None,
                     session_factory: None,
                 },
             )
@@ -2019,6 +2031,9 @@ fn binary_web_prompt_persists_and_restores_after_listener_restart() {
             .args([
                 "--listen",
                 &address.to_string(),
+                // TLS is the default transport; this test drives the binary
+                // over plain HTTP (http_rpc_binary), so opt out explicitly.
+                "--listen-plaintext",
                 "--model",
                 "faux/faux-1",
                 "--api-key",

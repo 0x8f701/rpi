@@ -2,7 +2,49 @@
 
 All notable changes to `rpi` are documented in this file.
 
-## [0.2.7] - 2026-08-09
+## [0.2.8] - 2026-08-10
+
+### Added
+
+- Built-in HTTPS for `--listen`: auto-generated self-signed TLS certificate
+  (rcgen + ring) by default; `--listen-cert`/`--listen-key` for real certificates;
+  `--listen-plaintext` to opt out of TLS. WebSocket (wss://) and collab work
+  over TLS without an external reverse proxy.
+- PTY interactive bash mode: `pty: true` + `input` parameter for commands that
+  prompt (e.g. `sudo`); portable-pty backend with process group reaping,
+  timeout/abort, and fallback to normal execution on spawn failure.
+- Codex Live realtime voice via CLIProxyAPI: WebRTC SDP exchange
+  (`RealtimeCreateCall`/`RealtimeCreateSession`/`RealtimeStop`) with sideband
+  WebSocket for transcript streaming; mode-aware mic button in Web UI.
+- Vision model delegation: non-vision models (e.g. DeepSeek) automatically
+  delegate image inputs to a configured `visionModel` for text description.
+- Web frontend: WebSocket heartbeat (30s ping, 60s dead detection, backoff
+  reconnect), highlight.js code highlighting (17 languages), mobile CSS
+  (sidebar drawer, touch targets, single-line composer), bash/tool cards,
+  file upload, hold-to-talk voice input, session titles, host switcher with
+  recent hosts, token configuration in Settings panel, rpi logo favicon.
+- Wider scrollbars (14px desktop, 24px touch) with hover/active states.
+
+### Changed
+
+- `--listen` defaults to HTTPS (self-signed); non-loopback TLS binds no longer
+  require `--listen-allow-insecure-remote`.
+- Tokenless browser same-origin auth accepts both `http://` and `https://`
+  origins.
+- Orchestration features (tasks, process, todo, glob) enabled in global
+  settings for Web mode.
+
+### Fixed
+
+- Self-signed private key cached with 0600 permissions; cache directory 0700.
+- PTY stdin EOF: VEOF (0x04) written when no input provided so `cat` exits.
+- PTY write errors now kill the child group instead of being silently ignored.
+- PTY spawn failure with `input` configured fails closed (no silent fallback
+  to non-interactive mode).
+- Empty certificate chain rejected before TLS server config construction.
+- Deprecated `subagents.agentOverrides` warnings silenced (migration still runs).
+- Insecure remote control plane warning removed.
+
 
 ### Changed
 
@@ -321,7 +363,6 @@ All notable changes to `rpi` are documented in this file.
 - `pi import-session` for converting `pi`, `omp`, `codex`, `claude`, `grok`,
   and `droid` sessions to native JSONL.
 - Default coding tools: `read`, `bash`, `edit`, and `write`; optional built-in
-  `grep`, `find`, and `ls` tools are available to custom sessions.
 - Multi-provider streaming support: OpenAI chat completions, OpenAI Responses,
   Anthropic Messages, and Google Generative AI.
 - Embedded model catalog with `pi models [filter]` listing plus local model
@@ -364,6 +405,7 @@ All notable changes to `rpi` are documented in this file.
   with a clear error.
 
 [0.2.7]: https://github.com/0x8f701/rpi/releases/tag/v0.2.7
+[0.2.8]: https://github.com/0x8f701/rpi/releases/tag/v0.2.8
 
 [0.2.6]: https://github.com/0x8f701/rpi/releases/tag/v0.2.6
 [0.2.5]: https://github.com/0x8f701/rpi/releases/tag/v0.2.5

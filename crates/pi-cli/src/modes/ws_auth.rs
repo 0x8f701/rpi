@@ -7,17 +7,20 @@
 //!
 //! - Loopback (127.0.0.0/8 or ::1) is always permitted. A token file is
 //!   optional; the control-plane listener's tokenless mode accepts native
-//!   clients and same-origin browsers whose request `Origin` is `http://`
-//!   with an authority matching the request's `Host` — the address the
-//!   user's browser actually used — rejecting ordinary unrelated
-//!   cross-origin pages. No advertised origin is required for this check.
+//!   clients and same-origin browsers whose request `Origin` is `http://` or
+//!   `https://` with an authority matching the request's `Host` — the
+//!   address the user's browser actually used — rejecting ordinary
+//!   unrelated cross-origin pages. No advertised origin is required for
+//!   this check.
 //! - `agent serve` always uses the strict loopback-only policy and rejects
 //!   tokenless browsers outright: ACP's tokenless transport accepts only
 //!   native clients without an `Origin` header.
-//! - `rpi --listen` may opt into non-loopback plaintext HTTP/WebSocket only
-//!   through its explicit insecure-remote flag; a token file is optional
-//!   there too. The token authenticates clients but does not encrypt the
-//!   bearer token or control traffic against passive network observers.
+//! - `rpi --listen` terminates TLS by default, so non-loopback binds are
+//!   permitted without a flag; non-loopback plaintext HTTP/WebSocket still
+//!   requires the explicit insecure-remote opt-in. A token file is optional
+//!   in either case. The token authenticates clients but does not encrypt
+//!   the bearer token or control traffic against passive network observers
+//!   (plaintext mode).
 //! - With a token configured, a client must present it either as an
 //!   `Authorization: Bearer <token>` header or as the `rpi-auth.<token>`
 //!   `Sec-WebSocket-Protocol` subprotocol. The matched subprotocol is echoed
@@ -152,7 +155,8 @@ pub(crate) fn normalize_host(value: &str) -> Option<String> {
 /// tokenless. A tokenless browser (browsers always send `Origin`) is accepted
 /// only when the caller permits Origin-bearing requests
 /// (`allow_tokenless_browser`, the control-plane listener) and the request
-/// is same-origin: exactly one valid `Origin` of `http://` whose authority
+/// is same-origin: exactly one valid `Origin` — `http://` or `https://`,
+/// whatever scheme the browser actually used — whose authority
 /// equals the request's single valid `Host` — the address the user's browser
 /// actually used, whatever LAN IP or hostname that is. Malformed or
 /// duplicate `Origin` or `Host` headers, and scheme/authority mismatches,
@@ -191,9 +195,13 @@ pub(crate) fn authorized(
         else {
             return false;
         };
-        // The transport is plaintext HTTP, so a same-origin browser page is
-        // necessarily an `http://` origin whose authority matches the Host.
-        return origin == format!("http://{host}");
+        // A same-origin browser page carries the scheme the browser actually
+        // used: `http://` for a plaintext listener, `https://` for TLS.
+        // Either scheme whose authority matches the request's Host is
+        // accepted; any other scheme is rejected.
+        let origin_http = format!("http://{host}");
+        let origin_https = format!("https://{host}");
+        return origin == origin_http || origin == origin_https;
     };
     let Some(value) = headers.get(http::header::AUTHORIZATION) else {
         return false;
@@ -219,7 +227,7 @@ pub(crate) fn constant_work_eq(candidate: &[u8], expected: &[u8]) -> bool {
     different == 0
 }
 
-/// Explicit pre-bind policy for plaintext HTTP/WebSocket transports.
+/// Explicit pre-bind policy for HTTP/WebSocket transports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ListenAddressPolicy {
     /// Permit only 127.0.0.0/8 and ::1.
@@ -227,6 +235,10 @@ pub(crate) enum ListenAddressPolicy {
     /// Permit non-loopback plaintext HTTP/WebSocket; a token file is
     /// optional (strongly recommended).
     AllowPlaintextRemote,
+    /// Permit non-loopback TLS-terminated HTTP/WebSocket without the
+    /// insecure-remote opt-in: TLS is not plaintext, so the flag is not
+    /// required. A token file is optional.
+    AllowTlsRemote,
 }
 
 /// Enforce the caller's address policy and load its authentication token.
@@ -246,7 +258,8 @@ pub(crate) fn load_auth_token(
              {address} is non-loopback. The transport is plaintext HTTP/WebSocket."
         );
     }
-    // Non-loopback with the explicit plaintext opt-in: a token is optional.
+    // Non-loopback with the explicit plaintext opt-in, or TLS: a token is
+    // optional.
     path.map(read_token_file).transpose()
 }
 
@@ -304,6 +317,7 @@ mod tests {
             for policy in [
                 ListenAddressPolicy::LoopbackOnly,
                 ListenAddressPolicy::AllowPlaintextRemote,
+                ListenAddressPolicy::AllowTlsRemote,
             ] {
                 assert!(
                     load_auth_token(address, None, "--listen", policy)
@@ -331,10 +345,13 @@ mod tests {
             for policy in [
                 ListenAddressPolicy::LoopbackOnly,
                 ListenAddressPolicy::AllowPlaintextRemote,
+                ListenAddressPolicy::AllowTlsRemote,
             ] {
                 for path in [None, Some(token.as_path())] {
+                    // Loopback-only refuses every non-loopback bind; the
+                    // plaintext opt-in and TLS both permit them.
                     let should_allow =
-                        policy == ListenAddressPolicy::AllowPlaintextRemote;
+                        policy != ListenAddressPolicy::LoopbackOnly;
                     let result = load_auth_token(address, path, "--listen", policy);
                     if should_allow {
                         assert_eq!(
@@ -544,9 +561,25 @@ mod tests {
             http::HeaderValue::from_static("http://127.0.0.1:9000"),
         );
         assert!(!authorized(&headers, None, true));
-        // The transport is plaintext HTTP: the Origin scheme must be
-        // `http://` even when the authority matches the Host.
-        for bad_scheme in ["https://127.0.0.1:8765", "ftp://127.0.0.1:8765"] {
+        // Either scheme the browser actually used — `http://` for a
+        // plaintext listener, `https://` for TLS — is accepted when the
+        // authority matches the Host; any other scheme is rejected.
+        for good_scheme in ["http://127.0.0.1:8765", "https://127.0.0.1:8765"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::HOST,
+                http::HeaderValue::from_static("127.0.0.1:8765"),
+            );
+            headers.insert(
+                http::header::ORIGIN,
+                http::HeaderValue::from_str(good_scheme).expect("header value"),
+            );
+            assert!(
+                authorized(&headers, None, true),
+                "origin {good_scheme:?} must be accepted on the listener"
+            );
+        }
+        for bad_scheme in ["ftp://127.0.0.1:8765"] {
             let mut headers = HeaderMap::new();
             headers.insert(
                 http::header::HOST,
@@ -558,7 +591,7 @@ mod tests {
             );
             assert!(
                 !authorized(&headers, None, true),
-                "origin {bad_scheme:?} must be rejected on the http listener"
+                "origin {bad_scheme:?} must be rejected on the listener"
             );
         }
     }

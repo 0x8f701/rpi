@@ -324,6 +324,7 @@ pub const SETTINGS_CATALOG: &[SettingDef] = &[
     setting!("maxTokens", Models, POSITIVE_I64, "null", "Maximum output tokens per model request.", NONE, ALL, LIVE, false, false),
     setting!("cacheRetention", Models, SettingValueType::Enum, "\"short\"", "Prompt-cache retention policy.", &["none", "short", "long"], ALL, LIVE, false, false),
     setting!("responsesStatefulChain", Models, BOOL, "false", "Opt-in stateful turn chaining for OpenAI Responses API models: carry previous_response_id across turns per session instead of resending full history.", NONE, ALL, LIVE, false, false),
+    setting!("visionModel", Models, STRING, "null", "Model spec (provider/id or bare id) used to describe images when the active chat model does not support image input. Prompts containing image blocks are delegated to this model and replaced with its text description before reaching the main model.", NONE, ALL, LIVE, false, false),
 
     setting!("steeringMode", Session, SettingValueType::Enum, "\"one-at-a-time\"", "Queue behavior for steering messages.", &["all", "one-at-a-time"], ALL, LIVE, false, false),
     setting!("followUpMode", Session, SettingValueType::Enum, "\"one-at-a-time\"", "Queue behavior for follow-up messages.", &["all", "one-at-a-time"], ALL, LIVE, false, false),
@@ -896,7 +897,7 @@ mod tests {
             "retry.modelFallback", "retry.fallbackChains",
             "branchSummary.reserveTokens", "branchSummary.skipPrompt", "steeringMode", "followUpMode", "autoRetry",
             "maxRetries", "baseDelayMs", "transport", "timeoutMs", "maxRetryDelayMs", "temperature", "maxTokens",
-            "cacheRetention", "responsesStatefulChain", "thinkingBudgets.minimal", "thinkingBudgets.low", "thinkingBudgets.medium",
+            "cacheRetention", "responsesStatefulChain", "visionModel", "thinkingBudgets.minimal", "thinkingBudgets.low", "thinkingBudgets.medium",
             "thinkingBudgets.high", "showImages", "imageWidthCells", "autoResizeImages", "httpIdleTimeoutMs",
             "websocketConnectTimeoutMs", "scopedModels", "keybindings", "quietStartup", "hideThinkingBlock",
             "showThinking", "exposeSessionEnvironment", "doubleEscapeAction", "orchestration.process",

@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use pi_coding::Application;
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -19,6 +20,7 @@ use tokio::{
     sync::{mpsc, watch},
     task::{JoinHandle, JoinSet},
 };
+use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 use tokio_tungstenite::{
     accept_hdr_async_with_config,
     tungstenite::{
@@ -99,6 +101,14 @@ const DEFAULT_WS_TIMEOUTS: WebSocketTimeouts = WebSocketTimeouts {
 /// binary. `vite dev` is the primary dev loop and needs no override.
 const RPI_WEB_DEV_DIR: &str = "RPI_WEB_DEV_DIR";
 
+/// Cache file names for the auto-generated self-signed listener certificate,
+/// stored under the standard agent home directory (`~/.pi/agent/`) so the
+/// same certificate persists across restarts: a browser's one-time
+/// acceptance of the self-signed certificate keeps working instead of
+/// warning on every fresh pair.
+const LISTEN_CERT_CACHE_NAME: &str = "listen-cert.pem";
+const LISTEN_KEY_CACHE_NAME: &str = "listen-key.pem";
+
 #[derive(Clone)]
 pub struct ListenConfig {
     pub address: SocketAddr,
@@ -112,6 +122,15 @@ pub struct ListenConfig {
     /// and other specific binds synthesize from the bound address and never
     /// need this.
     pub advertised_origin: Option<String>,
+    /// Serve plaintext HTTP/WebSocket instead of terminating TLS. When
+    /// `false` (the default) the listener uses HTTPS: either the certificate
+    /// pair in `tls_cert`/`tls_key` or an auto-generated self-signed
+    /// certificate cached under `~/.pi/agent/`.
+    pub plaintext: bool,
+    /// TLS certificate file (PEM) for HTTPS, paired with `tls_key`.
+    pub tls_cert: Option<PathBuf>,
+    /// TLS private key file (PEM) for HTTPS, paired with `tls_cert`.
+    pub tls_key: Option<PathBuf>,
     /// Factory that builds manager-owned session runtimes for the Web
     /// control plane (switch_session / new_session / fork / clone). `None`
     /// disables lifecycle opens with a clear error; tests inject a faux
@@ -122,6 +141,9 @@ pub struct ListenConfig {
 pub struct ListenHandle {
     address: SocketAddr,
     advertised_origin: Option<String>,
+    /// Whether the listener terminates TLS (https) or serves plaintext
+    /// (http). Drives the scheme of synthesized link URLs.
+    tls: bool,
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<()>>,
     manager: std::sync::Arc<SessionRuntimeManager>,
@@ -139,13 +161,14 @@ impl ListenHandle {
     }
     /// Effective advertised origin used to build collaboration links.
     ///
-    /// Loopback and other specific binds synthesize `http://<bound address>`
+    /// Loopback and other specific binds synthesize the scheme-appropriate
+    /// `https://<bound address>` (or `http://` with `--listen-plaintext`)
     /// automatically; a wildcard bind (0.0.0.0/::) yields `None` unless an
     /// explicit advertised origin was configured, so `/collab` fails closed
     /// instead of printing links synthesized from an unreachable wildcard.
     #[must_use]
     pub fn base_url(&self) -> Option<String> {
-        advertised_base_url(self.address, self.advertised_origin.as_deref())
+        advertised_base_url(self.address, self.advertised_origin.as_deref(), self.tls)
     }
 
     pub async fn stop(self) -> Result<()> {
@@ -193,6 +216,10 @@ pub async fn start(
 ) -> Result<ListenHandle> {
     let policy = if config.allow_insecure_remote {
         ListenAddressPolicy::AllowPlaintextRemote
+    } else if !config.plaintext {
+        // TLS is the default transport; a non-loopback HTTPS listener is not
+        // plaintext, so it needs no insecure-remote opt-in.
+        ListenAddressPolicy::AllowTlsRemote
     } else {
         ListenAddressPolicy::LoopbackOnly
     };
@@ -208,19 +235,38 @@ pub async fn start(
     let address = listener
         .local_addr()
         .context("reading control plane listener address")?;
+    // TLS is the default transport: `--listen-plaintext` opts out; an
+    // explicit --listen-cert/--listen-key pair loads a real certificate;
+    // otherwise a self-signed certificate is generated and cached. Build the
+    // acceptor before allocating the session manager so certificate problems
+    // fail fast as startup errors.
+    let tls = if config.plaintext {
+        None
+    } else {
+        Some(
+            make_tls_acceptor(
+                config.tls_cert.as_deref(),
+                config.tls_key.as_deref(),
+                address,
+            )
+            .await?,
+        )
+    };
+    let tls_active = tls.is_some();
     let manager = SessionRuntimeManager::new(application, extension_ui, config.session_factory).await;
     let collab = CollabService::new(manager.clone());
     let state = ServerState {
         manager: manager.clone(),
         collab: collab.clone(),
         token: token.map(Arc::from),
-        base_url: advertised_base_url(address, config.advertised_origin.as_deref()),
+        base_url: advertised_base_url(address, config.advertised_origin.as_deref(), tls_active),
     };
     let (shutdown, shutdown_rx) = watch::channel(false);
-    let task = tokio::spawn(run_listener(listener, state, shutdown_rx));
+    let task = tokio::spawn(run_listener(listener, tls, state, shutdown_rx));
     Ok(ListenHandle {
         address,
         advertised_origin: config.advertised_origin,
+        tls: tls_active,
         shutdown,
         task,
         manager,
@@ -315,18 +361,149 @@ pub(crate) fn parse_advertised_origin(input: &str) -> Result<String> {
 /// Resolve the effective advertised origin used to build collaboration links.
 ///
 /// An explicitly configured `--listen-advertised-origin` wins. Loopback and
-/// other specific bind addresses synthesize `http://<bound address>`
-/// automatically, unchanged. A wildcard bind (0.0.0.0/::) without an explicit
+/// other specific bind addresses synthesize `<scheme>://<bound address>`
+/// automatically, using `https` when the listener terminates TLS and `http`
+/// for `--listen-plaintext`. A wildcard bind (0.0.0.0/::) without an explicit
 /// origin yields `None` so `/collab` and `collab_start` fail closed instead
 /// of printing unreachable links.
-fn advertised_base_url(bind: SocketAddr, advertised: Option<&str>) -> Option<String> {
-    advertised
-        .map(str::to_owned)
-        .or_else(|| (!bind.ip().is_unspecified()).then(|| format!("http://{bind}")))
+fn advertised_base_url(bind: SocketAddr, advertised: Option<&str>, tls: bool) -> Option<String> {
+    advertised.map(str::to_owned).or_else(|| {
+        (!bind.ip().is_unspecified()).then(|| {
+            let scheme = if tls { "https" } else { "http" };
+            format!("{scheme}://{bind}")
+        })
+    })
+}
+
+/// Cache directory for the auto-generated self-signed certificate
+/// (`~/.pi/agent/`, the standard agent home layout).
+fn listen_cert_cache_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!("home directory is unavailable for the self-signed certificate cache")
+        })?;
+    Ok(PathBuf::from(home).join(".pi").join("agent"))
+}
+
+/// Pin a file or directory to owner-only permissions (the private key and
+/// its cache directory). Self-signed key material is a credential; default
+/// umask-derived permissions could expose it to other local users.
+#[cfg(unix)]
+fn ensure_owner_only_permissions(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting permissions on {}", path.display()))
+}
+
+/// Generate (once) and cache the self-signed listener certificate, returning
+/// the cert/key PEM paths. A complete existing pair is reused so the
+/// certificate stays stable across restarts — a browser's one-time
+/// acceptance of the self-signed certificate keeps working. `bind` only
+/// influences the generated certificate's subject alternative names.
+async fn self_signed_cert_paths(bind: SocketAddr) -> Result<(PathBuf, PathBuf)> {
+    let dir = listen_cert_cache_dir()?;
+    let cert_path = dir.join(LISTEN_CERT_CACHE_NAME);
+    let key_path = dir.join(LISTEN_KEY_CACHE_NAME);
+    // The cache directory holds the private key; pin it to owner-only (0700)
+    // so a permissive umask cannot expose the key. `create_dir_all` is
+    // idempotent, so this also hardens a directory created by older builds.
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("creating certificate cache directory {}", dir.display()))?;
+    #[cfg(unix)]
+    ensure_owner_only_permissions(&dir, 0o700)?;
+    if tokio::fs::try_exists(&cert_path).await.unwrap_or(false)
+        && tokio::fs::try_exists(&key_path).await.unwrap_or(false)
+    {
+        // Reuse path: a key written before the 0600 enforcement may still
+        // carry permissive permissions; harden it here too.
+        #[cfg(unix)]
+        ensure_owner_only_permissions(&key_path, 0o600)?;
+        return Ok((cert_path, key_path));
+    }
+    // Modern browsers require the requested host/IP to appear in the
+    // subject alternative names before they even show the self-signed
+    // interstitial, so the bound address (plus localhost) is included.
+    let mut subject_alt_names = vec!["localhost".to_owned()];
+    if !bind.ip().is_unspecified() {
+        subject_alt_names.push(bind.ip().to_string());
+    }
+    let mut params = CertificateParams::new(subject_alt_names)
+        .context("building self-signed certificate parameters")?;
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(DnType::CommonName, "rpi-listener");
+    let signing_key = KeyPair::generate().context("generating self-signed key pair")?;
+    let cert = params
+        .self_signed(&signing_key)
+        .context("generating self-signed certificate")?;
+    let cert_pem = cert.pem();
+    let key_pem = signing_key.serialize_pem();
+    tokio::fs::write(&cert_path, cert_pem).await.with_context(|| {
+        format!(
+            "writing self-signed certificate to {}",
+            cert_path.display()
+        )
+    })?;
+    tokio::fs::write(&key_path, key_pem).await.with_context(|| {
+        format!(
+            "writing self-signed private key to {}",
+            key_path.display()
+        )
+    })?;
+    // The private key is a credential: owner-only (0600) on Unix.
+    #[cfg(unix)]
+    ensure_owner_only_permissions(&key_path, 0o600)?;
+    Ok((cert_path, key_path))
+}
+
+/// Build the TLS acceptor for the control plane listener.
+///
+/// With an explicit `--listen-cert`/`--listen-key` pair (enforced at CLI
+/// parse time) the PEM files are loaded as-is, e.g. a Let's Encrypt
+/// fullchain and private key. Without them a self-signed certificate is
+/// generated with rcgen and cached under `~/.pi/agent/` so the same
+/// certificate persists across restarts. The handshake and HTTP/WebSocket
+/// processing share the same stream type, so TLS termination slots in before
+/// the request parser without changing anything downstream.
+async fn make_tls_acceptor(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    bind: SocketAddr,
+) -> Result<TlsAcceptor> {
+    // rustls 0.23 requires an explicit CryptoProvider; install ring (already
+    // in the dependency tree via rcgen/reqwest) before building ServerConfig.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let (cert_path, key_path) = match (cert_path, key_path) {
+        (None, None) => self_signed_cert_paths(bind).await?,
+        _ => bail!("--listen-cert and --listen-key must be provided together"),
+    };
+    let cert_pem = tokio::fs::read(&cert_path)
+        .await
+        .with_context(|| format!("reading TLS certificate {}", cert_path.display()))?;
+    let key_pem = tokio::fs::read(&key_path)
+        .await
+        .with_context(|| format!("reading TLS private key {}", key_path.display()))?;
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing TLS certificate {}", cert_path.display()))?;
+    if certs.is_empty() {
+        bail!("no certificates found in {}", cert_path.display());
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .with_context(|| format!("parsing TLS private key {}", key_path.display()))?
+        .ok_or_else(|| anyhow!("no private key found in {}", key_path.display()))?;
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("building TLS server configuration from certificate and key")?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 async fn run_listener(
     listener: TcpListener,
+    tls: Option<TlsAcceptor>,
     state: ServerState,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -341,11 +518,32 @@ async fn run_listener(
                 break;
             }
             accepted = listener.accept(), if connections.len() < MAX_CONNECTION_TASKS => {
-                let (stream, _) = accepted.context("accepting control plane connection")?;
+                let (tcp_stream, _) = accepted.context("accepting control plane connection")?;
                 let state = state.clone();
-                connections.spawn(async move {
-                    let _ = handle_connection(stream, state).await;
-                });
+                // Complete the TLS handshake on the accept loop before spawning
+                // the connection handler. TlsAcceptor::accept returns a future
+                // that is not Send (it borrows the acceptor and the handshake
+                // state machine across awaits), so it cannot live inside the
+                // spawned future that JoinSet requires to be Send. Performing it
+                // here yields a fully established TlsStream<TcpStream> — which is
+                // Send — and the spawned handler stays Send. TLS handshake
+                // failures (a plaintext client on the TLS port, a malformed
+                // ClientHello) drop only that connection; the accept loop keeps
+                // serving.
+                if let Some(acceptor) = &tls {
+                    match acceptor.accept(tcp_stream).await {
+                        Ok(tls_stream) => {
+                            connections.spawn(async move {
+                                let _ = handle_connection(tls_stream, state).await;
+                            });
+                        }
+                        Err(_) => continue,
+                    }
+                } else {
+                    connections.spawn(async move {
+                        let _ = handle_connection(tcp_stream, state).await;
+                    });
+                }
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 joined
@@ -363,7 +561,15 @@ async fn run_listener(
     Ok(())
 }
 
-async fn handle_connection(mut stream: TcpStream, state: ServerState) -> Result<()> {
+/// Handle one accepted control-plane connection. `S` is the transport: a
+/// plain `TcpStream` for `--listen-plaintext` or a
+/// `tokio_rustls::server::TlsStream<TcpStream>` after the TLS handshake.
+/// Both implement [`AsyncRead`] + [`AsyncWrite`] + `Unpin` + `Send`, so HTTP
+/// parsing and the WebSocket upgrade run unchanged on either.
+async fn handle_connection<S>(mut stream: S, state: ServerState) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let raw = match tokio::time::timeout(READ_TIMEOUT, read_http_request(&mut stream)).await {
         Ok(Ok(request)) => request,
         Ok(Err(error)) => {
@@ -575,9 +781,10 @@ struct RequestError {
     message: &'static str,
 }
 
-async fn read_http_request(
-    stream: &mut TcpStream,
-) -> std::result::Result<RawRequest, RequestError> {
+async fn read_http_request<S>(stream: &mut S) -> std::result::Result<RawRequest, RequestError>
+where
+    S: AsyncRead + Unpin,
+{
     let mut bytes = Vec::with_capacity(1024);
     let end = loop {
         let mut chunk = [0_u8; 1024];
@@ -685,11 +892,14 @@ fn parse_request_headers(
     })
 }
 
-async fn read_body(
-    stream: &mut TcpStream,
+async fn read_body<S>(
+    stream: &mut S,
     mut body: Vec<u8>,
     length: usize,
-) -> std::result::Result<Vec<u8>, RequestError> {
+) -> std::result::Result<Vec<u8>, RequestError>
+where
+    S: AsyncRead + Unpin,
+{
     if body.len() > length {
         body.truncate(length);
         return Ok(body);
@@ -716,13 +926,16 @@ async fn read_body(
     Ok(body)
 }
 
-struct PrefixedStream {
+struct PrefixedStream<S> {
     prefix: Vec<u8>,
     offset: usize,
-    stream: TcpStream,
+    stream: S,
 }
 
-impl AsyncRead for PrefixedStream {
+impl<S> AsyncRead for PrefixedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         context: &mut TaskContext<'_>,
@@ -740,7 +953,10 @@ impl AsyncRead for PrefixedStream {
     }
 }
 
-impl AsyncWrite for PrefixedStream {
+impl<S> AsyncWrite for PrefixedStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         context: &mut TaskContext<'_>,
@@ -800,13 +1016,16 @@ enum WriterControl {
 // Subscribe before accepting the WebSocket upgrade. Once the client observes
 // a successful handshake, every subsequent application/UI event must have an
 // active receiver rather than racing the server's post-handshake setup.
-async fn collab_websocket_connection(
-    stream: TcpStream,
+async fn collab_websocket_connection<S>(
+    stream: S,
     raw: RawRequest,
     mut connection: super::collab_service::CollabConnection,
     protocol: String,
     timeouts: WebSocketTimeouts,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let path = raw.path.clone();
     let mut prefix = raw.raw_headers;
     prefix.extend_from_slice(&raw.remainder);
@@ -988,13 +1207,16 @@ fn collab_stopped_close_frame() -> CloseFrame {
 }
 
 
-async fn websocket_connection(
-    stream: TcpStream,
+async fn websocket_connection<S>(
+    stream: S,
     raw: RawRequest,
     state: ServerState,
     protocol: Option<String>,
     timeouts: WebSocketTimeouts,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Fan-in: the manager merges every session runtime's projected events
     // (tagged with the owning top-level `sessionId`); every connection sees
     // every session's events, and commands route explicitly by sessionId.
@@ -1330,7 +1552,10 @@ fn content_length(headers: &HeaderMap) -> Option<usize> {
     Some(first)
 }
 
-async fn serve_web_page(stream: &mut TcpStream) -> Result<()> {
+async fn serve_web_page<S>(stream: &mut S) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     if let Ok(dir) = std::env::var(RPI_WEB_DEV_DIR)
         && !dir.trim().is_empty()
     {
@@ -1343,29 +1568,38 @@ async fn serve_web_page(stream: &mut TcpStream) -> Result<()> {
     write_response(stream, StatusCode::OK, mime, bytes).await
 }
 
-async fn write_plain_response(
-    stream: &mut TcpStream,
+async fn write_plain_response<S>(
+    stream: &mut S,
     status: StatusCode,
     message: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     write_response(stream, status, "text/plain; charset=utf-8", message.as_bytes()).await
 }
 
-async fn write_json_response<T: Serialize>(
-    stream: &mut TcpStream,
+async fn write_json_response<T: Serialize, S>(
+    stream: &mut S,
     status: StatusCode,
     value: &T,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let body = serde_json::to_vec(value).context("serializing HTTP RPC response")?;
     write_response(stream, status, CONTENT_TYPE_JSON, &body).await
 }
 
-async fn write_response(
-    stream: &mut TcpStream,
+async fn write_response<S>(
+    stream: &mut S,
     status: StatusCode,
     content_type: &str,
     body: &[u8],
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let reason = status.canonical_reason().unwrap_or("Error");
     let header = format!(
         "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -1572,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_policy_keeps_default_strict_and_allows_plaintext_remote_opt_in() {
+    fn auth_policy_keeps_default_strict_and_allows_plaintext_and_tls_remote() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("token-file");
         std::fs::write(&token, b"fixture-value").unwrap();
@@ -1623,6 +1857,28 @@ mod tests {
                     Some(&token),
                     "--listen",
                     ListenAddressPolicy::AllowPlaintextRemote,
+                )
+                .unwrap(),
+                Some(b"fixture-value".to_vec())
+            );
+            // TLS is not plaintext: non-loopback binds pass without the
+            // insecure-remote opt-in, with or without a token.
+            assert_eq!(
+                load_auth_token(
+                    address,
+                    None,
+                    "--listen",
+                    ListenAddressPolicy::AllowTlsRemote,
+                )
+                .unwrap(),
+                None
+            );
+            assert_eq!(
+                load_auth_token(
+                    address,
+                    Some(&token),
+                    "--listen",
+                    ListenAddressPolicy::AllowTlsRemote,
                 )
                 .unwrap(),
                 Some(b"fixture-value".to_vec())
@@ -2078,35 +2334,46 @@ mod tests {
     #[test]
     fn wildcard_binds_fail_closed_without_advertised_origin_and_loopback_stays_automatic() {
         // IPv4 and IPv6 wildcards: no origin -> fail closed (None); a
-        // configured origin is used verbatim in both cases.
+        // configured origin is used verbatim in both cases, whatever the
+        // transport scheme.
         for address in ["0.0.0.0:4321", "[::]:4321"] {
             let bind: SocketAddr = address.parse().expect("wildcard bind");
             assert!(bind.ip().is_unspecified(), "{address} must be a wildcard");
             assert_eq!(
-                advertised_base_url(bind, None),
+                advertised_base_url(bind, None, false),
                 None,
                 "{address} must fail closed without an advertised origin"
             );
             assert_eq!(
-                advertised_base_url(bind, Some("https://lan.example:8443")),
+                advertised_base_url(bind, Some("https://lan.example:8443"), true),
                 Some("https://lan.example:8443".to_owned()),
                 "{address} must use the configured origin"
             );
         }
-        // Loopback stays automatic, both stacks.
+        // Loopback stays automatic, both stacks: https by default, http with
+        // the explicit plaintext opt-out.
         for address in ["127.0.0.1:4321", "[::1]:4321"] {
             let bind: SocketAddr = address.parse().expect("loopback bind");
             assert!(bind.ip().is_loopback(), "{address} must be loopback");
             assert_eq!(
-                advertised_base_url(bind, None),
+                advertised_base_url(bind, None, true),
+                Some(format!("https://{bind}")),
+                "TLS loopback {address} must synthesize https from the bound address"
+            );
+            assert_eq!(
+                advertised_base_url(bind, None, false),
                 Some(format!("http://{bind}")),
-                "loopback {address} must synthesize from the bound address"
+                "plaintext loopback {address} must synthesize http from the bound address"
             );
         }
         // A specific non-loopback bind keeps synthesizing from the address.
         let bind: SocketAddr = "198.51.100.7:4321".parse().expect("specific bind");
         assert_eq!(
-            advertised_base_url(bind, None),
+            advertised_base_url(bind, None, true),
+            Some("https://198.51.100.7:4321".to_owned())
+        );
+        assert_eq!(
+            advertised_base_url(bind, None, false),
             Some("http://198.51.100.7:4321".to_owned())
         );
     }

@@ -11,6 +11,7 @@ import {
   StreamingAssistant,
   FinalAssistant,
   ToolCard,
+  BashCard,
   ToastList,
 } from './App';
 import type { ContentBlock } from './types';
@@ -500,17 +501,14 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
               return <ToolCard key={item.id} item={item} />;
             case 'toolResult':
               return (
-                <div key={item.id} className="msg msg--bash">
-                  <pre className="bash-output">{item.text === '' ? '(empty tool result)' : item.text}</pre>
-                </div>
+                <BashCard
+                  key={item.id}
+                  label="tool output"
+                  output={item.text === '' ? '(empty tool result)' : item.text}
+                />
               );
             case 'bash':
-              return (
-                <div key={item.id} className="msg msg--bash">
-                  <div className="bash-cmd">$ {item.command}</div>
-                  <pre className="bash-output">{item.output}</pre>
-                </div>
-              );
+              return <BashCard key={item.id} command={item.command} output={item.output} />;
             case 'custom':
               return (
                 <div key={item.id} className="msg msg--custom" role="note">
