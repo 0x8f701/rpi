@@ -96,6 +96,9 @@ async function main() {
   const browser = await chromium.launch(launchOptions);
   try {
     const page = await browser.newPage();
+    if (token) {
+      await page.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
+    }
     page.on('pageerror', (err) => {
       console.error(`web-goal: page error: ${err.message}`);
     });
@@ -103,13 +106,6 @@ async function main() {
     // 1. Page loads; WS connects via the rpi-auth.<token> subprotocol (Settings panel).
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    if (token) {
-      await page.click('#settings-toggle-btn');
-      await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
-      await page.fill('#settings-token-input', token);
-      await page.click('#settings-token-save-btn');
-      await page.click('#settings-close-btn');
-    }
     await waitFor(
       page,
       () => document.getElementById('conn-state').dataset.state === 'on',
