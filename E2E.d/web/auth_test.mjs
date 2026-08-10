@@ -78,8 +78,11 @@ async function main() {
     if (everOn) fail('WS reached "connected" without a token');
 
     // 2. Wrong token: explicit Connect must surface the error toast and fail.
-    await page.fill('#token-input', wrongToken);
-    await page.click('#connect-btn');
+    await page.click('#settings-toggle-btn');
+    await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
+    await page.fill('#settings-token-input', wrongToken);
+    await page.click('#settings-token-save-btn');
+    await page.click('#settings-close-btn');
     await waitFor(
       page,
       () =>
@@ -92,8 +95,11 @@ async function main() {
     if (everOn) fail('WS reached "connected" with a wrong token');
 
     // 3. Good token: Connect reaches "connected" and the session works.
-    await page.fill('#token-input', token);
-    await page.click('#connect-btn');
+    await page.click('#settings-toggle-btn');
+    await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
+    await page.fill('#settings-token-input', token);
+    await page.click('#settings-token-save-btn');
+    await page.click('#settings-close-btn');
     await waitFor(
       page,
       () => document.getElementById('conn-state').dataset.state === 'on',

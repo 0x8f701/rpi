@@ -61,8 +61,11 @@ async function main() {
     await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
 
     // 1. Core flow: connect with the token, prompt round-trip, open a panel.
-    await page.fill('#token-input', token);
-    await page.click('#connect-btn');
+    await page.click('#settings-toggle-btn');
+    await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
+    await page.fill('#settings-token-input', token);
+    await page.click('#settings-token-save-btn');
+    await page.click('#settings-close-btn');
     await waitFor(
       page,
       () => document.getElementById('conn-state').dataset.state === 'on',
@@ -163,7 +166,7 @@ async function main() {
       const drawer = rect('#todo-panel');
       // #abort-btn is active-only, so it is NOT in the DOM while idle; it is
       // asserted separately while streaming above.
-      const targets = ['#send-btn', '#connect-btn', '#todos-toggle-btn'].map((sel) => ({
+      const targets = ['#send-btn', '#settings-toggle-btn', '#todos-toggle-btn'].map((sel) => ({
         sel,
         height: rect(sel) ? rect(sel).height : -1,
       }));

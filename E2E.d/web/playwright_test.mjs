@@ -71,11 +71,14 @@ async function main() {
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
     await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
 
-    // 2. WS connects via the rpi-auth.<token> subprotocol.
+    // 2. WS connects via the rpi-auth.<token> subprotocol (Settings panel).
     if (token) {
-      await page.fill('#token-input', token);
+      await page.click('#settings-toggle-btn');
+      await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
+      await page.fill('#settings-token-input', token);
+      await page.click('#settings-token-save-btn');
+      await page.click('#settings-close-btn');
     }
-    await page.click('#connect-btn');
     await waitFor(
       page,
       () => document.getElementById('conn-state').dataset.state === 'on',

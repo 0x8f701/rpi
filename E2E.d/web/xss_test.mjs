@@ -74,8 +74,11 @@ async function main() {
     await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
 
     // Connect via the rpi-auth.<token> subprotocol.
-    await page.fill('#token-input', token);
-    await page.click('#connect-btn');
+    await page.click('#settings-toggle-btn');
+    await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
+    await page.fill('#settings-token-input', token);
+    await page.click('#settings-token-save-btn');
+    await page.click('#settings-close-btn');
     await waitFor(
       page,
       () => document.getElementById('conn-state').dataset.state === 'on',

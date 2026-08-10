@@ -286,8 +286,11 @@ async function main() {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'T0.1: page title missing');
     await waitFor(page, () => document.querySelector('#conn-state') !== null, 'T0.1: conn-state missing');
-    await page.fill('#token-input', token);
-    await page.click('#connect-btn');
+    await page.click('#settings-toggle-btn');
+    await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
+    await page.fill('#settings-token-input', token);
+    await page.click('#settings-token-save-btn');
+    await page.click('#settings-close-btn');
     await waitFor(
       page,
       () => document.getElementById('conn-state').dataset.state === 'on',
@@ -691,8 +694,11 @@ async function main() {
     });
     await mobile.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(mobile, () => document.title === 'rpi web', 'T7.1: mobile page title missing');
-    await mobile.fill('#token-input', token);
-    await mobile.click('#connect-btn');
+    await mobile.click('#settings-toggle-btn');
+    await waitFor(mobile, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
+    await mobile.fill('#settings-token-input', token);
+    await mobile.click('#settings-token-save-btn');
+    await mobile.click('#settings-close-btn');
     await waitFor(
       mobile,
       () => document.getElementById('conn-state').dataset.state === 'on',

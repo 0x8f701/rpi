@@ -174,8 +174,11 @@ async function main() {
     /* ---- boot + connect ---- */
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
-    await page.fill('#token-input', token);
-    await page.click('#connect-btn');
+    await page.click('#settings-toggle-btn');
+    await waitFor(page, () => document.querySelector('#settings-token-input') !== null, 'settings token input missing');
+    await page.fill('#settings-token-input', token);
+    await page.click('#settings-token-save-btn');
+    await page.click('#settings-close-btn');
     await waitFor(page, () => document.getElementById('conn-state').dataset.state === 'on', 'WS did not connect');
     await waitFor(
       page,
