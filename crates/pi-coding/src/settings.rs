@@ -449,7 +449,7 @@ pub struct LiveSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_model: Option<String>,
     /// Base URL for the realtime (Codex Live) endpoint, typically
-    /// CLIProxyAPI's address (e.g. `http://192.168.1.76:8317`). Used when
+    /// CLIProxyAPI's address (e.g. `http://localhost:8317`). Used when
     /// `mode` is `"realtime"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realtime_base_url: Option<String>,
