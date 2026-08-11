@@ -11,7 +11,7 @@ releases in the background. If a newer release exists, a non-fatal status
 message is shown:
 
 ```text
-Update available: current v0.2.7, latest v0.2.8 — summary — URL (run `rpi update --self`)
+Update available: current v0.2.8, latest v0.2.9 — summary — URL (run `rpi update --self`)
 ```
 
 Source: `crates/pi-cli/src/self_update.rs:187-213`.

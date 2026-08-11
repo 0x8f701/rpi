@@ -64,9 +64,9 @@ does not force print mode.
 | `--approve` | `-a` | | Trust project-local `.pi` settings/resources for this run only. |
 | `--no-approve` | | | Refuse project-local `.pi` settings/resources for this run only. |
 | `--approval-mode <MODE>` | | `yolo\|write\|ask` | Host tool approval policy. `yolo` allows all capabilities, `write` confirms Exec, and `ask` confirms every tool call. Non-interactive confirmation fails closed. This is separate from project trust flags. |
-| `--listen <SOCKET_ADDR>` | | e.g. `127.0.0.1:8765` | Start the headless Web-only HTTP/WebSocket service. Serves `/web`, `/ws`, and `/rpc`; never starts a TUI or REPL and stays alive with closed stdin until Ctrl-C/SIGTERM. Positional prompts are rejected; submit them through the Web/RPC API. Loopback is the default. Authentication is optional: a tokenless loopback bind accepts same-origin browsers and native clients; non-loopback binds require `--listen-allow-insecure-remote` (token optional there too). |
-| `--listen-token-file <PATH>` | | token file | Optional Bearer token file. When set, the token is mandatory on every bind (browsers present `rpi-auth.<token>`; `/rpc` requires `Authorization: Bearer`). When unset, the listener is tokenless: loopback accepts same-origin browsers, and `--listen-allow-insecure-remote` accepts same-origin LAN browsers (browser `Origin` authority equals HTTP `Host`). |
-| `--listen-allow-insecure-remote` | | | Permit a non-loopback `--listen` address (token optional). Plaintext HTTP/WebSocket exposes any bearer token and control traffic to passive network observers. |
+| `--listen <SOCKET_ADDR>` | | e.g. `127.0.0.1:8765` | Start the headless Web-only HTTPS/WebSocket service. Serves `/web`, `/ws`, and `/rpc`; never starts a TUI or REPL and stays alive with closed stdin until Ctrl-C/SIGTERM. Positional prompts are rejected; submit them through the Web/RPC API. Uses HTTPS with a self-signed certificate by default (`--listen-cert`/`--listen-key` for real certs; `--listen-plaintext` to opt out). Loopback may be tokenless; a non-loopback HTTPS bind requires `--listen-token-file` (rejected pre-bind without one). |
+| `--listen-token-file <PATH>` | | token file | Bearer token file. Mandatory for non-loopback HTTPS unless `--listen-allow-insecure-remote` is used. When set, the token is required on every bind (browsers present `rpi-auth.<token>`; `/rpc` requires `Authorization: Bearer`). When unset, the listener is tokenless on loopback and on non-loopback binds with `--listen-allow-insecure-remote`; a non-loopback HTTPS bind without a token file (and without that flag) is rejected pre-bind. |
+| `--listen-allow-insecure-remote` | | | Explicit tokenless-remote opt-in. Permits tokenless browsers on a non-loopback bind. Combined with `--listen-plaintext` it is unauthenticated and unencrypted; without `--listen-plaintext` it is encrypted but unauthenticated. Exposes control traffic to passive network observers. |
 | `--listen-advertised-origin <URL>` | | http(s) origin | Advertised origin for collaboration links (`/collab`, `collab_start` without an explicit `baseUrl`) and the reachable `/web` URL printed at startup. Not required for ordinary `/web`, `/ws`, or `/rpc`: tokenless browser access uses ordinary same-origin (`Origin` authority equals HTTP `Host`). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing `/` is normalized away). Loopback and other specific binds advertise their bound address automatically; a wildcard bind (0.0.0.0 or `::`) without this flag prints no reachable URL and `/collab` fails closed instead of synthesizing links from an unreachable wildcard. |
 | `--version` | `-v`, `-V` | | Print version and exit. |
 | `--help` | `-h` | | Print help and exit. |
@@ -77,24 +77,53 @@ Short aliases are normalized before clap parses: `-v` maps to `--version`, `-xt`
 `--continue`, `--resume`, `--session`, `--session-id`, `--fork`, and `--no-session`
 are mutually exclusive.
 
-For explicit LAN access — tokenless (no token, same-origin browser):
+**Local HTTPS, no token** — loopback:
+
+```console
+$ rpi --listen 127.0.0.1:8765
+```
+
+Open <https://127.0.0.1:8765/web>; accept the self-signed certificate warning
+for local testing. The page auto-connects with no token.
+
+**Local plaintext, no token** — opt out of TLS on loopback:
+
+```console
+$ rpi --listen 127.0.0.1:8765 --listen-plaintext
+```
+
+Open <http://127.0.0.1:8765/web>; the page auto-connects with no token.
+
+**Remote / LAN HTTPS** — non-loopback; a token file is mandatory:
+
+```console
+$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token
+```
+
+Open `https://<host>:8765/web`. The browser must present the token.
+
+**Remote TLS, tokenless** — explicit insecure opt-in (encrypted but
+unauthenticated, not recommended):
 
 ```console
 $ rpi --listen 0.0.0.0:8765 --listen-allow-insecure-remote
 ```
 
-Open `http://<host-lan-ip>:8765/web` — or any hostname that routes to the
-host — from another machine; the browser auto-connects with no token. No
-`--listen-advertised-origin` is needed for ordinary `/web`, `/ws`, or
-`/rpc`: the browser's `Origin` authority must equal the HTTP `Host`
-(ordinary same-origin, which rejects unrelated cross-origin pages but is
-not authentication and not DNS-rebinding protection). This is plaintext and
-unauthenticated; use only on a network where passive observers are an
-accepted risk. To make the token mandatory, add `--listen-token-file`:
+Open `https://<host>:8765/web`. Browsers are accepted tokenless via same-origin
+(`Origin` equals `Host`). Prefer a token file for remote control.
+
+**Remote plaintext, tokenless** — explicit insecure opt-in (unauthenticated
+and unencrypted, not recommended):
 
 ```console
-$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token --listen-allow-insecure-remote
+$ rpi --listen 0.0.0.0:8765 --listen-plaintext --listen-allow-insecure-remote
 ```
+
+Open `http://<host>:8765/web`. No `--listen-advertised-origin` is needed for
+ordinary `/web`, `/ws`, or `/rpc`: the browser's `Origin` authority must equal
+the HTTP `Host` (ordinary same-origin, which rejects unrelated cross-origin
+pages but is not authentication and not DNS-rebinding protection). Use only
+on a network where passive observers are an accepted risk.
 
 The token authenticates clients but does not encrypt traffic. `rpi agent serve`
 remains loopback-only. `--listen-advertised-origin` is only for collaboration
@@ -233,7 +262,7 @@ primary commands. Other built-ins remain manually executable where documented.
 | `/code-review [<from> <to>]` | Browse a Git diff in a fullscreen tree/diff page: bare shows tracked HEAD→working-tree staged and unstaged changes; two refs compare any two commits/branches/tags |
 | `/btw [prompt]` | Open a persistent detached side conversation forked from the active main branch |
 | `/queue [cancel]` | Show pending steering/follow-up prompts (cancel clears them) |
-| `/live` | Hold-to-talk voice input (TUI) |
+| `/live` | Hold-to-talk voice input (TUI STT) |
 
 Frequently used hidden built-ins include `/help`, `/new`, `/sessions`, `/tree`,
 `/todo`, `/login`, `/logout`, `/share`, `/copy`, `/process`, `/theme`,
@@ -341,10 +370,10 @@ Resolution is case-insensitive. If the requested id is unknown but the provider 
 
 - `0` — success (`--help` and `--version` also exit `0`).
 - `1` — any runtime/dispatch error. Errors are printed to stderr without
-  secret values (`crates/pi-cli/src/main.rs:24-27`). Subcommands that fail
+  secret values (`crates/pi-cli/src/main.rs` exit path). Subcommands that fail
   (e.g. `rpi export` on a missing session) surface through this same path.
 - `2` — argument/usage errors, reported by clap's parser
-  (`error.exit()` in `crates/pi-cli/src/args.rs:615-616`).
+  (`error.exit()` in `crates/pi-cli/src/args.rs`).
 
 There is no finer-grained exit-code table; all failure modes collapse to `1`
 (or `2` for a usage error before dispatch).

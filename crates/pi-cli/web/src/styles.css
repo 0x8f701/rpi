@@ -59,6 +59,13 @@
   --transcript-max: 920px;
   --shadow-panel: -8px 0 32px rgba(0, 0, 0, 0.5);
   --shadow-toast: 0 4px 16px rgba(0, 0, 0, 0.5);
+
+  /* transcript scrollbar (app-right-edge rail; webkit + firefox) —
+   * thumb one step brighter than --border-strong, restrained accent on drag */
+  --transcript-scroll-track: rgba(156, 163, 176, 0.10);
+  --transcript-scroll-thumb: #5b6471;
+  --transcript-scroll-thumb-hover: #77818f;
+  --transcript-scroll-thumb-active: #418ca8;
 }
 
 /* ------------------------------------------------------------------ *
@@ -90,6 +97,13 @@
   --tool:         #e8e8f0;  /* legacy alias = light toolPendingBg */
   --shadow-panel: -8px 0 24px rgba(0, 0, 0, 0.12);
   --shadow-toast: 0 4px 16px rgba(0, 0, 0, 0.15);
+
+  /* transcript scrollbar — light theme: one step more pronounced than
+   * --border-strong, restrained accent on drag */
+  --transcript-scroll-track: rgba(31, 35, 40, 0.08);
+  --transcript-scroll-thumb: #7c838c;
+  --transcript-scroll-thumb-hover: #666d76;
+  --transcript-scroll-thumb-active: #4f7ba3;
 }
 
 /* ------------------------------------------------------------------ *
@@ -143,6 +157,24 @@ code, pre { font-family: inherit; }
   background: var(--accent-dim);
 }
 *::-webkit-scrollbar-corner { background: transparent; }
+/* Transcript rail — the session transcript spans the app width, so its
+ * scrollbar sits at the app's right edge. Slightly more visible than the
+ * generic chrome scrollbar: a discernible track plus a thumb one step
+ * brighter than --border-strong (hover brighter, drag a restrained accent).
+ * Firefox uses scrollbar-color; hover/active are WebKit-only. */
+#transcript {
+  scrollbar-width: auto;
+  scrollbar-color: var(--transcript-scroll-thumb) var(--transcript-scroll-track);
+}
+#transcript::-webkit-scrollbar { width: 14px; height: 14px; }
+#transcript::-webkit-scrollbar-track { background: var(--transcript-scroll-track); }
+#transcript::-webkit-scrollbar-thumb {
+  background: var(--transcript-scroll-thumb);
+  border-radius: 7px;
+  border: 3px solid var(--bg);
+}
+#transcript::-webkit-scrollbar-thumb:hover { background: var(--transcript-scroll-thumb-hover); }
+#transcript::-webkit-scrollbar-thumb:active { background: var(--transcript-scroll-thumb-active); }
 /* Touch devices: wider scrollbars for finger interaction */
 @media (pointer: coarse) {
   * { scrollbar-width: auto; }
@@ -150,6 +182,13 @@ code, pre { font-family: inherit; }
   *::-webkit-scrollbar-thumb {
     border-radius: 12px;
     border: 4px solid var(--bg);
+  }
+  /* The transcript keeps a slimmer rail than the generic 24px touch bar
+   * (still touch-grabbable, still native scroll). */
+  #transcript::-webkit-scrollbar { width: 18px; height: 18px; }
+  #transcript::-webkit-scrollbar-thumb {
+    border-radius: 9px;
+    border: 3px solid var(--bg);
   }
 }
 
@@ -306,17 +345,25 @@ header {
 /* ------------------------------------------------------------------ *
  * Transcript
  * ------------------------------------------------------------------ */
-main {
+/* The transcript main spans the full app width (scrollbar at the app's
+ * right edge, not the 920px column's); the inner wrapper owns the centered
+ * column, flex rhythm, and edge padding so content looks unchanged. */
+#transcript {
   flex: 1;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 16px 20px 20px;
+  width: 100%;
+  scrollbar-gutter: stable;
+}
+
+.transcript-content {
   display: flex;
   flex-direction: column;
   gap: 12px;
   width: 100%;
   max-width: var(--transcript-max);
   margin-inline: auto;
+  padding: 16px 20px 20px;
 }
 
 .empty-hint {
@@ -2144,7 +2191,7 @@ footer {
 
   /* Compact chrome + safe-area breathing room */
   header { padding: calc(8px + env(safe-area-inset-top)) 12px 8px; gap: 6px 8px; }
-  main { padding: 12px 12px 16px; gap: 10px; }
+  .transcript-content { padding: 12px 12px 16px; gap: 10px; }
   footer { padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); }
   .todo-panel__add input,
   .goal-create input,
@@ -2167,7 +2214,7 @@ footer {
   .brand { font-size: 14px; }
 
   /* Tighter message rhythm */
-  main { padding: 10px; }
+  .transcript-content { padding: 10px; }
   .msg { padding: 8px 10px; }
   .msg--assistant,
   .msg--user,

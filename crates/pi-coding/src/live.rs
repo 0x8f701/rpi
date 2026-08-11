@@ -91,14 +91,40 @@ pub const AUDIO_FILENAME: &str = "audio.wav";
 // Settings validation
 // ---------------------------------------------------------------------------
 
-/// Validates that `settings` can drive a `/live` session. Returns actionable
-/// errors — each names the exact `Settings.live.*` key to fix — for the
-/// disabled, unconfigured, and plaintext-endpoint cases.
+/// Validates that `settings` can drive a TUI `/live` hold-to-talk session.
+/// Returns actionable errors — each names the exact `Settings.live.*` key to
+/// fix — for the disabled, unconfigured, plaintext-endpoint, and unsupported
+/// mode cases.
+///
+/// Mode is trimmed and compared case-insensitively. Only `"stt"` drives the
+/// TUI Ptt pipeline (mic capture → STT → composer draft). `"realtime"` voice
+/// runs over WebRTC, which the TUI does not implement — the user must use the
+/// Web listener instead, so this validator reports that explicitly and never
+/// falls through to the STT-base-url checks (which would misreport a missing
+/// `sttBaseUrl` for a realtime config). Any other mode fails fast and lists
+/// the legal values.
 pub fn validate_live_settings(settings: &LiveRuntimeSettings) -> Result<()> {
     if !settings.enabled {
         bail!(
             "Live voice is disabled — set `Settings.live.enabled = true` (or run `/settings set live.enabled true`)"
         );
+    }
+    let mode = settings.mode.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "stt" => {}
+        "realtime" => bail!(
+            "TUI hold-to-talk only supports `Settings.live.mode = \"stt\"`; \
+             realtime voice runs over WebRTC in the Web listener — start it with \
+             `rpi --listen 127.0.0.1:8080` and open the /web page in a browser"
+        ),
+        other if other.is_empty() => bail!(
+            "`Settings.live.mode` is empty — set it to `stt` (TUI hold-to-talk) \
+             or `realtime` (Web listener)"
+        ),
+        other => bail!(
+            "Unknown `Settings.live.mode` value `{other}` — use `stt` \
+             (TUI hold-to-talk) or `realtime` (Web listener)"
+        ),
     }
     if settings.stt_base_url.trim().is_empty() {
         bail!(
@@ -982,6 +1008,130 @@ mod tests {
             assert!(error.contains("http"), "ws scheme rejected for {scheme}: {error}");
             assert!(error.contains("audio/transcriptions"), "{error}");
         }
+    }
+
+    #[test]
+    fn realtime_mode_directs_to_web_listener_not_stt_base_url() {
+        // A fully-configured realtime config (base url + key present) must not
+        // fall through to the STT-base-url checks: the TUI does not implement
+        // WebRTC, so the error points at the Web listener instead.
+        let s = LiveRuntimeSettings {
+            mode: "realtime".to_owned(),
+            realtime_base_url: "http://localhost:8317".to_owned(),
+            realtime_api_key: "rt-key".to_owned(),
+            // STT deliberately unconfigured to prove it is not mentioned.
+            stt_base_url: String::new(),
+            stt_api_key: String::new(),
+            ..settings("https://stt.example")
+        };
+        let error = validate_live_settings(&s).unwrap_err().to_string();
+        assert!(error.contains("realtime"), "{error}");
+        assert!(error.contains("rpi --listen 127.0.0.1:8080"), "must give a valid listen command: {error}");
+        assert!(error.contains("/web"), "must point at the /web page: {error}");
+        assert!(!error.contains("/live page"), "must not reference a /live web page: {error}");
+        assert!(
+            !error.contains("sttBaseUrl"),
+            "realtime must not misreport a missing sttBaseUrl: {error}"
+        );
+        assert!(
+            !error.contains("sttApiKey"),
+            "realtime must not mention sttApiKey: {error}"
+        );
+    }
+
+    #[test]
+    fn realtime_mode_errors_even_when_stt_is_configured() {
+        // Even with a valid STT endpoint, realtime mode never arms the TUI.
+        let s = LiveRuntimeSettings {
+            mode: "realtime".to_owned(),
+            ..settings("https://stt.example")
+        };
+        let error = validate_live_settings(&s).unwrap_err().to_string();
+        assert!(error.contains("Web listener"), "{error}");
+        assert!(validate_live_settings(&s).is_err());
+    }
+
+    #[test]
+    fn unknown_mode_fails_fast_listing_legal_values() {
+        let s = LiveRuntimeSettings {
+            mode: "banana".to_owned(),
+            ..settings("https://stt.example")
+        };
+        let error = validate_live_settings(&s).unwrap_err().to_string();
+        assert!(error.contains("banana"), "unknown mode echoed: {error}");
+        assert!(error.contains("stt"), "{error}");
+        assert!(error.contains("realtime"), "{error}");
+        // Must not reach the STT-base-url checks.
+        assert!(!error.contains("sttBaseUrl"), "{error}");
+    }
+
+    #[test]
+    fn empty_mode_fails_fast_listing_legal_values() {
+        let s = LiveRuntimeSettings {
+            mode: "   ".to_owned(),
+            ..settings("https://stt.example")
+        };
+        let error = validate_live_settings(&s).unwrap_err().to_string();
+        assert!(error.contains("live.mode"), "{error}");
+        assert!(error.contains("stt"), "{error}");
+        assert!(error.contains("realtime"), "{error}");
+    }
+
+    #[test]
+    fn mode_is_trimmed_and_case_insensitive() {
+        // Mixed-case/whitespace "stt" canonicalizes to the STT branch and
+        // validates against the configured STT endpoint.
+        for mode in ["STT", "Stt", "  stt  ", " sTt "] {
+            let s = LiveRuntimeSettings {
+                mode: mode.to_owned(),
+                ..settings("https://stt.example")
+            };
+            assert!(
+                validate_live_settings(&s).is_ok(),
+                "mode `{mode}` should canonicalize to stt and validate"
+            );
+        }
+        // Mixed-case/whitespace "realtime" canonicalizes to the realtime
+        // branch and directs to the Web listener (never the STT checks).
+        for mode in ["REALTIME", "Realtime", "  realtime  ", " rEaLtImE "] {
+            let s = LiveRuntimeSettings {
+                mode: mode.to_owned(),
+                stt_base_url: String::new(),
+                stt_api_key: String::new(),
+                ..settings("https://stt.example")
+            };
+            let error = validate_live_settings(&s).unwrap_err().to_string();
+            assert!(
+                error.contains("Web listener"),
+                "mode `{mode}` should canonicalize to realtime: {error}"
+            );
+            assert!(
+                error.contains("rpi --listen 127.0.0.1:8080"),
+                "mode `{mode}` must give a valid listen command: {error}"
+            );
+            assert!(
+                error.contains("/web"),
+                "mode `{mode}` must point at the /web page: {error}"
+            );
+            assert!(
+                !error.contains("sttBaseUrl"),
+                "mode `{mode}` must not misreport sttBaseUrl: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn stt_mode_still_validates_endpoint_and_key() {
+        // Regression guard: the canonical STT path is unchanged by the mode
+        // dispatch — empty base url / key / plaintext scheme still error.
+        let mut s = settings("https://stt.example");
+        s.stt_base_url.clear();
+        assert!(validate_live_settings(&s).is_err());
+        s.stt_base_url = "https://stt.example".to_owned();
+        s.stt_api_key.clear();
+        assert!(validate_live_settings(&s).is_err());
+        s.stt_api_key = "key".to_owned();
+        assert!(validate_live_settings(&s).is_ok());
     }
 
     #[test]

@@ -24,61 +24,69 @@ built page from disk instead, for iterating without recompiling Rust.
 
 ## Starting the listener
 
-`rpi --listen` is a headless Web-only backend. It never initializes terminal
-raw mode, cursor probing, a TUI, or a line REPL. Standard input may be closed;
-the service stays alive until Ctrl-C or SIGTERM, then flushes the active session
-and shuts down its listener and runtime manager cleanly. Web prompts use the
-normal session recorder, so restarting with `--continue`, `--resume`,
-`--session`, or `--session-id` restores the recorded conversation.
+`rpi --listen <SOCKET_ADDR>` is a headless Web-only backend. It never
+initializes terminal raw mode, cursor probing, a TUI, or a line REPL. Standard
+input may be closed; the service stays alive until Ctrl-C or SIGTERM, then
+flushes the active session and shuts down its listener and runtime manager
+cleanly. Web prompts use the normal session recorder, so restarting with
+`--continue`, `--resume`, `--session`, or `--session-id` restores the recorded
+conversation.
 
-Authentication is **optional**: a tokenless listener accepts browser
-connections directly, and a configured token makes authentication mandatory.
+Authentication rules:
 
-**One-command local startup** (loopback, no token — the browser auto-connects):
+- Loopback (127.0.0.0/8 or ::1) may be tokenless or tokenized.
+- A non-loopback **HTTPS** bind requires `--listen-token-file`; tokenless
+  remote TLS is rejected pre-bind.
+- `--listen-allow-insecure-remote` is the explicit tokenless-remote opt-in:
+  it permits tokenless browsers on a non-loopback bind. Combined with
+  `--listen-plaintext` it is both unauthenticated and unencrypted; without
+  `--listen-plaintext` it is encrypted but unauthenticated.
+
+By default `--listen` uses HTTPS with an auto-generated self-signed
+certificate; use `--listen-plaintext` to opt out, or `--listen-cert` /
+`--listen-key` for real certificates.
+
+**One-command local startup** (loopback, no token, HTTPS):
 
 ```console
 $ rpi --listen 127.0.0.1:8765
-Control plane listening on http://127.0.0.1:8765 (loopback only)
+Control plane listening on https://127.0.0.1:8765 (loopback only)
 ```
 
-Open <http://127.0.0.1:8765/web> in a browser; the page auto-connects with no
-token and is ready to use. This is the default for local single-user work.
+Open <https://127.0.0.1:8765/web> in a browser; accept the self-signed
+certificate warning for local testing. The page auto-connects with no token.
 
-**Tokenless LAN access** — bind a non-loopback address and opt into
-plaintext remote listening (still no token):
+**Local plaintext** — opt out of TLS on loopback:
 
 ```console
-$ rpi --listen 0.0.0.0:8765 --listen-allow-insecure-remote
+$ rpi --listen 127.0.0.1:8765 --listen-plaintext
 ```
 
-Open `http://<host-lan-ip>:8765/web` — or any hostname that routes to the
-host — from another machine on the LAN; the page auto-connects with no
-token. No `--listen-advertised-origin` is needed for ordinary `/web`,
-`/ws`, or `/rpc`: the browser request is accepted when its `Origin`
-authority equals the HTTP `Host` — an ordinary same-origin check that
+Open <http://127.0.0.1:8765/web>; the page auto-connects with no token.
+
+**Remote / LAN HTTPS** — non-loopback; a token file is mandatory:
+
+```console
+$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token
+```
+
+Open `https://<host>:8765/web`. The browser must present the token.
+
+**Remote plaintext, tokenless** — explicit insecure opt-in (not recommended):
+
+```console
+$ rpi --listen 0.0.0.0:8765 --listen-plaintext --listen-allow-insecure-remote
+```
+
+Open `http://<host>:8765/web`. No `--listen-advertised-origin` is needed for
+ordinary `/web`, `/ws`, or `/rpc`: the browser request is accepted when its
+`Origin` authority equals the HTTP `Host` — an ordinary same-origin check that
 rejects unrelated cross-origin pages, not authentication and not
 DNS-rebinding protection. This is plaintext HTTP and WebSocket with **no
 authentication and no encryption**: anyone reachable on the network can
-drive the agent and observe traffic. Use loopback, or a TLS-terminating
-proxy in front of the listener, unless that exposure is explicitly
-acceptable.
-
-**Optional authenticated form** — add `--listen-token-file` to make the token
-mandatory on either bind:
-
-```console
-$ rpi --listen 127.0.0.1:8765 --listen-token-file <workspace>/rpi-token
-Control plane listening on http://127.0.0.1:8765 (loopback, authentication enabled)
-```
-
-Open <http://127.0.0.1:8765/web>, enter the token, and press **Connect**. For
-an authenticated LAN listener, combine the token file with the insecure-remote
-opt-in:
-
-```console
-$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token \
-      --listen-allow-insecure-remote
-```
+drive the agent and observe traffic. Use loopback, real certificates, or a
+TLS-terminating proxy in front of the listener, unless that exposure is
+explicitly acceptable.
 
 The token authenticates clients but provides no encryption: passive LAN
 observers can still capture the bearer token and control traffic.
@@ -111,15 +119,18 @@ Sec-WebSocket-Protocol: rpi-auth.<token>
 - The `Authorization` header path is unchanged. A token file makes the token
   mandatory on every bind; without one the listener is tokenless — browsers
   are accepted on loopback, and on a non-loopback bind with
-  `--listen-allow-insecure-remote` when the request's `Origin` authority
-  equals the HTTP `Host` (an ordinary same-origin check that rejects
-  unrelated cross-origin pages, not authentication and not DNS-rebinding
-  protection). Wrong, empty, or whitespace-containing candidates are
-  rejected. A configured token authenticates clients but provides no
-  encryption against passive network observers.
+  `--listen-allow-insecure-remote` (with `--listen-plaintext` for a plaintext
+  transport) when the request's `Origin` authority equals the HTTP `Host` (an
+  ordinary same-origin check that rejects unrelated cross-origin pages, not
+  authentication and not DNS-rebinding protection). Wrong, empty, or
+  whitespace-containing candidates are rejected. A configured token
+  authenticates clients but provides no encryption against passive network
+  observers.
 
 The token never appears in a URL or cookie; it is held only in the WebSocket
-handshake header and kept in `sessionStorage` by the page.
+handshake header and persisted by the page in `localStorage` under a
+per-listener-authority key (so a token saved for host A is not sent to host
+B).
 
 ## v1 features
 
@@ -176,9 +187,7 @@ handshake header and kept in `sessionStorage` by the page.
 - Remote approvals and overlay confirmations are intentionally unavailable
   (`extension_ui_response` is hard-rejected on the wire by design); the page
   shows tool results but cannot answer interactive extension prompts.
-- No TLS: the listener is plain HTTP/WebSocket. Non-loopback access is an
-  explicit plaintext opt-in (optionally authenticated), and passive network
-  observers can capture any bearer token and control traffic.
+- TLS is self-signed by default; provide real certificates with `--listen-cert` / `--listen-key` for production. Plaintext remote access is an explicit opt-in (`--listen-plaintext --listen-allow-insecure-remote`), and passive network observers can capture any bearer token and control traffic.
 
 ## Testing
 

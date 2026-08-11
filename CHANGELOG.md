@@ -2,6 +2,50 @@
 
 All notable changes to `rpi` are documented in this file.
 
+## [0.2.9] - 2026-08-11
+
+### Changed
+
+- Web realtime voice transport switched from a direct sideband WebSocket to an
+  `RTCDataChannel('oai-events')` on the same `RTCPeerConnection`; the data
+  channel is created before the SDP offer so it is negotiated in the answer.
+  `session.update` and server events (transcript, `delegation.created`, errors)
+  now flow over this channel, while audio stays on the WebRTC tracks.
+  `realtime_create_call` still proxies the SDP offer plus the v1 realtime
+  session object to CLIProxyAPI on the backend, so the realtime API key never
+  reaches the browser.
+- The Web transcript now uses a dedicated, higher-contrast native scrollbar
+  at the app's right edge. Nested tool and panel scrollbars remain subdued;
+  phone layouts keep native touch scrolling without a space-consuming minimap.
+- GitHub Actions test and release workflows now run independently: master and
+  pull-request tests remain the quality gate, while tag releases only validate,
+  build, package, verify, and publish native artifacts.
+
+### Fixed
+
+- `--listen` authentication tightened: loopback may still be tokenless, but a
+  non-loopback HTTPS bind now requires `--listen-token-file` (tokenless remote
+  TLS is rejected pre-bind). `--listen-allow-insecure-remote` is now the
+  explicit non-loopback tokenless opt-in; with TLS it is encrypted but
+  unauthenticated, and with `--listen-plaintext` it is also unencrypted.
+- Web `/web` token storage is now per-listener-authority `localStorage`
+  instead of `sessionStorage`, so a token saved for one host is never sent to
+  another.
+- TLS listener handshake stalls: added a bounded per-handshake timeout and
+  parallel accept handling.
+- Explicit `--listen-cert`/`--listen-key` pairs now load correctly instead of
+  rejecting every caller with the mixed-pair validation error.
+- Clarified `live.mode`: TUI `/live` only implements STT hold-to-talk; `stt` is
+  the default and `realtime` mode is only available in the Web listener
+  (`/web`). The TUI reports an actionable error when `live.mode` is `realtime`.
+- Vision model delegation now shares the main prompt, steering, and follow-up
+  context between the active chat model and the configured `visionModel`. A
+  misconfigured `visionModel` (unresolvable or not image-capable) fails with an
+  error instead of silently dropping images.
+- Web session selection is persisted per listener authority. Reloads restore
+  the last active session when it still exists; otherwise the first catalog
+  session becomes active with its authoritative transcript.
+
 ## [0.2.8] - 2026-08-10
 
 ### Added
@@ -404,8 +448,9 @@ All notable changes to `rpi` are documented in this file.
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
 
-[0.2.7]: https://github.com/0x8f701/rpi/releases/tag/v0.2.7
+[0.2.9]: https://github.com/0x8f701/rpi/releases/tag/v0.2.9
 [0.2.8]: https://github.com/0x8f701/rpi/releases/tag/v0.2.8
+[0.2.7]: https://github.com/0x8f701/rpi/releases/tag/v0.2.7
 
 [0.2.6]: https://github.com/0x8f701/rpi/releases/tag/v0.2.6
 [0.2.5]: https://github.com/0x8f701/rpi/releases/tag/v0.2.5

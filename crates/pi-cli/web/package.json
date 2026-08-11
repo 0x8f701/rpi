@@ -6,7 +6,7 @@
   "description": "rpi web client — vite + react + typescript, built into the rpi binary via build.rs",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && rm -rf .transcript-test-build && esbuild scripts/transcript.test.ts --bundle --platform=node --format=esm --outfile=.transcript-test-build/transcript.test.mjs && node .transcript-test-build/transcript.test.mjs && rm -rf .transcript-test-build && vite build && node scripts/trim-dist.mjs",
+    "build": "tsc --noEmit && rm -rf .web-test-build && esbuild scripts/transcript.test.ts --bundle --platform=node --format=esm --outfile=.web-test-build/transcript.test.mjs && esbuild scripts/realtime.test.ts --bundle --platform=node --format=esm --outfile=.web-test-build/realtime.test.mjs && esbuild scripts/goal.test.ts --bundle --platform=node --format=esm --outfile=.web-test-build/goal.test.mjs && esbuild scripts/socket.test.ts --bundle --platform=node --format=esm --outfile=.web-test-build/socket.test.mjs && esbuild scripts/hostToken.test.ts --bundle --platform=node --format=esm --outfile=.web-test-build/hostToken.test.mjs && esbuild scripts/sessionPreference.test.ts --bundle --platform=node --format=esm --outfile=.web-test-build/sessionPreference.test.mjs && node .web-test-build/transcript.test.mjs && node .web-test-build/realtime.test.mjs && node .web-test-build/goal.test.mjs && node .web-test-build/socket.test.mjs && node .web-test-build/hostToken.test.mjs && node .web-test-build/sessionPreference.test.mjs && rm -rf .web-test-build && vite build && node scripts/trim-dist.mjs",
     "preview": "vite preview",
     "coverage:build": "vite build --config vite.coverage.config.ts",
     "coverage:report": "node scripts/coverage-report.mjs",

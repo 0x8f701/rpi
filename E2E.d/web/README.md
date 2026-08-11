@@ -51,7 +51,7 @@ exits non-zero when any lane failed.
 | WS auth (no/wrong/good token) | `auth` | silent no-token probe, wrong-token error toast, good-token connect |
 | mobile viewport (375×667) | `mobile` | core flow at phone width, no horizontal overflow, full-screen drawer, composer above the fold, ≥44px touch targets, dominant ≥240px textarea, one dynamic Send/Steer action, active-only Abort, hidden `#thinking-select`, and a working session drawer toggle |
 | multi-session (concurrent runtimes) | `sessions` | **playwright-only** (no fallback/skip): slow A continues while B completes; source-session routing; unread clear-on-switch; authoritative A/B restore; abort/toast isolation; busy-close refusal then idle close; 8-session cap; Todo/Goal/Workflow isolation; desktop rail and Android drawer behavior |
-| session persistence and restore | `session_restore` | Web prompt records normally; loaded switch restores backend history; close/reopen resumes from disk; listener SIGTERM/restart rebinds to the new primary and restores the persisted session |
+| session persistence and restore | `session_restore` | Web prompt records normally; loaded switch restores backend history; close/reopen resumes from disk; listener SIGTERM/restart rebinds to the new primary and restores the persisted session; a page reload restores the last-activated session from the per-authority preference (R5); a missing saved id falls back to the first catalog row (R6) — R5/R6 executed-assertion evidence written to `coverage-assertions.json` like the sessions lane |
 
 ## CI wiring
 

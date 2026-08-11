@@ -26,9 +26,41 @@ import {
   BASH_OUTPUT_LINE_LIMIT,
   TOOL_OUTPUT_LINE_LIMIT,
 } from './transcript';
+import {
+  firstString,
+  buildRealtimeSessionConfig,
+  setupRealtimeCall,
+  isRealtimeLiveMode,
+  classifyInputTranscriptEvent,
+  finalTranscriptText,
+  nextInputTranscriptCommit,
+  realtimeErrorMessage,
+} from './realtime';
+import { STALE_ABORT, isCurrentPending, shouldScheduleReconnect, detachTransportHandlers } from './socket';
+import { loadInitialAuthorityToken, loadTokenForAuthority, saveTokenForAuthority, type StorageLike } from './hostToken';
+import {
+  loadSessionPreference,
+  saveSessionPreference,
+  selectSessionFromCatalog,
+  type SessionPreferenceRow,
+} from './sessionPreference';
+import { routeCommandSession, goalGetCommand, goalJournalCommand } from './goal';
 
 const RPI_AUTH_PREFIX = 'rpi-auth.';
-const TOKEN_STORAGE_KEY = 'rpi-web-token';
+// localStorage may throw on access in private mode / blocked cookies; the
+// hostToken helpers catch OPERATION errors but not the property access, so
+// resolve a safe storage backend once at module load. Each host's auth token
+// is persisted under a per-authority scoped key (no global fallback), so a
+// token saved for host A is never sent to a different host B. The same safe
+// backend backs the per-authority session preference (sessionPreference.ts):
+// a session selected on host A is never restored on host B.
+const tokenStorage: StorageLike | null = (() => {
+  try {
+    return typeof window !== 'undefined' && window && window.localStorage ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+})();
 const RECENT_HOSTS_STORAGE_KEY = 'rpi-web-recent-hosts';
 const RECENT_HOSTS_MAX = 10;
 const RECONNECT_INITIAL_DELAY = 1000;
@@ -58,6 +90,10 @@ interface Pending {
   reject: (reason: Error) => void;
   bubbleId?: string;
   timer: number;
+  // Socket generation this command was sent on; a response/settlement only
+  // applies when it matches socketGenRef.current (a superseded socket's
+  // late response/timeout must not settle a newer socket's pending).
+  gen: number;
 }
 
 export interface LiveNodes {
@@ -377,28 +413,6 @@ async function blobToWav(blob: Blob): Promise<Blob | null> {
   }
 }
 
-/** First non-empty string among `values` (empty strings and non-strings are
- *  skipped) — used to read defensive field variants off realtime sideband
- *  events without guessing the exact key the backend chose. */
-function firstString(...values: unknown[]): string {
-  for (const value of values) {
-    if (typeof value === 'string' && value.trim()) return value.trim();
-  }
-  return '';
-}
-
-/** Sideband WebSocket URL for a realtime call: CLIProxyAPI serves
- *  `/v1/realtime?call_id=...` under the configured base. An http(s) base is
- *  converted to ws(s), a scheme-less host is assumed http, and a trailing
- *  `/v1` is de-duplicated (Hyper parity, mirroring `transcriptions_url`). */
-function sidebandRealtimeWsUrl(baseUrl: string, callId: string): string {
-  const trimmed = baseUrl.trim().replace(/\/+$/, '');
-  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
-  const origin = withScheme.replace(/^https?:\/\//i, '').replace(/\/v1$/i, '');
-  const scheme = /^https:/i.test(withScheme) ? 'wss' : 'ws';
-  return `${scheme}://${origin}/v1/realtime?call_id=${encodeURIComponent(callId)}`;
-}
-
 /* ------------------------------------------------------------------ *
  * App
  * ------------------------------------------------------------------ */
@@ -495,11 +509,20 @@ export function App() {
   const [liveSettings, setLiveSettings] = useState<LiveSettingsWire | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
+  // Monotonic socket generation: connect() bumps it; every pending command
+  // and every onOpen bootstrap continuation stamps/captures it so a socket
+  // superseded mid-bootstrap (A dropped, B reconnected healthy) can never
+  // applyState / setConnState / refreshGoal / scheduleReconnect on B's behalf
+  // — its pending is drained on replace and its continuation bails via
+  // STALE_ABORT / `!alive()`. See ./socket.ts for the pure invariant.
+  const socketGenRef = useRef(0);
   // The target rpi instance (host:port). Defaults to the host that served the
-  // page; commitHost() updates it (and the header input) on change. The
-  // token comes from the Settings panel (rpi-web-token in localStorage).
-  // Both are refs so connect() reads them synchronously (React state lags one
-  // render).
+  // page; commitHost() updates it (and the header input) on change. The token
+  // is the CURRENT host's auth token, persisted under a per-authority scoped
+  // key (rpi-web-token:<authority>); commitHost switches it to the target
+  // host's token (or empty) before connect, and handleTokenChange saves it
+  // under the current host — never a global fallback, so a token never leaks
+  // across origins. Both are refs so connect() reads them synchronously.
   const hostRef = useRef(typeof window !== 'undefined' ? window.location.host : '');
   const tokenRef = useRef(token);
   const pendingRef = useRef(new Map<string, Pending>());
@@ -534,19 +557,28 @@ export function App() {
   const mediaChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<number | null>(null);
   // Codex Live realtime voice (WebRTC): active while the call is up; the
-  // sideband WS delivers transcript/delegation events for the overlay. The
-  // transcript text is accumulated in a ref and written straight into the
-  // overlay node (no React re-render per delta — same hot-path decision as
-  // the streaming transcript); realtimeDelegation is a rare state change.
+  // `oai-events` data channel delivers transcript/delegation events for the
+  // overlay. The transcript text is accumulated in a ref and written straight
+  // into the overlay node (no React re-render per delta — same hot-path
+  // decision as the streaming transcript); realtimeDelegation is a rare state
+  // change.
   const [realtimeActive, setRealtimeActive] = useState(false);
   const [realtimeDelegation, setRealtimeDelegation] = useState<string | null>(null);
   const realtimePcRef = useRef<RTCPeerConnection | null>(null);
-  const realtimeWsRef = useRef<WebSocket | null>(null);
+  // The `oai-events` RTCDataChannel on the realtime peer connection carries
+  // session.update + server events (transcript/delegation/error). It rides
+  // the WebRTC DTLS transport (no browser-side Bearer header, no mixed-content
+  // block) — the direct sideband WebSocket was removed for those reasons.
+  const realtimeDcRef = useRef<RTCDataChannel | null>(null);
   // Synchronous start-guard: getUserMedia/offer/answer is async, so a quick
   // double-click could race two call setups before realtimeActive re-renders.
   const realtimeBusyRef = useRef(false);
   const realtimeAudioRef = useRef<HTMLAudioElement | null>(null);
   const realtimeTranscriptRef = useRef('');
+  // Last finalized USER input transcript committed to the composer, used to
+  // dedup the two V1 final-event variants (input_transcript.done +
+  // input_audio_transcription.completed) for one utterance. Reset per call.
+  const lastCommittedTranscriptRef = useRef('');
   const realtimeTranscriptNodeRef = useRef<HTMLDivElement | null>(null);
   // Suppresses RPC error toasts during the reconnection bootstrap sequence
   // (get_state rebind) so a phone waking from sleep doesn't spam "command
@@ -620,8 +652,6 @@ export function App() {
     setUnreadBySessionId((prev) => ({ ...prev, [sid]: (prev[sid] ?? 0) + 1 }));
   }, []);
 
-
-
   /* ---------------- RPC plumbing ---------------- */
 
   const sendCommand = useCallback((command: Record<string, unknown>, bubbleId?: string): Promise<unknown> => {
@@ -640,11 +670,11 @@ export function App() {
     // so deny_unknown_fields schemas (workflow_*) accept it safely on the
     // multi-session backend — every command, workflow included, routes to the
     // owning runtime instead of defaulting to the primary.
-    const explicitSid =
-      typeof command.sessionId === 'string' && command.sessionId !== ''
-        ? command.sessionId
-        : null;
-    const sid = explicitSid ?? sessionIdRef.current;
+    // The routing rule lives in ./goal (routeCommandSession) so the
+    // background goal_updated / lifecycle A→B cross-write invariant is
+    // testable without a socket: an explicit command.sessionId wins over the
+    // active session; a null/empty/absent sessionId falls back to active.
+    const sid = routeCommandSession(command, sessionIdRef.current);
     const frame = sid ? { ...command, id, sessionId: sid } : { ...command, id };
     const timer = window.setTimeout(() => {
       if (pendingRef.current.delete(id)) {
@@ -652,15 +682,24 @@ export function App() {
         reject(new Error('command timed out'));
       }
     }, COMMAND_TIMEOUT_MS);
-    pendingRef.current.set(id, { resolve, reject, bubbleId, timer });
+    pendingRef.current.set(id, { resolve, reject, bubbleId, timer, gen: socketGenRef.current });
     ws.send(JSON.stringify(frame));
     return promise;
   }, [removeItem]);
 
   const onResponse = useCallback((frame: RpcResponse) => {
-    const pending = pendingRef.current.get(frame.id || '');
+    const id = frame.id || '';
+    const pending = pendingRef.current.get(id);
     if (!pending) return;
-    pendingRef.current.delete(frame.id || '');
+    // A response for a command sent on a superseded socket: the replace drain
+    // already rejected its promise. Drop the stale settlement so it can
+    // neither continue a dead bootstrap nor settle a newer socket's pending.
+    if (!isCurrentPending(pending.gen, socketGenRef.current)) {
+      pendingRef.current.delete(id);
+      window.clearTimeout(pending.timer);
+      return;
+    }
+    pendingRef.current.delete(id);
     window.clearTimeout(pending.timer);
     if (frame.success) {
       pending.resolve(frame.data || {});
@@ -672,6 +711,23 @@ export function App() {
       pending.reject(error);
     }
   }, [removeItem, toast]);
+
+  /** Reject + delete every pending command NOT on the keep generation, clearing
+   *  its timeout. Called from connect() when a new socket supersedes the old
+   *  one, so the old socket's pending commands (bootstrap get_state, in-flight
+   *  user RPCs) never linger until their 30s timeout to fire a stale
+   *  continuation that could applyState or reconnect on the healthy socket's
+   *  behalf. */
+  const rejectPendingExcept = useCallback((keepGen: number, reason: string) => {
+    const pending = pendingRef.current;
+    for (const [id, entry] of pending) {
+      if (entry.gen !== keepGen) {
+        pending.delete(id);
+        window.clearTimeout(entry.timer);
+        entry.reject(new Error(reason));
+      }
+    }
+  }, []);
 
   /** D89: dispatch a flattened pi_coding::TodoOp over the `todo_op` RPC. */
   const runTodoOp = useCallback((op: Record<string, unknown>) => {
@@ -776,12 +832,17 @@ export function App() {
    *  an async refreshGoal() can never query one session and paint another. */
   const refreshGoal = useCallback((sid: string | null) => {
     if (!sid) return;
-    sendCommand({ type: 'goal_get' })
+    // Stamp the OWNING sessionId on both RPCs (goalGetCommand/goalJournalCommand)
+    // so a background `goal_updated` for B while A is active — or a lifecycle
+    // A→B refresh captured before sessionIdRef advances — routes to B's runtime,
+    // not the active session's. Without this, sendCommand defaulted to
+    // sessionIdRef.current and painted the active session's goal into B's cache.
+    sendCommand(goalGetCommand(sid))
       .then((data) => {
         setGoalStateBySessionId((prev) => ({ ...prev, [sid]: data as GoalStateWire }));
       })
       .catch(() => {});
-    sendCommand({ type: 'goal_journal' })
+    sendCommand(goalJournalCommand(sid))
       .then((data) => {
         if (Array.isArray(data)) {
           setGoalJournalBySessionId((prev) => ({ ...prev, [sid]: data as GoalEventWire[] }));
@@ -836,10 +897,20 @@ export function App() {
       setGoalStateBySessionId((prev) => ({ ...prev, [target]: d.goal as GoalStateWire }));
     }
     // Live/STT settings are global (not per-session); advertise them to the
-    // composer's mic when the backend includes them in get_state.
-    const live = d.runtimeSettings && typeof d.runtimeSettings === 'object' ? d.runtimeSettings.live : undefined;
-    if (live && typeof live === 'object') {
-      setLiveSettings(live);
+    // composer's mic when the backend includes them in get_state. When the
+    // backend advertises runtimeSettings WITHOUT a live block (e.g. live mode
+    // was turned off in settings), clear any stale liveSettings so the
+    // composer doesn't keep showing realtime after a switch — never assume
+    // realtime when live is absent. A missing runtimeSettings entirely (older
+    // backend) leaves liveSettings untouched.
+    const runtime = d.runtimeSettings;
+    if (runtime && typeof runtime === 'object') {
+      const live = runtime.live;
+      if (live && typeof live === 'object') {
+        setLiveSettings(live);
+      } else {
+        setLiveSettings(null);
+      }
     }
     // Session cutover (previous non-empty id -> DIFFERENT non-empty id): the
     // active view switches to the new session's cache. Same-id refreshes
@@ -897,6 +968,12 @@ export function App() {
         refreshGoal(target);
         sessionIdRef.current = target;
         setSessionId(target);
+        // D96: the activated session is now THIS host's preference. Only the
+        // non-secret session id is stored, under the per-authority key, so a
+        // selection on host A never restores on host B. new/fork/clone/switch
+        // all land here, so every lifecycle success persists (fail-soft: a
+        // blocked localStorage never breaks the activation).
+        saveSessionPreference(tokenStorage, hostRef.current, target);
         return Promise.resolve();
       }
       return refreshState();
@@ -1103,6 +1180,14 @@ export function App() {
         delayRef.current = RECONNECT_INITIAL_DELAY;
       }
     }, HEARTBEAT_STABILITY_MS);
+    // Capture THIS socket's generation; every bootstrap continuation checks
+    // `alive()` so a socket superseded mid-bootstrap (A dropped, B reconnected
+    // healthy) bails via STALE_ABORT / `!alive()` and can never applyState /
+    // setConnState / refreshGoal / scheduleReconnect on B's behalf. Its pending
+    // commands were already rejected by connect()'s replace drain, so the
+    // rejection flowing here is caught and discarded, not retried.
+    const gen = socketGenRef.current;
+    const alive = () => socketGenRef.current === gen;
     // Bootstrap the authoritative active session BEFORE exposing the
     // connected UI. The first get_state probes with the current (possibly
     // stale) active session id; on a server restart the stale id is rejected
@@ -1113,21 +1198,25 @@ export function App() {
     // recreates its streaming assistant so later deltas/message_end remain
     // routable.
     const rebindToPrimary = () => {
+      if (!alive()) throw STALE_ABORT; // superseded: don't re-probe on the new socket
       sessionIdRef.current = null;
       return sendCommand({ type: 'get_state' });
     };
     sendCommand({ type: 'get_state' })
       .catch(rebindToPrimary)
       .then((state) => {
+        if (!alive()) throw STALE_ABORT;
         applyState(state);
         const target = sessionIdRef.current;
         if (!target) throw new Error('state response did not bind a session');
         return sendCommand({ type: 'get_messages', sessionId: target }).then((data) => {
+          if (!alive()) throw STALE_ABORT;
           if (!data || typeof data !== 'object' || !('messages' in data) || !Array.isArray(data.messages)) {
             throw new Error('messages response missing messages');
           }
           const messages = data.messages;
           return sendCommand({ type: 'get_state', sessionId: target }).then((latestState) => {
+            if (!alive()) throw STALE_ABORT;
             const latest = (latestState || {}) as { isStreaming?: boolean };
             applyState(latestState, target);
             if (latest.isStreaming === true) {
@@ -1160,6 +1249,7 @@ export function App() {
             // and this settled state snapshot. Re-fetch after observing idle
             // so the replacement cannot use pre-settlement history.
             return sendCommand({ type: 'get_messages', sessionId: target }).then((settledData) => {
+              if (!alive()) throw STALE_ABORT;
               if (!settledData || typeof settledData !== 'object' || !('messages' in settledData) || !Array.isArray(settledData.messages)) {
                 throw new Error('settled messages response missing messages');
               }
@@ -1178,30 +1268,82 @@ export function App() {
         });
       })
       .then(() => {
-        setConnState('on');
-        bootRef.current = false;
-        // Goal snapshot + journal for the now-bound session (the sid is
-        // derived from the state response, so the refresh targets the right
-        // runtime even on the very first connect).
-        refreshGoal(sessionIdRef.current);
-        sendCommand({ type: 'get_available_models' })
+        if (!alive()) throw STALE_ABORT;
+        // D96: restore the saved session preference for THIS authority, once
+        // per connection (never on sidebar polls). The authoritative primary
+        // was bound above; session_list now reveals whether the saved (or
+        // first-catalog) session differs, and switch_session re-targets it
+        // BEFORE the UI is exposed so the first paint already shows the
+        // restored session. A missing saved id falls back to the first row;
+        // an empty catalog keeps the bound primary (persisted so a later
+        // reload with the same catalog restores it). session_list is
+        // auxiliary: its failure must not fail the whole bootstrap (the bound
+        // primary stays active, preference untouched) — only a STALE_ABORT
+        // propagates, so a superseded socket never continues on the new one's
+        // behalf.
+        return sendCommand({ type: 'session_list' })
           .then((data) => {
-            const list = (data as { models?: Array<{ id: string; name: string; provider: string }> }).models || [];
-            setModels(list.filter((m) => m && m.id && m.provider));
+            if (!alive()) throw STALE_ABORT;
+            // session_list -> `{ sessions: RpcSessionListRow[] }`; narrow the
+            // wire shape defensively (never an unchecked inline cast) — the
+            // selector re-validates each row's sessionId/path at runtime.
+            const list = data && typeof data === 'object' ? data : null;
+            const wireSessions = list !== null && 'sessions' in list ? list.sessions : undefined;
+            const rows: SessionPreferenceRow[] = Array.isArray(wireSessions) ? wireSessions : [];
+            const saved = loadSessionPreference(tokenStorage, hostRef.current);
+            const target = selectSessionFromCatalog(rows, saved);
+            if (!target) {
+              // No catalog rows: the backend primary is the only session —
+              // persist it so a later reload with the same catalog keeps it.
+              if (sessionIdRef.current) saveSessionPreference(tokenStorage, hostRef.current, sessionIdRef.current);
+              return;
+            }
+            if (target.sessionId === sessionIdRef.current) return; // already the active session
+            // Re-target: switch_session resolves with the authoritative
+            // `{sessionId,state,messages}` snapshot; onLifecycleResult
+            // consumes it atomically and persists the new preference.
+            return sendCommand({ type: 'switch_session', sessionPath: target.path }).then((result) => {
+              if (!alive()) throw STALE_ABORT;
+              return onLifecycleResult(result);
+            });
           })
-          .catch(() => {});
-        sendCommand({ type: 'get_available_thinking_levels' })
-          .then((data) => {
-            const list = (data as { levels?: string[] }).levels || [];
-            setLevels(list);
+          .catch((err) => {
+            if (err === STALE_ABORT) throw err;
+            return; // catalog failure: keep the bound primary, no switch loop
           })
-          .catch(() => {});
+          .then(() => {
+            if (!alive()) throw STALE_ABORT;
+            setConnState('on');
+            bootRef.current = false;
+            // Goal snapshot + journal for the now-bound session (the sid is
+            // derived from the state response, so the refresh targets the right
+            // runtime even on the very first connect).
+            refreshGoal(sessionIdRef.current);
+            sendCommand({ type: 'get_available_models' })
+              .then((data) => {
+                const list = (data as { models?: Array<{ id: string; name: string; provider: string }> }).models || [];
+                setModels(list.filter((m) => m && m.id && m.provider));
+              })
+              .catch(() => {});
+            sendCommand({ type: 'get_available_thinking_levels' })
+              .then((data) => {
+                const list = (data as { levels?: string[] }).levels || [];
+                setLevels(list);
+              })
+              .catch(() => {});
+          })
       })
-      .catch(() => {
+      .catch((err) => {
+        // Stale socket (superseded, or its pending was drained on replace):
+        // bail WITHOUT scheduling a reconnect or clearing bootRef — the newer,
+        // healthy socket owns the reconnect path and the boot flag. Only a
+        // LIVE socket's real bootstrap failure (state did not bind, messages
+        // missing) reconnects.
+        if (!shouldScheduleReconnect(err, alive())) return;
         bootRef.current = false;
         scheduleReconnect();
       });
-  }, [applyState, refreshGoal, rescheduleSilenceTimer, scheduleReconnect, sendCommand]);
+  }, [applyState, onLifecycleResult, refreshGoal, rescheduleSilenceTimer, scheduleReconnect, sendCommand]);
 
   const connect = useCallback(() => {
     if (retryTimerRef.current !== null) {
@@ -1214,13 +1356,26 @@ export function App() {
     const old = wsRef.current;
     wsRef.current = null;
     if (old) {
-      old.onclose = null;
+      // Detach ALL four handlers (not just onclose) before closing: a
+      // CONNECTING old socket whose onopen fires after replacement would
+      // otherwise run onOpen against the NEW generation/wsRef and bootstrap a
+      // second time, and a late onmessage would route old frames into the new
+      // socket. detachTransportHandlers nulls onopen/onmessage/onerror/onclose.
+      detachTransportHandlers(old);
       try {
         old.close(1000, 'replaced');
       } catch {
         /* already closed */
       }
     }
+    // Advance the socket generation and reject every pending command from a
+    // PRIOR socket (replace/close). The new socket's commands (sent from
+    // onOpen) stamp the new gen; their bootstrap continuations check `alive()`
+    // so a superseded socket can never applyState/setConnState/refreshGoal/
+    // scheduleReconnect on the healthy socket's behalf. Draining here (not in
+    // onclose) means the old pending is rejected the moment a new socket is
+    // created, well before its 30s timeout could fire a stale continuation.
+    rejectPendingExcept(++socketGenRef.current, 'connection replaced');
     // The host comes from the header input (hostRef) and the token from the
     // Settings panel (tokenRef) — both kept in sync with React state so this
     // callback never re-creates across renders.
@@ -1268,7 +1423,7 @@ export function App() {
     ws.onerror = () => {
       /* the close event carries the failure */
     };
-  }, [clearHeartbeatTimers, onOpen, rescheduleSilenceTimer, scheduleReconnect, toast]);
+  }, [clearHeartbeatTimers, onOpen, rejectPendingExcept, rescheduleSilenceTimer, scheduleReconnect, toast]);
 
   /** Commit a host typed in the header: persist to recent hosts (max 10,
    *  most recent first) and, on a real change, fully reset the app and
@@ -1288,24 +1443,31 @@ export function App() {
     if (next === hostRef.current) return;
     bootProbeRef.current = false;
     resetAllState();
+    // Load the TARGET host's scoped token (or empty) BEFORE connect — never
+    // the legacy/global key, never the previous host's token — so a token
+    // saved for A is not sent to B (cross-origin credential leak). Set hostRef
+    // and tokenRef/state synchronously so connect() reads the target pair.
+    const nextToken = loadTokenForAuthority(tokenStorage, next);
     hostRef.current = next;
+    tokenRef.current = nextToken;
+    setToken(nextToken);
     setHostInput(next);
     connect();
   }, [connect, resetAllState]);
 
-  /** Settings-panel token commit: persist under `rpi-web-token` and reconnect
-   *  so the new token takes effect (rpi-auth.<token> subprotocol). */
+  /** Settings-panel token commit: persist under the CURRENT host's scoped key
+   *  (rpi-web-token:<authority> — never a global key) so each host's token
+   *  stays separate, and reconnect so the new token takes effect
+   *  (rpi-auth.<token> subprotocol). Persist even when unchanged so the stored
+   *  value reflects the panel, but reconnect only on change. */
   const handleTokenChange = useCallback((nextToken: string) => {
     const trimmed = nextToken.trim();
-    if (trimmed === tokenRef.current) return; // same token: nothing to reconnect
+    const host = hostRef.current; // snapshot the authority this token belongs to
+    saveTokenForAuthority(tokenStorage, host, trimmed);
+    if (trimmed === tokenRef.current) return; // same token: persisted, no reconnect
     bootProbeRef.current = false;
     tokenRef.current = trimmed;
     setToken(trimmed);
-    try {
-      window.localStorage.setItem(TOKEN_STORAGE_KEY, trimmed);
-    } catch {
-      /* private mode: token lives in state only */
-    }
     connect();
   }, [connect]);
 
@@ -1909,9 +2071,11 @@ export function App() {
 
   /* ---------------- composer: realtime voice (Codex Live WebRTC) ---------------- */
 
-  /** True when the backend advertises realtime mode; the mic becomes a
-   *  click-to-toggle call button instead of hold-to-talk STT. */
-  const isRealtimeMode = liveSettings?.mode === 'realtime';
+  /** True when the backend advertises live.enabled and realtime mode (trim +
+   *  ASCII lowercase, centralized in realtime.ts). A missing/disabled live
+   *  block never selects realtime, and applyState clears stale liveSettings
+   *  when runtimeSettings omits live. */
+  const isRealtimeMode = isRealtimeLiveMode(liveSettings);
 
   /** Commit a final transcript to the composer textarea, mirroring the STT
    *  flow's commit so both voice paths land the draft the same way. */
@@ -1927,28 +2091,44 @@ export function App() {
     },
     [autoResize]
   );
-
-  /** Sideband event dispatch: transcript deltas stream into the overlay, a
-   *  final transcript commits to the composer, delegations get a notification
-   *  row, errors surface as toasts. Output audio is delivered over WebRTC
-   *  (not this socket), so output_audio.delta is intentionally a no-op. */
+  /** `oai-events` data-channel event dispatch: USER input transcript deltas
+   *  stream into the overlay, a final transcript commits to the composer
+   *  (deduped across the two V1 final-event variants), delegations get a
+   *  notification row, errors surface as toasts. Transport-agnostic — the
+   *  handler parses JSON frames regardless of transport; the direct sideband
+   *  WebSocket was removed (it could carry no browser Bearer header and would
+   *  mixed-content-block on HTTPS→http), so events now arrive over the
+   *  `oai-events` RTCDataChannel. Assistant OUTPUT transcript events are
+   *  intentionally NOT routed here (classifyInputTranscriptEvent returns null
+   *  for them) so they can never be committed to the composer as a user
+   *  draft; output audio rides the WebRTC track, so output_audio.delta is a
+   *  no-op. */
   const handleRealtimeFrame = useCallback(
     (frame: Record<string, unknown>) => {
       const type = typeof frame.type === 'string' ? frame.type : '';
+      // USER input transcript (CLIProxyAPI aliases + V1 conversation API).
+      // Deltas append to the overlay; finals commit the authoritative
+      // utterance to the composer, deduped so the two V1 final variants for
+      // one utterance do not double-commit.
+      const cls = classifyInputTranscriptEvent(type);
+      if (cls === 'delta') {
+        const delta = firstString(frame.delta, frame.transcript);
+        if (!delta) return;
+        realtimeTranscriptRef.current += delta;
+        const node = realtimeTranscriptNodeRef.current;
+        if (node) node.textContent = realtimeTranscriptRef.current;
+        return;
+      }
+      if (cls === 'final') {
+        const text = finalTranscriptText(frame);
+        const commit = nextInputTranscriptCommit(text, lastCommittedTranscriptRef.current);
+        if (commit) {
+          lastCommittedTranscriptRef.current = commit;
+          commitTranscriptToComposer(commit);
+        }
+        return;
+      }
       switch (type) {
-        case 'transcript.delta': {
-          const delta = firstString(frame.delta);
-          if (!delta) return;
-          realtimeTranscriptRef.current += delta;
-          const node = realtimeTranscriptNodeRef.current;
-          if (node) node.textContent = realtimeTranscriptRef.current;
-          break;
-        }
-        case 'transcript.done': {
-          const text = firstString(frame.transcript, frame.text, frame.delta);
-          if (text) commitTranscriptToComposer(text);
-          break;
-        }
         case 'delegation.created': {
           const d = frame.delegation;
           const delegationText =
@@ -1965,7 +2145,10 @@ export function App() {
           break;
         }
         case 'error': {
-          toast(firstString(frame.message) || 'realtime session error', true);
+          // V1 nests the detail under `error.message`/`error.code`; fall back
+          // to the top-level alias fields. Always surface a bounded message so
+          // a configured-but-failed session is never silently swallowed.
+          toast(realtimeErrorMessage(frame), true);
           break;
         }
         case 'output_audio.delta':
@@ -1978,22 +2161,24 @@ export function App() {
     [commitTranscriptToComposer, toast]
   );
 
-  /** Tear down the realtime call: close the sideband WS, close the
-   *  RTCPeerConnection, stop the mic tracks, and tell the backend the session
-   *  is over. Idempotent; `silent` skips the realtime_stop RPC (unmount path,
-   *  where the main socket is already gone). */
+  /** Tear down the realtime call: close the `oai-events` data channel, close
+   *  the RTCPeerConnection, stop the mic tracks, and tell the backend the
+   *  session is over. Idempotent; `silent` skips the realtime_stop RPC (unmount
+   *  path, where the main socket is already gone). Nulling the channel/pc refs
+   *  first means a late data-channel onclose/onerror is a no-op (no duplicate
+   *  toast, no re-entrant teardown). */
   const stopRealtime = useCallback(
     (opts?: { silent?: boolean }) => {
-      const hadSession = realtimePcRef.current !== null || realtimeWsRef.current !== null;
-      const ws = realtimeWsRef.current;
-      realtimeWsRef.current = null;
-      if (ws) {
-        ws.onopen = null;
-        ws.onmessage = null;
-        ws.onerror = null;
-        ws.onclose = null;
+      const hadSession = realtimePcRef.current !== null || realtimeDcRef.current !== null;
+      const dc = realtimeDcRef.current;
+      realtimeDcRef.current = null;
+      if (dc) {
+        dc.onopen = null;
+        dc.onmessage = null;
+        dc.onerror = null;
+        dc.onclose = null;
         try {
-          ws.close();
+          dc.close();
         } catch {
           /* already closed */
         }
@@ -2016,6 +2201,7 @@ export function App() {
       const audio = realtimeAudioRef.current;
       if (audio) audio.srcObject = null;
       realtimeTranscriptRef.current = '';
+      lastCommittedTranscriptRef.current = '';
       const node = realtimeTranscriptNodeRef.current;
       if (node) node.textContent = '';
       setRealtimeDelegation(null);
@@ -2028,8 +2214,13 @@ export function App() {
   );
 
   /** Start a Codex Live realtime call: mic track -> RTCPeerConnection ->
-   *  SDP offer over the realtime_create_call RPC -> answer -> sideband WS for
-   *  transcript/delegation events (incoming audio rides the WebRTC track). */
+   *  `oai-events` RTCDataChannel (created BEFORE the offer so it is negotiated
+   *  in the SDP) -> SDP offer over the realtime_create_call RPC -> answer.
+   *  session.update + server events (transcript/delegation/error) flow over
+   *  the data channel, which rides the WebRTC DTLS transport — no browser-side
+   *  Bearer header and no HTTPS/http mixed-content block (the reasons the
+   *  direct sideband WebSocket was removed). Incoming audio rides the WebRTC
+   *  track. */
   const startRealtime = useCallback(async () => {
     if (realtimeActive || realtimeBusyRef.current) return;
     const baseUrl = (liveSettings?.realtimeBaseUrl ?? '').trim();
@@ -2050,91 +2241,84 @@ export function App() {
     }
     const model = (liveSettings?.realtimeModel ?? '').trim() || 'gpt-realtime-1.5';
     const voice = (liveSettings?.voice ?? '').trim() || 'sol';
-    let stream: MediaStream | null = null;
-    let pc: RTCPeerConnection | null = null;
-    let ws: WebSocket | null = null;
     realtimeBusyRef.current = true;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      pc = new RTCPeerConnection();
-      realtimePcRef.current = pc;
-      mediaStreamRef.current = stream;
-      for (const track of stream.getTracks()) pc.addTrack(track, stream);
-      pc.ontrack = (event) => {
-        const audio = realtimeAudioRef.current;
-        if (audio && event.streams.length > 0) {
-          audio.srcObject = event.streams[0];
-          void audio.play().catch(() => {});
-        }
-      };
-      pc.onconnectionstatechange = () => {
-        if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) {
-          stopRealtime();
-        }
-      };
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      const result = (await sendCommand({ type: 'realtime_create_call', sdpOffer: offer.sdp ?? '' })) as {
-        sdp?: unknown;
-        callId?: unknown;
-      };
-      const sdp = typeof result?.sdp === 'string' ? result.sdp : '';
-      const callId = typeof result?.callId === 'string' ? result.callId : '';
-      if (!sdp || !callId) {
-        throw new Error('realtime_create_call returned no SDP answer or call id');
-      }
-      await pc.setRemoteDescription({ type: 'answer', sdp });
-      // Sideband events (transcript/delegation) ride a separate WS; audio
-      // flows over the WebRTC connection itself.
-      const socket = new WebSocket(sidebandRealtimeWsUrl(baseUrl, callId));
-      ws = socket;
-      realtimeWsRef.current = socket;
-      socket.onopen = () => {
-        // Advertise the session config the backend negotiated for.
-        socket.send(JSON.stringify({ type: 'session.update', session: { model, voice } }));
-      };
-      socket.onmessage = (event) => {
-        try {
-          const frame = JSON.parse(String(event.data)) as Record<string, unknown>;
-          if (frame && typeof frame === 'object') handleRealtimeFrame(frame);
-        } catch {
-          // Non-JSON frames (pings/heartbeats) are ignored.
-        }
-      };
-      socket.onerror = () => {
-        if (realtimeWsRef.current === socket) toast('realtime sideband connection failed', true);
-      };
-      socket.onclose = () => {
-        if (realtimeWsRef.current === socket) realtimeWsRef.current = null;
-      };
+      await setupRealtimeCall({
+        getUserMedia: () =>
+          navigator.mediaDevices.getUserMedia({ audio: true }).then((s) => {
+            mediaStreamRef.current = s;
+            return s;
+          }),
+        createPeerConnection: () => new RTCPeerConnection(),
+        sendCreateCall: (sdpOffer) =>
+          sendCommand({ type: 'realtime_create_call', sdpOffer }).then((raw) => {
+            const r = (raw || {}) as { sdp?: unknown; callId?: unknown };
+            const sdp = typeof r?.sdp === 'string' ? r.sdp : '';
+            const callId = typeof r?.callId === 'string' ? r.callId : '';
+            return { sdp, callId };
+          }),
+        onPeerConnection: (pcArg) => {
+          // Set the pc ref first so a partial-failure catch can release it.
+          realtimePcRef.current = pcArg;
+          pcArg.ontrack = (event) => {
+            const audio = realtimeAudioRef.current;
+            if (audio && event.streams.length > 0) {
+              audio.srcObject = event.streams[0];
+              void audio.play().catch(() => {});
+            }
+          };
+          pcArg.onconnectionstatechange = () => {
+            if (pcArg && (pcArg.connectionState === 'failed' || pcArg.connectionState === 'closed')) {
+              stopRealtime();
+            }
+          };
+        },
+        onDataChannel: (_pcArg, dcArg) => {
+          // Set the dc ref first so a partial-failure catch / onclose can
+          // release it; wiring happens before createOffer (the channel is
+          // created inside setupRealtimeCall before the offer).
+          realtimeDcRef.current = dcArg;
+          dcArg.onopen = () => {
+            // Re-advertise the full V1 session config (the SAME object the
+            // Rust create-call POST body carries — Contract 4) so the
+            // configured voice takes effect; the legacy {model, voice}
+            // top-level shape was silently ignored by the V1 parser (voice
+            // must nest under audio.output.voice).
+            try {
+              dcArg.send(JSON.stringify({ type: 'session.update', session: buildRealtimeSessionConfig(model, voice) }));
+            } catch {
+              /* channel closed between open and send; onclose handles teardown */
+            }
+          };
+          dcArg.onmessage = (event) => {
+            try {
+              const frame = JSON.parse(String(event.data)) as Record<string, unknown>;
+              if (frame && typeof frame === 'object') handleRealtimeFrame(frame);
+            } catch {
+              // Non-JSON frames are ignored.
+            }
+          };
+          dcArg.onerror = () => {
+            if (realtimeDcRef.current === dcArg) toast('realtime data channel error', true);
+          };
+          dcArg.onclose = () => {
+            // An unexpected close mid-call tears the call down (idempotent: a
+            // user-initiated stopRealtime nulls the ref first, so this no-ops).
+            if (realtimeDcRef.current === dcArg) stopRealtime();
+          };
+        },
+      });
+      lastCommittedTranscriptRef.current = '';
       realtimeTranscriptRef.current = '';
       const node = realtimeTranscriptNodeRef.current;
       if (node) node.textContent = '';
       setRealtimeDelegation(null);
       setRealtimeActive(true);
     } catch (err) {
-      if (ws) {
-        realtimeWsRef.current = null;
-        try {
-          ws.onclose = null;
-          ws.close();
-        } catch {
-          /* already closed */
-        }
-      }
-      if (pc) {
-        realtimePcRef.current = null;
-        try {
-          pc.ontrack = null;
-          pc.close();
-        } catch {
-          /* already closed */
-        }
-      }
-      if (stream) {
-        mediaStreamRef.current = null;
-        stream.getTracks().forEach((track) => track.stop());
-      }
+      // A partial setup leaves the pc/dc/mic refs set incrementally via the
+      // setup callbacks; release them WITHOUT firing realtime_stop (silent —
+      // the call never fully came up).
+      stopRealtime({ silent: true });
       toast(`realtime call failed: ${err instanceof Error ? err.message : String(err)}`, true);
     } finally {
       realtimeBusyRef.current = false;
@@ -2168,30 +2352,36 @@ export function App() {
 
   /* ---------------- effects ---------------- */
 
-  // Restore the token and connect on boot.
+  // Restore the token for the INITIAL page authority and connect on boot. The
+  // legacy global token (rpi-web-token) is migrated to the initial authority's
+  // scoped key ONCE and the legacy key deleted — it never leaks to a different
+  // host. The ref/state are set synchronously (including empty) so the very
+  // first connection already uses the correct token.
   useEffect(() => {
-    let saved = '';
-    try {
-      saved = window.localStorage.getItem(TOKEN_STORAGE_KEY) || '';
-    } catch {
-      /* private mode */
-    }
-    if (saved) {
-      // Set the ref synchronously so the very first connection already uses
-      // the saved token (React state would lag one render).
-      tokenRef.current = saved.trim();
-      setToken(tokenRef.current);
-    }
+    const saved = loadInitialAuthorityToken(tokenStorage, hostRef.current);
+    tokenRef.current = saved;
+    setToken(saved);
     connect();
     return () => {
       if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current);
       clearHeartbeatTimers();
-      // Release the mic/WebRTC/sideband resources; the realtime_stop RPC is
+      // Release the mic/WebRTC/data-channel resources; the realtime_stop RPC is
       // skipped (silent) because the main socket is closing underneath us.
       stopRealtime({ silent: true });
       const ws = wsRef.current;
       wsRef.current = null;
-      if (ws) ws.close(1000, 'unload');
+      // Detach the main socket's handlers before close so a late onopen /
+      // onmessage / onerror / onclose cannot fire post-unmount (e.g. a
+      // CONNECTING socket whose onopen would otherwise bootstrap into a torn-
+      // down component).
+      if (ws) {
+        detachTransportHandlers(ws);
+        try {
+          ws.close(1000, 'unload');
+        } catch {
+          /* already closed */
+        }
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2398,6 +2588,7 @@ export function App() {
         />
         <div className="app-main">
       <main id="transcript" aria-live="polite" ref={transcriptRef} onScroll={onTranscriptScroll}>
+        <div className="transcript-content">
         {activeItems.length === 0 && (
           <div className="empty-hint">
             {connState === 'on' ? (
@@ -2466,6 +2657,7 @@ export function App() {
               );
           }
         })}
+        </div>
       </main>
 
       {/* panel mount point — every panel is KEYED by (panel, session) so its

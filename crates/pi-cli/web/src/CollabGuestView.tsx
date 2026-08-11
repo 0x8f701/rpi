@@ -476,6 +476,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
       </header>
 
       <main id="transcript" aria-live="polite" ref={transcriptRef} onScroll={onTranscriptScroll}>
+        <div className="transcript-content">
         {items.length === 0 && (
           <div className="empty-hint">
             {status === 'connected'
@@ -541,6 +542,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
               return null;
           }
         })}
+        </div>
       </main>
 
       <footer>

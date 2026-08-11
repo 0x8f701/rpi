@@ -616,9 +616,13 @@ pub enum RpcCommand {
     },
     /// Exchange a WebRTC SDP offer for a Codex Live realtime call by proxying
     /// `POST {realtimeBaseUrl}/v1/realtime/calls` on the backend (avoids CORS
-    /// and keeps the API key server-side). Returns
+    /// and keeps the API key server-side). The POST body is
+    /// `{ "sdp": offer, "session": { type, model, audio: { input, output } } }`,
+    /// where `session` is the Quicksilver realtime shape reused verbatim for
+    /// the `oai-events` data channel's `session.update`. The upstream answer is
+    /// a bare SDP body with the call id in the `Location` header. Returns
     /// `{ "sdp": "<answer>", "callId": "<call id>" }` for the browser's
-    /// `RTCPeerConnection` plus the sideband `WS /v1/realtime?call_id=…`.
+    /// `RTCPeerConnection` and the `oai-events` data channel.
     /// Wire shape: `{ "type": "realtime_create_call", "id"?: string, "sdpOffer": string }`.
     RealtimeCreateCall {
         #[serde(default)]
@@ -626,19 +630,10 @@ pub enum RpcCommand {
         #[serde(rename = "sdpOffer")]
         sdp_offer: String,
     },
-    /// Create a Codex Live realtime session by proxying
-    /// `POST {realtimeBaseUrl}/v1/live` on the backend (the browser never
-    /// holds the API key). Returns the upstream session payload (token/headers
-    /// are passed through verbatim).
-    /// Wire shape: `{ "type": "realtime_create_session", "id"?: string }`.
-    RealtimeCreateSession {
-        #[serde(default)]
-        id: Option<String>,
-    },
     /// Notify the backend that the Codex Live realtime session ended. The
-    /// browser tears down its own `RTCPeerConnection` and sideband WebSocket;
-    /// this command is an acknowledgment so the RPC owner can release any
-    /// server-side bookkeeping. Returns `{ "stopped": true }`.
+    /// browser tears down its own `RTCPeerConnection` and `oai-events` data
+    /// channel; this command is an acknowledgment so the RPC owner can release
+    /// any server-side bookkeeping. Returns `{ "stopped": true }`.
     /// Wire shape: `{ "type": "realtime_stop", "id"?: string }`.
     RealtimeStop {
         #[serde(default)]
@@ -746,7 +741,6 @@ impl RpcCommand {
             | Self::CollabStop { id, .. }
             | Self::CloseSession { id }
             | Self::RealtimeCreateCall { id, .. }
-            | Self::RealtimeCreateSession { id }
             | Self::RealtimeStop { id } => id.clone(),
         }
     }
@@ -850,7 +844,6 @@ impl RpcCommand {
             Self::CollabStop { .. } => "collab_stop",
             Self::CloseSession { .. } => "close_session",
             Self::RealtimeCreateCall { .. } => "realtime_create_call",
-            Self::RealtimeCreateSession { .. } => "realtime_create_session",
             Self::RealtimeStop { .. } => "realtime_stop",
         }
     }
@@ -2061,13 +2054,13 @@ async fn handle_command_inner(
         RpcCommand::Steer {
             message, images, ..
         } => {
-            app.steer(message, images).await;
+            app.steer(message, images).await?;
             Ok(None)
         }
         RpcCommand::FollowUp {
             message, images, ..
         } => {
-            app.follow_up(message, images).await;
+            app.follow_up(message, images).await?;
             Ok(None)
         }
         RpcCommand::Abort { .. } => {
@@ -2566,16 +2559,12 @@ async fn handle_command_inner(
             bail!("collaboration room commands require the listen control plane")
         }
         // Codex Live realtime proxy commands. The browser owns WebRTC and the
-        // sideband WS; these only relay signaling/session HTTP calls to
-        // CLIProxyAPI with the server-held API key (never exposed to the
-        // frontend).
+        // `oai-events` data channel; these only relay signaling/session HTTP
+        // calls to CLIProxyAPI with the server-held API key (never exposed to
+        // the frontend).
         RpcCommand::RealtimeCreateCall { sdp_offer, .. } => {
             let live = app.runtime_settings().live.clone();
             Ok(Some(realtime_create_call(&live, &sdp_offer).await?))
-        }
-        RpcCommand::RealtimeCreateSession { .. } => {
-            let live = app.runtime_settings().live.clone();
-            Ok(Some(realtime_create_session(&live).await?))
         }
         RpcCommand::RealtimeStop { .. } => Ok(Some(json!({"stopped": true}))),
         // The Web control plane's session runtime manager intercepts
@@ -2612,6 +2601,11 @@ fn realtime_endpoint(base: &str, path: &str) -> String {
 /// access key must be configured, and plaintext bearer credentials are
 /// rejected unless `allowInsecure` is set.
 fn validate_realtime_proxy(settings: &pi_coding::LiveRuntimeSettings) -> Result<()> {
+    if !settings.enabled {
+        bail!(
+            "Live voice is disabled — set `Settings.live.enabled = true` (or run `/settings set live.enabled true`)"
+        );
+    }
     if settings.realtime_base_url.trim().is_empty() {
         bail!(
             "Realtime voice is not configured — set `Settings.live.realtimeBaseUrl` to your CLIProxyAPI base URL (e.g. http://host:port)"
@@ -2640,9 +2634,71 @@ fn validate_realtime_proxy(settings: &pi_coding::LiveRuntimeSettings) -> Result<
     }
 }
 
+/// Builds the CLIProxyAPI realtime session payload — the `session` object sent
+/// in the create-call POST and reused verbatim for the `oai-events` data
+/// channel's `session.update`. This is the Quicksilver realtime session shape:
+/// `{ type, model, audio: { input: { format: { type, rate } }, output: { voice } } }`.
+/// The configured `realtimeModel`/`voice` are passed through unchanged
+/// (custom aliases are not hard-rejected here; the upstream surfaces any
+/// mismatch as a diagnostic error).
+fn realtime_session_payload(settings: &pi_coding::LiveRuntimeSettings) -> Value {
+    json!({
+        "type": "quicksilver",
+        "model": settings.realtime_model,
+        "audio": {
+            "input": {
+                "format": {
+                    "type": "audio/pcm",
+                    "rate": 24000,
+                },
+            },
+            "output": {
+                "voice": settings.voice,
+            },
+        },
+    })
+}
+
+/// Parses a realtime call id from the last path segment of a `Location`
+/// header. Accepts a non-empty `rtc_`-prefixed suffix or a standard UUID;
+/// rejects anything else. The error names the offending `Location` value so
+/// the caller can diagnose routing, but never echoes auth material (the
+/// header is a server-supplied path/URL, not a credential).
+fn parse_realtime_call_id(location: Option<&reqwest::header::HeaderValue>) -> Result<String> {
+    let header = location.context(
+        "realtime_create_call: /v1/realtime/calls response has no `Location` header (call id)",
+    )?;
+    let raw = header
+        .to_str()
+        .with_context(|| format!("realtime_create_call: `Location` header is not valid UTF-8: {header:?}"))?;
+    // The call id is the last non-empty path segment, ignoring any query/fragment.
+    let path = raw
+        .split(['?', '#'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(raw);
+    let segment = path
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .with_context(|| format!("realtime_create_call: `Location` has no path segment to derive a call id: {raw:?}"))?;
+    let valid = if let Some(suffix) = segment.strip_prefix("rtc_") {
+        !suffix.is_empty()
+    } else {
+        uuid::Uuid::parse_str(segment).is_ok()
+    };
+    if !valid {
+        bail!(
+            "realtime_create_call: `Location` call id `{segment}` is neither a non-empty `rtc_` id nor a standard UUID (Location: {raw:?})"
+        );
+    }
+    Ok(segment.to_owned())
+}
+
 /// Proxies `POST {realtimeBaseUrl}/v1/realtime/calls` with the SDP offer and
-/// the configured model, returning the answer as `{"sdp": ..., "callId": ...}`
-/// for the browser's `RTCPeerConnection` and sideband WebSocket.
+/// the configured model/voice, returning the answer as
+/// `{"sdp": ..., "callId": ...}` for the browser's `RTCPeerConnection` and
+/// `oai-events` data channel. The upstream response is a bare SDP body; the
+/// call id is parsed from the `Location` header.
 async fn realtime_create_call(
     settings: &pi_coding::LiveRuntimeSettings,
     sdp_offer: &str,
@@ -2656,10 +2712,13 @@ async fn realtime_create_call(
     let response = client
         .post(&url)
         .bearer_auth(settings.realtime_api_key.trim())
-        .json(&json!({ "sdp": sdp_offer, "model": settings.realtime_model }))
+        .json(&json!({ "sdp": sdp_offer, "session": realtime_session_payload(settings) }))
         .send()
         .await
         .with_context(|| format!("POST {url} (realtime_create_call) failed"))?;
+    // Capture the Location header before consuming the body — the call id
+    // lives there, not in the (bare SDP) response body.
+    let location = response.headers().get(reqwest::header::LOCATION).cloned();
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -2668,53 +2727,15 @@ async fn realtime_create_call(
             body.chars().take(300).collect::<String>()
         );
     }
-    let payload: Value = response
-        .json()
+    let sdp = response
+        .text()
         .await
-        .context("realtime_create_call: parsing /v1/realtime/calls response")?;
-    let sdp = payload
-        .get("sdp")
-        .and_then(Value::as_str)
-        .filter(|sdp| !sdp.is_empty())
-        .context("realtime_create_call: /v1/realtime/calls response has no non-empty `sdp` answer")?;
-    let call_id = payload
-        .get("call_id")
-        .or_else(|| payload.get("callId"))
-        .and_then(Value::as_str)
-        .filter(|call_id| !call_id.is_empty())
-        .context("realtime_create_call: /v1/realtime/calls response has no non-empty `call_id`")?;
-    Ok(json!({ "sdp": sdp, "callId": call_id }))
-}
-
-/// Proxies `POST {realtimeBaseUrl}/v1/live` with the configured model and
-/// voice, passing the upstream session payload (token/headers) through
-/// verbatim.
-async fn realtime_create_session(settings: &pi_coding::LiveRuntimeSettings) -> Result<Value> {
-    validate_realtime_proxy(settings)?;
-    let url = realtime_endpoint(&settings.realtime_base_url, "/live");
-    let client = reqwest::Client::builder()
-        .timeout(REALTIME_PROXY_TIMEOUT)
-        .build()
-        .context("building realtime proxy client")?;
-    let response = client
-        .post(&url)
-        .bearer_auth(settings.realtime_api_key.trim())
-        .json(&json!({ "model": settings.realtime_model, "voice": settings.voice }))
-        .send()
-        .await
-        .with_context(|| format!("POST {url} (realtime_create_session) failed"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        bail!(
-            "realtime_create_session: {url} returned {status}: {}",
-            body.chars().take(300).collect::<String>()
-        );
+        .context("realtime_create_call: reading /v1/realtime/calls SDP answer body")?;
+    if sdp.trim().is_empty() {
+        bail!("realtime_create_call: /v1/realtime/calls returned an empty SDP answer body");
     }
-    response
-        .json()
-        .await
-        .with_context(|| format!("realtime_create_session: parsing {url} response"))
+    let call_id = parse_realtime_call_id(location.as_ref())?;
+    Ok(json!({ "sdp": sdp, "callId": call_id }))
 }
 
 pub(crate) fn public_message(message: Message) -> Message {
@@ -5450,8 +5471,8 @@ mod tests {
         let app = build_todo_app("faux-rpc-queue", "faux-rpc-queue-api").await;
         app.set_steering_mode(QueueMode::All).await;
         app.set_follow_up_mode(QueueMode::All).await;
-        app.steer("first steer".to_owned(), Vec::new()).await;
-        app.follow_up("second follow".to_owned(), Vec::new()).await;
+        app.steer("first steer".to_owned(), Vec::new()).await.expect("queue steer");
+        app.follow_up("second follow".to_owned(), Vec::new()).await.expect("queue follow-up");
 
         let listed = handle_command(
             &app,
@@ -5894,5 +5915,358 @@ mod tests {
             );
         }
         app.cleanup().await;
+    }
+    // ---- Codex Live realtime proxy: local TCP mock regression tests ----
+    //
+    // A loopback TCP server speaks just enough HTTP/1.1 to stand in for
+    // CLIProxyAPI, so the create-call contract is exercised with no real
+    // network and no real credentials. The bearer below is a test fixture,
+    // never a live secret.
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    const REALTIME_TEST_KEY: &str = "test-bearer-not-a-real-secret";
+    const REALTIME_TEST_SDP_OFFER: &str =
+        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+
+    fn realtime_test_settings(base_url: &str) -> pi_coding::LiveRuntimeSettings {
+        pi_coding::LiveRuntimeSettings {
+            enabled: true,
+            mode: "realtime".to_owned(),
+            stt_base_url: String::new(),
+            stt_api_key: String::new(),
+            stt_model: String::new(),
+            realtime_base_url: base_url.to_owned(),
+            realtime_api_key: REALTIME_TEST_KEY.to_owned(),
+            // A custom alias (not the upstream's gpt-realtime-1.5) proves the
+            // configured model label is forwarded verbatim, not rewritten or
+            // hard-rejected here.
+            realtime_model: "gpt-5.6-sol".to_owned(),
+            voice: "sol".to_owned(),
+            language: None,
+            allow_insecure: true,
+        }
+    }
+
+    #[test]
+    fn realtime_proxy_requires_live_enabled() {
+        let mut settings = realtime_test_settings("http://127.0.0.1:1");
+        settings.enabled = false;
+        let error = validate_realtime_proxy(&settings)
+            .expect_err("disabled realtime must fail closed")
+            .to_string();
+        assert!(error.contains("Settings.live.enabled"), "{error}");
+        assert!(!error.contains(REALTIME_TEST_KEY), "{error}");
+    }
+
+    struct MockRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl MockRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// Reads one HTTP/1.1 request (request line + headers + exactly
+    /// `Content-Length` body bytes) from `reader`.
+    async fn read_http_request<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> MockRequest {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let header_end = loop {
+            let n = reader
+                .read(&mut chunk)
+                .await
+                .expect("read request bytes before connection close");
+            if n == 0 {
+                panic!("connection closed before full HTTP request was received");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break idx + 4;
+            }
+        };
+        let header_block =
+            std::str::from_utf8(&buf[..header_end]).expect("ascii request header block");
+        let mut lines = header_block.split("\r\n");
+        let request_line = lines.next().expect("request line");
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().expect("method").to_owned();
+        let path = parts.next().expect("path").to_owned();
+        let mut headers = Vec::new();
+        let mut content_length = 0usize;
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim();
+                let value = v.trim();
+                if key.eq_ignore_ascii_case("content-length") {
+                    content_length = value.parse().expect("content-length");
+                }
+                headers.push((key.to_owned(), value.to_owned()));
+            }
+        }
+        // Keep reading until the full body (per Content-Length) is buffered.
+        while buf.len() < header_end + content_length {
+            let n = reader.read(&mut chunk).await.expect("read request body");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let body = buf[header_end..header_end + content_length].to_vec();
+        MockRequest {
+            method,
+            path,
+            headers,
+            body,
+        }
+    }
+
+    async fn write_http_response(
+        socket: &mut tokio::net::TcpStream,
+        status_line: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) {
+        let mut out = format!("{status_line}\r\n");
+        for (k, v) in headers {
+            out.push_str(&format!("{k}: {v}\r\n"));
+        }
+        out.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        out.push_str("Connection: close\r\n\r\n");
+        socket
+            .write_all(out.as_bytes())
+            .await
+            .expect("write response headers");
+        socket.write_all(body).await.expect("write response body");
+        socket.flush().await.expect("flush response");
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_posts_session_payload_and_returns_sdp_call_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let req = read_http_request(&mut sock).await;
+        // Method + path: POST /v1/realtime/calls.
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/realtime/calls");
+        // Bearer header carries only the test fake value.
+        assert_eq!(
+            req.header("authorization").unwrap(),
+            format!("Bearer {REALTIME_TEST_KEY}")
+        );
+        // Content-Type is JSON.
+        assert!(
+            req.header("content-type")
+                .unwrap()
+                .starts_with("application/json"),
+            "content-type: {:?}",
+            req.header("content-type")
+        );
+        // Body is the contract shape: { sdp, session: { type, model, audio } }.
+        let body: Value = serde_json::from_slice(&req.body).expect("json body");
+        assert_eq!(body["sdp"], REALTIME_TEST_SDP_OFFER);
+        let session = body.get("session").expect("session object");
+        assert!(session.is_object(), "session must be an object: {session}");
+        assert_eq!(session["type"], "quicksilver");
+        // Configured model alias forwarded verbatim, not rewritten.
+        assert_eq!(session["model"], "gpt-5.6-sol");
+        assert_eq!(session["audio"]["input"]["format"]["type"], "audio/pcm");
+        assert_eq!(session["audio"]["input"]["format"]["rate"], 24000);
+        assert_eq!(session["audio"]["output"]["voice"], "sol");
+
+        let sdp_answer = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 201 Created",
+            &[
+                ("Location".to_owned(), "/v1/realtime/calls/rtc_alpha-001".to_owned()),
+                ("Content-Type".to_owned(), "application/sdp".to_owned()),
+            ],
+            sdp_answer.as_bytes(),
+        )
+        .await;
+
+        let result = call.await.expect("task join").expect("create call ok");
+        assert_eq!(result["sdp"], sdp_answer);
+        assert_eq!(result["callId"], "rtc_alpha-001");
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_accepts_uuid_location() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let _req = read_http_request(&mut sock).await;
+        let sdp_answer = "v=0\r\no=- 9 9 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 200 OK",
+            &[(
+                "Location".to_owned(),
+                format!("https://proxy.example/v1/realtime/calls/{uuid}"),
+            )],
+            sdp_answer.as_bytes(),
+        )
+        .await;
+
+        let result = call.await.expect("task join").expect("create call ok");
+        assert_eq!(result["callId"], uuid);
+        assert_eq!(result["sdp"], sdp_answer);
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_rejects_missing_location() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let _req = read_http_request(&mut sock).await;
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 201 Created",
+            &[("Content-Type".to_owned(), "application/sdp".to_owned())],
+            b"v=0\r\no=- 3 3 IN IP4 127.0.0.1\r\n",
+        )
+        .await;
+
+        let err = call
+            .await
+            .expect("task join")
+            .expect_err("missing Location must error");
+        let msg = err.to_string();
+        assert!(msg.contains("no `Location` header"), "{msg}");
+        // Must not echo auth material.
+        assert!(!msg.contains(REALTIME_TEST_KEY), "{msg}");
+        assert!(!msg.contains("Bearer"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_rejects_illegal_location() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let _req = read_http_request(&mut sock).await;
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 201 Created",
+            &[
+                ("Location".to_owned(), "/v1/realtime/calls/not-a-valid-id".to_owned()),
+                ("Content-Type".to_owned(), "application/sdp".to_owned()),
+            ],
+            b"v=0\r\no=- 4 4 IN IP4 127.0.0.1\r\n",
+        )
+        .await;
+
+        let err = call
+            .await
+            .expect("task join")
+            .expect_err("illegal Location must error");
+        let msg = err.to_string();
+        assert!(msg.contains("not-a-valid-id"), "{msg}");
+        assert!(msg.contains("Location"), "{msg}");
+        assert!(!msg.contains(REALTIME_TEST_KEY), "{msg}");
+        assert!(!msg.contains("Bearer"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_rejects_empty_sdp() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let _req = read_http_request(&mut sock).await;
+        // Whitespace-only body must be rejected as an empty SDP answer.
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 201 Created",
+            &[
+                ("Location".to_owned(), "/v1/realtime/calls/rtc_ok".to_owned()),
+                ("Content-Type".to_owned(), "application/sdp".to_owned()),
+            ],
+            b"   \r\n  \t ",
+        )
+        .await;
+
+        let err = call
+            .await
+            .expect("task join")
+            .expect_err("empty SDP must error");
+        assert!(err.to_string().contains("empty SDP"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_surfaces_truncated_non_2xx_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let _req = read_http_request(&mut sock).await;
+        let long_body = "X".repeat(2000);
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 503 Service Unavailable",
+            &[("Content-Type".to_owned(), "text/plain".to_owned())],
+            long_body.as_bytes(),
+        )
+        .await;
+
+        let err = call
+            .await
+            .expect("task join")
+            .expect_err("non-2xx must error");
+        let msg = err.to_string();
+        assert!(msg.contains("503"), "{msg}");
+        // Body is truncated to 300 chars in the error.
+        assert!(msg.contains(&"X".repeat(300)), "{msg}");
+        assert!(!msg.contains(&"X".repeat(301)), "{msg}");
+        // Auth must not leak into the error.
+        assert!(!msg.contains(REALTIME_TEST_KEY), "{msg}");
+        assert!(!msg.contains("Bearer"), "{msg}");
     }
 }

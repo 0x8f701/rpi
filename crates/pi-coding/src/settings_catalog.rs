@@ -442,6 +442,11 @@ pub const SETTINGS_CATALOG: &[SettingDef] = &[
     setting!("live.sttModel", Live, STRING, "\"whisper-1\"", "Model label sent as the multipart model field. 'whisper-1' is only a fallback label; the configured base URL serves or rejects it — this product never contacts OpenAI.", NONE, ALL, LIVE, false, false),
     setting!("live.language", Live, STRING, "null", "Optional BCP-47 language hint sent as the multipart language field.", NONE, ALL, LIVE, false, false),
     setting!("live.allowInsecure", Live, BOOL, "false", "Explicitly allow http:// STT endpoints (e.g. a loopback self-hosted whisper server). Default false: plaintext bearer credentials are rejected with an actionable error.", NONE, ALL, LIVE, false, false),
+    setting!("live.mode", Live, SettingValueType::Enum, "\"stt\"", "Voice mode: `stt` drives TUI hold-to-talk (mic capture → speech-to-text → composer draft); `realtime` drives WebRTC realtime voice, which the TUI does not implement — `/live`/hold-to-talk report an actionable error directing the user to the Web listener (start it with `rpi --listen 127.0.0.1:8080` and open the /web page in a browser). The runtime trims and lowercases this value; the catalog draft accepts only the canonical lowercase forms.", &["stt", "realtime"], ALL, LIVE, false, false),
+    setting!("live.realtimeBaseUrl", Live, STRING, "\"\"", "Base URL of the realtime voice endpoint (CLIProxyAPI's /v1/realtime/calls, e.g. http://localhost:8317) used by the Web listener when live.mode is `realtime`. The TUI never contacts this URL; it is read live by the Web listener with each realtime call.", NONE, ALL, LIVE, false, false),
+    setting!("live.realtimeApiKey", Live, SettingValueType::Secret, "null", "Access key for live.realtimeBaseUrl (CLIProxyAPI realtime endpoint). Secret material: redacted in every settings view and never writable through settings.json — edit the settings file directly (or use an environment reference like $REALTIME_API_KEY). Never logged.", NONE, SettingScopeSupport::None, RESTART, true, false),
+    setting!("live.realtimeModel", Live, STRING, "\"gpt-realtime-1.5\"", "Realtime model label sent in the realtime session payload. Used by the Web listener when live.mode is `realtime`; the runtime applies this default when the field is absent.", NONE, ALL, LIVE, false, false),
+    setting!("live.voice", Live, STRING, "\"sol\"", "Voice for the realtime session (e.g. `sol`). Used by the Web listener when live.mode is `realtime`; the runtime applies this default when the field is absent.", NONE, ALL, LIVE, false, false),
 
     setting!("defaultProjectTrust", TrustSecurity, SettingValueType::Enum, "\"ask\"", "Default trust for projects without a stored decision.", &["ask", "always", "never"], GLOBAL, RESTART, false, true),
     setting!("approvalMode", TrustSecurity, SettingValueType::Enum, "\"yolo\"", "Host tool approval policy.", &["yolo", "write", "ask"], GLOBAL, RESTART, false, true),
@@ -917,7 +922,7 @@ mod tests {
             "memory.hindsightBankMission", "memory.hindsightRetainMission", "memory.hindsightRecallBudget",
             "memory.hindsightRecallMaxTokens", "memory.hindsightRecallTypes", "memory.hindsightRequestTimeoutMs",
             "memory.hindsightRecallTimeoutMs", "memory.hindsightRetainTimeoutMs", "memory.hindsightReflectTimeoutMs",
-            "live.enabled", "live.sttBaseUrl", "live.sttModel", "live.language", "live.allowInsecure",
+            "live.enabled", "live.sttBaseUrl", "live.sttModel", "live.language", "live.allowInsecure", "live.mode", "live.realtimeBaseUrl", "live.realtimeModel", "live.voice",
         ]);
         let actual = SETTINGS_CATALOG.iter().filter(|definition| !definition.secret).map(|definition| definition.key).collect::<BTreeSet<_>>();
         assert_eq!(actual, expected);
@@ -1274,6 +1279,105 @@ mod tests {
         assert_eq!(runtime.stt_api_key, secret);
         let persisted = fs::read_to_string(agent.path().join("settings.json")).expect("persisted");
         assert!(persisted.contains(secret.as_str()), "raw key preserved on disk");
+    }
+
+    #[test]
+    fn live_realtime_api_key_is_secret_marked_redacted_and_never_editable() {
+        let (agent, cwd, _) = manager();
+        let secret = ["r", "t-", "realtime-secret-1234567890abcdef"].concat();
+        fs::write(
+            agent.path().join("settings.json"),
+            format!(
+                r#"{{"live":{{"mode":"realtime","realtimeBaseUrl":"http://localhost:8317","realtimeApiKey":"{secret}"}}}}"#
+            ),
+        )
+        .expect("settings");
+        let manager = SettingsManager::load_phase_one(cwd.path(), agent.path()).expect("reload");
+        let definition = SettingsCatalog::definition("live.realtimeApiKey").expect("definition");
+        assert!(definition.secret, "live.realtimeApiKey must be marked secret");
+        assert_eq!(
+            definition.value_type,
+            SettingValueType::Secret,
+            "live.realtimeApiKey must use the Secret value type"
+        );
+        // A secret is never writable through any scope.
+        assert_eq!(definition.scopes, SettingScopeSupport::None);
+        let view = manager.setting("live.realtimeApiKey").expect("secret view");
+        assert!(view.redacted);
+        assert_eq!(view.effective_value, REDACTED_VALUE);
+        let encoded = serde_json::to_string(&view).expect("serialize view");
+        assert!(!encoded.contains(secret.as_str()), "view must not leak the realtime key: {encoded}");
+        assert!(encoded.contains(REDACTED_VALUE));
+        assert!(!view.editable_global && !view.editable_project);
+
+        // The draft API refuses to write the secret through settings.json.
+        let mut draft = manager.settings_draft(SettingsScope::Global).expect("draft");
+        let error = draft
+            .set("live.realtimeApiKey", json!("replacement"))
+            .expect_err("secret write")
+            .to_string();
+        assert!(!error.contains("replacement"));
+        assert!(error.contains("secret material"), "{error}");
+
+        // The runtime still sees the configured realtime key (redacted view is
+        // never round-tripped into the persisted file).
+        let runtime = manager.settings().live_runtime();
+        assert_eq!(runtime.realtime_api_key, secret);
+        assert_eq!(runtime.mode, "realtime");
+        assert_eq!(runtime.realtime_base_url, "http://localhost:8317");
+        let persisted = fs::read_to_string(agent.path().join("settings.json")).expect("persisted");
+        assert!(persisted.contains(secret.as_str()), "raw realtime key preserved on disk");
+    }
+
+    #[test]
+    fn live_realtime_catalog_entries_have_correct_semantics() {
+        // live.mode: enum stt/realtime, default stt, live-reload behavior,
+        // editable in both scopes.
+        let mode = SettingsCatalog::definition("live.mode").expect("live.mode definition");
+        assert_eq!(mode.category, SettingCategory::Live);
+        assert_eq!(mode.value_type, SettingValueType::Enum);
+        assert_eq!(
+            mode.enum_values.iter().copied().collect::<Vec<_>>(),
+            vec!["stt", "realtime"]
+        );
+        assert_eq!(mode.default_value(), json!("stt"));
+        assert_eq!(mode.behavior, SettingApplyBehavior::Live);
+        assert!(mode.scopes.allows(SettingsScope::Global));
+        assert!(mode.scopes.allows(SettingsScope::Project));
+        assert!(!mode.secret);
+
+        // The catalog draft accepts the canonical lowercase values and
+        // rejects anything else (the runtime validator is the lenient layer
+        // that trims/lowercases file-edited values).
+        let (_agent, _cwd, manager) = manager();
+        let mut draft = manager.settings_draft(SettingsScope::Global).expect("draft");
+        draft.set("live.mode", json!("realtime")).expect("stage realtime");
+        assert!(draft.set("live.mode", json!("Realtime")).is_err(), "mixed-case rejected by catalog");
+        assert!(draft.set("live.mode", json!("banana")).is_err());
+
+        // live.realtimeBaseUrl / realtimeModel / voice: plain strings, live,
+        // both scopes, not secret.
+        for (key, default) in [
+            ("live.realtimeBaseUrl", json!("")),
+            ("live.realtimeModel", json!("gpt-realtime-1.5")),
+            ("live.voice", json!("sol")),
+        ] {
+            let definition = SettingsCatalog::definition(key).expect("{key} definition");
+            assert_eq!(definition.category, SettingCategory::Live, "{key}");
+            assert_eq!(definition.value_type, STRING, "{key}");
+            assert_eq!(definition.default_value(), default, "{key}");
+            assert_eq!(definition.behavior, SettingApplyBehavior::Live, "{key}");
+            assert!(definition.scopes.allows(SettingsScope::Global), "{key}");
+            assert!(definition.scopes.allows(SettingsScope::Project), "{key}");
+            assert!(!definition.secret, "{key}");
+        }
+
+        // live.realtimeApiKey follows the same secret shape as live.sttApiKey.
+        let key_def = SettingsCatalog::definition("live.realtimeApiKey").expect("realtimeApiKey");
+        assert_eq!(key_def.value_type, SettingValueType::Secret);
+        assert_eq!(key_def.scopes, SettingScopeSupport::None);
+        assert!(key_def.secret);
+        assert_eq!(key_def.default_value(), Value::Null);
     }
 
     #[test]

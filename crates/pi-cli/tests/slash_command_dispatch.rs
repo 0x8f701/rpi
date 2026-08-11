@@ -1814,7 +1814,8 @@ async fn queue_cancel_drains_pending_messages_and_clears_count() {
 
     // Queue a steering message; the queue must reflect it.
     app.steer("steer the model mid-turn".to_owned(), Vec::new())
-        .await;
+        .await
+        .expect("queue steering message");
     let (steering, follow_up) = app.queued_messages().await;
     assert_eq!(steering.len(), 1, "one steering message must be queued");
     assert!(follow_up.is_empty(), "no follow-up expected");

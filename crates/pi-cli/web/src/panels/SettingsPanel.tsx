@@ -77,7 +77,7 @@ interface SettingsPanelProps {
   refreshState: () => Promise<unknown>;
   /** Current connection token (rpi-auth.<token> subprotocol). */
   token: string;
-  /** Persist a new token (localStorage rpi-web-token) and reconnect. */
+  /** Persist a new token for the current listener authority and reconnect. */
   onTokenChange: (token: string) => void;
   onClose: () => void;
 }
@@ -390,7 +390,7 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
               autoComplete="off"
               spellCheck={false}
               placeholder="rpi-auth token (optional)"
-              title="Sent as the rpi-auth.<token> WebSocket subprotocol. Saved to localStorage (rpi-web-token); Save/Enter reconnects."
+              title="Sent as the rpi-auth.<token> WebSocket subprotocol. Saved only for the current listener authority; Save/Enter reconnects."
               onChange={(e) => setTokenDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') onTokenChange(tokenDraft);
@@ -408,8 +408,8 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
           </div>
           <div className="settings-connection__hint">
             Leave blank when the listener runs without <code>--listen-token-file</code>. When the
-            listener was started with a token, enter it here and press Save — the page saves it to
-            localStorage (rpi-web-token) and reconnects immediately.
+            listener was started with a token, enter it here and press Save — the page saves it only
+            for the current listener authority and reconnects immediately.
           </div>
         </section>
         <nav className="settings-categories" aria-label="Settings categories">

@@ -535,8 +535,8 @@ async fn state_tracks_modes_pending_counts_and_new_session_reset() {
     application
         .set_session_name("  State\nTest  ")
         .expect("set name");
-    application.steer("steer".to_owned(), Vec::new()).await;
-    application.follow_up("follow".to_owned(), Vec::new()).await;
+    application.steer("steer".to_owned(), Vec::new()).await.expect("queue steer");
+    application.follow_up("follow".to_owned(), Vec::new()).await.expect("queue follow-up");
 
     let queued = application.state().await;
     assert!(!queued.is_streaming);
@@ -630,9 +630,9 @@ async fn queue_snapshot_and_drain_preserve_steering_then_follow_up_order() {
     let (session, registration) = session_with_responses(Vec::new());
     let application = Application::new(session).await;
     let mut events = application.subscribe();
-    application.steer("steer one".to_owned(), Vec::new()).await;
-    application.steer("steer two".to_owned(), Vec::new()).await;
-    application.follow_up("follow one".to_owned(), Vec::new()).await;
+    application.steer("steer one".to_owned(), Vec::new()).await.expect("queue first steer");
+    application.steer("steer two".to_owned(), Vec::new()).await.expect("queue second steer");
+    application.follow_up("follow one".to_owned(), Vec::new()).await.expect("queue follow-up");
     let mut queue_updates = Vec::new();
     while queue_updates.len() < 3 {
         match tokio::time::timeout(Duration::from_secs(2), events.recv()).await.expect("queue event timeout").expect("queue event") {

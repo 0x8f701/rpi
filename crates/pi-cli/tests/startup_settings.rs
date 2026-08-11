@@ -534,6 +534,11 @@ fn session_dir_settings_diagnostics_do_not_pollute_json_stdout() {
     );
     assert!(ok, "JSON startup failed: {err}");
     assert!(!err.contains("deprecated subagents.agentOverrides"), "agentOverrides migration is silent: {err}");
+    let raw = fs::read_to_string(agent.path().join("settings.json")).expect("read settings after startup");
+    assert!(
+        raw.contains("agentOverrides"),
+        "silent in-memory migration must not rewrite settings until an explicit save: {raw}"
+    );
     for line in out.lines().filter(|line| !line.trim().is_empty()) {
         serde_json::from_str::<serde_json::Value>(line)
             .unwrap_or_else(|error| panic!("diagnostic polluted JSON stdout ({error}): {line}"));

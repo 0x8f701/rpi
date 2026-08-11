@@ -691,13 +691,20 @@ fn write_legacy_agent_settings(home: &Path) {
         r#"{
   "subagents": {
     "agentOverrides": {
-      "reviewer": { "enabled": true, "model": "faux/faux-1" }
+      "reviewer": { "enabled": false, "model": "faux/faux-1" }
     }
   }
 }
 "#,
     )
     .expect("seed legacy settings");
+    let agents = agent.join("agents");
+    std::fs::create_dir_all(&agents).expect("agents dir");
+    std::fs::write(
+        agents.join("reviewer.md"),
+        "---\nname: reviewer\ndescription: legacy migration probe\n---\nReview carefully.\n",
+    )
+    .expect("seed reviewer definition");
 }
 
 /// Drain `read` to EOF while retaining at most `cap` bytes (prefix).
@@ -1319,7 +1326,7 @@ fn pty_todo_overview_detail_navigation() {
 /// usable. (Previously the warning was shown and dismissed with Esc; now the
 /// migration runs silently per the silenced-deprecated-warnings change.)
 #[test]
-fn pty_startup_warnings_surface_after_tui_launch() {
+fn pty_silent_legacy_migration_keeps_override_and_composer_usable() {
     let mut probe = PtyProbe::spawn_seeded(&["--model", "faux/faux-1"], 28, 100, |home, _cwd| {
         write_legacy_agent_settings(home);
     });
@@ -1329,12 +1336,44 @@ fn pty_startup_warnings_surface_after_tui_launch() {
         probe.snapshot()
     );
 
-    // The deprecation warning must NOT appear on the live screen.
-    let live = probe.live_screen();
+    // Silence covers the complete PTY stream, not only the final screen after
+    // ratatui has repainted over any pre-TUI stderr output.
+    let snapshot = probe.snapshot();
     assert!(
-        !live.contains("deprecated subagents.agentOverrides")
-            && !live.contains("subagents.agentOverrides"),
-        "agentOverrides migration is silent — no warning on TUI: {live}"
+        !snapshot.contains("deprecated subagents.agentOverrides")
+            && !snapshot.contains("subagents.agentOverrides"),
+        "agentOverrides migration is silent on the complete PTY stream: {snapshot}"
+    );
+
+    // The migrated override still takes effect: the Agents panel resolves the
+    // reviewer row through the configured faux model instead of merely hiding
+    // the old warning while dropping the legacy data.
+    let agents_start = probe.len();
+    probe.type_chars("/agents");
+    probe.send(b"\r");
+    assert!(
+        probe
+            .wait_for_live_after(agents_start, Duration::from_secs(15), |live| {
+                live.contains("Agents")
+                    && live.lines().any(|line| {
+                        line.contains("OFF")
+                            && line.contains("reviewer")
+                            && line.contains("model=faux/faux-1")
+                    })
+            })
+            .is_some(),
+        "silent migration must feed the seeded reviewer definition: {}",
+        probe.live_screen()
+    );
+    probe.send(&[ESC]);
+    assert!(
+        probe
+            .wait_for_live_after(agents_start, Duration::from_secs(8), |live| {
+                !live.contains("Global settings · Enter toggle")
+            })
+            .is_some(),
+        "Agents panel must close before composer assertion: {}",
+        probe.live_screen()
     );
 
     // Composer is immediately usable (no warning toast to dismiss).

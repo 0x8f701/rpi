@@ -1505,113 +1505,160 @@ impl Session {
     }
 
     /// When the active model lacks image support and `settings.visionModel` is
-    /// configured, sends image ContentBlocks to the vision model for a text
-    /// description and replaces them in the prompt. Falls back to the original
-    /// content on any error or when delegation is not needed.
-    async fn delegate_vision_images(&self, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
-        // Only delegate when there are image blocks.
-        let has_images = content.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
-        if !has_images {
-            return content;
+    /// configured, sends image content to the configured vision model and
+    /// replaces it with the returned description.
+    async fn delegate_vision_images(&self, content: Vec<ContentBlock>) -> Result<Vec<ContentBlock>> {
+        if !content.iter().any(|block| matches!(block, ContentBlock::Image { .. })) {
+            return Ok(content);
         }
-        // Check the active model's image support.
         let active_model = self.inner.shared.state.read().model.clone();
-        if active_model.input.iter().any(|m| m == "image") {
-            return content;
+        if active_model.input.iter().any(|input| input == "image") {
+            return Ok(content);
         }
-        // Read visionModel from live settings.
         let vision_spec = self
             .inner
             .resources
             .read()
             .as_ref()
-            .and_then(|r| r.snapshot().settings.vision_model.clone());
-        let Some(vision_spec) = vision_spec.filter(|s| !s.trim().is_empty()) else {
-            return content;
+            .and_then(|resources| resources.snapshot().settings.vision_model.clone())
+            .filter(|spec| !spec.trim().is_empty());
+        let Some(vision_spec) = vision_spec else {
+            return Ok(content);
         };
-        // Resolve the vision model.
-        let vision_model = match crate::resolve_model(&vision_spec) {
-            Ok(m) => m,
-            Err(_) => {
-                return content;
-            }
-        };
-        // Extract image blocks and text blocks separately.
-        let images: Vec<ContentBlock> = content
+        let vision_model = crate::resolve_model(&vision_spec)
+            .map_err(|error| anyhow!("configured vision model {vision_spec:?} could not be resolved: {error}"))?;
+        if !vision_model.input.iter().any(|input| input == "image") {
+            return Err(anyhow!(
+                "configured vision model {}/{} does not support image input",
+                vision_model.provider,
+                vision_model.id,
+            ));
+        }
+
+        let images = content
             .iter()
-            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .filter(|block| matches!(block, ContentBlock::Image { .. }))
             .cloned()
-            .collect();
-        let image_count = images.len();
-        let _ = image_count;
-        let inner = &self.inner.shared;
-        let mut stream_options = inner.stream_options.read().clone();
-        let api_key = inner.state.read().api_key.clone();
-        stream_options.stream.api_key = Some(api_key);
+            .collect::<Vec<_>>();
+        let mut stream_options = self.inner.shared.stream_options.read().clone();
+        stream_options.stream.api_key = None;
+        stream_options.stream.headers.clear();
+        stream_options.stream.env.clear();
+        if let Some(resolver) = &self.inner.shared.auth_resolver {
+            let auth = resolver(vision_model.clone()).await.with_context(|| {
+                format!(
+                    "resolving authentication for configured vision model {}/{}",
+                    vision_model.provider, vision_model.id,
+                )
+            })?;
+            stream_options.stream.api_key = Some(auth.api_key);
+            merge_headers_case_insensitive(&mut stream_options.stream.headers, auth.headers);
+            stream_options.stream.env.extend(auth.env);
+        } else {
+            stream_options.stream.api_key = Some(self.inner.shared.state.read().api_key.clone());
+        }
         stream_options.stream.max_tokens = Some(4096);
         stream_options.stream.cache_retention = CacheRetention::None;
-        stream_options.stream.session_id = Some(uuid::Uuid::now_v7().to_string());
+        stream_options.stream.session_id = Some(Uuid::now_v7().to_string());
         stream_options.reasoning = None;
+        let vision_model_id = vision_model.id.clone();
         let context = Context {
             system_prompt: VISION_DELEGATION_SYSTEM_PROMPT.to_owned(),
             messages: vec![Message::User(UserMessage {
                 content: {
                     let mut blocks = images;
-                    blocks.push(ContentBlock::text("Describe these images in detail, focusing on code, UI, diagrams, and technical content."));
+                    blocks.push(ContentBlock::text(
+                        "Describe these images in detail, focusing on code, UI, diagrams, and technical content.",
+                    ));
                     blocks
                 },
                 timestamp: pi_ai::now_millis(),
             })],
             tools: Vec::new(),
         };
-        // Bound the vision call like compaction's summarize.
-        let stream_fn = inner.stream_fn.clone();
+        let stream_fn = self.inner.shared.stream_fn.clone();
         let produced = tokio::time::timeout(VISION_DELEGATION_TIMEOUT, async {
             let stream = (stream_fn)(vision_model, context, stream_options).await;
-            while stream.next().await.is_some() {}
-            stream.result().await
-        })
-        .await;
-        let description = match produced {
-            Ok(Some(response)) => {
-                let text: String = response
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if text.trim().is_empty() {
-                    return content;
+            let mut stream_error = None;
+            while let Some(event) = stream.next().await {
+                if let AssistantMessageEvent::Error { error, .. } = event {
+                    stream_error = Some(error);
                 }
-                text
             }
-            Ok(None) => {
-                return content;
-            }
-            Err(_) => {
-                return content;
-            }
-        };
-        // Replace image blocks with the text description.
-        let mut new_content = Vec::with_capacity(content.len());
+            (stream.result().await, stream_error)
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "vision model {vision_model_id} timed out after {}s while analyzing image input",
+                VISION_DELEGATION_TIMEOUT.as_secs(),
+            )
+        })?;
+        let (produced, stream_error) = produced;
+        if let Some(response) = stream_error {
+            let detail = response
+                .error_message
+                .as_deref()
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("provider stream failed without details");
+            return Err(anyhow!("vision model {vision_model_id} failed while analyzing image input: {detail}"));
+        }
+        let response = produced
+            .ok_or_else(|| anyhow!("vision model {vision_model_id} returned no result while analyzing image input"))?;
+        if response.stop_reason == StopReason::Error || response.stop_reason == StopReason::Aborted {
+            let detail = response
+                .error_message
+                .as_deref()
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("provider returned an error without details");
+            return Err(anyhow!("vision model {vision_model_id} failed while analyzing image input: {detail}"));
+        }
+        let description = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if description.trim().is_empty() {
+            return Err(anyhow!("vision model {vision_model_id} returned empty text while analyzing image input"));
+        }
+
+        let mut replacement = Vec::with_capacity(content.len());
         let mut description_inserted = false;
         for block in content {
             if matches!(block, ContentBlock::Image { .. }) {
                 if !description_inserted {
-                    new_content.push(ContentBlock::text(format!(
-                        "[Image analyzed by {vision_model_id}: {description}]",
-                        vision_model_id = self.inner.shared.state.read().model.id
+                    replacement.push(ContentBlock::text(format!(
+                        "[Image analyzed by {vision_model_id}: {description}]"
                     )));
                     description_inserted = true;
                 }
             } else {
-                new_content.push(block);
+                replacement.push(block);
             }
         }
-        new_content
+        Ok(replacement)
+    }
+
+    async fn delegate_vision_messages(&self, messages: Vec<Message>) -> Result<Vec<Message>> {
+        let mut delegated = Vec::with_capacity(messages.len());
+        for message in messages {
+            delegated.push(self.delegate_vision_message(message).await?);
+        }
+        Ok(delegated)
+    }
+
+    async fn delegate_vision_message(&self, message: Message) -> Result<Message> {
+        match message {
+            Message::User(mut user) => {
+                user.content = self.delegate_vision_images(user.content).await?;
+                Ok(Message::User(user))
+            }
+            message => Ok(message),
+        }
     }
 
     /// Resolver that confines subagent children's process spawns (their bash
@@ -1801,6 +1848,7 @@ impl Session {
             content: content.into_blocks(),
             timestamp: pi_ai::now_millis(),
         });
+        let message = self.delegate_vision_message(message).await?;
         if self.inner.run_slot.lock().active {
             match delivery {
                 MessageDelivery::FollowUp => self.inner.agent.follow_up(message).await,
@@ -3913,17 +3961,17 @@ impl Session {
             content: Vec::new(),
             timestamp: pi_ai::now_millis(),
         })];
-        let claim = self.begin_run("user").await?;
         let mut content = Vec::with_capacity(images.len() + usize::from(!prompt.is_empty()));
         if !prompt.is_empty() {
             content.push(ContentBlock::text(prompt));
         }
         content.extend(images);
-        let content = self.delegate_vision_images(content).await;
+        let content = self.delegate_vision_images(content).await?;
         messages[0] = Message::User(UserMessage {
             content,
             timestamp: pi_ai::now_millis(),
         });
+        let claim = self.begin_run("user").await?;
         let messages = self.inject_selection_messages(messages).await;
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel::<AgentEvent>();
         let subscription = self
@@ -4013,6 +4061,7 @@ impl Session {
         if messages.is_empty() {
             return Err(anyhow!("messages must not be empty"));
         }
+        let messages = self.delegate_vision_messages(messages).await?;
         let messages = self.inject_selection_messages(messages).await;
         let claim = self.begin_run("user").await?;
         let operation = self.execute_with_retries(Some(messages)).await;
@@ -4535,9 +4584,11 @@ impl Session {
         self.inner.agent.subscribe(listener).await
     }
 
-    pub async fn steer(&self, message: Message) {
+    pub async fn steer(&self, message: Message) -> Result<()> {
+        let message = self.delegate_vision_message(message).await?;
         self.inner.agent.steer(message).await;
         self.publish_queue_update().await;
+        Ok(())
     }
 
     /// Arm (or disarm) the interactive `ask` round trip. Only interactive
@@ -4574,9 +4625,11 @@ impl Session {
         self.inner.shared.ask.cancel_pending()
     }
 
-    pub async fn follow_up(&self, message: Message) {
+    pub async fn follow_up(&self, message: Message) -> Result<()> {
+        let message = self.delegate_vision_message(message).await?;
         self.inner.agent.follow_up(message).await;
         self.publish_queue_update().await;
+        Ok(())
     }
 
     pub fn enable_compaction(&self, settings: CompactionSettings) {
@@ -8745,8 +8798,8 @@ mod queued_message_consumption_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), gate_started.notified())
             .await
             .expect("gate tool must start");
-        session.steer(Message::user_text("steer one", 1)).await;
-        session.steer(Message::user_text("steer two", 2)).await;
+        session.steer(Message::user_text("steer one", 1)).await.expect("queue first steer");
+        session.steer(Message::user_text("steer two", 2)).await.expect("queue second steer");
         gate_release.notify_waiters();
 
         // Collect every QueueUpdate while the turn is in flight, then drain
@@ -9213,5 +9266,376 @@ mod mcp_session_reset_tests {
                 "kind={kind:?}: server config must survive the cutover: {listed}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod vision_delegation_tests {
+    use std::{
+        collections::HashMap,
+        path::Path,
+        sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    };
+
+    use pi_ai::{AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream};
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct StreamCall {
+        model: Model,
+        context: Context,
+        options: SimpleStreamOptions,
+    }
+
+    fn image() -> ContentBlock {
+        ContentBlock::Image {
+            data: "aW1hZ2U=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        }
+    }
+
+    fn model(id: &str, provider: &str, api: &str, accepts_images: bool) -> Model {
+        Model {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            provider: provider.to_owned(),
+            api: api.to_owned(),
+            input: if accepts_images { vec!["text".to_owned(), "image".to_owned()] } else { vec!["text".to_owned()] },
+            ..Model::default()
+        }
+    }
+
+    fn completed_stream(model: Model, response: Result<String, String>) -> AssistantMessageEventStream {
+        let stream = pi_ai::new_assistant_message_event_stream();
+        let producer = stream.clone();
+        tokio::spawn(async move {
+            producer.push(AssistantMessageEvent::Start { partial: AssistantMessage::pending(&model) }).await;
+            let mut message = AssistantMessage::pending(&model);
+            match response {
+                Ok(text) => {
+                    message.content = vec![ContentBlock::text(text)];
+                    message.stop_reason = StopReason::Stop;
+                    producer.push(AssistantMessageEvent::Done { reason: StopReason::Stop, message: message.clone() }).await;
+                }
+                Err(error) => {
+                    message.stop_reason = StopReason::Error;
+                    message.error_message = Some(error);
+                    producer.push(AssistantMessageEvent::Error { reason: StopReason::Error, error: message.clone() }).await;
+                }
+            }
+            producer.end(Some(message)).await;
+        });
+        stream
+    }
+
+    fn recording_stream(
+        responses: Vec<Result<&'static str, &'static str>>,
+    ) -> (StreamFn, Arc<Mutex<Vec<StreamCall>>>, Arc<AtomicUsize>) {
+        let responses = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let captured_calls = calls.clone();
+        let captured_count = call_count.clone();
+        let stream: StreamFn = Arc::new(move |model, context, options| {
+            captured_count.fetch_add(1, Ordering::SeqCst);
+            captured_calls.lock().push(StreamCall { model: model.clone(), context, options });
+            let response = responses
+                .lock()
+                .pop_front()
+                .unwrap_or(Ok("main response"))
+                .map(str::to_owned)
+                .map_err(str::to_owned);
+            Box::pin(async move { completed_stream(model, response) })
+        });
+        (stream, calls, call_count)
+    }
+
+    async fn attach_vision_settings(session: &Session, agent_dir: &Path, cwd: &Path, vision_spec: Option<&str>) {
+        let settings = vision_spec.map_or_else(|| json!({}), |spec| json!({ "visionModel": spec }));
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::to_string(&settings).expect("settings json"),
+        )
+        .expect("write settings");
+        let mut options = crate::ResourceManagerOptions::new(cwd);
+        options.agent_dir = agent_dir.to_path_buf();
+        options.project_trust_override = Some(true);
+        let resources = ResourceManager::new(options).expect("resource manager");
+        session.attach_resources(resources).await.expect("attach resources");
+    }
+
+    fn test_session(
+        cwd: &Path,
+        main_model: Model,
+        stream_fn: StreamFn,
+        auth_resolver: Option<SessionAuthResolver>,
+    ) -> Session {
+        Session::new(SessionOptions {
+            model: main_model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "fallback-key".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream_fn),
+            auth_resolver,
+        })
+        .expect("session")
+    }
+
+    fn only_user_content(context: &Context) -> &[ContentBlock] {
+        match context.messages.as_slice() {
+            [Message::User(user)] => &user.content,
+            messages => panic!("expected one user message, got {messages:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_vision_model_delegates_before_main_session_stream() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let api = format!("vision-delegation-api-{}", Uuid::now_v7());
+        let provider = format!("vision-delegation-provider-{}", Uuid::now_v7());
+        let main_model = model("main-text-only", &provider, &api, false);
+        let vision_model = model("actual-vision-id", &provider, &api, true);
+        let registration = pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+            api,
+            provider: provider.clone(),
+            models: vec![main_model.clone(), vision_model.clone()],
+            chunk_size: 1,
+        });
+        let (stream, calls, _) = recording_stream(vec![Ok("screen description"), Ok("main answer")]);
+        let session = test_session(cwd.path(), main_model.clone(), stream, None);
+        attach_vision_settings(
+            &session,
+            agent_dir.path(),
+            cwd.path(),
+            Some(&format!("{provider}/{}", vision_model.id)),
+        )
+        .await;
+
+        session.run_messages(vec![Message::User(UserMessage {
+            content: vec![ContentBlock::text("inspect"), image()],
+            timestamp: 1,
+        })]).await.expect("delegated run");
+
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 2, "vision stream must run before main stream");
+        assert_eq!(calls[0].model.id, vision_model.id);
+        assert!(only_user_content(&calls[0].context).iter().any(|block| matches!(block, ContentBlock::Image { .. })), "vision context must contain the image");
+        assert_eq!(calls[1].model.id, main_model.id);
+        let main_content = only_user_content(&calls[1].context);
+        assert!(!main_content.iter().any(|block| matches!(block, ContentBlock::Image { .. })), "main context must not contain the image");
+        let replacement = content_text(main_content);
+        assert!(replacement.contains("[Image analyzed by actual-vision-id: screen description]"), "actual vision id and description must be inserted: {replacement}");
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn run_messages_delegates_each_user_image_without_changing_other_roles() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let api = format!("vision-multi-api-{}", Uuid::now_v7());
+        let provider = format!("vision-multi-provider-{}", Uuid::now_v7());
+        let main_model = model("main-multi-model", &provider, &api, false);
+        let vision_model = model("vision-multi-model", &provider, &api, true);
+        let vision_model_id = vision_model.id.clone();
+        let registration = pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+            api,
+            provider: provider.clone(),
+            models: vec![main_model.clone(), vision_model.clone()],
+            chunk_size: 1,
+        });
+        let (stream, calls, _) = recording_stream(vec![Ok("first description"), Ok("second description")]);
+        let session = test_session(cwd.path(), main_model, stream, None);
+        attach_vision_settings(
+            &session,
+            agent_dir.path(),
+            cwd.path(),
+            Some(&format!("{provider}/{}", vision_model.id)),
+        )
+        .await;
+        let custom = Message::Custom(CustomMessage {
+            custom_type: "vision-test".to_owned(),
+            content: CustomMessageContent::Blocks(vec![image()]),
+            display: false,
+            details: None,
+            timestamp: 2,
+        });
+
+        let delegated = session.delegate_vision_messages(vec![
+            Message::User(UserMessage { content: vec![image()], timestamp: 1 }),
+            custom.clone(),
+            Message::User(UserMessage { content: vec![image()], timestamp: 3 }),
+        ]).await.expect("delegate user images");
+
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 2, "each user image must make one vision call");
+        assert!(calls.iter().all(|call| call.model.id == vision_model_id), "only the vision model may be called");
+        assert_eq!(delegated.len(), 3);
+        assert_eq!(delegated[1], custom, "custom image message must remain unchanged");
+        for index in [0usize, 2] {
+            let Message::User(user) = &delegated[index] else {
+                panic!("delegated message {index} must remain a user message");
+            };
+            assert!(!user.content.iter().any(|block| matches!(block, ContentBlock::Image { .. })), "each user image must be delegated");
+        }
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn vision_auth_resolver_authenticates_the_vision_stream() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let api = format!("vision-auth-api-{}", Uuid::now_v7());
+        let provider = format!("vision-auth-provider-{}", Uuid::now_v7());
+        let main_model = model("main-auth-model", &provider, &api, false);
+        let vision_model = model("vision-auth-model", &provider, &api, true);
+        let registration = pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+            api,
+            provider: provider.clone(),
+            models: vec![main_model.clone(), vision_model.clone()],
+            chunk_size: 1,
+        });
+        let (stream, calls, _) = recording_stream(vec![Ok("auth description")]);
+        let resolved_models = Arc::new(Mutex::new(Vec::new()));
+        let captured_models = resolved_models.clone();
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let captured_call_count = resolver_calls.clone();
+        let resolver: SessionAuthResolver = Arc::new(move |model| {
+            captured_call_count.fetch_add(1, Ordering::SeqCst);
+            captured_models.lock().push(model.id.clone());
+            Box::pin(async move {
+                let mut headers = HashMap::new();
+                headers.insert("X-Vision-Header".to_owned(), format!("header-for-{}", model.id));
+                let mut env = HashMap::new();
+                env.insert("VISION_AUTH_MARKER".to_owned(), format!("env-for-{}", model.id));
+                Ok(RequestAuth {
+                    api_key: format!("key-for-{}", model.id),
+                    headers,
+                    env,
+                    available_model_ids: None,
+                })
+            })
+        });
+        let session = test_session(cwd.path(), main_model, stream, Some(resolver));
+        let mut main_options = SimpleStreamOptions::default();
+        main_options.stream.api_key = Some("main-key-must-not-leak".to_owned());
+        main_options.stream.headers.insert("X-Main-Header".to_owned(), "main-header".to_owned());
+        main_options.stream.env.insert("MAIN_AUTH_MARKER".to_owned(), "main-env".to_owned());
+        session.set_stream_options(main_options).await;
+        attach_vision_settings(
+            &session,
+            agent_dir.path(),
+            cwd.path(),
+            Some(&format!("{provider}/{}", vision_model.id)),
+        )
+        .await;
+
+        session.steer(Message::User(UserMessage { content: vec![image()], timestamp: 1 })).await.expect("authenticated delegated steer");
+
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1, "vision delegation must resolve auth exactly once");
+        assert_eq!(resolved_models.lock().as_slice(), &[vision_model.id.clone()], "resolver must receive only the vision model");
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 1, "queuing the delegated steer must make only the vision call");
+        let vision_call = &calls[0];
+        assert_eq!(vision_call.options.stream.api_key.as_deref(), Some("key-for-vision-auth-model"));
+        assert_eq!(vision_call.options.stream.headers.get("X-Vision-Header").map(String::as_str), Some("header-for-vision-auth-model"));
+        assert_eq!(vision_call.options.stream.env.get("VISION_AUTH_MARKER").map(String::as_str), Some("env-for-vision-auth-model"));
+        assert!(!vision_call.options.stream.headers.contains_key("X-Main-Header"), "main headers must not leak into vision auth");
+        assert!(!vision_call.options.stream.env.contains_key("MAIN_AUTH_MARKER"), "main env must not leak into vision auth");
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn unconfigured_vision_model_preserves_image_for_main_stream() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (stream, calls, _) = recording_stream(vec![Ok("main answer")]);
+        let main_model = model("main-no-vision-config", "vision-unconfigured-provider", "vision-unconfigured-api", false);
+        let session = test_session(cwd.path(), main_model, stream, None);
+
+        session.run("inspect", vec![image()]).await.expect("run without vision configuration");
+
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert!(only_user_content(&calls[0].context).iter().any(|block| matches!(block, ContentBlock::Image { .. })), "unconfigured behavior must preserve the image");
+    }
+
+    #[tokio::test]
+    async fn vision_provider_error_prevents_main_provider_call() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let api = format!("vision-error-api-{}", Uuid::now_v7());
+        let provider = format!("vision-error-provider-{}", Uuid::now_v7());
+        let main_model = model("main-after-error", &provider, &api, false);
+        let vision_model = model("vision-error-model", &provider, &api, true);
+        let registration = pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+            api,
+            provider: provider.clone(),
+            models: vec![main_model.clone(), vision_model.clone()],
+            chunk_size: 1,
+        });
+        let (stream, _, call_count) = recording_stream(vec![Err("vision service rejected image")]);
+        let session = test_session(cwd.path(), main_model, stream, None);
+        attach_vision_settings(
+            &session,
+            agent_dir.path(),
+            cwd.path(),
+            Some(&format!("{provider}/{}", vision_model.id)),
+        )
+        .await;
+
+        let error = session.run("inspect", vec![image()]).await.expect_err("vision error must fail the run");
+        assert!(error.to_string().contains("vision service rejected image"), "actionable provider error: {error:#}");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "main provider must not run after vision failure");
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn steer_and_follow_up_delegate_images_before_enqueue() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let api = format!("vision-queue-api-{}", Uuid::now_v7());
+        let provider = format!("vision-queue-provider-{}", Uuid::now_v7());
+        let main_model = model("main-queue-model", &provider, &api, false);
+        let vision_model = model("vision-queue-model", &provider, &api, true);
+        let registration = pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+            api,
+            provider: provider.clone(),
+            models: vec![main_model.clone(), vision_model.clone()],
+            chunk_size: 1,
+        });
+        let (stream, calls, _) = recording_stream(vec![Ok("steer description"), Ok("follow description")]);
+        let session = test_session(cwd.path(), main_model, stream, None);
+        attach_vision_settings(
+            &session,
+            agent_dir.path(),
+            cwd.path(),
+            Some(&format!("{provider}/{}", vision_model.id)),
+        )
+        .await;
+
+        session.steer(Message::User(UserMessage { content: vec![image()], timestamp: 1 })).await.expect("queue delegated steer");
+        session.follow_up(Message::User(UserMessage { content: vec![image()], timestamp: 2 })).await.expect("queue delegated follow-up");
+
+        let (steering, follow_up) = session.queued_messages().await;
+        let steering_text = match steering.as_slice() {
+            [Message::User(user)] => content_text(&user.content),
+            messages => panic!("expected one queued steering user message, got {messages:?}"),
+        };
+        let follow_up_text = match follow_up.as_slice() {
+            [Message::User(user)] => content_text(&user.content),
+            messages => panic!("expected one queued follow-up user message, got {messages:?}"),
+        };
+        assert!(steering_text.contains("steer description") && steering_text.contains(&vision_model.id));
+        assert!(follow_up_text.contains("follow description") && follow_up_text.contains(&vision_model.id));
+        assert_eq!(calls.lock().len(), 2, "only the two vision calls should run before dequeue");
+        registration.unregister();
     }
 }

@@ -157,7 +157,33 @@ controls.
   raw graphics protocol bytes. Source: `crates/pi-cli/src/terminal_images.rs` and
   `crates/pi-cli/src/tui.rs`.
 - `--listen` selects a headless Web-only service around one live `Application`; it never acquires the terminal or reads stdin, and stops on Ctrl-C/SIGTERM. It is rejected with positional prompts, subcommands, print, JSON/RPC, or model-listing exits. HTTP and WebSocket messages are capped at 4 MiB, ordinary commands at 16 concurrent operations, pre-auth connections at 64 tasks, and outbound WebSocket delivery uses a bounded queue. Recovery commands such as abort and process stop can bypass saturated ordinary-work slots.
-- `--listen` is loopback-only (127.0.0.0/8 or ::1) by default. A non-loopback or wildcard bind requires the explicit `--listen-allow-insecure-remote` opt-in; a token file is optional there (strongly recommended). The opt-in does not encrypt plaintext HTTP/WebSocket: passive LAN observers can capture control traffic and, when a token is configured, the bearer token. `agent serve` remains strictly loopback-only with no remote opt-in and no tokenless browser access. On loopback, the bounded regular token file is optional; a configured token must be presented exactly as `Authorization: Bearer <token>` or the constant-time `rpi-auth.<token>` WebSocket subprotocol on every bind. Without a token, the listener is tokenless: native clients without `Origin` are always accepted, and a browser (which always sends `Origin`) is accepted only when its `Origin` authority equals the request's HTTP `Host` — an ordinary same-origin check that rejects unrelated cross-origin pages, not authentication and not DNS-rebinding protection. This works on any bind, including a wildcard address (0.0.0.0 or `::`), with no `--listen-advertised-origin` required for `/web`, `/ws`, or `/rpc`. `--listen-advertised-origin <URL>` (a strict http/https origin with no credentials, path, query, or fragment) is only for collaboration-link generation (`/collab`, `collab_start` without an explicit `baseUrl`) and the reachable `/web` URL printed at startup; loopback and other specific binds advertise their bound address automatically, and a wildcard bind without it prints no reachable URL while `/collab` fails closed instead of synthesizing links from an unreachable wildcard. Interactive extension dialogs remain exclusively owned by the local TUI: remote clients cannot observe or answer them.
+- `--listen` defaults to HTTPS with a self-signed certificate; `--listen-cert` /
+  `--listen-key` loads real certificates, and `--listen-plaintext` opts out of
+  TLS. Loopback (127.0.0.0/8 or ::1) may be tokenless or tokenized. A
+  non-loopback **HTTPS** bind requires `--listen-token-file`; a tokenless
+  remote TLS listener is rejected pre-bind. The explicit
+  `--listen-allow-insecure-remote` opt-in is the tokenless-remote escape hatch:
+  it permits tokenless browsers on a non-loopback bind. Combined with
+  `--listen-plaintext` it is both unauthenticated and unencrypted; without
+  `--listen-plaintext` it is encrypted but unauthenticated. If a token file is
+  also configured, the token remains mandatory; plaintext mode lets passive
+  network observers capture the bearer token and control traffic. `agent serve` remains strictly
+  loopback-only with no remote opt-in and no tokenless browser access. A
+  configured token must be presented exactly as `Authorization: Bearer <token>`
+  or the constant-time `rpi-auth.<token>` WebSocket subprotocol on every bind.
+  Without a token, the listener is tokenless: native clients without `Origin`
+  are always accepted, and a browser is accepted only when its `Origin`
+  authority equals the request's HTTP `Host` — an ordinary same-origin check
+  that rejects unrelated cross-origin pages, not authentication and not
+  DNS-rebinding protection. `--listen-advertised-origin <URL>` (a strict
+  http/https origin with no credentials, path, query, or fragment) is only
+  for collaboration-link generation (`/collab`, `collab_start` without an
+  explicit `baseUrl`) and the reachable `/web` URL printed at startup; loopback
+  and other specific binds advertise their bound address automatically, and a
+  wildcard bind without it prints no reachable URL while `/collab` fails closed
+  instead of synthesizing links from an unreachable wildcard. Interactive
+  extension dialogs remain exclusively owned by the local TUI: remote clients
+  cannot observe or answer them.
 
 ## Extension manifest, environment, and process isolation
 
@@ -260,8 +286,8 @@ terminal.
 ## Parent-process hardening
 
 Before any dispatch, `rpi` runs best-effort parent-process hardening
-(`harden_process` in `crates/pi-cli/src/lib.rs:64-84`, invoked from
-`crates/pi-cli/src/main.rs:12-17`):
+(`harden_process` in `crates/pi-cli/src/lib.rs`, invoked from
+`crates/pi-cli/src/main.rs`):
 
 - On Linux, the process is made non-dumpable and ptrace attach (plus
   `/proc/<pid>/mem` access) is denied even to same-user debuggers.

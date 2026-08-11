@@ -13,6 +13,10 @@
 #       and restores the same transcript (backend, not frontend cache)
 #   R4  after SIGTERM-restarting the listener, reopening the Web and
 #       switching to the recorded session restores its history from disk
+#   R5  a page reload restores the last-activated session from the
+#       per-authority preference (active row + transcript)
+#   R6  a saved preference naming a nonexistent session falls back to the
+#       first catalog row, which becomes active with its transcript loaded
 #
 # The lane FAILS (non-zero) when playwright/chromium cannot be used; there
 # is no agent-browser fallback and no skip.
@@ -35,7 +39,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-session-restore - session parity: prompt recorded, loaded switch restore, disk-resume restore, restart restore (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-session-restore - session parity: prompt recorded, loaded switch restore, disk-resume restore, restart restore, preference reload restore, missing-preference fallback (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;

@@ -68,7 +68,7 @@ impl ChildSession {
         Self { session }
     }
 
-    async fn steer(&self, message: &MailboxMessage) {
+    async fn steer(&self, message: &MailboxMessage) -> Result<()> {
         self.session
             .steer(pi_ai::Message::Custom(pi_ai::CustomMessage {
                 custom_type: ORCHESTRATION_MESSAGE_TYPE.to_owned(),
@@ -83,7 +83,7 @@ impl ChildSession {
                 })),
                 timestamp: i64::try_from(message.timestamp).unwrap_or(i64::MAX),
             }))
-            .await;
+            .await
     }
 
     async fn run(&self, assignment: &str) -> Result<crate::RunResult> {
@@ -2068,7 +2068,14 @@ soft_budget: None,
 
         // Steer pre-run messages, acknowledging each only after delivery.
         for message in &pre_run {
-            child.steer(message).await;
+            if let Err(error) = child.steer(message).await {
+                return self.failed_result(
+                    &TaskItem { index: 0, id: agent_id.clone(), agent: agent_type.clone(), assignment: assignment.clone(), todo_task_id: None, ..Default::default() },
+                    job_id,
+                    AgentStatus::Idle,
+                    &format!("failed to deliver queued message {}: {error:#}", message.id),
+                );
+            }
             self.acknowledge_delivery(&agent_id, &message.id);
         }
 
@@ -2084,7 +2091,9 @@ soft_budget: None,
                 message = delivery_rx.recv() => {
                     match message {
                         Some(message) => {
-                            child.steer(&message).await;
+                            if let Err(error) = child.steer(&message).await {
+                                break Err(format!("failed to deliver message {}: {error:#}", message.id));
+                            }
                             self.acknowledge_delivery(&agent_id, &message.id);
                         }
                         None => break Err("active child delivery bridge closed".to_owned()),
@@ -3641,7 +3650,14 @@ soft_budget: None,
             }
         };
         for message in &pre_run {
-            child.steer(message).await;
+            if let Err(error) = child.steer(message).await {
+                return self.failed_result(
+                    &item,
+                    job_id,
+                    AgentStatus::Idle,
+                    &format!("failed to deliver queued message {}: {error:#}", message.id),
+                );
+            }
             self.acknowledge_delivery(&item.id, &message.id);
         }
         let mut run = Box::pin(child.run(&item.assignment));
@@ -3654,7 +3670,9 @@ soft_budget: None,
                 message = delivery_rx.recv() => {
                     match message {
                         Some(message) => {
-                            child.steer(&message).await;
+                            if let Err(error) = child.steer(&message).await {
+                                break Err(format!("failed to deliver message {}: {error:#}", message.id));
+                            }
                             self.acknowledge_delivery(&item.id, &message.id);
                         }
                         None => break Err("active child delivery bridge closed".to_owned()),

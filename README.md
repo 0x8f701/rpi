@@ -24,14 +24,14 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
 ```
 
-Pin both the installer source and selected release to `v0.2.8`:
+Pin both the installer source and selected release to `v0.2.9`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.8/install.sh | bash -s -- --version v0.2.8
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.9/install.sh | bash -s -- --version v0.2.9
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.8/install.ps1))) -Version v0.2.8
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.9/install.ps1))) -Version v0.2.9
 ```
 
 The release archive contains the compiled `rpi` executable; users do not need
@@ -102,7 +102,7 @@ See [`docs/src/introduction/quickstart.md`](docs/src/introduction/quickstart.md)
 - [`docs/src/user-guide/orchestration.md`](docs/src/user-guide/orchestration.md) — subagents, jobs, soft budgets, IRC, and the `task`/`hub`/`yield` tools
 - [`docs/src/user-guide/workflows.md`](docs/src/user-guide/workflows.md) — isolated concurrent workflows (worktree/overlayfs/none) with planning and Todo-DAG execution
 - [`docs/src/user-guide/session-recovery.md`](docs/src/user-guide/session-recovery.md) — `/rewind`, `/checkpoint`, `/snapcompact`, `/handoff`, doom-loop recovery, and session TTL
-- [`docs/src/user-guide/live.md`](docs/src/user-guide/live.md) — hold-to-talk voice input (`/live`)
+- [`docs/src/user-guide/live.md`](docs/src/user-guide/live.md) — TUI hold-to-talk STT (`/live`) and Web realtime voice (`/web`)
 - [`docs/src/reference/configuration-profiles.md`](docs/src/reference/configuration-profiles.md) — `--profile`, TOML settings, env expansion, and scoped auth
 - [`docs/src/reference/sandbox-isolation.md`](docs/src/reference/sandbox-isolation.md) — Linux filesystem sandbox and overlayfs isolation
 - [`docs/src/reference/hooks.md`](docs/src/reference/hooks.md) — host hooks and the trust hook
@@ -139,7 +139,8 @@ Runnable examples are in [`examples/`](examples/).
 | Orchestration: subagents, jobs, soft budgets, IRC, `task`/`hub`/`yield` tools | Implemented |
 | Isolated concurrent workflows (`/workflow`: worktree/overlayfs/none isolation, planning + Todo-DAG execution) | Implemented |
 | Session recovery (`/rewind`, `/checkpoint`, `/snapcompact`, `/handoff`) and startup session TTL pruning | Implemented |
-| Hold-to-talk voice input (`/live`) | Implemented (requires `live-capture` build feature) |
+| TUI hold-to-talk voice input (`/live` STT) | Implemented (requires `live-capture` build feature) |
+| Web realtime voice (WebRTC Codex Live on `/web`) | Implemented (requires `live.mode = realtime` + CLIProxyAPI) |
 | Linux filesystem sandbox (`sandbox` settings) and overlayfs isolation | Implemented (Linux) |
 | Model Context Protocol (MCP) client (`mcpServers` + `mcp` tool) | Implemented (stdio transport) |
 | Agent Client Protocol (ACP) mode (`rpi agent stdio` / `rpi agent serve`) | Implemented |
@@ -165,48 +166,65 @@ See [`docs/src/user-guide/cli-modes.md`](docs/src/user-guide/cli-modes.md) for d
 
 ## Web control plane
 
-`rpi --listen` runs a headless Web-only backend and serves the embedded client
-at `/web`. It never starts the TUI or line REPL, stays alive with closed stdin
-until Ctrl-C/SIGTERM, and records Web conversations in the normal session store
-so `--continue`/`--resume` restore them after restart. The listener defaults to
-loopback and authentication is optional.
+`rpi --listen <SOCKET_ADDR>` runs a headless Web-only backend and serves the
+embedded client at `/web`. It never starts the TUI or line REPL, stays alive
+with closed stdin until Ctrl-C/SIGTERM, and records Web conversations in the
+normal session store so `--continue`/`--resume` restore them after restart.
+The flag requires a socket address. By default it uses HTTPS with an
+auto-generated self-signed certificate; provide real certificates with
+`--listen-cert` and `--listen-key`, or opt out with `--listen-plaintext`.
 
-**Local, no token** — the default, one command:
+Authentication rules:
+
+- Loopback (127.0.0.0/8 or ::1) may be tokenless or tokenized.
+- A non-loopback **HTTPS** bind requires `--listen-token-file`; tokenless
+  remote TLS is rejected pre-bind.
+- `--listen-allow-insecure-remote` is the explicit tokenless-remote opt-in:
+  it permits tokenless browsers on a non-loopback bind. Combined with
+  `--listen-plaintext` it is both unauthenticated and unencrypted; without
+  `--listen-plaintext` it is encrypted but unauthenticated.
+
+**Local HTTPS, no token** — loopback:
 
 ```console
 $ rpi --listen 127.0.0.1:8765
 ```
 
-Open <http://127.0.0.1:8765/web>; the browser auto-connects with no token.
+Open <https://127.0.0.1:8765/web>; accept the self-signed certificate warning
+for local testing. The page auto-connects with no token.
 
-**LAN, no token** — bind a non-loopback address and explicitly opt into
-plaintext remote listening (still no token):
-
-```console
-$ rpi --listen 0.0.0.0:8765 --listen-allow-insecure-remote
-```
-
-Open `http://<host-lan-ip>:8765/web` (or any hostname that routes to the
-host) from another machine; the browser auto-connects with no token. No
-`--listen-advertised-origin` is needed for ordinary `/web`, `/ws`, or
-`/rpc`: the browser request is accepted when its `Origin` authority equals
-the HTTP `Host` — an ordinary same-origin check that rejects unrelated
-cross-origin pages, not authentication and not DNS-rebinding protection.
-This is **unauthenticated and unencrypted**: anyone reachable on the
-network can drive the agent and observe traffic. Prefer loopback or a
-TLS-terminating proxy on untrusted networks.
-
-**Authenticated** — add `--listen-token-file <path>` to any of the above to
-make the token mandatory; the browser then requires it:
+**Local plaintext, no token** — opt out of TLS on loopback:
 
 ```console
-$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token \
-      --listen-allow-insecure-remote
+$ rpi --listen 127.0.0.1:8765 --listen-plaintext
 ```
 
-The token authenticates clients but does not encrypt the bearer token or
-control traffic against passive LAN observers. `rpi agent serve` remains
-loopback-only and rejects tokenless browsers.
+Open <http://127.0.0.1:8765/web>; the page auto-connects with no token.
+
+**Remote / LAN HTTPS** — non-loopback; a token file is mandatory:
+
+```console
+$ rpi --listen 0.0.0.0:8765 --listen-token-file <workspace>/rpi-token
+```
+
+Open `https://<host>:8765/web`. The browser must present the token.
+
+**Remote plaintext, tokenless** — explicit insecure opt-in (not recommended):
+
+```console
+$ rpi --listen 0.0.0.0:8765 --listen-plaintext --listen-allow-insecure-remote
+```
+
+Open `http://<host>:8765/web`. Same-origin browser access applies (`Origin`
+authority equals HTTP `Host`). This is **unauthenticated and unencrypted**:
+anyone reachable on the network can drive the agent and observe traffic. Prefer
+loopback, real certificates, or a TLS-terminating proxy on untrusted networks.
+
+The `/web` page stores the token per listener authority in `localStorage`;
+it is never placed in a URL or cookie. The token authenticates clients but
+does not encrypt the bearer token or control traffic against passive network
+observers. `rpi agent serve` remains loopback-only and rejects tokenless
+browsers.
 
 Collaboration join links (`/collab`, `collab_start` without an explicit
 `baseUrl`) cannot be synthesized from a wildcard bind. For a wildcard

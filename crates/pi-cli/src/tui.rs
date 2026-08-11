@@ -859,7 +859,7 @@ pub async fn interactive(
             let expanded = crate::file_args::expand_prompt_in_workspace(
                 &prompt,
                 session.workspace_roots())?;
-            application.follow_up(expanded.prompt, expanded.images).await;
+            application.follow_up(expanded.prompt, expanded.images).await?;
         }
     }
     let mut update_notice = Some(Box::pin(crate::self_update::startup_notice()));
@@ -8399,7 +8399,10 @@ async fn dispatch_action(
             let attachments =
                 assemble_submit_attachments(&state.pending_attachments, file_images);
             if state.is_streaming {
-                application.follow_up(expanded.prompt, attachments).await;
+                if let Err(error) = application.follow_up(expanded.prompt, attachments).await {
+                    state.push_status(format!("Follow-up was not accepted: {error}"), true);
+                    return Ok(false);
+                }
                 state.status = "Queued follow-up".to_owned();
             } else if let Err(error) = application.prompt(expanded.prompt, attachments, None).await
             {
@@ -30227,8 +30230,8 @@ mod tests {
             after_tool_call: None, stream_fn: None, auth_resolver: None,
         }).expect("session");
         let application = Application::new(session).await;
-        application.steer("steer me now".to_owned(), Vec::new()).await;
-        application.follow_up("follow up later".to_owned(), Vec::new()).await;
+        application.steer("steer me now".to_owned(), Vec::new()).await.expect("queue steer");
+        application.follow_up("follow up later".to_owned(), Vec::new()).await.expect("queue follow-up");
         let mut state = todo_test_state(Vec::new());
 
         // View: counts and previews land in the transcript; status untouched.
@@ -30425,8 +30428,8 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), gate_started.notified())
             .await
             .expect("gate tool must start");
-        application.steer("steer one".to_owned(), Vec::new()).await;
-        application.steer("steer two".to_owned(), Vec::new()).await;
+        application.steer("steer one".to_owned(), Vec::new()).await.expect("queue first steer");
+        application.steer("steer two".to_owned(), Vec::new()).await.expect("queue second steer");
 
         // Both queued messages project onto the composer: `⟦steering⟧` shows
         // the first queued message and the header counts `⚙ 2`.

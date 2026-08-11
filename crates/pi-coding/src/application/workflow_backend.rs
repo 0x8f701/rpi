@@ -275,8 +275,7 @@ impl WorkflowSupervisorBackend for WorkflowApplicationBackend {
     }
 
     async fn steer_supervisor(&self, message: String) -> Result<()> {
-        self.application.steer(message, Vec::new()).await;
-        Ok(())
+        self.application.steer(message, Vec::new()).await
     }
 
     fn planning_deadline(&self) -> Duration {
@@ -598,7 +597,7 @@ mod tests {
             stream.push(tool_call_message("todo", serde_json::json!({ "op": "view" })));
         }
         stream.push(text_message("steer done"));
-        application.steer("continue the work".to_owned(), Vec::new()).await;
+        application.steer("continue the work".to_owned(), Vec::new()).await.expect("queue steer");
         tokio::time::timeout(Duration::from_secs(10), application.session().continue_run())
             .await
             .expect("steer run must settle")
@@ -635,7 +634,7 @@ mod tests {
             stream.push(tool_call_message("todo", serde_json::json!({ "op": "view" })));
         }
         stream.push(text_message("steer done"));
-        application.steer("continue the work".to_owned(), Vec::new()).await;
+        application.steer("continue the work".to_owned(), Vec::new()).await.expect("queue steer");
         tokio::time::timeout(Duration::from_secs(10), application.session().continue_run())
             .await
             .expect("steer run must settle")

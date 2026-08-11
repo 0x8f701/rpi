@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "pi-agent"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2689,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ai"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "pi-cli"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2754,7 +2754,7 @@ dependencies = [
 
 [[package]]
 name = "pi-coding"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "pi-sandbox"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "libc",
  "seccompiler",

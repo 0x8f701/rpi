@@ -16,7 +16,7 @@
 - [Orchestration: subagents, jobs, and IRC](user-guide/orchestration.md)
 - [Isolated concurrent workflows](user-guide/workflows.md)
 - [Session recovery: rewind, checkpoints, handoffs, and TTL](user-guide/session-recovery.md)
-- [Live voice (`/live`)](user-guide/live.md)
+- [Live voice: TUI `/live` STT and `/web` realtime](user-guide/live.md)
 - [Models and custom providers](user-guide/models.md)
 - [Authentication](user-guide/authentication.md)
 - [RPC JSONL protocol](user-guide/rpc-json.md)

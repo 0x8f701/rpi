@@ -4,8 +4,8 @@ name: Release
 # the five supported native targets, package per-target archives named
 # rpi-<version>-<target-triple>.{tar.gz|zip} (each containing a root rpi/rpi.exe
 # plus LICENSE), generate SHA256SUMS, and publish as a GitHub Release.
-# The tagged commit must pass the reusable Test workflow before any release
-# validation or native artifact build starts.
+# Tests run independently on master and pull requests; this workflow validates
+# the tag, builds native artifacts, verifies them, and publishes the release.
 
 on:
   push:
@@ -22,17 +22,10 @@ env:
   MAX_RELEASE_BINARY_BYTES: "67108864"
 
 jobs:
-  test:
-    name: required test gate
-    uses: ./.github/workflows/test.yml
-    permissions:
-      contents: read
-
 
   validate-release:
     name: validate release tag
     runs-on: ubuntu-24.04
-    needs: [test]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5

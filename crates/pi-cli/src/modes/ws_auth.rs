@@ -15,12 +15,16 @@
 //! - `agent serve` always uses the strict loopback-only policy and rejects
 //!   tokenless browsers outright: ACP's tokenless transport accepts only
 //!   native clients without an `Origin` header.
-//! - `rpi --listen` terminates TLS by default, so non-loopback binds are
-//!   permitted without a flag; non-loopback plaintext HTTP/WebSocket still
-//!   requires the explicit insecure-remote opt-in. A token file is optional
-//!   in either case. The token authenticates clients but does not encrypt
-//!   the bearer token or control traffic against passive network observers
-//!   (plaintext mode).
+//! - `rpi --listen` terminates TLS by default. A non-loopback TLS bind is
+//!   permitted without the insecure-remote flag but requires a token file:
+//!   a tokenless remote TLS listener would accept unauthenticated
+//!   control-plane commands from any network client, so the pre-bind guard
+//!   fails closed with an actionable `--listen-token-file` hint. Non-loopback
+//!   plaintext HTTP/WebSocket still requires the explicit insecure-remote
+//!   opt-in, which is the one tokenless-remote escape hatch. Loopback
+//!   (127.0.0.0/8 or ::1) stays tokenless-or-tokenized under every policy.
+//!   The token authenticates clients but does not encrypt the bearer token or
+//!   control traffic against passive network observers (plaintext mode).
 //! - With a token configured, a client must present it either as an
 //!   `Authorization: Bearer <token>` header or as the `rpi-auth.<token>`
 //!   `Sec-WebSocket-Protocol` subprotocol. The matched subprotocol is echoed
@@ -226,18 +230,21 @@ pub(crate) fn constant_work_eq(candidate: &[u8], expected: &[u8]) -> bool {
     }
     different == 0
 }
-
 /// Explicit pre-bind policy for HTTP/WebSocket transports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ListenAddressPolicy {
-    /// Permit only 127.0.0.0/8 and ::1.
+    /// Permit only 127.0.0.0/8 and ::1; a non-loopback bind is rejected
+    /// regardless of whether a token file is configured.
     LoopbackOnly,
-    /// Permit non-loopback plaintext HTTP/WebSocket; a token file is
-    /// optional (strongly recommended).
-    AllowPlaintextRemote,
+    /// Explicit insecure-remote opt-in (`--listen-allow-insecure-remote`):
+    /// permit non-loopback HTTP/WebSocket tokenless or with a token regardless
+    /// of whether the outer listener uses TLS. `listen::start` gives this
+    /// policy priority over the transport branch, so the flag is the one
+    /// tokenless-remote escape hatch (a token is strongly recommended).
+    AllowInsecureRemote,
     /// Permit non-loopback TLS-terminated HTTP/WebSocket without the
-    /// insecure-remote opt-in: TLS is not plaintext, so the flag is not
-    /// required. A token file is optional.
+    /// insecure-remote opt-in (TLS is not plaintext), but require a token
+    /// file: a tokenless non-loopback TLS listener is rejected pre-bind.
     AllowTlsRemote,
 }
 
@@ -250,17 +257,54 @@ pub(crate) fn load_auth_token(
     policy: ListenAddressPolicy,
 ) -> Result<Option<Vec<u8>>> {
     if address.is_loopback() {
+        // Loopback is always permitted, with or without a token, under every
+        // policy: the developer experience stays tokenless on the local host.
         return path.map(read_token_file).transpose();
     }
-    if policy == ListenAddressPolicy::LoopbackOnly {
-        bail!(
-            "{address_name} only binds loopback addresses (127.0.0.0/8 or ::1); \
-             {address} is non-loopback. The transport is plaintext HTTP/WebSocket."
-        );
+    match policy {
+        ListenAddressPolicy::LoopbackOnly => {
+            // Loopback-only refuses every non-loopback bind regardless of a
+            // token. The remedy is surface-specific: `--listen` exposes a
+            // remote opt-in and a TLS+token path, while `agent serve` is
+            // loopback-only by design. Branch on the caller-supplied name so
+            // the shared message never points an ACP user at `--listen` flags.
+            let remedy = if address_name == "--listen" {
+                " To bind a non-loopback address, pass \
+                 --listen-allow-insecure-remote (with --listen-token-file \
+                 strongly recommended), or drop --listen-plaintext to serve \
+                 TLS with --listen-token-file."
+            } else {
+                " Use a loopback address (127.0.0.0/8 or ::1) instead."
+            };
+            bail!(
+                "{address_name} only binds loopback addresses (127.0.0.0/8 or ::1); \
+                 {address} is non-loopback.{remedy}"
+            );
+        }
+        ListenAddressPolicy::AllowTlsRemote => {
+            // Non-loopback TLS requires a token: a tokenless remote TLS
+            // listener would accept unauthenticated control-plane commands
+            // from any network client. Fail closed before bind with an
+            // actionable hint naming the non-loopback address and the flag;
+            // the token contents are never echoed.
+            if path.is_none() {
+                bail!(
+                    "{address_name} binds a non-loopback address ({address}) over TLS \
+                     without an authentication token. Remote TLS listeners require \
+                     --listen-token-file; bind a loopback address (127.0.0.0/8 or ::1) \
+                     for tokenless access, or pass --listen-allow-insecure-remote to \
+                     explicitly accept tokenless remote access."
+                );
+            }
+            path.map(read_token_file).transpose()
+        }
+        ListenAddressPolicy::AllowInsecureRemote => {
+            // Explicit insecure-remote opt-in: tokenless and authenticated
+            // remote binds are both allowed regardless of transport (a token
+            // is strongly recommended but not required).
+            path.map(read_token_file).transpose()
+        }
     }
-    // Non-loopback with the explicit plaintext opt-in, or TLS: a token is
-    // optional.
-    path.map(read_token_file).transpose()
 }
 
 /// Read and validate a token file: a regular file, at most
@@ -316,7 +360,7 @@ mod tests {
         for (address, label) in loopbacks {
             for policy in [
                 ListenAddressPolicy::LoopbackOnly,
-                ListenAddressPolicy::AllowPlaintextRemote,
+                ListenAddressPolicy::AllowInsecureRemote,
                 ListenAddressPolicy::AllowTlsRemote,
             ] {
                 assert!(
@@ -342,32 +386,73 @@ mod tests {
             ("2001:db8::1".parse().unwrap(), "documentation IPv6"),
         ];
         for (address, label) in remote {
-            for policy in [
-                ListenAddressPolicy::LoopbackOnly,
-                ListenAddressPolicy::AllowPlaintextRemote,
-                ListenAddressPolicy::AllowTlsRemote,
-            ] {
-                for path in [None, Some(token.as_path())] {
-                    // Loopback-only refuses every non-loopback bind; the
-                    // plaintext opt-in and TLS both permit them.
-                    let should_allow =
-                        policy != ListenAddressPolicy::LoopbackOnly;
-                    let result = load_auth_token(address, path, "--listen", policy);
-                    if should_allow {
-                        assert_eq!(
-                            result.unwrap(),
-                            path.map(|_| b"fixture-value".to_vec()),
-                            "{label}: explicit opt-in must pass pre-bind policy with or without a token"
-                        );
-                    } else {
+            let addr_str = address.to_string();
+            // LoopbackOnly refuses every non-loopback bind regardless of a
+            // token: the policy is address-scoped, not token-gated. The
+            // refusal names the non-loopback address, hints at
+            // --listen-token-file, and never echoes token contents.
+            for path in [None, Some(token.as_path())] {
+                match load_auth_token(address, path, "--listen", ListenAddressPolicy::LoopbackOnly) {
+                    Ok(_) => panic!("{label}: LoopbackOnly must refuse non-loopback (token={})", path.is_some()),
+                    Err(error) => {
+                        let message = format!("{error:#}");
                         assert!(
-                            result.is_err(),
-                            "{label}: policy={policy:?} token={} must be refused",
-                            path.is_some()
+                            message.contains(addr_str.as_str()),
+                            "{label}: LoopbackOnly refusal must name the non-loopback address: {message}"
+                        );
+                        assert!(
+                            message.contains("--listen-token-file"),
+                            "{label}: LoopbackOnly refusal must hint at --listen-token-file: {message}"
+                        );
+                        assert!(
+                            !message.contains("fixture-value"),
+                            "{label}: LoopbackOnly refusal must not leak token contents: {message}"
                         );
                     }
                 }
             }
+
+            // AllowTlsRemote: the security fix. A tokenless non-loopback TLS
+            // bind is rejected pre-bind; a configured token is loaded and the
+            // bind proceeds. The rejection names the address, hints at
+            // --listen-token-file, and is secret-free.
+            match load_auth_token(address, None, "--listen", ListenAddressPolicy::AllowTlsRemote) {
+                Ok(_) => panic!("{label}: AllowTlsRemote must reject a tokenless non-loopback bind pre-bind"),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    assert!(
+                        message.contains(addr_str.as_str()),
+                        "{label}: AllowTlsRemote refusal must name the non-loopback address: {message}"
+                    );
+                    assert!(
+                        message.contains("--listen-token-file"),
+                        "{label}: AllowTlsRemote refusal must hint at --listen-token-file: {message}"
+                    );
+                    assert!(
+                        !message.contains("fixture-value"),
+                        "{label}: AllowTlsRemote refusal must not leak token contents: {message}"
+                    );
+                }
+            }
+            assert_eq!(
+                load_auth_token(address, Some(&token), "--listen", ListenAddressPolicy::AllowTlsRemote).unwrap(),
+                Some(b"fixture-value".to_vec()),
+                "{label}: AllowTlsRemote must load the token for a non-loopback bind"
+            );
+
+            // AllowInsecureRemote: the explicit insecure-remote opt-in permits
+            // non-loopback binds tokenless (LAN access) or with a token.
+            assert!(
+                load_auth_token(address, None, "--listen", ListenAddressPolicy::AllowInsecureRemote)
+                    .unwrap()
+                    .is_none(),
+                "{label}: AllowInsecureRemote must permit a tokenless non-loopback opt-in"
+            );
+            assert_eq!(
+                load_auth_token(address, Some(&token), "--listen", ListenAddressPolicy::AllowInsecureRemote).unwrap(),
+                Some(b"fixture-value".to_vec()),
+                "{label}: AllowInsecureRemote must load the token for a non-loopback bind"
+            );
         }
     }
 
@@ -599,28 +684,28 @@ mod tests {
     #[test]
     fn authorized_tokenless_wildcard_listener_accepts_same_origin_browser_without_advertised_origin() {
         // A wildcard bind has no advertised origin, but the request's own
-        // Host is the comparison target: any LAN address the browser
-        // actually used is accepted, so no --listen-advertised-origin is
-        // needed for browser auth.
+        // Host is the comparison target: any address the browser actually
+        // used is accepted, so no --listen-advertised-origin is needed for
+        // browser auth.
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::HOST,
-            http::HeaderValue::from_static("192.168.1.50:8765"),
+            http::HeaderValue::from_static("rpi.example:8765"),
         );
         headers.insert(
             http::header::ORIGIN,
-            http::HeaderValue::from_static("http://192.168.1.50:8765"),
+            http::HeaderValue::from_static("http://rpi.example:8765"),
         );
         assert!(authorized(&headers, None, true));
-        // A LAN hostname the user typed works the same way.
+        // A different hostname the user typed works the same way.
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::HOST,
-            http::HeaderValue::from_static("mypi.lan:8765"),
+            http::HeaderValue::from_static("alternate.example:8765"),
         );
         headers.insert(
             http::header::ORIGIN,
-            http::HeaderValue::from_static("http://mypi.lan:8765"),
+            http::HeaderValue::from_static("http://alternate.example:8765"),
         );
         assert!(authorized(&headers, None, true));
     }

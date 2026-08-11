@@ -63,7 +63,10 @@ from disk.
 
 - The token travels only in the WebSocket handshake
   (`Sec-WebSocket-Protocol: rpi-auth.<token>`, constant-time compared and
-  echoed server-side) and `sessionStorage` — never in URLs or cookies.
+  echoed server-side) and per-listener-authority `localStorage` keys — never in
+  URLs or cookies. The legacy global key migrates once to the initial
+  authority, then is deleted; switching hosts never reuses another host's
+  token.
 - Every model-derived string passes through `src/redact.ts`
   (`redactSecrets` + `escapeHtml`, JS ports of the Rust export pipeline)
   before touching the DOM; React's JSX escaping covers the rest. Streaming

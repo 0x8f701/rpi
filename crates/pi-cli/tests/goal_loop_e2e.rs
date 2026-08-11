@@ -8,20 +8,27 @@
 //! * **REPL harness** — `rpi --mode text` with piped stdin/stdout/stderr.
 //!   Slash commands run through the real `repl.rs` dispatch and print their
 //!   formatted output lines; errors go to stderr as `rpi: <message>`. This is
-//!   the deterministic workhorse for the lifecycle, drop, budget, persistence,
-//!   and loop scenarios. Every process runs on the DEFAULT session path under
-//!   a fresh temp HOME: this exercises the startup TTL prune against the
-//!   just-started recorder's still-empty per-cwd directory (regression: the
-//!   prune used to delete it before the first durable goal write, failing
-//!   with ENOENT).
-//! * **Budget crossing** — the REPL runs with `--listen 127.0.0.1:0`; the test
-//!   POSTs `goal_update_usage` over the HTTP control plane (the same
-//!   `GoalRuntime::update_usage` pipeline a finished goal turn charges through)
-//!   and observes the goal auto-pause on budget exhaustion, resume rejection,
-//!   and drop from the exhausted state — exactly the T06 Phase-2 flow.
-//! * **Persistence** — restart the binary in the same temp HOME/cwd with
-//!   `--continue`; the goal journal is replayed from the session tree, so the
-//!   completed goal survives.
+//!   the deterministic workhorse for the lifecycle, drop, and loop scenarios.
+//!   Every process runs on the DEFAULT session path under a fresh temp HOME:
+//!   this exercises the startup TTL prune against the just-started recorder's
+//!   still-empty per-cwd directory (regression: the prune used to delete it
+//!   before the first durable goal write, failing with ENOENT).
+//! * **Headless listener harness** — `rpi --listen 127.0.0.1:0
+//!   --listen-plaintext --model faux/faux-1` with piped stdio. `--listen` is
+//!   a Web-only service that never starts the TUI or line REPL (product
+//!   contract), so readiness is the stderr `Control plane listening on
+//!   http://…` banner and its parsed bound address, never a stdout prompt.
+//!   It runs on the same DEFAULT session path under the fresh temp HOME.
+//! * **Budget crossing** — the test charges 6 tokens against a 5-token goal
+//!   through `goal_update_usage` over the HTTP control plane (the same
+//!   `GoalRuntime::update_usage` pipeline a finished goal turn charges
+//!   through) and observes the goal auto-pause on budget exhaustion, resume
+//!   rejection, and drop from the exhausted state — exactly the T06 Phase-2
+//!   flow.
+//! * **Persistence** — stop the listener (SIGTERM) and restart the binary in
+//!   the same temp HOME/cwd with `--continue`; the goal journal is replayed
+//!   from the session tree, so the goal survives with its budget and charged
+//!   usage exactly.
 //! * **PTY harness** — a real pseudoterminal drives the TUI: bare `/goal`
 //!   opens the Create/Show panel, the panel Enter flow creates a goal, and the
 //!   footer goal chip renders `🎯 Goal N/M` and transitions `⏸`/`🎯`/`✓` across
@@ -49,7 +56,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::pty::{Winsize, openpty};
+use nix::sys::signal::{Signal, kill};
 use nix::sys::termios::Termios;
+use nix::unistd::Pid;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -588,7 +597,8 @@ fn glyph_width(ch: char) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP control-plane client for the budget-crossing scenario.
+// HTTP control-plane client + headless listener probe for the Web-only
+// scenarios (`--listen` never starts the line REPL).
 // ---------------------------------------------------------------------------
 
 /// POST one JSON-RPC-ish command to the `--listen` control plane and return the
@@ -616,7 +626,7 @@ fn http_rpc(addr: &str, body: &Value) -> Value {
 }
 
 /// `127.0.0.1:PORT` parsed from the `Control plane listening on http://…`
-/// banner the REPL prints to stderr.
+/// banner the listener prints to stderr.
 fn control_plane_addr(stderr: &str) -> String {
     const MARKER: &str = "Control plane listening on http://";
     let start = stderr
@@ -628,6 +638,134 @@ fn control_plane_addr(stderr: &str) -> String {
         .expect("control plane address terminator")
         + start;
     stderr[start..end].to_owned()
+}
+
+/// A running headless `rpi --listen` Web-only probe with piped stdio.
+///
+/// Listener mode never starts the TUI or line REPL (the product contract for
+/// `--listen`), so readiness is NOT a stdout prompt: [`ListenerProbe::spawn`]
+/// waits for the `Control plane listening on http://…` banner on stderr and
+/// parses the bound address. All goal mutations run through the JSON-RPC
+/// control plane ([`ListenerProbe::rpc`]). `stop()` SIGTERMs the process —
+/// listener mode shuts down gracefully on SIGTERM and exits 0 after
+/// `application.cleanup()` — and the Drop impl kills as a backstop.
+struct ListenerProbe {
+    child: Child,
+    stderr_buffer: Arc<Mutex<String>>,
+    addr: String,
+}
+
+impl ListenerProbe {
+    /// Spawn `rpi --listen 127.0.0.1:0 --listen-plaintext --model faux/faux-1`
+    /// on the default session path (plus `extra`, e.g. `--continue`), then
+    /// wait for the control-plane banner and parse the bound address.
+    fn spawn(home: &Path, cwd: &Path, extra: &[&str]) -> Self {
+        let mut cmd = Command::new(rpi_bin());
+        cmd.env_clear();
+        cmd.env("HOME", home);
+        cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("PI_OFFLINE", "1");
+        cmd.env("PI_SKIP_VERSION_CHECK", "1");
+        cmd.env("PI_FAUX_RESPONSE", FAUX_RESPONSE);
+        cmd.args([
+            "--listen",
+            "127.0.0.1:0",
+            "--listen-plaintext",
+            "--model",
+            "faux/faux-1",
+        ]);
+        cmd.args(extra);
+        cmd.current_dir(cwd);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn rpi listener");
+        let stdout = child.stdout.take().expect("listener stdout pipe");
+        let stderr = child.stderr.take().expect("listener stderr pipe");
+        let stderr_buffer = Arc::new(Mutex::new(String::new()));
+        // Drain stdout too: the listener writes no prompt, but an unread pipe
+        // would backpressure the child if it ever emitted startup chatter.
+        let stdout_buffer = Arc::new(Mutex::new(String::new()));
+        pump(stdout, stdout_buffer);
+        pump(stderr, stderr_buffer.clone());
+        let mut probe = Self {
+            child,
+            stderr_buffer,
+            addr: String::new(),
+        };
+        probe.ready();
+        probe
+    }
+
+    fn stderr_snapshot(&self) -> String {
+        self.stderr_buffer.lock().expect("stderr lock").clone()
+    }
+
+    fn wait_stderr(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.stderr_snapshot().contains(needle) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Wait for the control-plane banner (the listener's readiness signal —
+    /// there is no REPL prompt) and parse the bound address.
+    fn ready(&mut self) {
+        assert!(
+            self.wait_stderr(
+                "Control plane listening on http://",
+                Duration::from_secs(30)
+            ),
+            "control plane must announce its address, stderr: {:?}",
+            self.stderr_snapshot()
+        );
+        self.addr = control_plane_addr(&self.stderr_snapshot());
+    }
+
+    /// POST one JSON-RPC-ish command to the control plane and return the
+    /// `RpcResponse` envelope.
+    fn rpc(&self, body: &Value) -> Value {
+        http_rpc(&self.addr, body)
+    }
+
+    /// SIGTERM the listener (its shutdown path runs `application.cleanup`)
+    /// and require a clean exit.
+    fn stop(mut self) {
+        kill(Pid::from_raw(self.child.id() as i32), Signal::SIGTERM)
+            .expect("send SIGTERM to listener");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll listener exit") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "rpi listener did not exit after SIGTERM\nstderr: {:?}",
+                    self.stderr_snapshot()
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        assert!(
+            status.success(),
+            "rpi listener exit after SIGTERM: {status:?} stderr={:?}",
+            self.stderr_snapshot()
+        );
+    }
+}
+
+impl Drop for ListenerProbe {
+    fn drop(&mut self) {
+        // Backstop: never strand a child if a test failed before stop().
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -879,50 +1017,34 @@ fn repl_goal_drop_terminates_goal_and_slot_stays_permanent() {
 }
 
 /// Contract: a token budget is enforced through the real binary — create with
-/// `--tokens 5`, charge 6 tokens through the control-plane `goal_update_usage`
-/// RPC (the same `GoalRuntime::update_usage` pipeline finished goal turns
-/// charge through), and the goal auto-pauses as `budget_exhausted`; resume is
-/// rejected while the exhausted budget is immutable; drop still works from the
-/// exhausted state and complete on dropped is rejected. Wire-level budget
-/// validation (`tokenBudget: 0`) is rejected too.
+/// a 5-token budget, charge 6 tokens through the control-plane
+/// `goal_update_usage` RPC (the same `GoalRuntime::update_usage` pipeline
+/// finished goal turns charge through), and the goal auto-pauses as
+/// `budget_exhausted`; resume is rejected while the exhausted budget is
+/// immutable; drop still works from the exhausted state and complete on
+/// dropped is rejected. Wire-level budget validation (`tokenBudget: 0`) is
+/// rejected too.
 #[test]
-fn repl_goal_budget_usage_crossing_pauses_and_blocks_resume() {
+fn goal_budget_usage_crossing_pauses_and_blocks_resume() {
     let home = TempDir::new().expect("temp HOME");
     let cwd = TempDir::new().expect("temp cwd");
-    let mut repl = ReplProbe::spawn(
-        home.path(),
-        cwd.path(),
-        &[
-            "--mode",
-            "text",
-            "--model",
-            "faux/faux-1",
-            "--listen",
-            "127.0.0.1:0",
-            "--listen-plaintext",
-        ],
-    );
-    repl.ready();
-    // The control-plane banner is printed to stderr before the REPL prompt.
-    assert!(
-        repl.wait_stderr(
-            "Control plane listening on http://",
-            Duration::from_secs(30)
-        ),
-        "control plane must announce its address, stderr: {:?}",
-        repl.stderr_snapshot()
-    );
-    let addr = control_plane_addr(&repl.stderr_snapshot());
+    let probe = ListenerProbe::spawn(home.path(), cwd.path(), &[]);
 
-    let created = repl.command("/goal create --tokens 5 finish the bridge");
-    assert!(
-        created.starts_with("Goal work started · active · 0/5 tokens · finish the bridge"),
-        "goal create output: {created:?}"
+    // goal_create RPC equivalent of `/goal create --tokens 5 finish the
+    // bridge`: the headless listener never starts a goal-work turn on its
+    // own, so the goal is simply `active` with zero usage.
+    let created = probe.rpc(
+        &json!({"type": "goal_create", "id": "budget-create", "objective": "finish the bridge", "tokenBudget": 5}),
     );
+    assert_eq!(created["success"], true, "create response: {created}");
+    assert_eq!(created["command"], "goal_create");
+    assert_eq!(created["data"]["lifecycle"], "active");
+    assert_eq!(created["data"]["objective"], "finish the bridge");
+    assert_eq!(created["data"]["tokenBudget"], 5);
+    assert_eq!(created["data"]["usage"]["tokensUsed"], 0);
 
     // Charge past the 5-token budget: active must auto-pause, never complete.
-    let charge = http_rpc(
-        &addr,
+    let charge = probe.rpc(
         &json!({"type": "goal_update_usage", "id": "budget-charge", "tokens": 6, "activeTimeSeconds": 1}),
     );
     assert_eq!(charge["success"], true, "charge response: {charge}");
@@ -933,11 +1055,18 @@ fn repl_goal_budget_usage_crossing_pauses_and_blocks_resume() {
     assert_eq!(charge["data"]["tokenBudget"], 5);
     assert_eq!(charge["data"]["usage"]["tokensUsed"], 6);
 
-    let shown = repl.command("/goal show");
-    assert_eq!(shown.trim(), "paused · 6/5 tokens · finish the bridge");
+    // goal_get RPC equivalent of `/goal show`.
+    let shown = probe.rpc(&json!({"type": "goal_get", "id": "budget-show"}));
+    assert_eq!(shown["success"], true, "goal_get response: {shown}");
+    let current = &shown["data"]["current"];
+    assert_eq!(current["lifecycle"], "paused");
+    assert_eq!(current["pauseReason"], "budget_exhausted");
+    assert_eq!(current["objective"], "finish the bridge");
+    assert_eq!(current["tokenBudget"], 5);
+    assert_eq!(current["usage"]["tokensUsed"], 6);
 
     // Exhausted budgets are immutable: resume is rejected.
-    let resume = http_rpc(&addr, &json!({"type": "goal_resume", "id": "budget-resume"}));
+    let resume = probe.rpc(&json!({"type": "goal_resume", "id": "budget-resume"}));
     assert_eq!(resume["success"], false, "resume must fail: {resume}");
     assert_eq!(resume["command"], "goal_resume");
     assert!(
@@ -949,8 +1078,7 @@ fn repl_goal_budget_usage_crossing_pauses_and_blocks_resume() {
     );
 
     // Runtime budget validation on the wire path.
-    let zero = http_rpc(
-        &addr,
+    let zero = probe.rpc(
         &json!({"type": "goal_create", "id": "budget-zero", "objective": "x", "tokenBudget": 0}),
     );
     assert_eq!(zero["success"], false, "zero budget must fail: {zero}");
@@ -962,13 +1090,16 @@ fn repl_goal_budget_usage_crossing_pauses_and_blocks_resume() {
         "zero budget failure message: {zero}"
     );
 
-    let dropped = repl.command("/goal drop");
-    assert_eq!(dropped.trim(), "dropped · 6/5 tokens · finish the bridge");
+    // goal_drop RPC equivalent of `/goal drop`.
+    let dropped = probe.rpc(&json!({"type": "goal_drop", "id": "budget-drop"}));
+    assert_eq!(dropped["success"], true, "drop response: {dropped}");
+    assert_eq!(dropped["command"], "goal_drop");
+    assert_eq!(dropped["data"]["lifecycle"], "dropped");
+    assert_eq!(dropped["data"]["objective"], "finish the bridge");
+    assert_eq!(dropped["data"]["tokenBudget"], 5);
+    assert_eq!(dropped["data"]["usage"]["tokensUsed"], 6);
 
-    let complete = http_rpc(
-        &addr,
-        &json!({"type": "goal_complete", "id": "budget-complete"}),
-    );
+    let complete = probe.rpc(&json!({"type": "goal_complete", "id": "budget-complete"}));
     assert_eq!(complete["success"], false, "complete must fail: {complete}");
     assert!(
         complete["error"]
@@ -978,7 +1109,7 @@ fn repl_goal_budget_usage_crossing_pauses_and_blocks_resume() {
         "complete failure message: {complete}"
     );
 
-    repl.quit();
+    probe.stop();
 }
 
 /// Contract: the goal survives a process restart in the same temp HOME/cwd —
@@ -1041,45 +1172,25 @@ fn repl_goal_state_survives_restart_through_journal_replay() {
 /// resumed active goal work is safety-paused, and pause/resume/complete all
 /// still work on the restored goal.
 #[test]
-fn repl_goal_active_restart_resumes_session_restores_usage_budget_and_lifecycle() {
+fn goal_active_restart_resumes_session_restores_usage_budget_and_lifecycle() {
     let home = TempDir::new().expect("temp HOME");
     let cwd = TempDir::new().expect("temp cwd");
 
     {
-        let mut repl = ReplProbe::spawn(
-            home.path(),
-            cwd.path(),
-            &[
-                "--mode",
-                "text",
-                "--model",
-                "faux/faux-1",
-                "--listen",
-                "127.0.0.1:0",
-                "--listen-plaintext",
-            ],
-        );
-        repl.ready();
-        assert!(
-            repl.wait_stderr(
-                "Control plane listening on http://",
-                Duration::from_secs(30)
-            ),
-            "control plane must announce its address, stderr: {:?}",
-            repl.stderr_snapshot()
-        );
-        let addr = control_plane_addr(&repl.stderr_snapshot());
+        let probe = ListenerProbe::spawn(home.path(), cwd.path(), &[]);
 
-        let created = repl.command("/goal create --tokens 100 deliver the release");
-        assert!(
-            created.starts_with("Goal work started · active · 0/100 tokens · deliver the release"),
-            "goal create output: {created:?}"
+        let created = probe.rpc(
+            &json!({"type": "goal_create", "id": "restart-create", "objective": "deliver the release", "tokenBudget": 100}),
         );
+        assert_eq!(created["success"], true, "create response: {created}");
+        assert_eq!(created["data"]["lifecycle"], "active");
+        assert_eq!(created["data"]["objective"], "deliver the release");
+        assert_eq!(created["data"]["tokenBudget"], 100);
+        assert_eq!(created["data"]["usage"]["tokensUsed"], 0);
 
         // Charge usage through the same `goal_update_usage` pipeline finished
         // goal turns charge through: 40 tokens + 15s of active time.
-        let charge = http_rpc(
-            &addr,
+        let charge = probe.rpc(
             &json!({"type": "goal_update_usage", "id": "restart-charge", "tokens": 40, "activeTimeSeconds": 15}),
         );
         assert_eq!(charge["success"], true, "charge response: {charge}");
@@ -1087,47 +1198,32 @@ fn repl_goal_active_restart_resumes_session_restores_usage_budget_and_lifecycle(
         assert_eq!(charge["data"]["usage"]["tokensUsed"], 40);
         assert_eq!(charge["data"]["usage"]["activeTimeSeconds"], 15);
 
-        let shown = repl.command("/goal show");
-        assert_eq!(shown.trim(), "active · 40/100 tokens · deliver the release");
+        // goal_get equivalent of `/goal show`: still active, 40/100 charged.
+        let shown = probe.rpc(&json!({"type": "goal_get", "id": "restart-shown"}));
+        assert_eq!(shown["success"], true, "goal_get response: {shown}");
+        let current = &shown["data"]["current"];
+        assert_eq!(current["lifecycle"], "active");
+        assert_eq!(current["objective"], "deliver the release");
+        assert_eq!(current["tokenBudget"], 100);
+        assert_eq!(current["usage"]["tokensUsed"], 40);
+        assert_eq!(current["usage"]["activeTimeSeconds"], 15);
 
-        // Let the goal-work turn settle before exiting so the journal is idle.
-        thread::sleep(Duration::from_secs(2));
-        repl.quit();
+        // Every goal commit is durable before its RPC response returns and no
+        // goal-work turn is running, so the journal is idle at exit.
+        probe.stop();
     }
 
-    let mut resumed = ReplProbe::spawn(
-        home.path(),
-        cwd.path(),
-        &[
-            "--mode",
-            "text",
-            "--model",
-            "faux/faux-1",
-            "--continue",
-            "--listen",
-            "127.0.0.1:0",
-            "--listen-plaintext",
-        ],
-    );
-    resumed.ready();
+    // `--continue` resumes the recorded session; the listener stays headless.
+    let resumed = ListenerProbe::spawn(home.path(), cwd.path(), &["--continue"]);
     assert!(
         resumed.wait_stderr("resumed", Duration::from_secs(10)),
         "restart must resume the recorded session, stderr: {:?}",
         resumed.stderr_snapshot()
     );
-    assert!(
-        resumed.wait_stderr(
-            "Control plane listening on http://",
-            Duration::from_secs(30)
-        ),
-        "control plane must announce its address, stderr: {:?}",
-        resumed.stderr_snapshot()
-    );
-    let addr = control_plane_addr(&resumed.stderr_snapshot());
 
     // The journal replay restores the goal with its budget AND charged usage,
     // and the active goal work is safety-paused on resume.
-    let state = http_rpc(&addr, &json!({"type": "goal_get", "id": "restart-get"}));
+    let state = resumed.rpc(&json!({"type": "goal_get", "id": "restart-get"}));
     assert_eq!(state["success"], true, "goal_get response: {state}");
     assert_eq!(state["data"]["current"]["lifecycle"], "paused");
     assert_eq!(state["data"]["current"]["pauseReason"], "resume_safety");
@@ -1136,20 +1232,25 @@ fn repl_goal_active_restart_resumes_session_restores_usage_budget_and_lifecycle(
     assert_eq!(state["data"]["current"]["usage"]["activeTimeSeconds"], 15);
     assert_eq!(state["data"]["current"]["objective"], "deliver the release");
 
-    let shown = resumed.command("/goal show");
-    assert_eq!(shown.trim(), "paused · 40/100 tokens · deliver the release");
+    // Lifecycle still works on the restored goal: resume re-activates it and
+    // complete terminates it, preserving the charged usage.
+    let resumed_work = resumed.rpc(&json!({"type": "goal_resume", "id": "restart-resume"}));
+    assert_eq!(resumed_work["success"], true, "resume response: {resumed_work}");
+    assert_eq!(resumed_work["data"]["lifecycle"], "active");
+    assert_eq!(resumed_work["data"]["objective"], "deliver the release");
+    assert_eq!(resumed_work["data"]["tokenBudget"], 100);
+    assert_eq!(resumed_work["data"]["usage"]["tokensUsed"], 40);
+    assert_eq!(resumed_work["data"]["usage"]["activeTimeSeconds"], 15);
 
-    // Lifecycle still works on the restored goal: resume starts goal work
-    // again and complete terminates it, preserving the charged usage.
-    let resumed_work = resumed.command("/goal resume");
-    assert!(
-        resumed_work.starts_with("Goal work started · active · 40/100 tokens · deliver the release"),
-        "resume output: {resumed_work:?}"
-    );
-    let completed = resumed.command("/goal complete");
-    assert_eq!(completed.trim(), "completed · 40/100 tokens · deliver the release");
+    let completed = resumed.rpc(&json!({"type": "goal_complete", "id": "restart-complete"}));
+    assert_eq!(completed["success"], true, "complete response: {completed}");
+    assert_eq!(completed["data"]["lifecycle"], "completed");
+    assert_eq!(completed["data"]["objective"], "deliver the release");
+    assert_eq!(completed["data"]["tokenBudget"], 100);
+    assert_eq!(completed["data"]["usage"]["tokensUsed"], 40);
+    assert_eq!(completed["data"]["usage"]["activeTimeSeconds"], 15);
 
-    resumed.quit();
+    resumed.stop();
 }
 
 /// Contract: the goal is scoped to its session — a restart WITHOUT

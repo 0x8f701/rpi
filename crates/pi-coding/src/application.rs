@@ -1469,12 +1469,10 @@ impl Application {
         if active.loop_turn_active.load(Ordering::Acquire) {
             return match streaming_behavior {
                 Some(StreamingBehavior::Steer) => {
-                    active.session.steer(user_message(message, images)).await;
-                    Ok(())
+                    active.session.steer(user_message(message, images)).await
                 }
                 Some(StreamingBehavior::FollowUp) => {
-                    active.session.follow_up(user_message(message, images)).await;
-                    Ok(())
+                    active.session.follow_up(user_message(message, images)).await
                 }
                 None => Err(anyhow!(
                     "session is already processing; choose steer or followUp"
@@ -1484,12 +1482,10 @@ impl Application {
         let Ok(turn_guard) = active.turn_gate.clone().try_lock_owned() else {
             return match streaming_behavior {
                 Some(StreamingBehavior::Steer) => {
-                    active.session.steer(user_message(message, images)).await;
-                    Ok(())
+                    active.session.steer(user_message(message, images)).await
                 }
                 Some(StreamingBehavior::FollowUp) => {
-                    active.session.follow_up(user_message(message, images)).await;
-                    Ok(())
+                    active.session.follow_up(user_message(message, images)).await
                 }
                 None => Err(anyhow!(
                     "session is already processing; choose steer or followUp"
@@ -1588,20 +1584,20 @@ impl Application {
         Ok(())
     }
 
-    pub async fn steer(&self, message: String, images: Vec<ContentBlock>) {
+    pub async fn steer(&self, message: String, images: Vec<ContentBlock>) -> Result<()> {
         let active = self.runtime();
         if active.todo_continuation_suppressed.load(Ordering::Acquire) {
             active.todo_resume_requested.store(true, Ordering::Release);
         }
-        active.session.steer(user_message(message, images)).await;
+        active.session.steer(user_message(message, images)).await
     }
 
-    pub async fn follow_up(&self, message: String, images: Vec<ContentBlock>) {
+    pub async fn follow_up(&self, message: String, images: Vec<ContentBlock>) -> Result<()> {
         let active = self.runtime();
         if active.todo_continuation_suppressed.load(Ordering::Acquire) {
             active.todo_resume_requested.store(true, Ordering::Release);
         }
-        active.session.follow_up(user_message(message, images)).await;
+        active.session.follow_up(user_message(message, images)).await
     }
 
     /// Task-scoped interrupt: cancels the active agent turn, its in-flight tool

@@ -210,17 +210,20 @@ pub struct Cli {
     #[arg(long, value_name = "SOCKET_ADDR")]
     pub listen: Option<std::net::SocketAddr>,
 
-    /// Optional bearer token file for --listen. When set, /ws and /rpc
-    /// require the token from this file (as `Authorization: Bearer <token>`
-    /// or the `rpi-auth.<token>` subprotocol); without it the listener is
-    /// tokenless and accepts browsers directly.
+    /// Bearer token file for --listen. When set, /ws and /rpc require the
+    /// token from this file (as `Authorization: Bearer <token>` or the
+    /// `rpi-auth.<token>` subprotocol). Optional for loopback; required for a
+    /// non-loopback TLS listener unless --listen-allow-insecure-remote is set.
+    /// A configured token remains mandatory even with that remote opt-in.
     #[arg(long, value_name = "PATH", requires = "listen")]
     pub listen_token_file: Option<PathBuf>,
 
-    /// Explicitly allow plaintext HTTP/WebSocket on a non-loopback --listen
-    /// address. A token file is optional (strongly recommended): passive
-    /// network observers can capture control traffic and, when configured,
-    /// the bearer token.
+    /// Explicit tokenless-remote opt-in for --listen. Takes priority over the
+    /// TLS/plaintext choice, so a non-loopback bind may omit
+    /// --listen-token-file over plaintext or TLS — the one escape hatch from
+    /// the non-loopback TLS token requirement. Supplying a token file still
+    /// enforces authentication. Plaintext exposes the bearer token and control
+    /// traffic to passive network observers.
     #[arg(long, requires = "listen")]
     pub listen_allow_insecure_remote: bool,
 

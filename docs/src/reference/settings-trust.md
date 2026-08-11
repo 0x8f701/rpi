@@ -9,7 +9,7 @@ order:
 2. The platform home directory (`HOME` on Unix, `USERPROFILE` on Windows) with
    `/.pi/agent` appended.
 
-Source: `crates/pi-coding/src/resources.rs:26-41`.
+Source: `crates/pi-coding/src/resources.rs` (`agent_dir_path` and resource discovery).
 
 Within `<agent-dir>` the CLI reads:
 
@@ -21,7 +21,7 @@ Within `<agent-dir>` the CLI reads:
 - `skills/`, `prompts/`, `themes/` — global resources.
 
 Project-local resources are loaded from `<workspace>/.pi/` only when that project
-is trusted. Source: `crates/pi-coding/src/resource_manager.rs:49-70`.
+is trusted. Source: `crates/pi-coding/src/resource_manager.rs` (`ResourcePaths::discover_from_agent_dir`).
 
 ## Project trust
 
@@ -32,8 +32,7 @@ decisions are stored in `<agent-dir>/trust.json`, versioned as
 resolver walks parent directories, so a decision at `<workspace>` covers
 `<workspace>/sub-project`.
 
-Source: `crates/pi-coding/src/trust.rs:67-140` and
-`crates/pi-coding/src/trust.rs:180-216`.
+Source: `crates/pi-coding/src/trust.rs` (`TrustStore`, `TrustResolution`, and `apply_trust_hook_outcomes`).
 
 Default behavior is controlled by `settings.json`:
 
@@ -62,8 +61,7 @@ headless mode an unset or `"ask"` decision is treated as untrusted, so use
 `--approve` when you need project resources. If the project has no `.pi`
 directory, it is implicitly trusted.
 
-Source: `crates/pi-coding/src/trust.rs:37-43` and
-`crates/pi-cli/src/args.rs:168-174`.
+Source: `crates/pi-coding/src/trust.rs` (`TrustDecision` defaults) and `crates/pi-cli/src/args.rs` (`--approve` / `--no-approve`).
 
 ## `settings.json`
 
@@ -72,8 +70,7 @@ Global settings live at `<agent-dir>/settings.json`. Project settings live at
 trusted. Unknown fields are retained across merges so other product modules can
 use them.
 
-Source: `crates/pi-coding/src/settings.rs:666-669` and
-`crates/pi-coding/src/settings.rs:729-843`.
+Source: `crates/pi-coding/src/settings.rs` (`RuntimeSettingsSnapshot` and settings merge logic).
 
 ```json
 {
@@ -196,15 +193,14 @@ Source: `crates/pi-coding/src/settings.rs:666-669` and
 | `packages` | Local/git package sources to install/load. |
 | `extensions`, `skills`, `prompts`, `themes` | Resource names to load from configured packages and discovered paths. |
 | `sandbox` | Opt-in Linux filesystem sandbox for bash (`enabled`, `network`, `allowedPaths`, `deniedPaths`, `readOnly`); see [`sandbox-isolation.md`](sandbox-isolation.md). |
-| `live` | Hold-to-talk voice configuration (`enabled`, `sttBaseUrl`, `sttApiKey`, `sttModel`, `language`, `allowInsecure`); see [`live.md`](../user-guide/live.md). |
+| `live` | Voice configuration (`enabled`, `mode`, `sttBaseUrl`, `sttApiKey`, `sttModel`, `realtimeBaseUrl`, `realtimeApiKey`, `realtimeModel`, `voice`, `language`, `allowInsecure`); see [`live.md`](../user-guide/live.md). |
+| `visionModel` | Model spec used to describe images when the active chat model does not support image input. The delegation shares the main prompt, steering, and follow-up context; a misconfigured `visionModel` (unresolvable or not image-capable) fails with an error instead of silently dropping images. |
 | `memory` | Memory backend (`backend`: `local`/`hindsight`/`off`; Hindsight HTTP endpoint/token, plaintext opt-in, bank/scoping, recall policy, injection, and per-operation timeouts); see [`memory.md`](memory.md). |
 | `hooks` | Host hooks: external commands observing/gating session events; see [`hooks.md`](hooks.md). |
 | `permissionRules` | Path-level permission rules evaluated before the approval mode; see [`security.md`](security.md). |
 | `mcpServers` | MCP servers for the `mcp` tool (`name`, `transport`, `command`/`args`/`env`, `url`, `disabled`); see [`mcp.md`](mcp.md). |
 
-Source: `crates/pi-coding/src/settings.rs:342-416`,
-`crates/pi-coding/src/settings.rs:970-1096`, and
-`crates/pi-coding/src/settings.rs:1104-1129`.
+Source: `crates/pi-coding/src/settings.rs` (`Settings`, `LiveSettings`, `LiveRuntimeSettings`, `SettingsCatalog`, and known-field definitions).
 
 ### Supported operational settings coverage
 
@@ -240,7 +236,7 @@ list, or module-specific configuration.
 | `doubleEscapeAction` | `tui_runtime` |
 | `orchestration` | orchestration tool gates |
 
-Source: `crates/pi-coding/src/settings.rs:302-330`.
+Source: `crates/pi-coding/src/settings.rs` (`SUPPORTED_SETTINGS_COVERAGE`).
 
 ## Model and thinking-level precedence
 
@@ -279,9 +275,7 @@ Configuration and resources are loaded into an atomic snapshot.
   atomic (temp file + `fs::rename` + directory sync). Session-only overrides
   via `apply_overrides` are never persisted.
 
-Source: `crates/pi-cli/src/commands.rs:145-180`,
-`crates/pi-coding/src/settings.rs:729-843`, and
-`crates/pi-coding/src/resource_manager.rs:139-253`.
+Source: `crates/pi-cli/src/commands.rs` (`reload` command), `crates/pi-coding/src/settings.rs` (`SettingsManager::reload`), and `crates/pi-coding/src/resource_manager.rs` (`stage_reload` / `commit_reload`).
 
 ## Trust boundaries
 

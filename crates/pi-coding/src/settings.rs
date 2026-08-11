@@ -429,7 +429,7 @@ pub struct LiveSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Voice mode: `"stt"` (simple STT via whisper-compatible endpoint) or
-    /// `"realtime"` (Codex Live via CLIProxyAPI's /v1/live + /v1/realtime/calls).
+    /// `"realtime"` (Codex Live via CLIProxyAPI's /v1/realtime/calls + oai-events RTCDataChannel).
     /// Default `"stt"` for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
@@ -666,7 +666,7 @@ pub struct RuntimeSettingsState {
     pub orchestration_isolation: crate::WorkflowIsolationSetting,
     /// Effective hold-to-talk voice configuration (`Settings.live`), including
     /// the realtime (Codex Live) base URL/model/voice the web frontend needs
-    /// to drive `realtime_create_call`/`realtime_create_session`. Secret keys
+    /// to drive `realtime_create_call`. Secret keys
     /// are omitted from serialization; `Debug` redacts them.
     pub live: LiveRuntimeSettings,
 }

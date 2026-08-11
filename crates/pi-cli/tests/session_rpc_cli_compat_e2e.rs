@@ -1736,6 +1736,12 @@ fn startup_warning_stays_on_stderr_and_json_stdout_stays_pure() {
         !out.contains("deprecated subagents.agentOverrides"),
         "startup warning must not pollute JSON stdout: {out}"
     );
+    let raw = fs::read_to_string(agent.path().join("settings.json"))
+        .expect("read settings after startup");
+    assert!(
+        raw.contains("agentOverrides"),
+        "silent in-memory migration must not rewrite settings until an explicit save: {raw}"
+    );
     assert!(
         !out.contains('\u{1b}'),
         "JSON stdout must not contain ANSI: {out:?}"

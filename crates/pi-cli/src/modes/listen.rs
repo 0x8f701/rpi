@@ -42,6 +42,9 @@ pub use super::session_runtime_manager::{
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time an accepted TLS connection may occupy a connection task
+/// without completing its server-side handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Server-side ping cadence for established collaboration guests. Browsers
 /// answer pings automatically at the protocol level (RFC 6455 5.5.2), so a
@@ -113,8 +116,12 @@ const LISTEN_KEY_CACHE_NAME: &str = "listen-key.pem";
 pub struct ListenConfig {
     pub address: SocketAddr,
     pub token_file: Option<PathBuf>,
-    /// Permit a non-loopback plaintext bind; a token file is optional
-    /// (strongly recommended).
+    /// Explicit insecure-remote opt-in (`--listen-allow-insecure-remote`).
+    /// `start` gives this flag priority over the plaintext/TLS branch, so a
+    /// non-loopback bind may omit a token regardless of transport (the one
+    /// tokenless-remote escape hatch). If `token_file` is supplied it remains
+    /// mandatory. Without the flag, non-loopback plaintext is refused and
+    /// non-loopback TLS requires `token_file`.
     pub allow_insecure_remote: bool,
     /// Explicitly advertised HTTP(S) origin used to build collaboration
     /// links when `address` is a wildcard bind (0.0.0.0/::). Validated and
@@ -215,10 +222,14 @@ pub async fn start(
     config: ListenConfig,
 ) -> Result<ListenHandle> {
     let policy = if config.allow_insecure_remote {
-        ListenAddressPolicy::AllowPlaintextRemote
+        ListenAddressPolicy::AllowInsecureRemote
     } else if !config.plaintext {
         // TLS is the default transport; a non-loopback HTTPS listener is not
-        // plaintext, so it needs no insecure-remote opt-in.
+        // plaintext, so it needs no insecure-remote opt-in, but it still
+        // requires a token file — enforced by `load_auth_token` under
+        // `AllowTlsRemote` (a tokenless non-loopback TLS bind is rejected
+        // pre-bind). `allow_insecure_remote` above takes priority and is the
+        // one tokenless-remote escape hatch.
         ListenAddressPolicy::AllowTlsRemote
     } else {
         ListenAddressPolicy::LoopbackOnly
@@ -476,6 +487,7 @@ async fn make_tls_acceptor(
     // in the dependency tree via rcgen/reqwest) before building ServerConfig.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let (cert_path, key_path) = match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => (cert_path.to_path_buf(), key_path.to_path_buf()),
         (None, None) => self_signed_cert_paths(bind).await?,
         _ => bail!("--listen-cert and --listen-key must be provided together"),
     };
@@ -519,31 +531,23 @@ async fn run_listener(
             }
             accepted = listener.accept(), if connections.len() < MAX_CONNECTION_TASKS => {
                 let (tcp_stream, _) = accepted.context("accepting control plane connection")?;
+                let tls = tls.clone();
                 let state = state.clone();
-                // Complete the TLS handshake on the accept loop before spawning
-                // the connection handler. TlsAcceptor::accept returns a future
-                // that is not Send (it borrows the acceptor and the handshake
-                // state machine across awaits), so it cannot live inside the
-                // spawned future that JoinSet requires to be Send. Performing it
-                // here yields a fully established TlsStream<TcpStream> — which is
-                // Send — and the spawned handler stays Send. TLS handshake
-                // failures (a plaintext client on the TLS port, a malformed
-                // ClientHello) drop only that connection; the accept loop keeps
-                // serving.
-                if let Some(acceptor) = &tls {
-                    match acceptor.accept(tcp_stream).await {
-                        Ok(tls_stream) => {
-                            connections.spawn(async move {
-                                let _ = handle_connection(tls_stream, state).await;
-                            });
-                        }
-                        Err(_) => continue,
-                    }
-                } else {
-                    connections.spawn(async move {
+                connections.spawn(async move {
+                    if let Some(acceptor) = tls {
+                        let Ok(Ok(tls_stream)) = tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            acceptor.accept(tcp_stream),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        let _ = handle_connection(tls_stream, state).await;
+                    } else {
                         let _ = handle_connection(tcp_stream, state).await;
-                    });
-                }
+                    }
+                });
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 joined
@@ -1799,6 +1803,34 @@ mod tests {
         assert_eq!(frame.reason, "collaboration room stopped");
     }
 
+    #[tokio::test]
+    async fn tls_acceptor_accepts_explicit_pair_and_rejects_mixed_pair() {
+        let directory = tempfile::tempdir().expect("certificate directory");
+        let cert_path = directory.path().join("cert.pem");
+        let key_path = directory.path().join("key.pem");
+        let params = CertificateParams::new(vec!["127.0.0.1".to_owned()])
+            .expect("certificate parameters");
+        let signing_key = KeyPair::generate().expect("generate signing key");
+        let certificate = params.self_signed(&signing_key).expect("generate certificate");
+        std::fs::write(&cert_path, certificate.pem()).expect("write certificate");
+        std::fs::write(&key_path, signing_key.serialize_pem()).expect("write key");
+        let bind = "127.0.0.1:0".parse().unwrap();
+
+        make_tls_acceptor(Some(&cert_path), Some(&key_path), bind)
+            .await
+            .expect("explicit certificate pair must build an acceptor");
+        for (cert, key) in [(Some(cert_path.as_path()), None), (None, Some(key_path.as_path()))] {
+            let error = match make_tls_acceptor(cert, key, bind).await {
+                Ok(_) => panic!("mixed certificate pair must be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("--listen-cert and --listen-key must be provided together")
+            );
+        }
+    }
 
     fn headers(input: &[u8]) -> std::result::Result<RawRequest, RequestError> {
         let end = find_header_end(input).expect("header terminator");
@@ -1806,82 +1838,78 @@ mod tests {
     }
 
     #[test]
-    fn auth_policy_keeps_default_strict_and_allows_plaintext_and_tls_remote() {
+    fn auth_policy_keeps_loopback_open_and_requires_remote_tls_token() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("token-file");
         std::fs::write(&token, b"fixture-value").unwrap();
+        // Loopback is always permitted, tokenless or tokenized, under every
+        // policy: the developer experience stays tokenless on the local host.
         for address in ["127.0.0.1", "::1"] {
             let address = address.parse().unwrap();
-            assert!(
-                load_auth_token(address, None, "--listen", ListenAddressPolicy::LoopbackOnly)
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(
-                load_auth_token(
-                    address,
-                    Some(&token),
-                    "--listen",
-                    ListenAddressPolicy::LoopbackOnly,
-                )
-                .unwrap(),
-                Some(b"fixture-value".to_vec())
-            );
+            for policy in [
+                ListenAddressPolicy::LoopbackOnly,
+                ListenAddressPolicy::AllowInsecureRemote,
+                ListenAddressPolicy::AllowTlsRemote,
+            ] {
+                assert!(
+                    load_auth_token(address, None, "--listen", policy)
+                        .unwrap()
+                        .is_none(),
+                    "tokenless loopback must remain available under {policy:?}"
+                );
+                assert_eq!(
+                    load_auth_token(address, Some(&token), "--listen", policy).unwrap(),
+                    Some(b"fixture-value".to_vec()),
+                    "token-authenticated loopback must remain available under {policy:?}"
+                );
+            }
         }
         for address in ["0.0.0.0", "::", "198.51.100.7", "8.8.8.8"] {
             let address = address.parse().unwrap();
+            // LoopbackOnly refuses every non-loopback bind regardless of a
+            // token: the policy is address-scoped, not token-gated.
             assert!(
-                load_auth_token(
-                    address,
-                    Some(&token),
-                    "--listen",
-                    ListenAddressPolicy::LoopbackOnly,
-                )
-                .is_err()
+                load_auth_token(address, Some(&token), "--listen", ListenAddressPolicy::LoopbackOnly)
+                    .is_err(),
+                "LoopbackOnly must refuse a tokenized non-loopback bind"
             );
-            // The explicit plaintext opt-in permits non-loopback binds with a
-            // token (recommended) or without one (tokenless LAN access).
+            // The explicit insecure-remote opt-in permits non-loopback binds
+            // with a token (recommended) or without one, regardless of TLS.
             assert_eq!(
-                load_auth_token(
-                    address,
-                    None,
-                    "--listen",
-                    ListenAddressPolicy::AllowPlaintextRemote,
-                )
-                .unwrap(),
+                load_auth_token(address, None, "--listen", ListenAddressPolicy::AllowInsecureRemote).unwrap(),
                 None
             );
             assert_eq!(
-                load_auth_token(
-                    address,
-                    Some(&token),
-                    "--listen",
-                    ListenAddressPolicy::AllowPlaintextRemote,
-                )
-                .unwrap(),
+                load_auth_token(address, Some(&token), "--listen", ListenAddressPolicy::AllowInsecureRemote).unwrap(),
                 Some(b"fixture-value".to_vec())
             );
-            // TLS is not plaintext: non-loopback binds pass without the
-            // insecure-remote opt-in, with or without a token.
+            // TLS is not plaintext, so a non-loopback TLS bind needs no
+            // insecure-remote opt-in — but it requires a token: a tokenless
+            // remote TLS listener would accept unauthenticated control-plane
+            // commands from any network client, so the pre-bind guard fails
+            // closed with a --listen-token-file hint (no token contents leak).
+            match load_auth_token(address, None, "--listen", ListenAddressPolicy::AllowTlsRemote) {
+                Ok(_) => panic!("tokenless non-loopback TLS must be rejected pre-bind"),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    assert!(
+                        message.contains(address.to_string().as_str()),
+                        "TLS refusal must name the non-loopback address: {message}"
+                    );
+                    assert!(
+                        message.contains("--listen-token-file"),
+                        "TLS refusal must hint at --listen-token-file: {message}"
+                    );
+                    assert!(
+                        !message.contains("fixture-value"),
+                        "TLS refusal must not leak token contents: {message}"
+                    );
+                }
+            }
             assert_eq!(
-                load_auth_token(
-                    address,
-                    None,
-                    "--listen",
-                    ListenAddressPolicy::AllowTlsRemote,
-                )
-                .unwrap(),
-                None
-            );
-            assert_eq!(
-                load_auth_token(
-                    address,
-                    Some(&token),
-                    "--listen",
-                    ListenAddressPolicy::AllowTlsRemote,
-                )
-                .unwrap(),
-                Some(b"fixture-value".to_vec())
+                load_auth_token(address, Some(&token), "--listen", ListenAddressPolicy::AllowTlsRemote).unwrap(),
+                Some(b"fixture-value".to_vec()),
+                "AllowTlsRemote must load the token for a non-loopback bind"
             );
         }
     }

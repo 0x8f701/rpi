@@ -24,6 +24,7 @@ use pi_coding::{
     ExtensionUiResponse, ProcessSpawnSpec, Session, SessionOptions, TodoPhase,
     collab::{FrameDirection, capability, derive_connection_key, open_frame, parse_link, seal_frame},
 };
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,6 +37,51 @@ use tokio_tungstenite::{
 #[path = "common/mod.rs"]
 mod common;
 use common::*;
+
+async fn listen_tls(application: Application) -> (ListenHandle, String, TempDir) {
+    let certificate_dir = tempfile::tempdir().expect("certificate dir");
+    let certificate_path = certificate_dir.path().join("listen-cert.pem");
+    let key_path = certificate_dir.path().join("listen-key.pem");
+    let mut params = CertificateParams::new(vec!["127.0.0.1".to_owned()])
+        .expect("certificate parameters");
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(DnType::CommonName, "rpi-listener-test");
+    let signing_key = KeyPair::generate().expect("generate signing key");
+    let certificate = params.self_signed(&signing_key).expect("generate certificate");
+    let certificate_pem = certificate.pem();
+    std::fs::write(&certificate_path, &certificate_pem).expect("write certificate");
+    std::fs::write(&key_path, signing_key.serialize_pem()).expect("write private key");
+
+    let handle = start(
+        application,
+        ExtensionUiAdapter::new(),
+        ListenConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            token_file: None,
+            allow_insecure_remote: false,
+            advertised_origin: None,
+            plaintext: false,
+            tls_cert: Some(certificate_path),
+            tls_key: Some(key_path),
+            session_factory: None,
+        },
+    )
+    .await
+    .expect("start TLS listener");
+    (handle, certificate_pem, certificate_dir)
+}
+
+fn tls_http_client(certificate_pem: &str) -> reqwest::Client {
+    let trusted_certificate = reqwest::Certificate::from_pem(certificate_pem.as_bytes())
+        .expect("parse trusted certificate");
+    reqwest::Client::builder()
+        .https_only(true)
+        .timeout(Duration::from_secs(2))
+        .no_proxy()
+        .add_root_certificate(trusted_certificate)
+        .build()
+        .expect("build TLS client")
+}
 
 #[tokio::test]
 async fn http_get_state_returns_exact_rpc_response() {
@@ -732,6 +778,64 @@ async fn non_loopback_policy_requires_explicit_opt_in() {
 }
 
 #[tokio::test]
+async fn tls_remote_without_token_is_rejected_pre_bind() {
+    // The security fix: a non-loopback TLS listener (the default transport)
+    // without --listen-allow-insecure-remote and without --listen-token-file
+    // is rejected before TcpListener::bind, so no socket is opened and no
+    // self-signed certificate is generated. The refusal names the non-loopback
+    // address, hints at --listen-token-file, and never echoes a token.
+    let app = faux_application("listen-tls-remote-no-token").await;
+    let extension_ui = ExtensionUiAdapter::new();
+    let cases: [(std::net::SocketAddr, &str); 6] = [
+        ("0.0.0.0:0".parse().unwrap(), "IPv4 wildcard TLS no token"),
+        ("[::]:0".parse().unwrap(), "IPv6 wildcard TLS no token"),
+        ("198.51.100.7:0".parse().unwrap(), "distinct non-loopback IPv4 TLS no token"),
+        ("192.0.2.1:0".parse().unwrap(), "documentation IPv4 TLS no token"),
+        ("8.8.8.8:0".parse().unwrap(), "public IPv4 TLS no token"),
+        ("[2001:db8::1]:0".parse().unwrap(), "documentation IPv6 TLS no token"),
+    ];
+    for (address, label) in cases {
+        let error = match start(
+            app.application.clone(),
+            extension_ui.clone(),
+            ListenConfig {
+                address,
+                token_file: None,
+                allow_insecure_remote: false,
+                advertised_origin: None,
+                plaintext: false,
+                tls_cert: None,
+                tls_key: None,
+                session_factory: None,
+            },
+        )
+        .await
+        {
+            Ok(handle) => {
+                let _ = handle.stop().await;
+                panic!("{label} must be refused before bind");
+            }
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        let ip = address.ip().to_string();
+        assert!(
+            message.contains(ip.as_str()),
+            "{label}: refusal must name the non-loopback address ({ip}): {message}"
+        );
+        assert!(
+            message.contains("--listen-token-file"),
+            "{label}: refusal must hint at --listen-token-file: {message}"
+        );
+        assert!(
+            !message.contains("fixture-value"),
+            "{label}: refusal must not echo token contents: {message}"
+        );
+    }
+    app.application.cleanup().await;
+}
+
+#[tokio::test]
 async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertised_origin() {
     let app = faux_application("listen-wildcard-tokenless").await;
     let extension_ui = ExtensionUiAdapter::new();
@@ -820,10 +924,10 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
     assert!(ok, "same-origin browser ws must serve get_state");
     ws.close(None).await.ok();
 
-    // Any LAN address or hostname the user's browser actually used works:
-    // the connection arrives on loopback while Host/Origin model the LAN
-    // page address, so arbitrary LAN IPs, hostnames, and the `localhost`
-    // alias all pass the same Host-based check.
+    // Any address or hostname the user's browser actually used works: the
+    // connection arrives on loopback while Host/Origin model the page
+    // address, so arbitrary hostnames and the `localhost` alias all pass the
+    // same Host-based check.
     let post = |host: &str, origin: &str, id: &str| {
         let body = format!(r#"{{"type":"get_state","id":"{id}"}}"#);
         format!(
@@ -832,8 +936,8 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
         )
     };
     for (host, origin, id) in [
-        (format!("192.168.1.50:{port}"), format!("http://192.168.1.50:{port}"), "browser-lan-ip"),
-        (format!("mypi.lan:{port}"), format!("http://mypi.lan:{port}"), "browser-lan-hostname"),
+        (format!("rpi.example:{port}"), format!("http://rpi.example:{port}"), "browser-named-host"),
+        (format!("alternate.example:{port}"), format!("http://alternate.example:{port}"), "browser-alternate-host"),
         (format!("localhost:{port}"), format!("http://localhost:{port}"), "browser-localhost"),
     ] {
         let response = http_raw_exchange(loopback, post(&host, &origin, &id).as_bytes()).await;
@@ -850,7 +954,7 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
         loopback,
         br#"{"type":"get_state","id":"browser-mismatch"}"#,
         None,
-        &[("origin", &format!("http://192.168.1.50:{port}"))],
+        &[("origin", &format!("http://unrelated.example:{port}"))],
     )
     .await;
     assert_eq!(status, 401, "mismatched browser origin must be 401");
@@ -1472,6 +1576,87 @@ async fn multiple_ws_clients_cannot_resolve_tui_interaction() {
     ws_a.close(None).await.ok();
     ws_b.close(None).await.ok();
     handle.stop().await.expect("stop");
+    app.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn silent_tls_handshake_does_not_block_following_client() {
+    let app = faux_application("listen-tls-silent-handshake").await;
+    let (handle, certificate_pem, _certificate_dir) = listen_tls(app.application.clone()).await;
+    let addr = handle.local_addr();
+
+    let silent = TcpStream::connect(addr).await.expect("connect silent TCP client");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = tls_http_client(&certificate_pem);
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .post(format!("https://{addr}/rpc"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(json!({"type":"get_state","id":"after-silent-tls"}).to_string())
+            .send(),
+    )
+    .await
+    .expect("valid TLS client was blocked by silent predecessor")
+    .expect("valid TLS request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("parse TLS RPC response");
+    assert_eq!(body["type"], "response");
+    assert_eq!(body["id"], "after-silent-tls");
+    assert_eq!(body["success"], true);
+
+    drop(silent);
+    handle.stop().await.expect("stop TLS listener");
+    app.application.cleanup().await;
+}
+
+#[tokio::test]
+async fn silent_tls_handshakes_are_capped_as_connection_tasks() {
+    let app = faux_application("listen-tls-handshake-cap").await;
+    let (handle, certificate_pem, _certificate_dir) = listen_tls(app.application.clone()).await;
+    let addr = handle.local_addr();
+    assert_eq!(MAX_CONNECTION_TASKS, 64);
+
+    let mut silent = Vec::with_capacity(MAX_CONNECTION_TASKS);
+    for _ in 0..MAX_CONNECTION_TASKS {
+        silent.push(TcpStream::connect(addr).await.expect("connect silent TLS client"));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = tls_http_client(&certificate_pem);
+    let request_body = json!({"type":"get_state","id":"tls-cap"}).to_string();
+    let overflow = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .post(format!("https://{addr}/rpc"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request_body.clone())
+            .send(),
+    )
+    .await
+    .expect("TLS connection above task cap must be rejected promptly");
+    assert!(overflow.is_err(), "TLS connection above task cap must not be served");
+
+    drop(silent.pop());
+    let mut recovered = false;
+    for _ in 0..32 {
+        let response = client
+            .post(format!("https://{addr}/rpc"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request_body.clone())
+            .send()
+            .await;
+        if response.is_ok_and(|response| response.status() == reqwest::StatusCode::OK) {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(recovered, "TLS request should recover after a handshake task exits");
+
+    drop(silent);
+    handle.stop().await.expect("stop TLS listener");
     app.application.cleanup().await;
 }
 
