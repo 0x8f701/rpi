@@ -2,8 +2,10 @@
 # Focused D93 subagents-panel lane (skip-guarded) — same fixture as the core
 # lane (steering mock + orchestration enabled + writer agent + real
 # `rpi --listen`), but only the Subagents acceptance: spawn a faux subagent
-# via the panel, assert a live job card with activity, hub-message it, view
-# its output, and cancel it.
+# via the panel, assert a live job card with activity, open the running-job
+# detail modal (dialog accessibility, task/status/elapsed/activity + non-empty
+# recent history, Refresh, Escape/Close dismissal), hub-message it, view its
+# output, and cancel it.
 #
 # Usage: bash E2E.d/web/subagents.sh [run|list]
 set -euo pipefail
@@ -37,6 +39,7 @@ spawn_rpi() {
         PATH="${PATH:-/usr/bin:/bin}" LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}" \
         PI_CODING_AGENT_DIR="$root/home/.pi/agent" \
         PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 \
+        ${RPI_WEB_DEV_DIR:+RPI_WEB_DEV_DIR="$RPI_WEB_DEV_DIR"} \
         "$RPI_BIN" --offline \
         --listen 127.0.0.1:0 \
         --listen-plaintext \
@@ -70,7 +73,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-subagents - Subagents panel: spawn/live-activity/hub-send/output-view/cancel (playwright/agent-browser, skip-guarded)'
+                'web-subagents - Subagents panel: spawn/live-activity/detail-modal(accessibility+history+refresh+close)/hub-send/output-view/cancel (playwright, skip-guarded)'
             return 0
             ;;
         run|all) ;;

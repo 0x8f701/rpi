@@ -1,4 +1,4 @@
-// Todo DAG panel (D89) — phases → tasks with status bullets, dependency
+// Todo DAG panel — phases → tasks with status bullets, dependency
 // edges, readiness, per-task detail, and mutations via the `todo_op` RPC
 // (flattened pi_coding::TodoOp: {"type":"todo_op","op":"append",...}).
 //
@@ -160,7 +160,10 @@ export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
       <div className="todo-panel__head">
         <span className="todo-panel__title">Todos</span>
         <span className="todo-panel__counts" id="todo-counts" title="open · active · blocked · completed">
-          {counts.open} open · {counts.active} active · {counts.blocked} blocked · {counts.completed} done
+          <span className="todo-panel__counts-item">{counts.open} open</span> ·{' '}
+          <span className="todo-panel__counts-item">{counts.active} active</span> ·{' '}
+          <span className="todo-panel__counts-item">{counts.blocked} blocked</span> ·{' '}
+          <span className="todo-panel__counts-item">{counts.completed} done</span>
         </span>
         <button id="todo-close-btn" type="button" className="todo-panel__close" title="Close todos panel" onClick={onClose}>
           ×

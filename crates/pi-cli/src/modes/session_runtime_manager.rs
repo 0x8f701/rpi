@@ -101,6 +101,17 @@ pub trait SessionSpawner: Send + Sync {
         &self,
         request: SessionSpawnRequest,
     ) -> Pin<Box<dyn Future<Output = Result<SessionSpawnResult>> + Send>>;
+    fn session_storage(&self) -> Option<crate::session_run::SessionStorage> {
+        None
+    }
+    /// Catalog the manager uses for Web session resolution. Production
+    /// spawners leave this `None` (the manager derives the catalog from
+    /// [`SessionSpawner::session_storage`]); test spawners inject a hermetic
+    /// catalog so foreign import/reuse can be exercised without touching the
+    /// real home directory.
+    fn catalog(&self) -> Option<pi_coding::SessionCatalog> {
+        None
+    }
 }
 
 /// One loaded session runtime: independent application, extension UI adapter,
@@ -116,8 +127,12 @@ struct SessionRuntime {
 }
 
 impl SessionRuntime {
-    fn new(application: Application, extension_ui: ExtensionUiAdapter) -> Self {
-        let dispatcher = RpcDispatcher::new(application.clone());
+    fn new(
+        application: Application,
+        extension_ui: ExtensionUiAdapter,
+        storage: Option<crate::session_run::SessionStorage>,
+    ) -> Self {
+        let dispatcher = RpcDispatcher::new_with_session_storage(application.clone(), storage);
         Self {
             application,
             extension_ui,
@@ -177,9 +192,11 @@ impl SessionRuntimeManager {
     ) -> Arc<Self> {
         let (events, keepalive_events) = broadcast::channel(EVENT_FANIN_CAPACITY);
         let (ui_events, keepalive_ui) = broadcast::channel(EVENT_FANIN_CAPACITY);
+        let storage = factory.as_ref().and_then(|factory| factory.session_storage());
         let primary = Arc::new(SessionRuntime::new(
             primary_application,
             primary_extension_ui,
+            storage,
         ));
         let manager = Arc::new(Self {
             primary: primary.clone(),
@@ -217,6 +234,14 @@ impl SessionRuntimeManager {
         self.ui_events.subscribe()
     }
 
+    /// Test-only access to the fan-in broadcast sender, so
+    /// `websocket_connection` tests can drive the /ws outbound path (bursts,
+    /// slow readers) without a live session runtime.
+    #[cfg(test)]
+    pub(crate) fn events_tx(&self) -> broadcast::Sender<Value> {
+        self.events.clone()
+    }
+
     async fn register_runtime(
         &self,
         runtime: &Arc<SessionRuntime>,
@@ -235,14 +260,31 @@ impl SessionRuntimeManager {
         }
     }
 
-    /// Canonical key for the by_path registry. The same physical session
-    /// file must map to one key no matter which side produced the path
-    /// (prepared resume path vs spawned recorder path); otherwise dedup
-    /// misses and two recorders append to one JSONL.
+    /// Canonical key for the by_path registry and Web catalog identity. The
+    /// same physical session file must map to one key no matter which side
+    /// produced the path; missing unflushed paths remain lexical.
     fn canonical_session_key(path: &Path) -> PathBuf {
-        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        canonical_session_path(path)
     }
 
+
+    async fn existing_runtime_for_id(
+        &self,
+        session_id: &str,
+        expected_path: Option<&Path>,
+    ) -> Result<Option<Arc<SessionRuntime>>> {
+        let Some(existing) = self.by_id.read().await.get(session_id).cloned() else {
+            return Ok(None);
+        };
+        let existing_path = existing
+            .current_identity()
+            .map(|(_, path)| Self::canonical_session_key(&path));
+        let expected_path = expected_path.map(Self::canonical_session_key);
+        if existing_path != expected_path {
+            bail!("session id {session_id} is already loaded from another session file");
+        }
+        Ok(Some(existing))
+    }
     /// Add the runtime's CURRENT id/path as aliases (called by the forwarder
     /// when an in-place identity cutover is detected). Stale aliases are kept
     /// so the Web client's pre-cutover sessionId keeps routing.
@@ -453,6 +495,38 @@ impl SessionRuntimeManager {
         }
     }
 
+    fn resolve_web_catalog_session_path(
+        &self,
+        source: &SessionRuntime,
+        session_path: &str,
+    ) -> Result<Option<PathBuf>> {
+        let sources = crate::resume_catalog::web_resume_sources(&source.application);
+        if let Some(catalog) = self.factory.as_ref().and_then(|factory| factory.catalog()) {
+            return resolve_web_catalog_session_path(
+                &catalog,
+                source.application.session().cwd(),
+                session_path,
+                &sources,
+            )
+            .map(Some);
+        }
+        let Some(storage) = self
+            .factory
+            .as_ref()
+            .and_then(|factory| factory.session_storage())
+        else {
+            return Ok(None);
+        };
+        let catalog = storage.catalog().context("building Web session catalog")?;
+        resolve_web_catalog_session_path(
+            &catalog,
+            source.application.session().cwd(),
+            session_path,
+            &sources,
+        )
+        .map(Some)
+    }
+
     /// `switch_session`: ensure/open the requested persisted session without
     /// mutating the source. The target is identified by trusted server-side
     /// path validation ([`pi_coding::PreparedSessionResume::prepare_path`],
@@ -462,19 +536,8 @@ impl SessionRuntimeManager {
     async fn open_persisted(self: &Arc<Self>, source: &Arc<SessionRuntime>, session_path: &str) -> Result<Arc<SessionRuntime>> {
         let _guard = self.create_lock.lock().await;
         let raw = Path::new(session_path);
-        // Dedup to an already-loaded runtime BEFORE requiring the file to
-        // exist on disk. A session that is loaded but whose recorder has not
-        // yet flushed its first assistant message has NO file on disk (the
-        // lazy recorder holds the header in memory), so `prepare_path` would
-        // reject its valid path and `switch_session` to it would fail with
-        // "invalid session path". The `by_path` registry keys the runtime by
-        // its recorder path from the moment it is loaded, so a loaded target
-        // (flushed or not) always dedups here; `prepare_path` only runs for a
-        // genuinely-not-loaded resume, which requires the persisted file.
-        // Both the canonical key (matches a flushed, canonical-registered
-        // runtime) and the raw key (matches a runtime registered while its
-        // file was still unflushed) are checked so a flush after load cannot
-        // split one physical session into two recorders.
+        // Loaded sessions can precede their recorder's first flush, so Web
+        // lifecycle paths dedup the raw recorder path before catalog lookup.
         let existing = {
             let by_path = self.by_path.read().await;
             by_path.get(&Self::canonical_session_key(raw)).cloned()
@@ -483,11 +546,26 @@ impl SessionRuntimeManager {
         if let Some(runtime) = existing {
             return Ok(runtime);
         }
+        let resolved_path = self.resolve_web_catalog_session_path(source, session_path)?;
+        let raw = resolved_path.as_deref().unwrap_or(raw);
+        if let Some(runtime) = {
+            let by_path = self.by_path.read().await;
+            by_path.get(&Self::canonical_session_key(raw)).cloned()
+        } {
+            return Ok(runtime);
+        }
         let prepared = pi_coding::PreparedSessionResume::prepare_path(raw)
             .with_context(|| format!("invalid session path {session_path:?}"))?;
         let canonical = Self::canonical_session_key(prepared.path());
         if let Some(runtime) = self.by_path.read().await.get(&canonical).cloned() {
             return Ok(runtime);
+        }
+        let target_id = prepared.tree().header.id.clone();
+        if let Some(existing) = self
+            .existing_runtime_for_id(&target_id, Some(&canonical))
+            .await?
+        {
+            return Ok(existing);
         }
         self.check_cap().await?;
         let factory = self
@@ -500,7 +578,7 @@ impl SessionRuntimeManager {
             source: source.application.clone(),
         };
         let result = factory.spawn(request).await?;
-        let runtime = self.register_spawned(result).await;
+        let runtime = self.register_spawned(result).await?;
         Ok(runtime)
     }
 
@@ -519,7 +597,7 @@ impl SessionRuntimeManager {
             source: source.application.clone(),
         };
         let result = factory.spawn(request).await?;
-        Ok(self.register_spawned(result).await)
+        self.register_spawned(result).await
     }
 
     async fn fork_from(self: &Arc<Self>, source: &Arc<SessionRuntime>, entry_id: &str) -> Result<Arc<SessionRuntime>> {
@@ -535,7 +613,7 @@ impl SessionRuntimeManager {
             source: source.application.clone(),
         };
         let result = factory.spawn(request).await?;
-        Ok(self.register_spawned(result).await)
+        self.register_spawned(result).await
     }
 
     async fn clone_from(self: &Arc<Self>, source: &Arc<SessionRuntime>) -> Result<Arc<SessionRuntime>> {
@@ -551,14 +629,31 @@ impl SessionRuntimeManager {
             source: source.application.clone(),
         };
         let result = factory.spawn(request).await?;
-        Ok(self.register_spawned(result).await)
+        self.register_spawned(result).await
     }
 
-    async fn register_spawned(self: &Arc<Self>, result: SessionSpawnResult) -> Arc<SessionRuntime> {
-        let runtime = Arc::new(SessionRuntime::new(result.application, result.extension_ui));
-        self.register_runtime(&runtime, Some((result.session_id, result.session_file.unwrap_or_default()))).await;
+    async fn register_spawned(self: &Arc<Self>, result: SessionSpawnResult) -> Result<Arc<SessionRuntime>> {
+        let session_file = result.session_file.unwrap_or_default();
+        let expected_path = (!session_file.as_os_str().is_empty()).then_some(session_file.as_path());
+        match self
+            .existing_runtime_for_id(&result.session_id, expected_path)
+            .await
+        {
+            Ok(Some(existing)) => {
+                result.application.cleanup().await;
+                return Ok(existing);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                result.application.cleanup().await;
+                return Err(error);
+            }
+        }
+        let storage = self.factory.as_ref().and_then(|factory| factory.session_storage());
+        let runtime = Arc::new(SessionRuntime::new(result.application, result.extension_ui, storage));
+        self.register_runtime(&runtime, Some((result.session_id, session_file))).await;
         SessionRuntime::start_forwarder(self, &runtime, self.events.clone(), self.ui_events.clone());
-        runtime
+        Ok(runtime)
     }
 
     /// `close_session`: requires a sessionId; rejects the primary and rejects
@@ -638,6 +733,9 @@ impl SessionRuntimeManager {
         if runtime.dispatcher.side_chat_busy().await {
             bail!("a side-chat turn is in progress");
         }
+        if runtime.dispatcher.code_review_busy().await {
+            bail!("a code-review turn is in progress");
+        }
         Ok(())
     }
 
@@ -647,6 +745,7 @@ impl SessionRuntimeManager {
     async fn shutdown_runtime(self: &Arc<Self>, runtime: &Arc<SessionRuntime>) {
         runtime.abort_forwarder();
         runtime.dispatcher.shutdown_side_chat().await;
+        runtime.dispatcher.shutdown_code_review().await;
         runtime.application.cleanup().await;
         let mut by_id = self.by_id.write().await;
         by_id.retain(|_, value| !Arc::ptr_eq(value, runtime));
@@ -669,6 +768,7 @@ impl SessionRuntimeManager {
         for runtime in &runtimes {
             if !Arc::ptr_eq(runtime, &self.primary) {
                 runtime.dispatcher.shutdown_side_chat().await;
+                runtime.dispatcher.shutdown_code_review().await;
                 runtime.application.cleanup().await;
             }
         }
@@ -729,16 +829,26 @@ impl SessionRuntimeManager {
         if data.get("sessions").is_none() {
             return RpcResponse { data: Some(data), ..response };
         }
-        let loaded: HashSet<String> = {
+        let loaded: HashSet<(String, PathBuf)> = {
             let by_id = self.by_id.read().await;
-            by_id.keys().cloned().collect()
+            by_id
+                .values()
+                .filter_map(|runtime| runtime.current_identity())
+                .map(|(session_id, path)| (session_id, Self::canonical_session_key(&path)))
+                .collect()
         };
         let Some(sessions) = data.get_mut("sessions").and_then(Value::as_array_mut) else {
             return RpcResponse { data: Some(data), ..response };
         };
         for row in sessions.iter_mut() {
-            if let Some(sid) = row.get("sessionId").and_then(Value::as_str)
-                && loaded.contains(sid)
+            let identity = row
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .zip(row.get("path").and_then(Value::as_str))
+                .map(|(session_id, path)| {
+                    (session_id.to_owned(), Self::canonical_session_key(Path::new(path)))
+                });
+            if identity.as_ref().is_some_and(|identity| loaded.contains(identity))
                 && let Some(object) = row.as_object_mut()
             {
                 object.insert("loaded".to_owned(), json!(true));
@@ -746,8 +856,14 @@ impl SessionRuntimeManager {
         }
         let listed = sessions
             .iter()
-            .filter_map(|row| row.get("sessionId").and_then(Value::as_str))
-            .map(str::to_owned)
+            .filter_map(|row| {
+                row.get("sessionId")
+                    .and_then(Value::as_str)
+                    .zip(row.get("path").and_then(Value::as_str))
+            })
+            .map(|(session_id, path)| {
+                (session_id.to_owned(), Self::canonical_session_key(Path::new(path)))
+            })
             .collect::<HashSet<_>>();
         let runtimes = {
             let by_id = self.by_id.read().await;
@@ -762,7 +878,8 @@ impl SessionRuntimeManager {
             let Some((session_id, path)) = runtime.current_identity() else {
                 continue;
             };
-            if listed.contains(&session_id) {
+            let listed_identity = (session_id.clone(), Self::canonical_session_key(&path));
+            if listed.contains(&listed_identity) {
                 continue;
             }
             let state = runtime.application.state().await;
@@ -783,6 +900,26 @@ impl SessionRuntimeManager {
         }
         RpcResponse { data: Some(data), ..response }
     }
+}
+
+pub(crate) fn canonical_session_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn resolve_web_catalog_session_path(
+    catalog: &pi_coding::SessionCatalog,
+    preferred_cwd: &Path,
+    session_path: &str,
+    sources: &[pi_coding::SessionSourceKind],
+) -> Result<PathBuf> {
+    crate::resume_catalog::resolve_resume_selection(
+        catalog,
+        &crate::resume_catalog::ResumeSelectionRequest::Input(session_path.to_owned()),
+        Some(preferred_cwd),
+        sources,
+    )
+    .map(|selection| selection.path)
+    .context("resolving Web session selection")
 }
 
 /// Which commands are handled by the manager instead of a session dispatcher.
@@ -951,6 +1088,51 @@ mod tests {
         (model, registration)
     }
 
+    fn write_codex_session(catalog: &pi_coding::SessionCatalog, id: &str, cwd: &Path) -> PathBuf {
+        let path = catalog
+            .root_for(pi_coding::SessionSourceKind::Codex)
+            .path
+            .join(format!("rollout-{id}.jsonl"));
+        std::fs::create_dir_all(path.parent().expect("Codex parent"))
+            .expect("Codex parent");
+        let cwd = serde_json::to_string(&cwd.to_string_lossy()).expect("Codex cwd");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{cwd}}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"Codex prompt\"}}]}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"Codex reply\"}}]}}}}\n",
+            ),
+        )
+        .expect("Codex session");
+        path
+    }
+
+    fn write_omp_session(catalog: &pi_coding::SessionCatalog, id: &str, cwd: &Path) -> PathBuf {
+        let path = catalog
+            .root_for(pi_coding::SessionSourceKind::Omp)
+            .path
+            .join("--work--")
+            .join(format!("{id}.jsonl"));
+        std::fs::create_dir_all(path.parent().expect("OMP parent"))
+            .expect("OMP parent");
+        let cwd = serde_json::to_string(&cwd.to_string_lossy()).expect("OMP cwd");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":{cwd}}}\n{{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"OMP prompt\"}}}}\n",
+            ),
+        )
+        .expect("OMP session");
+        path
+    }
+
+    fn web_catalog_fixture() -> (TempDir, TempDir, pi_coding::SessionCatalog) {
+        let home = tempfile::tempdir().expect("catalog home");
+        let native = tempfile::tempdir().expect("native root");
+        let catalog = pi_coding::SessionCatalog::new(home.path())
+            .with_native_session_root(native.path());
+        (home, native, catalog)
+    }
+
     fn unique(label: &str) -> String {
         format!("{label}-{}", uuid::Uuid::now_v7().simple())
     }
@@ -1025,20 +1207,32 @@ mod tests {
         kinds: Arc<std::sync::Mutex<Vec<SessionSpawnKind>>>,
         model: Model,
         registration: FauxProviderRegistration,
+        /// Hermetic catalog injected via [`SessionSpawner::catalog`] so the
+        /// manager's Web import/reuse path can be exercised without touching
+        /// the real home directory.
+        catalog: Option<pi_coding::SessionCatalog>,
     }
 
     impl Default for TestSpawner {
         fn default() -> Self {
             // chunk_size 1: prompts stream byte-by-byte, so tests can queue
-            // arbitrarily long replies and keep the child busy on demand.
-            let (model, registration) = faux_model_sized("spawner-child", 1);
+            // steer/abort while a turn remains active.
+            let (model, registration) = faux_model_sized("manager", 1);
             Self {
                 spawns: Arc::new(AtomicUsize::new(0)),
                 opened: Arc::new(std::sync::Mutex::new(Vec::new())),
                 kinds: Arc::new(std::sync::Mutex::new(Vec::new())),
                 model,
                 registration,
+                catalog: None,
             }
+        }
+    }
+
+    impl TestSpawner {
+        fn with_catalog(mut self, catalog: pi_coding::SessionCatalog) -> Self {
+            self.catalog = Some(catalog);
+            self
         }
     }
 
@@ -1051,16 +1245,18 @@ mod tests {
             Box::pin(async move {
                 this.spawns.fetch_add(1, Ordering::SeqCst);
                 this.kinds.lock().expect("kinds").push(request.kind.clone());
-                let resume_path = match &request.kind {
+                let (resume_path, opened_session_id) = match &request.kind {
                     SessionSpawnKind::Open { resume_path } => {
                         this.opened.lock().expect("opened").push(resume_path.clone());
-                        Some(resume_path.clone())
+                        let opened_session_id = pi_coding::PreparedSessionResume::prepare_path(resume_path)
+                            .ok()
+                            .map(|prepared| prepared.tree().header.id.clone());
+                        (Some(resume_path.clone()), opened_session_id)
                     }
-                    _ => None,
+                    _ => (None, None),
                 };
-                let (application, session_id, dir) =
+                let (application, generated_session_id, dir) =
                     recorded_application_with(this.model.clone()).await;
-                // The spawned session's temp dir must outlive the spawn so
                 // the persisted session file stays visible to resume-catalog
                 // scans (session_list) and switch dedup.
                 let _kept = dir.keep();
@@ -1068,12 +1264,15 @@ mod tests {
                     application.session().recorder_info().map(|(_, path)| path)
                 });
                 Ok(SessionSpawnResult {
-                    session_id,
+                    session_id: opened_session_id.unwrap_or(generated_session_id),
                     session_file,
                     application,
                     extension_ui: ExtensionUiAdapter::default(),
                 })
             })
+        }
+        fn catalog(&self) -> Option<pi_coding::SessionCatalog> {
+            self.catalog.clone()
         }
     }
 
@@ -1123,6 +1322,305 @@ mod tests {
         assert!(ok.success);
         manager.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn persona_commands_are_session_scoped_and_fail_closed() {
+        let (manager, _primary_registration) = manager_with(None).await;
+        // Every persona command (reads, mutations, destructive ops with
+        // confirmation) routes through the sessionId registry: an unknown
+        // session is rejected BEFORE any runtime is touched, so a stale or
+        // forged sessionId can never mutate another session's persona store.
+        for command in [
+            RpcCommand::PersonaList { id: None },
+            RpcCommand::PersonaGet {
+                id: None,
+                name: "mentor".into(),
+            },
+            RpcCommand::PersonaCreate {
+                id: None,
+                name: "guide".into(),
+                content: "---\nname: guide\ndescription: g\n---\nprompt".into(),
+            },
+            RpcCommand::PersonaEdit {
+                id: None,
+                name: "guide".into(),
+                content: "---\nname: guide\ndescription: g\n---\nprompt".into(),
+            },
+            RpcCommand::PersonaRemove {
+                id: None,
+                name: "mentor".into(),
+                confirm: true,
+            },
+            RpcCommand::PersonaPurge {
+                id: None,
+                name: "mentor".into(),
+                confirm: true,
+            },
+            RpcCommand::PersonaSelect {
+                id: None,
+                name: "mentor".into(),
+            },
+            RpcCommand::PersonaClear { id: None },
+            RpcCommand::PersonaCurrent { id: None },
+        ] {
+            let name = command.command_name();
+            let response = manager
+                .dispatch(command, Some("missing".into()))
+                .await;
+            assert!(!response.success, "{name} must fail on an unknown session");
+            let error = response.error.expect("error");
+            assert!(error.contains("unknown session missing"), "{name}: {error}");
+        }
+        // Absent sessionId routes to the primary runtime: persona_list is
+        // session-scoped read-only and reports disabled (no resource manager
+        // on the test primary) instead of erroring.
+        let listed = manager.dispatch(RpcCommand::PersonaList { id: None }, None).await;
+        assert!(listed.success, "{listed:?}");
+        assert_eq!(listed.data.expect("list")["enabled"], json!(false));
+        manager.shutdown().await;
+    }
+
+    #[test]
+    fn web_catalog_switch_imports_foreign_sessions_idempotently() {
+        let (_home, _native, catalog) = web_catalog_fixture();
+        let cwd = tempfile::tempdir().expect("source cwd");
+        let source = write_codex_session(&catalog, "codex-web", cwd.path());
+        let sources = [
+            pi_coding::SessionSourceKind::NativePi,
+            pi_coding::SessionSourceKind::Omp,
+            pi_coding::SessionSourceKind::Codex,
+            pi_coding::SessionSourceKind::Grok,
+        ];
+
+        let first = resolve_web_catalog_session_path(
+            &catalog,
+            cwd.path(),
+            &source.to_string_lossy(),
+            &sources,
+        )
+        .expect("first import");
+        let second = resolve_web_catalog_session_path(
+            &catalog,
+            cwd.path(),
+            &source.to_string_lossy(),
+            &sources,
+        )
+        .expect("reuse import");
+
+        assert_ne!(first, source);
+        assert_eq!(second, first);
+        let native_root = catalog.root_for(pi_coding::SessionSourceKind::NativePi).path;
+        assert_eq!(first.parent(), Some(native_root.as_path()));
+        pi_coding::PreparedSessionResume::prepare_path(&first).expect("imported native session");
+    }
+
+    #[test]
+    fn web_catalog_switch_never_opens_omp_store_in_place() {
+        let (_home, _native, catalog) = web_catalog_fixture();
+        let cwd = tempfile::tempdir().expect("source cwd");
+        let source = write_omp_session(&catalog, "omp-web", cwd.path());
+        let imported = resolve_web_catalog_session_path(
+            &catalog,
+            cwd.path(),
+            &source.to_string_lossy(),
+            &[
+                pi_coding::SessionSourceKind::NativePi,
+                pi_coding::SessionSourceKind::Omp,
+            ],
+        )
+        .expect("OMP import");
+
+        assert_ne!(imported, source);
+        let native_root = catalog.root_for(pi_coding::SessionSourceKind::NativePi).path;
+        assert_eq!(imported.parent(), Some(native_root.as_path()));
+    }
+
+    #[test]
+    fn web_catalog_switch_rejects_disabled_foreign_sources() {
+        let (_home, _native, catalog) = web_catalog_fixture();
+        let cwd = tempfile::tempdir().expect("source cwd");
+        let source = write_codex_session(&catalog, "codex-disabled", cwd.path());
+        let error = resolve_web_catalog_session_path(
+            &catalog,
+            cwd.path(),
+            &source.to_string_lossy(),
+            &[pi_coding::SessionSourceKind::NativePi],
+        )
+        .expect_err("disabled Codex source");
+
+        assert!(format!("{error:#}").contains("session not found"), "{error:#}");
+        let native_root = catalog.root_for(pi_coding::SessionSourceKind::NativePi).path;
+        assert!(native_root.read_dir().expect("native root").next().is_none());
+    }
+
+    #[test]
+    fn web_catalog_foreign_import_leaves_source_bytes_invariant() {
+        let (_home, _native, catalog) = web_catalog_fixture();
+        let cwd = tempfile::tempdir().expect("source cwd");
+        let source = write_codex_session(&catalog, "codex-bytes", cwd.path());
+        let before = std::fs::read(&source).expect("source bytes before");
+        let mtime_before = std::fs::metadata(&source)
+            .expect("source metadata before")
+            .modified()
+            .ok();
+        let sources = [
+            pi_coding::SessionSourceKind::NativePi,
+            pi_coding::SessionSourceKind::Omp,
+            pi_coding::SessionSourceKind::Codex,
+            pi_coding::SessionSourceKind::Grok,
+        ];
+
+        let first = resolve_web_catalog_session_path(
+            &catalog,
+            cwd.path(),
+            &source.to_string_lossy(),
+            &sources,
+        )
+        .expect("first import");
+        // A second selection reuses the existing native import; both must
+        // leave the foreign source untouched (read-only foreign JSONL).
+        let second = resolve_web_catalog_session_path(
+            &catalog,
+            cwd.path(),
+            &source.to_string_lossy(),
+            &sources,
+        )
+        .expect("reuse import");
+        assert_eq!(second, first);
+
+        assert_eq!(
+            std::fs::read(&source).expect("source bytes after"),
+            before,
+            "foreign source bytes must not change on import or reuse",
+        );
+        let mtime_after = std::fs::metadata(&source)
+            .expect("source metadata after")
+            .modified()
+            .ok();
+        assert_eq!(
+            mtime_after, mtime_before,
+            "foreign source mtime must not change on import or reuse",
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_imports_foreign_session_before_spawn_and_reuses_lineage() {
+        let (_home, _native, catalog) = web_catalog_fixture();
+        let cwd = tempfile::tempdir().expect("source cwd");
+        let source_path = write_codex_session(&catalog, "codex-mgr", cwd.path());
+        let source_bytes_before = std::fs::read(&source_path).expect("source bytes before");
+        let native_root = catalog
+            .root_for(pi_coding::SessionSourceKind::NativePi)
+            .path
+            .clone();
+        let spawner = Arc::new(TestSpawner::default().with_catalog(catalog.clone()));
+        let (manager, _primary_registration) = manager_with(Some(spawner.clone())).await;
+
+        let first = manager
+            .dispatch(
+                RpcCommand::SwitchSession {
+                    id: None,
+                    session_path: source_path.to_string_lossy().into_owned(),
+                },
+                None,
+            )
+            .await;
+        assert!(first.success, "{}", first.error.unwrap_or_default());
+
+        // The manager imported the foreign source through the catalog BEFORE
+        // spawning, and spawned the NATIVE copy — never the foreign file.
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 1);
+        let opened = spawner.opened.lock().expect("opened").clone();
+        assert_eq!(opened.len(), 1, "exactly one spawn");
+        assert_ne!(
+            opened[0], source_path,
+            "must not open the foreign source in place",
+        );
+        assert_eq!(
+            opened[0].parent(),
+            Some(native_root.as_path()),
+            "spawned the native import under the native root: {:?}",
+            opened[0],
+        );
+
+        // The foreign source file is never mutated by import or spawn.
+        assert_eq!(
+            std::fs::read(&source_path).expect("source bytes after"),
+            source_bytes_before,
+        );
+
+        // Repeated selection reuses the one native import/runtime: the
+        // already-loaded native path dedups in by_path before any spawn.
+        let second = manager
+            .dispatch(
+                RpcCommand::SwitchSession {
+                    id: None,
+                    session_path: source_path.to_string_lossy().into_owned(),
+                },
+                None,
+            )
+            .await;
+        assert!(second.success, "{}", second.error.unwrap_or_default());
+        assert_eq!(
+            spawner.spawns.load(Ordering::SeqCst),
+            1,
+            "reuse must not spawn a second runtime",
+        );
+        manager.shutdown().await;
+    }
+
+
+    #[tokio::test]
+    async fn switch_rejects_duplicate_session_id_from_different_path() {
+        let spawner = Arc::new(TestSpawner::default());
+        let (manager, _primary_registration) = manager_with(Some(spawner.clone())).await;
+        let dir = tempfile::tempdir().expect("sessions");
+        let (model, _registration) = faux_model("duplicate-id");
+        let first = pi_coding::start_session_in(
+            dir.path(),
+            Some(&model),
+            Some("off"),
+            Some(dir.path()),
+            None,
+            None,
+        )
+        .expect("first session");
+        first.persist_now().expect("first persisted");
+        let first_path = first.path();
+        let second_path = dir.path().join("duplicate.jsonl");
+        std::fs::copy(&first_path, &second_path).expect("copy duplicate session");
+
+        let first_open = manager
+            .dispatch(
+                RpcCommand::SwitchSession {
+                    id: None,
+                    session_path: first_path.to_string_lossy().into_owned(),
+                },
+                None,
+            )
+            .await;
+        assert!(first_open.success, "{}", first_open.error.unwrap_or_default());
+        let duplicate = manager
+            .dispatch(
+                RpcCommand::SwitchSession {
+                    id: None,
+                    session_path: second_path.to_string_lossy().into_owned(),
+                },
+                None,
+            )
+            .await;
+
+        assert!(!duplicate.success);
+        assert!(
+            duplicate
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("already loaded from another session file"))
+        );
+        assert_eq!(spawner.spawns.load(Ordering::SeqCst), 1);
+        manager.shutdown().await;
+    }
+
 
     #[tokio::test]
     async fn new_session_returns_snapshot_and_leaves_source_intact() {

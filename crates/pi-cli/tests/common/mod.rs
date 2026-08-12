@@ -118,6 +118,40 @@ pub async fn listen(application: Application) -> (ListenHandle, ExtensionUiAdapt
             tls_cert: None,
             tls_key: None,
             session_factory: None,
+            #[cfg(debug_assertions)]
+            outbound_writer_delay: Duration::ZERO,
+        },
+    )
+    .await
+    .expect("start listener");
+    (handle, extension_ui)
+}
+
+/// Like [`listen`], but with the test-only slow-writer seam enabled: every
+/// /ws connection's outbound writer stalls its first send for `delay` before
+/// delivering it, so the bounded outbound queue fills and the slow-client
+/// grace (1008 eviction) fires deterministically without depending on kernel
+/// socket buffers.
+#[cfg(debug_assertions)]
+pub async fn listen_with_writer_delay(
+    application: Application,
+    delay: Duration,
+) -> (ListenHandle, ExtensionUiAdapter) {
+    let extension_ui = ExtensionUiAdapter::new();
+    extension_ui.set_canonical_queries_supported(true);
+    let handle = start(
+        application,
+        extension_ui.clone(),
+        ListenConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            token_file: None,
+            allow_insecure_remote: false,
+            advertised_origin: None,
+            plaintext: true,
+            tls_cert: None,
+            tls_key: None,
+            session_factory: None,
+            outbound_writer_delay: delay,
         },
     )
     .await
@@ -146,6 +180,8 @@ pub async fn listen_with_token(
             tls_cert: None,
             tls_key: None,
             session_factory: None,
+            #[cfg(debug_assertions)]
+            outbound_writer_delay: Duration::ZERO,
         },
     )
     .await

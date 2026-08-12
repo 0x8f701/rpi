@@ -16,6 +16,11 @@ use sha2::{Digest, Sha256};
 
 /// Hard cap on combined git stdout for the review snapshot.
 pub const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
+/// Hard cap on the changed-file catalog (`git diff --name-status -z`) that
+/// backfills files a truncated combined patch could not carry. A catalog past
+/// this bound means the change set itself is beyond reviewable size: the
+/// snapshot fails closed instead of silently omitting files.
+pub const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 /// Soft cap on rendered lines per file (binary/oversize still shown as markers).
 pub const MAX_FILE_RENDER_LINES: usize = 4_000;
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -219,6 +224,7 @@ impl ReviewSnapshot {
             identity_hint.as_bytes(),
             error.as_bytes(),
             false,
+            None,
         );
         Self {
             root,
@@ -293,11 +299,18 @@ impl HunkIdentity {
     }
 }
 
+/// Stable snapshot identity. `catalog` is the raw changed-file catalog bytes
+/// (`git diff --name-status -z` output); hashing it keeps the stale guard
+/// sensitive to files beyond a truncated patch's cut point — otherwise adding
+/// or renaming a file past the 2 MiB window would reuse an old snapshot id
+/// even though the placeholder set changed. `None` is used only for error and
+/// empty snapshots that never acquired a catalog.
 fn review_snapshot_identity(
     root: &Path,
     comparison: &[u8],
     diff: &[u8],
     truncated: bool,
+    catalog: Option<&[u8]>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(root.to_string_lossy().as_bytes());
@@ -305,6 +318,13 @@ fn review_snapshot_identity(
     hasher.update(comparison);
     hasher.update([0]);
     hasher.update(diff);
+    match catalog {
+        Some(bytes) => {
+            hasher.update([1]);
+            hasher.update(bytes);
+        }
+        None => hasher.update([0]),
+    }
     hasher.update([u8::from(truncated)]);
     format!("{:x}", hasher.finalize())
 }
@@ -611,6 +631,41 @@ fn load_revision_snapshot(
     };
     let comparison = format!("revisions\0{from_commit}\0{to_commit}");
     let isolated = sandbox.environment(&root);
+
+    // Changed-file catalog first: a complete bounded list of what the
+    // comparison changes, used to backfill files a truncated combined patch
+    // could not carry. Diff options mirror the patch below so rename pairing
+    // is identical. A catalog past its bound fails closed instead of silently
+    // omitting files.
+    let catalog_args = [
+        "--literal-pathspecs",
+        "diff",
+        "--name-status",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--default-prefix",
+        "--no-relative",
+        "--find-renames",
+        "--histogram",
+        "-O",
+        null_device(),
+        from_commit.as_str(),
+        to_commit.as_str(),
+        "--",
+    ];
+    let catalog_output = match run_git_bounded(&root, &catalog_args, MAX_CATALOG_BYTES, Some(isolated)) {
+        Ok(output) if output.error.is_none() && !output.truncated => output,
+        Ok(output) => {
+            let error = output
+                .error
+                .unwrap_or_else(|| "changed file catalog exceeded the size limit".to_owned());
+            return ReviewSnapshot::empty_for_scope_error(root, scope, error);
+        }
+        Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
+    };
+
     let args = [
         "--literal-pathspecs",
         "diff",
@@ -631,7 +686,7 @@ fn load_revision_snapshot(
         Ok(output) => output,
         Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
     };
-    snapshot_from_diff_output(root, scope, comparison.as_bytes(), output)
+    snapshot_from_diff_output(root, scope, comparison.as_bytes(), output, Some(&catalog_output))
 }
 
 fn resolve_review_commit(root: &Path, revision: &str, label: &str) -> Result<String, String> {
@@ -710,25 +765,38 @@ fn load_working_tree_snapshot(root: PathBuf, sandbox: GitSandbox) -> ReviewSnaps
         Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
     }
 
+    // Rename-aware changed-file catalog: the same `--name-status -z` output
+    // both extends the review pathspecs with rename destinations and backfills
+    // files a truncated combined patch could not carry. The diff options
+    // mirror the final patch so rename pairing is identical between the
+    // catalog and the parsed diff. A catalog past its bound fails closed
+    // instead of silently omitting files.
     let rename_args = [
         "diff",
         "--cached",
         "--name-status",
         "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--default-prefix",
+        "--no-relative",
         "--find-renames",
+        "--histogram",
         head.as_str(),
         "--",
     ];
-    let rename_output = match run_git_bounded(&root, &rename_args, MAX_DIFF_BYTES, Some(isolated)) {
+    let rename_output = match run_git_bounded(&root, &rename_args, MAX_CATALOG_BYTES, Some(isolated)) {
         Ok(output) if output.error.is_none() && !output.truncated => output,
         Ok(output) => {
             let error = output
                 .error
-                .unwrap_or_else(|| "rename path list exceeded the size limit".to_owned());
+                .unwrap_or_else(|| "changed file catalog exceeded the size limit".to_owned());
             return ReviewSnapshot::empty_for_scope_error(root, scope, error);
         }
         Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
     };
+    let catalog = name_status_catalog(&rename_output.stdout);
     for destination in rename_destination_paths(&rename_output.stdout) {
         reviewable_paths.insert(normalize_repo_path(&encode_path_bytes(&destination)));
         review_path_args.insert(os_string_from_git_path(destination));
@@ -739,7 +807,7 @@ fn load_working_tree_snapshot(root: PathBuf, sandbox: GitSandbox) -> ReviewSnaps
         return ReviewSnapshot {
             root: root.clone(),
             scope,
-            snapshot_id: review_snapshot_identity(&root, comparison.as_bytes(), &[], false),
+            snapshot_id: review_snapshot_identity(&root, comparison.as_bytes(), &[], false, None),
             files: Vec::new(),
             truncated: false,
             error: None,
@@ -772,9 +840,11 @@ fn load_working_tree_snapshot(root: PathBuf, sandbox: GitSandbox) -> ReviewSnaps
         Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
     };
 
-    let mut snapshot = snapshot_from_diff_output(root, scope, comparison.as_bytes(), output);
+    let mut snapshot =
+        snapshot_from_diff_output(root, scope, comparison.as_bytes(), output, Some(&rename_output));
     // Synthetic untracked additions staged only for rename discovery never
-    // enter the path-limited patch.
+    // enter the path-limited patch, so their placeholder entries (added only
+    // when the patch truncated) are dropped here alongside any parsed ghosts.
     snapshot.files.retain(|file| {
         file.status == FileStatus::Renamed || reviewable_paths.contains(&file.path)
     });
@@ -786,12 +856,16 @@ fn snapshot_from_diff_output(
     scope: ReviewScope,
     comparison: &[u8],
     output: GitOutput,
+    catalog_output: Option<&GitOutput>,
 ) -> ReviewSnapshot {
     if let Some(error) = output.error {
         return ReviewSnapshot::empty_for_scope_error(root, scope, error);
     }
 
-    let snapshot_id = review_snapshot_identity(&root, comparison, &output.stdout, output.truncated);
+    let catalog = catalog_output.map(|output| name_status_catalog(&output.stdout));
+    let catalog_bytes = catalog_output.map(|output| output.stdout.as_slice());
+    let snapshot_id =
+        review_snapshot_identity(&root, comparison, &output.stdout, output.truncated, catalog_bytes);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut files = parse_unified_diff(&stdout);
     if output.truncated {
@@ -800,6 +874,12 @@ fn snapshot_from_diff_output(
             if last.message.is_none() {
                 last.message = Some("diff truncated by size limit".to_owned());
             }
+        }
+        // Global truncation is recoverable file-body paging, not data loss:
+        // every catalogued path the combined patch could not carry is retained
+        // as an on-demand placeholder so no changed file silently disappears.
+        if let Some(catalog) = catalog {
+            merge_catalog_placeholders(&mut files, &catalog);
         }
     }
     ReviewSnapshot {
@@ -843,6 +923,109 @@ fn rename_destination_paths(stdout: &[u8]) -> Vec<Vec<u8>> {
         index += 1;
     }
     destinations
+}
+
+/// Message on on-demand placeholder entries: the file's body was not carried
+/// by the truncated combined patch and loads through `code_review_file_diff`.
+const PLACEHOLDER_MESSAGE: &str = "diff omitted: combined diff truncated; loaded on demand";
+
+/// One entry in the changed-file catalog: how a destination path changed and
+/// where it came from (rename/copy provenance).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogEntry {
+    status: FileStatus,
+    previous_path: Option<String>,
+}
+
+/// Parse `git diff --name-status -z --find-renames` output (NUL-separated
+/// `STATUS\0PATH` records, `R/C<score>\0OLD\0NEW` for renames/copies) into a
+/// catalog keyed by normalized destination path. Keys round-trip through the
+/// same `encode_path_bytes` + `normalize_repo_path` pipeline as parsed diff
+/// paths, so non-UTF-8 and backslash/tab paths compare byte-for-byte against
+/// parsed [`DiffFile`]s.
+fn name_status_catalog(stdout: &[u8]) -> BTreeMap<String, CatalogEntry> {
+    let fields = stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let mut catalog = BTreeMap::new();
+    let mut index = 0usize;
+    while index < fields.len() {
+        let status = fields[index];
+        index += 1;
+        if index >= fields.len() {
+            break;
+        }
+        if status.first().is_some_and(|prefix| matches!(prefix, b'R' | b'C')) {
+            let previous = fields[index];
+            index += 1;
+            if index >= fields.len() {
+                break;
+            }
+            let destination = fields[index];
+            index += 1;
+            catalog.insert(
+                normalize_repo_path(&encode_path_bytes(destination)),
+                CatalogEntry {
+                    status: if status.first() == Some(&b'R') {
+                        FileStatus::Renamed
+                    } else {
+                        FileStatus::Copied
+                    },
+                    previous_path: Some(normalize_repo_path(&encode_path_bytes(previous))),
+                },
+            );
+        } else {
+            let destination = fields[index];
+            index += 1;
+            let status = match status.first().copied() {
+                Some(b'A') => FileStatus::Added,
+                Some(b'D') => FileStatus::Deleted,
+                Some(b'X') => FileStatus::Unknown,
+                _ => FileStatus::Modified,
+            };
+            catalog.insert(
+                normalize_repo_path(&encode_path_bytes(destination)),
+                CatalogEntry {
+                    status,
+                    previous_path: None,
+                },
+            );
+        }
+    }
+    catalog
+}
+
+/// Backfill placeholder [`DiffFile`] entries for every catalogued path the
+/// truncated combined patch could not carry. Parsed entries are never touched
+/// — their hunks and identities stay intact; a path counts as covered when it
+/// is a parsed destination or the previous path of a parsed rename/copy, so
+/// rename sources never get spurious placeholder entries even if the catalog
+/// and the patch paired differently. Placeholders carry empty hunks, the
+/// `truncated` marker, and an explicit on-demand message.
+fn merge_catalog_placeholders(files: &mut Vec<DiffFile>, catalog: &BTreeMap<String, CatalogEntry>) {
+    let covered: BTreeSet<String> = files
+        .iter()
+        .flat_map(|file| {
+            std::iter::once(file.path.clone()).chain(file.previous_path.iter().cloned())
+        })
+        .collect();
+    for (path, entry) in catalog {
+        if covered.contains(path) {
+            continue;
+        }
+        files.push(DiffFile {
+            path: path.clone(),
+            previous_path: entry.previous_path.clone(),
+            status: entry.status,
+            binary: false,
+            insertions: 0,
+            deletions: 0,
+            hunks: Vec::new(),
+            truncated: true,
+            message: Some(PLACEHOLDER_MESSAGE.to_owned()),
+        });
+    }
 }
 
 fn os_string_from_git_path(path: Vec<u8>) -> OsString {
@@ -2022,6 +2205,363 @@ fn read_bounded<R: std::io::Read>(mut reader: R, max: usize) -> std::io::Result<
     Ok((buffer, truncated))
 }
 
+// ---------------------------------------------------------------------------
+// Bounded single-file diff paging (read-only RPC surface).
+//
+// The snapshot acquires the whole HEAD→working-tree (or two-revision) diff
+// under a 2 MiB total cap, so a single large file can be truncated. Files the
+// combined patch could not carry stay listed as on-demand placeholders (see
+// `merge_catalog_placeholders`), never silently omitted. The paging RPC
+// re-runs the SAME fixed-argv, isolated-sandbox, bounded git diff scoped to
+// one file's pathspec (with its rename provenance), parses it under a higher
+// per-file byte cap, and serves ordered pages out of an in-memory cache.
+// Pathspecs are derived from the snapshot's normalized DiffFile entry, never
+// attacker-controlled; the RPC layer additionally enforces snapshot-id and
+// path-containment before calling here.
+// ---------------------------------------------------------------------------
+
+/// Per-file full diff byte cap for the paging RPC. Bounded so a single huge
+/// file never streams unbounded git output, but well above the 2 MiB snapshot
+/// cap so a file truncated by the global snapshot can still be loaded in full.
+pub const MAX_FILE_DIFF_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum diff lines returned in one page. Combined with the per-page byte
+/// cap, keeps every page well under the 4 MiB WS frame limit.
+pub const MAX_FILE_PAGE_LINES: usize = 1000;
+/// Per-page wire byte cap (sum of line text + numbers + JSON overhead). The
+/// page accumulator stops at this bound even when the line-count cap has not
+/// been reached, so a page of long lines cannot blow the WS frame.
+pub const MAX_FILE_PAGE_BYTES: usize = 1024 * 1024;
+/// Per-line text cap. A single minified line can exceed the page byte cap; the
+/// loader truncates such a line and marks it so the page stays frame-safe and
+/// the user knows content was elided.
+pub const MAX_DIFF_LINE_TEXT_BYTES: usize = 256 * 1024;
+
+/// Full parsed diff for a single file, ready to be sliced into pages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub previous_path: Option<String>,
+    pub status: FileStatus,
+    pub binary: bool,
+    /// All diff lines across hunks, in display order.
+    pub lines: Vec<DiffLine>,
+    /// True when the per-file byte cap was hit — even more content exists
+    /// beyond what was loaded. The frontend surfaces this as a hard cap.
+    pub truncated: bool,
+    pub error: Option<String>,
+}
+
+/// One bounded page of a single file's diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDiffPage {
+    pub path: String,
+    pub snapshot_id: String,
+    pub previous_path: Option<String>,
+    pub status: FileStatus,
+    pub binary: bool,
+    pub lines: Vec<DiffLine>,
+    /// Cursor of the first line in this page (0-based across the full file).
+    pub cursor: usize,
+    /// Cursor of the next page, or `None` when no more lines remain.
+    pub next_cursor: Option<usize>,
+    pub has_more: bool,
+    /// Total lines in the full file diff (the page is a window over this).
+    pub total_lines: usize,
+    /// Per-file byte cap was hit during load; even more content exists.
+    pub truncated: bool,
+}
+
+impl FileDiff {
+    /// Load a single file's full diff for the same comparison the snapshot
+    /// used. `file` is the snapshot's [`DiffFile`] entry (path + rename
+    /// provenance), so the pathspec is containment-derived and never
+    /// attacker-controlled. Output is bounded to [`MAX_FILE_DIFF_BYTES`] and
+    /// each line's text is capped to [`MAX_DIFF_LINE_TEXT_BYTES`].
+    #[must_use]
+    pub fn load(cwd: &Path, scope: &ReviewScope, file: &DiffFile) -> Self {
+        Self::load_with_root(cwd, scope, file)
+    }
+
+    fn load_with_root(cwd: &Path, scope: &ReviewScope, file: &DiffFile) -> Self {
+        // Pathspecs come from the snapshot's normalized file entry; re-normalize
+        // for defense in depth and reject empty / traversal / NUL.
+        let mut pathspecs: Vec<OsString> = Vec::new();
+        if let Some(previous) = &file.previous_path {
+            let normalized = normalize_repo_path(previous);
+            if normalized.is_empty() || normalized == "." || normalized.contains('\0') {
+                return Self::error(file.path.clone(), file.previous_path.clone(), format!("invalid rename source {previous:?}"));
+            }
+            pathspecs.push(os_string_from_git_path(normalized.into_bytes()));
+        }
+        let normalized = normalize_repo_path(&file.path);
+        if normalized.is_empty() || normalized == "." || normalized.contains('\0') {
+            return Self::error(file.path.clone(), file.previous_path.clone(), format!("invalid file path {:?}", file.path));
+        }
+        pathspecs.push(os_string_from_git_path(normalized.into_bytes()));
+
+        let repository = match RepositoryLayout::discover(cwd) {
+            Ok(repository) => repository,
+            Err(error) => {
+                return Self::error(file.path.clone(), file.previous_path.clone(), format_git_error("not a git repository", &error));
+            }
+        };
+        if let Err(error) = repository_attributes_are_safe(&repository) {
+            return Self::error(file.path.clone(), file.previous_path.clone(), error);
+        }
+        let head_reference = match read_small_file(&repository.git_dir.join("HEAD"), MAX_GIT_METADATA_BYTES)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "git HEAD is not valid UTF-8".to_owned()))
+        {
+            Ok(head) => strip_output_line_ending(&head).to_owned(),
+            Err(error) => return Self::error(file.path.clone(), file.previous_path.clone(), error),
+        };
+        let object_format = match detect_object_format(&repository) {
+            Ok(format) => format,
+            Err(error) => return Self::error(file.path.clone(), file.previous_path.clone(), error),
+        };
+        let sandbox = match GitSandbox::create(&repository, &object_format, &head_reference) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return Self::error(file.path.clone(), file.previous_path.clone(), error),
+        };
+        let root = repository.root.clone();
+        let isolated = sandbox.environment(&root);
+
+        let output = match scope {
+            ReviewScope::WorkingTree => Self::run_working_tree(&root, isolated, &pathspecs),
+            ReviewScope::Revisions { from, to } => Self::run_revisions(&root, isolated, &pathspecs, from, to),
+        };
+        match output {
+            Ok(output) => Self::from_output(file, output),
+            Err(error) => Self::error(file.path.clone(), file.previous_path.clone(), error),
+        }
+    }
+
+    fn run_working_tree(
+        root: &Path,
+        isolated: IsolatedGitEnvironment<'_>,
+        pathspecs: &[OsString],
+    ) -> Result<GitOutput, String> {
+        let head = git_rev_parse(root, &["--verify", "HEAD"], Some(isolated))
+            .map(|head| strip_output_line_ending(&head).to_owned())
+            .map_err(|_| "repository has no commits yet (unborn HEAD)".to_owned())?;
+        let sandbox_index = isolated.git_dir.join("index");
+        if !sandbox_index.is_file() {
+            let args = ["read-tree", head.as_str()];
+            match run_git_bounded(root, &args, MAX_GIT_METADATA_BYTES, Some(isolated)) {
+                Ok(output) if output.error.is_none() && !output.truncated => {}
+                Ok(output) => {
+                    return Err(output.error.unwrap_or_else(|| "git read-tree output exceeded the metadata limit".to_owned()));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Re-base only the target paths on HEAD in the disposable index: a
+        // copied real index may already have staged a rename's source
+        // deletion, in which case `git add -- <source>` fails ("did not match
+        // any files") because the path exists in neither the index nor the
+        // worktree. Resetting the path entries to HEAD keeps every pathspec
+        // addressable so rename detection pairs both sides exactly like the
+        // snapshot; other index entries stay untouched. `git reset` tolerates
+        // unmatched pathspecs silently, so a stale or malicious path still
+        // fails closed at the `git add` step below.
+        let mut reset_args: Vec<OsString> = vec![
+            "--literal-pathspecs".into(),
+            "reset".into(),
+            "-q".into(),
+            "HEAD".into(),
+            "--".into(),
+        ];
+        reset_args.extend(pathspecs.iter().cloned());
+        match run_git_bounded_os(root, &reset_args, MAX_GIT_METADATA_BYTES, Some(isolated)) {
+            Ok(output) if output.error.is_none() && !output.truncated => {}
+            Ok(output) => {
+                return Err(output.error.unwrap_or_else(|| "git reset output exceeded the metadata limit".to_owned()));
+            }
+            Err(error) => return Err(error),
+        }
+        // Stage only the target paths in the disposable sandbox index so the
+        // HEAD-vs-working-tree content for these paths is reviewable exactly
+        // like the snapshot, without staging the whole tree.
+        let mut add_args: Vec<OsString> = vec!["--literal-pathspecs".into(), "add".into(), "--".into()];
+        add_args.extend(pathspecs.iter().cloned());
+        match run_git_bounded_os(root, &add_args, MAX_GIT_METADATA_BYTES, Some(isolated)) {
+            Ok(output) if output.error.is_none() && !output.truncated => {}
+            Ok(output) => {
+                return Err(output.error.unwrap_or_else(|| "git add output exceeded the metadata limit".to_owned()));
+            }
+            Err(error) => return Err(error),
+        }
+        let mut args: Vec<OsString> = vec![
+            "--literal-pathspecs".into(),
+            "diff".into(),
+            "--cached".into(),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
+            "--no-color".into(),
+            "--default-prefix".into(),
+            "--no-relative".into(),
+            "--find-renames".into(),
+            "--histogram".into(),
+            head.into(),
+            "-O".into(),
+            null_device().into(),
+            "--".into(),
+        ];
+        args.extend(pathspecs.iter().cloned());
+        run_git_bounded_os(root, &args, MAX_FILE_DIFF_BYTES, Some(isolated))
+    }
+
+    fn run_revisions(
+        root: &Path,
+        isolated: IsolatedGitEnvironment<'_>,
+        pathspecs: &[OsString],
+        from: &str,
+        to: &str,
+    ) -> Result<GitOutput, String> {
+        let from_commit = resolve_review_commit(root, from, "source")?;
+        let to_commit = resolve_review_commit(root, to, "target")?;
+        let mut args: Vec<OsString> = vec![
+            "--literal-pathspecs".into(),
+            "diff".into(),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
+            "--no-color".into(),
+            "--default-prefix".into(),
+            "--no-relative".into(),
+            "--find-renames".into(),
+            "--histogram".into(),
+            "-O".into(),
+            null_device().into(),
+            from_commit.into(),
+            to_commit.into(),
+            "--".into(),
+        ];
+        args.extend(pathspecs.iter().cloned());
+        run_git_bounded_os(root, &args, MAX_FILE_DIFF_BYTES, Some(isolated))
+    }
+
+    fn from_output(file: &DiffFile, output: GitOutput) -> Self {
+        if let Some(error) = output.error {
+            return Self::error(file.path.clone(), file.previous_path.clone(), error);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let files = parse_unified_diff(&stdout);
+        // Pick the entry matching the snapshot file's path; a rename with two
+        // pathspecs still produces one entry whose path == file.path.
+        let entry = files
+            .iter()
+            .find(|parsed| parsed.path == file.path)
+            .or_else(|| files.first());
+        let Some(entry) = entry else {
+            return Self {
+                path: file.path.clone(),
+                previous_path: file.previous_path.clone(),
+                status: file.status,
+                binary: false,
+                lines: Vec::new(),
+                truncated: false,
+                error: Some("file diff is empty (the path may no longer differ in this comparison)".to_owned()),
+            };
+        };
+        let mut lines: Vec<DiffLine> = Vec::new();
+        for hunk in &entry.hunks {
+            for line in &hunk.lines {
+                lines.push(cap_line(line.clone()));
+            }
+        }
+        Self {
+            path: entry.path.clone(),
+            previous_path: entry.previous_path.clone(),
+            status: entry.status,
+            binary: entry.binary,
+            lines,
+            truncated: output.truncated,
+            error: None,
+        }
+    }
+
+    fn error(path: String, previous_path: Option<String>, message: String) -> Self {
+        Self {
+            path,
+            previous_path,
+            status: FileStatus::Unknown,
+            binary: false,
+            lines: Vec::new(),
+            truncated: false,
+            error: Some(message),
+        }
+    }
+
+    /// Slice a bounded page out of the loaded diff. `cursor` must be in range;
+    /// `max_lines` is clamped to [`MAX_FILE_PAGE_LINES`]. The page also stops
+    /// at [`MAX_FILE_PAGE_BYTES`] so a page of long lines never exceeds the WS
+    /// frame budget. At least one line is always returned when the cursor is
+    /// in range and the file is not binary/empty.
+    pub fn slice_page(
+        &self,
+        snapshot_id: &str,
+        cursor: usize,
+        max_lines: usize,
+    ) -> Result<FileDiffPage, String> {
+        if snapshot_id.is_empty() {
+            return Err("missing snapshot id".to_owned());
+        }
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        let total = self.lines.len();
+        if cursor > total {
+            return Err(format!("cursor {cursor} out of range (total {total})"));
+        }
+        let cap = max_lines.clamp(1, MAX_FILE_PAGE_LINES);
+        let mut page: Vec<DiffLine> = Vec::new();
+        let mut bytes = 0usize;
+        let mut index = cursor;
+        while index < total {
+            if page.len() >= cap {
+                break;
+            }
+            let line = &self.lines[index];
+            // 32 bytes covers line numbers + kind tag + JSON overhead.
+            let line_bytes = line.text.len() + 32;
+            if !page.is_empty() && bytes + line_bytes > MAX_FILE_PAGE_BYTES {
+                break;
+            }
+            bytes += line_bytes;
+            page.push(line.clone());
+            index += 1;
+        }
+        let next_cursor = index;
+        let has_more = next_cursor < total;
+        Ok(FileDiffPage {
+            path: self.path.clone(),
+            snapshot_id: snapshot_id.to_owned(),
+            previous_path: self.previous_path.clone(),
+            status: self.status,
+            binary: self.binary,
+            lines: page,
+            cursor,
+            next_cursor: has_more.then_some(next_cursor),
+            has_more,
+            total_lines: total,
+            truncated: self.truncated,
+        })
+    }
+}
+
+/// Truncate a diff line's text to [`MAX_DIFF_LINE_TEXT_BYTES`] on a UTF-8
+/// boundary, appending a visible marker so the elision is never silent.
+fn cap_line(mut line: DiffLine) -> DiffLine {
+    if line.text.len() > MAX_DIFF_LINE_TEXT_BYTES {
+        let mut end = MAX_DIFF_LINE_TEXT_BYTES;
+        while end > 0 && !line.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.text.truncate(end);
+        line.text.push_str(" ⋯[line truncated: exceeds byte cap]");
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2508,6 +3048,7 @@ deleted file mode 100644
             ReviewScope::WorkingTree,
             b"working-tree",
             output,
+            None,
         );
         assert!(snapshot.files.is_empty());
         assert_eq!(snapshot.error.as_deref(), Some("fatal: later path failed"));
@@ -2606,5 +3147,641 @@ deleted file mode 100644
         let changed = HunkIdentity::new("snapshot-a", "a.rs", &changed_files[0].hunks[0]);
         assert_ne!(first.content_hash, changed.content_hash);
         assert!(!first.matches_across_snapshots(&changed));
+    }
+
+    // ---- Bounded single-file diff paging ----
+
+    fn diff_file_at(path: &str, previous: Option<&str>, status: FileStatus) -> DiffFile {
+        DiffFile {
+            path: path.to_owned(),
+            previous_path: previous.map(str::to_owned),
+            status,
+            binary: false,
+            insertions: 0,
+            deletions: 0,
+            hunks: Vec::new(),
+            truncated: false,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn slice_page_rejects_empty_snapshot_id_and_out_of_range_cursor() {
+        let diff = FileDiff {
+            path: "a.rs".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            lines: vec![
+                DiffLine { kind: DiffLineKind::Context, old_no: Some(1), new_no: Some(1), text: "keep".into() },
+                DiffLine { kind: DiffLineKind::Addition, old_no: None, new_no: Some(2), text: "added".into() },
+            ],
+            truncated: false,
+            error: None,
+        };
+        assert!(diff.slice_page("", 0, 10).is_err(), "empty snapshot id rejected");
+        assert!(diff.slice_page("snap", 3, 10).is_err(), "cursor past total rejected");
+        // cursor == total is valid (returns an empty terminal page).
+        let terminal = diff.slice_page("snap", 2, 10).expect("cursor == total ok");
+        assert!(terminal.lines.is_empty());
+        assert!(!terminal.has_more);
+        assert_eq!(terminal.next_cursor, None);
+        assert_eq!(terminal.total_lines, 2);
+    }
+
+    #[test]
+    fn slice_page_clamps_max_lines_and_preserves_order() {
+        let lines: Vec<DiffLine> = (0..5)
+            .map(|i| DiffLine { kind: DiffLineKind::Addition, old_no: None, new_no: Some(i + 1), text: format!("line{i}") })
+            .collect();
+        let diff = FileDiff {
+            path: "a.rs".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            lines,
+            truncated: false,
+            error: None,
+        };
+        let first = diff.slice_page("snap", 0, 2).expect("first page");
+        assert_eq!(first.cursor, 0);
+        assert_eq!(first.lines.len(), 2);
+        assert_eq!(first.lines[0].text, "line0");
+        assert_eq!(first.lines[1].text, "line1");
+        assert!(first.has_more);
+        assert_eq!(first.next_cursor, Some(2));
+        let second = diff.slice_page("snap", 2, 2).expect("second page");
+        assert_eq!(second.cursor, 2);
+        assert_eq!(second.lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>(), ["line2", "line3"]);
+        assert!(second.has_more);
+        assert_eq!(second.next_cursor, Some(4));
+        let third = diff.slice_page("snap", 4, 2).expect("third page");
+        assert_eq!(third.lines.len(), 1);
+        assert_eq!(third.lines[0].text, "line4");
+        assert!(!third.has_more);
+        assert_eq!(third.next_cursor, None);
+        // max_lines=0 clamps to 1.
+        let one = diff.slice_page("snap", 0, 0).expect("max_lines 0 -> 1");
+        assert_eq!(one.lines.len(), 1);
+    }
+
+    #[test]
+    fn slice_page_surfaces_error_and_binary_state() {
+        let err = FileDiff {
+            path: "a.rs".into(),
+            previous_path: None,
+            status: FileStatus::Unknown,
+            binary: false,
+            lines: Vec::new(),
+            truncated: false,
+            error: Some("boom".into()),
+        };
+        assert!(err.slice_page("snap", 0, 10).is_err());
+        let bin = FileDiff {
+            path: "a.png".into(),
+            previous_path: None,
+            status: FileStatus::Binary,
+            binary: true,
+            lines: Vec::new(),
+            truncated: false,
+            error: None,
+        };
+        let page = bin.slice_page("snap", 0, 10).expect("binary page");
+        assert!(page.binary);
+        assert!(page.lines.is_empty());
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn cap_line_truncates_oversize_text_on_char_boundary() {
+        let huge = "x".repeat(MAX_DIFF_LINE_TEXT_BYTES + 200);
+        let line = DiffLine { kind: DiffLineKind::Addition, old_no: None, new_no: Some(1), text: huge };
+        let capped = cap_line(line);
+        assert!(capped.text.len() < MAX_DIFF_LINE_TEXT_BYTES + 200);
+        assert!(capped.text.contains("⋯[line truncated: exceeds byte cap]"));
+        let small = cap_line(DiffLine { kind: DiffLineKind::Context, old_no: Some(1), new_no: Some(1), text: "ok".into() });
+        assert_eq!(small.text, "ok");
+    }
+
+    #[test]
+    fn load_file_diff_loads_real_working_tree_file() {
+        let repo = init_repo();
+        write(repo.path().join("src/real.rs").as_path(), "base\n");
+        git(repo.path(), &["add", "src/real.rs"]);
+        git(repo.path(), &["commit", "-m", "add real"]);
+        write(repo.path().join("src/real.rs").as_path(), "base\nedited\n");
+        let snapshot = load_review_snapshot(repo.path());
+        let real = snapshot.files.iter().find(|f| f.path == "src/real.rs").expect("real file").clone();
+        let diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &real);
+        assert!(diff.error.is_none(), "{:?}", diff.error);
+        assert!(diff.lines.iter().any(|l| l.text == "edited"));
+        let page = diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("page");
+        assert!(page.lines.iter().any(|l| l.text == "edited"));
+    }
+
+    #[test]
+    fn load_file_diff_rejects_traversal_path_fail_closed() {
+        let repo = init_repo();
+        write(repo.path().join("real.txt").as_path(), "base\n");
+        git(repo.path(), &["add", "real.txt"]);
+        git(repo.path(), &["commit", "-m", "add real"]);
+        write(repo.path().join("real.txt").as_path(), "base\nedited\n");
+        // A malicious file entry whose raw path traverses outside the repo.
+        // normalize_repo_path collapses ".." to "etc/passwd"; the loader never
+        // reads outside the work tree and git diff reports no such change.
+        let evil = DiffFile { path: "../etc/passwd".into(), previous_path: None, status: FileStatus::Modified, binary: false, insertions: 0, deletions: 0, hunks: Vec::new(), truncated: false, message: None };
+        let evil_diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &evil);
+        assert!(evil_diff.error.is_some() || evil_diff.lines.is_empty(), "traversal path did not fail closed: {:?}", evil_diff);
+        // The traversal must never create a file outside the repo.
+        assert!(!repo.path().join("../etc/passwd").exists(), "traversal escaped the repo root");
+    }
+
+    #[test]
+    fn load_file_diff_loads_single_file_after_global_truncation() {
+        // Build a repo whose HEAD→working-tree diff exceeds the 2 MiB global
+        // snapshot cap, so the snapshot is truncated, then verify the paging
+        // loader still loads the big file's full diff page by page.
+        let repo = init_repo();
+        let big_path = "big.txt";
+        let baseline = "base\n".repeat(64);
+        write(repo.path().join(big_path).as_path(), &baseline);
+        git(repo.path(), &["add", big_path]);
+        git(repo.path(), &["commit", "-m", "big baseline"]);
+        // ~3 MiB of working-tree additions → total diff > 2 MiB global cap.
+        let changed = "changed-line\n".repeat(250_000);
+        write(repo.path().join(big_path).as_path(), &changed);
+
+        let snapshot = load_review_snapshot(repo.path());
+        assert!(snapshot.truncated, "snapshot should be globally truncated: {:?}", snapshot.error);
+        let big = snapshot.files.iter().find(|f| f.path == big_path).expect("big file").clone();
+
+        let diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &big);
+        assert!(diff.error.is_none(), "{:?}", diff.error);
+        assert!(!diff.binary);
+        assert!(
+            diff.lines.len() > MAX_FILE_RENDER_LINES,
+            "paging loader should recover the full file: got {} lines",
+            diff.lines.len()
+        );
+        // Page through the whole file; the paged line count must equal the
+        // full file and the final page has no next cursor.
+        let mut cursor = 0usize;
+        let mut pages = 0usize;
+        let mut seen = 0usize;
+        loop {
+            let page = diff.slice_page(&snapshot.snapshot_id, cursor, MAX_FILE_PAGE_LINES).expect("page");
+            assert_eq!(page.cursor, cursor);
+            seen += page.lines.len();
+            pages += 1;
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+            if pages > 1000 {
+                panic!("paging did not terminate");
+            }
+        }
+        assert_eq!(seen, diff.lines.len(), "paged lines must equal the full file");
+        assert!(pages > 1, "the big file must require more than one page");
+    }
+
+    #[test]
+    fn load_file_diff_handles_rename_and_binary_entries() {
+        let repo = init_repo();
+        // A multi-line baseline so a small append keeps git's rename
+        // similarity above the default 50% threshold (a tiny single-line
+        // file with a content edit drops below it and reads as delete+add).
+        let baseline = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n";
+        write(repo.path().join("old.txt").as_path(), baseline);
+        git(repo.path(), &["add", "old.txt"]);
+        git(repo.path(), &["commit", "-m", "add old"]);
+        fs::rename(repo.path().join("old.txt"), repo.path().join("new.txt")).expect("rename");
+        write(repo.path().join("new.txt").as_path(), &format!("{baseline}renamed\n"));
+        // A binary file (fake PNG header) added in the working tree.
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR\x00\x00\x00\x00";
+        fs::write(repo.path().join("img.png"), png).expect("write png");
+        git(repo.path(), &["add", "img.png"]);
+
+        let snapshot = load_review_snapshot(repo.path());
+        let renamed = snapshot.files.iter().find(|f| f.path == "new.txt").expect("renamed").clone();
+        assert_eq!(renamed.status, FileStatus::Renamed);
+        let rename_diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &renamed);
+        assert!(rename_diff.error.is_none(), "{:?}", rename_diff.error);
+        assert!(rename_diff.lines.iter().any(|l| l.text == "renamed"), "rename diff lost content: {:?}", rename_diff.lines);
+        assert_eq!(rename_diff.previous_path.as_deref(), Some("old.txt"));
+
+        let binary = snapshot.files.iter().find(|f| f.path == "img.png").expect("binary").clone();
+        assert!(binary.binary, "snapshot should mark the png binary");
+        let binary_diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &binary);
+        assert!(binary_diff.error.is_none(), "{:?}", binary_diff.error);
+        assert!(binary_diff.binary, "paging loader should preserve binary flag");
+        let binary_page = binary_diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("binary page");
+        assert!(binary_page.binary);
+        assert!(binary_page.lines.is_empty(), "binary file has no text lines");
+    }
+
+    #[test]
+    fn load_file_diff_two_revision_scope_paginates_single_file() {
+        let repo = init_repo();
+        git(repo.path(), &["branch", "review-base"]);
+        write(repo.path().join("paged.txt").as_path(), "base\n");
+        git(repo.path(), &["add", "paged.txt"]);
+        git(repo.path(), &["commit", "-m", "add paged"]);
+        git(repo.path(), &["branch", "review-target"]);
+        let scope = ReviewScope::Revisions { from: "review-base".to_owned(), to: "review-target".to_owned() };
+        let snapshot = load_review_snapshot_for(repo.path(), scope.clone());
+        let file = snapshot.files.iter().find(|f| f.path == "paged.txt").expect("paged").clone();
+        let diff = FileDiff::load(repo.path(), &scope, &file);
+        assert!(diff.error.is_none(), "{:?}", diff.error);
+        let page = diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("page");
+        assert!(page.lines.iter().any(|l| l.text == "base"));
+        assert!(!page.has_more);
+    }
+
+    // ---- Complete changed-file catalog across global truncation ----
+
+    #[test]
+    fn name_status_catalog_parses_statuses_and_rename_provenance() {
+        let stdout =
+            b"M\0src/a.rs\0A\0new.txt\0D\0gone.txt\0R100\0old.txt\0renamed.txt\0C50\0src/orig.rs\0src/copy.rs\0T\0typechange.txt\0";
+        let catalog = name_status_catalog(stdout);
+        assert_eq!(catalog.len(), 6);
+        assert_eq!(catalog["src/a.rs"].status, FileStatus::Modified);
+        assert_eq!(catalog["src/a.rs"].previous_path, None);
+        assert_eq!(catalog["new.txt"].status, FileStatus::Added);
+        assert_eq!(catalog["gone.txt"].status, FileStatus::Deleted);
+        let renamed = &catalog["renamed.txt"];
+        assert_eq!(renamed.status, FileStatus::Renamed);
+        assert_eq!(renamed.previous_path.as_deref(), Some("old.txt"));
+        let copied = &catalog["src/copy.rs"];
+        assert_eq!(copied.status, FileStatus::Copied);
+        assert_eq!(copied.previous_path.as_deref(), Some("src/orig.rs"));
+        assert_eq!(catalog["typechange.txt"].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn truncated_combined_patch_backfills_catalog_placeholders() {
+        let patch = b"diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,4 @@\n keep\n-old\n+new\n+added\n context\ndiff --git a/old2.txt b/new2.txt\nsimilarity index 100%\nrename from old2.txt\nrename to new2.txt\ndiff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1,3 +1,3 @@\n-keep\n+gone\n".to_vec();
+        let output = GitOutput {
+            stdout: patch,
+            truncated: true,
+            error: None,
+        };
+        let catalog = GitOutput {
+            stdout: b"M\0src/a.rs\0M\0src/b.rs\0R100\0old2.txt\0new2.txt\0D\0old2.txt\0A\0added.txt\0D\0deleted.txt\0".to_vec(),
+            truncated: false,
+            error: None,
+        };
+        let snapshot = snapshot_from_diff_output(
+            PathBuf::from("repo"),
+            ReviewScope::WorkingTree,
+            b"working-tree",
+            output,
+            Some(&catalog),
+        );
+        assert!(snapshot.truncated);
+        let paths = snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            ["src/a.rs", "new2.txt", "src/b.rs", "added.txt", "deleted.txt"]
+        );
+        // Parsed entries keep hunks, status, and provenance untouched.
+        let a = &snapshot.files[0];
+        assert_eq!(a.path, "src/a.rs");
+        assert!(!a.truncated);
+        assert_eq!(a.insertions, 2);
+        assert_eq!(a.deletions, 1);
+        assert_eq!(a.hunks.len(), 1);
+        let renamed = &snapshot.files[1];
+        assert_eq!(renamed.path, "new2.txt");
+        assert_eq!(renamed.status, FileStatus::Renamed);
+        assert_eq!(renamed.previous_path.as_deref(), Some("old2.txt"));
+        assert!(!renamed.truncated, "fully parsed rename keeps its parsed state");
+        // The last parsed file carries the partial-body marker.
+        let b = &snapshot.files[2];
+        assert!(b.truncated);
+        assert_eq!(b.message.as_deref(), Some("diff truncated by size limit"));
+        assert_eq!(b.hunks.len(), 1);
+        // Absent catalogued paths become on-demand placeholders.
+        let added = &snapshot.files[3];
+        assert_eq!(added.path, "added.txt");
+        assert_eq!(added.status, FileStatus::Added);
+        assert_eq!(added.previous_path, None);
+        assert!(added.hunks.is_empty());
+        assert!(added.truncated);
+        assert_eq!(added.message.as_deref(), Some(PLACEHOLDER_MESSAGE));
+        let deleted = &snapshot.files[4];
+        assert_eq!(deleted.status, FileStatus::Deleted);
+        assert!(deleted.hunks.is_empty());
+        assert!(deleted.truncated);
+        assert_eq!(deleted.message.as_deref(), Some(PLACEHOLDER_MESSAGE));
+        // A rename source only ever appears as provenance, never as a
+        // placeholder, even when the catalog lists it separately.
+        assert!(!snapshot.files.iter().any(|file| file.path == "old2.txt"));
+    }
+
+    #[test]
+    fn truncated_snapshot_identity_includes_catalog_bytes() {
+        let patch = || GitOutput {
+            stdout: b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n".to_vec(),
+            truncated: true,
+            error: None,
+        };
+        let catalog_a = GitOutput {
+            stdout: b"A\0a.txt\0M\0b.txt\0".to_vec(),
+            truncated: false,
+            error: None,
+        };
+        let catalog_b = GitOutput {
+            stdout: b"A\0a.txt\0M\0b.txt\0A\0c.txt\0".to_vec(),
+            truncated: false,
+            error: None,
+        };
+        let snapshot_a = snapshot_from_diff_output(
+            PathBuf::from("repo"),
+            ReviewScope::WorkingTree,
+            b"working-tree",
+            patch(),
+            Some(&catalog_a),
+        );
+        let snapshot_b = snapshot_from_diff_output(
+            PathBuf::from("repo"),
+            ReviewScope::WorkingTree,
+            b"working-tree",
+            patch(),
+            Some(&catalog_b),
+        );
+        let snapshot_a_again = snapshot_from_diff_output(
+            PathBuf::from("repo"),
+            ReviewScope::WorkingTree,
+            b"working-tree",
+            patch(),
+            Some(&catalog_a),
+        );
+        assert_ne!(
+            snapshot_a.snapshot_id, snapshot_b.snapshot_id,
+            "a file added past the truncation point must change the snapshot id"
+        );
+        assert_eq!(
+            snapshot_a.snapshot_id, snapshot_a_again.snapshot_id,
+            "identical diff and catalog stay idempotent"
+        );
+    }
+
+    /// Repo whose combined HEAD→working-tree diff exceeds the 2 MiB snapshot
+    /// cap. Two ~2.6 MiB single-file diffs (verified path-sorted output:
+    /// `big-a.txt` < `big-b.txt` < `rename-new.txt` < `zz-later.txt`) mean the
+    /// first file consumes the whole cap, so every later file is a guaranteed
+    /// on-demand placeholder regardless of git's exact output order. The
+    /// untracked `stray.txt` must never appear.
+    fn build_truncated_working_tree_repo() -> TempDir {
+        let repo = init_repo();
+        let baseline = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n";
+        write(repo.path().join("big-a.txt").as_path(), "base\n");
+        write(repo.path().join("big-b.txt").as_path(), "base\n");
+        write(repo.path().join("rename-old.txt").as_path(), baseline);
+        write(repo.path().join("zz-later.txt").as_path(), "base\n");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-m", "truncation baseline"]);
+        // ~2.6 MiB of additions per big file → each single-file diff exceeds
+        // the 2 MiB combined-patch cap.
+        let changed = "changed-line\n".repeat(200_000);
+        write(repo.path().join("big-a.txt").as_path(), &changed);
+        write(repo.path().join("big-b.txt").as_path(), &changed);
+        fs::rename(repo.path().join("rename-old.txt"), repo.path().join("rename-new.txt"))
+            .expect("rename");
+        // A small content edit keeps the rename paired (above the 50%
+        // similarity threshold) while giving the loaded diff hunk lines.
+        write(
+            repo.path().join("rename-new.txt").as_path(),
+            &format!("{baseline}renamed\n"),
+        );
+        write(repo.path().join("zz-later.txt").as_path(), "base\nchanged\n");
+        write(repo.path().join("stray.txt").as_path(), "untracked, never reviewed\n");
+        repo
+    }
+
+    #[test]
+    fn load_review_snapshot_truncated_patch_lists_every_changed_file() {
+        let repo = build_truncated_working_tree_repo();
+        let index = repo.path().join(".git/index");
+        let index_before = fs::read(&index).expect("index before");
+
+        let snapshot = load_review_snapshot(repo.path());
+
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(snapshot.truncated, "combined patch must exceed the 2 MiB cap");
+        let paths = snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        for expected in ["big-a.txt", "big-b.txt", "rename-new.txt", "zz-later.txt"] {
+            assert!(
+                paths.contains(&expected),
+                "changed file missing after truncation: {paths:?}"
+            );
+        }
+        assert!(!paths.contains(&"stray.txt"), "untracked file must stay excluded: {paths:?}");
+        // The first big file parses partially; the second big file, the rename
+        // and the later file become on-demand placeholders.
+        let parsed = snapshot
+            .files
+            .iter()
+            .filter(|file| !file.hunks.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(parsed.len(), 1, "{paths:?}");
+        assert!(parsed[0].truncated, "partially parsed file must carry the marker");
+        let placeholders = snapshot
+            .files
+            .iter()
+            .filter(|file| file.hunks.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(placeholders.len(), 3, "{paths:?}");
+        for placeholder in placeholders {
+            assert!(placeholder.truncated, "placeholder must be marked truncated");
+            assert_eq!(placeholder.message.as_deref(), Some(PLACEHOLDER_MESSAGE));
+        }
+        let renamed = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "rename-new.txt")
+            .expect("rename placeholder");
+        assert_eq!(renamed.status, FileStatus::Renamed);
+        assert_eq!(renamed.previous_path.as_deref(), Some("rename-old.txt"));
+
+        // Every placeholder loads a readable bounded page through the paging
+        // loader, including the truncated big file and the rename.
+        let scope = ReviewScope::WorkingTree;
+        for file in snapshot.files.iter().filter(|file| file.hunks.is_empty()) {
+            let diff = FileDiff::load(repo.path(), &scope, file);
+            assert!(diff.error.is_none(), "{}: {:?}", file.path, diff.error);
+            let page = diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("page");
+            assert_eq!(page.path, file.path, "page serves the requested file");
+            if file.path.starts_with("big-") {
+                assert!(
+                    diff.lines.len() > MAX_FILE_RENDER_LINES,
+                    "big placeholder must recover the full body: {} lines",
+                    diff.lines.len()
+                );
+            } else {
+                assert!(!diff.lines.is_empty(), "small placeholder must load its lines");
+            }
+        }
+        assert_eq!(
+            fs::read(&index).expect("index after"),
+            index_before,
+            "review must never mutate the real index"
+        );
+    }
+
+    #[test]
+    fn load_review_snapshot_revision_truncated_patch_lists_every_changed_file() {
+        let repo = init_repo();
+        let baseline = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n";
+        write(repo.path().join("big-a.txt").as_path(), "base\n");
+        write(repo.path().join("big-b.txt").as_path(), "base\n");
+        write(repo.path().join("rename-old.txt").as_path(), baseline);
+        write(repo.path().join("zz-later.txt").as_path(), "base\n");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-m", "truncation baseline"]);
+        let from = String::from_utf8(git_output(repo.path(), &["rev-parse", "HEAD"]))
+            .expect("from hash");
+        let from = strip_output_line_ending(&from).to_owned();
+        let changed = "changed-line\n".repeat(200_000);
+        write(repo.path().join("big-a.txt").as_path(), &changed);
+        write(repo.path().join("big-b.txt").as_path(), &changed);
+        git(repo.path(), &["mv", "rename-old.txt", "rename-new.txt"]);
+        write(
+            repo.path().join("rename-new.txt").as_path(),
+            &format!("{baseline}renamed\n"),
+        );
+        write(repo.path().join("zz-later.txt").as_path(), "base\nchanged\n");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-m", "truncation changes"]);
+
+        let scope = ReviewScope::Revisions {
+            from,
+            to: "HEAD".to_owned(),
+        };
+        let snapshot = load_review_snapshot_for(repo.path(), scope.clone());
+
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(snapshot.truncated, "combined patch must exceed the 2 MiB cap");
+        let paths = snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        for expected in ["big-a.txt", "big-b.txt", "rename-new.txt", "zz-later.txt"] {
+            assert!(
+                paths.contains(&expected),
+                "revision changed file missing after truncation: {paths:?}"
+            );
+        }
+        let placeholders = snapshot
+            .files
+            .iter()
+            .filter(|file| file.hunks.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(placeholders.len(), 3, "{paths:?}");
+        for placeholder in placeholders {
+            assert!(placeholder.truncated);
+            assert_eq!(placeholder.message.as_deref(), Some(PLACEHOLDER_MESSAGE));
+        }
+        let renamed = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "rename-new.txt")
+            .expect("rename placeholder");
+        assert_eq!(renamed.status, FileStatus::Renamed);
+        assert_eq!(renamed.previous_path.as_deref(), Some("rename-old.txt"));
+
+        // The revision-scope placeholder loads through the paging loader too.
+        for file in snapshot.files.iter().filter(|file| file.hunks.is_empty()) {
+            let diff = FileDiff::load(repo.path(), &scope, file);
+            assert!(diff.error.is_none(), "{}: {:?}", file.path, diff.error);
+            let page = diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("page");
+            assert_eq!(page.path, file.path);
+            assert!(!diff.lines.is_empty(), "placeholder must load its lines");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revision_catalog_overflow_fails_closed_with_explicit_error() {
+        // 620 files under 15 nested 255-byte directories → ~2.4 MiB of
+        // `git diff --name-status -z` output, past MAX_CATALOG_BYTES, so the
+        // review must fail closed instead of silently omitting files.
+        let repo = init_repo();
+        let mut dir = String::new();
+        for _ in 0..15 {
+            dir.push_str(&"d".repeat(255));
+            dir.push('/');
+        }
+        for index in 0..620 {
+            write(repo.path().join(format!("{dir}f{index:04}.txt")).as_path(), "base\n");
+        }
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-m", "deep baseline"]);
+        let from = String::from_utf8(git_output(repo.path(), &["rev-parse", "HEAD"]))
+            .expect("from hash");
+        let from = strip_output_line_ending(&from).to_owned();
+        for index in 0..620 {
+            write(repo.path().join(format!("{dir}f{index:04}.txt")).as_path(), "changed\n");
+        }
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-m", "deep changes"]);
+
+        let snapshot = load_review_snapshot_for(
+            repo.path(),
+            ReviewScope::Revisions {
+                from,
+                to: "HEAD".to_owned(),
+            },
+        );
+
+        let error = snapshot.error.expect("catalog overflow must fail closed");
+        assert!(error.contains("catalog"), "{error}");
+        assert!(
+            snapshot.files.is_empty(),
+            "overflow must never silently omit a subset: {:?}",
+            snapshot.files
+        );
+    }
+
+    #[test]
+    fn file_tree_default_expanded_and_collapse_hides_children() {
+        let snapshot = ReviewSnapshot {
+            root: PathBuf::from("repo"),
+            scope: ReviewScope::WorkingTree,
+            snapshot_id: "snap".to_owned(),
+            files: vec![
+                diff_file_at("src/a.rs", None, FileStatus::Modified),
+                diff_file_at("src/b.rs", None, FileStatus::Added),
+                diff_file_at("docs/readme.md", None, FileStatus::Modified),
+            ],
+            truncated: false,
+            error: None,
+        };
+        let tree = FileTree::from_snapshot(&snapshot);
+        // Default expanded: all five rows (src, a.rs, b.rs, docs, readme.md).
+        assert_eq!(tree.visible_rows().len(), 5);
+        let src_idx = tree.visible_rows().iter().find(|r| tree.nodes[r.node_index].path == "src").expect("src row").node_index;
+        let mut collapsed = tree.clone();
+        collapsed.set_collapsed(src_idx, true);
+        assert!(collapsed.is_collapsed(src_idx));
+        assert_eq!(collapsed.visible_rows().len(), 3, "collapsing src hides its two files");
+        collapsed.set_collapsed(src_idx, false);
+        assert_eq!(collapsed.visible_rows().len(), 5);
+        // Toggling a file row is a no-op.
+        let file_idx = tree.visible_rows().iter().find(|r| tree.nodes[r.node_index].path == "src/a.rs").expect("file row").node_index;
+        let mut toggled = tree.clone();
+        toggled.toggle_collapse(file_idx);
+        assert_eq!(toggled.visible_rows().len(), 5);
     }
 }

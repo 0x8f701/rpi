@@ -12,7 +12,15 @@ import { viteSingleFile } from 'vite-plugin-singlefile';
 //   - build.sourcemap: 'inline'  a data-URI source map embedded in the bundle
 //                                so the V8 -> Istanbul conversion can map every
 //                                executed range back to the original TS/TSX
-//                                source (crates/pi-cli/web/src/**)
+//                                source (crates/pi-cli/web/src/**). The per-file
+//                                hard gate (coverage-report.mjs +
+//                                coverage.config.mjs fileThresholds, e.g.
+//                                scrollPin.ts >= 90% lines/functions/branches/statements)
+//                                depends on this attribution being exact, so
+//                                minify MUST stay false and sourcemap MUST stay
+//                                'inline' — never switch to external maps or
+//                                minification here without re-validating the
+//                                per-file numbers.
 //
 // The output stays a single self-contained `index.html` (vite-plugin-singlefile)
 // because the fixture's `rpi --listen` serves only `RPI_WEB_DEV_DIR/index.html`.

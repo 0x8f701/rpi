@@ -26,6 +26,14 @@ use pi_cli::interactive_commands::{
 use pi_coding::{
     Application, ResourceManager, ResourceManagerOptions, Session, SessionOptions,
 };
+/// Per-process isolated native session root so `start_new_recording()` never
+/// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
+fn test_sessions_root() -> std::path::PathBuf {
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+        tempfile::tempdir().expect("test sessions root")
+    });
+    ROOT.path().to_path_buf()
+}
 
 fn persona_dir(agent_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let dir = agent_dir.join("personas").join(name);
@@ -90,6 +98,7 @@ fn faux_session() -> (Session, pi_ai::providers::FauxProviderRegistration) {
         auth_resolver: None,
     })
     .expect("session");
+    session.set_session_dir(test_sessions_root());
     session.start_new_recording().expect("start recording");
     (session, registration)
 }

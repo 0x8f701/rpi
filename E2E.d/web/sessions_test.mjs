@@ -3,21 +3,19 @@
 // Environment:
 //   RPI_URL         http://127.0.0.1:<port>/web
 //   RPI_TOKEN       token file content (served via rpi-auth.<token> subprotocol)
-//   RPI_MOCK_CONTROL_URL loopback mock origin for the T3 release barrier
 //   RPI_CHROME      executable path of the system Chrome (optional)
 //   RPI_EVIDENCE    evidence dir for screenshots + executed-assertion evidence
 //
 // REQUIRES the MultiSessionRuntimeManager backend: top-level `sessionId`
 // command routing, lifecycle responses `{sessionId,state,messages}`, every
-// event tagged with the owning `sessionId`, close_session idle/busy
-// semantics, MAX_LOADED_SESSIONS=8 with no eviction, and the `loaded` overlay
-// on session_list rows. The lane FAILS (exit 2) whenever any assertion fails;
-// there is no agent-browser fallback and no skip.
+// event tagged with the owning `sessionId`, MAX_LOADED_SESSIONS=8 with no
+// eviction, and the `loaded` overlay on session_list rows. The lane FAILS
+// (exit 2) whenever any assertion fails; there is no agent-browser fallback
+// and no skip.
 //
 // Mock scenario: `sessions` (E2E.d/lib/user_mock_server.py) — replies are
-// routed by exact prompt text. `sessions-slow-b3` sends its first delta, then
-// waits for the test-owned release endpoint; anything else follows the normal
-// slow/echo fixture behavior.
+// routed by exact prompt text; `sessions-slow-a*` and `sessions-slow-b` are
+// slow streams, anything else is an instant echo.
 //
 // Assertion matrix (feature -> IDs, used by the coverage report):
 //   T0  boot + token connect + primary session row
@@ -36,8 +34,6 @@
 //       T6.2 desktop collapse -> compact rail with reopen control
 //       T6.3 rail reopen restores the sidebar
 //       T6.4 sidebar Manage opens the session panel
-//   T3  T3.1 close busy session -> refusal toast surfaced, row/loaded stays
-//       T3.2 close after idle -> loaded marker drops (close succeeded)
 //   T4  T4.1 create sessions to the 8-session cap
 //       T4.2 9th create refused with the cap error surfaced
 //       T4.3 no eviction: earlier session switches back, loaded count == 8
@@ -64,7 +60,6 @@ import path from 'node:path';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
-const mockControlUrl = process.env.RPI_MOCK_CONTROL_URL || '';
 const chromePath = process.env.RPI_CHROME || '';
 const evidence = process.env.RPI_EVIDENCE || '.';
 
@@ -76,7 +71,6 @@ const DOCUMENTED_IDS = [
   'T0.1', 'T0.2', 'T0.3',
   'T1.1', 'T1.2', 'T1.3', 'T1.4', 'T1.5', 'T1.6',
   'T2.1', 'T2.2', 'T2.3', 'T2.4', 'T2.5',
-  'T3.1', 'T3.2',
   'T4.1', 'T4.2', 'T4.3',
   'T5.1', 'T5.2', 'T5.3',
   'T6.1', 'T6.2', 'T6.3', 'T6.4',
@@ -116,12 +110,6 @@ async function rowIds(page) {
   return page.evaluate(() =>
     [...document.querySelectorAll('.session-sidebar__switch')].map((r) => r.dataset.sessionId || '')
   );
-}
-
-async function rowExists(page, sid) {
-  return page.evaluate((s) => {
-    return [...document.querySelectorAll('.session-sidebar__switch')].some((r) => r.dataset.sessionId === s);
-  }, sid);
 }
 
 async function clickRow(page, sid, id) {
@@ -165,28 +153,6 @@ async function rowUnread(page, sid) {
   return page.evaluate((s) => {
     const badge = document.querySelector(`.session-sidebar__unread[data-unread-for="${s}"]`);
     return badge ? Number(badge.dataset.unread || 0) : 0;
-  }, sid);
-}
-
-async function rowLoaded(page, sid) {
-  return page.evaluate((s) => {
-    return document.querySelector(`.session-sidebar__loaded[data-loaded-for="${s}"]`) !== null;
-  }, sid);
-}
-
-async function clickRowClose(page, sid, id) {
-  await waitFor(
-    page,
-    (s) => {
-      const btn = document.querySelector(`.session-sidebar__close[data-session-id="${s}"]`);
-      return btn !== null && !btn.disabled;
-    },
-    `${id}: close button for session ${sid} never became clickable`,
-    30000,
-    sid
-  );
-  await page.evaluate((s) => {
-    document.querySelector(`.session-sidebar__close[data-session-id="${s}"]`).click();
   }, sid);
 }
 
@@ -370,8 +336,9 @@ async function main() {
     knownIds.push(sessionC);
     await waitForBadge(page, true, 'T2.2: C streaming badge missing');
 
-    // T2.3: abort C -> neutral toast; T2.4: tail chunks never render.
-    await page.click('#abort-btn');
+    // T2.3: unified Stop action aborts C -> neutral toast.
+    await waitFor(page, () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Stop generating', 'T2.3: unified action never switched to Stop');
+    await page.click('#send-btn');
     await waitFor(
       page,
       () => {
@@ -436,7 +403,7 @@ async function main() {
     await page.click('#session-close-btn');
     await waitFor(page, () => document.getElementById('session-panel') === null, 'T6.4: session panel never closed');
     // T6.4 (open+close the session panel via Manage) collapses the desktop
-    // rail; re-open it before the T3/T4 New actions. Wait on the exact
+    // rail; re-open it before the T4 New actions. Wait on the exact
     // control we are about to click (the New button, which lives in the
     // sidebar header), not on the nav, so the next click is observable.
     await page.click('#rail-reopen-btn');
@@ -448,85 +415,6 @@ async function main() {
       },
       'T6.4: New session control never restored after the session panel close'
     );
-    /* ---------------- T3: close busy refusal then idle success ---------------- */
-    await page.click('#sidebar-new-session-btn');
-    await waitForEmptyView(page, 'T3.1: session D did not show the empty new-session view');
-    // D's provider sends one non-terminal delta, then blocks on the test-owned
-    // release barrier. Observing that exact delta proves D entered its turn;
-    // the mock cannot emit its final tail or [DONE] before we release it.
-    await promptAndWait(page, 'sessions-slow-b3', 'sessions-slow-b3-1/', 'T3.1: D held stream never entered its turn');
-    const sessionD = await waitForNewRow(page, knownIds, 'T3.1: session D row never appeared');
-    knownIds.push(sessionD);
-    // Switch back to A so D runs in the background. Its first provider delta
-    // already proves entry into D's turn; the provider remains held regardless
-    // of client event timing until the explicit release below.
-    await clickRow(page, sessionA, 'T3.1: switch back to A (D now background)');
-    const dUnreadBeforeRelease = await rowUnread(page, sessionD);
-    const dLoadedBefore = await rowLoaded(page, sessionD);
-    if (!dLoadedBefore) fail('T3.1: D row lacks the loaded marker while it is running');
-    // T3.1: close a BUSY session while the provider is still held. Because
-    // release occurs only after the refusal assertions below, the close is
-    // causally ordered before provider completion rather than timed by luck.
-    await clickRowClose(page, sessionD, 'T3.1: close button for held busy D');
-    await waitFor(
-      page,
-      () => {
-        const toasts = [...document.querySelectorAll('#toasts .toast--error')];
-        return toasts.some(
-          (t) => (t.textContent || '').includes('close_session failed') && (t.textContent || '').includes('busy')
-        );
-      },
-      'T3.1: busy-close refusal never surfaced (expected "session is busy" toast)',
-      15000
-    );
-    if (!(await rowExists(page, sessionD))) fail('T3.1: busy-close refusal removed the session row (must be non-destructive)');
-    if (!(await rowLoaded(page, sessionD))) fail('T3.1: busy-close refusal unloaded the session (must be non-destructive)');
-    await page.screenshot({ path: `${evidence}/sessions-t3-busy-refused.png`, fullPage: true });
-
-    // T3.2: only after busy refusal/non-destruction is observed do we release
-    // D's provider. Require an HTTP 200 acknowledgement, then require its two
-    // terminal background events (message_end + agent_settled), activate D to
-    // prove the authoritative final tail and idle badge, then close it from A.
-    if (!mockControlUrl) fail('T3.2: RPI_MOCK_CONTROL_URL is required for the session release barrier');
-    let releaseResponse;
-    try {
-      releaseResponse = await fetch(`${mockControlUrl}/__release-session`, { method: 'POST', body: '{}' });
-    } catch (error) {
-      fail(`T3.2: session provider release request failed: ${error}`);
-    }
-    if (!releaseResponse.ok) {
-      fail(`T3.2: session provider release returned HTTP ${releaseResponse.status}`);
-    }
-    const releaseBody = await releaseResponse.json().catch(() => null);
-    if (releaseBody?.released !== true) fail('T3.2: session provider release acknowledgement was invalid');
-    await waitFor(
-      page,
-      ({ sid, before }) => {
-        const badge = document.querySelector(`.session-sidebar__unread[data-unread-for="${sid}"]`);
-        return badge !== null && Number(badge.dataset.unread || 0) >= before + 2;
-      },
-      'T3.2: released D never emitted message_end and agent_settled',
-      30000,
-      { sid: sessionD, before: dUnreadBeforeRelease }
-    );
-    await clickRow(page, sessionD, 'T3.2: activate released D to prove its final transcript');
-    await waitFor(
-      page,
-      () => document.body.textContent.includes('slow-b3-done')
-        && document.getElementById('stream-badge')?.hidden === true,
-      'T3.2: released D never rendered its final tail and idle state',
-      30000
-    );
-    await clickRow(page, sessionA, 'T3.2: switch back to A before closing idle D');
-    await clickRowClose(page, sessionD, 'T3.2: close button for settled D');
-    await waitFor(
-      page,
-      (s) => !document.querySelector(`.session-sidebar__loaded[data-loaded-for="${s}"]`),
-      'T3.2: close of the idle session never succeeded (loaded marker still present)',
-      30000,
-      sessionD
-    );
-    await page.screenshot({ path: `${evidence}/sessions-t3-closed.png`, fullPage: true });
 
     /* ---------------- T4: 8-session cap, no eviction ---------------- */
     await clickRow(page, sessionA, 'T4.1: switch back to A before creating more sessions');
@@ -753,7 +641,7 @@ async function main() {
     fs.mkdirSync(evidence, { recursive: true });
     fs.writeFileSync(path.join(evidence, 'coverage-assertions.json'), JSON.stringify({ executed: [...executed] }, null, 2));
 
-    console.log(`web-sessions: PASSED (${executed.size}/${DOCUMENTED_IDS.length} assertions, T0 boot, T1 concurrent streaming + unread + restore, T2 abort/toast isolation, T6 rail collapse/reopen + header, T3 close busy/idle, T4 8-session cap + no eviction, T5 Todo/Goal/Workflow isolation, T7 390x844 drawer pick-close) — evidence at ${path.join(evidence, 'coverage-assertions.json')}`);
+    console.log(`web-sessions: PASSED (${executed.size}/${DOCUMENTED_IDS.length} assertions, T0 boot, T1 concurrent streaming + unread + restore, T2 abort/toast isolation, T6 rail collapse/reopen + header, T4 8-session cap + no eviction, T5 Todo/Goal/Workflow isolation, T7 390x844 drawer pick-close) — evidence at ${path.join(evidence, 'coverage-assertions.json')}`);
   } finally {
     await browser.close().catch(() => {});
   }

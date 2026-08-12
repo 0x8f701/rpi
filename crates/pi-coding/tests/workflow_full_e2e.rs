@@ -126,6 +126,17 @@ fn definition() -> AgentDefinition {
     path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
 }
 
+/// Per-process isolated native session root for workflow test sessions, so
+/// supervisor/parent `start_new_recording()` never writes into the real
+/// `~/.pi/agent/sessions` tree (the Web sidebar catalog source). Shared
+/// across tests; parallel-safe via `LazyLock`, isolated from HOME.
+fn test_sessions_root() -> PathBuf {
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+        tempfile::tempdir().expect("test sessions root")
+    });
+    ROOT.path().to_path_buf()
+}
+
 #[derive(Clone)]
 struct TestFactory {
     snapshot: ChildSessionOptionsSnapshot,
@@ -181,6 +192,7 @@ impl ApplicationRuntimeFactory for TestFactory {
                 workspace,
                 None,
             )?;
+            session.set_session_dir(test_sessions_root());
             session.start_new_recording()?;
             Ok(ApplicationRuntimeCandidate::new(session).with_orchestration(orchestration))
         })
@@ -218,6 +230,7 @@ fn parent_session(repo: &Path, responses: Vec<FauxResponse>) -> (Session, FauxPr
         auth_resolver: None,
     })
     .expect("session");
+    session.set_session_dir(test_sessions_root());
     (session, registration)
 }
 

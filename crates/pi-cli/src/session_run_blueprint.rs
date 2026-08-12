@@ -531,6 +531,11 @@ impl RunSessionBlueprint {
                 return Err(error).context("building session");
             }
         };
+        // Offline contract: `--offline` / process `PI_OFFLINE` (resolved by
+        // `session_run::offline`) must fail network-touching session
+        // operations (e.g. the gist share path) closed on every
+        // blueprint-built session — fresh and resumed alike.
+        session.set_offline(crate::session_run::offline());
         if let Some(session_dir) = &self.session_dir {
             session.set_session_dir(session_dir.clone());
         }

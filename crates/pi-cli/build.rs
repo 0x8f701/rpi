@@ -41,18 +41,35 @@ fn main() {
     generated.push_str("#[allow(clippy::all)]\n");
     generated.push_str("pub(crate) static FILES: &[(&str, &str, &[u8])] = &[\n");
     for (rel, abs) in &files {
+        let bytes = fs::read(abs).unwrap_or_else(|err| {
+            panic!("failed to read web client asset {}: {err}", abs.display())
+        });
         generated.push_str(&format!(
-            "    ({:?}, {:?}, include_bytes!({:?})),\n",
+            "    ({:?}, {:?}, include_bytes!({:?})), // bytes={} fingerprint={:016x}\n",
             rel,
             mime_for(rel),
-            abs
+            abs,
+            bytes.len(),
+            content_fingerprint(&bytes)
         ));
+        println!("cargo:rerun-if-changed={}", abs.display());
     }
     generated.push_str("];\n");
 
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("web_assets.rs");
     fs::write(&out, generated).expect("write web assets module");
     println!("cargo:rerun-if-changed={}", dist.display());
+}
+
+/// Stable, dependency-free asset fingerprint used only to make the generated
+/// module change when an asset's bytes change without changing its path.
+fn content_fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Walks `dir` under `root` and returns every regular file as a
@@ -245,6 +262,7 @@ mod tests {
                 "assets/app.js",
                 "assets/img/logo.svg",
                 "assets/img/nested/deep.bin",
+
                 "assets/styles.css",
                 "index.html",
             ]
@@ -261,6 +279,12 @@ mod tests {
         let again = collect_files(&root, &root).expect("collect again");
         assert_eq!(files, again);
         cleanup(&root);
+    }
+
+    #[test]
+    fn asset_fingerprint_changes_with_contents() {
+        assert_ne!(content_fingerprint(b"first"), content_fingerprint(b"second"));
+        assert_eq!(content_fingerprint(b"stable"), content_fingerprint(b"stable"));
     }
 
     #[test]

@@ -35,7 +35,17 @@ export function redactSecrets(input: unknown): string {
 }
 
 export function escapeHtml(input: unknown): string {
-  return redactSecrets(input)
+  return escapeHtmlRaw(redactSecrets(input));
+}
+
+/**
+ * Escape HTML entities WITHOUT secret redaction — the raw source text is
+ * preserved verbatim. Used where the payload is code the user must see
+ * exactly (diff bodies): the generic credential heuristic would otherwise
+ * mangle ordinary identifiers like `apiKey = "..."`.
+ */
+export function escapeHtmlRaw(input: unknown): string {
+  return String(input == null ? '' : input)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')

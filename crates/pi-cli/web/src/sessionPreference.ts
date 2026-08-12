@@ -1,21 +1,18 @@
 /**
- * Host-scoped session preference — pure helpers that persist the last
- * ACTIVATED session id per rpi listener authority under a per-authority
- * localStorage key, so a session selected on host A is never restored on
- * host B (mirrors the hostToken.ts authority isolation for auth tokens).
- * Shared by App.tsx's bootstrap restoration / onLifecycleResult and the
- * node-runnable regression test (scripts/sessionPreference.test.ts).
+ * Listener-scoped session preference — persists the last activated session id
+ * per rpi connection authority. App restores the selected listener authority
+ * before bootstrap, so reload reads the same listener bucket even when the
+ * page origin and WebSocket target use different host strings. Only the
+ * non-secret session identity is stored — never tokens, transcripts, or
+ * filesystem paths.
  *
- * Only the NON-SECRET session identity (sessionId) is stored — never tokens,
- * transcripts, or filesystem paths. Storage is passed in as a parameter (no
- * module-level state, no DOM coupling), so the node test drives an in-memory
- * StorageLike directly. Each helper catches storage-operation errors and
- * degrades to '' / no-op, so private mode or blocked cookies never crash the
- * session flow.
+ * Storage is passed in as a parameter. Each helper catches storage-operation
+ * errors and degrades to '' / no-op, so blocked storage never breaks sessions.
  */
 import type { StorageLike } from './hostToken';
 
 const SESSION_PREF_PREFIX = 'rpi-web-session:';
+
 
 /** The host-scoped localStorage key for `authority`:
  *  `rpi-web-session:<encodeURIComponent(authority.trim())>`. The authority is

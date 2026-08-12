@@ -69,18 +69,82 @@ pub struct RunSession {
 /// host (`extension_ui: None` in the blueprint): secondary Web-only sessions
 /// must never share the primary TUI's approval slot, and approval-required
 /// tools fail closed instead of hanging or routing to the wrong session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionStorage {
+    DefaultTree { native_root: PathBuf },
+    ExplicitRoot(PathBuf),
+}
+
+impl SessionStorage {
+    fn default_tree() -> Self {
+        Self::DefaultTree {
+            native_root: pi_coding::native_sessions_root(),
+        }
+    }
+
+    pub(crate) fn session_dir_for(&self, cwd: &Path) -> Result<PathBuf> {
+        match self {
+            Self::DefaultTree { native_root } => {
+                let encoded = pi_coding::default_session_dir(cwd)
+                    .file_name()
+                    .ok_or_else(|| anyhow!("default session directory has no project component"))?
+                    .to_owned();
+                Ok(native_root.join(encoded))
+            }
+            Self::ExplicitRoot(root) => Ok(root.clone()),
+        }
+    }
+
+    pub(crate) fn catalog(&self) -> Result<pi_coding::SessionCatalog> {
+        let catalog = pi_coding::SessionCatalog::from_env()?;
+        match self {
+            // `native_root` is the default per-project sessions TREE
+            // (`<agent>/sessions` in the production layout): encoded project
+            // directories live directly under it. The catalog's native source
+            // is the same tree (`<agent>/sessions`), so the agent dir is the
+            // root's parent. Callers constructing a DefaultTree for tests
+            // must use the production-shaped root, not a bare directory.
+            Self::DefaultTree { native_root } => {
+                let agent_dir = native_root
+                    .parent()
+                    .ok_or_else(|| anyhow!("native sessions root has no agent directory"))?;
+                Ok(catalog.with_native_agent_dir(agent_dir))
+            }
+            Self::ExplicitRoot(root) => Ok(catalog.with_native_session_root(root)),
+        }
+    }
+}
+
+/// Builds manager-owned session runtimes for the Web/listen control plane.
 #[derive(Clone)]
 pub struct RunSessionSpawner {
     cli: Cli,
-    session_dir: PathBuf,
+    storage: SessionStorage,
 }
 
 impl RunSessionSpawner {
-    pub(crate) fn from_startup(cli: &Cli, session_dir: PathBuf) -> Self {
+    pub(crate) fn from_startup(cli: &Cli, storage: SessionStorage) -> Self {
         Self {
             cli: sanitize_cli_for_children(cli),
-            session_dir,
+            storage,
         }
+    }
+
+    pub(crate) fn storage(&self) -> SessionStorage {
+        self.storage.clone()
+    }
+
+    /// Resolve the working directory and session directory for a child
+    /// spawned from `source`. Both follow the SOURCE runtime's live cwd:
+    /// DefaultTree derives the per-project directory from it (a child of an
+    /// activated/resumed project-B runtime stores under project B, never the
+    /// startup directory), while ExplicitRoot is exact regardless of cwd.
+    /// `new_session`, `fork_session`, and `clone_session` all place their
+    /// children through this single derivation.
+    fn child_placement(&self, source: &Application) -> Result<(PathBuf, PathBuf)> {
+        let cwd = source.session().cwd().to_path_buf();
+        let session_dir = self.storage.session_dir_for(&cwd)?;
+        Ok((cwd, session_dir))
     }
 
     /// Open (resume) the persisted session at `path` as an independent
@@ -100,7 +164,7 @@ impl RunSessionSpawner {
                 format!("resolving resumed working directory {}", recorded_cwd.display())
             })?;
         }
-        let blueprint = self.child_blueprint()?;
+        let blueprint = self.child_blueprint(&target_cwd)?;
         let options = child_session_options(source, &target_cwd);
         let candidate = blueprint
             .build_runtime_candidate(target_cwd.clone(), options, Some(prepared))
@@ -132,8 +196,8 @@ impl RunSessionSpawner {
         &self,
         source: &Application,
     ) -> Result<crate::modes::session_runtime_manager::SessionSpawnResult> {
-        let cwd = source.session().cwd().to_path_buf();
-        let blueprint = self.child_blueprint()?;
+        let (cwd, _session_dir) = self.child_placement(source)?;
+        let blueprint = self.child_blueprint(&cwd)?;
         let options = child_session_options(source, &cwd);
         let candidate = blueprint
             .build_runtime_candidate(cwd.clone(), options, None)
@@ -182,10 +246,11 @@ impl RunSessionSpawner {
             // mirroring the in-place fork's no-parent path.
             return self.new_session(source).await;
         };
+        let (_, session_dir) = self.child_placement(source)?;
         let recorder = pi_coding::create_branched_session_in(
             &source_path,
             parent_id,
-            Some(&self.session_dir),
+            Some(&session_dir),
         )?;
         recorder.persist_now()?;
         let branched = recorder.path();
@@ -207,8 +272,9 @@ impl RunSessionSpawner {
             .session_tree()?
             .active_leaf_id
             .ok_or_else(|| anyhow!("cannot clone session: no current entry selected"))?;
+        let (_, session_dir) = self.child_placement(source)?;
         let recorder =
-            pi_coding::create_branched_session_in(&source_path, &leaf_id, Some(&self.session_dir))?;
+            pi_coding::create_branched_session_in(&source_path, &leaf_id, Some(&session_dir))?;
         recorder.persist_now()?;
         let branched = recorder.path();
         self.open_resumed(source, &branched).await
@@ -217,10 +283,10 @@ impl RunSessionSpawner {
     /// Rebuild the child blueprint from the sanitized CLI. `extension_ui` is
     /// deliberately None so the child uses a per-session non-interactive
     /// (fail-closed) approval host instead of the primary TUI adapter.
-    fn child_blueprint(&self) -> Result<RunSessionBlueprint> {
+    fn child_blueprint(&self, cwd: &Path) -> Result<RunSessionBlueprint> {
         let (_, resource_options) = startup_resource_options(&self.cli, true)?;
         let mut blueprint = RunSessionBlueprint::from_cli(&self.cli, resource_options, None);
-        blueprint.set_session_dir(self.session_dir.clone());
+        blueprint.set_session_dir(self.storage.session_dir_for(cwd)?);
         Ok(blueprint)
     }
 }
@@ -248,6 +314,10 @@ impl crate::modes::session_runtime_manager::SessionSpawner for RunSessionSpawner
                 }
             }
         })
+    }
+
+    fn session_storage(&self) -> Option<SessionStorage> {
+        Some(self.storage())
     }
 }
 
@@ -561,38 +631,45 @@ pub(crate) fn resolve_prompt_input(
 
 const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
 
-/// Resolve the single session storage and lookup directory for a working directory.
-/// Precedence matches upstream: CLI, non-empty environment, effective settings,
-/// then the existing per-cwd default.
-pub(crate) fn effective_session_dir(
-    cwd: &Path,
+/// Resolve whether session persistence uses the default per-project tree or an
+/// exact custom root. Precedence matches upstream: CLI, non-empty environment,
+/// effective settings, then the default tree.
+pub(crate) fn effective_session_storage(
     cli_session_dir: Option<&Path>,
     settings_session_dir: Option<&Path>,
-) -> Result<PathBuf> {
+) -> Result<SessionStorage> {
     let env_session_dir = std::env::var_os(SESSION_DIR_ENV).filter(|value| !value.is_empty());
-    resolve_effective_session_dir(
-        cwd,
+    resolve_effective_session_storage(
         cli_session_dir,
         env_session_dir.as_deref().map(Path::new),
         settings_session_dir,
     )
 }
 
-fn resolve_effective_session_dir(
+/// Resolve the session directory for one working directory.
+pub(crate) fn effective_session_dir(
     cwd: &Path,
+    cli_session_dir: Option<&Path>,
+    settings_session_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    effective_session_storage(cli_session_dir, settings_session_dir)?.session_dir_for(cwd)
+}
+
+fn resolve_effective_session_storage(
     cli_session_dir: Option<&Path>,
     env_session_dir: Option<&Path>,
     settings_session_dir: Option<&Path>,
-) -> Result<PathBuf> {
+) -> Result<SessionStorage> {
     let configured = cli_session_dir
         .or(env_session_dir)
         .or(settings_session_dir);
     let Some(configured) = configured else {
-        return pi_coding::canonical_path(&pi_coding::default_session_dir(cwd))
-            .context("resolving default session directory");
+        return Ok(SessionStorage::default_tree());
     };
     let expanded = expand_session_dir_tilde(configured)?;
-    pi_coding::canonical_path(&expanded).context("resolving effective session directory")
+    let root = pi_coding::canonical_path(&expanded)
+        .context("resolving effective session directory")?;
+    Ok(SessionStorage::ExplicitRoot(root))
 }
 
 fn expand_session_dir_tilde(path: &Path) -> Result<PathBuf> {
@@ -856,7 +933,8 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
     )
     .context("loading settings and resources")?;
     let mut settings = preview_resources.snapshot().settings.clone();
-    let session_dir = effective_session_dir(&cwd, cli.session_dir.as_deref(), settings.session_dir.as_deref())?;
+    let storage = effective_session_storage(cli.session_dir.as_deref(), settings.session_dir.as_deref())?;
+    let session_dir = storage.session_dir_for(&cwd)?;
     blueprint.set_session_dir(session_dir.clone());
 
 
@@ -1115,7 +1193,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         model,
         scoped_models,
         startup_warnings,
-        spawner: RunSessionSpawner::from_startup(cli, session_dir),
+        spawner: RunSessionSpawner::from_startup(cli, storage),
     })
 }
 
@@ -1251,33 +1329,31 @@ mod tests {
         let settings = cwd.path().join("settings");
 
         assert_eq!(
-            resolve_effective_session_dir(cwd.path(), Some(&cli), Some(&env), Some(&settings))
+            resolve_effective_session_storage(Some(&cli), Some(&env), Some(&settings))
                 .expect("CLI"),
-            cli
+            SessionStorage::ExplicitRoot(cli)
         );
         assert_eq!(
-            resolve_effective_session_dir(cwd.path(), None, Some(&env), Some(&settings))
+            resolve_effective_session_storage(None, Some(&env), Some(&settings))
                 .expect("environment"),
-            env
+            SessionStorage::ExplicitRoot(env)
         );
         assert_eq!(
-            resolve_effective_session_dir(cwd.path(), None, None, Some(&settings))
+            resolve_effective_session_storage(None, None, Some(&settings))
                 .expect("settings"),
-            settings
+            SessionStorage::ExplicitRoot(settings)
         );
+        let storage = resolve_effective_session_storage(None, None, None).expect("default");
         assert_eq!(
-            resolve_effective_session_dir(cwd.path(), None, None, None).expect("default"),
+            storage.session_dir_for(cwd.path()).expect("project directory"),
             pi_coding::default_session_dir(cwd.path())
         );
         assert_eq!(
-            resolve_effective_session_dir(
-                cwd.path(),
-                None,
-                None,
-                Some(Path::new("relative-sessions")),
+            resolve_effective_session_storage(None, None, Some(Path::new("relative-sessions")))
+                .expect("relative settings"),
+            SessionStorage::ExplicitRoot(
+                pi_coding::canonical_path(Path::new("relative-sessions")).expect("relative path")
             )
-            .expect("relative settings"),
-            pi_coding::canonical_path(Path::new("relative-sessions")).expect("relative path")
         );
     }
 
@@ -1288,10 +1364,99 @@ mod tests {
         let env_session_dir = std::ffi::OsStr::new("");
         let env_session_dir = (!env_session_dir.is_empty()).then(|| Path::new(env_session_dir));
         assert_eq!(
-            resolve_effective_session_dir(cwd.path(), None, env_session_dir, Some(&settings))
+            resolve_effective_session_storage(None, env_session_dir, Some(&settings))
                 .expect("settings"),
-            settings
+            SessionStorage::ExplicitRoot(settings)
         );
+    }
+
+    #[test]
+    fn session_storage_keeps_default_projects_separate_and_custom_root_exact() {
+        let root = tempfile::tempdir().expect("native root");
+        let project_a = tempfile::tempdir().expect("project A");
+        let project_b = tempfile::tempdir().expect("project B");
+        let default = SessionStorage::DefaultTree { native_root: root.path().to_path_buf() };
+        let dir_a = default.session_dir_for(project_a.path()).expect("project A dir");
+        let dir_b = default.session_dir_for(project_b.path()).expect("project B dir");
+        assert_ne!(dir_a, dir_b);
+        assert_eq!(dir_a.parent(), Some(root.path()));
+        assert_eq!(dir_b.parent(), Some(root.path()));
+
+        let custom = tempfile::tempdir().expect("custom root");
+        let explicit = SessionStorage::ExplicitRoot(custom.path().to_path_buf());
+        assert_eq!(explicit.session_dir_for(project_a.path()).expect("A"), custom.path());
+        assert_eq!(explicit.session_dir_for(project_b.path()).expect("B"), custom.path());
+    }
+
+    /// A runtime whose session runs in `cwd`, standing in for an
+    /// activated/resumed manager-owned runtime (child placement only reads
+    /// the source session's live cwd).
+    async fn session_application(cwd: &Path) -> Application {
+        let session = Session::new(SessionOptions {
+            model: pi_ai::Model::default(),
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: SimpleStreamOptions::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        Application::new(session).await
+    }
+
+    #[tokio::test]
+    async fn spawned_child_follows_activated_project_cwd_and_default_tree_storage() {
+        // Startup runs in project A; the activated/resumed runtime's session
+        // lives in project B. `new_session` (and fork/clone) place their
+        // children through `child_placement`, which must inherit the
+        // ACTIVATED cwd and derive DefaultTree storage from it — never the
+        // startup (project-A) directory. Reusing the startup root would fail
+        // the cwd and session-directory assertions below.
+        let root = tempfile::tempdir().expect("native root");
+        let project_a = tempfile::tempdir().expect("project A");
+        let project_b = tempfile::tempdir().expect("project B");
+        let storage = SessionStorage::DefaultTree { native_root: root.path().to_path_buf() };
+        let cli = <Cli as clap::Parser>::try_parse_from(["rpi"]).expect("default cli");
+        let spawner = RunSessionSpawner::from_startup(&cli, storage);
+
+        let source = session_application(project_b.path()).await;
+        let (cwd, session_dir) = spawner.child_placement(&source).expect("placement");
+        assert_eq!(cwd, project_b.path(), "child must inherit the activated runtime's cwd");
+        let project_b_dir = spawner.storage().session_dir_for(project_b.path()).expect("project B dir");
+        let project_a_dir = spawner.storage().session_dir_for(project_a.path()).expect("project A dir");
+        assert_eq!(
+            session_dir, project_b_dir,
+            "child must store under DefaultTree's project-B directory"
+        );
+        assert_ne!(
+            session_dir, project_a_dir,
+            "child storage must not reuse the startup project directory"
+        );
+
+        // ExplicitRoot stays exact regardless of the activated cwd.
+        let custom = tempfile::tempdir().expect("custom root");
+        let explicit = RunSessionSpawner::from_startup(
+            &cli,
+            SessionStorage::ExplicitRoot(custom.path().to_path_buf()),
+        );
+        let (cwd, session_dir) = explicit.child_placement(&source).expect("explicit placement");
+        assert_eq!(cwd, project_b.path());
+        assert_eq!(session_dir, custom.path());
+        source.cleanup().await;
+
+        // The derivation is cwd-sensitive, not a fixed root: a project-A
+        // source maps to the project-A directory.
+        let source_a = session_application(project_a.path()).await;
+        let (cwd, session_dir_a) = spawner.child_placement(&source_a).expect("placement A");
+        assert_eq!(cwd, project_a.path());
+        assert_eq!(session_dir_a, project_a_dir);
+        source_a.cleanup().await;
     }
 
     #[test]

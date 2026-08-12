@@ -46,9 +46,49 @@ if (enabled) {
   }
 
   let pageSeq = 0;
-  const tracked = new Set(); // pages still collecting
+  const tracked = new Set(); // pages with an active coverage segment
 
-  async function startOn(page) {
+  // One-time navigation instrumentation, applied per page (WeakSet-guarded so
+  // a page's navigation functions are never wrapped twice). Segments coverage
+  // at navigation boundaries: V8/Playwright's cross-navigation accumulation is
+  // unreliable (a reload can drop the ranges of the previous document, zeroing
+  // every pre-reload function count in the final stopJSCoverage dump —
+  // observed: an attachments lane that pasted/picked/dropped files then
+  // reloaded produced a payload whose intake helpers were all count=0 while
+  // the lane's own assertions had passed). So each navigation API drains the
+  // CURRENT segment to a payload file first, then starts a FRESH segment
+  // BEFORE the navigation runs — the new document's scripts therefore execute
+  // with coverage already active — and leaves that segment running afterwards.
+  // Every document's counts are captured by the next dump (or by browser
+  // close), and the reporter merges the per-segment payload files.
+  //
+  // The wrapper calls startSegment (repeatable) — never startOn — because
+  // re-patching here would stack the wrapper recursively on every navigation:
+  // dumpFrom drops the page from `tracked`, and a guard keyed on `tracked`
+  // would pass again right after the dump.
+  const instrumented = new WeakSet();
+  function instrumentPage(page) {
+    if (instrumented.has(page)) return;
+    instrumented.add(page);
+    for (const nav of ['goto', 'reload', 'goBack', 'goForward', 'setContent']) {
+      const orig = page[nav];
+      if (typeof orig !== 'function') continue;
+      page[nav] = async (...args) => {
+        await dumpFrom(page).catch(() => {});
+        await startSegment(page).catch(() => {});
+        try {
+          return await orig.apply(page, args);
+        } catch (err) {
+          throw err;
+        }
+      };
+    }
+  }
+
+  // Repeatable segment start: no-op while the page already has an active
+  // segment. That tracked-set guard is also what prevents a double coverage
+  // start when a navigation fails and leaves the fresh segment running.
+  async function startSegment(page) {
     if (tracked.has(page)) return;
     tracked.add(page);
     try {
@@ -57,6 +97,12 @@ if (enabled) {
       tracked.delete(page);
       console.error(`[coverage-hook] startJSCoverage failed: ${err && err.message ? err.message : err}`);
     }
+  }
+
+  // Page bootstrap: instrument once, then open the first coverage segment.
+  async function startOn(page) {
+    instrumentPage(page);
+    await startSegment(page);
   }
 
   async function dumpFrom(page) {

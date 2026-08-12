@@ -166,15 +166,11 @@ async fn unsupervised_detach_is_rejected_but_ordinary_foreground_bash_is_unchang
 #[tokio::test]
 async fn dropping_application_kills_owned_process() {
     let cwd = tempfile::tempdir().expect("tempdir");
-    let pid_file = cwd.path().join("application.pid");
     let (session, registration) = session(cwd.path());
     let application = Application::new(session).await;
-    let process = application.process_spawn(spec(cwd.path(), &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()))).await.expect("spawn");
+    let process = application.process_spawn(spec(cwd.path(), "exec sleep 30")).await.expect("spawn");
+    let pid = process.pid.expect("managed pid") as i32;
     assert!(application.process_describe(&process.id).is_ok());
-    let pid = loop {
-        if let Ok(text) = std::fs::read_to_string(&pid_file) { break text.trim().parse::<i32>().expect("pid"); }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
     drop(application);
     for _ in 0..100 {
         if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() { registration.unregister(); return; }
@@ -186,22 +182,13 @@ async fn dropping_application_kills_owned_process() {
 #[tokio::test]
 async fn cleanup_is_idempotent_and_kills_owned_process() {
     let cwd = tempfile::tempdir().expect("tempdir");
-    let pid_file = cwd.path().join("cleanup.pid");
     let (session, registration) = session(cwd.path());
     let application = Application::new(session).await;
-    application
-        .process_spawn(spec(
-            cwd.path(),
-            &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
-        ))
+    let process = application
+        .process_spawn(spec(cwd.path(), "exec sleep 30"))
         .await
         .expect("spawn");
-    let pid = loop {
-        if let Ok(text) = std::fs::read_to_string(&pid_file) {
-            break text.trim().parse::<i32>().expect("pid");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    let pid = process.pid.expect("managed pid") as i32;
 
     application.cleanup().await;
     application.cleanup().await;
@@ -219,14 +206,10 @@ async fn cleanup_is_idempotent_and_kills_owned_process() {
 #[tokio::test]
 async fn new_session_stops_owned_process() {
     let cwd = tempfile::tempdir().expect("tempdir");
-    let pid_file = cwd.path().join("session-change.pid");
     let (session, registration) = session(cwd.path());
     let application = Application::new(session).await;
-    application.process_spawn(spec(cwd.path(), &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()))).await.expect("spawn");
-    let pid = loop {
-        if let Ok(text) = std::fs::read_to_string(&pid_file) { break text.trim().parse::<i32>().expect("pid"); }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    let process = application.process_spawn(spec(cwd.path(), "exec sleep 30")).await.expect("spawn");
+    let pid = process.pid.expect("managed pid") as i32;
     assert!(!application.new_session().await.expect("new session").cancelled);
     for _ in 0..100 {
         if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() { registration.unregister(); return; }
@@ -294,17 +277,11 @@ async fn same_cwd_switch_session_stops_owned_process_and_drops_old_output() {
         .await
         .expect("attach first");
 
-    let pid_file = cwd.path().join("same-cwd-switch.pid");
     let process = application
-        .process_spawn(spec(cwd.path(), &format!("echo $$ > '{}'; exec sleep 30", pid_file.display())))
+        .process_spawn(spec(cwd.path(), "exec sleep 30"))
         .await
         .expect("spawn");
-    let pid = loop {
-        if let Ok(text) = std::fs::read_to_string(&pid_file) {
-            break text.trim().parse::<i32>().expect("pid");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    let pid = process.pid.expect("managed pid") as i32;
 
     let second = pi_coding::start_session_in(
         cwd.path(),
@@ -345,22 +322,13 @@ async fn same_cwd_switch_session_stops_owned_process_and_drops_old_output() {
 #[tokio::test]
 async fn task_abort_keeps_supervised_process_then_explicit_stop_cleans_up() {
     let cwd = tempfile::tempdir().expect("tempdir");
-    let pid_file = cwd.path().join("task-abort.pid");
     let (session, registration) = session(cwd.path());
     let application = Application::new(session).await;
     let process = application
-        .process_spawn(spec(
-            cwd.path(),
-            &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
-        ))
+        .process_spawn(spec(cwd.path(), "exec sleep 30"))
         .await
         .expect("spawn supervised process");
-    let pid = loop {
-        if let Ok(text) = std::fs::read_to_string(&pid_file) {
-            break text.trim().parse::<i32>().expect("pid");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    let pid = process.pid.expect("managed pid") as i32;
 
     // The exact task-interrupt entry point the TUI Esc/Ctrl-C path calls.
     application.abort().await;

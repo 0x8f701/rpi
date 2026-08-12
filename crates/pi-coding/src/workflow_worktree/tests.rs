@@ -50,6 +50,8 @@ impl Fixture {
 }
 
 fn fixture_git(cwd: &Path, args: &[&str]) -> String {
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let hooks_path = format!("core.hooksPath={null_device}");
     let output = Command::new("git")
         .args([
             "-c",
@@ -58,11 +60,14 @@ fn fixture_git(cwd: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
+            "-c",
+            hooks_path.as_str(),
         ])
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device)
         .env("LC_ALL", "C")
         .output()
         .expect("execute fixture git");

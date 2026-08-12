@@ -91,11 +91,16 @@ explicitly acceptable.
 The token authenticates clients but provides no encryption: passive LAN
 observers can still capture the bearer token and control traffic.
 
-Collaboration join links follow the same bind/advertise separation: wildcard
+Collaboration join links remain separate from the Web UI banner: wildcard
 binds (0.0.0.0 or `::`) require `--listen-advertised-origin <URL>` (a strict
 http/https origin without credentials, path, query, or fragment) before
 `/collab` — or `collab_start` without an explicit `baseUrl` — can print
 reachable links; loopback binds advertise their local address automatically.
+Startup still prints a Web UI hint on wildcard binds: explicit
+`--listen-advertised-origin` wins; otherwise rpi best-effort discovers a
+route-selected LAN address (`Web UI: <scheme>://<lan-ip>:<port>/web`) or falls
+back to text telling you to use this machine's LAN IP and port. Ordinary
+`/web` access does not depend on that banner.
 
 The page itself is always served without authentication: it carries no data,
 and every command and event flows through the `/rpc` and `/ws` routes, which
@@ -144,11 +149,40 @@ B).
   the active-only **Abort** button) stops the run. Redundant dedicated Steer
   and Follow up buttons are intentionally absent, leaving the textarea usable
   on phone-width screens.
+- **Command picker** — the button left of the prompt opens the backend
+  `get_commands` catalog. The Web surface exposes `/compact`, `/skill`, and
+  `/code-review`; selecting an entry drafts the command and keeps focus in the
+  composer so the user can add arguments before confirming with Enter.
+- **Attachments** — attach images and code/text via the paperclip multi-file
+  picker, drag/drop onto the composer, or pasting clipboard files (for example
+  a screenshot). Ordinary text paste is unchanged. Supported images
+  (PNG/JPEG/GIF/WebP) are sent as image content blocks; recognized UTF-8
+  code/text files (common source and config extensions such as `.rs` and
+  `.ts`) are prepended as a sanitized filename plus a safely fenced code
+  block in the prompt message. Multiple files are accepted in intake order.
+  Unsupported binaries, non-image formats the prompt wire cannot carry, files
+  that fail UTF-8 validation, and oversized or over-budget batches are
+  rejected with a visible summary. Intake is bounded by per-file size, file
+  count, and a combined wire budget under the control-plane frame limit.
+- **Code highlighting** — fenced blocks use highlight.js. Fence info strings
+  with metadata or aliases (for example `rust,ignore` or `rs`) normalize to
+  the base language so Rust and other registered languages highlight the full
+  source instead of only a partial auto-detected span.
+
+- **Code review** — `/code-review` opens a bounded HEAD-to-working-tree diff;
+  `/code-review <from> <to>` compares two commits, branches, or tags. The panel
+  supports file and hunk navigation, refresh, and per-hunk comments answered by
+  a detached read-only review agent.
 - **Streaming transcript** — assistant turns render live from the event
   stream: text deltas, collapsible `thinking` blocks, compact tool-call cards,
-  bash/tool-result blocks, and final markdown. Internal `display: false`
-  system scaffolding is hidden like the TUI; bash output keeps the last 10
-  lines and other tool output keeps the last 6 with an omitted-line count.
+  bash/tool-result blocks, and final markdown. Task delegations render a
+  structured card (Goal / Constraints / Contract from shared context, plus each
+  child name/agent/target with live status, activity, and result) instead of
+  raw tool-args JSON; Edit cards show path, operation, and a
+  semantically styled `details.diff`. Raw args/details stay collapsed.
+  Internal `display: false` system scaffolding is hidden like the TUI; bash
+  output keeps the last 10 lines and other tool output keeps the last 6 with
+  an omitted-line count.
 - **Model / thinking switch** — model and thinking-level dropdowns populated
   from `get_available_models` / `get_available_thinking_levels`, applying
   `set_model` and `set_thinking_level`; the session name comes from
@@ -157,11 +191,32 @@ B).
   error toasts for failed commands, failed runs, and connection problems.
 - **Multi-session authoritative restore** — switching sessions consumes the
   target runtime's backend snapshot; closed sessions resume from disk, and a
-  listener restart rebinds before controls become active. Web prompts use the
-  normal session recorder and remain available after restart.
+  listener restart rebinds before controls become active. The saved-session
+  sidebar requests `session_list` with `scope: "all_projects"`: the default
+  native tree lists sessions across projects in the active profile, while an
+  explicit `--session-dir` or `sessionDir` setting lists only that exact root.
+  Web prompts use the normal session recorder and remain available after restart.
 - **Panels** — dedicated views for todo, goal, workflow, session tree,
-  settings, subagent jobs, side chat, and maintenance, each driven by the same
-  JSONL RPC control plane.
+  settings, subagent jobs, side chat, maintenance, and code review, each driven
+  by the same JSONL RPC control plane.
+- **Personas** — the Personas panel manages the same persistent persona
+  definitions as the TUI `/persona` surface. A persona is a durable agent
+  definition at `~/.pi/agent/personas/<name>/persona.md` (user scope) or
+  `<project>/.pi/personas/<name>/persona.md` (project scope, trusted
+  projects), with its memory (`memory/entries.jsonl`) and session archives
+  (`sessions/`) kept under the same root. The panel lists each persona with
+  its contract summary and memory/session counts, shows the raw definition,
+  and supports create/edit (validated against the same schema and storage as
+  `/persona new` / `/persona edit`, with a live catalog reload on save).
+  Destructive actions are explicitly confirmed and clearly distinguished:
+  **Remove** deletes only `persona.md` and keeps the memory/sessions under
+  the persona root, while **Purge** deletes the whole root including state.
+  **Select** makes the persona the preferred agent for unnamed task spawns
+  (`/persona <name> --select`); **Run** spawns a task with the persona as the
+  agent via the existing `task_spawn` RPC. Natural-language delegation
+  (`让 <persona> …`) is resolved by the main agent through the existing
+  orchestration agent catalog/task tool — the page never heuristically routes
+  prompts.
 - **Collaboration guest route** — `/collab/ws/<roomId>` serves the same
   embedded client for encrypted live-collaboration guests, reading the
   capability key from the URL fragment locally before opening the encrypted

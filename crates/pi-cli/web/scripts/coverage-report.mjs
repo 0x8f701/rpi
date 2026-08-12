@@ -50,6 +50,11 @@ const defaultConfig = {
   // src/types.ts is a type-only module: zero runtime statements, so it never
   // appears in V8 coverage and is excluded from the expected-file set.
   exclude: ['src/types.ts'],
+  // Per-file hard thresholds, keyed by the source path relative to webRoot
+  // (e.g. "src/scrollPin.ts"). Enforced after the global totals against the
+  // same source-mapped per-file summary the per-file table prints; a miss
+  // fails the command (exit 2). See coverage.config.mjs for the rationale.
+  fileThresholds: {},
   thresholds: { lines: 90, functions: 90, branches: 75, statements: 90 },
 };
 let config = defaultConfig;
@@ -206,9 +211,14 @@ const context = libReport.createContext({
 
 console.log('\n[coverage] per-file (source-mapped to crates/pi-cli/web/src):');
 console.log('  ' + ['file', 'lines', 'functions', 'branches', 'statements'].map((h) => h.padEnd(11)).join(''));
+// Per-file summaries keyed by the source path relative to webRoot, for the
+// per-file hard thresholds (config.fileThresholds). Built once here so the
+// table and the gate use the SAME source-mapped Istanbul summary.
+const perFileSummary = {};
 for (const file of srcOnly.files().sort()) {
   const s = srcOnly.fileCoverageFor(file).toSummary();
   const rel = path.relative(webRoot, file).replace(/\\/g, '/');
+  perFileSummary[rel] = s;
   const fmt = (x) => `${String(x.pct).padStart(3)}% (${x.covered}/${x.total})`.padEnd(30);
   console.log(`  ${rel.padEnd(34)}${fmt(s.lines)}${fmt(s.functions)}${fmt(s.branches)}${fmt(s.statements)}`);
 }
@@ -241,6 +251,39 @@ for (const metric of ['lines', 'functions', 'branches', 'statements']) {
     failures.push(`${metric}: ${got}% < required ${want}%`);
   }
 }
+
+// ---- 4b. per-file hard thresholds ----
+// Enforced alongside the global totals (both feed the single `failures`
+// list below so one run reports every miss). A file listed in
+// config.fileThresholds that is missing from the source-mapped coverage
+// fails the command (a collection/source-mapping gap, not a soft skip);
+// each listed metric must meet its threshold. The gate prints an explicit
+// verdict per gated file so the report names scrollPin.ts (and any future
+// gated file) unambiguously.
+const fileThresholdEntries = Object.entries(config.fileThresholds || {});
+if (fileThresholdEntries.length > 0) {
+  console.log('\n[coverage] per-file hard thresholds:');
+}
+for (const [rel, reqs] of fileThresholdEntries) {
+  const s = perFileSummary[rel];
+  if (!s) {
+    failures.push(`${rel}: gated file missing from source-mapped coverage (collection or source-mapping gap)`);
+    console.log(`  ${rel.padEnd(34)} MISSING — gated file produced no coverage`);
+    continue;
+  }
+  const metricVerdict = [];
+  for (const metric of ['lines', 'functions', 'branches', 'statements']) {
+    const want = reqs[metric];
+    if (typeof want !== 'number') continue;
+    const got = Number(s[metric].pct);
+    const ok = s[metric].total > 0 && Number.isFinite(got) && got >= want;
+    if (!ok) {
+      failures.push(`${rel} ${metric}: ${s[metric].total > 0 ? got + '%' : '0/0'} < required ${want}%`);
+    }
+    metricVerdict.push(`${metric[0]}=${s[metric].total > 0 ? got + '%' : '0/0'}/${want}%${ok ? '' : ' FAIL'}`);
+  }
+  console.log(`  ${rel.padEnd(34)} ${metricVerdict.join('  ')}`);
+}
 if (failures.length > 0) {
   console.error('\n[coverage] THRESHOLD FAILURE:');
   for (const f of failures) console.error(`  - ${f}`);
@@ -248,6 +291,6 @@ if (failures.length > 0) {
   process.exit(2);
 }
 
-console.log(`\n[coverage] thresholds met (lines/functions/branches/statements >= ${config.thresholds.lines}/${config.thresholds.functions}/${config.thresholds.branches}/${config.thresholds.statements}%)`);
+console.log(`\n[coverage] thresholds met (global lines/functions/branches/statements >= ${config.thresholds.lines}/${config.thresholds.functions}/${config.thresholds.branches}/${config.thresholds.statements}%; per-file hard gate: ${fileThresholdEntries.length} file(s), incl. scrollPin.ts)`);
 console.log(`[coverage] report outputs: ${outDir}/coverage-summary.json, ${outDir}/lcov.info, ${outDir}/lcov-report/`);
 console.log(`[coverage] payload sources: ${perPayload.map((p) => `${p.file}(${p.convertible} scripts)`).join(', ')}`);

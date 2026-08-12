@@ -7,10 +7,13 @@
  * dependency so `esbuild --platform=node` can bundle the test in isolation
  * (mirroring src/transcript.ts + scripts/transcript.test.ts).
  *
- * The session object shape matches the CLIProxyAPI/chatgpt.com V1 "quicksilver"
- * contract exactly (Contract 2): the SAME object rides the Rust create-call
- * POST body AND the web `session.update` event frame sent over the
- * `oai-events` RTCDataChannel (Contract 4), so the two never drift.
+ * The session object here is the model-bearing V1 "quicksilver" shape sent as
+ * the web `session.update` event frame over the `oai-events` RTCDataChannel,
+ * with `voice` nested under `audio.output.voice`. It deliberately DIFFERS from
+ * the Rust create-call POST session (rpc.rs `realtime_session_payload`), which
+ * is a strict subset WITHOUT `model`: Codex realtime rejects `session.model`
+ * with 400, so the configured model can only be delivered here, over the data
+ * channel.
  */
 
 /** PCM input sample rate the V1 session expects (24 kHz mono). A JSON number,
@@ -28,11 +31,13 @@ export function firstString(...values: unknown[]): string {
   return '';
 }
 
-/** The V1 "quicksilver" realtime session object. Carried in the create-call
- *  POST body (`{sdp, session}`) and re-sent verbatim as the `session.update`
+/** The V1 "quicksilver" realtime session object sent as the `session.update`
  *  event frame's `session` field over the `oai-events` data channel. `voice`
  *  nests under `audio.output.voice` (the legacy top-level `voice` was silently
- *  ignored by the V1 parser, so the configured voice never took effect). */
+ *  ignored by the V1 parser, so the configured voice never took effect).
+ *  NOTE: this model-bearing shape is data-channel-only — the Rust create-call
+ *  POST session is a strict subset WITHOUT `model`, which Codex realtime
+ *  rejects with 400. */
 export interface RealtimeSessionConfig {
   type: 'quicksilver';
   model: string;
@@ -42,11 +47,13 @@ export interface RealtimeSessionConfig {
   };
 }
 
-/** Build the V1 "quicksilver" session config. Shape matches the contract
- *  exactly: `{type:'quicksilver', model, audio:{input:{format:{type:'audio/pcm',
- *  rate:24000}}, output:{voice}}}`. The caller defaults `model`/`voice` before
- *  calling, so both are always non-empty; the object never carries an `id`
- *  (the official client strips it pre-send). */
+/** Build the V1 "quicksilver" session config for the data-channel
+ *  `session.update` frame: `{type:'quicksilver', model,
+ *  audio:{input:{format:{type:'audio/pcm', rate:24000}}, output:{voice}}}`.
+ *  The caller defaults `model`/`voice` before calling, so both are always
+ *  non-empty; the object never carries an `id` (the official client strips it
+ *  pre-send). This is the ONLY place the configured `model` reaches the
+ *  realtime session — the Rust create-call POST session omits it. */
 export function buildRealtimeSessionConfig(model: string, voice: string): RealtimeSessionConfig {
   return {
     type: 'quicksilver',
@@ -143,6 +150,87 @@ export function nextInputTranscriptCommit(finalText: string, lastCommitted: stri
  *  instead of a direct sideband WebSocket. */
 export const REALTIME_EVENT_CHANNEL = 'oai-events';
 
+
+/** Bounded wait for ICE candidate gathering before the offer is POSTed. The
+ *  OpenAI/CLIProxy realtime `/v1/realtime/calls` endpoint is a single HTTP
+ *  round trip with NO trickle-ICE sideband: the offer MUST carry gathered ICE
+ *  candidates or the server's answer cannot connect (the data channel never
+ *  opens, `session.update` never fires, and the user sees nothing — the
+ *  long-standing "realtime doesn't work" failure). The FakePeerConnection
+ *  used by the existing E2E/TS mocks never gathers ICE, so this bug is
+ *  invisible to those tests. Five seconds is the OpenAI realtime WebRTC
+ *  reference client's gather bound; on a loopback/LAN only host candidates
+ *  are gathered, which completes in well under a second. */
+export const REALTIME_ICE_GATHER_TIMEOUT_MS = 5000;
+
+/** Normalize an `RTCPeerConnectionState` (or `iceConnectionState`) into a
+ *  small UI bucket. `disconnected` is distinguished from `failed` because the
+ *  former is recoverable (a transient ICE path loss) while the latter is
+ *  terminal. Pure so the connection-status overlay and the toast/teardown
+ *  decision are testable without a browser. */
+export function classifyRealtimeConnectionState(state: unknown): 'new' | 'connecting' | 'connected' | 'disconnected' | 'failed' | 'closed' | 'unknown' {
+  if (typeof state !== 'string') return 'unknown';
+  switch (state) {
+    case 'new':
+    case 'connecting':
+    case 'connected':
+    case 'disconnected':
+    case 'failed':
+    case 'closed':
+      return state;
+    // iceConnectionState aliases that map onto the pc.connectionState buckets.
+    case 'checking':
+      return 'connecting';
+    case 'completed':
+      return 'connected';
+    default:
+      return 'unknown';
+  }
+}
+
+/** A minimal scheduler seam around `setTimeout`/`clearTimeout` so the gather
+ *  wait's timeout path is testable deterministically (no real wall-clock
+ *  timer). Defaults to the platform globals. The timer id type is opaque
+ *  (`unknown`) because browser `setTimeout` returns `number` while Node
+ *  returns a `Timeout` handle — both round-trip through the matching
+ *  `clearTimeout`. */
+export interface RealtimeScheduler {
+  setTimeout: (fn: () => void, ms: number) => unknown;
+  clearTimeout: (id: unknown) => void;
+}
+
+/** Wait until `pc.iceGatheringState === 'complete'` (all candidates gathered),
+ *  or until `timeoutMs` elapses — whichever is first. Resolves (never rejects):
+ *  a gather timeout is a recoverable fallback that posts whatever candidates
+ *  have been gathered so far rather than wedging the call setup forever. Uses
+ *  the standard `icegatheringstatechange` event; safe to call when gathering
+ *  is already complete (resolves immediately). `scheduler` is a test seam that
+ *  defaults to the platform `setTimeout`/`clearTimeout`. */
+export async function waitForIceGatheringComplete(
+  pc: RTCPeerConnection,
+  timeoutMs: number = REALTIME_ICE_GATHER_TIMEOUT_MS,
+  scheduler: RealtimeScheduler = {
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (id) => clearTimeout(id as number),
+  },
+): Promise<void> {
+  if (pc.iceGatheringState === 'complete') return;
+  const { promise, resolve } = Promise.withResolvers<void>();
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    pc.removeEventListener('icegatheringstatechange', onChange);
+    scheduler.clearTimeout(timer);
+    resolve();
+  };
+  const onChange = () => {
+    if (pc.iceGatheringState === 'complete') finish();
+  };
+  const timer = scheduler.setTimeout(finish, timeoutMs);
+  pc.addEventListener('icegatheringstatechange', onChange);
+  await promise;
+}
 /** Dependencies injected into `setupRealtimeCall` so the call-setup ORDER is
  *  testable with recorded mocks (no browser/WebSocket needed). The types are
  *  erased by esbuild for the node test, which supplies plain mock objects. */
@@ -155,12 +243,31 @@ export interface RealtimeCallDeps {
   /** Wire the data channel handlers right after createDataChannel (before
    *  createOffer), so onopen/onmessage are in place before the channel opens. */
   onDataChannel?: (pc: RTCPeerConnection, dc: RTCDataChannel) => void;
+  /** Override the ICE-gathering wait bound (default
+   *  [`REALTIME_ICE_GATHER_TIMEOUT_MS`]). The wait happens after
+   *  `setLocalDescription` and before `sendCreateCall` so the POSTed offer
+   *  carries gathered candidates. */
+  iceGatheringTimeoutMs?: number;
+  /** Override the gather-wait implementation (test seam: the node mock has no
+   *  real ICE layer). Defaults to [`waitForIceGatheringComplete`]. */
+  waitForIceGathering?: (pc: RTCPeerConnection, timeoutMs: number) => Promise<void>;
 }
 
 /** Orchestrate the realtime call setup in the contract-mandated order:
  *  getUserMedia -> RTCPeerConnection -> addTrack -> wire pc handlers ->
  *  createDataChannel('oai-events') -> wire channel handlers -> createOffer ->
- *  setLocalDescription -> realtime_create_call -> setRemoteDescription.
+ *  setLocalDescription -> WAIT FOR ICE GATHERING -> realtime_create_call ->
+ *  setRemoteDescription.
+ *
+ *  The ICE-gathering wait is the fix for the long-standing "realtime doesn't
+ *  work" failure: the `/v1/realtime/calls` endpoint is a single HTTP round
+ *  trip with no trickle sideband, so the offer MUST carry gathered ICE
+ *  candidates. Reading `offer.sdp` immediately after `setLocalDescription`
+ *  posts an offer with zero candidates — the server's answer cannot connect,
+ *  the `oai-events` data channel never opens, `session.update` never fires,
+ *  and the user sees no transcript/error (silent failure). After the gather
+ *  wait, `pc.localDescription.sdp` carries the gathered `a=candidate` lines
+ *  and is what gets POSTed.
  *
  *  The `oai-events` data channel is created BEFORE createOffer so it is
  *  negotiated in the SDP; NO direct WebSocket to the CLIProxy realtime
@@ -180,7 +287,14 @@ export async function setupRealtimeCall(
   deps.onDataChannel?.(pc, dc);
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  const result = await deps.sendCreateCall(offer.sdp ?? '');
+  // Wait for ICE candidate gathering BEFORE posting: the realtime
+  // create-call endpoint does not trickle, so the offer must carry gathered
+  // candidates or the answer cannot connect. pc.localDescription.sdp is
+  // updated in place as candidates are gathered, so read it AFTER the wait.
+  const wait = deps.waitForIceGathering ?? waitForIceGatheringComplete;
+  await wait(pc, deps.iceGatheringTimeoutMs ?? REALTIME_ICE_GATHER_TIMEOUT_MS);
+  const gatheredSdp = pc.localDescription?.sdp ?? offer.sdp ?? '';
+  const result = await deps.sendCreateCall(gatheredSdp);
   if (!result || !result.sdp || !result.callId) {
     throw new Error('realtime_create_call returned no SDP answer or call id');
   }

@@ -72,6 +72,17 @@ async function lastAssistantText(page) {
   });
 }
 
+// Read a small JSON evidence file written by the mock/fixture (e.g. the
+// realtime create-call header record), returning null when absent/invalid.
+async function readJsonIfExists(file) {
+  try {
+    const raw = await fs.promises.readFile(file, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 /** Raw RPC client over the SAME listener (second WS session — concurrency). */
 function rpcClient(wsUrl) {
   const ws = new WebSocket(wsUrl, token ? [`rpi-auth.${token}`] : []);
@@ -139,6 +150,122 @@ async function main() {
     page.on('pageerror', (err) => {
       console.error(`web-cov: page error: ${err.message}`);
     });
+    // WebRTC/media platform stubs for the realtime coverage scenario. The
+    // App runs its REAL startRealtime -> setupRealtimeCall flow and
+    // the REAL realtime_create_call RPC; only the browser platform APIs
+    // (navigator.mediaDevices.getUserMedia, RTCPeerConnection) are replaced so
+    // the WebRTC handshake is deterministic. The stubs expose
+    // window.__rtStub (sendFrame/openChannel/closeChannel) for the test to
+    // drive oai-events frames.
+    await page.addInitScript(() => {
+      if (window.__rtStub) return;
+      class FakeAudioTrack {
+        constructor() { this.kind = 'audio'; }
+        stop() {}
+      }
+      class FakeMediaStream {
+        constructor() { this.track = new FakeAudioTrack(); }
+        getTracks() { return [this.track]; }
+      }
+      class FakeDataChannel {
+        constructor(label) {
+          this.label = label;
+          this.readyState = 'connecting';
+          this.sent = [];
+          this.onopen = null;
+          this.onmessage = null;
+          this.onclose = null;
+          this.onerror = null;
+        }
+        send(data) { this.sent.push(data); }
+        close() { this.readyState = 'closed'; }
+      }
+      class FakePeerConnection {
+        constructor() {
+          this.localDescription = null;
+          this.remoteDescription = null;
+          this.connectionState = 'new';
+          // iceGatheringState 'complete' makes src/realtime.ts's
+          // waitForIceGatheringComplete resolve immediately (the real browser
+          // gathers host candidates in well under a second; the fake skips the
+          // wait so the E2E flow stays deterministic). The gather wait reads
+          // pc.localDescription.sdp AFTER setLocalDescription, so the fake
+          // stores the offer there verbatim. The SECOND coverage call arms
+          // window.__rtStub.gatherDelay so the fake starts 'gathering' and
+          // the test completes it via __rtStub.finishGathering() — driving
+          // waitForIceGatheringComplete's icegatheringstatechange event path.
+          this.iceGatheringState = window.__rtStub.gatherDelay ? 'gathering' : 'complete';
+          this.gatherListeners = [];
+          this.channels = [];
+          this.onicecandidate = null;
+          this.onconnectionstatechange = null;
+          this.ontrack = null;
+          window.__rtStub.pc = this;
+          window.__rtStub.dc = null;
+        }
+        addEventListener(type, fn) {
+          if (type === 'icegatheringstatechange') this.gatherListeners.push(fn);
+        }
+        removeEventListener(type, fn) {
+          if (type === 'icegatheringstatechange') {
+            this.gatherListeners = this.gatherListeners.filter((h) => h !== fn);
+          }
+        }
+        finishGathering() {
+          this.iceGatheringState = 'complete';
+          for (const handler of this.gatherListeners) handler();
+        }
+        addTrack() {}
+        createDataChannel(label) {
+          const dc = new FakeDataChannel(label);
+          this.channels.push(dc);
+          window.__rtStub.dc = dc;
+          return dc;
+        }
+        async createOffer() {
+          return { type: 'offer', sdp: 'v=0\r\no=e2e 0 0 IN IP4 127.0.0.1\r\ns=e2e-offer\r\n' };
+        }
+        async setLocalDescription(desc) { this.localDescription = desc; }
+        async setRemoteDescription(desc) {
+          this.remoteDescription = desc;
+          this.connectionState = 'connected';
+          if (this.onconnectionstatechange) this.onconnectionstatechange({});
+        }
+        close() { this.connectionState = 'closed'; }
+      }
+      window.__rtStub = {
+        pc: null,
+        dc: null,
+        getUserMedia() { return Promise.resolve(new FakeMediaStream()); },
+        openChannel() {
+          const dc = window.__rtStub.dc;
+          if (dc) {
+            dc.readyState = 'open';
+            if (dc.onopen) dc.onopen({});
+          }
+        },
+        finishGathering() {
+          const pc = window.__rtStub.pc;
+          if (pc) pc.finishGathering();
+        },
+        sendFrame(obj) {
+          const dc = window.__rtStub.dc;
+          if (dc && dc.onmessage) dc.onmessage({ data: JSON.stringify(obj) });
+        },
+        closeChannel() {
+          const dc = window.__rtStub.dc;
+          if (dc) {
+            dc.readyState = 'closed';
+            if (dc.onclose) dc.onclose({});
+          }
+        },
+      };
+      Object.defineProperty(navigator, 'mediaDevices', {
+        configurable: true,
+        value: { getUserMedia: () => window.__rtStub.getUserMedia() },
+      });
+      window.RTCPeerConnection = FakePeerConnection;
+    });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await waitFor(page, () => document.title === 'rpi web', 'page title missing');
     await waitFor(page, () => document.querySelector('#conn-state') !== null, 'conn-state missing');
@@ -205,11 +332,11 @@ async function main() {
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, (tail) => document.body.textContent.includes(tail), 'full slow reply never streamed into the DOM', 30000, slowTail);
     await waitFor(page, () => document.getElementById('stream-badge').hidden === true, 'streaming badge did not clear after the reply completed');
-    const sendLabelWhenIdle = await page.textContent('#send-btn');
-    if (sendLabelWhenIdle?.trim() !== 'Send') {
-      fail(`primary submit did not return to Send while idle: "${sendLabelWhenIdle}"`);
+    const idleActionLabel = await page.getAttribute('#send-btn', 'aria-label');
+    if (idleActionLabel !== 'Send message') {
+      fail(`unified action did not return to Send while idle: "${idleActionLabel}"`);
     }
-    record('app.primary-submit-send');
+    record('app.primary-action-send');
     record('prompt.slow-stream-full');
 
     // Request 2 is instant.
@@ -227,11 +354,11 @@ async function main() {
       () => document.getElementById('stream-badge').hidden === false,
       'streaming badge never appeared for the third stream'
     );
-    const sendLabelWhileStreaming = await page.textContent('#send-btn');
-    if (sendLabelWhileStreaming?.trim() !== 'Steer') {
-      fail(`primary submit did not switch to Steer while streaming: "${sendLabelWhileStreaming}"`);
+    const streamingActionLabel = await page.getAttribute('#send-btn', 'aria-label');
+    if (streamingActionLabel !== 'Stop generating') {
+      fail(`unified action did not switch to Stop while streaming: "${streamingActionLabel}"`);
     }
-    record('app.primary-submit-steer');
+    record('app.primary-action-stop');
     // Dismiss every toast accumulated by earlier phases (e.g. the Phase A
     // wrong-token "connection failed" error toast, which auto-dismisses only
     // after 7s) so the abort's anyError check below is scoped to toasts the
@@ -240,7 +367,7 @@ async function main() {
       document.querySelectorAll('#toasts .toast').forEach((t) => t.click());
     });
     await waitFor(page, () => document.querySelectorAll('#toasts .toast').length === 0, 'stale toasts did not clear before the abort');
-    await page.click('#abort-btn');
+    await page.click('#send-btn');
     await waitFor(page, () => document.getElementById('stream-badge').hidden === true, 'streaming badge did not clear after abort');
     const preserved = await lastAssistantText(page);
     if (!preserved.includes('steer-3-')) fail(`aborted message lost the streamed text: "${preserved}"`);
@@ -368,6 +495,111 @@ async function main() {
     if (!imagePolicy.safePngImg) fail('the safe data:image PNG did not render as a live <img>');
     record('md.image-blocked');
 
+    // ---- markdown renderer coverage: extra branches (RICH_TEXT_EXTRA) ----
+    // hr / blockquote / ordered+nested lists / task-glyph variants /
+    // unregistered-language + lang-less fences / empty + invalid mermaid
+    // hydration / currency-vs-math / URL-policy extras.
+    await page.fill('#prompt-input', 'render markdown extra branches');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => document.querySelector('#transcript .assistant-text .md-quote') !== null,
+      'md.extra: blockquote never rendered',
+      30000
+    );
+    record('md.extra-blockquote');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('#transcript .assistant-text hr')].length >= 1,
+      'md.extra: hr never rendered',
+      10000
+    );
+    record('md.extra-hr');
+    await waitFor(
+      page,
+      () => document.querySelector('#transcript .assistant-text ol.md-list') !== null,
+      'md.extra: ordered list never rendered',
+      10000
+    );
+    record('md.extra-ol');
+    const nestedList = await page.evaluate(() => {
+      const ol = document.querySelector('#transcript .assistant-text ol.md-list');
+      return !!ol && !!ol.querySelector('li ul.md-list');
+    });
+    if (!nestedList) fail('md.extra: nested list never rendered inside a list item');
+    record('md.extra-nested-list');
+    const extraFenceLangs = await page.evaluate(() =>
+      [...document.querySelectorAll('#transcript .md-fence__lang')].map((n) => n.textContent || '')
+    );
+    if (!extraFenceLangs.includes('weirdlang')) {
+      fail(`md.extra: unregistered-language fence label missing: ${JSON.stringify(extraFenceLangs)}`);
+    }
+    if (!extraFenceLangs.includes('text')) {
+      fail(`md.extra: lang-less fence label missing: ${JSON.stringify(extraFenceLangs)}`);
+    }
+    record('md.extra-fence-langs');
+    // Empty mermaid source: the async hydration empty-source branch clears
+    // the host (no rendered/error class, empty textContent).
+    await waitFor(
+      page,
+      () =>
+        [...document.querySelectorAll('#transcript .md-mermaid-host')].some(
+          (h) =>
+            (h.textContent || '').trim() === '' &&
+            !h.classList.contains('md-mermaid-host--rendered') &&
+            !h.classList.contains('md-mermaid-host--error')
+        ),
+      'md.extra: empty mermaid host never cleared',
+      15000
+    );
+    record('md.extra-mermaid-empty');
+    // Invalid-diagram mermaid: hydration's error branch renders the error
+    // host with the escaped source.
+    await waitFor(
+      page,
+      () => document.querySelector('#transcript .md-mermaid-host--error') !== null,
+      'md.extra: invalid mermaid never errored',
+      15000
+    );
+    const mermaidErrorSource = await page.evaluate(
+      () => document.querySelector('#transcript .md-mermaid-host--error .md-mermaid-error__source')?.textContent || ''
+    );
+    if (!mermaidErrorSource.includes('bad token here')) {
+      fail(`md.extra: mermaid error source missing: ${mermaidErrorSource.slice(0, 120)}`);
+    }
+    record('md.extra-mermaid-error');
+    const extraRichText = await lastAssistantText(page);
+    if (!extraRichText.includes('5$/unit')) fail('md.extra: currency amount not preserved as literal text');
+    record('md.extra-currency');
+    // URL-policy extras: ./ relative image allowed, http image allowed,
+    // javascript: image blocked, mailto link allowed.
+    await waitFor(
+      page,
+      () => document.querySelector('#transcript img.md-image[alt="rel"]') !== null,
+      'md.extra: relative ./ image never rendered',
+      10000
+    );
+    record('md.extra-image-relative');
+    await waitFor(
+      page,
+      () => document.querySelector('#transcript img.md-image[alt="http"]') !== null,
+      'md.extra: http image never rendered',
+      10000
+    );
+    await waitFor(
+      page,
+      () => document.querySelector('#transcript a[href^="mailto:"]') !== null,
+      'md.extra: mailto link never rendered',
+      10000
+    );
+    const blockedExtraImg = await page.evaluate(() =>
+      [...document.querySelectorAll('#transcript .assistant-text img')].some((i) =>
+        (i.getAttribute('src') || '').toLowerCase().startsWith('javascript:')
+      )
+    );
+    if (blockedExtraImg) fail('md.extra: javascript: image leaked as a live img');
+    record('md.extra-url-policy');
+
     // ---- Phase C2: tool execution card (App.ToolCard + redact.safeJson) ----
     // A prompt carrying the marker makes the agent call the `read` tool once;
     // the tool_execution_start/end events render a .tool-card in the transcript.
@@ -380,7 +612,7 @@ async function main() {
         const cards = [...document.querySelectorAll('.tool-card')];
         if (cards.length <= b) return false;
         const last = cards[cards.length - 1];
-        return (last.querySelector('.tool-card__name')?.textContent || '') === 'read';
+        return last.getAttribute('data-tool-name') === 'read';
       },
       'read tool-card never rendered in the transcript',
       30000,
@@ -392,22 +624,209 @@ async function main() {
       () => {
         const cards = [...document.querySelectorAll('.tool-card')];
         const last = cards[cards.length - 1];
-        return !!last && last.querySelector('.tool-card__state--done') !== null;
-    },
+        return !!last && last.getAttribute('data-tool-status') === 'done';
+      },
       'read tool-card never reached done state',
       30000
     );
     const toolCardArgs = await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.tool-card')];
       const last = cards[cards.length - 1];
-      return last
-        ? { name: last.querySelector('.tool-card__name')?.textContent || '', result: last.querySelector('.tool-card__result')?.textContent || '', hasArgs: last.querySelector('.tool-card__args') !== null }
-        : null;
+      if (!last || last.getAttribute('data-tool-name') !== 'read') return null;
+      const resultEl = last.querySelector('.tool-card__output') || last.querySelector('.tool-card__result');
+      return {
+        name: last.getAttribute('data-tool-name') || '',
+        result: resultEl ? resultEl.textContent || '' : '',
+        summaryPath: last.querySelector('.tool-card__summary-path')?.textContent || '',
+      };
     });
     if (!toolCardArgs || toolCardArgs.name !== 'read') fail(`tool-card name wrong: ${JSON.stringify(toolCardArgs)}`);
-    if (!toolCardArgs.hasArgs) fail('tool-card args pre (safeJson) never rendered');
+    if (toolCardArgs.summaryPath !== 'seed.txt') {
+      fail(`tool-card summary path never rendered: ${JSON.stringify(toolCardArgs)}`);
+    }
     if (!toolCardArgs.result.includes('web coverage seed')) fail(`tool-card result never showed the read file content: "${toolCardArgs.result}"`);
     record('app.tool-card-done');
+
+    await waitFor(
+      page,
+      () => document.getElementById('stream-badge').hidden === true,
+      'tool-card turn never settled',
+      30000,
+    );
+    const settledToolCard = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.tool-card')];
+      const last = cards[cards.length - 1];
+      if (!last) return null;
+      const resultEl = last.querySelector('.tool-card__output') || last.querySelector('.tool-card__result');
+      return {
+        name: last.getAttribute('data-tool-name') || '',
+        state: last.getAttribute('data-tool-status') || last.querySelector('.tool-card__state')?.textContent || '',
+        result: resultEl ? resultEl.textContent || '' : '',
+      };
+    });
+    if (!settledToolCard || settledToolCard.name !== 'read' || settledToolCard.state !== 'done') {
+      fail(`tool-card disappeared or changed after agent settlement: ${JSON.stringify(settledToolCard)}`);
+    }
+    if (!settledToolCard.result.includes('web coverage seed')) {
+      fail(`settled tool-card lost its result: ${JSON.stringify(settledToolCard)}`);
+    }
+    record('app.tool-card-settled');
+
+    await page.fill('#prompt-input', 'tool-card coverage web search');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('.tool-card')].some((card) =>
+        card.getAttribute('data-tool-name') === 'web_search' &&
+        card.getAttribute('data-tool-status') === 'error'
+      ),
+      'unavailable web_search tool card never rendered its deterministic error',
+      30000
+    );
+    const webSearchCard = await page.evaluate(() => {
+      const card = [...document.querySelectorAll('.tool-card')].find((node) =>
+        node.getAttribute('data-tool-name') === 'web_search'
+      );
+      if (!card) return null;
+      const resultEl = card.querySelector('.tool-card__output') || card.querySelector('.tool-card__result');
+      return {
+        hasArgs: card.querySelector('.tool-card__args') !== null,
+        isError: card.getAttribute('data-tool-status') === 'error' || card.querySelector('.tool-card__state--error') !== null,
+        result: resultEl ? resultEl.textContent || '' : '',
+      };
+    });
+    if (!webSearchCard?.hasArgs || !webSearchCard.isError || !webSearchCard.result.includes('Tool web_search not found')) {
+      fail(`unavailable web_search card did not render args and the real dispatch error: ${JSON.stringify(webSearchCard)}`);
+    }
+    record('app.tool-card-web-search');
+
+    await page.fill('#prompt-input', 'tool-card coverage edit seed');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => [...document.querySelectorAll('.tool-card--edit')].some((card) =>
+        card.querySelector('.tool-card__state--done') !== null
+      ),
+      'edit tool card never rendered and settled',
+      30000
+    );
+    const editCard = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.tool-card--edit')];
+      const card = cards[cards.length - 1];
+      if (!card) return null;
+      return {
+        path: card.querySelector('.tool-card__edit-path')?.textContent || '',
+        operation: card.querySelector('.tool-card__edit-op')?.textContent || '',
+        additions: [...card.querySelectorAll('.tool-card__diff-line--add')].map((line) => line.textContent || ''),
+        rawOpen: card.querySelector('details.tool-card__raw[open]') !== null,
+      };
+    });
+    if (!editCard || editCard.path !== 'seed.txt' || editCard.operation !== 'edit') {
+      fail(`edit card metadata wrong: ${JSON.stringify(editCard)}`);
+    }
+    if (!editCard.additions.some((line) => line.includes('web coverage edited')) || editCard.rawOpen) {
+      fail(`edit card semantic diff/default collapse wrong: ${JSON.stringify(editCard)}`);
+    }
+    record('app.tool-card-edit');
+
+    // ============== Codex Live realtime voice call (real App flow) ==============
+    // The fixture advertises live.enabled + mode=realtime with
+    // realtimeBaseUrl pointing at the loopback mock; the WebRTC platform APIs
+    // are stubbed (addInitScript) but the App's REAL startRealtime ->
+    // setupRealtimeCall path runs: getUserMedia -> RTCPeerConnection ->
+    // addTrack -> createDataChannel('oai-events') -> createOffer ->
+    // setLocalDescription -> REAL realtime_create_call RPC (Rust proxy ->
+    // mock POST /v1/realtime/calls) -> setRemoteDescription. Events then
+    // arrive over the stubbed data channel via window.__rtStub.sendFrame.
+    const rtOverlaySel = '#realtime-transcript';
+    await page.click('#mic-btn');
+    await waitFor(
+      page,
+      (sel) => document.querySelector(sel) !== null,
+      'realtime: overlay never appeared after the mic click',
+      30000,
+      rtOverlaySel
+    );
+    record('realtime.overlay-visible');
+    // The proxy's POST reached the mock with the contract headers; the mock
+    // recorded them (MOCK_REALTIME_EVIDENCE) for this assertion.
+    const rtCallMeta = await readJsonIfExists(path.join(evidence, 'realtime-call.json'));
+    if (!rtCallMeta || rtCallMeta.openaiAlpha !== 'quicksilver=v2') {
+      fail(`realtime: create-call proxy did not send OpenAI-Alpha: quicksilver=v2 (got ${JSON.stringify(rtCallMeta)})`);
+    }
+    if (!rtCallMeta.callId || !String(rtCallMeta.callId).startsWith('rtc_')) {
+      fail(`realtime: create-call call id missing/not rtc_ (got ${JSON.stringify(rtCallMeta)})`);
+    }
+    if (rtCallMeta.authPresent !== true) {
+      fail(`realtime: create-call proxy did not send the Bearer token (got ${JSON.stringify(rtCallMeta)})`);
+    }
+    record('realtime.proxy-alpha-header');
+    // Drive an input-transcript delta over the data channel: overlay text
+    // grows without a React re-render (direct node write).
+    await page.evaluate(() => window.__rtStub.sendFrame({ type: 'transcript.delta', delta: 'realtime hello ' }));
+    await waitFor(
+      page,
+      () => (document.querySelector('.realtime-transcript__text')?.textContent || '').includes('realtime hello'),
+      'realtime: transcript delta never reached the overlay',
+      10000
+    );
+    record('realtime.transcript-delta');
+    // A V1 final event commits the utterance to the composer.
+    await page.evaluate(() =>
+      window.__rtStub.sendFrame({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: 'realtime hello world',
+      })
+    );
+    await waitFor(
+      page,
+      () => (document.getElementById('prompt-input')?.value || '').includes('realtime hello world'),
+      'realtime: final transcript never committed to the composer',
+      10000
+    );
+    record('realtime.transcript-commit');
+    // The second V1 final variant for the same utterance must be deduped.
+    await page.evaluate(() =>
+      window.__rtStub.sendFrame({ type: 'conversation.input_transcript.done', transcript: 'realtime hello world' })
+    );
+    await page.waitForTimeout(400);
+    const committedOnce = await page.evaluate(
+      () => (document.getElementById('prompt-input')?.value.match(/realtime hello world/g) || []).length
+    );
+    if (committedOnce !== 1) fail(`realtime: final transcript double-committed (count ${committedOnce})`);
+    record('realtime.transcript-dedup');
+    // An error frame surfaces a bounded toast through realtimeErrorMessage.
+    await page.evaluate(() =>
+      window.__rtStub.sendFrame({ type: 'error', error: { message: 'realtime boom', code: 'E-2' } })
+    );
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('realtime error [E-2]: realtime boom'),
+      'realtime: error frame never surfaced a toast',
+      10000
+    );
+    record('realtime.error-toast');
+    // A delegation event renders the overlay delegation row.
+    await page.evaluate(() =>
+      window.__rtStub.sendFrame({ type: 'delegation.created', delegation: { description: 'delegating to writer' } })
+    );
+    await waitFor(
+      page,
+      () => (document.querySelector('.realtime-transcript__delegation')?.textContent || '').includes('delegating to writer'),
+      'realtime: delegation never rendered in the overlay',
+      10000
+    );
+    record('realtime.delegation');
+    // Stop via the same mic button: realtime_stop RPC + overlay teardown.
+    await page.click('#mic-btn');
+    await waitFor(
+      page,
+      (sel) => document.querySelector(sel) === null,
+      'realtime: overlay never disappeared after the stop click',
+      10000,
+      rtOverlaySel
+    );
+    record('realtime.stop');
 
     // ============== Phase L: reconnect (real server kill) ==============
     // The lane shell (coverage.sh) watches kill-server.marker, kills and
@@ -445,6 +864,20 @@ async function main() {
     const survives = await page.evaluate((tail) => document.body.textContent.includes(tail), slowTail);
     if (!survives) fail('pre-crash assistant reply vanished after the reconnect');
     record('reconnect.transcript-survives');
+    const toolCardAfterReconnect = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.tool-card')];
+      const readCard = cards.find((card) => card.getAttribute('data-tool-name') === 'read');
+      if (!readCard) return null;
+      const resultEl = readCard.querySelector('.tool-card__output') || readCard.querySelector('.tool-card__result');
+      return {
+        state: readCard.getAttribute('data-tool-status') || readCard.querySelector('.tool-card__state')?.textContent || '',
+        result: resultEl ? resultEl.textContent || '' : '',
+      };
+    });
+    if (!toolCardAfterReconnect || toolCardAfterReconnect.state !== 'done' || !toolCardAfterReconnect.result.includes('web coverage seed')) {
+      fail(`completed tool-card did not survive authoritative reconnect replay: ${JSON.stringify(toolCardAfterReconnect)}`);
+    }
+    record('app.tool-card-reconnect');
     const msgsBeforePost = await page.evaluate(() => document.querySelectorAll('.msg--assistant .assistant-text').length);
     await page.fill('#prompt-input', 'still here after the restart');
     await page.press('#prompt-input', 'Enter');
@@ -594,6 +1027,18 @@ async function main() {
     );
     record('todo.dep-unlink');
     // Detail-pane Complete button (covers the open-branch detail onClick).
+    const todoPanelDiag = await page.evaluate(() => ({
+      panelPresent: document.getElementById('todo-panel') !== null,
+      detailPresent: document.getElementById('todo-detail') !== null,
+      detailId: document.getElementById('todo-detail')?.dataset.taskId ?? '',
+      completeBtn: document.getElementById('todo-detail-complete') !== null,
+      reopenBtn: document.getElementById('todo-detail-reopen') !== null,
+      tasks: [...document.querySelectorAll('.todo-task')].map((r) => ({
+        text: r.textContent?.trim().slice(0, 40) || '',
+        status: r.querySelector('.todo-task__bullet')?.getAttribute('aria-label') || '',
+      })),
+    }));
+    console.error(`web-cov: TODO DIAG: ${JSON.stringify(todoPanelDiag)}`);
     await page.click('#todo-detail-complete');
     await waitFor(
       page,
@@ -996,6 +1441,226 @@ async function main() {
     await waitFor(page, () => document.getElementById('settings-panel') === null, 'settings panel did not close');
     record('settings.close');
 
+    // ============ Phase H2: slash command dispatch ============
+    // Web-supported slash surface (commands.ts parseSupportedCommand +
+    // slashDispatch.ts resolveSlashAction): /compact (llm RPC), /compact
+    // --snap (snapcompact RPC), /skill <name>, bare /skill (usage toast),
+    // /code-review (panel), /code-review <from> <to> (range args),
+    // /code-review <one arg> (usage toast), and an unknown /slash that
+    // falls through as a NORMAL prompt (user bubble + assistant reply).
+    // Every intercepted command renders a labeled summary bubble (or the
+    // usage toast) — never an optimistic user bubble.
+    const summaryIndexOf = (label) =>
+      page.evaluate((want) => {
+        const labels = [...document.querySelectorAll('#transcript .msg--summary__label')].map((n) => n.textContent || '');
+        const texts = [...document.querySelectorAll('#transcript .msg--summary__text')].map((n) => n.textContent || '');
+        const idx = labels.lastIndexOf(want);
+        return { idx, hasText: idx >= 0 ? (texts[idx] || '').trim() !== '' : false };
+      }, label);
+    // /compact --snap -> snapcompact RPC -> 'snapcompact' summary bubble.
+    let summaryBefore = await page.evaluate(() => document.querySelectorAll('#transcript .msg--summary').length);
+
+    // /compact --snap -> snapcompact RPC -> 'snapcompact' summary bubble.
+    await page.fill('#prompt-input', '/compact --snap');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      (b) => {
+        const labels = [...document.querySelectorAll('#transcript .msg--summary__label')].map((n) => n.textContent || '');
+        const texts = [...document.querySelectorAll('#transcript .msg--summary__text')].map((n) => n.textContent || '');
+        const idx = labels.lastIndexOf('snapcompact');
+        return idx >= b && (texts[idx] || '').trim() !== '';
+      },
+      'slash: /compact --snap never rendered a snapcompact summary bubble',
+      30000,
+      summaryBefore
+    );
+    const snapSummary = await page.evaluate(() => {
+      const labels = [...document.querySelectorAll('#transcript .msg--summary__label')].map((n) => n.textContent || '');
+      const texts = [...document.querySelectorAll('#transcript .msg--summary__text')].map((n) => n.textContent || '');
+      const idx = labels.lastIndexOf('snapcompact');
+      return idx >= 0 ? texts[idx] : '';
+    });
+    if (!/Snapcompact/.test(snapSummary) && !/snapcompact/.test(snapSummary)) {
+      fail(`slash: snapcompact bubble text does not name the report: "${snapSummary}"`);
+    }
+    record('slash.snapcompact');
+
+    // /compact <instructions> -> llm compact RPC -> 'compact' summary bubble.
+    summaryBefore = await page.evaluate(() => document.querySelectorAll('#transcript .msg--summary').length);
+    await page.fill('#prompt-input', '/compact reword the session summary');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      (b) => {
+        const labels = [...document.querySelectorAll('#transcript .msg--summary__label')].map((n) => n.textContent || '');
+        const texts = [...document.querySelectorAll('#transcript .msg--summary__text')].map((n) => n.textContent || '');
+        const idx = labels.lastIndexOf('compact');
+        return idx >= b && (texts[idx] || '').trim() !== '';
+      },
+      'slash: /compact <instructions> never rendered a compact summary bubble',
+      30000,
+      summaryBefore
+    );
+    const compactSummary = await page.evaluate(() => {
+      const labels = [...document.querySelectorAll('#transcript .msg--summary__label')].map((n) => n.textContent || '');
+      const texts = [...document.querySelectorAll('#transcript .msg--summary__text')].map((n) => n.textContent || '');
+      const idx = labels.lastIndexOf('compact');
+      return idx >= 0 ? texts[idx] : '';
+    });
+    if (!/Compact/.test(compactSummary) && !/compact/.test(compactSummary)) {
+      fail(`slash: compact bubble text does not name the report: "${compactSummary}"`);
+    }
+    record('slash.compact-llm');
+
+    // Bare /compact -> llm compact with EMPTY instructions (covers
+    // isSnapCompactArgs's empty-args branch: !trimmed -> false).
+    summaryBefore = await page.evaluate(() => document.querySelectorAll('#transcript .msg--summary').length);
+    await page.fill('#prompt-input', '/compact');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      (b) => {
+        const labels = [...document.querySelectorAll('#transcript .msg--summary__label')].map((n) => n.textContent || '');
+        const texts = [...document.querySelectorAll('#transcript .msg--summary__text')].map((n) => n.textContent || '');
+        const idx = labels.lastIndexOf('compact');
+        return idx >= b && (texts[idx] || '').trim() !== '';
+      },
+      'slash: bare /compact never rendered a compact summary bubble',
+      30000,
+      summaryBefore
+    );
+    record('slash.compact-bare');
+
+    // /compact --snap <trailing> -> snap path via the leading-flag regex
+    // (covers the /^--snap(?:\s|$)/ branch; trailing text is ignored).
+    summaryBefore = await page.evaluate(() => document.querySelectorAll('#transcript .msg--summary').length);
+    await page.fill('#prompt-input', '/compact --snap ignore the tail');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      (b) => {
+        const labels = [...document.querySelectorAll('#transcript .msg--summary__label')].map((n) => n.textContent || '');
+        const texts = [...document.querySelectorAll('#transcript .msg--summary__text')].map((n) => n.textContent || '');
+        const idx = labels.lastIndexOf('snapcompact');
+        return idx >= b && (texts[idx] || '').trim() !== '';
+      },
+      'slash: /compact --snap <tail> never rendered a snapcompact summary bubble',
+      30000,
+      summaryBefore
+    );
+    record('slash.snapcompact-tail');
+
+    // Bare /skill -> usage error toast (no summary bubble, no user bubble).
+    const userBubblesBeforeSkillError = await page.evaluate(() => document.querySelectorAll('.msg--user').length);
+    await page.fill('#prompt-input', '/skill');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () =>
+        Array.from(document.querySelectorAll('.toast--error')).some((t) =>
+          t.textContent.includes('usage: /skill')
+        ),
+      'slash: bare /skill never produced the usage error toast',
+      10000
+    );
+    const userBubblesAfterSkillError = await page.evaluate(() => document.querySelectorAll('.msg--user').length);
+    if (userBubblesAfterSkillError !== userBubblesBeforeSkillError) {
+      fail(`slash: bare /skill created an optimistic user bubble (+${userBubblesAfterSkillError - userBubblesBeforeSkillError}) — usage errors must not dispatch`);
+    }
+    record('slash.skill-usage-error');
+
+    // /skill <name> -> skill RPC -> 'skill' summary bubble (result or a
+    // visible dispatch error — the backend skill catalog has no 'audit').
+    summaryBefore = await page.evaluate(() => document.querySelectorAll('#transcript .msg--summary').length);
+    await page.fill('#prompt-input', '/skill audit');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      (b) => {
+        const labels = [...document.querySelectorAll('#transcript .msg--summary__label')].map((n) => n.textContent || '');
+        const texts = [...document.querySelectorAll('#transcript .msg--summary__text')].map((n) => n.textContent || '');
+        const idx = labels.lastIndexOf('skill');
+        return idx >= b && (texts[idx] || '').trim() !== '';
+      },
+      'slash: /skill audit never rendered a skill summary bubble',
+      30000,
+      summaryBefore
+    );
+    record('slash.skill-rpc');
+
+    // /code-review -> opens the review panel; close via its own Close button.
+    await page.fill('#prompt-input', '/code-review');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => document.getElementById('code-review-panel') !== null,
+      'slash: /code-review never opened the review panel',
+      30000
+    );
+    record('slash.code-review-open');
+    await page.click('.code-review__close.panel-close');
+    await waitFor(
+      page,
+      () => document.getElementById('code-review-panel') === null,
+      'slash: code-review panel never closed via its Close button'
+    );
+    record('slash.code-review-close');
+
+    // /code-review <from> <to> -> panel opens with the range args.
+    await page.fill('#prompt-input', '/code-review HEAD~1 HEAD');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => document.getElementById('code-review-panel') !== null,
+      'slash: /code-review range never opened the review panel',
+      30000
+    );
+    record('slash.code-review-range');
+    await page.click('.code-review__close.panel-close');
+    await waitFor(
+      page,
+      () => document.getElementById('code-review-panel') === null,
+      'slash: code-review range panel never closed'
+    );
+
+    // /code-review <one arg> -> usage error toast (zero or two revisions).
+    await page.fill('#prompt-input', '/code-review HEAD');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () =>
+        Array.from(document.querySelectorAll('.toast--error')).some((t) =>
+          t.textContent.includes('usage: /code-review')
+        ),
+      'slash: one-arg /code-review never produced the usage error toast',
+      10000
+    );
+    record('slash.code-review-usage-error');
+
+    // Unknown /slash falls through as a NORMAL prompt (no interception):
+    // a user bubble with the raw text + the mock's followup assistant reply.
+    const userBubblesBeforeFallthrough = await page.evaluate(() => document.querySelectorAll('.msg--user').length);
+    await page.fill('#prompt-input', '/definitely-not-a-command');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      (b) => {
+        const users = [...document.querySelectorAll('.msg--user')];
+        return users.length > b && (users[users.length - 1]?.textContent || '').includes('/definitely-not-a-command');
+      },
+      'slash: unknown /slash did not fall through as a normal user prompt',
+      30000,
+      userBubblesBeforeFallthrough
+    );
+    record('slash.unknown-falls-through');
+    await waitFor(
+      page,
+      () => document.getElementById('stream-badge').hidden === true,
+      'slash: unknown-/slash prompt never finished streaming before the next phase',
+      30000
+    );
+
     // ==================== Phase I: sessions panel ====================
     await waitFor(page, () => document.getElementById('session-sidebar') !== null, 'session sidebar did not render');
     await waitFor(
@@ -1163,14 +1828,23 @@ async function main() {
     });
     await waitFor(
       page,
+      () => ![...document.querySelectorAll('.subagent-job')]
+        .some((card) => (card.textContent || '').includes('audit the release notes')),
+      'cancelled subagent remained under Running',
+      30000
+    );
+    await page.click('.subagents-panel__filter-btn[data-filter="completed"]');
+    await waitFor(
+      page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
         const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
         return !!card && card.getAttribute('data-status') === 'cancelled';
       },
-      'subagent job never reached cancelled status',
+      'subagent job never appeared as cancelled under Completed',
       30000
     );
+    await page.click('.subagents-panel__filter-btn[data-filter="running"]');
     record('subagent.cancel');
 
     // ---- subagents coverage: spawn via Enter + message via Enter ----
@@ -1361,31 +2035,41 @@ async function main() {
     await page.click('.maintenance .panel-close');
     await waitFor(page, () => document.querySelector('.maintenance') === null, 'maintenance panel did not close via its close button');
     record('app.maintenance-close');
-    // The dedicated Steer/Follow up composer controls were removed (the
-    // primary Send/Steer button + Enter already cover both verbs, and Abort
-    // is active-only), so there are no #steer-btn/#followup-btn clicks to
-    // record here. The primary submit's send/steer labels are asserted in
-    // Phase A (app.primary-submit-send / app.primary-submit-steer).
+    // Enter preserves the prompt/steer keyboard flow; the single composer
+    // button switches between Send and Stop as asserted above.
 
     // ==================== Phase M: mobile viewport ====================
     const mobile = await browser.newPage({ viewport: { width: 375, height: 667 } });
     await connectPage(mobile);
+    // The fresh page bootstraps the FULL session history (get_messages in the
+    // connect bootstrap), so "any assistant text present" is true before the
+    // prompt is accepted and the composer shows Send while the session is
+    // still idle. Waiting on those two alone races the drawer measurements
+    // into the mobile turn's stream window: with odd mock parity the reply is
+    // the ~3s slow stream, and the idle-composer metrics then read
+    // "Stop generating" mid-turn. Wait on a settle condition tied to THIS
+    // prompt instead (mirrors the prime-turn pattern above): a NEW assistant
+    // message with non-empty text, the streaming badge cleared (agent_settled
+    // settled the turn), and the unified action back to Send message.
+    const beforeMobile = await mobile.evaluate(
+      () => document.querySelectorAll('.msg--assistant .assistant-text').length
+    );
     await mobile.fill('#prompt-input', 'hello from a phone');
     await mobile.press('#prompt-input', 'Enter');
     await waitFor(
       mobile,
-      () => {
+      (before) => {
         const nodes = [...document.querySelectorAll('.msg--assistant .assistant-text')];
-        return nodes.length > 0 && (nodes[nodes.length - 1]?.textContent || '').trim() !== '';
+        return (
+          nodes.length > before &&
+          (nodes[nodes.length - 1]?.textContent || '').trim() !== '' &&
+          document.getElementById('stream-badge')?.hidden === true &&
+          document.getElementById('send-btn')?.getAttribute('aria-label') === 'Send message'
+        );
       },
-      'mobile prompt never round-tripped',
-      60000
-    );
-    await waitFor(
-      mobile,
-      () => document.getElementById('send-btn')?.textContent?.trim() === 'Send' && document.getElementById('abort-btn') === null,
-      'mobile composer never returned to idle after prompt',
-      60000
+      'mobile prompt never round-tripped to an idle composer',
+      60000,
+      beforeMobile
     );
     const toggleDisplay = await mobile.evaluate(
       () => getComputedStyle(document.getElementById('sidebar-toggle-btn')).display
@@ -1429,10 +2113,8 @@ async function main() {
         const r = el.getBoundingClientRect();
         return { top: r.top, bottom: r.bottom, left: r.left, width: r.width, height: r.height };
       };
-      const footer = rect('footer');
+      const footer = rect('.app-main > footer');
       const ta = rect('#prompt-input');
-      // #abort-btn is active-only, so it is NOT in the DOM while idle; its
-      // 44px touch target is exercised while streaming (Phase A abort path).
       const targets = ['#send-btn', '#settings-toggle-btn', '#todos-toggle-btn'].map((sel) => ({
         sel,
         height: rect(sel) ? rect(sel).height : -1,
@@ -1446,7 +2128,7 @@ async function main() {
         textareaW: ta ? ta.width : -1,
         textareaH: ta ? ta.height : -1,
         targets,
-        abortPresent: document.querySelector('#abort-btn') !== null,
+        actionLabel: document.getElementById('send-btn')?.getAttribute('aria-label') || '',
         thinkingDisplay: thinking ? getComputedStyle(thinking).display : 'missing',
       };
     });
@@ -1458,17 +2140,15 @@ async function main() {
       fail(`composer sits below the fold: bottom ${metrics.composerBottom} > innerHeight ${metrics.innerHeight}`);
     }
     record('mobile.composer-above-fold');
-    // Idle usable composer: with the dedicated Steer/Follow up controls gone
-    // and Abort active-only, the textarea must be the dominant composer
-    // element on a phone and keep a usable entry height.
+    // Idle usable composer: the unified action leaves the textarea dominant.
     if (metrics.textareaW < 240) {
       fail(`#prompt-input usable width is ${metrics.textareaW}px at 375px (must be >= 240px)`);
     }
     if (metrics.textareaH < 44) {
       fail(`#prompt-input usable height is ${metrics.textareaH}px (must be >= 44px)`);
     }
-    if (metrics.abortPresent) {
-      fail('#abort-btn must not render while idle (active-only composer); found in DOM');
+    if (metrics.actionLabel !== 'Send message') {
+      fail(`mobile unified action did not return to Send: "${metrics.actionLabel}"`);
     }
     for (const t of metrics.targets) {
       if (t.height < 44) fail(`touch target ${t.sel} is ${t.height}px (must be >= 44px)`);
@@ -1494,6 +2174,381 @@ async function main() {
     await page.click('#todo-close-btn');
     await waitFor(page, () => document.getElementById('todo-panel') === null, 'todo panel did not close (nav)');
     record('nav.panel-open-close');
+
+    // ---- realtime call #2: ICE-gather event path, session.update, error
+    //      frame variants, dc error/close, connection-state buckets ----
+    // The second call arms window.__rtStub.gatherDelay so the fake peer
+    // connection starts 'gathering'; the test completes it via
+    // __rtStub.finishGathering(), driving waitForIceGatheringComplete's
+    // icegatheringstatechange listener + finish branches (the first call
+    // took the immediate-complete shortcut).
+    await page.evaluate(() => {
+      window.__rtStub.gatherDelay = true;
+    });
+    await page.click('#mic-btn');
+    await waitFor(
+      page,
+      (sel) => document.querySelector(sel) !== null,
+      'realtime#2: overlay never appeared after the second mic click',
+      30000,
+      rtOverlaySel
+    );
+    await waitFor(
+      page,
+      () => window.__rtStub && window.__rtStub.pc !== null,
+      'realtime#2: fake peer connection never created',
+      15000
+    );
+    await page.evaluate(() => window.__rtStub.finishGathering());
+    // The overlay exposes the live connection-state bucket once the mock
+    // answer lands (classifyRealtimeConnectionState('connected')).
+    await waitFor(
+      page,
+      () => document.getElementById('realtime-conn-state')?.dataset.state === 'connected',
+      'realtime#2: overlay never showed the connected connection state',
+      20000
+    );
+    record('realtime.conn-state-connected');
+    // Opening the data channel re-advertises the full V1 quicksilver session
+    // config (buildRealtimeSessionConfig) — the SAME shape the create-call
+    // POST body carries, with voice nested under audio.output.
+    await page.evaluate(() => window.__rtStub.openChannel());
+    const sessionUpdate = await page.evaluate(() => {
+      const dc = window.__rtStub.dc;
+      if (!dc) return null;
+      for (const data of dc.sent) {
+        try {
+          const obj = JSON.parse(data);
+          if (obj && obj.type === 'session.update') return obj;
+        } catch {
+          /* non-JSON frame */
+        }
+      }
+      return null;
+    });
+    if (
+      !sessionUpdate ||
+      sessionUpdate.session?.type !== 'quicksilver' ||
+      sessionUpdate.session.audio?.input?.format?.rate !== 24000 ||
+      !sessionUpdate.session.audio?.output?.voice
+    ) {
+      fail(`realtime#2: session.update frame missing the quicksilver config: ${JSON.stringify(sessionUpdate)}`);
+    }
+    record('realtime.session-update');
+    // Error-frame variants hit realtimeErrorMessage's fallback branches:
+    // message-only / code-only / bare (no detail).
+    await page.evaluate(() => window.__rtStub.sendFrame({ type: 'error', message: 'bare message detail' }));
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('realtime error: bare message detail'),
+      'realtime#2: message-only error frame never toasted',
+      10000
+    );
+    record('realtime.error-message-only');
+    await page.evaluate(() => window.__rtStub.sendFrame({ type: 'error', code: 'E-9' }));
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('realtime error [E-9]'),
+      'realtime#2: code-only error frame never toasted',
+      10000
+    );
+    record('realtime.error-code-only');
+    await page.evaluate(() => window.__rtStub.sendFrame({ type: 'error' }));
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('realtime session error'),
+      'realtime#2: bare error frame never produced the default toast',
+      10000
+    );
+    record('realtime.error-bare');
+    // Data-channel error -> bounded toast; the call stays up.
+    await page.evaluate(() => {
+      const dc = window.__rtStub.dc;
+      if (dc && dc.onerror) dc.onerror({});
+    });
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('realtime data channel error'),
+      'realtime#2: data channel error never toasted',
+      10000
+    );
+    record('realtime.dc-error');
+    // 'disconnected' connection state (transient ICE loss): interrupt toast,
+    // call stays UP.
+    await page.evaluate(() => {
+      const pc = window.__rtStub.pc;
+      pc.connectionState = 'disconnected';
+      if (pc.onconnectionstatechange) pc.onconnectionstatechange({});
+    });
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('realtime connection interrupted'),
+      'realtime#2: disconnected state never toasted the interrupt notice',
+      10000
+    );
+    const overlayAfterDisconnected = await page.evaluate(
+      (sel) => document.querySelector(sel) !== null,
+      rtOverlaySel
+    );
+    if (!overlayAfterDisconnected) fail('realtime#2: disconnected state tore the call down (must stay up)');
+    record('realtime.conn-disconnected');
+    // 'failed' connection state (terminal): toast + teardown (overlay closes).
+    await page.evaluate(() => {
+      const pc = window.__rtStub.pc;
+      pc.connectionState = 'failed';
+      if (pc.onconnectionstatechange) pc.onconnectionstatechange({});
+    });
+    await waitFor(
+      page,
+      () => document.body.textContent.includes('realtime connection failed'),
+      'realtime#2: failed state never toasted the terminal failure',
+      10000
+    );
+    await waitFor(
+      page,
+      (sel) => document.querySelector(sel) === null,
+      'realtime#2: failed state never tore the overlay down',
+      15000,
+      rtOverlaySel
+    );
+    record('realtime.conn-failed-teardown');
+
+
+    // ==================== Phase P: transcript + tool-title wire branches ====================
+    // Real-wire typed entries driven through the EXISTING helpers only — the
+    // raw second-session RPC client (Bash RPC -> bash_execution_end ->
+    // .msg--bash) and the steering mock's content-routed tool calls
+    // (tool_execution_start/end -> .tool-card with the generic fallback view).
+    // No WebSocket wrapping, no host switching: every frame is produced by the
+    // REAL backend and observed in the REAL page DOM.
+    const wireActiveSid = await page.evaluate(
+      () => document.querySelector('.session-sidebar__row--active .session-sidebar__switch')?.dataset.sessionId || ''
+    );
+    if (!wireActiveSid) fail('no active session id found in the sidebar for the wire branch phase');
+
+    // ---- bash_execution_end variants (real Bash RPC -> .msg--bash) ----
+    // NOTE: waitFor evaluates the predicate in the PAGE context — wanted
+    // command/status values MUST travel via the `arg` parameter, never as
+    // closures over Node-scope variables (they are undefined in-page). The
+    // predicate receives `arg` as its first (and only) parameter.
+    const bashCardWith = (want) => {
+      const cards = [...document.querySelectorAll('.msg--bash')];
+      const card = cards[cards.length - 1];
+      if (!card) return false;
+      const cmd = card.querySelector('.bash-command-text')?.textContent || '';
+      return cmd === want.command && card.getAttribute('data-bash-status') === want.status;
+    };
+    await rpc.call({ type: 'bash', sessionId: wireActiveSid, command: 'echo wire-bash-ok', excludeFromContext: false });
+    await waitFor(
+      page,
+      bashCardWith,
+      'wire: exit-0 bash never rendered a done .msg--bash card',
+      30000,
+      { command: 'echo wire-bash-ok', status: 'done' }
+    );
+    record('wire.bash-done');
+    await rpc.call({ type: 'bash', sessionId: wireActiveSid, command: 'true', excludeFromContext: false });
+    await waitFor(
+      page,
+      bashCardWith,
+      'wire: empty-output bash never rendered its done card',
+      30000,
+      { command: 'true', status: 'done' }
+    );
+    record('wire.bash-empty');
+    await rpc.call({ type: 'bash', sessionId: wireActiveSid, command: 'exit 7', excludeFromContext: false });
+    await waitFor(
+      page,
+      (want) => {
+        const cards = [...document.querySelectorAll('.msg--bash')];
+        const card = cards[cards.length - 1];
+        if (!card) return false;
+        const cmd = card.querySelector('.bash-command-text')?.textContent || '';
+        return cmd === want.command && card.getAttribute('data-bash-status') === 'error' && card.classList.contains('msg--bash--error');
+      },
+      'wire: non-zero bash exit never rendered an error .msg--bash card',
+      30000,
+      { command: 'exit 7' }
+    );
+    record('wire.bash-error');
+    // 25 output lines must fold to the last 10 with the "… 15 more lines"
+    // leading hint (BASH_OUTPUT_LINE_LIMIT tail bound, boundOutput).
+    await rpc.call({ type: 'bash', sessionId: wireActiveSid, command: 'seq 1 25', excludeFromContext: false });
+    await waitFor(
+      page,
+      (want) => {
+        const cards = [...document.querySelectorAll('.msg--bash')];
+        const card = cards[cards.length - 1];
+        if (!card) return false;
+        const cmd = card.querySelector('.bash-command-text')?.textContent || '';
+        const text = card.textContent || '';
+        return cmd === want.command && text.includes('15 more lines') && text.includes('25');
+      },
+      'wire: long bash output never rendered bounded to the 10-line tail',
+      30000,
+      { command: 'seq 1 25' }
+    );
+    record('wire.bash-bound-tail');
+
+    // ---- toolTitle + generic tool-card branches (real tool_execution_* dispatch) ----
+    // Each marker makes the backend dispatch an UNKNOWN tool whose wire name
+    // exercises humanToolTitle: snake_case Title-Case, whole-word acronym
+    // preservation (IRC/RPC), kebab-case Title-Case with acronyms (URL/HTTP),
+    // and credential redaction BEFORE title-casing (sk-* -> [REDACTED]).
+    // The deterministic "Tool <name> not found" error settles every card.
+    const wireTitleJourney = async (marker, toolName, expectedTitle, id) => {
+      await waitFor(
+        page,
+        () => document.getElementById('stream-badge').hidden === true,
+        `wire: session not idle before ${toolName}`,
+        30000
+      );
+      await page.fill('#prompt-input', marker);
+      await page.press('#prompt-input', 'Enter');
+      await waitFor(
+        page,
+        (name) => {
+          const cards = [...document.querySelectorAll('.tool-card')];
+          const card = cards.find((c) => c.getAttribute('data-tool-name') === name);
+          return !!card && card.getAttribute('data-tool-status') === 'error';
+        },
+        `wire: ${toolName} card never settled as error`,
+        30000,
+        toolName
+      );
+      const card = await page.evaluate((name) => {
+        const cards = [...document.querySelectorAll('.tool-card')];
+        const c = cards.find((node) => node.getAttribute('data-tool-name') === name);
+        if (!c) return null;
+        const title = c.querySelector('.tool-card__title')?.textContent || '';
+        const resultEl = c.querySelector('.tool-card__output') || c.querySelector('.tool-card__result');
+        return {
+          title,
+          name: c.getAttribute('data-tool-name') || '',
+          status: c.getAttribute('data-tool-status') || '',
+          result: resultEl ? resultEl.textContent || '' : '',
+        };
+      }, toolName);
+      if (!card || card.title !== expectedTitle) {
+        fail(`wire: ${toolName} card title wrong (want "${expectedTitle}", got ${JSON.stringify(card)})`);
+      }
+      if (card.status !== 'error' || !card.result.includes('not found')) {
+        fail(`wire: ${toolName} card did not surface the dispatch error: ${JSON.stringify(card)}`);
+      }
+      record(id);
+    };
+    await wireTitleJourney('tool-title coverage snake', 'code_search', 'Code Search', 'wire.title-snake');
+    await wireTitleJourney('tool-title coverage acronym', 'irc_rpc_status', 'IRC RPC Status', 'wire.title-acronym');
+    await wireTitleJourney('tool-title coverage kebab', 'url_http_check', 'URL HTTP Check', 'wire.title-kebab');
+    // The generic error card additionally proves the raw wire tool name and
+    // the error status survive on data attributes while the compact args line
+    // (compactToolArgs first-of command/path/pattern) renders, not raw JSON.
+    await waitFor(
+      page,
+      () => {
+        const cards = [...document.querySelectorAll('.tool-card')];
+        const card = cards.find((c) => c.getAttribute('data-tool-name') === 'code_search');
+        return (
+          !!card &&
+          card.querySelector('.tool-card__summary-line') !== null &&
+          card.querySelector('.tool-card__output') !== null
+        );
+      },
+      'wire: generic error card never rendered the compact summary line + output',
+      10000
+    );
+    const genericCard = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.tool-card')];
+      const card = cards.find((c) => c.getAttribute('data-tool-name') === 'code_search');
+      if (!card) return null;
+      const raw = card.querySelector('.tool-card__raw');
+      const argsEl = card.querySelector('.tool-card__args');
+      return {
+        name: card.getAttribute('data-tool-name') || '',
+        status: card.getAttribute('data-tool-status') || '',
+        summary: card.querySelector('.tool-card__summary-line')?.textContent || '',
+        rawOpen: !!raw && raw.hasAttribute('open'),
+        argsJson: argsEl ? argsEl.textContent || '' : '',
+      };
+    });
+    if (!genericCard || genericCard.name !== 'code_search' || genericCard.status !== 'error') {
+      fail(`wire: generic card metadata wrong: ${JSON.stringify(genericCard)}`);
+    }
+    if (genericCard.summary !== 'rpi') fail(`wire: compact args summary wrong: ${JSON.stringify(genericCard.summary)}`);
+    if (genericCard.rawOpen) fail('wire: generic card raw args must default to collapsed');
+    if (!genericCard.argsJson.includes('"pattern"') || !genericCard.argsJson.includes('"rpi"')) {
+      fail(`wire: generic card raw args lost the tool arguments: ${JSON.stringify(genericCard.argsJson)}`);
+    }
+    record('wire.tool-error-card');
+
+    // ---- transcript coverage: real Todo tool card (structured view) ----
+    // The steering mock routes this marker to a real `todo` tool call (op
+    // init, two phases). The runtime executes the REAL todo tool, so the
+    // transcript renders the structured Todo card: the running frame
+    // projects the init args (resolveTodoCardView -> todoPhasesFromInitArgs)
+    // and the settled frame projects the result details.phases
+    // (parseTodoPhases). Both must surface the phase/task list with typed
+    // status markers — never the raw args JSON as the default view.
+    await waitFor(
+      page,
+      () => document.getElementById('stream-badge').hidden === true,
+      'wire: session not idle before the todo card journey',
+      30000
+    );
+    await page.fill('#prompt-input', 'tool-card coverage todo init');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => {
+        const cards = [...document.querySelectorAll('.tool-card')];
+        const card = cards.find((c) => c.getAttribute('data-tool-name') === 'todo');
+        return !!card && card.querySelector('.tool-card__todo-phase') !== null;
+      },
+      'wire: todo tool card never rendered its phase list',
+      30000
+    );
+    record('wire.todo-card-running');
+    await waitFor(
+      page,
+      () => {
+        const cards = [...document.querySelectorAll('.tool-card')];
+        const card = cards.find((c) => c.getAttribute('data-tool-name') === 'todo');
+        return !!card && card.getAttribute('data-tool-status') === 'done';
+      },
+      'wire: todo tool card never reached the done state',
+      30000
+    );
+    const todoCard = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.tool-card')];
+      const card = cards.find((c) => c.getAttribute('data-tool-name') === 'todo');
+      if (!card) return null;
+      return {
+        status: card.getAttribute('data-tool-status') || '',
+        title: card.querySelector('.tool-card__name')?.textContent || '',
+        phases: [...card.querySelectorAll('.tool-card__todo-phase')].map((p) => ({
+          name: p.querySelector('.tool-card__todo-phase-name')?.textContent || '',
+          tasks: [...p.querySelectorAll('.tool-card__todo-task')].map((t) => ({
+            content: t.querySelector('.tool-card__todo-content')?.textContent || '',
+            status: t.getAttribute('data-status') || '',
+          })),
+        })),
+      };
+    });
+    if (!todoCard || todoCard.status !== 'done' || todoCard.title !== 'Todo') {
+      fail(`wire: todo card metadata wrong: ${JSON.stringify(todoCard)}`);
+    }
+    const todoPhaseNames = (todoCard.phases || []).map((p) => p.name);
+    if (!todoPhaseNames.includes('Plan') || !todoPhaseNames.includes('Build')) {
+      fail(`wire: todo card phases missing: ${JSON.stringify(todoPhaseNames)}`);
+    }
+    const todoTaskStatuses = (todoCard.phases || []).flatMap((p) => p.tasks.map((t) => t.status));
+    if (
+      todoTaskStatuses.length < 2 ||
+      !todoTaskStatuses.every((s) => ['pending', 'in_progress', 'completed', 'abandoned'].includes(s))
+    ) {
+      fail(`wire: todo card task statuses wrong: ${JSON.stringify(todoTaskStatuses)}`);
+    }
+    record('wire.todo-structured-view');
 
     // ---- evidence ----
     fs.mkdirSync(evidence, { recursive: true });

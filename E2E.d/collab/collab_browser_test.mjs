@@ -201,8 +201,8 @@ async function main() {
       const cards = document.querySelectorAll('#transcript .tool-card');
       if (cards.length === 0) return null;
       const card = cards[0];
-      const name = card.querySelector('.tool-card__name')?.textContent?.trim() || '';
-      const state = card.getAttribute('data-state') || card.querySelector('[class*="tool-card__state"]')?.className || '';
+      const name = card.querySelector('.tool-card__name, .tool-card__title')?.textContent?.trim() || '';
+      const state = card.getAttribute('data-tool-status') || card.querySelector('[class*="tool-card__state"]')?.className || '';
       return { name, state, total: cards.length };
     });
     assert('BG-05', 'tool card renders with name', toolCardInfo !== null && toolCardInfo.name.length > 0,
@@ -250,20 +250,19 @@ async function main() {
     if (role === 'control') {
       const promptEnabled = await page.evaluate(() => {
         const input = document.getElementById('prompt-input');
-        const send = document.getElementById('send-btn');
-        const abort = document.getElementById('abort-btn');
+        const action = document.getElementById('send-btn');
         return {
           inputExists: input !== null,
           inputDisabled: input?.disabled === true,
-          sendExists: send !== null,
-          sendDisabled: send?.disabled === true,
-          abortExists: abort !== null,
+          actionExists: action !== null,
+          actionDisabled: action?.disabled === true,
+          actionLabel: action?.getAttribute('aria-label') || '',
         };
       });
-      assert('BG-07', 'control guest: composer enabled (prompt-input + send-btn + abort-btn present)',
+      assert('BG-07', 'control guest: composer enabled with one unified action',
         promptEnabled.inputExists && !promptEnabled.inputDisabled &&
-        promptEnabled.sendExists && promptEnabled.abortExists,
-        `input=${promptEnabled.inputExists} disabled=${promptEnabled.inputDisabled} send=${promptEnabled.sendExists} abort=${promptEnabled.abortExists}`);
+        promptEnabled.actionExists && !promptEnabled.actionDisabled && promptEnabled.actionLabel === 'Send message',
+        `input=${promptEnabled.inputExists} disabled=${promptEnabled.inputDisabled} action=${promptEnabled.actionExists} label=${promptEnabled.actionLabel}`);
 
       // BG-07b: control can type and send a prompt
       const testPrompt = 'browser-collab-e2e-prompt';
@@ -287,30 +286,25 @@ async function main() {
     } else {
       const viewState = await page.evaluate(() => {
         const input = document.getElementById('prompt-input');
-        const send = document.getElementById('send-btn');
-        const abort = document.getElementById('abort-btn');
+        const action = document.getElementById('send-btn');
         const notice = document.querySelector('.collab-viewonly-notice');
         return {
           inputExists: input !== null,
           inputDisabled: input?.disabled === true,
-          inputHidden: input?.hidden === true || getComputedStyle(input).display === 'none',
-          sendExists: send !== null,
-          sendDisabled: send?.disabled === true,
-          abortExists: abort !== null,
-          abortDisabled: abort?.disabled === true,
+          inputHidden: input?.hidden === true || (input ? getComputedStyle(input).display === 'none' : true),
+          actionExists: action !== null,
+          actionDisabled: action?.disabled === true,
           noticeVisible: notice !== null && getComputedStyle(notice).display !== 'none',
         };
       });
-      assert('BG-07', 'view guest: composer disabled (prompt-input disabled, send-btn disabled, view-only notice visible)',
-        viewState.inputDisabled && viewState.sendDisabled &&
-        (viewState.inputHidden || !viewState.sendExists || viewState.sendDisabled) &&
-        viewState.noticeVisible,
-        `inputDisabled=${viewState.inputDisabled} sendDisabled=${viewState.sendDisabled} notice=${viewState.noticeVisible}`);
+      assert('BG-07', 'view guest: composer unavailable and view-only notice visible',
+        (viewState.inputHidden || !viewState.inputExists || viewState.inputDisabled) &&
+        (!viewState.actionExists || viewState.actionDisabled) && viewState.noticeVisible,
+        `input=${viewState.inputExists} disabled=${viewState.inputDisabled} action=${viewState.actionExists} notice=${viewState.noticeVisible}`);
 
-      // BG-07b: view guest cannot type (disabled input)
-      assert('BG-07b', 'view guest: abort button disabled or absent',
-        !viewState.abortExists || viewState.abortDisabled,
-        `abortExists=${viewState.abortExists} abortDisabled=${viewState.abortDisabled}`);
+      assert('BG-07b', 'view guest: unified composer action disabled or absent',
+        !viewState.actionExists || viewState.actionDisabled,
+        `actionExists=${viewState.actionExists} actionDisabled=${viewState.actionDisabled}`);
     }
 
     // ── BG-08: no host path in DOM ─────────────────────────────────────

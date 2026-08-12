@@ -1,4 +1,4 @@
-// Goal panel (D90) — current goal (objective, lifecycle, token budget +
+// Goal panel — current goal (objective, lifecycle, token budget +
 // usage, pins), lifecycle actions, and the goal journal replay view.
 //
 // Wire shapes mirror pi-coding (serde camelCase / snake_case lifecycles) —

@@ -32,15 +32,17 @@
 //!   back to the plain `/bin/bash` subprocess path so the observable result
 //!   is unchanged. Runtime command errors stay in brush (they produce output
 //!   and an exit code like bash would).
-//! - **Timeout/abort**: brush runs on a dedicated thread with its own
-//!   current-thread tokio runtime. On timeout/abort, processes spawned by the
-//!   command (descendants of this process that were not present at the start,
-//!   guarded by `/proc/<pid>/stat` start times against pid reuse) are
-//!   SIGTERM/SIGKILLed, the shell is given a short grace to unwind, and a
-//!   pure-builtin busy loop that cannot be interrupted in-process is
-//!   abandoned (the tool call returns; the thread dies with the process).
-//!   Brush executions are serialized process-wide so descendant attribution
-//!   never crosses runs.
+//! - **Timeout/abort**: brush runs on a dedicated `pi-brush-bash` thread with
+//!   its own current-thread tokio runtime. On timeout/abort, only processes
+//!   forked by that thread (and their descendants) that were not present in
+//!   the pre-command baseline — guarded by `/proc/<pid>/stat` start times
+//!   against pid reuse — are SIGTERM/SIGKILLed. Enumeration is rooted at
+//!   `/proc/<pid>/task/<brush_tid>/children`, so concurrent children of other
+//!   threads (PDF extractors, converters, etc.) are never reaped. The shell
+//!   is given a short grace to unwind, and a pure-builtin busy loop that
+//!   cannot be interrupted in-process is abandoned (the tool call returns;
+//!   the thread dies with the process). Brush executions are still serialized
+//!   process-wide so bash-to-bash descendant attribution never crosses runs.
 //! - **Host guards**: in-process execution shares the rpi process, so
 //!   builtins that would replace/stop/mutate the host are refused with an
 //!   actionable message (`exec`, `suspend`, `ulimit`, `umask`) and `kill` is
@@ -53,7 +55,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -85,12 +87,12 @@ const BRUSH_EXIT_GRACE: Duration = Duration::from_secs(2);
 /// an idle window means the pipe has been fully drained.
 const BRUSH_READER_IDLE_MS: u16 = 200;
 
-/// Process-wide serialization of brush executions. Descendant attribution for
-/// timeout/abort reaping (baseline snapshot + kill of new descendants) is
-/// only sound when no other bash run is spawning descendants concurrently, so
-/// brush runs take turns. `run_bash_core` holds the same lock for the
-/// sandboxed subprocess path, so a brush timeout can never reap another
-/// bash run's children either.
+/// Process-wide serialization of brush executions. Bash-to-bash descendant
+/// attribution remains sound under this lock; timeout/abort reaping itself is
+/// thread-scoped to the dedicated brush TID (see [`collect_thread_descendants`]),
+/// so non-bash spawners (PDF, converters, …) are never killed by a concurrent
+/// brush timeout. `run_bash_core` holds the same lock for the sandboxed
+/// subprocess path as well.
 static BASH_EXEC_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Outcome of an in-process brush execution.
@@ -179,13 +181,11 @@ async fn run_brush_command_impl(
     abort: AbortSignal,
     stream: Arc<dyn Fn(&[u8]) + Send + Sync>,
 ) -> Result<BrushRunOutcome> {
-    // Baseline descendants of this process (pid -> start time). Only
-    // processes absent from the baseline — or present with a different start
-    // time, i.e. a recycled pid — may be reaped on timeout/abort.
-    let Some(baseline) = descendant_snapshot() else {
-        // Cannot reap safely (no /proc); keep the subprocess path.
+    // /proc is required for thread-scoped descendant reaping. The baseline
+    // itself is taken after the brush thread publishes its TID (below).
+    if !Path::new("/proc/self").exists() {
         return Ok(BrushRunOutcome::Fallback);
-    };
+    }
 
     // Merged stdout+stderr capture: one pipe, writer duplicated for fd 1 and
     // fd 2 so interleaving order is preserved (same design as the sandbox
@@ -204,6 +204,15 @@ async fn run_brush_command_impl(
     let env = env.to_vec();
     let (tx, mut rx) = oneshot::channel::<ThreadResult>();
 
+    // Brush thread TID is the reap root: only children forked by that thread
+    // (and their descendants) may be killed on timeout/abort. The thread
+    // publishes its TID, waits for the caller to capture the pre-command
+    // baseline, then runs the command.
+    let brush_tid = Arc::new(AtomicI32::new(0));
+    let baseline_done = Arc::new(AtomicBool::new(false));
+    let brush_tid_thread = brush_tid.clone();
+    let baseline_done_thread = baseline_done.clone();
+
     // The brush session runs on a dedicated thread with its own current-thread
     // tokio runtime: long-running commands (external children, quiet gaps)
     // must not block the main runtime, and a busy builtin loop that cannot be
@@ -211,6 +220,15 @@ async fn run_brush_command_impl(
     let handle = std::thread::Builder::new()
         .name("pi-brush-bash".to_owned())
         .spawn(move || {
+            // Publish this thread's kernel TID before any command work so the
+            // caller can baseline `/proc/self/task/<tid>/children`.
+            let tid = nix::unistd::gettid().as_raw();
+            brush_tid_thread.store(tid, Ordering::Release);
+            // Wait until the caller has captured the pre-command baseline.
+            while !baseline_done_thread.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+
             let send = |result: ThreadResult| {
                 let _ = tx.send(result);
             };
@@ -271,6 +289,28 @@ async fn run_brush_command_impl(
             send(thread_result);
         })
         .map_err(|e| anyhow!("{}", e))?;
+
+    // Wait for the brush thread to publish its TID, snapshot that thread's
+    // (normally empty) children, then release the thread to run the command.
+    let tid = loop {
+        let tid = brush_tid.load(Ordering::Acquire);
+        if tid != 0 {
+            break tid;
+        }
+        if handle.is_finished() {
+            // Thread died before publishing a TID; nothing to reap.
+            return Ok(BrushRunOutcome::Fallback);
+        }
+        tokio::task::yield_now().await;
+    };
+    let Some(baseline) = descendant_snapshot(tid) else {
+        // Should be unreachable after the /proc check above; if the thread's
+        // task dir vanished, fall back rather than reaping process-wide.
+        baseline_done.store(true, Ordering::Release);
+        drop(handle);
+        return Ok(BrushRunOutcome::Fallback);
+    };
+    baseline_done.store(true, Ordering::Release);
 
     // Reader: polls the merged pipe and streams chunks into the accumulator.
     // While the command runs, quiet periods are tolerated; once `ended` is
@@ -357,7 +397,7 @@ async fn run_brush_command_impl(
             // pure-builtin busy loop cannot be interrupted in-process, so the
             // thread is abandoned after the grace; the tool call still
             // returns, and the thread dies with the process.
-            kill_new_descendants(&baseline);
+            kill_new_descendants(&baseline, tid);
             let _ = tokio::time::timeout(BRUSH_EXIT_GRACE, &mut rx).await;
             ended.store(true, Ordering::Release);
             let _ = reader_task.await;
@@ -496,27 +536,53 @@ fn host_refusal(context: &ExecutionContext<'_, DefaultShellExtensions>, name: &s
 // Descendant tracking (Linux /proc)
 // ---------------------------------------------------------------------------
 
-/// pid -> start time (`/proc/<pid>/stat` field 22) for every descendant of
-/// this process, recursively.
+/// pid -> start time (`/proc/<pid>/stat` field 22) for every descendant under
+/// a scoped root (brush thread children + their recursive descendants).
 #[cfg(target_os = "linux")]
 type DescendantSnapshot = HashMap<i32, u64>;
 
+/// Snapshot of processes currently in the brush thread's descendant tree.
+/// Rooted at children forked by `brush_tid` of this process; deeper levels
+/// include every thread of each child process (grandchildren may be forked by
+/// any thread of a child).
 #[cfg(target_os = "linux")]
-fn descendant_snapshot() -> Option<DescendantSnapshot> {
+fn descendant_snapshot(brush_tid: i32) -> Option<DescendantSnapshot> {
     if !Path::new("/proc/self").exists() {
         return None;
     }
     let mut snapshot = DescendantSnapshot::new();
-    collect_descendants(std::process::id() as i32, &mut snapshot);
+    collect_thread_descendants(std::process::id() as i32, brush_tid, &mut snapshot);
     Some(snapshot)
 }
 
+/// Top-level collector rooted at a single thread of `pid`: reads only
+/// `/proc/<pid>/task/<tid>/children`, then recurses with
+/// [`collect_descendants`] so grandchildren forked by any thread of a child
+/// process are included. This is the brush reap scope — never the whole
+/// process's every-thread children list.
+#[cfg(target_os = "linux")]
+fn collect_thread_descendants(pid: i32, tid: i32, out: &mut DescendantSnapshot) {
+    let Ok(contents) =
+        std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/children"))
+    else {
+        return; // thread or process vanished; keep what we have
+    };
+    for child in contents.split_whitespace() {
+        let Ok(child) = child.parse::<i32>() else { continue };
+        if let Some(start) = process_start_time(child) {
+            out.insert(child, start);
+        }
+        collect_descendants(child, out);
+    }
+}
+
+/// Recursively collect every child of `pid` across all of its threads.
+/// Used for levels below the brush thread: a grandchild may be forked by any
+/// thread of an intermediate child process, so the full task directory must
+/// be scanned — reading only `task/<pid>/children` (the main thread) would
+/// silently miss them.
 #[cfg(target_os = "linux")]
 fn collect_descendants(pid: i32, out: &mut DescendantSnapshot) {
-    // /proc/<pid>/task/<tid>/children lists the children forked by ONE
-    // thread. Commands spawned by the brush thread are forked from that
-    // thread, so the whole task directory must be scanned — reading only
-    // task/<pid>/children (the main thread) silently misses them.
     let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
         return; // process vanished mid-walk; keep what we have
     };
@@ -549,24 +615,41 @@ fn process_start_time(pid: i32) -> Option<u64> {
     fields.get(19).and_then(|field| field.parse().ok())
 }
 
-/// Test-only descendant count (all threads), used to assert timeout/abort
-/// reaping leaves no orphaned children behind.
+/// Test-only count of live descendants under any `pi-brush-bash` thread.
+/// Scoped the same way as timeout reaping so concurrent non-bash children
+/// (PDF extractors, sibling tests) do not inflate the count.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn test_descendant_count() -> usize {
+    let pid = std::process::id() as i32;
     let mut snapshot = DescendantSnapshot::new();
-    collect_descendants(std::process::id() as i32, &mut snapshot);
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return 0;
+    };
+    for task in tasks.flatten() {
+        let Ok(tid) = task.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm")) else {
+            continue;
+        };
+        if comm.trim() != "pi-brush-bash" {
+            continue;
+        }
+        collect_thread_descendants(pid, tid, &mut snapshot);
+    }
     snapshot.len()
 }
 
-/// SIGTERM then SIGKILL every descendant not present in the baseline (or
-/// present with a different start time — the pid was recycled). Best-effort:
-/// a process that already exited is a no-op.
+/// SIGTERM then SIGKILL every descendant under `brush_tid` that is not present
+/// in the baseline (or present with a different start time — the pid was
+/// recycled). Best-effort: a process that already exited is a no-op. Only the
+/// brush thread's subtree is scanned — never process-wide.
 #[cfg(target_os = "linux")]
-fn kill_new_descendants(baseline: &DescendantSnapshot) {
+fn kill_new_descendants(baseline: &DescendantSnapshot, brush_tid: i32) {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     let mut current = DescendantSnapshot::new();
-    collect_descendants(std::process::id() as i32, &mut current);
+    collect_thread_descendants(std::process::id() as i32, brush_tid, &mut current);
     let targets: Vec<i32> = current
         .iter()
         .filter(|(pid, start)| baseline.get(pid) != Some(start))
@@ -581,5 +664,213 @@ fn kill_new_descendants(baseline: &DescendantSnapshot) {
     std::thread::sleep(Duration::from_millis(100));
     for pid in &targets {
         let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests (Linux /proc thread-scoped descendant contract)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn process_alive(pid: i32) -> bool {
+        // /proc/<pid> remains for zombies until reaped; only non-zombie
+        // states count as still live (Z = dead, waiting for waitpid).
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(close) = stat.rfind(')') else {
+            return false;
+        };
+        let state = stat[close + 1..].split_whitespace().next().unwrap_or("");
+        state != "Z" && !state.is_empty()
+    }
+
+
+    /// A child forked by a sibling thread must not appear in the brush-thread
+    /// subtree — this is the contract that prevents timeout reaping from
+    /// SIGKILLing concurrent PDF/converter children.
+    #[test]
+    fn thread_scoped_snapshot_excludes_sibling_thread_children() {
+        let pid = std::process::id() as i32;
+        let self_tid = nix::unistd::gettid().as_raw();
+
+        let (child_tx, child_rx) = mpsc::channel::<i32>();
+        let sibling = std::thread::Builder::new()
+            .name("sibling-spawner".to_owned())
+            .spawn(move || {
+                let mut child = Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn sibling sleep");
+                let child_pid = child.id() as i32;
+                let _ = child_tx.send(child_pid);
+                let _ = child.wait();
+            })
+            .expect("spawn sibling thread");
+
+        let sibling_child = child_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sibling child pid");
+        assert!(
+            process_alive(sibling_child),
+            "sibling child {sibling_child} must be alive"
+        );
+
+        let mut brush_scope = DescendantSnapshot::new();
+        collect_thread_descendants(pid, self_tid, &mut brush_scope);
+        assert!(
+            !brush_scope.contains_key(&sibling_child),
+            "sibling thread child {sibling_child} must not appear in this thread's subtree: {brush_scope:?}"
+        );
+
+        // Process-wide scan still sees it (documents the old bug surface).
+        let mut whole = DescendantSnapshot::new();
+        collect_descendants(pid, &mut whole);
+        assert!(
+            whole.contains_key(&sibling_child),
+            "process-wide scan must still observe sibling child {sibling_child}"
+        );
+
+        // Cleanup: SIGKILL the sibling child so the thread can exit.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(sibling_child),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = sibling.join();
+    }
+
+    /// Grandchildren forked by a direct child of this thread must still be
+    /// enumerated (and therefore reaped) under the thread-scoped collector.
+    #[test]
+    fn thread_scoped_snapshot_includes_grandchildren() {
+        let pid = std::process::id() as i32;
+        let self_tid = nix::unistd::gettid().as_raw();
+
+        // `sh -c 'sleep 300 & wait'` keeps `sh` as the direct child and
+        // `sleep` as a grandchild (sh does not exec, so both stay live).
+        let mut sh = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 & echo $!; wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh with sleep grandchild");
+        let sh_pid = sh.id() as i32;
+
+        // Read the grandchild pid that sh printed.
+        let mut stdout = sh.stdout.take().expect("sh stdout");
+        let mut buf = String::new();
+        // Bounded read: one line with the background sleep pid.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while buf.lines().next().map(|l| l.trim().is_empty()).unwrap_or(true)
+            && std::time::Instant::now() < deadline
+        {
+            use std::io::Read;
+            let mut tmp = [0u8; 64];
+            match stdout.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.push_str(&String::from_utf8_lossy(&tmp[..n])),
+                Err(_) => break,
+            }
+        }
+        let grandchild: i32 = buf
+            .lines()
+            .next()
+            .expect("grandchild pid line")
+            .trim()
+            .parse()
+            .expect("grandchild pid number");
+        assert!(
+            process_alive(grandchild),
+            "grandchild sleep {grandchild} must be alive"
+        );
+
+        let mut snap = DescendantSnapshot::new();
+        collect_thread_descendants(pid, self_tid, &mut snap);
+        assert!(
+            snap.contains_key(&sh_pid),
+            "direct child sh {sh_pid} must be in thread scope: {snap:?}"
+        );
+        assert!(
+            snap.contains_key(&grandchild),
+            "grandchild sleep {grandchild} must be in thread scope: {snap:?}"
+        );
+
+        // kill_new_descendants with empty baseline must reap both.
+        let empty = DescendantSnapshot::new();
+        kill_new_descendants(&empty, self_tid);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if !process_alive(sh_pid) && !process_alive(grandchild) {
+                let _ = sh.wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(sh_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(grandchild),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = sh.wait();
+        panic!("thread-scoped reap left sh={sh_pid} and/or sleep={grandchild} alive");
+    }
+
+    /// Sibling children must survive a kill_new_descendants pass scoped to
+    /// this thread — the PDF race root-cause regression.
+    #[test]
+    fn kill_new_descendants_does_not_reap_sibling_thread_children() {
+        let self_tid = nix::unistd::gettid().as_raw();
+
+        let (child_tx, child_rx) = mpsc::channel::<i32>();
+        let sibling = std::thread::Builder::new()
+            .name("sibling-spawner".to_owned())
+            .spawn(move || {
+                let mut child = Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn sibling sleep");
+                let child_pid = child.id() as i32;
+                let _ = child_tx.send(child_pid);
+                let _ = child.wait();
+            })
+            .expect("spawn sibling thread");
+
+        let sibling_child = child_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sibling child pid");
+
+        // Empty baseline + this thread's TID: should not touch sibling child.
+        let empty = DescendantSnapshot::new();
+        kill_new_descendants(&empty, self_tid);
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            process_alive(sibling_child),
+            "sibling child {sibling_child} must survive brush-scoped reap"
+        );
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(sibling_child),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = sibling.join();
     }
 }

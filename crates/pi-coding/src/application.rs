@@ -3105,6 +3105,16 @@ impl Application {
     pub fn share_session(&self) {
         let session = self.runtime().session();
         let events = self.inner.events.clone();
+        // Offline contract: fail closed before spawning `gh` or touching the
+        // network. `PI_OFFLINE` (process env or session env overlay) makes
+        // gist sharing deterministically unavailable, mirroring
+        // `self_update`/`web_search`.
+        if crate::share::share_offline_for(&session) {
+            let _ = events.send(ApplicationEvent::ShareFailed {
+                message: crate::share::OFFLINE_MESSAGE.to_owned(),
+            });
+            return;
+        }
         let options = crate::export::ExportOptions::default();
         tokio::spawn(async move {
             let result = crate::share::share_session(&session, &options).await;

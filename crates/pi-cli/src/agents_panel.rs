@@ -747,7 +747,7 @@ fn model_source_label(source: AgentModelSource) -> &'static str {
 const PERSONA_COUNT_BOUND: usize = 9_999;
 
 /// Bounded persona contract summary for one panel row.
-fn persona_contract_summary(definition: &AgentDefinition) -> String {
+pub(crate) fn persona_contract_summary(definition: &AgentDefinition) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(
         if definition
@@ -796,13 +796,13 @@ fn persona_contract_summary(definition: &AgentDefinition) -> String {
 /// (returns 0); symlinked or non-regular state reports an error instead of
 /// being followed.
 #[derive(Clone, Debug, Default)]
-struct PersonaStateCounts {
-    memory_entries: Option<usize>,
-    transcript_count: Option<usize>,
-    error: Option<String>,
+pub(crate) struct PersonaStateCounts {
+    pub(crate) memory_entries: Option<usize>,
+    pub(crate) transcript_count: Option<usize>,
+    pub(crate) error: Option<String>,
 }
 
-fn persona_state_counts(root: Option<PathBuf>) -> PersonaStateCounts {
+pub(crate) fn persona_state_counts(root: Option<PathBuf>) -> PersonaStateCounts {
     let Some(root) = root else {
         return PersonaStateCounts::default();
     };

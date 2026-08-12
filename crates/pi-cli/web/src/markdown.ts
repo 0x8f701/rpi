@@ -1,6 +1,7 @@
-import { escapeHtml, redactSecrets, safeImage } from './redact';
+import { escapeHtml, escapeHtmlRaw, redactSecrets, safeImage } from './redact';
 import katex from 'katex';
 import mermaid from 'mermaid';
+import { codeLanguage } from './attachments';
 // highlight.js core build + a focused language subset (tree-shakeable
 // per-language imports; auto-detection uses only the registered set).
 import hljs from 'highlight.js/lib/core';
@@ -23,6 +24,7 @@ import xml from 'highlight.js/lib/languages/xml';
 import yaml from 'highlight.js/lib/languages/yaml';
 import 'highlight.js/styles/github-dark.css';
 import 'katex/dist/katex.min.css';
+import { normalizeThinkingNewlines } from './transcript';
 import type { ContentBlock } from './types';
 
 const hljsLanguages = {
@@ -31,6 +33,132 @@ const hljsLanguages = {
 };
 for (const [name, def] of Object.entries(hljsLanguages)) {
   hljs.registerLanguage(name, def);
+}
+
+/* ------------------------------------------------------------------ *
+ * Diff-line highlighting (code-review pane). One hljs call per contiguous
+ * run of lines instead of one per line; each returned fragment is balanced
+ * and its textContent equals redactSecrets(line.text) — the exact text the
+ * plain renderer (safeText) shows, credential-shaped content included.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Resolve a registered highlight.js language for a repo-relative path via the
+ * shared filename→language mapping (attachments.ts). Returns null when the
+ * path maps to no language or to a language outside the registered subset —
+ * such lines render as plain text.
+ */
+export function diffPathLanguage(path: string): string | null {
+  const hint = codeLanguage(path);
+  if (!hint) return null;
+  const base = hint.toLowerCase();
+  return hljs.getLanguage(base) ? base : null;
+}
+
+/**
+ * Split one hljs block output into per-line fragments. hljs emits literal
+ * '\n' for newlines and a token may span lines (multi-line comments, raw
+ * strings); at every line boundary the open spans are closed and re-opened on
+ * the next line so each fragment is balanced HTML with the same textContent
+ * as the joined source. The tag walk only matches hljs's own
+ * `<span class="...">` / `</span>` pairs.
+ */
+function splitHighlightedLines(html: string): string[] {
+  const lines: string[] = [];
+  const openTags: string[] = [];
+  let current = '';
+  let index = 0;
+  while (index < html.length) {
+    const ch = html[index];
+    if (ch === '<') {
+      const tagEnd = html.indexOf('>', index);
+      if (tagEnd === -1) {
+        current += html.slice(index);
+        break;
+      }
+      const tag = html.slice(index, tagEnd + 1);
+      if (tag.startsWith('<span class="')) {
+        openTags.push(tag);
+        current += tag;
+      } else if (tag === '</span>') {
+        openTags.pop();
+        current += tag;
+      } else {
+        current += tag;
+      }
+      index = tagEnd + 1;
+      continue;
+    }
+    if (ch === '\n') {
+      if (openTags.length > 0) {
+        current += '</span>'.repeat(openTags.length);
+      }
+      lines.push(current);
+      current = openTags.length > 0 ? openTags.join('') : '';
+      index += 1;
+      continue;
+    }
+    current += ch;
+    index += 1;
+  }
+  lines.push(current);
+  return lines;
+}
+
+/**
+ * Batch-highlight diff line bodies. `texts` uses null for lines that must
+ * stay plain (meta lines); each maximal run of non-null lines is highlighted
+ * with ONE hljs call (bounded hunk/page granularity) and split back into one
+ * balanced HTML fragment per line. `language` must be a registered language
+ * name (see diffPathLanguage). Fragments are hljs-escaped — hostile input
+ * stays literal — and every line passes through redactSecrets() FIRST so the
+ * highlighted textContent is byte-identical to what the pane's plain renderer
+ * (safeText) shows: ordinary/hostile source verbatim, credential-shaped
+ * content as [REDACTED]. A thrown grammar (or a fragment-count mismatch)
+ * falls back to plain escaped text per line with the same redaction.
+ */
+export function highlightDiffLineFragments(
+  language: string,
+  texts: ReadonlyArray<string | null>,
+): Array<string | null> {
+  const fragments: Array<string | null> = new Array(texts.length).fill(null);
+  let runStart = -1;
+  const flushRun = (end: number) => {
+    if (runStart < 0 || end <= runStart) return;
+    const run = texts.slice(runStart, end) as string[];
+    const highlighted = highlightLineRun(language, run);
+    for (let i = 0; i < highlighted.length; i++) {
+      fragments[runStart + i] = highlighted[i];
+    }
+    runStart = -1;
+  };
+  for (let i = 0; i <= texts.length; i++) {
+    if (i < texts.length && texts[i] !== null) {
+      if (runStart < 0) runStart = i;
+    } else {
+      flushRun(i);
+    }
+  }
+  return fragments;
+}
+
+function highlightLineRun(language: string, texts: string[]): string[] {
+  // Redact FIRST, exactly like the pane's plain renderer (safeText): the
+  // textContent contract is identical for highlighted and plain lines, so
+  // credential-shaped content becomes [REDACTED] in both while ordinary or
+  // hostile source stays verbatim.
+  const redacted = texts.map((text) => redactSecrets(text));
+  try {
+    const joined = hljs.highlight(redacted.join('\n'), {
+      language,
+      ignoreIllegals: true,
+    }).value;
+    const fragments = splitHighlightedLines(joined);
+    if (fragments.length === redacted.length) return fragments;
+    return redacted.map((text) => escapeHtmlRaw(text));
+  } catch {
+    return redacted.map((text) => escapeHtmlRaw(text));
+  }
 }
 
 // Markdown renderer for assistant text. The input is RAW model text; the
@@ -180,26 +308,41 @@ function extractFences(raw: string): Segment[] {
   return segments;
 }
 
-function renderFence(lang: string, source: string): string {
-  if (lang === 'mermaid') {
+export function renderFence(lang: string, source: string): string {
+  // Normalize the fence info string. Markdown code fences may carry
+  // comma-separated metadata after the language token (```rust,ignore,
+  // ```rs,no_run). Without stripping the suffix, hljs.getLanguage("rust,ignore")
+  // returns undefined and the renderer falls back to highlightAuto, which
+  // uses ignoreIllegals:false internally. The Rust grammar declares
+  // `illegal: '</` and bails on many real-world snippets, so a different
+  // language (or plaintext) with only a few overlapping keyword spans wins
+  // the relevance race — most of the block renders as plain text, i.e.
+  // "only a small part is highlighted."
+  //
+  // Splitting to the base token lets getLanguage resolve registered aliases
+  // (the rust grammar registers `rs` as an alias), and ignoreIllegals:true
+  // forces the grammar to consume the ENTIRE source, emitting every token —
+  // including late ones — as hljs spans. The catch falls back to plain
+  // escaping so a fence can never break rendering. hljs output is already
+  // HTML-escaped; the copy button reads textContent, which stays the source.
+  const baseLang = lang.split(/[,;\s]/)[0].toLowerCase();
+  if (baseLang === 'mermaid') {
     // Host for async hydration: textContent is the diagram source (escaped
     // here, decoded back by the browser), replaced by SVG in hydrateMermaid().
     return `<div class="md-mermaid-host">${escapeHtml(source)}</div>`;
   }
+  const registered = baseLang !== '' ? hljs.getLanguage(baseLang) : undefined;
   let highlighted: string;
   try {
-    // hljs.highlight throws on unregistered languages and illegal lexemes;
-    // fall back to auto-detection (and finally plain escaping) so a fence
-    // can never break rendering. hljs output is already HTML-escaped; the
-    // copy button reads textContent, which stays the plain source.
-    highlighted =
-      lang !== '' && hljs.getLanguage(lang)
-        ? hljs.highlight(source, { language: lang }).value
-        : hljs.highlightAuto(source).value;
+    highlighted = registered
+      ? hljs.highlight(source, { language: baseLang, ignoreIllegals: true }).value
+      : hljs.highlightAuto(source).value;
   } catch {
     highlighted = escapeHtml(source);
   }
-  const label = lang !== '' ? lang : 'text';
+  const label = registered
+    ? (registered.name || baseLang).toLowerCase()
+    : (baseLang !== '' ? baseLang : 'text');
   return (
     `<div class="md-fence">` +
     `<div class="md-fence__head"><span class="md-fence__lang">${escapeHtml(label)}</span>` +
@@ -412,6 +555,17 @@ export function renderMarkdown(raw: string): string {
   return html;
 }
 
+/** Shared thinking header (brain icon + `Thinking`) as React-free HTML —
+ *  identical for the streaming summary (App.tsx StreamingAssistant) and the
+ *  restored/final rendering, so the two paths can never drift. The icon is an
+ *  inline SVG (no asset, no dependency); text is the literal title. */
+export function thinkingSummaryHtml(): string {
+  return '<svg class="thinking__icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    + '<path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/>'
+    + '<path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/>'
+    + '</svg>Thinking';
+}
+
 /** Render one assistant message's content blocks (final, non-streaming). */
 export function renderBlocks(blocks: ContentBlock[]): string {
   let html = '';
@@ -420,7 +574,11 @@ export function renderBlocks(blocks: ContentBlock[]): string {
     if (block.type === 'text' && typeof block.text === 'string' && block.text !== '') {
       html += renderMarkdown(block.text);
     } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
-      html += `<details class="thinking"><summary class="thinking__summary">thinking</summary><div class="thinking__body">${renderMarkdown(block.thinking)}</div></details>`;
+      // Same conservative literal-`\n` normalization the live delta path
+      // applies (transcript.ts), so restored thinking bodies render
+      // multi-line exactly like the streaming body; markdown stays safe
+      // because normalization runs BEFORE renderMarkdown.
+      html += `<details class="thinking" open><summary class="thinking__summary">${thinkingSummaryHtml()}</summary><div class="thinking__body">${renderMarkdown(normalizeThinkingNewlines(block.thinking))}</div></details>`;
     } else if (block.type === 'image') {
       const src = safeImage(block.mimeType, block.data);
       if (src) html += `<img class="md-image" src="${src}" alt="image">`;
@@ -451,8 +609,17 @@ function initMermaid(): void {
  * Replace `.md-mermaid-host` elements inside `root` with rendered SVG.
  * Never throws: parse failures (and initialization failures) degrade to a
  * styled block showing the raw source. Safe to call repeatedly.
+ *
+ * `onMutated` is invoked SYNCHRONOUSLY, immediately after each mutation that
+ * replaces a host's content (rendered SVG, error block, or empty-host clear)
+ * — a layout-relevant height change that arrives with no React commit and no
+ * streamed delta. The transcript pin controller uses it to re-pin the
+ * viewport in the SAME task as the mutation, so the next frame is already
+ * glued to the bottom; a ResizeObserver alone delivers one frame later.
+ * Never called for hosts skipped via `data-mermaid="done"`, and never called
+ * when mermaid initialization fails because no mutation happened.
  */
-export async function hydrateMermaid(root: HTMLElement): Promise<void> {
+export async function hydrateMermaid(root: HTMLElement, onMutated?: () => void): Promise<void> {
   try {
     initMermaid();
   } catch {
@@ -465,6 +632,7 @@ export async function hydrateMermaid(root: HTMLElement): Promise<void> {
     const source = host.textContent ?? '';
     if (source.trim() === '') {
       host.innerHTML = '';
+      onMutated?.();
       continue;
     }
     try {
@@ -479,6 +647,7 @@ export async function hydrateMermaid(root: HTMLElement): Promise<void> {
         '</div>';
       host.classList.add('md-mermaid-host--error');
     }
+    onMutated?.();
   }
 }
 

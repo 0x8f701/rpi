@@ -56,6 +56,17 @@ fn commit_file(cwd: &Path, relative: &str, contents: &str, message: &str) -> Str
 }
 fn definition() -> AgentDefinition { AgentDefinition { name: "task".into(), description: "workflow worker".into(), system_prompt: "complete workflow Todo".into(), tools: Some(Vec::new()), autoload_skills: Vec::new(), model: None, thinking_level: Some(ThinkingLevel::Off), max_turns: None, max_tool_calls: None, timeout_secs: None, disallowed_tools: Vec::new(), capability_ceiling: None, source: AgentDefinitionSource::Bundled, path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None } }
 
+/// Per-process isolated native session root for workflow test sessions, so
+/// supervisor/parent `start_new_recording()` never writes into the real
+/// `~/.pi/agent/sessions` tree (the Web sidebar catalog source). Shared
+/// across tests; parallel-safe via `LazyLock`, isolated from HOME.
+fn test_sessions_root() -> PathBuf {
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+        tempfile::tempdir().expect("test sessions root")
+    });
+    ROOT.path().to_path_buf()
+}
+
 #[derive(Clone)] struct TestFactory { snapshot: ChildSessionOptionsSnapshot }
 impl ApplicationRuntimeFactory for TestFactory {
     fn build_runtime_candidate(&self, _: PathBuf, _: SessionOptions, _: Option<pi_coding::PreparedSessionResume>) -> ApplicationRuntimeFuture { Box::pin(async { anyhow::bail!("unused") }) }
@@ -64,6 +75,7 @@ impl ApplicationRuntimeFactory for TestFactory {
             options.cwd = cwd.path().to_path_buf(); options.tools = None;
             let workspace = WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new())?;
             let session = Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(options, Vec::new(), Default::default(), pi_coding::ResourceDiscovery::Disabled, workspace, None)?;
+            session.set_session_dir(test_sessions_root());
             session.start_new_recording()?;
             let artifacts = std::env::temp_dir().join(format!("pi-workflow-test-artifacts-{}", uuid::Uuid::now_v7()));
             let mut config = OrchestrationConfig::new(AgentCatalog::from_agents(vec![definition()]), artifacts);
@@ -85,6 +97,7 @@ impl ApplicationRuntimeFactory for TypedAgentTestFactory {
             options.cwd = cwd.path().to_path_buf(); options.tools = None;
             let workspace = WorkspaceRoots::new(cwd.path(), Vec::<PathBuf>::new())?;
             let session = Session::new_with_todo_additional_tools_filtered_discovery_workspace_and_uri(options, Vec::new(), Default::default(), pi_coding::ResourceDiscovery::Disabled, workspace, None)?;
+            session.set_session_dir(test_sessions_root());
             session.start_new_recording()?;
             let artifacts = std::env::temp_dir().join(format!("pi-workflow-test-artifacts-{}", uuid::Uuid::now_v7()));
             let mut researcher = definition();
@@ -107,6 +120,7 @@ fn parent_session(repo: &Path, responses: Vec<FauxResponse>) -> (Session, FauxPr
     let suffix = uuid::Uuid::now_v7().to_string(); let model = Model { id: format!("workflow-{suffix}"), name: "Workflow Test".into(), api: format!("workflow-api-{suffix}"), provider: format!("workflow-provider-{suffix}"), ..Model::default() };
     let registration = register_faux_provider(FauxProviderOptions { api: model.api.clone(), provider: model.provider.clone(), models: vec![model.clone()], chunk_size: 32 }); registration.set_responses(responses);
     let session = Session::new(SessionOptions { model, cwd: repo.to_path_buf(), system_prompt: String::new(), thinking_level: ThinkingLevel::Off, api_key: "faux".into(), compaction: None, stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None, after_tool_call: None, stream_fn: None, auth_resolver: None }).expect("session");
+    session.set_session_dir(test_sessions_root());
     (session, registration)
 }
 fn planning(objective: &str) -> FauxResponse { FauxResponse { content: vec![ContentBlock::ToolCall(ToolCall { id: "todo-init".into(), name: "todo".into(), arguments: serde_json::json!({"op":"init","items":[objective]}), thought_signature: None })], stop_reason: StopReason::ToolUse, error_message: None } }

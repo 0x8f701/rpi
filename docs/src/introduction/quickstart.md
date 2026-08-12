@@ -65,10 +65,11 @@ rpi -m anthropic/claude-sonnet-4-5
 - Otherwise you get the line REPL (`> ` prompt).
 
 In both modes you can type a message or use slash commands. Type `/help` for the
-22 primary commands, including `/workflow`, the TUI-only `/code-review` and
-`/btw` overlays, and `/live`.
-Model and thinking-level switches work as slash commands in the line REPL; the
-TUI uses `/model` plus keybindings such as `Ctrl+L` and `Ctrl+T`.
+23 primary commands, including `/workflow`, `/code-review`, `/btw`, `/skill`,
+and `/live`. The Web composer exposes its supported command surface through the
+button left of the input. Model and thinking-level switches work as slash
+commands in the line REPL; the TUI uses `/model` plus keybindings such as
+`Ctrl+L` and `Ctrl+T`.
 
 ## Switch models and reasoning level
 

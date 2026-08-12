@@ -77,9 +77,10 @@ async function main() {
       slowPrefix
     );
 
-    // EARLY abort: the instant the first delta is visible. The next chunks
-    // arrive 0.6s apart, so the preserved text is the first chunk only.
-    await page.click('#abort-btn');
+    // EARLY abort: the unified composer action changes to Stop as soon as the
+    // first delta is visible. The next chunks arrive 0.6s apart.
+    await waitFor(page, () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Stop generating', 'unified action never switched to Stop');
+    await page.click('#send-btn');
     await waitFor(
       page,
       () => document.getElementById('stream-badge').hidden === true,

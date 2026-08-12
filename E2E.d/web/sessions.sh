@@ -2,7 +2,7 @@
 # Web multi-session E2E lane — PLAYWRIGHT-ONLY (no agent-browser fallback, no
 # skip). Requires the MultiSessionRuntimeManager backend (top-level sessionId
 # routing, lifecycle {sessionId,state,messages} snapshots, per-session events,
-# MAX_LOADED_SESSIONS=8 cap, close_session idle/busy semantics).
+# MAX_LOADED_SESSIONS=8 cap).
 #
 # Spawns the real `rpi --listen` binary with a token file and the loopback
 # mock provider (--scenario sessions; content-routed replies so concurrently
@@ -13,8 +13,6 @@
 #       round-trips; background unread; unread clears on switch-back;
 #       authoritative transcript restore
 #   T2  abort + toast isolation (aborting B never affects A's stream)
-#   T3  close_session busy refusal surfaced, then idle close succeeds
-#       (loaded marker drops)
 #   T4  8-session cap, no eviction, error surfaced
 #   T5  Todo/Goal/Workflow state never leaks across sessions
 #   T6  desktop rail collapse/reopen, sidebar New/Manage/switch, header has
@@ -42,7 +40,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-sessions - multi-session: concurrent streaming, source-session routing, background unread, abort/toast isolation, close busy refusal + idle success, 8-session cap, Todo/Goal/Workflow isolation, desktop collapse rail, mobile drawer pick-close (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-sessions - multi-session: concurrent streaming, source-session routing, background unread, abort/toast isolation, 8-session cap, Todo/Goal/Workflow isolation, desktop collapse rail, mobile drawer pick-close (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;
@@ -73,8 +71,7 @@ main() {
 
     # Hard playwright run: exit 1 from web_run_playwright means the npm
     # install failed — for THIS lane that is a real failure (no fallback).
-    web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/sessions_test.mjs" \
-        "RPI_MOCK_CONTROL_URL=http://127.0.0.1:$port" || pw_status=$?
+    web_run_playwright "$url" "$evidence" "$root/playwright" "$SCRIPT_DIR/sessions_test.mjs" || pw_status=$?
     if [ "$pw_status" -ne 0 ]; then
         fail "$SCENARIO: playwright lane failed (exit $pw_status) — sessions lane is playwright-only"
     fi

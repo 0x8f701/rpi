@@ -735,17 +735,75 @@ fn concurrent_ids_correlate_independently() {
     assert_success(a, "get_state", "a");
     assert_success(b, "get_commands", "b");
     assert_success(c, "get_session_stats", "c");
-    let command_names = b["data"]["commands"]
+    // Contract: get_commands projects the executable catalog — builtins plus
+    // trusted dynamic prompt/skill/extension commands — so the primary slash
+    // surface is a subset, not an exact match. Assert the
+    // machine-independent invariants: every primary present, unique names,
+    // closed source set, and skill entries carrying the `skill:` prefix plus
+    // a bare `skillName`.
+    let commands = b["data"]["commands"]
         .as_array()
-        .expect("get_commands returns an array")
-        .iter()
-        .map(|command| command["name"].as_str().expect("command name"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        command_names,
-        pi_cli::interactive_commands::PRIMARY_COMMAND_NAMES,
-        "RPC command discovery must match TUI and REPL primary slash surface"
+        .expect("get_commands returns an array");
+    assert!(
+        !commands.is_empty(),
+        "get_commands must return at least the builtin commands: {b}"
     );
+    let mut names = std::collections::HashSet::new();
+    for command in commands {
+        let name = command
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("command entry missing name: {command}"));
+        assert!(
+            !name.is_empty(),
+            "command name must be non-empty: {command}"
+        );
+        assert!(
+            names.insert(name),
+            "get_commands must not repeat command names: {name}"
+        );
+        let source = command
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("command {name} missing source: {command}"));
+        assert!(
+            matches!(source, "builtin" | "prompt" | "skill" | "extension"),
+            "unexpected source {source:?} on command {name}: {command}"
+        );
+        assert!(
+            command.get("description").and_then(Value::as_str).is_some(),
+            "command {name} missing description: {command}"
+        );
+        if source == "skill" {
+            let skill_name = command
+                .get("skillName")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("skill command {name} missing skillName: {command}"));
+            assert!(
+                !skill_name.is_empty(),
+                "skill command {name} must carry a non-empty bare skillName: {command}"
+            );
+            assert_eq!(
+                name.strip_prefix("skill:"),
+                Some(skill_name),
+                "skill wire name must be `skill:<skillName>`: {command}"
+            );
+        }
+    }
+    // Every primary slash command is present and labeled `builtin` (builtins
+    // win collisions in the executable catalog), regardless of how many
+    // dynamic skills the fixture loads.
+    for &primary in pi_cli::interactive_commands::PRIMARY_COMMAND_NAMES {
+        let command = commands
+            .iter()
+            .find(|command| command["name"].as_str() == Some(primary))
+            .unwrap_or_else(|| panic!("get_commands missing primary command {primary:?}"));
+        assert_eq!(
+            command["source"].as_str(),
+            Some("builtin"),
+            "primary command {primary} must be labeled builtin on the wire: {command}"
+        );
+    }
 
     assert!(a["data"].is_object(), "get_state data: {a}");
     assert!(

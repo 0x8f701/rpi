@@ -17,6 +17,9 @@
  *  to a different host. */
 export const LEGACY_TOKEN_KEY = 'rpi-web-token';
 
+/** Last listener authority selected by the host input for this page origin. */
+export const ACTIVE_HOST_KEY = 'rpi-web-active-host';
+
 const HOST_TOKEN_PREFIX = 'rpi-web-token:';
 
 /** Minimal localStorage-like backend the helpers need. */
@@ -39,6 +42,29 @@ export function normalizeHostAuthority(raw: string): string {
  *  still encoding the EXACT trimmed authority (no origin-wide fallback). */
 export function hostTokenKey(authority: string): string {
   return `${HOST_TOKEN_PREFIX}${encodeURIComponent(normalizeHostAuthority(authority))}`;
+}
+
+/** Restore the last selected listener, falling back to the page authority. */
+export function loadActiveHost(storage: StorageLike | null, pageAuthority: string): string {
+  const fallback = normalizeHostAuthority(pageAuthority);
+  if (!storage) return fallback;
+  try {
+    return normalizeHostAuthority(storage.getItem(ACTIVE_HOST_KEY) || '') || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Persist a non-empty listener authority; never throws. */
+export function saveActiveHost(storage: StorageLike | null, authority: string): void {
+  if (!storage) return;
+  const value = normalizeHostAuthority(authority);
+  if (!value) return;
+  try {
+    storage.setItem(ACTIVE_HOST_KEY, value);
+  } catch {
+    /* private mode / quota — active listener remains in memory */
+  }
 }
 
 /** Read the token for `authority` from the SCOPED key only (never legacy);

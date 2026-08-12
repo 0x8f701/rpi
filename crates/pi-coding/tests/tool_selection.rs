@@ -47,10 +47,15 @@ fn default_tool_set_remains_the_coding_tools() -> Result<()> {
     )?;
     assert_eq!(
         session.get_active_tool_names(),
-        // Coding tools plus the ambient `ask` and `mcp` tools every default
-        // session carries (ask: interactive round trip; mcp: session-scoped
-        // registry). Both are skipped when `options.tools` is explicit.
-        ["read", "bash", "edit", "write", "ast_edit", "generate_image", "memory", "ask", "mcp"]
+        // Default main catalog: the coding tools (including the native
+        // `browser` automation tool) plus the ambient `ask` and `mcp` tools
+        // every default session carries (ask: interactive round trip; mcp:
+        // session-scoped registry). The ambient pair is skipped when
+        // `options.tools` is explicit.
+        [
+            "read", "bash", "browser", "edit", "write", "ast_edit", "generate_image", "memory",
+            "ask", "mcp"
+        ]
     );
     Ok(())
 }
@@ -133,8 +138,8 @@ fn process_and_todo_remain_explicit_capabilities() -> Result<()> {
     assert_eq!(
         session.get_active_tool_names(),
         [
-            "read", "bash", "edit", "write", "ast_edit", "generate_image", "memory", "todo",
-            "ask", "mcp", "process"
+            "read", "bash", "browser", "edit", "write", "ast_edit", "generate_image", "memory",
+            "todo", "ask", "mcp", "process"
         ]
     );
     Ok(())
@@ -153,7 +158,10 @@ fn glob_is_opt_in_not_in_default_main_catalog() -> Result<()> {
     let default_names = default_session.get_active_tool_names();
     assert_eq!(
         default_names,
-        ["read", "bash", "edit", "write", "ast_edit", "generate_image", "memory", "ask", "mcp"]
+        [
+            "read", "bash", "browser", "edit", "write", "ast_edit", "generate_image", "memory",
+            "ask", "mcp"
+        ]
     );
     assert!(!default_names.iter().any(|n| n == "glob"));
 
@@ -170,8 +178,8 @@ fn glob_is_opt_in_not_in_default_main_catalog() -> Result<()> {
     assert_eq!(
         with_glob.get_active_tool_names(),
         [
-            "read", "bash", "edit", "write", "ast_edit", "generate_image", "memory", "ask", "mcp",
-            "glob"
+            "read", "bash", "browser", "edit", "write", "ast_edit", "generate_image", "memory",
+            "ask", "mcp", "glob"
         ]
     );
 

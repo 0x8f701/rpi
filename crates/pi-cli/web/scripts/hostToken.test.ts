@@ -9,9 +9,12 @@
 // Drives an in-memory StorageLike directly (no DOM) — behavioral assertions
 // on the storage contract, not source strings.
 import {
+  ACTIVE_HOST_KEY,
   LEGACY_TOKEN_KEY,
   hostTokenKey,
+  loadActiveHost,
   loadTokenForAuthority,
+  saveActiveHost,
   saveTokenForAuthority,
   loadInitialAuthorityToken,
 } from '../src/hostToken.ts';
@@ -39,6 +42,22 @@ function makeStorage() {
   check('scoped keys for A and B differ', hostTokenKey('a:1') !== hostTokenKey('b:2'));
   check('scoped key encodes the colon', hostTokenKey('a:1') === 'rpi-web-token:a%3A1');
   check('trim applied before encoding', hostTokenKey('  a:1  ') === hostTokenKey('a:1'));
+}
+
+// ---- selected listener authority survives reload; failures fall back ----
+{
+  const s = makeStorage();
+  check('active host defaults to page authority', loadActiveHost(s, 'localhost:8765') === 'localhost:8765');
+  saveActiveHost(s, '127.0.0.1:8765');
+  check('active host stored', s.getItem(ACTIVE_HOST_KEY) === '127.0.0.1:8765');
+  check('reload restores selected listener', loadActiveHost(s, 'localhost:8765') === '127.0.0.1:8765');
+  saveActiveHost(s, '   ');
+  check('blank host does not erase listener', loadActiveHost(s, 'localhost:8765') === '127.0.0.1:8765');
+  const throwing = { getItem: () => { throw new Error('blocked'); }, setItem: () => { throw new Error('blocked'); }, removeItem: () => {} };
+  check('blocked storage falls back to page authority', loadActiveHost(throwing, 'localhost:8765') === 'localhost:8765');
+  let threw = false;
+  try { saveActiveHost(throwing, '127.0.0.1:8765'); } catch { threw = true; }
+  check('blocked active-host save never throws', !threw);
 }
 
 // ---- (1) save A, switch to B (absent) => connect pair B/empty, A stays only A ----

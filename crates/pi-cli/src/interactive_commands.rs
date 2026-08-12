@@ -125,6 +125,7 @@ pub const PRIMARY_COMMAND_NAMES: &[&str] = &[
     "btw",
     "queue",
     "live",
+    "skill",
 ];
 
 /// True when `name` is part of the visible primary slash surface.
@@ -571,7 +572,7 @@ pub async fn execute_interactive_persona_command(
                 .orchestration_runtime()
                 .map(|runtime| runtime.begin_persona_destructive_operation(&definition.name))
                 .transpose()?;
-            reset_persona_state(&root)?;
+            reset_persona_state(&root, &name)?;
             Ok(format!(
                 "Persona {name:?} reset: memory and sessions cleared; persona.md kept"
             ))
@@ -583,15 +584,19 @@ pub async fn execute_interactive_persona_command(
                 .orchestration_runtime()
                 .map(|runtime| runtime.begin_persona_destructive_operation(&definition.name))
                 .transpose()?;
-            remove_persona_definition(&root)?;
+            remove_persona_definition(&root, &name)?;
             // Reload so the deleted definition disappears from subsequent
             // catalog reads. Failure retains the lifecycle block fail-closed.
+            // The error chain may carry absolute resource paths — it is a
+            // server-side diagnostic (stderr) only; the wire message stays
+            // fixed and path-free.
             if let Err(error) = application.reload().await {
+                eprintln!("persona reload failed after remove for {name:?}: {error:#}");
                 if let Some(guard) = lifecycle_guard {
                     guard.retain();
                 }
                 anyhow::bail!(
-                    "persona {name:?} was removed, but resource reload failed; the persona remains blocked in this session until reload or restart: {error:#}"
+                    "persona {name:?} was removed, but resource reload failed; the persona remains blocked in this session until reload or restart (see the server log for details)"
                 );
             }
             Ok(format!(
@@ -605,13 +610,14 @@ pub async fn execute_interactive_persona_command(
                 .orchestration_runtime()
                 .map(|runtime| runtime.begin_persona_destructive_operation(&definition.name))
                 .transpose()?;
-            purge_persona_root(&root)?;
+            purge_persona_root(&root, &name)?;
             if let Err(error) = application.reload().await {
+                eprintln!("persona reload failed after purge for {name:?}: {error:#}");
                 if let Some(guard) = lifecycle_guard {
                     guard.retain();
                 }
                 anyhow::bail!(
-                    "persona {name:?} was purged, but resource reload failed; the persona remains blocked in this session until reload or restart: {error:#}"
+                    "persona {name:?} was purged, but resource reload failed; the persona remains blocked in this session until reload or restart (see the server log for details)"
                 );
             }
             Ok(format!(
@@ -641,7 +647,7 @@ fn find_persona<'a>(
         .ok_or_else(|| anyhow::anyhow!("unknown persona {name:?}; /persona lists available personas"))
 }
 
-fn current_preferred_agent(application: &pi_coding::Application) -> Option<String> {
+pub(crate) fn current_preferred_agent(application: &pi_coding::Application) -> Option<String> {
     if let Some(name) = application
         .orchestration_runtime()
         .and_then(|runtime| runtime.preferred_agent())
@@ -735,15 +741,17 @@ fn resolve_persona_root(
         agent_dir.join("personas"),
         resources.cwd.join(".pi").join("personas"),
     ];
-    ensure_persona_root_contained(&root, &scopes)
+    ensure_persona_root_contained(&root, &scopes, &definition.name)
 }
 
 /// Ensure `root` is a real directory strictly inside one of the allowed persona
 /// scope roots, rejecting symlink escapes and path aliases. Returns the
-/// canonical persona root on success.
-fn ensure_persona_root_contained(root: &Path, scopes: &[PathBuf]) -> anyhow::Result<PathBuf> {
+/// canonical persona root on success. User-visible error contexts name the
+/// persona only — never filesystem paths (they would leak absolute paths to
+/// Web clients on failure).
+fn ensure_persona_root_contained(root: &Path, scopes: &[PathBuf], persona: &str) -> anyhow::Result<PathBuf> {
     let meta = std::fs::symlink_metadata(root)
-        .with_context(|| format!("reading persona root {}", root.display()))?;
+        .with_context(|| format!("reading persona root for {persona:?}"))?;
     if meta.file_type().is_symlink() {
         anyhow::bail!("persona root must not be a symlink");
     }
@@ -753,13 +761,13 @@ fn ensure_persona_root_contained(root: &Path, scopes: &[PathBuf]) -> anyhow::Res
     // Reject symlink parents (scope path itself must not be a link).
     if let Some(parent) = root.parent() {
         let parent_meta = std::fs::symlink_metadata(parent)
-            .with_context(|| format!("reading persona parent {}", parent.display()))?;
+            .with_context(|| format!("reading persona scope for {persona:?}"))?;
         if parent_meta.file_type().is_symlink() {
             anyhow::bail!("persona scope path must not contain symlinks");
         }
     }
     let canonical_root = std::fs::canonicalize(root)
-        .with_context(|| format!("canonicalizing persona root {}", root.display()))?;
+        .with_context(|| format!("canonicalizing persona root for {persona:?}"))?;
     let mut allowed = false;
     for scope in scopes {
         // Materialize the scope directory when absent so canonicalize can
@@ -768,7 +776,7 @@ fn ensure_persona_root_contained(root: &Path, scopes: &[PathBuf]) -> anyhow::Res
             continue;
         }
         let scope_meta = std::fs::symlink_metadata(scope)
-            .with_context(|| format!("reading persona scope {}", scope.display()))?;
+            .with_context(|| format!("reading persona scope for {persona:?}"))?;
         if scope_meta.file_type().is_symlink() {
             anyhow::bail!("persona scope path must not contain symlinks");
         }
@@ -796,37 +804,37 @@ fn ensure_persona_root_contained(root: &Path, scopes: &[PathBuf]) -> anyhow::Res
     Ok(canonical_root)
 }
 
-fn reset_persona_state(root: &Path) -> anyhow::Result<()> {
+fn reset_persona_state(root: &Path, persona: &str) -> anyhow::Result<()> {
     let memory = root.join("memory");
     let sessions = root.join("sessions");
     if memory.exists() {
         std::fs::remove_dir_all(&memory)
-            .with_context(|| format!("removing persona memory {}", memory.display()))?;
+            .with_context(|| format!("removing persona memory for {persona:?}"))?;
     }
     if sessions.exists() {
         std::fs::remove_dir_all(&sessions)
-            .with_context(|| format!("removing persona sessions {}", sessions.display()))?;
+            .with_context(|| format!("removing persona sessions for {persona:?}"))?;
     }
     Ok(())
 }
 
-fn remove_persona_definition(root: &Path) -> anyhow::Result<()> {
+fn remove_persona_definition(root: &Path, persona: &str) -> anyhow::Result<()> {
     let persona_md = root.join("persona.md");
     if persona_md.exists() {
         let meta = std::fs::symlink_metadata(&persona_md)
-            .with_context(|| format!("reading {}", persona_md.display()))?;
+            .with_context(|| format!("reading persona definition for {persona:?}"))?;
         if meta.file_type().is_symlink() {
             anyhow::bail!("refusing to delete symlinked persona.md");
         }
         std::fs::remove_file(&persona_md)
-            .with_context(|| format!("removing {}", persona_md.display()))?;
+            .with_context(|| format!("removing persona definition for {persona:?}"))?;
     }
     Ok(())
 }
 
-fn purge_persona_root(root: &Path) -> anyhow::Result<()> {
+fn purge_persona_root(root: &Path, persona: &str) -> anyhow::Result<()> {
     std::fs::remove_dir_all(root)
-        .with_context(|| format!("purging persona root {}", root.display()))?;
+        .with_context(|| format!("purging persona root for {persona:?}"))?;
     Ok(())
 }
 
@@ -852,7 +860,7 @@ pub async fn commit_persona_definition(
     persona_name_path_safe(name)?;
     let snapshot = application
         .resource_snapshot()
- .ok_or_else(|| anyhow::anyhow!("persona catalog is unavailable"))?;
+        .ok_or_else(|| anyhow::anyhow!("persona catalog is unavailable"))?;
     let (root, source, trusted) = match kind {
         PersonaEditKind::New => {
             if let Some(existing) = snapshot.agents.iter().find(|d| d.name == name) {
@@ -868,7 +876,7 @@ pub async fn commit_persona_definition(
             if persona_md.exists() {
                 anyhow::bail!("persona {name:?} already exists; use /persona edit {name}");
             }
-            atomic_write_persona(&root, &persona_md, content, PersonaEditKind::New)?;
+            atomic_write_persona(&root, &persona_md, content, PersonaEditKind::New, name)?;
             (root, source, trusted)
         }
         PersonaEditKind::Edit => {
@@ -876,23 +884,29 @@ pub async fn commit_persona_definition(
             validate_persona_content(content, name, definition.source, definition.trusted)?;
             let persona_md = root.join("persona.md");
             let meta = std::fs::symlink_metadata(&persona_md)
-                .with_context(|| format!("reading {}", persona_md.display()))?;
+                .with_context(|| format!("reading persona definition for {name:?}"))?;
             if meta.file_type().is_symlink() {
                 anyhow::bail!("refusing to overwrite a symlinked persona.md");
             }
             if !meta.is_file() {
                 anyhow::bail!("persona.md is not a regular file");
             }
-            atomic_write_persona(&root, &persona_md, content, PersonaEditKind::Edit)?;
+            atomic_write_persona(&root, &persona_md, content, PersonaEditKind::Edit, name)?;
             (root, definition.source, definition.trusted)
         }
     };
 
     if let Err(error) = application.reload().await {
-        return Ok(format!(
-            "Persona {name:?} {} but resource reload failed: {error:#}",
+        // The reload error chain may carry absolute resource paths — record
+        // it as a server-side diagnostic (stderr) only; the wire error stays
+        // fixed and path-free. The write already landed, but the catalog is
+        // stale: report a REAL failure so the Web editor keeps the draft and
+        // the modal instead of pretending the persona is live.
+        eprintln!("persona reload failed after {} for {name:?}: {error:#}", persona_kind_verb(kind));
+        anyhow::bail!(
+            "persona {name:?} was {}, but resource reload failed; reload or restart required",
             persona_kind_verb(kind)
-        ));
+        );
     }
     Ok(format!(
         "Persona {name:?} {} ({})",
@@ -919,7 +933,7 @@ pub fn persona_editor_seed(
             let (root, _definition) = resolve_existing_persona(application, name)?;
             let persona_md = root.join("persona.md");
             let meta = std::fs::symlink_metadata(&persona_md)
-                .with_context(|| format!("reading {}", persona_md.display()))?;
+                .with_context(|| format!("reading persona definition for {name:?}"))?;
             if meta.file_type().is_symlink() {
                 anyhow::bail!("refusing to read a symlinked persona.md");
             }
@@ -927,7 +941,7 @@ pub fn persona_editor_seed(
                 anyhow::bail!("persona.md is not a regular file");
             }
             std::fs::read_to_string(&persona_md)
-                .with_context(|| format!("reading {}", persona_md.display()))
+                .with_context(|| format!("reading persona definition for {name:?}"))
         }
     }
 }
@@ -1029,23 +1043,23 @@ fn resolve_new_persona_root(
             anyhow::bail!("persona scope path must not contain symlinks");
         }
         Ok(meta) if !meta.is_dir() => {
-            anyhow::bail!("persona user scope is not a directory: {}", user_scope.display());
+            anyhow::bail!("persona user scope is not a directory");
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(&user_scope)
-                .with_context(|| format!("creating persona user scope {}", user_scope.display()))?;
+                .with_context(|| format!("creating persona user scope for {name:?}"))?;
         }
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("reading persona user scope {}", user_scope.display()));
+                .with_context(|| format!("reading persona user scope for {name:?}"));
         }
     }
     let root = user_scope.join(name);
     std::fs::create_dir_all(&root)
-        .with_context(|| format!("creating persona root {}", root.display()))?;
+        .with_context(|| format!("creating persona root for {name:?}"))?;
     let scopes = [user_scope, project_scope];
-    let canonical = ensure_persona_root_contained(&root, &scopes)?;
+    let canonical = ensure_persona_root_contained(&root, &scopes, name)?;
     Ok((canonical, pi_coding::AgentDefinitionSource::User, true))
 }
 
@@ -1075,8 +1089,9 @@ fn atomic_write_persona(
     persona_md: &Path,
     content: &str,
     kind: PersonaEditKind,
+    persona: &str,
 ) -> anyhow::Result<()> {
-    let tmp = write_persona_temp(root, content)?;
+    let tmp = write_persona_temp(root, content, persona)?;
     let install = match kind {
         // No-clobber install: hard_link fails if persona.md already exists
         // (any type, including a symlink), so a concurrent creator cannot be
@@ -1088,42 +1103,62 @@ fn atomic_write_persona(
         PersonaEditKind::Edit => std::fs::rename(&tmp, persona_md),
     };
     if let Err(error) = install {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error).with_context(|| format!("installing {}", persona_md.display()));
+        // Best-effort temp cleanup that PRESERVES the primary install error.
+        // The temp holds the persona definition content (potentially
+        // sensitive), so a cleanup failure is recorded on stderr — type and
+        // context only, never the path or content — while the primary error
+        // is still returned to the caller.
+        if let Err(cleanup) = std::fs::remove_file(&tmp) {
+            eprintln!("persona temp cleanup failed after install error for {persona:?}: {cleanup}");
+        }
+        return Err(error).with_context(|| format!("installing persona definition for {persona:?}"));
     }
-    // New: persona.md is now a hard link to the temp; drop the temp name. For
-    // Edit, rename already consumed the temp path.
+    // New: persona.md is now a hard link to the temp; drop the temp name so no
+    // leftover temp file stays behind. For Edit, rename already consumed it.
     if matches!(kind, PersonaEditKind::New) {
-        let _ = std::fs::remove_file(&tmp);
+        std::fs::remove_file(&tmp)
+            .with_context(|| format!("cleaning up persona temp file for {persona:?}"))?;
     }
-    // Best-effort parent directory sync so the install is durable.
-    if let Ok(dir) = std::fs::File::open(root) {
-        let _ = dir.sync_all();
-    }
+    // The install must be durable: fsync the containing directory so the
+    // hard-link/rename survives a crash. Errors are surfaced (path-free
+    // persona context, never swallowed) — a definition that could vanish is a
+    // real failure, not a best-effort side effect.
+    let dir = std::fs::File::open(root)
+        .with_context(|| format!("opening persona root for {persona:?}"))?;
+    dir.sync_all()
+        .with_context(|| format!("syncing persona root for {persona:?}"))?;
     Ok(())
 }
 
 /// Create a unique, never-before-existing temp file inside the validated
 /// persona root and write the content with fsync. Uses `create_new` so a
 /// pre-placed symlink at a guessed name cannot be followed.
-fn write_persona_temp(root: &Path, content: &str) -> anyhow::Result<PathBuf> {
+fn write_persona_temp(root: &Path, content: &str, persona: &str) -> anyhow::Result<PathBuf> {
     use std::io::Write;
     let tmp = root.join(format!(".persona.md.tmp.{}", uuid::Uuid::new_v4()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .with_context(|| format!("creating persona temp file {}", tmp.display()))?;
+        .with_context(|| format!("creating persona temp file for {persona:?}"))?;
     if let Err(error) = file.write_all(content.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error)
-            .with_context(|| format!("writing persona temp file {}", tmp.display()));
+            .with_context(|| format!("writing persona temp file for {persona:?}"));
     }
     if let Err(error) = file.flush() {
         let _ = std::fs::remove_file(&tmp);
         return Err(error).context("flushing persona temp file");
     }
-    let _ = file.sync_all();
+    // The temp write must be durable before it can be installed: a lost fsync
+    // can drop the persona definition on crash. The sync error is the primary
+    // error — cleanup of the temp is best-effort and preserves it.
+    file.sync_all()
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&tmp);
+            error
+        })
+        .with_context(|| format!("syncing persona temp file for {persona:?}"))?;
     Ok(tmp)
 }
 
@@ -2486,9 +2521,10 @@ mod tests {
                 "btw",
                 "queue",
                 "live",
+                "skill",
             ]
         );
-        assert_eq!(PRIMARY_COMMAND_NAMES.len(), 22);
+        assert_eq!(PRIMARY_COMMAND_NAMES.len(), 23);
         let visible = visible_catalog()
             .into_iter()
             .map(|command| command.name)
@@ -3496,10 +3532,15 @@ mod tests {
             let _ = link;
             return;
         }
-        let err = ensure_persona_root_contained(&link, &[scope]).expect_err("symlink escape");
+        let err = ensure_persona_root_contained(&link, &[scope], "escaped")
+            .expect_err("symlink escape");
         assert!(
             err.to_string().contains("symlink") || err.to_string().contains("escapes"),
             "{err:#}"
+        );
+        assert!(
+            !err.to_string().contains(base.path().to_string_lossy().as_ref()),
+            "containment errors must not embed absolute paths: {err:#}"
         );
     }
 

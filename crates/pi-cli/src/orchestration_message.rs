@@ -7,6 +7,7 @@ use std::borrow::Cow;
 
 use pi_ai::{ContentBlock, CustomMessage};
 use pi_coding::{orchestration_message_view, ORCHESTRATION_MESSAGE_TYPE};
+use serde_json::Value;
 
 pub use pi_coding::ORCHESTRATION_MESSAGE_TYPE as ORCHESTRATION_IRC_TYPE;
 
@@ -21,10 +22,16 @@ pub struct OrchestrationIrcView<'a> {
 }
 
 impl OrchestrationIrcView<'_> {
-    /// `IRC · <from> → <to>` using already-resolved display labels.
+    /// Human-facing direction label matching the Hub card vocabulary.
     #[must_use]
     pub fn label(&self, from_label: &str, to_label: &str) -> String {
-        format!("IRC · {from_label} → {to_label}")
+        if self.from == "Main" {
+            format!("✉ IRC ➤ {to_label}")
+        } else if self.to == "Main" {
+            format!("✉ IRC ⟵ {from_label}")
+        } else {
+            format!("✉ IRC {from_label} ➤ {to_label}")
+        }
     }
 
     /// Optional muted reply metadata row.
@@ -35,18 +42,6 @@ impl OrchestrationIrcView<'_> {
             .map(|reply_to| format!("reply to {reply_to}"))
     }
 
-    /// Body content blocks for transcript rows (never the XML envelope).
-    #[must_use]
-    pub fn body_blocks(&self) -> Vec<ContentBlock> {
-        let mut blocks = Vec::new();
-        if !self.body.is_empty() {
-            blocks.push(ContentBlock::text(self.body.as_ref()));
-        }
-        if let Some(metadata) = self.reply_metadata() {
-            blocks.push(ContentBlock::text(metadata));
-        }
-        blocks
-    }
 }
 
 /// Prefer the coding-crate view helper (plain body, no XML wrapper).
@@ -78,6 +73,48 @@ pub fn orchestration_irc_view_from_mailbox<'a>(
         body: Cow::Borrowed(body),
         reply_to: reply_to.map(Cow::Borrowed),
     }
+}
+
+/// Build a view from a typed JSON projection of a delivered mailbox message
+/// (the `details.message` / `details.reply` object a `hub wait` or
+/// `hub send`-with-`await` tool result carries). Reads the typed `id` /
+/// `from` / `to` / `body` / `replyTo` fields directly — it never parses the
+/// model-facing prose text to recover metadata, so a control-prose result
+/// cannot leak into the visible transcript as a typed card by accident.
+///
+/// Returns `None` when `value` is not a non-empty object carrying at least an
+/// `id` and `from`, so a timeout (`message: null`) or a malformed projection
+/// falls back to the plain tool card instead of rendering an empty IRC frame.
+#[must_use]
+pub fn orchestration_irc_view_from_json(value: &Value) -> Option<OrchestrationIrcView<'static>> {
+    let object = value.as_object()?;
+    let id = object.get("id").and_then(Value::as_str)?.to_owned();
+    let from = object.get("from").and_then(Value::as_str)?.to_owned();
+    if id.is_empty() || from.is_empty() {
+        return None;
+    }
+    let to = object
+        .get("to")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let body = object
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let reply_to = object
+        .get("replyTo")
+        .and_then(Value::as_str)
+        .filter(|reply_to| !reply_to.is_empty())
+        .map(str::to_owned);
+    Some(OrchestrationIrcView {
+        id: Cow::Owned(id),
+        from: Cow::Owned(from),
+        to: Cow::Owned(to),
+        body: Cow::Owned(body),
+        reply_to: reply_to.map(Cow::Owned),
+    })
 }
 
 /// True when the custom message is a typed orchestration IRC payload.
@@ -136,7 +173,7 @@ mod tests {
         assert_eq!(view.reply_to.as_deref(), Some("parent-9"));
         assert!(!view.body.contains("orchestration-message"));
         assert!(!view.body.contains("Replying to message"));
-        assert_eq!(view.label("Main", "task: child"), "IRC · Main → task: child");
+        assert_eq!(view.label("Main", "task: child"), "✉ IRC ➤ task: child");
         assert_eq!(view.reply_metadata().as_deref(), Some("reply to parent-9"));
     }
 
@@ -164,5 +201,38 @@ mod tests {
             timestamp: 1,
         };
         assert!(orchestration_irc_view(&message).is_none());
+    }
+
+    #[test]
+    fn json_view_reads_typed_fields_and_rejects_non_irc_projections() {
+        // Typed mailbox projection: fields come from JSON, never parsed out of
+        // the model-facing prose text.
+        let value = serde_json::json!({
+            "id": "m-1",
+            "from": "Main",
+            "to": "Child",
+            "body": "hello child",
+            "replyTo": "parent-9",
+            "timestamp": 7,
+        });
+        let view = orchestration_irc_view_from_json(&value).expect("typed view");
+        assert_eq!(view.id.as_ref(), "m-1");
+        assert_eq!(view.from.as_ref(), "Main");
+        assert_eq!(view.to.as_ref(), "Child");
+        assert_eq!(view.body.as_ref(), "hello child");
+        assert_eq!(view.reply_to.as_deref(), Some("parent-9"));
+
+        // A null `message` (hub wait timeout) and a missing `from` must not
+        // produce an empty IRC frame — the caller falls back to the plain
+        // tool card instead.
+        assert!(orchestration_irc_view_from_json(&serde_json::Value::Null).is_none());
+        assert!(orchestration_irc_view_from_json(&serde_json::json!({"id": "x"})).is_none());
+        assert!(orchestration_irc_view_from_json(&serde_json::json!({"id": "", "from": "Main"})).is_none());
+
+        // Empty replyTo is dropped (no spurious "reply to " metadata row).
+        let no_reply = orchestration_irc_view_from_json(&serde_json::json!({
+            "id": "m-2", "from": "Alpha", "to": "Beta", "body": "hi", "replyTo": "",
+        })).expect("view without reply");
+        assert!(no_reply.reply_to.is_none());
     }
 }

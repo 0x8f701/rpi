@@ -1,4 +1,4 @@
-// Workflow panel (D91) — master-detail mirror of the TUI workflow page.
+// Workflow panel — master-detail mirror of the TUI workflow page.
 //
 // Wire shapes mirror pi-cli workflow_rpc.rs (serde camelCase) and the
 // WorkflowPanelSnapshot projection in workflow_panel.rs. Commands reuse the

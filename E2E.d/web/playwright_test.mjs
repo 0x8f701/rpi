@@ -15,9 +15,11 @@
 // content renderer (table/task-list/mermaid/KaTeX), the Workflow panel
 // creates a workflow (live status) then cancels it, the Settings panel
 // browses by category (secret keys redacted + not editable), edits `theme`
-// in a draft, applies, and reflects the persisted value, and the Session
-// panel renders session info, renames the session (panel + header), lists
-// saved sessions, and switches to a new session.
+// in a draft, applies, and reflects the persisted value, the Session panel
+// renders session info, renames the session (panel + header), lists saved
+// sessions, and switches to a new session, the Subagents panel spawns and
+// cancels a live job, and the structured Task tool card renders Goal/
+// Constraints/Contract + child without raw JSON.
 
 import { chromium } from 'playwright';
 import fs from 'node:fs';
@@ -97,17 +99,16 @@ async function main() {
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, (reply) => document.body.textContent.includes(reply), 'fast reply never streamed into the DOM', 30000, fastReply);
 
-    // 4. Abort stops the slow stream (request 3) mid-flight; page recovers.
+    // 4. Unified Stop action aborts the slow stream (request 3) mid-flight.
     await page.fill('#prompt-input', 'stream a long answer');
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, () => document.body.textContent.includes('steer-3-'), 'third stream never started');
-    // Guarantee the run is still in flight so the Abort button is enabled.
     await waitFor(
       page,
-      () => document.getElementById('stream-badge').hidden === false,
-      'streaming badge never appeared for the third stream (mock stream finished too fast?)'
+      () => document.getElementById('send-btn')?.getAttribute('aria-label') === 'Stop generating',
+      'unified composer action never switched to Stop'
     );
-    await page.click('#abort-btn');
+    await page.click('#send-btn');
     await waitFor(
       page,
       () => document.getElementById('stream-badge').hidden === true,
@@ -214,10 +215,180 @@ async function main() {
     );
     await page.screenshot({ path: `${evidence}/todo-panel.png`, fullPage: true });
 
+    // 5b. Todo header counts layout contract (real DOM geometry): every
+    // `N label` counter is atomic — the digit and label never split across
+    // lines — the WHOLE counts line stays on one row at desktop (the panel
+    // is widened to 460px so it fits), and the close chip shares the head
+    // row without being squeezed out.
+    const countsLayout = await page.evaluate(() => {
+      const countsEl = document.getElementById('todo-counts');
+      const closeBtn = document.getElementById('todo-close-btn');
+      const panel = document.getElementById('todo-panel');
+      if (!countsEl || !closeBtn || !panel) return null;
+      const lineHeight = parseFloat(getComputedStyle(countsEl).lineHeight) || 0;
+      const countsBox = countsEl.getBoundingClientRect();
+      const panelBox = panel.getBoundingClientRect();
+      const closeBox = closeBtn.getBoundingClientRect();
+      // Atom rects: measure every `<digits> <label>` text run (the JSX
+      // renders each counter as its own text node, so map match offsets onto
+      // the text nodes and use a Range to get the run's real box).
+      const text = countsEl.textContent || '';
+      const walker = document.createTreeWalker(countsEl, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      let node;
+      while ((node = walker.nextNode())) nodes.push(node);
+      let acc = 0;
+      const runs = nodes.map((n) => {
+        const r = { node: n, start: acc, end: acc + n.textContent.length };
+        acc = r.end;
+        return r;
+      });
+      const atoms = [];
+      for (const m of text.matchAll(/\d+\s+\S+/g)) {
+        const start = m.index;
+        const end = start + m[0].length;
+        let sNode = null;
+        let sOff = 0;
+        let eNode = null;
+        let eOff = 0;
+        for (const run of runs) {
+          if (sNode === null && start < run.end) { sNode = run.node; sOff = start - run.start; }
+          if (end <= run.end) { eNode = run.node; eOff = end - run.start; break; }
+        }
+        if (sNode && eNode) {
+          const range = document.createRange();
+          range.setStart(sNode, sOff);
+          range.setEnd(eNode, eOff);
+          const r = range.getBoundingClientRect();
+          atoms.push({ text: m[0], height: r.height });
+        }
+      }
+      return {
+        countsText: text,
+        lineHeight,
+        countsHeight: countsBox.height,
+        countsSingleLine: countsBox.height <= lineHeight * 1.5,
+        atoms,
+        atomsSingleLine: atoms.every((a) => a.height <= lineHeight * 1.5),
+        panelWidth: panelBox.width,
+        closeInsidePanel: closeBox.right <= panelBox.right - 1 && closeBox.left >= panelBox.left,
+        closeSharesHeadRow: Math.abs(closeBox.top + closeBox.height / 2 - (countsBox.top + countsBox.height / 2)) < lineHeight,
+      };
+    });
+    if (!countsLayout) fail('todo panel header (counts/close) missing');
+    if (countsLayout.atoms.length < 4) fail(`todo counts atoms missing: "${countsLayout.countsText}"`);
+    if (!countsLayout.countsSingleLine) {
+      fail(`todo counts wrapped at desktop: "${countsLayout.countsText}" height ${countsLayout.countsHeight} vs line-height ${countsLayout.lineHeight}`);
+    }
+    if (!countsLayout.atomsSingleLine) {
+      fail(`todo counts atom split across lines at desktop: ${JSON.stringify(countsLayout.atoms)}`);
+    }
+    const doneAtom = countsLayout.atoms.find((a) => a.text.endsWith('done'));
+    if (!doneAtom) fail('todo counts missing the "N done" atom');
+    if (countsLayout.panelWidth < 440) {
+      fail(`todo panel not widened on desktop: ${countsLayout.panelWidth}px (counts need a single line)`);
+    }
+    if (!countsLayout.closeInsidePanel || !countsLayout.closeSharesHeadRow) {
+      fail(`todo close chip squeezed or misplaced: inside=${countsLayout.closeInsidePanel} sameRow=${countsLayout.closeSharesHeadRow}`);
+    }
+
+    // 5c. The same contract at 390×844 mobile: the counts line MAY wrap
+    // between counters on phones, but every `N label` atom (including
+    // `0 done`) stays intact and the drawer never overflows the viewport.
+    const mobilePage = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    if (token) {
+      await mobilePage.addInitScript((t) => { window.localStorage.setItem('rpi-web-token', t); }, token);
+    }
+    await mobilePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await waitFor(mobilePage, () => document.getElementById('conn-state')?.dataset.state === 'on', 'mobile WS did not connect');
+    // Panel toggles live inside the session-sidebar drawer on phones.
+    await mobilePage.click('#sidebar-toggle-btn');
+    await waitFor(
+      mobilePage,
+      () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open'),
+      'mobile sidebar drawer never opened'
+    );
+    await mobilePage.click('#todos-toggle-btn');
+    await waitFor(mobilePage, () => document.getElementById('todo-panel') !== null, 'mobile todo panel did not open');
+    const mobileLayout = await mobilePage.evaluate(() => {
+      const countsEl = document.getElementById('todo-counts');
+      const closeBtn = document.getElementById('todo-close-btn');
+      const panel = document.getElementById('todo-panel');
+      if (!countsEl || !closeBtn || !panel) return null;
+      const lineHeight = parseFloat(getComputedStyle(countsEl).lineHeight) || 0;
+      const countsBox = countsEl.getBoundingClientRect();
+      const panelBox = panel.getBoundingClientRect();
+      const closeBox = closeBtn.getBoundingClientRect();
+      const text = countsEl.textContent || '';
+      const walker = document.createTreeWalker(countsEl, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      let node;
+      while ((node = walker.nextNode())) nodes.push(node);
+      let acc = 0;
+      const runs = nodes.map((n) => {
+        const r = { node: n, start: acc, end: acc + n.textContent.length };
+        acc = r.end;
+        return r;
+      });
+      const atoms = [];
+      for (const m of text.matchAll(/\d+\s+\S+/g)) {
+        const start = m.index;
+        const end = start + m[0].length;
+        let sNode = null;
+        let sOff = 0;
+        let eNode = null;
+        let eOff = 0;
+        for (const run of runs) {
+          if (sNode === null && start < run.end) { sNode = run.node; sOff = start - run.start; }
+          if (end <= run.end) { eNode = run.node; eOff = end - run.start; break; }
+        }
+        if (sNode && eNode) {
+          const range = document.createRange();
+          range.setStart(sNode, sOff);
+          range.setEnd(eNode, eOff);
+          const r = range.getBoundingClientRect();
+          atoms.push({ text: m[0], height: r.height });
+        }
+      }
+      return {
+        countsText: text,
+        lineHeight,
+        atoms,
+        atomsSingleLine: atoms.every((a) => a.height <= lineHeight * 1.5),
+        panelWidth: panelBox.width,
+        countsRight: countsBox.right,
+        panelRight: panelBox.right,
+        closeInsidePanel: closeBox.right <= panelBox.right - 1 && closeBox.left >= panelBox.left,
+        closeSharesHeadRow: Math.abs(closeBox.top + closeBox.height / 2 - (countsBox.top + countsBox.height / 2)) < lineHeight,
+        scrollWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+      };
+    });
+    await mobilePage.close();
+    if (!mobileLayout) fail('mobile todo panel header (counts/close) missing');
+    if (mobileLayout.atoms.length < 4) fail(`mobile todo counts atoms missing: "${mobileLayout.countsText}"`);
+    if (!mobileLayout.atomsSingleLine) {
+      fail(`mobile todo counts atom split across lines at 390px: ${JSON.stringify(mobileLayout.atoms)}`);
+    }
+    const mobileDoneAtom = mobileLayout.atoms.find((a) => a.text.endsWith('done'));
+    if (!mobileDoneAtom) fail('mobile todo counts missing the "N done" atom');
+    if (mobileLayout.panelWidth < mobileLayout.innerWidth - 1) {
+      fail(`mobile todo panel not full-screen: ${mobileLayout.panelWidth} vs viewport ${mobileLayout.innerWidth}`);
+    }
+    if (mobileLayout.countsRight > mobileLayout.panelRight - 1) {
+      fail(`mobile todo counts overflow the panel: counts right ${mobileLayout.countsRight} vs panel right ${mobileLayout.panelRight}`);
+    }
+    if (mobileLayout.scrollWidth > mobileLayout.innerWidth + 1) {
+      fail(`mobile horizontal overflow with todo panel open: scrollWidth ${mobileLayout.scrollWidth} > viewport ${mobileLayout.innerWidth}`);
+    }
+    if (!mobileLayout.closeInsidePanel || !mobileLayout.closeSharesHeadRow) {
+      fail(`mobile todo close chip squeezed or misplaced: inside=${mobileLayout.closeInsidePanel} sameRow=${mobileLayout.closeSharesHeadRow}`);
+    }
+
     // 6. Rich content: the mock returns markdown (table + task list), a
-    // mermaid flowchart fence, and $...$/$$...$$ math. The upgraded renderer
-    // must produce a real table, task glyphs, a mermaid SVG, and KaTeX HTML,
-    // with no raw fence markers leaking into the transcript.
+    // mermaid flowchart fence, $...$/$$...$$ math, and a `rust,ignore` fence.
+    // The upgraded renderer must produce the structured content and highlight
+    // Rust tokens through the END of the code block, with no raw fence markers.
     //
     // The mock routes RICH_TEXT by prompt CONTENT ("render rich content" as
     // the request's last user message), so request parity cannot matter.
@@ -251,6 +422,25 @@ async function main() {
     await waitFor(page, () => document.querySelector('.md-task-glyph') !== null, 'task-list glyph never rendered', 30000);
     await waitFor(page, () => document.querySelector('.assistant-text svg') !== null, 'mermaid SVG never rendered', 30000);
     await waitFor(page, () => document.querySelector('.assistant-text .katex') !== null, 'KaTeX math never rendered', 30000);
+    await waitFor(
+      page,
+      () => {
+        const rustFence = [...document.querySelectorAll('.md-fence')].find(
+          (fence) => fence.querySelector('.md-fence__lang')?.textContent?.trim() === 'rust'
+        );
+        if (!rustFence) return false;
+        const code = rustFence.querySelector('code');
+        const lateLiteral = [...rustFence.querySelectorAll('.hljs-literal')].some(
+          (node) => node.textContent === 'None'
+        );
+        const lateKeyword = [...rustFence.querySelectorAll('.hljs-keyword')].some(
+          (node) => node.textContent === 'match'
+        );
+        return !!code && code.textContent.includes('None => Err') && lateLiteral && lateKeyword;
+      },
+      'Rust fence metadata did not highlight tokens through the end of the block',
+      30000
+    );
     const richText = await lastAssistantText(page);
     if (richText.includes('```')) {
       fail(`raw fence markers leaked into the transcript: ${richText}`);
@@ -517,6 +707,105 @@ async function main() {
       fail('spawned subagent never rendered a live activity/elapsed line');
     }
     await page.screenshot({ path: `${evidence}/subagents-spawned.png`, fullPage: true });
+    // The job is still running because the mock streams slowly. Open the
+    // modal via the Details trigger and assert an
+    // accessible dialog (role=dialog, aria-modal, aria-label, correct
+    // data-job-id, initial focus on Close) showing the task description, live
+    // status/elapsed, latest activity, the live badge, and NON-EMPTY recent
+    // history while the job runs — the acceptance that fails when a
+    // long-running job exposes only status/output. Exercise Refresh
+    // (refetch keeps the transcript live with no error), close via Escape,
+    // reopen by clicking the card, and close via the Close button.
+    await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.subagent-job')];
+      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      if (!card) throw new Error('subagent card missing before modal open');
+      card.querySelector('[data-details-trigger]').click();
+    });
+    await waitFor(page, () => document.querySelector('[data-details-dialog]') !== null, 'detail modal never opened (Details trigger)');
+    const detailsA11y = await page.evaluate(() => {
+      const dlg = document.querySelector('[data-details-dialog]');
+      const close = document.querySelector('[data-details-close]');
+      const card = [...document.querySelectorAll('.subagent-job')]
+        .find((c) => (c.textContent || '').includes('audit the release notes'));
+      return {
+        role: dlg?.getAttribute('role') || '',
+        ariaModal: dlg?.getAttribute('aria-modal') || '',
+        ariaLabel: dlg?.getAttribute('aria-label') || '',
+        jobId: dlg?.getAttribute('data-job-id') || '',
+        cardJobId: card?.getAttribute('data-job-id') || '',
+        focusOnClose: !!close && document.activeElement === close,
+      };
+    });
+    if (detailsA11y.role !== 'dialog') fail(`detail modal must be role=dialog, got "${detailsA11y.role}"`);
+    if (detailsA11y.ariaModal !== 'true') fail('detail modal must set aria-modal=true');
+    if (detailsA11y.ariaLabel !== 'Subagent job details') fail(`detail modal aria-label mismatch: "${detailsA11y.ariaLabel}"`);
+    if (!detailsA11y.jobId || detailsA11y.jobId !== detailsA11y.cardJobId) {
+      fail(`detail modal bound to wrong job: dialog=${detailsA11y.jobId} card=${detailsA11y.cardJobId}`);
+    }
+    if (!detailsA11y.focusOnClose) fail('detail modal initial focus did not land on the Close button');
+    const detailsContent = await page.evaluate(() => {
+      const txt = (sel) => (document.querySelector(sel)?.textContent || '').trim();
+      return {
+        description: txt('[data-details-description]'),
+        status: txt('[data-details-status] .subagent-job__status'),
+        elapsed: txt('[data-details-elapsed]'),
+        activity: txt('[data-details-activity]'),
+        live: document.querySelector('[data-details-live]') !== null,
+      };
+    });
+    if (!detailsContent.description.includes('audit the release notes')) {
+      fail(`detail modal description missing the task text: "${detailsContent.description}"`);
+    }
+    if (!['queued', 'running'].includes(detailsContent.status)) {
+      fail(`detail modal status must be live (queued/running), got "${detailsContent.status}"`);
+    }
+    if (!detailsContent.elapsed) fail('detail modal elapsed never rendered while running');
+    if (!detailsContent.activity) fail('detail modal latest activity never rendered');
+    if (!detailsContent.live) fail('detail modal live badge missing while the job is running');
+    // Recent history MUST be non-empty while the job is still running.
+    await waitFor(
+      page,
+      () => {
+        const pre = document.querySelector('[data-details-history]');
+        const text = pre ? pre.textContent.trim() : '';
+        return text !== '' && !text.startsWith('(no transcript yet') && !text.startsWith('(transcript unavailable)');
+      },
+      'detail modal recent history never became non-empty while the job was running',
+      15000
+    );
+    const detailsErrorShown = await page.evaluate(
+      () => document.querySelector('[data-details-error]') !== null,
+    );
+    if (detailsErrorShown) {
+      fail('detail modal reported an agent_history error while the job was running');
+    }
+    await page.screenshot({ path: `${evidence}/subagents-modal-running.png`, fullPage: true });
+    // Refresh re-fetches the child transcript: dialog stays open, history
+    // remains non-empty, no error appears.
+    await page.evaluate(() => document.querySelector('[data-details-refresh]').click());
+    await waitFor(
+      page,
+      () => {
+        const pre = document.querySelector('[data-details-history]');
+        return !!pre && pre.textContent.trim() !== '' && document.querySelector('[data-details-error]') === null;
+      },
+      'detail modal Refresh broke the recent history view',
+      10000
+    );
+    // Close via Escape dismisses the modal.
+    await page.keyboard.press('Escape');
+    await waitFor(page, () => document.querySelector('[data-details-dialog]') === null, 'detail modal did not close on Escape');
+    // Reopen by clicking the running job card (the section onClick path) and
+    // close via the Close button — proving both dismissal paths.
+    await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.subagent-job')];
+      const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
+      card.querySelector('.subagent-job__description').click();
+    });
+    await waitFor(page, () => document.querySelector('[data-details-dialog]') !== null, 'detail modal never opened on card click');
+    await page.evaluate(() => document.querySelector('[data-details-close]').click());
+    await waitFor(page, () => document.querySelector('[data-details-dialog]') === null, 'detail modal did not close on Close button');
 
     // Message the subagent via hub_send (per-job message input + Send).
     // React controlled inputs ignore `input.value=`; use the native setter so
@@ -570,7 +859,8 @@ async function main() {
       'job output pane never opened'
     );
 
-    // Cancel the job and assert the settled cancelled status in the list.
+    // Cancel moves the job out of the default Running filter. Switch to
+    // Completed and assert the same card is retained with cancelled status.
     await page.evaluate(() => {
       const cards = [...document.querySelectorAll('.subagent-job')];
       const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
@@ -580,17 +870,76 @@ async function main() {
     });
     await waitFor(
       page,
+      () => ![...document.querySelectorAll('.subagent-job')]
+        .some((card) => (card.textContent || '').includes('audit the release notes')),
+      'cancelled subagent remained under Running',
+      30000
+    );
+    await page.click('.subagents-panel__filter-btn[data-filter="completed"]');
+    await waitFor(
+      page,
       () => {
         const cards = [...document.querySelectorAll('.subagent-job')];
         const card = cards.find((c) => (c.textContent || '').includes('audit the release notes'));
         return !!card && card.getAttribute('data-status') === 'cancelled';
       },
-      'subagent job never reached cancelled status',
+      'subagent job never appeared as cancelled under Completed',
       30000
     );
     await page.screenshot({ path: `${evidence}/subagents.png`, fullPage: true });
 
-    console.log('web: playwright PASSED (page load, WS connect, prompt round-trip, abort, recovery, todo panel, rich content, workflow create/cancel, settings browse/edit/apply + secret refusal, session info/rename/switch/new, subagents spawn/live/message/output/cancel)');
+    // Structured Task tool card (main transcript): real `task` tool call with
+    // shared context + one child. Assert Goal/Constraints/Contract, child
+    // name/agent/status, and that raw args JSON is not the default view.
+    const taskCardBefore = await page.evaluate(() => document.querySelectorAll('.tool-card--task').length);
+    await page.fill('#prompt-input', 'tool-card coverage task spawn');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      (b) => document.querySelectorAll('.tool-card--task').length > b,
+      'task tool-card never rendered in the transcript',
+      45000,
+      taskCardBefore,
+    );
+    const taskCard = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('.tool-card--task')];
+      const last = cards[cards.length - 1];
+      if (!last) return null;
+      const sections = [...last.querySelectorAll('.tool-card__section')].map((s) => ({
+        label: s.querySelector('.tool-card__section-label')?.textContent || '',
+        body: s.querySelector('.tool-card__section-body')?.textContent || '',
+      }));
+      const child = last.querySelector('.tool-card__child');
+      const argsPre = last.querySelector('.tool-card__args');
+      const rawOpen = last.querySelector('details.tool-card__raw[open]');
+      return {
+        sections,
+        childName: child?.querySelector('.tool-card__child-name')?.textContent || '',
+        childAgent: child?.querySelector('.tool-card__child-agent')?.textContent || '',
+        childStatus: child?.getAttribute('data-status') || child?.querySelector('.tool-card__child-status')?.textContent || '',
+        childTarget: child?.querySelector('.tool-card__child-target')?.textContent || '',
+        rawVisible: !!argsPre && !last.querySelector('details.tool-card__raw'),
+        rawExpanded: !!rawOpen,
+        text: last.textContent || '',
+      };
+    });
+    if (!taskCard) fail('task tool-card evaluate returned null');
+    const goal = taskCard.sections.find((s) => s.label === 'Goal');
+    const constraints = taskCard.sections.find((s) => s.label === 'Constraints');
+    const contract = taskCard.sections.find((s) => s.label === 'Contract');
+    if (!goal || !goal.body.includes('Ship the Task card')) fail(`task Goal missing: ${JSON.stringify(taskCard.sections)}`);
+    if (!constraints || !constraints.body.includes('Be precise')) fail(`task Constraints missing: ${JSON.stringify(taskCard.sections)}`);
+    if (!contract || !contract.body.includes('Keep stable ids')) fail(`task Contract missing: ${JSON.stringify(taskCard.sections)}`);
+    if (taskCard.childName !== 'Alpha') fail(`task child name wrong: ${taskCard.childName}`);
+    if (taskCard.childAgent !== 'writer') fail(`task child agent wrong: ${taskCard.childAgent}`);
+    if (!taskCard.childTarget.includes('audit the release notes')) fail(`task child target wrong: ${taskCard.childTarget}`);
+    if (!taskCard.childStatus) fail('task child status missing');
+    if (taskCard.rawVisible || taskCard.rawExpanded) fail('task card dumped raw JSON as the default view');
+    if (taskCard.text.includes('"tasks"') && !taskCard.text.includes('Goal')) fail('task card looks like raw JSON dump');
+    if (taskCard.text.includes('Goal null')) fail(`task card rendered "Goal null": ${taskCard.text.slice(0, 200)}`);
+    await page.screenshot({ path: `${evidence}/task-card.png`, fullPage: true });
+
+    console.log('web: playwright PASSED (page load, WS connect, prompt round-trip, abort, recovery, todo panel, rich content, workflow create/cancel, settings browse/edit/apply + secret refusal, session info/rename/switch/new, subagents spawn/live/detail-modal/message/output/cancel, task tool card)');
   } finally {
     await browser.close();
   }

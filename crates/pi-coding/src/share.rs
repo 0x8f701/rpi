@@ -34,10 +34,51 @@ pub struct ShareResult {
     pub html_path: PathBuf,
 }
 
+/// Truthy semantics for `PI_OFFLINE`, matching `pi_cli::session_run::offline`
+/// and `crate::tools::web_search`: any of `1`/`true`/`yes`
+/// (case-insensitive, trimmed) is "on".
+#[must_use]
+pub(crate) fn offline_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// Reads the live `PI_OFFLINE` process env var. Kept as a tiny seam so the
+/// truthy parsing is unit-testable without mutating the process environment
+/// (`std::env::set_var` is `unsafe` in edition 2024 and forbidden here).
+fn offline() -> bool {
+    offline_from(std::env::var("PI_OFFLINE").ok().as_deref())
+}
+
+/// Actionable failure message for the gist-share offline contract, shared by
+/// the pre-spawn gate and the spawn-time guard so both report the same text.
+pub(crate) const OFFLINE_MESSAGE: &str =
+    "share is unavailable while PI_OFFLINE is enabled; unset PI_OFFLINE to create a gist";
+
+/// Pure OR of the two offline sources, kept as a tiny seam so the contract is
+/// unit-testable without mutating the process environment.
+#[must_use]
+fn share_offline_from_flags(process_offline: bool, session_offline: bool) -> bool {
+    process_offline || session_offline
+}
+
+/// Offline contract for gist sharing: `PI_OFFLINE` is truthy in the process
+/// environment or the session-scoped offline flag is set
+/// ([`crate::Session::set_offline`]).
+#[must_use]
+pub(crate) fn share_offline_for(session: &crate::Session) -> bool {
+    share_offline_from_flags(offline(), session.is_offline())
+}
+
 /// Check that `gh` is installed and authenticated.
 ///
 /// Returns an actionable error explaining what to install or run if not.
 async fn check_gh_available() -> Result<()> {
+    if offline() {
+        bail!("{OFFLINE_MESSAGE}");
+    }
     let version = Command::new("gh")
         .arg("--version")
         .output()
@@ -332,6 +373,28 @@ fn encrypted_share_note() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_from_matches_pi_offline_truthy_semantics() {
+        for value in ["1", "true", "TRUE", " yes ", "tRuE"] {
+            assert!(offline_from(Some(value)), "{value:?} must count as offline");
+        }
+        for value in ["", "0", "false", "no", "off", "2", "disabled"] {
+            assert!(!offline_from(Some(value)), "{value:?} must stay online");
+        }
+        assert!(!offline_from(None), "missing PI_OFFLINE stays online");
+    }
+
+    #[test]
+    fn share_offline_contract_is_process_env_or_session_flag() {
+        // Pure OR of the two offline sources (process env PI_OFFLINE and the
+        // session-scoped flag); the live wiring is covered end-to-end by the
+        // pi-cli slash dispatch test (ShareFailed carrying the contract).
+        assert!(!share_offline_from_flags(false, false));
+        assert!(share_offline_from_flags(true, false));
+        assert!(share_offline_from_flags(false, true));
+        assert!(share_offline_from_flags(true, true));
+    }
 
     #[test]
     fn derive_viewer_url_with_none_template_returns_gist_url() {

@@ -14,7 +14,8 @@ use std::io::Cursor;
 
 const IMG_MAX_WIDTH: u32 = 2000;
 const IMG_MAX_HEIGHT: u32 = 2000;
-const IMG_MAX_BASE64_BYTES: usize = (4.5 * 1024.0 * 1024.0) as usize;
+/// Inline base64 budget leaves headroom inside the 4 MiB listener frame cap.
+const IMG_MAX_BASE64_BYTES: usize = 3 * 1024 * 1024;
 
 /// Matches pi's `qualitySteps = dedupe([jpegQuality(default 80), 85, 70, 55, 40])`.
 const JPEG_QUALITIES: &[u8] = &[80, 85, 70, 55, 40];
@@ -497,6 +498,12 @@ mod tests {
         assert_eq!(base64_size(1), 4);
         assert_eq!(base64_size(3), 4);
         assert_eq!(base64_size(4), 8);
+    }
+
+    #[test]
+    fn inline_limit_leaves_rpc_frame_headroom() {
+        assert_eq!(IMG_MAX_BASE64_BYTES, 3 * 1024 * 1024);
+        assert!(IMG_MAX_BASE64_BYTES < 4 * 1024 * 1024);
     }
 
     #[test]

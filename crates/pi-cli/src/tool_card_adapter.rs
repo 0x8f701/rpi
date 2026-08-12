@@ -34,6 +34,13 @@ pub struct ToolCardRows {
     /// card renders the command from this field so embedded newlines survive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bash_command: Option<String>,
+    /// Original arguments retained for tool-specific rendering. The adapter
+    /// stores the redacted value so presentation never needs raw tool input.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub arguments: serde_json::Value,
+    /// Authoritative redacted tool-result details for specialized cards.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub details: serde_json::Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +84,171 @@ pub fn task_delegation_request(arguments: &serde_json::Value) -> Option<TaskDele
             task: task.to_owned(),
         }],
     })
+}
+
+/// Display-ready Goal / Constraints / Contract bodies split from a Task
+/// delegation `context`, mirroring the Web Task card's structured default
+/// view. Each body is bounded; raw `# Heading` lines never reach the rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskDelegationSections {
+    pub goal: String,
+    pub constraints: String,
+    pub contract: String,
+}
+
+/// Character budget for one Task context section (Web `TASK_SECTION_CHAR_LIMIT`).
+pub const TASK_SECTION_CHAR_LIMIT: usize = 480;
+/// Character budget for a Task child target summary (Web `TASK_TARGET_CHAR_LIMIT`).
+pub const TASK_TARGET_CHAR_LIMIT: usize = 220;
+
+/// Bound free-form text to a character budget without mid-code-unit cuts.
+/// The budget covers the whole bounded body: when truncated, the output is
+/// exactly `limit` characters and ends with `…`, so the ellipsis never
+/// shrinks the total below the advertised cap (mirrors the Web `boundText`
+/// budget semantics).
+#[must_use]
+pub fn bound_display_text(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    if limit <= 1 {
+        return "…".to_owned();
+    }
+    let mut bounded = text.chars().take(limit - 1).collect::<String>();
+    // A truncated body must end with the ellipsis AND total exactly `limit`
+    // characters: when the 479-char prefix ends inside a whitespace run,
+    // extend past it so the trimmed tail cannot shrink the total below the
+    // budget.
+    let mut rest = text.chars().skip(limit - 1);
+    while bounded.chars().last().is_some_and(char::is_whitespace) {
+        bounded.pop();
+        if let Some(next) = rest.next() {
+            bounded.push(next);
+        } else {
+            break;
+        }
+    }
+    bounded.push('…');
+    bounded
+}
+
+/// The three recognized Task context section kinds (Web `TaskContextSections`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskSectionKey {
+    Goal,
+    Constraints,
+    Contract,
+}
+
+/// ATX heading title: optional indent ≤3, 1–6 hashes, required space, optional
+/// trailing hashes. Returns `None` for non-heading lines (mirrors the Web
+/// `parseHeading`).
+fn atx_heading_title(line: &str) -> Option<String> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let hashes = rest.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let after = rest.get(hashes..)?;
+    let after = after.strip_prefix([' ', '\t'])?;
+    let title = strip_trailing_hashes(after).trim();
+    (!title.is_empty()).then(|| title.to_owned())
+}
+
+/// Strip an optional trailing `[ \t]+#+[ \t]*` closing sequence from an ATX
+/// heading title (`## Goal ##` → `Goal`); a lone `#` not preceded by
+/// whitespace (`foo#bar`) is content, not a closer.
+fn strip_trailing_hashes(title: &str) -> &str {
+    let bytes = title.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], b' ' | b'\t') {
+        end -= 1;
+    }
+    let hashes_end = end;
+    while end > 0 && bytes[end - 1] == b'#' {
+        end -= 1;
+    }
+    if end == hashes_end || end == 0 || !matches!(bytes[end - 1], b' ' | b'\t') {
+        return title;
+    }
+    let mut trimmed = end;
+    while trimmed > 0 && matches!(bytes[trimmed - 1], b' ' | b'\t') {
+        trimmed -= 1;
+    }
+    &title[..trimmed]
+}
+
+/// Normalize a heading title to one of the recognized section keys, matching
+/// the Web aliases case-insensitively (goal/goals, constraints/constraint/
+/// "constraints and preferences", contract/acceptance/"acceptance criteria").
+fn normalize_task_section_key(title: &str) -> Option<TaskSectionKey> {
+    let key = title
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let key = key.split_whitespace().collect::<Vec<_>>().join(" ");
+    match key.as_str() {
+        "goal" | "goals" => Some(TaskSectionKey::Goal),
+        "constraints"
+        | "constraint"
+        | "constraints preferences"
+        | "constraints and preferences" => Some(TaskSectionKey::Constraints),
+        "contract" | "acceptance" | "acceptance criteria" => Some(TaskSectionKey::Contract),
+        _ if key.starts_with("goal ") => Some(TaskSectionKey::Goal),
+        _ if key.starts_with("constraint") => Some(TaskSectionKey::Constraints),
+        _ if key.starts_with("contract") => Some(TaskSectionKey::Contract),
+        _ => None,
+    }
+}
+
+/// Split a task `context` string into Goal / Constraints / Contract bodies.
+/// Unrecognized leading prose folds into Goal so a free-form briefing still
+/// surfaces; known headings are matched case-insensitively with ATX levels;
+/// every body is bounded to [`TASK_SECTION_CHAR_LIMIT`] (mirrors the Web
+/// `parseTaskContextSections`).
+#[must_use]
+pub fn task_delegation_sections(context: &str) -> TaskDelegationSections {
+    let normalized = context.replace("\r\n", "\n").replace('\r', "\n");
+    let mut goal = Vec::new();
+    let mut constraints = Vec::new();
+    let mut contract = Vec::new();
+    let mut leading = Vec::new();
+    let mut current: Option<TaskSectionKey> = None;
+    for line in normalized.lines() {
+        let key = atx_heading_title(line).and_then(|title| normalize_task_section_key(&title));
+        if let Some(key) = key {
+            current = Some(key);
+            continue;
+        }
+        match current {
+            Some(TaskSectionKey::Goal) => goal.push(line),
+            Some(TaskSectionKey::Constraints) => constraints.push(line),
+            Some(TaskSectionKey::Contract) => contract.push(line),
+            None => leading.push(line),
+        }
+    }
+    if leading.iter().any(|line| !line.trim().is_empty()) {
+        let mut all = leading;
+        all.extend(goal);
+        goal = all;
+    }
+    TaskDelegationSections {
+        goal: bound_display_text(&goal.join("\n"), TASK_SECTION_CHAR_LIMIT),
+        constraints: bound_display_text(&constraints.join("\n"), TASK_SECTION_CHAR_LIMIT),
+        contract: bound_display_text(&contract.join("\n"), TASK_SECTION_CHAR_LIMIT),
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -272,7 +444,8 @@ fn card_rows(card: &ToolCard, expanded: bool) -> ToolCardRows {
     ToolCardRows { tool_call_id: card.tool_call_id.clone(), tool_name: card.tool_name.clone(), ordinal: card.ordinal,
         arguments_summary: compact_tool_arguments(&card.arguments), code_language, status: card.status, is_partial: card.is_partial(),
         is_error: card.is_error, cancelled: card.cancelled, truncated: omitted_content_lines > 0, omitted_content_lines, rows,
-        skill_name: skill.as_ref().map(|skill_view| skill_view.name.clone()), bash_command }
+        skill_name: skill.as_ref().map(|skill_view| skill_view.name.clone()), bash_command,
+        arguments: redact_value(&card.arguments), details: redact_value(&view.details) }
 }
 
 fn tool_code_language(tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
@@ -411,6 +584,30 @@ mod tests {
     }
 
     #[test]
+    fn hub_card_keeps_redacted_message_and_recipient_for_irc_rendering() {
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let mut adapter = ToolCardPresentationAdapter::new();
+        adapter.apply_application_event(&start("hub", "hub", json!({
+            "op": "send",
+            "to": "DeepSeekRenderingFinal",
+            "message": format!("token={secret}")
+        })));
+        adapter.apply_application_event(&end(
+            "hub",
+            "hub",
+            "- DeepSeekRenderingFinal: woken",
+            json!({"op":"send","receipts":[{"to":"DeepSeekRenderingFinal","outcome":"woken"}]}),
+            false,
+        ));
+        let card = adapter.rows("hub", false).expect("hub card");
+        assert_eq!(card.arguments["op"], "send");
+        assert_eq!(card.arguments["to"], "DeepSeekRenderingFinal");
+        assert!(!card.arguments.to_string().contains(&secret));
+        assert!(card.arguments.to_string().contains("[REDACTED]"));
+        assert_eq!(card.details["receipts"][0]["outcome"], "woken");
+    }
+
+    #[test]
     fn task_request_preserves_shared_context_and_children() {
         let request = task_delegation_request(&json!({
             "context": "# Goal\nShip it\n\n# Constraints\nBe precise",
@@ -423,6 +620,76 @@ mod tests {
         assert_eq!(request.children[0].name.as_deref(), Some("Alpha"));
         assert_eq!(request.children[0].agent.as_deref(), Some("reviewer"));
         assert!(request.context.contains("# Constraints"));
+    }
+
+    #[test]
+    fn task_sections_split_long_chinese_goal_constraints_contract() {
+        let goal = "验证用户给出的长中文 Task delegation（Goal/Constraints/Contract + DeepSeek child）在 Web transcript 中是否正确、可读、无溢出地结构化渲染。";
+        let constraints = "只用 DeepSeek。共享工作树并发修改；不得回滚、格式化、提交或运行全套测试。先读现有 Task card 实现与现有真实 E2E；不要重复实现。默认只改测试/E2E；保留 redaction/bounds/raw collapsed。";
+        let contract = "正确渲染：标题 Task；Goal/Constraints/Contract 独立区块；child name/agent/target/status；长中文正常 wrap；无水平 overflow；raw JSON 默认折叠；desktop 和 390px mobile 可读。";
+        let sections = task_delegation_sections(&format!(
+            "# Goal\n{goal}\n\n# Constraints\n{constraints}\n\n# Contract\n{contract}"
+        ));
+        assert_eq!(sections.goal, goal, "Goal body must hold the long Chinese verbatim");
+        assert_eq!(sections.constraints, constraints, "Constraints body must hold the long Chinese verbatim");
+        assert_eq!(sections.contract, contract, "Contract body must hold the long Chinese verbatim");
+        assert!(!sections.goal.contains("只用 DeepSeek"), "sections must not cross-contaminate");
+        assert!(!sections.constraints.contains("验证用户给出的"), "sections must not cross-contaminate");
+        assert!(sections.goal.chars().count() <= TASK_SECTION_CHAR_LIMIT);
+        assert!(sections.constraints.chars().count() <= TASK_SECTION_CHAR_LIMIT);
+        assert!(sections.contract.chars().count() <= TASK_SECTION_CHAR_LIMIT);
+    }
+
+    #[test]
+    fn task_sections_bound_overlong_bodies_and_fold_leading_prose() {
+        // An overlong section is bounded with a trailing ellipsis.
+        let long = "长".repeat(TASK_SECTION_CHAR_LIMIT + 120);
+        let sections = task_delegation_sections(&format!("# Goal\n{long}"));
+        assert_eq!(sections.goal.chars().count(), TASK_SECTION_CHAR_LIMIT);
+        assert!(sections.goal.ends_with('…'), "bounded body ends with ellipsis");
+        assert!(sections.goal.chars().all(|character| character == '长' || character == '…'));
+
+        // Leading unrecognized prose folds into Goal so a free-form briefing
+        // still surfaces.
+        let sections = task_delegation_sections("briefing without headings\n\n# Constraints\nBe precise");
+        assert!(sections.goal.contains("briefing without headings"), "leading prose folds into Goal");
+        assert_eq!(sections.constraints, "Be precise");
+        assert!(sections.contract.is_empty());
+
+        // A context with no content yields no sections at all.
+        let sections = task_delegation_sections("   \n\n");
+        assert!(sections.goal.is_empty() && sections.constraints.is_empty() && sections.contract.is_empty());
+
+        // Regression: a truncated body whose 479-char prefix ends inside a
+        // whitespace run must still total exactly the budget with the
+        // ellipsis — the trimmed tail must not shrink the total below
+        // TASK_SECTION_CHAR_LIMIT (the real long-Chinese fixture straddles a
+        // space at index 478).
+        let straddle = format!("{} {} {}", "长".repeat(TASK_SECTION_CHAR_LIMIT - 2), "尾".repeat(40), "结");
+        let sections = task_delegation_sections(&format!("# Goal\n{straddle}"));
+        assert_eq!(sections.goal.chars().count(), TASK_SECTION_CHAR_LIMIT, "whitespace-straddle total");
+        assert!(sections.goal.ends_with('…'), "whitespace-straddle ellipsis");
+    }
+
+    #[test]
+    fn task_sections_match_heading_aliases_and_ignore_unknown_headings() {
+        let sections = task_delegation_sections(
+            "## Goal: ship\n\nthe objective\n\n### Constraints & Preferences\n\nprecise work\n\n#### Acceptance Criteria\n\none card",
+        );
+        assert!(sections.goal.contains("the objective"), "Goal: alias with trailing prose: {sections:?}");
+        assert_eq!(sections.constraints, "precise work", "Constraints & Preferences alias: {sections:?}");
+        assert_eq!(sections.contract, "one card", "Acceptance Criteria alias: {sections:?}");
+        assert!(!sections.goal.contains("Constraints"), "heading lines never leak into bodies: {sections:?}");
+
+        // Unknown headings are body content of the current section, not new
+        // sections (Web parity).
+        let sections = task_delegation_sections("# Goal\none\n\n## Notes\nmore");
+        assert_eq!(sections.goal, "one\n\n## Notes\nmore");
+        assert!(sections.constraints.is_empty() && sections.contract.is_empty());
+
+        // ATX edge cases: trailing hashes stripped, missing space is not a heading.
+        let sections = task_delegation_sections("## Goal ##\nobjective\n\n##Goal\nnot a heading");
+        assert_eq!(sections.goal, "objective\n\n##Goal\nnot a heading", "##Goal must stay body text");
     }
     #[test]
     fn edit_read_write_and_foreground_status_are_specific() {

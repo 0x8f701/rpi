@@ -64,6 +64,8 @@ async fn listen_tls(application: Application) -> (ListenHandle, String, TempDir)
             tls_cert: Some(certificate_path),
             tls_key: Some(key_path),
             session_factory: None,
+            #[cfg(debug_assertions)]
+            outbound_writer_delay: Duration::ZERO,
         },
     )
     .await
@@ -758,6 +760,8 @@ async fn non_loopback_policy_requires_explicit_opt_in() {
                 tls_cert: None,
                 tls_key: None,
                 session_factory: None,
+                #[cfg(debug_assertions)]
+                outbound_writer_delay: Duration::ZERO,
             },
         )
         .await
@@ -807,6 +811,8 @@ async fn tls_remote_without_token_is_rejected_pre_bind() {
                 tls_cert: None,
                 tls_key: None,
                 session_factory: None,
+                #[cfg(debug_assertions)]
+                outbound_writer_delay: Duration::ZERO,
             },
         )
         .await
@@ -851,6 +857,8 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
             tls_cert: None,
             tls_key: None,
             session_factory: None,
+            #[cfg(debug_assertions)]
+            outbound_writer_delay: Duration::ZERO,
         },
     )
     .await
@@ -996,6 +1004,8 @@ async fn wildcard_listener_with_opt_in_enforces_token_over_loopback_connection()
             tls_cert: None,
             tls_key: None,
             session_factory: None,
+            #[cfg(debug_assertions)]
+            outbound_writer_delay: Duration::ZERO,
         },
     )
     .await
@@ -1052,6 +1062,8 @@ async fn loopback_listen_accepts_v4_and_v6_with_and_without_token() {
                     tls_cert: None,
                     tls_key: None,
                     session_factory: None,
+                    #[cfg(debug_assertions)]
+                    outbound_writer_delay: Duration::ZERO,
                 },
             )
             .await
@@ -1064,9 +1076,55 @@ async fn loopback_listen_accepts_v4_and_v6_with_and_without_token() {
     }
 }
 
+/// Outcome of the bounded post-stop probe against the old listener address.
+enum ProbeOutcome {
+    /// No bytes arrived: connect refused (address released), the current
+    /// occupant never answered within the short budget, or the connection was
+    /// torn down. Any of these means the old listener is not serving.
+    Gone,
+    /// The occupant answered with these raw bytes.
+    Bytes(Vec<u8>),
+}
+
+/// Bounded raw-HTTP probe: POST a minimal `get_state` request and read
+/// whatever the current occupant answers, under a short total deadline (so a
+/// silent re-binder can never hang the probe). Connect/write/read failures
+/// and timeouts all map to [`ProbeOutcome::Gone`] instead of panicking — the
+/// probe must not depend on the new occupant speaking our protocol. Only a
+/// live listener that actually replies yields bytes for the caller to
+/// inspect.
+async fn probe_listener(addr: std::net::SocketAddr) -> ProbeOutcome {
+    const PROBE_BUDGET: Duration = Duration::from_secs(1);
+    let body = json!({"type":"get_state","id":"stop-probe"}).to_string();
+    let request = format!(
+        "POST /rpc HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    match tokio::time::timeout(PROBE_BUDGET, async {
+        let mut stream = TcpStream::connect(addr).await?;
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok::<Vec<u8>, std::io::Error>(response)
+    })
+    .await
+    {
+        Ok(Ok(bytes)) => ProbeOutcome::Bytes(bytes),
+        Ok(Err(_)) | Err(_) => ProbeOutcome::Gone,
+    }
+}
+
 #[tokio::test]
 async fn stop_handle_closes_listener_and_cleanup_still_runs() {
     let app = faux_application("listen-stop").await;
+    // Unique, collision-proof session marker: after `stop`, only a response
+    // still carrying this exact name proves the old listener is alive. The
+    // name is set through the shared Application so the live listener makes
+    // it observable over the wire via get_state.
+    let marker = unique("listen-stop");
+    app.application
+        .set_session_name(&marker)
+        .expect("set session name marker");
     let process = app
         .application
         .process_spawn(spawn_sleep_spec(app.cwd.path(), 30))
@@ -1079,14 +1137,71 @@ async fn stop_handle_closes_listener_and_cleanup_still_runs() {
             .any(|info| info.id == process.id)
     );
 
-    let (handle, _extension_ui) = listen(app.application.clone()).await;
+    let extension_ui = ExtensionUiAdapter::new();
+    let handle = start(
+        app.application.clone(),
+        extension_ui,
+        ListenConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            token_file: None,
+            allow_insecure_remote: false,
+            advertised_origin: None,
+            plaintext: true,
+            tls_cert: None,
+            tls_key: None,
+            session_factory: None,
+            #[cfg(debug_assertions)]
+            outbound_writer_delay: Duration::ZERO,
+        },
+    )
+    .await
+    .expect("start listener");
     let addr = handle.local_addr();
-    handle.stop().await.expect("stop");
-    let result = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await;
+    // While the listener is live the address must be occupied.
     assert!(
-        result.is_err() || result.unwrap().is_err(),
-        "listener should be closed after stop"
+        std::net::TcpListener::bind(addr).is_err(),
+        "listener must hold its address while running"
     );
+    // The listener must serve OUR application identity: get_state echoes the
+    // marker, pinning down the exact listener the probe watches for.
+    let body = json!({"type":"get_state","id":"stop-marker"}).to_string();
+    let (status, response) = http_post_rpc(addr, body.as_bytes(), None).await;
+    assert_eq!(
+        status,
+        200,
+        "status {status} body {}",
+        String::from_utf8_lossy(&response)
+    );
+    let value: Value = serde_json::from_slice(&response).expect("parse get_state");
+    assert_eq!(
+        value["data"]["sessionName"].as_str(),
+        Some(marker.as_str()),
+        "get_state must expose the marker: {value}"
+    );
+
+    handle.stop().await.expect("stop");
+    // `stop` is a true barrier: the listener task has completed and its
+    // listening socket is closed. The freed address may already be re-bound
+    // by a concurrent test (`bind(:0)` on an ephemeral port is fair game
+    // under parallel `cargo test --workspace` runs), so we never try to bind
+    // it ourselves — we probe semantically instead. Only a response still
+    // carrying our unique marker would prove the old listener is alive;
+    // connect refusal, a silent or foreign occupant, a protocol mismatch, or
+    // a timeout all mean the old listener is gone.
+    match probe_listener(addr).await {
+        ProbeOutcome::Gone => {}
+        ProbeOutcome::Bytes(bytes) => {
+            let served_marker = parse_body(&bytes)
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .and_then(|parsed| parsed["data"]["sessionName"].as_str().map(str::to_owned));
+            assert_ne!(
+                served_marker.as_deref(),
+                Some(marker.as_str()),
+                "old listener still served get_state after stop: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
 
     app.application.cleanup().await;
     assert!(
@@ -2297,9 +2412,15 @@ fn binary_web_prompt_persists_and_restores_after_listener_restart() {
 }
 
 #[tokio::test]
+#[cfg(debug_assertions)]
 async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
     let app = faux_application("listen-ws-slow-reader").await;
-    let (handle, extension_ui) = listen(app.application.clone()).await;
+    // The test-only slow-writer seam stalls the /ws outbound writer's first
+    // message for 6s — longer than the 5s slow-client grace — so the bounded
+    // outbound queue fills and the 1008 eviction fires deterministically
+    // without depending on kernel socket-buffer behavior.
+    let (handle, extension_ui) =
+        listen_with_writer_delay(app.application.clone(), Duration::from_secs(6)).await;
     let addr = handle.local_addr();
     let socket = tokio::net::TcpSocket::new_v4().expect("create slow-reader TCP socket");
     socket
@@ -2319,9 +2440,12 @@ async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
         .0;
     let mut slow = slow.into_inner();
 
+    // Flood well past the 64-message outbound queue while the client never
+    // reads: the writer is stalled by the seam, the queue fills, and the
+    // enqueue grace (5s) expires — the connection must be torn down.
     let payload = "x".repeat(128 * 1024);
     tokio::time::timeout(DEADLINE, async {
-        for _ in 0..512 {
+        for _ in 0..128 {
             extension_ui
                 .request(
                     ExtensionUiContext {

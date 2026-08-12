@@ -6,7 +6,7 @@ case "${1:-run}" in
     list|--list|--dry-run)
         "$SCRIPT_DIR/ci/campaigns.sh" list
         printf '%s\n' 'installer.static - checked-in install.sh regression suite'
-        printf '%s\n' 'web - unified client suite: core (load/auth/stream/abort/todo/rich/workflow/settings/session/subagents), goal, xss, abort, reconnect, mobile, auth, extras, sessions — 10 lanes (E2E_CI_WEB=1)'
+        printf '%s\n' 'web - unified client suite: core (load/auth/stream/abort/todo/rich/workflow/settings/session/subagents), goal, xss, abort, reconnect, mobile, auth, extras, sessions, session_restore, projects, commands_review, attachments (E2E_CI_WEB=1)'
         ;;
     run)
         [ -f "$REPO_ROOT/tests/install-sh-static.sh" ] || {

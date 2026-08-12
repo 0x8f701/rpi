@@ -587,11 +587,14 @@ impl SessionCatalog {
             SessionSourceKind::NativePi if self.native_session_root.is_some() => {
                 path_under_depth(path, &root, 1, 1)
             }
-            SessionSourceKind::NativePi => is_native_tree_session(path, &root),
-            SessionSourceKind::Grok => is_grok_summary_depth(path, &root),
-            SessionSourceKind::Omp => {
-                is_native_tree_session(path, &root) || path_under_depth(path, &root, 1, 8)
+            // Native Pi and OMP share the same all-project resume layout:
+            // `<cwd-dir>/<session>.jsonl` only. OMP's native listAllSessions
+            // globs `*/*.jsonl`; deeper paths are subagent/task child trees
+            // that must never enter the resume catalog.
+            SessionSourceKind::NativePi | SessionSourceKind::Omp => {
+                is_native_tree_session(path, &root)
             }
+            SessionSourceKind::Grok => is_grok_summary_depth(path, &root),
             _ => true,
         };
         valid_depth.then_some(metadata)
@@ -600,8 +603,9 @@ impl SessionCatalog {
     fn walk_max_depth(&self, kind: SessionSourceKind) -> usize {
         match kind {
             SessionSourceKind::NativePi if self.native_session_root.is_some() => 1,
-            SessionSourceKind::NativePi | SessionSourceKind::Claude => 2,
-            SessionSourceKind::Omp => 8,
+            // OMP matches native listAllSessions (`*/*.jsonl`): walk only the
+            // two-component tree and never enter parent-session child dirs.
+            SessionSourceKind::NativePi | SessionSourceKind::Claude | SessionSourceKind::Omp => 2,
             SessionSourceKind::Codex => 4,
             SessionSourceKind::Grok => 3,
             SessionSourceKind::Droid => 1,
@@ -1211,11 +1215,17 @@ impl SessionCatalog {
         let format = kind
             .to_import_format()
             .expect("foreign kind maps to import format");
-        let parsed = match parse_source_under_root_public(
-            format,
-            &self.root_for(kind).path,
-            path,
-        ) {
+        let root = self.root_for(kind).path;
+        // Open through the configured root capability once and reuse the
+        // secured descriptors for both aggregate size and parsing. This avoids
+        // ambient reopen and confines companion reads (e.g. Grok chat_history)
+        // to the already-validated no-follow capability handles.
+        let opened = match open_source_under_root(format, &root, path) {
+            Ok(opened) => opened,
+            Err(_) => return Ok(None),
+        };
+        let aggregate_size = opened.aggregate_size();
+        let parsed = match parse_opened_source_public(format, opened) {
             Ok(parsed) => parsed,
             Err(_) => return Ok(None),
         };
@@ -1272,12 +1282,12 @@ impl SessionCatalog {
             kind,
             session_id,
             summary,
+            size: aggregate_size,
+            message_count: Some(parsed.meaningful_count),
             cwd: parsed.cwd,
             modified_epoch,
             display_time: format_epoch(modified_epoch),
             path: path.to_path_buf(),
-            size,
-            message_count: Some(parsed.messages.len()),
             name: None,
             status,
             import_lineage: Some(lineage),

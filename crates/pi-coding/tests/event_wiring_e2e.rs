@@ -47,8 +47,17 @@ fn lifecycle_model() -> Model {
     }
 }
 
+/// Per-process isolated native session root so `start_new_recording()` never
+/// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
+fn test_sessions_root() -> std::path::PathBuf {
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+        tempfile::tempdir().expect("test sessions root")
+    });
+    ROOT.path().to_path_buf()
+}
+
 fn session_with(model: Model) -> Session {
-    Session::new(SessionOptions {
+    let session = Session::new(SessionOptions {
         model,
         cwd: std::env::current_dir().expect("current directory"),
         system_prompt: String::new(),
@@ -62,7 +71,9 @@ fn session_with(model: Model) -> Session {
         stream_fn: None,
         auth_resolver: None,
     })
-    .expect("build session")
+.expect("build session");
+    session.set_session_dir(test_sessions_root());
+    session
 }
 
 /// Write the extension entry and load it into a fresh in-process runtime.

@@ -1,4 +1,4 @@
-// Session panel (D92) — current session info plus the session lifecycle
+// Session panel — current session info plus the session lifecycle
 // actions: new session, switch (from the unified resume catalog), fork (from
 // forkable user messages), clone, and rename.
 //
@@ -12,6 +12,77 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { safeText } from '../redact';
+
+/** Max visible path length in the Session panel (mobile-safe bound). */
+export const SESSION_PATH_DISPLAY_MAX = 72;
+
+/**
+ * Backend-authoritative path field from get_state (`cwd` / `sessionFile`).
+ * Missing/empty/non-string -> Unavailable (never guess). Present values are
+ * redacted via safeText and mid-truncated for mobile/narrow layouts; full
+ * value stays available for the title/tooltip.
+ */
+export function formatSessionPath(value: unknown): { text: string; title: string; available: boolean } {
+  if (typeof value !== 'string') {
+    return { text: 'Unavailable', title: '', available: false };
+  }
+  const trimmed = value.trim();
+  if (trimmed === '') {
+    return { text: 'Unavailable', title: '', available: false };
+  }
+  const safe = safeText(trimmed);
+  if (safe.length <= SESSION_PATH_DISPLAY_MAX) {
+    return { text: safe, title: safe, available: true };
+  }
+  // Keep head + tail so both project root and file name remain readable.
+  const head = Math.max(20, Math.floor(SESSION_PATH_DISPLAY_MAX * 0.45));
+  const tail = SESSION_PATH_DISPLAY_MAX - head - 1;
+  const text = `${safe.slice(0, head)}…${safe.slice(-tail)}`;
+  return { text, title: safe, available: true };
+}
+
+/** Parent directory of a session file path (Unix or Windows separators). */
+export function sessionDirectoryOf(sessionFile: unknown): string | null {
+  if (typeof sessionFile !== 'string') return null;
+  const trimmed = sessionFile.trim();
+  if (trimmed === '') return null;
+  const cleaned = trimmed.replace(/[\\/]+$/, '');
+  const idx = Math.max(cleaned.lastIndexOf('/'), cleaned.lastIndexOf('\\'));
+  if (idx <= 0) return null;
+  return cleaned.slice(0, idx);
+}
+
+/** Project/workspace label: last segment of cwd, or null when unavailable. */
+export function projectLabelOf(cwd: unknown): string | null {
+  if (typeof cwd !== 'string') return null;
+  const trimmed = cwd.trim();
+  if (trimmed === '') return null;
+  const cleaned = trimmed.replace(/[\\/]+$/, '');
+  if (cleaned === '') return null;
+  const idx = Math.max(cleaned.lastIndexOf('/'), cleaned.lastIndexOf('\\'));
+  const base = (idx >= 0 ? cleaned.slice(idx + 1) : cleaned).trim();
+  return base || null;
+}
+
+/**
+ * Concise New-session ownership/storage hint from get_state fields only.
+ * Never invents paths — missing fields become "Unavailable".
+ */
+export function newSessionLocationHint(cwd: unknown, sessionFile: unknown): string {
+  const project = projectLabelOf(cwd);
+  const cwdDisp = formatSessionPath(cwd);
+  const fileDisp = formatSessionPath(sessionFile);
+  const dirRaw = sessionDirectoryOf(sessionFile);
+  const dirDisp = dirRaw ? formatSessionPath(dirRaw) : { text: 'Unavailable', title: '', available: false };
+  const projectPart = project ? safeText(project) : 'Unavailable';
+  const cwdPart = cwdDisp.available ? cwdDisp.text : 'Unavailable';
+  const storePart = dirDisp.available
+    ? dirDisp.text
+    : fileDisp.available
+      ? fileDisp.text
+      : 'Unavailable';
+  return `New session inherits project ${projectPart} (cwd ${cwdPart}) and stores under ${storePart}.`;
+}
 
 export interface SessionInfo {
   model?: { id?: string; name?: string; provider?: string } | null;
@@ -61,6 +132,26 @@ export interface SessionRowWire {
   /** Present (true) when the multi-session manager currently has this
    *  session loaded (session_list `loaded` overlay). */
   loaded?: boolean;
+  /** True when the row is an unnamed, tiny, native rpi session recorded under
+   *  the OS temp root (historical test-harness shape). The sidebar hides
+   *  these by default but keeps them searchable; loaded/active rows always
+   *  stay visible. Recoverable view signal — never a deletion. */
+  temporary?: boolean;
+}
+
+export function sessionRowKey(
+  row: Pick<SessionRowWire, 'source' | 'sessionId' | 'path'>,
+): string {
+  return `${row.source || 'pi'}::${row.sessionId}::${row.path}`;
+}
+
+export function isLoadedCurrentSession(
+  row: Pick<SessionRowWire, 'loaded' | 'sessionId'>,
+  activeSessionId: string | null | undefined,
+  hasLoadedActiveRow = false,
+): boolean {
+  if (row.sessionId !== activeSessionId) return false;
+  return row.loaded === true || !hasLoadedActiveRow;
 }
 
 interface ForkMessageWire {
@@ -70,6 +161,11 @@ interface ForkMessageWire {
 
 interface SessionPanelProps {
   sendCommand: (command: Record<string, unknown>) => Promise<unknown>;
+  /** Bounded wait for the current socket to reach OPEN. The mount auto-load
+   *  awaits this before `sendCommand` so a mount-before-WebSocket-OPEN surfaces
+   *  no persistent `load failed: not connected`; active lifecycle/rename
+   *  actions bypass it (via `load({waitForReady:false})`) and fail fast. */
+  waitForReady: () => Promise<void>;
   /** Re-fetch get_state into the app shell (header session name etc.). */
   refreshState: () => Promise<unknown>;
   /** Consume a lifecycle RPC result atomically: `{sessionId,state,messages}`
@@ -98,7 +194,7 @@ function formatTokens(stats: SessionStatsWire | null): string {
   return parts.length > 0 ? parts.join(' · ') : '—';
 }
 
-export function SessionPanel({ sendCommand, refreshState, onLifecycleResult, onClose }: SessionPanelProps) {
+export function SessionPanel({ sendCommand, waitForReady, refreshState, onLifecycleResult, onClose }: SessionPanelProps) {
   const [info, setInfo] = useState<SessionInfo | null>(null);
   const [stats, setStats] = useState<SessionStatsWire | null>(null);
   const [sessions, setSessions] = useState<SessionRowWire[]>([]);
@@ -111,29 +207,52 @@ export function SessionPanel({ sendCommand, refreshState, onLifecycleResult, onC
   const [status, setStatus] = useState('');
   const mountedRef = useRef(true);
 
-  const load = useCallback(async () => {
-    const [stateData, statsData, listData, forkData] = await Promise.all([
-      sendCommand({ type: 'get_state' }),
-      sendCommand({ type: 'get_session_stats' }),
-      sendCommand({ type: 'session_list' }),
-      sendCommand({ type: 'get_fork_messages' }),
-    ]);
-    if (!mountedRef.current) return;
-    // These wire shapes are the rpi control plane's own RPC contract
-    // (RpcSessionState / SessionStats / session_list / get_fork_messages).
-    const info = stateData as SessionInfo;
-    const stats = statsData as SessionStatsWire | null;
-    const list = listData as SessionListWire;
-    const forkDataWire = forkData as ForkMessagesWire;
-    setInfo(info || null);
-    setStats(stats);
-    setSessions(Array.isArray(list?.sessions) ? list.sessions : []);
-    const forkMessagesWire = Array.isArray(forkDataWire?.messages) ? forkDataWire.messages : [];
-    setForkMessages(forkMessagesWire);
-    if (forkMessagesWire.length > 0 && !forkMessagesWire.some((f) => f.entryId === forkEntry)) {
-      setForkEntry(forkMessagesWire[0].entryId);
+  /** Re-fetch state/stats/catalog/fork messages. Auto callers (mount effect)
+   *  pass `waitForReady: true` (default) so a mount-before-WebSocket-OPEN
+   *  waits bounded for the socket to open instead of surfacing a persistent
+   *  `load failed: not connected`; a gate timeout or a transient post-gate
+   *  `not connected` race is swallowed silently (a re-open re-mounts the panel
+   *  or the user refreshes) — never a permanent error. Active lifecycle/rename
+   *  flows pass `waitForReady: false` so a disconnect FAILS FAST on the action. */
+  const load = useCallback(async (opts?: { waitForReady?: boolean }): Promise<void> => {
+    const wait = opts?.waitForReady !== false;
+    if (wait) {
+      try {
+        await waitForReady();
+      } catch {
+        return; // gate timeout during disconnect — silent; re-open re-mounts
+      }
     }
-  }, [sendCommand, forkEntry]);
+    try {
+      const [stateData, statsData, listData, forkData] = await Promise.all([
+        sendCommand({ type: 'get_state' }),
+        sendCommand({ type: 'get_session_stats' }),
+        sendCommand({ type: 'session_list', scope: 'all_projects' }),
+        sendCommand({ type: 'get_fork_messages' }),
+      ]);
+      if (!mountedRef.current) return;
+      // These wire shapes are the rpi control plane's own RPC contract
+      // (RpcSessionState / SessionStats / session_list / get_fork_messages).
+      const info = stateData as SessionInfo;
+      const stats = statsData as SessionStatsWire | null;
+      const list = listData as SessionListWire;
+      const forkDataWire = forkData as ForkMessagesWire;
+      setInfo(info || null);
+      setStats(stats);
+      setSessions(Array.isArray(list?.sessions) ? list.sessions : []);
+      const forkMessagesWire = Array.isArray(forkDataWire?.messages) ? forkDataWire.messages : [];
+      setForkMessages(forkMessagesWire);
+      if (forkMessagesWire.length > 0 && !forkMessagesWire.some((f) => f.entryId === forkEntry)) {
+        setForkEntry(forkMessagesWire[0].entryId);
+      }
+    } catch (err) {
+      // A post-gate `not connected` is a transient race (socket dropped between
+      // gate-resolve and send); never a persistent `load failed: not
+      // connected`. Other errors surface.
+      if (wait && (err as Error).message === 'not connected') return;
+      throw err;
+    }
+  }, [sendCommand, waitForReady, forkEntry]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -154,7 +273,14 @@ export function SessionPanel({ sendCommand, refreshState, onLifecycleResult, onC
       try {
         await action();
         await refreshState();
-        await load();
+        // Fail-fast refresh: the action used sendCommand directly, so a
+        // disconnect here is a transient post-action race — swallow
+        // `not connected` (no misleading "${label} failed" after success);
+        // other refresh errors surface.
+        await load({ waitForReady: false }).catch((err: Error) => {
+          if ((err as Error).message === 'not connected') return;
+          throw err;
+        });
         setStatus(`${label} ok`);
       } catch (err) {
         setStatus(`${label} failed: ${safeText((err as Error).message)}`);
@@ -179,7 +305,12 @@ export function SessionPanel({ sendCommand, refreshState, onLifecycleResult, onC
       try {
         const result = await action();
         await onLifecycleResult(result);
-        await load();
+        // Fail-fast refresh (see run): swallow a transient post-action
+        // `not connected`; other refresh errors surface.
+        await load({ waitForReady: false }).catch((err: Error) => {
+          if ((err as Error).message === 'not connected') return;
+          throw err;
+        });
         setStatus(`${label} ok`);
       } catch (err) {
         setStatus(`${label} failed: ${safeText((err as Error).message)}`);
@@ -216,6 +347,9 @@ export function SessionPanel({ sendCommand, refreshState, onLifecycleResult, onC
   };
 
   const currentId = info?.sessionId || stats?.sessionId || null;
+  const hasLoadedCurrentRow = sessions.some(
+    (row) => row.loaded === true && row.sessionId === currentId,
+  );
   const tokens = formatTokens(stats);
   const contextPct =
     stats?.contextUsage?.percent != null ? `${Math.round(stats.contextUsage.percent)}%` : '—';
@@ -257,13 +391,28 @@ export function SessionPanel({ sendCommand, refreshState, onLifecycleResult, onC
             </dd>
             <dt>Thinking</dt>
             <dd>{info?.thinkingLevel ? safeText(info.thinkingLevel) : '—'}</dd>
+            <dt>Project</dt>
+            <dd data-testid="session-project-value">
+              {(() => {
+                const label = projectLabelOf(info?.cwd);
+                return label ? safeText(label) : 'Unavailable';
+              })()}
+            </dd>
             <dt>Working directory</dt>
-            <dd title={info?.cwd ? safeText(info.cwd) : ''}>
-              {info?.cwd ? safeText(info.cwd) : '—'}
+            <dd
+              data-testid="session-cwd-value"
+              className="session-info__path"
+              title={formatSessionPath(info?.cwd).title}
+            >
+              {formatSessionPath(info?.cwd).text}
             </dd>
             <dt>Session file</dt>
-            <dd title={info?.sessionFile ? safeText(info.sessionFile) : ''}>
-              {info?.sessionFile ? safeText(info.sessionFile) : '—'}
+            <dd
+              data-testid="session-file-value"
+              className="session-info__path"
+              title={formatSessionPath(info?.sessionFile).title}
+            >
+              {formatSessionPath(info?.sessionFile).text}
             </dd>
             <dt>Messages</dt>
             <dd>
@@ -278,8 +427,32 @@ export function SessionPanel({ sendCommand, refreshState, onLifecycleResult, onC
             <dd>{safeText(contextPct)}</dd>
           </dl>
 
+          <p
+            className="session-info__new-hint"
+            data-testid="session-new-location-hint"
+            title={(() => {
+              const cwdFull = formatSessionPath(info?.cwd);
+              const fileFull = formatSessionPath(info?.sessionFile);
+              const dirRaw = sessionDirectoryOf(info?.sessionFile);
+              const dirFull = dirRaw ? formatSessionPath(dirRaw) : null;
+              const parts: string[] = [];
+              if (cwdFull.available) parts.push(`cwd: ${cwdFull.title}`);
+              if (dirFull?.available) parts.push(`session dir: ${dirFull.title}`);
+              else if (fileFull.available) parts.push(`session file: ${fileFull.title}`);
+              return parts.join(' · ');
+            })()}
+          >
+            {newSessionLocationHint(info?.cwd, info?.sessionFile)}
+          </p>
+
           <div className="session-actions">
-            <button id="session-new-btn" type="button" onClick={onNew} disabled={busy} title="Start a fresh session (new_session)">
+            <button
+              id="session-new-btn"
+              type="button"
+              onClick={onNew}
+              disabled={busy}
+              title="Start a fresh session in this project/cwd (new_session)"
+            >
               New session
             </button>
             <button id="session-clone-btn" type="button" onClick={onClone} disabled={busy} title="Clone the current branch (clone)">
@@ -330,13 +503,13 @@ export function SessionPanel({ sendCommand, refreshState, onLifecycleResult, onC
         </div>
 
         <div className="session-list">
-          <h3 className="panel__subhead">Saved sessions (this working directory)</h3>
+          <h3 className="panel__subhead">Saved sessions (all projects)</h3>
           {sessions.length === 0 && <div className="panel__empty">No saved sessions found.</div>}
           <ul className="session-list__rows">
             {sessions.map((row) => {
-              const isCurrent = row.sessionId === currentId;
+              const isCurrent = isLoadedCurrentSession(row, currentId, hasLoadedCurrentRow);
               return (
-                <li key={row.sessionId} className={`session-row${isCurrent ? ' session-row--current' : ''}`}>
+                <li key={sessionRowKey(row)} className={`session-row${isCurrent ? ' session-row--current' : ''}`}>
                   <div className="session-row__main">
                     <span className="session-row__name">
                       {row.name ? safeText(row.name) : safeText(row.sessionId)}

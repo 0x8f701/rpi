@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{Arc, LazyLock, atomic::{AtomicUsize, Ordering}},
     time::Duration,
 };
 
@@ -20,6 +20,15 @@ use pi_coding::{
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+/// Per-process isolated native session root so `start_new_recording()` never
+/// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
+fn test_sessions_root() -> PathBuf {
+    static ROOT: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
+        tempfile::tempdir().expect("test sessions root")
+    });
+    ROOT.path().to_path_buf()
+}
 
 fn session_with_responses(responses: Vec<FauxResponse>) -> (Session, FauxProviderRegistration) {
     let suffix = uuid::Uuid::now_v7().to_string();
@@ -54,6 +63,7 @@ fn session_with_responses(responses: Vec<FauxResponse>) -> (Session, FauxProvide
         auth_resolver: None,
     })
     .expect("build session");
+    session.set_session_dir(test_sessions_root());
     session.start_new_recording().expect("start application test recording");
     (session, registration)
 }
@@ -100,6 +110,7 @@ fn session_with_recorded_contexts(
         auth_resolver: None,
     })
     .expect("build context-recording session");
+    session.set_session_dir(test_sessions_root());
     (session, registration)
 }
 

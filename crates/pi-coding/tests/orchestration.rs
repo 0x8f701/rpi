@@ -563,6 +563,35 @@ async fn real_task_children_route_main_alpha_beta_main_through_owned_hub_tools()
     assert_eq!(beta_hub[0].details.as_ref().expect("Beta wait details")["message"]["from"], "Alpha");
     assert_eq!(beta_hub[0].details.as_ref().expect("Beta wait details")["message"]["body"], ALPHA_TO_BETA);
     assert_eq!(beta_hub[1].details.as_ref().expect("Beta send details")["receipts"][0]["to"], "Main");
+    // The model still receives the parent/peer body via the tool-result text
+    // (`format!("[{}] {}: {}", id, from, body)`), and the typed `details`
+    // carries the same body — but no control/wait-interrupt prose is generated.
+    // The visible-transcript rendering (typed IRC card) is asserted in
+    // `pi-cli/src/tui.rs` (`hub_wait_renders_typed_irc_card_not_control_prose`).
+    fn tool_result_text(result: &pi_ai::ToolResultMessage) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                pi_ai::ContentBlock::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let alpha_wait_text = tool_result_text(alpha_hub[0]);
+    assert!(
+        alpha_wait_text.contains(MAIN_TO_ALPHA),
+        "model must receive the parent body in the hub wait result text: {alpha_wait_text:?}"
+    );
+    assert!(
+        !alpha_wait_text.contains("interrupted") && !alpha_wait_text.contains("interruptible"),
+        "no control/wait-interrupt prose in the model-facing tool result: {alpha_wait_text:?}"
+    );
+    assert_eq!(
+        alpha_hub[0].details.as_ref().expect("Alpha wait details")["message"]["body"],
+        MAIN_TO_ALPHA
+    );
     assert!(runtime.inbox("Alpha", true).is_empty());
     assert!(runtime.inbox("Beta", true).is_empty());
     assert!(runtime.inbox("Main", true).is_empty());

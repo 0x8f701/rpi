@@ -232,6 +232,23 @@ impl OpenedSource {
     pub(crate) fn into_primary(self) -> fs::File {
         self.primary
     }
+
+    /// Aggregate persisted size of the opened session and its companions, read
+    /// from the already securely-opened descriptors (no ambient reopen, no
+    /// symlink escape). For multi-file sources such as Grok this is the sum of
+    /// the primary (`summary.json`) and the chat companion (`chat_history.jsonl`);
+    /// for single-file sources it is the primary size. Companion regularity is
+    /// verified at secure-open time, so a missing companion contributes zero.
+    #[must_use]
+    pub(crate) fn aggregate_size(&self) -> u64 {
+        let mut total = self.metadata.len();
+        if let Some(chat) = &self.grok_chat {
+            if let Ok(metadata) = chat.metadata() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+        total
+    }
 }
 
 #[derive(Debug)]
@@ -590,6 +607,10 @@ pub struct ParsedSessionPublic {
     pub cwd: PathBuf,
     pub started_at: Option<String>,
     pub messages: Vec<ImportedMessage>,
+    /// Meaningful user/assistant turn count, independent of the lossy text
+    /// projection in `messages`. Image-only turns count here even though they
+    /// are dropped from `messages`; empty pending assistant placeholders do not.
+    pub meaningful_count: usize,
 }
 
 impl From<ParsedSession> for ParsedSessionPublic {
@@ -599,6 +620,7 @@ impl From<ParsedSession> for ParsedSessionPublic {
             cwd: parsed.cwd,
             started_at: parsed.started_at,
             messages: parsed.messages,
+            meaningful_count: parsed.meaningful_count,
         }
     }
 }
@@ -610,6 +632,7 @@ impl From<ParsedSessionPublic> for ParsedSession {
             cwd: parsed.cwd,
             started_at: parsed.started_at,
             messages: parsed.messages,
+            meaningful_count: parsed.meaningful_count,
         }
     }
 }

@@ -338,7 +338,8 @@ async fn opt_in_glob_tool_is_absent_by_default_and_matches_disk_when_enabled() {
     assert_eq!(
         default_session.get_active_tool_names(),
         [
-            "read", "bash", "edit", "write", "ast_edit", "generate_image", "memory", "ask", "mcp"
+            "read", "bash", "browser", "edit", "write", "ast_edit", "generate_image", "memory",
+            "ask", "mcp"
         ]
     );
     assert!(

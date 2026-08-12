@@ -67,7 +67,7 @@ does not force print mode.
 | `--listen <SOCKET_ADDR>` | | e.g. `127.0.0.1:8765` | Start the headless Web-only HTTPS/WebSocket service. Serves `/web`, `/ws`, and `/rpc`; never starts a TUI or REPL and stays alive with closed stdin until Ctrl-C/SIGTERM. Positional prompts are rejected; submit them through the Web/RPC API. Uses HTTPS with a self-signed certificate by default (`--listen-cert`/`--listen-key` for real certs; `--listen-plaintext` to opt out). Loopback may be tokenless; a non-loopback HTTPS bind requires `--listen-token-file` (rejected pre-bind without one). |
 | `--listen-token-file <PATH>` | | token file | Bearer token file. Mandatory for non-loopback HTTPS unless `--listen-allow-insecure-remote` is used. When set, the token is required on every bind (browsers present `rpi-auth.<token>`; `/rpc` requires `Authorization: Bearer`). When unset, the listener is tokenless on loopback and on non-loopback binds with `--listen-allow-insecure-remote`; a non-loopback HTTPS bind without a token file (and without that flag) is rejected pre-bind. |
 | `--listen-allow-insecure-remote` | | | Explicit tokenless-remote opt-in. Permits tokenless browsers on a non-loopback bind. Combined with `--listen-plaintext` it is unauthenticated and unencrypted; without `--listen-plaintext` it is encrypted but unauthenticated. Exposes control traffic to passive network observers. |
-| `--listen-advertised-origin <URL>` | | http(s) origin | Advertised origin for collaboration links (`/collab`, `collab_start` without an explicit `baseUrl`) and the reachable `/web` URL printed at startup. Not required for ordinary `/web`, `/ws`, or `/rpc`: tokenless browser access uses ordinary same-origin (`Origin` authority equals HTTP `Host`). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing `/` is normalized away). Loopback and other specific binds advertise their bound address automatically; a wildcard bind (0.0.0.0 or `::`) without this flag prints no reachable URL and `/collab` fails closed instead of synthesizing links from an unreachable wildcard. |
+| `--listen-advertised-origin <URL>` | | http(s) origin | Explicit advertised origin for collaboration links (`/collab`, `collab_start` without an explicit `baseUrl`) and the startup `Web UI:` line when set. Not required for ordinary `/web`, `/ws`, or `/rpc`: tokenless browser access uses ordinary same-origin (`Origin` authority equals HTTP `Host`). Strict origin: http/https scheme, a host with an optional numeric port, and no credentials, path, query, or fragment (a trailing `/` is normalized away). Loopback and other specific binds advertise their bound address automatically. On a wildcard bind (0.0.0.0 or `::`) without this flag, startup best-effort discovers a route-selected LAN address for the `Web UI:` line (`<scheme>://<lan-ip>:<port>/web`) or falls back to text telling you to use this machine's LAN IP and port; `/collab` still fails closed instead of synthesizing links from an unreachable wildcard. |
 | `--version` | `-v`, `-V` | | Print version and exit. |
 | `--help` | `-h` | | Print help and exit. |
 
@@ -126,10 +126,12 @@ pages but is not authentication and not DNS-rebinding protection). Use only
 on a network where passive observers are an accepted risk.
 
 The token authenticates clients but does not encrypt traffic. `rpi agent serve`
-remains loopback-only. `--listen-advertised-origin` is only for collaboration
-links and the reachable URL printed at startup; loopback and specific binds
-advertise their bound address automatically, and a wildcard bind without it
-prints no reachable URL (ordinary web access still works via same-origin).
+remains loopback-only. `--listen-advertised-origin` is required only for
+collaboration links on wildcard binds and, when set, also wins for the startup
+`Web UI:` line. Loopback and specific binds advertise their bound address
+automatically. A wildcard bind without it still prints a best-effort
+`Web UI: <scheme>://<lan-ip>:<port>/web` (or a textual LAN-IP fallback when
+discovery is unavailable); ordinary web access still works via same-origin.
 
 ## Subcommands
 
@@ -237,7 +239,7 @@ A trailing newline is appended after the final assistant text.
 
 ## Primary slash commands
 
-`/help`, slash completion, and RPC command discovery expose exactly these 21
+`/help`, slash completion, and RPC command discovery expose exactly these 23
 primary commands. Other built-ins remain manually executable where documented.
 
 | Command | Description |
@@ -260,6 +262,7 @@ primary commands. Other built-ins remain manually executable where documented.
 | `/goal` | Create and manage the durable session goal |
 | `/workflow` | Create and manage isolated concurrent workflows |
 | `/code-review [<from> <to>]` | Browse a Git diff in a fullscreen tree/diff page: bare shows tracked HEAD→working-tree staged and unstaged changes; two refs compare any two commits/branches/tags |
+| `/skill <name>` | Show a loaded skill's frontmatter summary |
 | `/btw [prompt]` | Open a persistent detached side conversation forked from the active main branch |
 | `/queue [cancel]` | Show pending steering/follow-up prompts (cancel clears them) |
 | `/live` | Hold-to-talk voice input (TUI STT) |

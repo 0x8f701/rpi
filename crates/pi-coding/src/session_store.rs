@@ -3112,16 +3112,15 @@ mod tests {
 
     #[test]
     fn persist_now_writes_header_without_assistant() {
-        let directory = std::env::temp_dir().join(format!("pi-session-persist-now-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).expect("create test directory");
-        let recorder = start_session_with_parent(&directory, None, None, Some(Path::new("parent.jsonl"))).expect("start session");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let recorder = start_session_in(workspace.path(), None, None, Some(sessions.path()), None, Some(Path::new("parent.jsonl"))).expect("start session");
         assert!(!recorder.path().exists());
         recorder.persist_now().expect("persist header");
         let tree = load_session_tree(recorder.path()).expect("load header-only session");
         assert_eq!(tree.header.parent_session.as_deref(), Some("parent.jsonl"));
         assert!(tree.entries.is_empty());
         recorder.close().expect("close recorder");
-        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     fn test_entry(id: &str, parent_id: Option<&str>) -> SessionEntry {
@@ -3555,9 +3554,9 @@ mod tests {
 
     #[test]
     fn custom_records_omit_absent_optional_metadata() {
-        let directory = std::env::temp_dir().join(format!("pi-session-custom-omit-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).expect("create test directory");
-        let recorder = start_session(&directory, None, None).expect("start session");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let recorder = start_session_in(workspace.path(), None, None, Some(sessions.path()), None, None).expect("start session");
         recorder.record_custom_entry("extension.state", None).expect("record custom state");
         recorder.record_custom_message(&CustomMessage {
             custom_type: "extension.notice".into(),
@@ -3579,14 +3578,13 @@ mod tests {
         assert!(message.get("details").is_none());
         assert!(message.get("role").is_none());
         assert!(message["timestamp"].as_str().is_some());
-        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[test]
     fn custom_entries_round_trip_and_project_with_original_metadata() {
-        let directory = std::env::temp_dir().join(format!("pi-session-custom-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).expect("create test directory");
-        let recorder = start_session(&directory, None, None).expect("start session");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let recorder = start_session_in(workspace.path(), None, None, Some(sessions.path()), None, None).expect("start session");
         recorder
             .record_custom_entry("extension.state", Some(json!({"cursor":7})))
             .expect("record custom state");
@@ -3619,7 +3617,6 @@ mod tests {
                 && message.content == custom.content
                 && !message.display
                 && message.details == custom.details));
-        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[test]

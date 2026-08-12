@@ -21,10 +21,16 @@
 #      ($EVIDENCE_ROOT/web-sessions/coverage-assertions.json)
 #   6. merge every V8 payload, convert through the inline source map
 #      (scripts/coverage-report.mjs), verify source mapping for every expected
-#      src file, emit text + JSON summary + lcov, enforce thresholds
+#      src file, emit text + JSON summary + lcov, enforce thresholds — the
+#      GLOBAL thresholds (coverage.config.mjs thresholds) AND per-file hard
+#      thresholds (coverage.config.mjs fileThresholds): scrollPin.ts is gated
+#      at >=90% lines/functions/branches/statements. Any scroll metric below
+#      its gate fails this command (exit 2). The REAL scroll browser lane
+#      payload (scroll_test.mjs, run in step 5) is asserted present and merged
+#      here.
 #   7. validate the feature matrix against the executed assertion evidence
 #      (coverage_matrix.mjs) — zero uncovered required assertions across the
-#      steering/xss drivers AND the sessions lane (T0.1-T7.4)
+#      steering/xss/fallback drivers AND the sessions + scroll lanes
 #
 # The normal bundle is rebuilt afterwards by the packaging owner
 # (FixWebDistPackaging); this command never writes dist/.
@@ -223,7 +229,30 @@ tools:
 You are the writer agent for deterministic web coverage.
 EOF
     printf '%s\n' "$TOKEN" >"$root/token"
+    # Realtime coverage: the mock's /v1/realtime/calls branch records the
+    # proxy's request headers here so coverage_test.mjs can assert
+    # OpenAI-Alpha: quicksilver=v2 + the Bearer token reached the backend.
+    export MOCK_REALTIME_EVIDENCE="$evidence/realtime-call.json"
     port="$(web_start_mock "$root" "$evidence")"
+    # Advertise Codex Live realtime mode to the web client at boot: the
+    # steering driver's realtime scenario clicks the composer mic and drives
+    # a REAL realtime_create_call RPC (Rust proxy -> this mock's create-call
+    # endpoint). allowInsecure is required for the loopback http:// base URL.
+    python3 - "$root/home/.pi/agent/settings.json" "$port" <<'PY'
+import json, sys
+path, port = sys.argv[1], sys.argv[2]
+settings = json.load(open(path, encoding="utf-8"))
+settings["live"] = {
+    "enabled": True,
+    "mode": "realtime",
+    "realtimeBaseUrl": f"http://127.0.0.1:{port}",
+    "realtimeApiKey": "mock-realtime-key",
+    "realtimeModel": "gpt-realtime-1.5",
+    "voice": "sol",
+    "allowInsecure": True,
+}
+json.dump(settings, open(path, "w", encoding="utf-8"))
+PY
     web_spawn_rpi "$root" "$evidence" "$port"
     url="$(web_wait_for_listener "$evidence")"
     log "coverage: steering fixture listener at $url"
@@ -370,6 +399,7 @@ EOF
     local collab_status=0
     RPI_BIN="$RPI_BIN" RPI_WEB_DEV_DIR="$COV_DIST" \
         RPI_COVERAGE_DIR="$PAYLOADS_DIR" RPI_COVERAGE_LANE="coverage-collab" \
+        COLLAB_VIEW_GUEST=1 \
         bash "$E2E_DIR/collab/collab_scenario.sh" run \
         >"$EVIDENCE_DIR/driver-collab.out" 2>&1 || collab_status=$?
     if [ "$collab_status" -eq 0 ]; then
@@ -385,13 +415,16 @@ EOF
     # ---- payload verification: every lane must have produced coverage ----
     local lanes
     lanes="$(sed -n 's/^LANES="\(.*\)"/\1/p' "$SCRIPT_DIR/run.sh")"
-    [ -n "$lanes" ] || lanes="core goal xss abort reconnect switch mobile auth auth_tokenless extras sessions session_restore"
+    [ -n "$lanes" ] || fail "coverage: could not extract the Web lane registry from run.sh"
     local lane testfile missing=0
     for lane in $lanes; do
-        testfile="$(sed -n "s#.*web_run_playwright [^ ]* [^ ]* [^ ]* \"\$SCRIPT_DIR/\([a-z0-9_]*\.mjs\)\".*#\1#p" "$SCRIPT_DIR/$lane.sh" | head -1)"
-        [ -n "$testfile" ] || testfile="$lane"
-        if ! ls "$PAYLOADS_DIR/${testfile%.mjs}-"*.json >/dev/null 2>&1; then
-            log "coverage: FAIL: lane '$lane' produced no coverage payload (expected ${testfile%.mjs}-*.json)"
+        testfile="$(sed -n "/web_run_playwright/,/\.mjs\"/ { s#.*\"\$SCRIPT_DIR/\([a-z0-9_]*\.mjs\)\".*#\1#p; }" "$SCRIPT_DIR/$lane.sh" | head -1)"
+        if [ -z "$testfile" ]; then
+            if [ -f "$SCRIPT_DIR/${lane}_test.mjs" ]; then testfile="${lane}_test.mjs"; else testfile="${lane}.mjs"; fi
+        fi
+        if ! ls "$PAYLOADS_DIR/${testfile%.mjs}-"*.json >/dev/null 2>&1 \
+            && ! ls "$PAYLOADS_DIR/$lane-"*.json >/dev/null 2>&1; then
+            log "coverage: FAIL: lane '$lane' produced no coverage payload (expected ${testfile%.mjs}-*.json or $lane-*.json)"
             missing=1
         fi
     done
@@ -402,6 +435,17 @@ EOF
         fi
     done
     [ "$missing" -eq 0 ] || fail "coverage: one or more lanes produced no coverage payload (skipped/fallback lanes are not counted)"
+
+    # The per-file hard gate (scrollPin.ts >= 90% lines/functions/branches/
+    # statements) depends on the REAL scroll browser lane's V8 payload being
+    # present and merged. Assert it explicitly (the generic loop above already
+    # checks it, but a named assertion makes a missing scroll payload an
+    # unambiguous failure rather than a generic "lane produced no coverage").
+    if ! ls "$PAYLOADS_DIR"/scroll_test-*.json >/dev/null 2>&1 \
+        && ! ls "$PAYLOADS_DIR"/scroll-*.json >/dev/null 2>&1; then
+        fail "coverage: scroll lane produced no V8 payload — scrollPin.ts per-file gate cannot be evaluated"
+    fi
+    log "coverage: scroll lane V8 payload present (scrollPin.ts per-file gate will be evaluated)"
 
     # ---- 6. merge + report + thresholds ----
     local report_dir="$EVIDENCE_DIR/report"
@@ -420,7 +464,11 @@ EOF
         --evidence "$EVIDENCE_DIR/driver-steering/coverage-assertions.json" \
         --evidence "$EVIDENCE_DIR/driver-xss/coverage-assertions.json" \
         --evidence "$EVIDENCE_DIR/driver-fallback/coverage-assertions.json" \
-        --evidence "$EVIDENCE_ROOT/web-sessions/coverage-assertions.json"
+        --evidence "$EVIDENCE_ROOT/web-sessions/coverage-assertions.json" \
+        --evidence "$EVIDENCE_ROOT/web-scroll/coverage-assertions.json" \
+        --evidence "$EVIDENCE_ROOT/web-projects/coverage-assertions.json" \
+        --evidence "$EVIDENCE_ROOT/web-external_sessions/coverage-assertions.json" \
+        --evidence "$EVIDENCE_ROOT/web-presentation/coverage-assertions.json"
 
     # persist payloads next to the report for later inspection
     mkdir -p "$EVIDENCE_DIR/payloads"

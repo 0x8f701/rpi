@@ -1,4 +1,4 @@
-// Settings panel (D92) — schema-driven settings browser with typed edit and
+// Settings panel — schema-driven settings browser with typed edit and
 // the server-held draft/apply flow (mirrors the TUI settings panel):
 //
 //   settings_inspect    -> SettingsCatalogSnapshot (categories + definitions +

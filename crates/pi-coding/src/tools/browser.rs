@@ -49,9 +49,11 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use pi_agent::{AbortSignal, AgentTool, AgentToolResult, ToolCapability};
+use pi_ai::ContentBlock;
 
-use super::{arg_str, check_aborted, s_object, s_string, text_result};
+use super::{arg_str, check_aborted, imageresize::process_image, paths::resolve_scoped_path, s_object, s_string, text_result};
 use crate::truncate::{format_size, truncate_head};
+use crate::WorkspaceRoots;
 
 /// Wall-clock budget for a single action, including browser startup wait.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -65,6 +67,10 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
 const EXTRACT_MAX_BYTES: usize = 16 * 1024;
 /// Cap on the number of tabs rendered by `list_tabs`.
 const LIST_TABS_MAX: usize = 20;
+/// Raw screenshot cap before image decoding/resizing.
+const SCREENSHOT_MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
+/// Inline base64 budget leaves headroom inside the 4 MiB listener frame cap.
+const SCREENSHOT_MAX_BASE64_BYTES: usize = 3 * 1024 * 1024;
 /// Error shown when no Chrome/Chromium binary can be found.
 const MISSING_CHROME_MESSAGE: &str = "\
 browser tool requires Chrome/Chromium, but none was found on this machine. \
@@ -90,9 +96,9 @@ enum Action {
 
 const ACTIONS_HINT: &str = "navigate, click, fill, screenshot, extract, list_tabs, close";
 
-/// Builds the `browser` tool. `cwd` anchors relative screenshot paths.
-pub(crate) fn browser_tool(cwd: &str) -> AgentTool {
-    let cwd = cwd.to_string();
+/// Builds the `browser` tool. `cwd` anchors workspace-scoped screenshot paths.
+pub(crate) fn browser_tool_for_workspace(workspace: WorkspaceRoots) -> AgentTool {
+    let cwd = workspace.cwd().to_string_lossy().into_owned();
     let params = s_object(
         vec![
             ("action", s_string("Action to perform")),
@@ -108,7 +114,7 @@ pub(crate) fn browser_tool(cwd: &str) -> AgentTool {
             ("text", s_string("Text to fill into the matched input (fill only)")),
             (
                 "path",
-                s_string("Filesystem path for the screenshot PNG (screenshot only)"),
+                s_string("Workspace-relative output path for the screenshot PNG (screenshot only)"),
             ),
         ],
         vec!["action"],
@@ -122,13 +128,14 @@ between calls, so click/fill/screenshot/extract accept an optional url to naviga
 (one call can then act on a page end to end). \
 Requires a Chrome/Chromium binary on this machine (CHROME_PATH, PATH, or standard install \
 locations); missing binaries are rejected with an actionable error. \
-Screenshots are saved as PNG files; only the path and size are returned (never the image \
-data). Outputs are bounded to {}KB.",
+Screenshots are saved only within the workspace and returned as bounded inline image content. \
+Outputs are bounded to {}KB.",
         EXTRACT_MAX_BYTES / 1024
     );
     AgentTool::new("browser", description, params, move |ctx| {
+        let workspace = workspace.clone();
         let cwd = cwd.clone();
-        async move { run_browser(&cwd, ctx.arguments, ctx.abort).await }
+        async move { run_browser_for_workspace(&cwd, &workspace, ctx.arguments, ctx.abort).await }
     })
     .with_capability(ToolCapability::Exec)
 }
@@ -651,32 +658,106 @@ async fn mouse_click_at(session: &mut BrowserSession, x: f64, y: f64) -> Result<
     }
     Ok(())
 }
-
-/// Resolves a screenshot path: absolute paths pass through, relative paths
-/// anchor at the tool's `cwd`. Parent directories are created on demand.
-fn resolve_screenshot_path(cwd: &str, path: &str) -> Result<PathBuf> {
-    let resolved = Path::new(path);
-    let resolved = if resolved.is_absolute() {
-        resolved.to_path_buf()
-    } else {
-        Path::new(cwd).join(resolved)
-    };
-    if let Some(parent) = resolved.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("browser: failed to create screenshot directory {}", parent.display())
-            })?;
+fn resolve_screenshot_path(workspace: &WorkspaceRoots, path: &str) -> Result<PathBuf> {
+    let output = PathBuf::from(resolve_scoped_path(path, workspace)?);
+    let parent = output
+        .parent()
+        .ok_or_else(|| anyhow!("browser: screenshot path has no parent"))?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!("browser: failed to create screenshot directory {}", parent.display())
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("browser: failed to resolve screenshot directory {}", parent.display()))?;
+    if !workspace.roots().iter().any(|root| canonical_parent.starts_with(root)) {
+        bail!("browser: screenshot path must stay within the workspace");
+    }
+    if output.exists() {
+        let canonical_output = std::fs::canonicalize(&output)
+            .with_context(|| format!("browser: failed to resolve screenshot path {}", output.display()))?;
+        if !workspace.roots().iter().any(|root| canonical_output.starts_with(root)) {
+            bail!("browser: screenshot path must stay within the workspace");
         }
     }
-    Ok(resolved)
+    Ok(output)
+}
+
+fn save_screenshot_bytes(workspace: &WorkspaceRoots, output: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = output
+        .parent()
+        .ok_or_else(|| anyhow!("browser: screenshot path has no parent"))?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("browser: failed to resolve screenshot directory {}", parent.display()))?;
+    if !workspace.roots().iter().any(|root| canonical_parent.starts_with(root)) {
+        bail!("browser: screenshot directory now resolves outside the workspace");
+    }
+    let name = output
+        .file_name()
+        .ok_or_else(|| anyhow!("browser: screenshot path must name a file"))?;
+    let final_path = canonical_parent.join(name);
+    if std::fs::symlink_metadata(&final_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!("browser: screenshot target must not be a symlink");
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&final_path)
+        .with_context(|| format!("browser: failed to write screenshot to {}", output.display()))?;
+    use std::io::Write as _;
+    file.write_all(bytes)
+        .with_context(|| format!("browser: failed to write screenshot to {}", output.display()))
+}
+fn screenshot_result(
+    workspace: &WorkspaceRoots,
+    output: &Path,
+    bytes: Vec<u8>,
+) -> Result<AgentToolResult> {
+    if bytes.len() > SCREENSHOT_MAX_INPUT_BYTES {
+        bail!("browser: screenshot exceeds the {} MiB input limit", SCREENSHOT_MAX_INPUT_BYTES / 1024 / 1024);
+    }
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        bail!("browser: screenshot did not produce a PNG image");
+    }
+    let processed = process_image(&bytes, "image/png", true);
+    if !processed.ok {
+        bail!("browser: {}", processed.message.trim_matches(['[', ']']));
+    }
+    let data = base64::engine::general_purpose::STANDARD.encode(&processed.data);
+    if data.len() > SCREENSHOT_MAX_BASE64_BYTES {
+        bail!("browser: screenshot exceeds the inline transport limit");
+    }
+    save_screenshot_bytes(workspace, output, &bytes)?;
+    let display_path = workspace
+        .roots()
+        .iter()
+        .find_map(|root| output.strip_prefix(root).ok())
+        .ok_or_else(|| anyhow!("browser: screenshot output is outside the workspace"))?
+        .to_string_lossy();
+    let mime_type = processed.mime_type;
+    Ok(AgentToolResult {
+        content: vec![
+            ContentBlock::text(format!(
+                "Screenshot saved to {} ({} {})",
+                display_path,
+                format_size(processed.data.len()),
+                mime_type
+            )),
+            ContentBlock::Image { data, mime_type },
+        ],
+        ..Default::default()
+    })
 }
 
 async fn run_action(
     session: &mut BrowserSession,
     action: &Action,
     args: &Value,
-    cwd: &str,
-) -> Result<String> {
+    workspace: &WorkspaceRoots,
+) -> Result<AgentToolResult> {
     // Each call spawns a fresh browser starting at about:blank, so non-
     // navigate actions accept an optional `url` to navigate first — a single
     // call can then operate on a real page end to end.
@@ -690,7 +771,7 @@ async fn run_action(
         Action::Navigate => {
             let url = arg_str(args, "url");
             let (title, href) = navigate_to(session, &url).await?;
-            Ok(format!("Navigated to {url}\nTitle: {title}\nURL: {href}"))
+            Ok(text_result(format!("Navigated to {url}\nTitle: {title}\nURL: {href}")))
         }
         Action::Click => {
             let selector = arg_str(args, "selector");
@@ -733,7 +814,7 @@ async fn run_action(
             if !new_text.is_empty() && new_text != text {
                 parts.push(format!("→ \"{new_text}\""));
             }
-            Ok(parts.join(" "))
+            Ok(text_result(parts.join(" ")))
         }
         Action::Fill => {
             let selector = arg_str(args, "selector");
@@ -748,7 +829,7 @@ async fn run_action(
             }
             let tag = info.get("tag").and_then(Value::as_str).unwrap_or("element");
             let value = info.get("value").and_then(Value::as_str).unwrap_or("");
-            Ok(format!("Filled {tag} ({selector}) — value now {value:?}"))
+            Ok(text_result(format!("Filled {tag} ({selector}) — value now {value:?}")))
         }
         Action::Screenshot => {
             let path = arg_str(args, "path");
@@ -762,17 +843,8 @@ async fn run_action(
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
                 .context("browser: screenshot data was not valid base64")?;
-            if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                bail!("browser: screenshot did not produce a PNG image");
-            }
-            let abs = resolve_screenshot_path(cwd, &path)?;
-            std::fs::write(&abs, &bytes)
-                .with_context(|| format!("browser: failed to write screenshot to {}", abs.display()))?;
-            Ok(format!(
-                "Screenshot saved to {} ({} PNG)",
-                abs.display(),
-                format_size(bytes.len())
-            ))
+            let output = resolve_screenshot_path(workspace, &path)?;
+            screenshot_result(workspace, &output, bytes)
         }
         Action::Extract => {
             let selector = arg_str(args, "selector");
@@ -796,7 +868,7 @@ async fn run_action(
                     truncated.output_bytes, truncated.total_bytes
                 ));
             }
-            Ok(out)
+            Ok(text_result(out))
         }
         Action::ListTabs => {
             let targets = fetch_json_list(session.port).await?;
@@ -806,7 +878,7 @@ async fn run_action(
                 .take(LIST_TABS_MAX)
                 .collect();
             if pages.is_empty() {
-                return Ok("No tabs".to_string());
+                return Ok(text_result("No tabs"));
             }
             let mut lines = vec![format!("{} tab(s):", pages.len())];
             for (index, target) in pages.iter().enumerate() {
@@ -818,9 +890,9 @@ async fn run_action(
                 }
                 lines.push(format!("{}. {title} — {url}", index + 1));
             }
-            Ok(lines.join("\n"))
+            Ok(text_result(lines.join("\n")))
         }
-        Action::Close => Ok("browser closed".to_string()),
+        Action::Close => Ok(text_result("browser closed")),
     }
 }
 
@@ -831,13 +903,24 @@ async fn run_action(
 /// Executes one `browser` action: validates, spawns a fresh headless browser,
 /// runs the action, and tears the browser down (also on errors/timeouts/abort).
 pub(crate) async fn run_browser(cwd: &str, args: Value, abort: AbortSignal) -> Result<AgentToolResult> {
-    run_browser_with(cwd, args, abort, None).await
+    let workspace = WorkspaceRoots::for_tool_factory(cwd);
+    run_browser_for_workspace(cwd, &workspace, args, abort).await
+}
+
+async fn run_browser_for_workspace(
+    cwd: &str,
+    workspace: &WorkspaceRoots,
+    args: Value,
+    abort: AbortSignal,
+) -> Result<AgentToolResult> {
+    run_browser_with(cwd, workspace, args, abort, None).await
 }
 
 /// `run_browser` with an injectable binary path so tests can exercise the
 /// missing-binary rejection deterministically and skip-guard the real smoke.
 async fn run_browser_with(
     cwd: &str,
+    workspace: &WorkspaceRoots,
     args: Value,
     abort: AbortSignal,
     chrome_bin: Option<PathBuf>,
@@ -847,6 +930,14 @@ async fn run_browser_with(
     let action = parse_action(action_input.trim())?;
     validate_args(&action, &args)?;
 
+    // Calls are stateless: every non-close action owns a fresh browser and
+    // tears it down before returning. `close` therefore has nothing to spawn
+    // or discover; treating it as an idempotent acknowledgement keeps the
+    // advertised action valid even when Chrome is unavailable.
+    if action == Action::Close {
+        return Ok(text_result("browser closed"));
+    }
+
     let bin = match chrome_bin {
         Some(path) if path.is_file() => path,
         Some(path) => bail!("browser: Chrome/Chromium binary not found at {}", path.display()),
@@ -855,7 +946,7 @@ async fn run_browser_with(
 
     let mut session = spawn_browser(&bin).await?;
     let outcome = tokio::select! {
-        res = tokio::time::timeout(ACTION_TIMEOUT, run_action(&mut session, &action, &args, cwd)) => {
+        res = tokio::time::timeout(ACTION_TIMEOUT, run_action(&mut session, &action, &args, workspace)) => {
             match res {
                 Ok(result) => result,
                 Err(_) => Err(anyhow!(
@@ -867,7 +958,7 @@ async fn run_browser_with(
         _ = abort.cancelled() => Err(anyhow!("Operation aborted")),
     };
     session.shutdown().await;
-    outcome.map(text_result)
+    outcome
 }
 
 #[cfg(test)]
@@ -881,6 +972,13 @@ mod tests {
             Some(pi_ai::ContentBlock::Text { text, .. }) => text.clone(),
             _ => String::new(),
         }
+    }
+
+    fn image_of(result: &AgentToolResult) -> Option<(&str, &str)> {
+        result.content.iter().find_map(|block| match block {
+            ContentBlock::Image { data, mime_type } => Some((data.as_str(), mime_type.as_str())),
+            _ => None,
+        })
     }
 
     #[test]
@@ -957,23 +1055,85 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_path_resolution_anchors_relative_at_cwd() {
+    fn screenshot_path_resolution_is_workspace_scoped() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("work");
         fs::create_dir_all(&cwd).unwrap();
-        let abs = resolve_screenshot_path(cwd.to_str().unwrap(), "shots/a.png").unwrap();
-        assert_eq!(abs, cwd.join("shots/a.png"));
-        assert!(abs.parent().unwrap().is_dir()); // parent auto-created
-        let absolute = resolve_screenshot_path(cwd.to_str().unwrap(), "/tmp/pi-browser-test.png")
+        let workspace = WorkspaceRoots::new(&cwd, Vec::<PathBuf>::new()).unwrap();
+        let output = resolve_screenshot_path(&workspace, "shots/a.png").unwrap();
+        assert_eq!(output, cwd.join("shots/a.png"));
+        assert!(output.parent().unwrap().is_dir());
+        assert!(resolve_screenshot_path(&workspace, "../outside.png").is_err());
+        let absolute = Path::new(std::path::MAIN_SEPARATOR_STR).join("outside.png");
+        assert!(resolve_screenshot_path(&workspace, absolute.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn screenshot_result_rejects_hostile_and_oversize_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("shot.png");
+        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
+        assert!(screenshot_result(&workspace, &output, b"not an image".to_vec()).is_err());
+        assert!(screenshot_result(&workspace, &output, vec![0; SCREENSHOT_MAX_INPUT_BYTES + 1]).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn screenshot_path_accepts_nested_additional_workspace_root() {
+        let cwd = tempfile::tempdir().unwrap();
+        let additional = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceRoots::new(cwd.path(), [additional.path()]).unwrap();
+        let output = additional.path().join("captures").join("shot.png");
+        let resolved = resolve_screenshot_path(&workspace, output.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, output);
+        assert!(output.parent().unwrap().is_dir());
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
             .unwrap();
-        assert_eq!(absolute, PathBuf::from("/tmp/pi-browser-test.png"));
+        let result = screenshot_result(&workspace, &resolved, bytes).unwrap();
+        assert!(!text_of(&result).contains(additional.path().to_string_lossy().as_ref()));
+        assert!(text_of(&result).contains("captures/shot.png"));
+    }
+
+    #[test]
+    fn screenshot_result_returns_bounded_png_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("shot.png");
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
+        let result = screenshot_result(&workspace, &output, bytes).unwrap();
+        let (data, mime_type) = image_of(&result).expect("inline screenshot image");
+        assert_eq!(mime_type, "image/png");
+        assert!(data.len() <= SCREENSHOT_MAX_BASE64_BYTES);
+        assert!(output.is_file());
+        assert!(!text_of(&result).contains(output.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_write_rejects_final_symlink() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let output = workspace_dir.path().join("shot.png");
+        std::os::unix::fs::symlink(outside.path(), &output).unwrap();
+        let workspace = WorkspaceRoots::new(workspace_dir.path(), Vec::<PathBuf>::new()).unwrap();
+        let error = save_screenshot_bytes(&workspace, &output, b"png").unwrap_err().to_string();
+        assert!(error.contains("must not be a symlink"), "{error}");
     }
 
     #[tokio::test]
     async fn missing_chrome_binary_yields_actionable_error() {
         let dir = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
         let result = run_browser_with(
             dir.path().to_str().unwrap(),
+            &workspace,
             json!({ "action": "list_tabs" }),
             AbortSignal::none(),
             Some(PathBuf::from("/nonexistent/pi-chrome")),
@@ -981,6 +1141,22 @@ mod tests {
         .await;
         let err = result.unwrap_err();
         assert!(err.to_string().contains("Chrome/Chromium binary not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent_without_chrome() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
+        let result = run_browser_with(
+            dir.path().to_str().unwrap(),
+            &workspace,
+            json!({ "action": "close" }),
+            AbortSignal::none(),
+            Some(PathBuf::from("/nonexistent/pi-chrome")),
+        )
+        .await
+        .expect("stateless close");
+        assert!(text_of(&result).contains("browser closed"));
     }
 
     /// Skip-guarded real-browser smoke: runs every action against a local
@@ -993,6 +1169,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
+        let workspace = WorkspaceRoots::new(dir.path(), Vec::<PathBuf>::new()).unwrap();
         let html = r#"<!DOCTYPE html><html><body>
             <p id="marker">hello-browser</p>
             <input id="name" value="initial">
@@ -1006,6 +1183,7 @@ mod tests {
 
         let result = run_browser_with(
             cwd,
+            &workspace,
             json!({ "action": "navigate", "url": url.clone() }),
             AbortSignal::none(),
             Some(bin.clone()),
@@ -1021,6 +1199,7 @@ mod tests {
 
         let result = run_browser_with(
             cwd,
+            &workspace,
             json!({ "action": "extract", "url": url.clone(), "selector": "#marker" }),
             AbortSignal::none(),
             Some(bin.clone()),
@@ -1031,6 +1210,7 @@ mod tests {
 
         let result = run_browser_with(
             cwd,
+            &workspace,
             json!({ "action": "extract", "url": url.clone() }),
             AbortSignal::none(),
             Some(bin.clone()),
@@ -1041,6 +1221,7 @@ mod tests {
 
         let result = run_browser_with(
             cwd,
+            &workspace,
             json!({ "action": "fill", "url": url.clone(), "selector": "#name", "text": "world" }),
             AbortSignal::none(),
             Some(bin.clone()),
@@ -1053,6 +1234,7 @@ mod tests {
 
         let result = run_browser_with(
             cwd,
+            &workspace,
             json!({ "action": "click", "url": url.clone(), "selector": "#btn" }),
             AbortSignal::none(),
             Some(bin.clone()),
@@ -1067,19 +1249,24 @@ mod tests {
         let shot = dir.path().join("shot.png");
         let result = run_browser_with(
             cwd,
+            &workspace,
             json!({ "action": "screenshot", "url": url.clone(), "path": "shot.png" }),
             AbortSignal::none(),
             Some(bin.clone()),
         )
         .await
         .expect("screenshot");
-        assert!(text_of(&result).contains("Screenshot saved to"), "{}", text_of(&result));
+        let (image_data, mime_type) = image_of(&result).expect("inline screenshot image");
+        assert_eq!(mime_type, "image/png");
+        assert!(image_data.len() <= SCREENSHOT_MAX_BASE64_BYTES);
+        assert!(text_of(&result).contains("Screenshot saved to shot.png"), "{}", text_of(&result));
         let bytes = fs::read(&shot).expect("screenshot file exists");
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG header");
         assert!(bytes.len() > 100, "non-trivial PNG size");
 
         let result = run_browser_with(
             cwd,
+            &workspace,
             json!({ "action": "list_tabs" }),
             AbortSignal::none(),
             Some(bin.clone()),
@@ -1090,6 +1277,7 @@ mod tests {
 
         let result = run_browser_with(
             cwd,
+            &workspace,
             json!({ "action": "close" }),
             AbortSignal::none(),
             Some(bin.clone()),
@@ -1101,6 +1289,7 @@ mod tests {
         // Unsupported scheme is rejected before any browser is spawned.
         let result = run_browser_with(
             cwd,
+            &workspace,
             json!({ "action": "navigate", "url": "javascript:alert(1)" }),
             AbortSignal::none(),
             Some(bin),

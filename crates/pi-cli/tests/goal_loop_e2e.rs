@@ -1393,9 +1393,12 @@ fn repl_loop_create_list_fire_cancel_delete_and_error_paths() {
 ///
 /// All assertions run against the replayed visible screen (ratatui paints
 /// table cells and footer fragments with explicit cursor moves, so raw-stream
-/// substrings would miss inter-word spaces and gap cells); chip transitions
-/// additionally assert the previous chip left the screen, proving the
-/// `🎯 → ⏸ → 🎯 → ✓` order.
+/// substrings would miss inter-word spaces and gap cells); each chip
+/// transition waits for ONE reconstructed snapshot that shows the new chip
+/// without the previous one, proving the `🎯 → ⏸ → 🎯 → ✓` order. A positive
+/// wait followed by an independent negative sample would race the repaint
+/// (the old chip can linger for a frame), so the transition contract is
+/// evaluated atomically on a single snapshot.
 #[test]
 fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
     let mut probe = TuiProbe::spawn();
@@ -1420,6 +1423,34 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
         let deadline = Instant::now() + timeout;
         loop {
             if visible(probe).contains(needle) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Wait for ONE reconstructed screen snapshot that shows `present` and no
+    /// longer shows `absent`. Ratatui's diffing backend paints a chip marker
+    /// flip across frames, and the resume turn's abort/restart can repaint the
+    /// previous chip for a frame, so a positive `wait_for_screen` followed by
+    /// an independent negative `visible()` sample can observe an intermediate
+    /// frame that still carries the old chip — the panic then prints a later,
+    /// already-clean snapshot and the two samples disagree. The transition
+    /// contract (`new chip on, old chip off`) is therefore proven by a single
+    /// atomic snapshot, never by two samplings.
+    fn wait_for_screen_transition(
+        probe: &TuiProbe,
+        present: &str,
+        absent: &str,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let screen = visible(probe);
+            if screen.contains(present) && !screen.contains(absent) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -1468,8 +1499,8 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
 
     // Pause → ⏸ chip (and the 🎯 chip must be gone); resume → 🎯 chip again
     // (a goal turn runs; ⏸ gone); complete → ✓ chip (🎯 gone). Each check
-    // waits for the new chip and then asserts the previous one left the
-    // visible screen, so the 🎯 → ⏸ → 🎯 → ✓ order is proven.
+    // waits for a single reconstructed snapshot showing the new chip without
+    // the previous one, so the 🎯 → ⏸ → 🎯 → ✓ order is proven atomically.
     probe.send(b"/goal pause\r");
     // Ratatui paints the footer chip with its diffing backend, rewriting only
     // the cells that change between frames; the 🎯(wide)→⏸(narrow) marker
@@ -1480,18 +1511,18 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
     // (`paused · 0/100 tokens · ship the widget`, from `state.status`) via the
     // cumulative RAW PTY stream as a best-effort settle barrier — the in-flight
     // goal turn's abort can clear `state.status` before a frame renders, so it
-    // is not a reliable pass/fail signal — then assert the footer chip as the
-    // authoritative paused-status + `0/100` budget check, and that the active
-    // chip left the screen.
+    // is not a reliable pass/fail signal — then wait for the footer chip as
+    // the authoritative paused-status + `0/100` budget check: one snapshot
+    // showing ⏸ without the active 🎯 chip.
     let _ = probe.wait_for("paused · 0/100 tokens · ship the widget", Duration::from_secs(8));
     assert!(
-        wait_for_screen(&probe, "⏸ Goal 0/100", Duration::from_secs(20)),
-        "footer pause chip after pause:\n{}",
-        visible(&probe)
-    );
-    assert!(
-        !visible(&probe).contains("🎯 Goal 0/100"),
-        "paused chip must replace the active chip:\n{}",
+        wait_for_screen_transition(
+            &probe,
+            "⏸ Goal 0/100",
+            "🎯 Goal 0/100",
+            Duration::from_secs(20)
+        ),
+        "footer pause chip after pause (⏸ must replace 🎯 on the same screen):\n{}",
         visible(&probe)
     );
 
@@ -1500,31 +1531,35 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
     // create-time `Goal work started · active · 0/100 tokens · …` (already
     // present in the raw stream from create, so it cannot distinguish the
     // transition). The footer `🎯 Goal 0/100` active chip — reliably rendered
-    // by the wide-glyph-aware Screen — is the authoritative resume signal.
+    // by the wide-glyph-aware Screen — is the authoritative resume signal:
+    // one snapshot must show it without the ⏸ chip (the resume turn's
+    // abort/restart can repaint the paused chip for a frame, so the
+    // transition is only proven once a single screen shows 🎯 and no ⏸).
     assert!(
-        wait_for_screen(&probe, "🎯 Goal 0/100", Duration::from_secs(20)),
-        "footer active chip after resume:\n{}",
-        visible(&probe)
-    );
-    assert!(
-        !visible(&probe).contains("⏸ Goal 0/100"),
-        "resumed chip must replace the paused chip:\n{}",
+        wait_for_screen_transition(
+            &probe,
+            "🎯 Goal 0/100",
+            "⏸ Goal 0/100",
+            Duration::from_secs(20)
+        ),
+        "footer active chip after resume (🎯 must replace ⏸ on the same screen):\n{}",
         visible(&probe)
     );
 
     probe.send(b"/goal complete\r");
     // Best-effort synchronization on the authoritative composer status line
     // (`completed · 0/100 tokens · …`); the footer `✓ Goal 0/100` chip is the
-    // authoritative completed-status + budget check.
+    // authoritative completed-status + budget check: one snapshot showing ✓
+    // without the active 🎯 chip.
     let _ = probe.wait_for("completed · 0/100 tokens · ship the widget", Duration::from_secs(8));
     assert!(
-        wait_for_screen(&probe, "✓ Goal 0/100", Duration::from_secs(20)),
-        "footer completed chip after complete:\n{}",
-        visible(&probe)
-    );
-    assert!(
-        !visible(&probe).contains("🎯 Goal 0/100"),
-        "completed chip must replace the active chip:\n{}",
+        wait_for_screen_transition(
+            &probe,
+            "✓ Goal 0/100",
+            "🎯 Goal 0/100",
+            Duration::from_secs(20)
+        ),
+        "footer completed chip after complete (✓ must replace 🎯 on the same screen):\n{}",
         visible(&probe)
     );
 

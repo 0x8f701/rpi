@@ -9,14 +9,12 @@
 #   R1  a Web prompt round-trips and the new session's row appears
 #   R2  switching away/back to a LOADED session restores its transcript
 #       from the authoritative backend snapshot
-#   R3  closing a settled session then switching back RESUMES from disk
-#       and restores the same transcript (backend, not frontend cache)
 #   R4  after SIGTERM-restarting the listener, reopening the Web and
 #       switching to the recorded session restores its history from disk
-#   R5  a page reload restores the last-activated session from the
-#       per-authority preference (active row + transcript)
-#   R6  a saved preference naming a nonexistent session falls back to the
-#       first catalog row, which becomes active with its transcript loaded
+#   R5  a page reload restores the last-activated session from the selected
+#       listener's preference, including a page/listener authority mismatch
+#   R6  a saved listener preference naming a nonexistent session falls back
+#       to the first catalog row, which becomes active with its transcript
 #
 # The lane FAILS (non-zero) when playwright/chromium cannot be used; there
 # is no agent-browser fallback and no skip.
@@ -39,7 +37,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-session-restore - session parity: prompt recorded, loaded switch restore, disk-resume restore, restart restore, preference reload restore, missing-preference fallback (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-session-restore - session parity: prompt recorded, loaded switch restore, restart restore, selected-listener preference reload restore, missing-preference fallback (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;
@@ -73,6 +71,11 @@ stamp = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00
 sid = 'web-transcript-parity'
 records = [
     {'type': 'session', 'version': 3, 'id': sid, 'timestamp': stamp, 'cwd': cwd},
+    # Explicit session_info name: the Web sidebar `temporary` marker must
+    # never apply to this legal restored session (native + unnamed + <10KiB +
+    # cwd under the OS temp root would otherwise hide it by default).
+    {'type': 'session_info', 'id': 'si-1', 'parentId': None, 'timestamp': stamp,
+     'name': 'web-transcript-parity'},
     {'type': 'message', 'id': 'u1', 'parentId': None, 'timestamp': stamp,
      'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'transcript parity seed'}], 'timestamp': 1}},
     {'type': 'custom_message', 'id': 'hidden', 'parentId': 'u1', 'timestamp': stamp,
@@ -80,9 +83,13 @@ records = [
      'display': False, 'details': {}},
     {'type': 'custom_message', 'id': 'irc', 'parentId': 'hidden', 'timestamp': stamp,
      'customType': 'orchestration_message',
-     'content': '<orchestration-message id="m1" from="Main">\nclean IRC parity body\n</orchestration-message>',
-     'display': True, 'details': {'id': 'm1', 'from': 'Main', 'to': 'Child', 'body': 'clean IRC parity body'}},
-    {'type': 'message', 'id': 'bash', 'parentId': 'irc', 'timestamp': stamp,
+     'content': '<orchestration-message id="m1" from="Main">\nclean IRC parity body\nReplying to message: parent-9\n</orchestration-message>',
+     'display': True, 'details': {'id': 'm1', 'from': 'Main', 'to': 'Child', 'body': 'clean IRC parity body', 'replyTo': 'parent-9'}},
+    {'type': 'custom_message', 'id': 'irc-in', 'parentId': 'irc', 'timestamp': stamp,
+     'customType': 'orchestration_message',
+     'content': '<orchestration-message id="m2" from="Child">\n' + '\n'.join(f'irc-incoming-line-{n}' for n in range(1, 11)) + '\n</orchestration-message>',
+     'display': True, 'details': {'id': 'm2', 'from': 'Child', 'to': 'Main', 'body': '\n'.join(f'irc-incoming-line-{n}' for n in range(1, 11))}},
+    {'type': 'message', 'id': 'bash', 'parentId': 'irc-in', 'timestamp': stamp,
      'message': {'role': 'bashExecution', 'command': 'seq 1 30',
                  'output': '\n'.join(f'bash-parity-{n}' for n in range(1, 31)),
                  'cancelled': False, 'truncated': False, 'timestamp': 2}},
@@ -136,6 +143,11 @@ PY
         "RPI_PARITY_SESSION=web-transcript-parity" \
         >"$evidence/playwright.out" 2>&1 &
     pw_pid=$!
+    # Register the playwright child so the EXIT/HUP/INT/TERM trap reaps it
+    # if the lane is killed externally (e.g. by a wrapping timeout). pw_pid
+    # is a function-local otherwise unreaped by cleanup_e2e; a stuck child
+    # (here: the test's setInterval kept Node alive) would leak on interrupt.
+    register_pid "$pw_pid"
 
     # Wait for the test's restart request; respawn the listener on the SAME port.
     local deadline=$((SECONDS + 180))

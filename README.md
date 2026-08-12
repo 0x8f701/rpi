@@ -24,14 +24,14 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/0x8f701/rpi/master/install.ps1 | iex
 ```
 
-Pin both the installer source and selected release to `v0.2.9`:
+Pin both the installer source and selected release to `v0.2.10`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.9/install.sh | bash -s -- --version v0.2.9
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.10/install.sh | bash -s -- --version v0.2.10
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.9/install.ps1))) -Version v0.2.9
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.10/install.ps1))) -Version v0.2.10
 ```
 
 The release archive contains the compiled `rpi` executable; users do not need
@@ -141,6 +141,7 @@ Runnable examples are in [`examples/`](examples/).
 | Session recovery (`/rewind`, `/checkpoint`, `/snapcompact`, `/handoff`) and startup session TTL pruning | Implemented |
 | TUI hold-to-talk voice input (`/live` STT) | Implemented (requires `live-capture` build feature) |
 | Web realtime voice (WebRTC Codex Live on `/web`) | Implemented (requires `live.mode = realtime` + CLIProxyAPI) |
+| Web command picker, bounded Git code review, multi-file image/code attach (paste/picker/drop), improved Rust fence highlight | Implemented |
 | Linux filesystem sandbox (`sandbox` settings) and overlayfs isolation | Implemented (Linux) |
 | Model Context Protocol (MCP) client (`mcpServers` + `mcp` tool) | Implemented (stdio transport) |
 | Agent Client Protocol (ACP) mode (`rpi agent stdio` / `rpi agent serve`) | Implemented |
@@ -230,8 +231,17 @@ Collaboration join links (`/collab`, `collab_start` without an explicit
 `baseUrl`) cannot be synthesized from a wildcard bind. For a wildcard
 `--listen` address (0.0.0.0 or `::`), pass
 `--listen-advertised-origin <URL>` — a strict http/https origin with no
-credentials, path, query, or fragment — so links point at a reachable host.
-Loopback and other specific binds advertise their bound address automatically.
+credentials, path, query, or fragment — so collab links point at a reachable
+host. Loopback and other specific binds advertise their bound address
+automatically.
+
+Startup also prints a reachable Web UI hint. Explicit
+`--listen-advertised-origin` wins (`Web UI: <origin>/web`). On a concrete bind
+the bound address is used. On a wildcard bind without that flag, rpi
+best-effort discovers a route-selected LAN address and prints
+`Web UI: <scheme>://<lan-ip>:<port>/web`; if discovery is unavailable it tells
+you to use this machine's LAN IP and port rather than an unreachable wildcard
+URL. Ordinary `/web` access does not depend on the banner.
 
 ## Changelog
 

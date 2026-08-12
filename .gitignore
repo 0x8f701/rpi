@@ -8,7 +8,9 @@ dist
 crates/pi-cli/web/dist/*
 !crates/pi-cli/web/dist/index.html
 node_modules
+crates/pi-cli/web/.web-test-build/
 crates/pi-cli/web/.transcript-test-build/
+crates/pi-cli/web/.panel-shots/
 /examples/target
 *.log
 /.pi/artifacts/
@@ -28,3 +30,4 @@ credentials*
 /crates/pi-cli/sessions/
 __pycache__
 book
+.web-test-build/

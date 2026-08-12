@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -15,6 +16,14 @@ use serde_json::json;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static REGISTRY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+/// Per-process isolated native session root so `start_new_recording()` never
+/// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
+fn test_sessions_root() -> PathBuf {
+    static ROOT: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
+        tempfile::tempdir().expect("test sessions root")
+    });
+    ROOT.path().to_path_buf()
+}
 
 fn make_session(
     responses: Vec<FauxResponse>,
@@ -51,6 +60,7 @@ fn make_session(
         auth_resolver: None,
     })
     .expect("session");
+    session.set_session_dir(test_sessions_root());
     (session, registration)
 }
 

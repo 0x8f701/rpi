@@ -612,6 +612,42 @@ main() {
         all_pass=1
     fi
 
+    # ── View-role browser guest (coverage driver only) ───────────────────
+    # COLLAB_VIEW_GUEST=1 (set by the coverage driver) starts a second
+    # browser guest on the VIEW link so CollabGuestView's view-only branches
+    # render through the real path (collab_view_guest.mjs). It joins AFTER
+    # SO-05 so the participant counts asserted there stay unchanged, and
+    # before the control prompt so the live stream reaches it.
+    local view_browser_pid=0
+    if [ "${COLLAB_VIEW_GUEST:-0}" = "1" ]; then
+        local view_browser_evidence="$evidence/browser-view-guest"
+        mkdir -p "$view_browser_evidence"
+        local view_browser_connected="$view_browser_evidence/connected.marker"
+        local view_browser_ready="$view_browser_evidence/pre-stop-complete.marker"
+        log "$SCENARIO: starting view-role browser guest (Playwright, view role)"
+        run_browser_guest "$view_link" "$view_browser_evidence" "$browser_work" \
+            "$SCRIPT_DIR/collab_view_guest.mjs" \
+            RPI_ROLE="view" \
+            RPI_EVENT_TEXT="$event_expect" \
+            RPI_HOST_PATH="$root/workspace" \
+            RPI_COVERAGE_LANE="coverage-collab-view" \
+            RPI_CONNECTED_MARKER="$view_browser_connected" \
+            RPI_READY_MARKER="$view_browser_ready" \
+            RPI_STOP_MARKER="$stop_marker" \
+            RPI_STOP_TIMEOUT="30" \
+            >"$view_browser_evidence/guest.stdout" 2>"$view_browser_evidence/guest.stderr" &
+        view_browser_pid=$!
+        register_pid $view_browser_pid
+        local view_join_deadline=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$view_join_deadline" ]; do
+            if [ -f "$view_browser_connected" ]; then break; fi
+            kill -0 "$view_browser_pid" 2>/dev/null || fail "$SCENARIO: view browser guest exited before connected marker"
+            sleep 0.2
+        done
+        [ -f "$view_browser_connected" ] || fail "$SCENARIO: view browser guest did not connect in time"
+        log "$SCENARIO: view-role browser guest connected"
+    fi
+
     # Release both CLI roles together. The control prompt now arrives live in
     # the already-connected browser; the browser then exercises its own prompt.
     touch "$guest_start_marker"
@@ -629,6 +665,16 @@ main() {
     done
     [ -f "$ctrl_evidence/stop-ready" ] && [ -f "$view_evidence/stop-ready" ] && [ -f "$browser_ready" ] \
         || fail "$SCENARIO: guests did not complete all pre-stop assertions"
+    # The view-role browser guest must finish its pre-stop assertions too.
+    if [ "$view_browser_pid" -ne 0 ]; then
+        local view_browser_prestop_deadline=$((SECONDS + 45))
+        while [ "$SECONDS" -lt "$view_browser_prestop_deadline" ]; do
+            if [ -f "$view_browser_ready" ]; then break; fi
+            kill -0 "$view_browser_pid" 2>/dev/null || fail "$SCENARIO: view browser guest exited before pre-stop-complete marker"
+            sleep 0.2
+        done
+        [ -f "$view_browser_ready" ] || fail "$SCENARIO: view browser guest did not finish its pre-stop assertions"
+    fi
 
     # ── collab_stop: stop the room through the headless listener RPC ─────
     log "$SCENARIO: sending collab_stop RPC"
@@ -648,12 +694,14 @@ main() {
     # Wait for all guests to finish (they should detect the stop close).
     log "$SCENARIO: waiting for guests to detect host stop"
     local wait_deadline=$((SECONDS + 45))
-    local ctrl_done=0 view_done=0 browser_done=0
+    local ctrl_done=0 view_done=0 browser_done=0 view_browser_done=0
     while [ "$SECONDS" -lt "$wait_deadline" ]; do
         if [ "$ctrl_done" -eq 0 ] && ! kill -0 "$ctrl_pid" 2>/dev/null; then ctrl_done=1; fi
         if [ "$view_done" -eq 0 ] && ! kill -0 "$view_pid" 2>/dev/null; then view_done=1; fi
         if [ "$browser_done" -eq 0 ] && ! kill -0 "$browser_pid" 2>/dev/null; then browser_done=1; fi
-        if [ "$ctrl_done" -eq 1 ] && [ "$view_done" -eq 1 ] && [ "$browser_done" -eq 1 ]; then break; fi
+        if [ "$view_browser_pid" -ne 0 ] && [ "$view_browser_done" -eq 0 ] && ! kill -0 "$view_browser_pid" 2>/dev/null; then view_browser_done=1; fi
+        if [ "$ctrl_done" -eq 1 ] && [ "$view_done" -eq 1 ] && [ "$browser_done" -eq 1 ] \
+            && { [ "$view_browser_pid" -eq 0 ] || [ "$view_browser_done" -eq 1 ]; }; then break; fi
         sleep 0.5
     done
     # ── Capture guest/browser exit status (set -e safe) ──────────────────
@@ -681,6 +729,16 @@ main() {
         kill "$browser_pid" 2>/dev/null || true
         wait "$browser_pid" 2>/dev/null || true
         browser_exit=124
+    fi
+    local view_browser_exit=0
+    if [ "$view_browser_pid" -ne 0 ]; then
+        if [ "$view_browser_done" -eq 1 ]; then
+            wait "$view_browser_pid" 2>/dev/null || view_browser_exit=$?
+        else
+            kill "$view_browser_pid" 2>/dev/null || true
+            wait "$view_browser_pid" 2>/dev/null || true
+            view_browser_exit=124
+        fi
     fi
 
     # ── SO-07: after stop, collab_status shows no rooms ───────────────────
@@ -755,6 +813,26 @@ main() {
         all_pass=1
     fi
 
+    # View-role browser guest results (coverage driver only)
+    if [ "$view_browser_pid" -ne 0 ]; then
+        if [ -f "$view_browser_evidence/view-browser-results.json" ]; then
+            local view_browser_failures
+            view_browser_failures="$(node -e '
+                const r = require(process.argv[1]);
+                process.stdout.write(String(r.filter(x=>!x.passed).length));
+            ' "$view_browser_evidence/view-browser-results.json")"
+            if [ "$view_browser_failures" = "0" ]; then
+                log "$SCENARIO: PASS view browser guest: all assertions passed"
+            else
+                log "$SCENARIO: FAIL view browser guest: $view_browser_failures assertion(s) failed"
+                all_pass=1
+            fi
+        else
+            log "$SCENARIO: FAIL view browser guest: no results file"
+            all_pass=1
+        fi
+    fi
+
 
     # Factor guest/browser process exit status into the final result. The
     # processes were already reaped/killed when their exit status was captured
@@ -769,6 +847,10 @@ main() {
     fi
     if [ "$browser_exit" -ne 0 ]; then
         log "$SCENARIO: FAIL browser guest: process exited nonzero ($browser_exit)"
+        all_pass=1
+    fi
+    if [ "$view_browser_pid" -ne 0 ] && [ "$view_browser_exit" -ne 0 ]; then
+        log "$SCENARIO: FAIL view browser guest: process exited nonzero ($view_browser_exit)"
         all_pass=1
     fi
 

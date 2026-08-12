@@ -496,16 +496,27 @@ pub struct LiveRuntimeSettings {
     pub allow_insecure: bool,
 }
 
+/// Debug label for a private endpoint URL field: `[CONFIGURED]` when set,
+/// `[UNSET]` otherwise. The raw URL (host/path) is never printed — voice
+/// endpoints are private and must not reach logs.
+fn configured_label(value: &str) -> &'static str {
+    if value.trim().is_empty() {
+        "[UNSET]"
+    } else {
+        "[CONFIGURED]"
+    }
+}
+
 impl std::fmt::Debug for LiveRuntimeSettings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LiveRuntimeSettings")
             .field("enabled", &self.enabled)
             .field("mode", &self.mode)
-            .field("stt_base_url", &self.stt_base_url)
+            .field("stt_base_url", &configured_label(&self.stt_base_url))
             .field("stt_api_key", &"[REDACTED]")
             .field("stt_model", &self.stt_model)
-            .field("realtime_base_url", &self.realtime_base_url)
+            .field("realtime_base_url", &configured_label(&self.realtime_base_url))
             .field("realtime_api_key", &"[REDACTED]")
             .field("realtime_model", &self.realtime_model)
             .field("voice", &self.voice)
@@ -616,6 +627,42 @@ pub struct RuntimeSettingsSnapshot {
     pub orchestration_isolation: crate::WorkflowIsolationSetting,
 }
 
+/// Web-facing projection of the effective live voice settings — the ONLY
+/// live fields the browser may hold. Endpoint URLs and credentials never
+/// cross the wire; configured-ness is projected as booleans so the UI can
+/// gate the mic (and the realtime create-call button) without learning
+/// where the endpoints live. The full internal view stays in
+/// [`LiveRuntimeSettings`]/[`RuntimeSettingsSnapshot`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebLiveSettings {
+    pub enabled: bool,
+    pub mode: String,
+    pub stt_configured: bool,
+    pub realtime_configured: bool,
+    pub realtime_model: String,
+    pub voice: String,
+}
+
+impl LiveRuntimeSettings {
+    /// Projects the effective live settings for the Web wire: only
+    /// `enabled`/`mode`/`sttConfigured`/`realtimeConfigured`/`realtimeModel`/
+    /// `voice` are exposed — never a base URL or a credential.
+    #[must_use]
+    pub fn web_live(&self) -> WebLiveSettings {
+        WebLiveSettings {
+            enabled: self.enabled,
+            mode: self.mode.clone(),
+            stt_configured: !self.stt_base_url.trim().is_empty()
+                && !self.stt_api_key.trim().is_empty(),
+            realtime_configured: !self.realtime_base_url.trim().is_empty()
+                && !self.realtime_api_key.trim().is_empty(),
+            realtime_model: self.realtime_model.clone(),
+            voice: self.voice.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettingsState {
@@ -664,11 +711,12 @@ pub struct RuntimeSettingsState {
     pub orchestration_soft_budget: crate::JobSoftBudget,
     pub orchestration_sandboxed: bool,
     pub orchestration_isolation: crate::WorkflowIsolationSetting,
-    /// Effective hold-to-talk voice configuration (`Settings.live`), including
-    /// the realtime (Codex Live) base URL/model/voice the web frontend needs
-    /// to drive `realtime_create_call`. Secret keys
-    /// are omitted from serialization; `Debug` redacts them.
-    pub live: LiveRuntimeSettings,
+    /// Effective hold-to-talk voice configuration as the WEB wire may see it
+    /// (the [`WebLiveSettings`] projection): `enabled`, `mode`,
+    /// `sttConfigured`, `realtimeConfigured`, `realtimeModel`, `voice`.
+    /// Endpoint URLs and credentials are NEVER serialized here — the browser
+    /// reaches both voice paths only through the backend RPC proxy.
+    pub live: WebLiveSettings,
 }
 
 impl RuntimeSettingsSnapshot {
@@ -725,7 +773,7 @@ impl RuntimeSettingsSnapshot {
             orchestration_soft_budget: self.orchestration_soft_budget,
             orchestration_sandboxed: self.orchestration_sandboxed,
             orchestration_isolation: self.orchestration_isolation,
-            live: self.live.clone(),
+            live: self.live.web_live(),
         }
     }
 }
@@ -2992,6 +3040,107 @@ mod tests {
         let encoded = serde_json::to_value(&settings).expect("serialize settings");
         let decoded: Settings = serde_json::from_value(encoded).expect("deserialize settings");
         assert_eq!(decoded, settings);
+    }
+
+    #[test]
+    fn web_live_projection_never_serializes_endpoints_or_keys() {
+        let settings = Settings {
+            live: Some(LiveSettings {
+                enabled: Some(true),
+                mode: Some("realtime".to_owned()),
+                stt_base_url: Some("https://stt.example.test".to_owned()),
+                stt_api_key: Some("stt-secret-key-1234567890abcdef".to_owned()),
+                stt_model: Some("whisper-1".to_owned()),
+                realtime_base_url: Some("https://rt.example.test".to_owned()),
+                realtime_api_key: Some("rt-secret-key-1234567890abcdef".to_owned()),
+                realtime_model: Some("gpt-realtime-1.5".to_owned()),
+                voice: Some("sol".to_owned()),
+                language: None,
+                allow_insecure: Some(false),
+            }),
+            ..Default::default()
+        };
+        let serialized =
+            serde_json::to_value(settings.runtime_settings().expect("runtime settings").state())
+                .expect("serialize web state");
+        // Endpoints and credentials never cross the Web wire.
+        for leaked in [
+            "sttBaseUrl",
+            "sttApiKey",
+            "realtimeBaseUrl",
+            "realtimeApiKey",
+            "stt-secret-key-1234567890abcdef",
+            "rt-secret-key-1234567890abcdef",
+            "stt.example.test",
+            "rt.example.test",
+        ] {
+            assert!(!serialized.to_string().contains(leaked), "{leaked:?} leaked: {serialized}");
+        }
+        let live = &serialized["live"];
+        // The UI gates and labels are projected; the block is EXACTLY the
+        // six-field projection (nothing can drift in later).
+        assert_eq!(live["enabled"], json!(true));
+        assert_eq!(live["mode"], json!("realtime"));
+        assert_eq!(live["sttConfigured"], json!(true));
+        assert_eq!(live["realtimeConfigured"], json!(true));
+        assert_eq!(live["realtimeModel"], json!("gpt-realtime-1.5"));
+        assert_eq!(live["voice"], json!("sol"));
+        let keys = live.as_object().expect("object").keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys.len(), 6, "{keys:?}");
+
+        // Unconfigured halves project false (the browser gates on booleans).
+        let mut settings = settings;
+        if let Some(live) = settings.live.as_mut() {
+            live.realtime_base_url = None;
+            live.realtime_api_key = None;
+        }
+        let serialized =
+            serde_json::to_value(settings.runtime_settings().expect("runtime settings").state())
+                .expect("serialize web state");
+        assert_eq!(serialized["live"]["sttConfigured"], json!(true));
+        assert_eq!(serialized["live"]["realtimeConfigured"], json!(false));
+        assert!(!serialized.to_string().contains("rt.example.test"), "{serialized}");
+    }
+
+    #[test]
+    fn live_runtime_settings_debug_never_prints_endpoints_or_keys() {
+        let runtime = LiveRuntimeSettings {
+            enabled: true,
+            mode: "realtime".to_owned(),
+            stt_base_url: "https://stt.example.test/v1".to_owned(),
+            stt_api_key: "stt-secret-key-1234567890abcdef".to_owned(),
+            stt_model: "whisper-1".to_owned(),
+            realtime_base_url: "https://rt.example.test/calls".to_owned(),
+            realtime_api_key: "rt-secret-key-1234567890abcdef".to_owned(),
+            realtime_model: "gpt-realtime-1.5".to_owned(),
+            voice: "sol".to_owned(),
+            language: None,
+            allow_insecure: false,
+        };
+        let debug = format!("{runtime:?}");
+        for leaked in [
+            "stt.example.test",
+            "rt.example.test",
+            "/v1",
+            "/calls",
+            "stt-secret-key-1234567890abcdef",
+            "rt-secret-key-1234567890abcdef",
+            "https://",
+        ] {
+            assert!(!debug.contains(leaked), "{leaked:?} leaked: {debug}");
+        }
+        assert!(debug.contains("[CONFIGURED]"), "configured label missing: {debug}");
+        assert!(debug.contains("[REDACTED]"), "key redaction missing: {debug}");
+
+        // Unset endpoints print the unset label, never a URL or empty value.
+        let unset = LiveRuntimeSettings {
+            stt_base_url: String::new(),
+            realtime_base_url: String::new(),
+            ..runtime
+        };
+        let debug = format!("{unset:?}");
+        assert!(debug.contains("[UNSET]"), "unset label missing: {debug}");
+        assert!(!debug.contains("https://"), "{debug}");
     }
 
     #[test]

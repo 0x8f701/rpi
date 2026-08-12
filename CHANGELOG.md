@@ -2,6 +2,136 @@
 
 All notable changes to `rpi` are documented in this file.
 
+## [0.2.10] - 2026-08-12
+
+### Added
+
+- The Web composer now has a command picker beside the input. Its catalog is
+  supplied by `get_commands`, and `/compact`, `/skill`, and `/code-review`
+  execute through dedicated control-plane commands instead of being sent to
+  the chat model.
+- Web code review now renders bounded HEAD-to-working-tree or two-revision Git
+  diffs, supports per-hunk read-only review threads, and keeps repository
+  mutation disabled in the review agent.
+- Wildcard `--listen` binds (0.0.0.0 or `::`) now best-effort discover a
+  route-selected LAN address and print `Web UI: <scheme>://<lan-ip>:<port>/web`
+  at startup. An explicit `--listen-advertised-origin` still wins for that
+  banner line; when discovery is unavailable the banner tells you to use this
+  machine's LAN IP and port instead of an unreachable wildcard URL.
+  Collaboration join links remain fail-closed and still require
+  `--listen-advertised-origin` on wildcard binds.
+- Web composer attachments: paste clipboard files, multi-file picker, and
+  drag/drop onto the composer. Images (PNG/JPEG/GIF/WebP) become prompt image
+  content blocks; recognized UTF-8 code/text files (for example `.rs`, `.ts`,
+  and other common source/config extensions) are included as a filename plus a
+  safely fenced code block in the prompt text. Paste intercepts only clipboard
+  files so ordinary text paste is unchanged. Unsupported, binary, or oversized
+  inputs are rejected with a visible summary; intake is bounded by per-file,
+  count, and combined wire limits under the control-plane frame budget.
+- The Web session browser now discovers native rpi sessions across projects and,
+  unless explicitly configured otherwise, read-only OMP, Codex, and Grok/Hyper
+  session stores. Selecting a foreign session imports it into native rpi
+  storage before opening it; the original file remains unchanged and repeated
+  selections reuse the imported lineage.
+- Running subagent cards now open a bounded details view with status, activity,
+  and redacted child history while preserving per-session routing.
+- The Web Subagents panel now defaults to active queued/running jobs and offers
+  a separate Completed view for completed, failed, and cancelled history.
+- Web Personas: a dedicated panel lists, views, creates, edits, selects,
+  clears, runs, removes, and purges persistent persona definitions through the
+  same backend catalog, validation, storage, and live reload as the TUI
+  `/persona` surface. Remove deletes only the definition while keeping the
+  persona's memory and sessions; purge deletes the whole persona root; both
+  require an explicit confirmation. Run spawns a task with the persona as the
+  agent, and natural-language delegation (`让 <persona> …`) is routed by the
+  backend orchestration catalog/selector — never by front-end prompt
+  heuristics.
+
+### Fixed
+
+- Realtime WebRTC call setup now sends the SDP offer and session object as a
+  JSON body exactly `{sdp, session}` with `Content-Type: application/json`,
+  matching CLIProxyAPI and the unified Realtime API contract.
+- Realtime setup now waits for ICE gathering before proxying the local SDP,
+  reports permission, connection, and autoplay failures in the Web UI, and
+  keeps audio on the remote WebRTC track while control events use
+  `RTCDataChannel('oai-events')`.
+- Hold-to-talk STT now proxies through a backend-only `stt_transcribe` RPC:
+  the Web sends only the bounded WAV recording (base64 + `audio/wav`), and
+  the STT endpoint URL and API key stay in the server-held `live.*` settings
+  (never on the browser wire). Captures are resampled to the fixed 16 kHz
+  STT rate in the browser so the 30-second decoded-size cap holds for any
+  capture device, and the hold timer releases at that same bound. The
+  backend validates the audio strictly (MIME allowlist, decoded-size cap,
+  RIFF/WAVE PCM16 header with consistent geometry and a 30-second duration
+  bound) and surfaces bounded, redacted errors that never echo the endpoint.
+- The Web `runtimeSettings.live` wire is now a safe projection — only
+  `enabled`/`mode`/`sttConfigured`/`realtimeConfigured`/`realtimeModel`/
+  `voice` — so no voice endpoint URL or credential ever reaches the browser
+  (both voice paths are reached exclusively through the backend RPC proxy).
+
+- Web session selection is retained across reloads after installing the
+  v0.2.10 listener; the browser restores the last active session for the
+  current listener authority.
+- Web markdown code fences with Rust info metadata such as `rust,ignore` and
+  the `rs` alias now highlight the full block instead of falling back to partial
+  auto-detection.
+- Web saved-session catalogs can explicitly request all projects. The default
+  native tree is scanned across the active profile, while configured custom
+  session roots remain exact and cross-project New sessions return to the
+  activated project's default directory.
+- Historical unnamed, small sessions recorded under temporary workspaces are
+  hidden from the Web sidebar by default without deleting them. Search,
+  active-session, and loaded-session views can recover those rows.
+- Web foreign-session discovery now matches each provider's native resume
+  layout. In particular, OMP lists only top-level project sessions and no
+  longer exposes task/subagent child transcripts.
+
+- The Web streaming transcript now stays pinned to the bottom while content
+  streams in, including asynchronous growth (images, markdown rendering).
+  Scrolling up to read pauses the pin: incoming deltas preserve the viewport
+  instead of yanking it, and returning to the bottom resumes following. A
+  session switch pins the newly activated session's transcript to the bottom
+  rather than inheriting the previous session's scroll position. The
+  collaboration guest view follows the same behavior.
+- Web Task tool cards no longer dump raw args JSON as the default view: they
+  show Goal / Constraints / Contract from the shared context plus each child
+  name, agent, target, status, activity, and result (live `job_updated` /
+  `message_delivered` updates). Edit cards show path, operation, and a
+  semantically styled `details.diff`; raw args/details remain collapsed.
+- Web Todo cards render compact phase/task state instead of backend control
+  prose, tool titles use human-readable capitalization, Thinking uses a
+  multiline `Thinking` disclosure, and Hub wait cards hide internal IDs,
+  timeout fields, and raw command JSON.
+- User image messages keep their original image blocks in optimistic and
+  restored transcript bubbles, and typed orchestration messages render as
+  bounded IRC cards with reply metadata instead of raw custom-message prose.
+- The Web Todo panel is wider on desktop, keeps each count such as `0 done`
+  together, and remains full-width without horizontal overflow on phones.
+- Web user messages with images now render the attachment preview first, the
+  user's real caption clearly below it, and an optional auto-vision analysis
+  as a clearly labeled, default-collapsed "Image analysis" card. The raw
+  `<attachment>` transport wrapper and the `[Image analyzed by …]` description
+  no longer leak into the user bubble as if they were the user's own text; an
+  image-only message shows no empty placeholder. The durable history still
+  keeps the original image blocks; the model-context vision delegation is
+  unchanged. The collaboration guest view renders the same way.
+
+- Web command requests now use generation-scoped bounded pending lifecycles.
+  An unresponsive current socket reconnects instead of leaving fast commands
+  pending indefinitely, while legitimate long operations keep their separate
+  bounded timeout and stale sockets cannot settle current requests.
+- The Web transport no longer disconnects responsive clients during large
+  transcript bursts: outbound queue pressure has a bounded grace period, and
+  reconnect restores the authoritative transcript without duplicate durable
+  tool cards or stale streaming state.
+- The composer now uses one dynamic Send/Stop action, coalesces textarea resize
+  measurements per animation frame, and avoids repeated layout reads while
+  typing or deleting long drafts.
+- Session bootstrap and reload no longer expose a transient state with catalog
+  rows present but no active row while the backend's loaded-session overlay is
+  converging.
+
 ## [0.2.9] - 2026-08-11
 
 ### Changed
@@ -57,9 +187,9 @@ All notable changes to `rpi` are documented in this file.
 - PTY interactive bash mode: `pty: true` + `input` parameter for commands that
   prompt (e.g. `sudo`); portable-pty backend with process group reaping,
   timeout/abort, and fallback to normal execution on spawn failure.
-- Codex Live realtime voice via CLIProxyAPI: WebRTC SDP exchange
-  (`RealtimeCreateCall`/`RealtimeCreateSession`/`RealtimeStop`) with sideband
-  WebSocket for transcript streaming; mode-aware mic button in Web UI.
+- Codex Live realtime voice via CLIProxyAPI: WebRTC SDP exchange through the
+  `RealtimeCreateCall`/`RealtimeStop` contract, with realtime events carried by
+  the negotiated `oai-events` data channel and remote audio played in Web UI.
 - Vision model delegation: non-vision models (e.g. DeepSeek) automatically
   delegate image inputs to a configured `visionModel` for text description.
 - Web frontend: WebSocket heartbeat (30s ping, 60s dead detection, backoff
@@ -95,8 +225,8 @@ All notable changes to `rpi` are documented in this file.
 - `rpi --listen` is now a Web-only, signal-owned service: it never acquires
   raw terminal state or starts the TUI/REPL, remains alive with closed stdin,
   rejects positional prompts, and shuts down cleanly on Ctrl-C or SIGTERM.
-- The Web composer uses one primary Send/Steer action, keeps Abort active-only,
-  and gives the textarea usable space on phone viewports.
+- The Web composer uses one dynamic Send/Stop action: it sends while idle and
+  aborts the active generation while streaming, including the collaboration guest view.
 
 ### Fixed
 
@@ -382,6 +512,8 @@ All notable changes to `rpi` are documented in this file.
 
 ### Migration
 
+- Releases up to 0.1.x shipped the executable as `pi`; starting with 0.2.0 the
+  command is `rpi`. Switch scripts and documentation from `pi` to `rpi`.
 - Fresh installs create only the `rpi` command. On Unix, `install.sh` removes a
   legacy installer-managed `~/.pi-rs/bin/pi` symlink only when it still points
   at a previous installer-owned download path; unmanaged `pi` commands are left
@@ -448,6 +580,7 @@ All notable changes to `rpi` are documented in this file.
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
 
+[0.2.10]: https://github.com/0x8f701/rpi/releases/tag/v0.2.10
 [0.2.9]: https://github.com/0x8f701/rpi/releases/tag/v0.2.9
 [0.2.8]: https://github.com/0x8f701/rpi/releases/tag/v0.2.8
 [0.2.7]: https://github.com/0x8f701/rpi/releases/tag/v0.2.7

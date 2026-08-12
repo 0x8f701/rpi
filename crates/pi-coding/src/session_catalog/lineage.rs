@@ -97,7 +97,13 @@ pub(super) fn read_native_list_info(file: File, path: &Path) -> Result<NativeLis
                 }
             }
             Some("message") => {
-                message_count += 1;
+                // Meaningful count and textual summary are intentionally
+                // separable: an image-only user/assistant turn is meaningful
+                // (it carries recoverable content) even when no portable text
+                // exists, while an empty pending assistant placeholder is not.
+                if message_meaningful(&value) {
+                    message_count += 1;
+                }
                 if first_message.is_none() {
                     if let Some(text) = message_text(&value) {
                         first_message = Some(text);
@@ -207,6 +213,42 @@ pub(super) fn message_text(value: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether a `type: "message"` record carries meaningful content for catalog
+/// noise filtering. A user/assistant turn with non-empty text OR a supported
+/// non-text content block (image attachment) is meaningful; an empty pending
+/// assistant placeholder (no content blocks) is not. Tool/system/custom records
+/// are excluded by role so they never count toward the meaningful total.
+pub(super) fn message_meaningful(value: &Value) -> bool {
+    let Some(message) = value.get("message") else {
+        return false;
+    };
+    let role = message.get("role").and_then(Value::as_str);
+    if !matches!(role, Some("user") | Some("assistant")) {
+        return false;
+    }
+    let Some(content) = message.get("content") else {
+        return false;
+    };
+    match content {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+                return false;
+            };
+            match block_type {
+                "text" => block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty()),
+                // Supported non-text content: image attachments.
+                "image" => true,
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
 }
 
 fn safe_read_text(mut file: File, path: &Path) -> Result<String, String> {

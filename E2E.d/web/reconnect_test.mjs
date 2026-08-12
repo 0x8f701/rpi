@@ -151,7 +151,12 @@ async function main() {
       30000,
       firstReply
     );
-    const staleStreamingItem = await page.locator('#transcript .assistant-toolcall').count() > 0;
+    // The streaming-only skeleton (StreamingAssistant) carries the `.thinking`
+    // details element; the authoritative restore renders FinalAssistant,
+    // which never emits one. The old `.assistant-toolcall` marker is gone
+    // (tool-call deltas are no longer rendered), so `.thinking` is the
+    // leftover-streaming discriminator.
+    const staleStreamingItem = await page.locator('#transcript .msg--assistant .thinking').count() > 0;
     if (staleStreamingItem) fail('stale streaming assistant remained after authoritative restore');
     await page.screenshot({ path: `${evidence}/reconnect-inflight-restored.png`, fullPage: true });
 

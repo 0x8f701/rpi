@@ -7,6 +7,14 @@ use pi_coding::{
     Application, ResourceManager, ResourceManagerOptions, Session, SessionOptions, SettingsScope,
     SettingSource,
 };
+/// Per-process isolated native session root so `start_new_recording()` never
+/// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
+fn test_sessions_root() -> std::path::PathBuf {
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+        tempfile::tempdir().expect("test sessions root")
+    });
+    ROOT.path().to_path_buf()
+}
 
 #[tokio::test]
 async fn real_enable_model_thinking_and_legacy_migration_persist() {
@@ -95,6 +103,7 @@ async fn real_enable_model_thinking_and_legacy_migration_persist() {
         auth_resolver: None,
     })
     .expect("session");
+    session.set_session_dir(test_sessions_root());
     session
         .start_new_recording()
         .expect("start agent config recording");

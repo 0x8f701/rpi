@@ -179,6 +179,7 @@ async fn recorded_application(
     )
     .expect("start recorder");
     let path = recorder.path();
+    session.set_session_dir(session_dir.to_path_buf());
     session.record(recorder).expect("attach recorder");
     let application = Application::new(session).await;
     (application, registration, path)

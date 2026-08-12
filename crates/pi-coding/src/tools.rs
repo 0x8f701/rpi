@@ -36,11 +36,11 @@ mod notebook;
 mod paths;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -73,7 +73,7 @@ use editmatch::{
 };
 use glob::{match_fd_glob, match_rg_glob, IgnoreStack};
 use github::github_tool;
-use browser::browser_tool;
+use browser::browser_tool_for_workspace;
 use image::inspect_image_tool;
 use ast_edit::ast_edit_tool;
 use ast_grep::ast_grep_tool;
@@ -104,6 +104,8 @@ const MAX_BASH_TIMEOUT_SECONDS: &str = "2147483.647";
 const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 const NON_VISION_IMAGE_NOTE: &str =
     "[Current model does not support images. The image will be omitted from this request.]";
+const MAX_INLINE_VIDEO_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_INLINE_VIDEO_BASE64_BYTES: usize = 3 * 1024 * 1024;
 
 /// The PI_* session metadata variables pi manages for bash commands. They are
 /// stripped from the inherited environment before every run so a parent
@@ -341,7 +343,7 @@ pub fn create_tool_with_session_env_and_rules(
         "find" => Ok(find_tool(cwd)),
         "glob" => Ok(glob_tool(cwd)),
         "ls" => Ok(ls_tool(cwd)),
-        "browser" => Ok(browser_tool(cwd)),
+        "browser" => Ok(browser_tool_for_workspace(factory_workspace(cwd))),
         "web_search" => Ok(web_search_tool()),
         "ast_grep" => Ok(ast_grep_tool(cwd)),
         "ast_edit" => Ok(ast_edit_tool(cwd)),
@@ -451,6 +453,7 @@ pub(crate) fn create_coding_tools_with_context_and_resolver_for_persona(
     let mut tools = vec![
         read_tool_with_resolver(cwd, skills, resolver),
         bash_tool(cwd, session_env.clone(), process, sandbox),
+        browser_tool_for_workspace(factory_workspace(cwd)),
         edit_tool(cwd),
         write_tool(cwd),
         ast_edit_tool(cwd),
@@ -485,6 +488,7 @@ pub fn create_coding_tools_for_workspace_with_context_and_resolver(
     let mut tools = vec![
         read_tool_for_workspace(workspace.clone(), skills, resolver),
         bash_tool(&cwd, session_env.clone(), process, sandbox),
+        browser_tool_for_workspace(workspace.clone()),
         edit_tool_for_workspace(workspace.clone()),
         write_tool_for_workspace(workspace.clone()),
         ast_edit_tool(&cwd),
@@ -534,6 +538,7 @@ pub fn create_coding_tools_with_context_and_resolver(
     let mut tools = vec![
         read_tool_with_resolver(cwd, skills, resolver),
         bash_tool(cwd, session_env.clone(), process, sandbox),
+        browser_tool_for_workspace(factory_workspace(cwd)),
         edit_tool(cwd),
         write_tool(cwd),
         ast_edit_tool(cwd),
@@ -662,7 +667,7 @@ pub fn create_all_tools_with_rules(
         find_tool(cwd),
         glob_tool(cwd),
         ls_tool(cwd),
-        browser_tool(cwd),
+        browser_tool_for_workspace(factory_workspace(cwd)),
         web_search_tool(),
         ast_grep_tool(cwd),
         ask::standalone_ask_tool(),
@@ -710,7 +715,7 @@ pub fn create_all_tools_with_session_env_and_rules(
         find_tool(cwd),
         glob_tool(cwd),
         ls_tool(cwd),
-        browser_tool(cwd),
+        browser_tool_for_workspace(factory_workspace(cwd)),
         web_search_tool(),
         ast_grep_tool(cwd),
         ask::standalone_ask_tool(),
@@ -768,7 +773,7 @@ pub fn create_all_tools_with_context_and_resolver_and_rules(
         find_tool(cwd),
         glob_tool(cwd),
         ls_tool(cwd),
-        browser_tool(cwd),
+        browser_tool_for_workspace(factory_workspace(cwd)),
         web_search_tool(),
         ast_grep_tool(cwd),
         ask::standalone_ask_tool(),
@@ -959,7 +964,7 @@ fn read_tool_for_workspace(
         vec!["path"],
     );
     let description = format!(
-        "Read the contents of a file or trusted skill:// URI. Supports text files, images (jpg, png, gif, webp, bmp), PDFs (text layer extracted via pdftotext; requires poppler-utils), Office documents (docx, xlsx, pptx, odt, ods, odp, rtf; extracted via pandoc or LibreOffice), EPUB ebooks (via pandoc), and Jupyter notebooks (ipynb; via jupyter nbconvert). Images are sent as attachments. For text, PDF, and converted document files, output is truncated to {} lines or {}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+        "Read the contents of a file or trusted skill:// URI. Supports text files, images (jpg, png, gif, webp, bmp), workspace-scoped videos (mp4, webm, ogg), PDFs (text layer extracted via pdftotext; requires poppler-utils), Office documents (docx, xlsx, pptx, odt, ods, odp, rtf; extracted via pandoc or LibreOffice), EPUB ebooks (via pandoc), and Jupyter notebooks (ipynb; via jupyter nbconvert). Images are sent as attachments; accepted videos are returned as bounded media details for authenticated Web preview. For text, PDF, and converted document files, output is truncated to {} lines or {}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
         DEFAULT_MAX_LINES,
         DEFAULT_MAX_BYTES / 1024
     );
@@ -995,6 +1000,82 @@ fn internal_uri_scheme(path: &str) -> Option<&'static str> {
     }
 }
 
+fn video_mime(path: &Path, prefix: &[u8]) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "mp4" if prefix.get(4..8) == Some(b"ftyp") => Some("video/mp4"),
+        "webm" if prefix.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) => Some("video/webm"),
+        "ogg"
+            if prefix.starts_with(b"OggS")
+                && prefix.windows(7).any(|window| window == b"\x80theora") =>
+        {
+            Some("video/ogg")
+        }
+        _ => None,
+    }
+}
+
+fn scoped_media_path(path: &str, workspace: &crate::WorkspaceRoots) -> Result<PathBuf> {
+    let scoped = resolve_scoped_path(path, workspace)?;
+    let canonical = std::fs::canonicalize(&scoped)
+        .with_context(|| format!("Could not resolve media path {path}"))?;
+    if !workspace.roots().iter().any(|root| canonical.starts_with(root)) {
+        return Err(anyhow!("Path escapes workspace roots: {path}"));
+    }
+    Ok(canonical)
+}
+
+fn inline_video_result(path: &str, workspace: &crate::WorkspaceRoots) -> Result<Option<AgentToolResult>> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    if !matches!(extension.as_deref(), Some("mp4" | "webm" | "ogg")) {
+        return Ok(None);
+    }
+    let canonical = scoped_media_path(path, workspace)?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| anyhow!("{error}"))?;
+    if metadata.len() > MAX_INLINE_VIDEO_BYTES {
+        return Err(anyhow!(
+            "video exceeds the {} MiB Web preview limit",
+            MAX_INLINE_VIDEO_BYTES / 1024 / 1024
+        ));
+    }
+    let mut prefix = [0_u8; 64];
+    let prefix_len = std::fs::File::open(&canonical)
+        .and_then(|mut file| std::io::Read::read(&mut file, &mut prefix))
+        .map_err(|error| anyhow!("{error}"))?;
+    let Some(mime_type) = video_mime(&canonical, &prefix[..prefix_len]) else {
+        return Err(anyhow!("video extension does not match supported media content"));
+    };
+    let bytes = std::fs::read(&canonical).map_err(|error| anyhow!("{error}"))?;
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    if data.len() > MAX_INLINE_VIDEO_BASE64_BYTES {
+        return Err(anyhow!("video exceeds the inline Web transport limit"));
+    }
+    let name = canonical
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("video")
+        .to_owned();
+    Ok(Some(AgentToolResult {
+        content: vec![ContentBlock::text(format!(
+            "Read video file [{mime_type}] {name} ({})",
+            format_size(metadata.len() as usize)
+        ))],
+        details: json!({
+            "media": [{
+                "kind": "video",
+                "mimeType": mime_type,
+                "data": data,
+                "name": name,
+                "sizeBytes": metadata.len(),
+            }]
+        }),
+        ..Default::default()
+    }))
+}
+
 async fn run_read(
     workspace: &crate::WorkspaceRoots,
     args: Value,
@@ -1024,10 +1105,21 @@ async fn run_read(
     if info.is_dir() {
         return Err(anyhow!("EISDIR: illegal operation on a directory, read"));
     }
-    // Image path: sniff magic bytes, process (convert BMP→PNG, auto-resize, EXIF).
+    if !path.starts_with("skill://") && internal_uri_scheme(&path).is_none() {
+        if let Some(result) = inline_video_result(&path, workspace)? {
+            return Ok(result);
+        }
+    }
+    // Local filesystem images must stay inside workspace roots. Trusted URI
+    // resolvers already enforce their own containment and may resolve outside it.
     if let Some(mime) = detect_supported_image_mime_type_from_file(Path::new(&abs)) {
+        let image_path = if path.starts_with("skill://") || internal_uri_scheme(&path).is_some() {
+            PathBuf::from(&abs)
+        } else {
+            scoped_media_path(&path, workspace)?
+        };
         check_aborted(&abort)?;
-        let data = std::fs::read(&abs).map_err(|e| anyhow!("{}", e))?;
+        let data = std::fs::read(&image_path).map_err(|e| anyhow!("{}", e))?;
         check_aborted(&abort)?;
         let processed = process_image(&data, &mime, true);
         check_aborted(&abort)?;
@@ -3641,6 +3733,16 @@ mod tests {
         d
     }
 
+    fn media_details(result: &AgentToolResult) -> &[Value] {
+        result.details["media"].as_array().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn tiny_webm() -> Vec<u8> {
+        let mut bytes = vec![0x1a, 0x45, 0xdf, 0xa3];
+        bytes.extend_from_slice(b"bounded-webm-fixture");
+        bytes
+    }
+
     fn noop_update() -> ToolUpdateFn {
         Arc::new(|_r: AgentToolResult| {})
     }
@@ -3990,7 +4092,9 @@ mod tests {
                 // race window. Then linger so `wait` is not ready yet, and exit
                 // nonzero to prove the real status is preserved.
                 "exec 1>&-\n",
-                "sleep 0.2\n",
+                // Keep the linger inside the shell so the observed status is
+                // always the fake pdftotext leader's own exit status.
+                "i=0; while [ $i -lt 200000 ]; do i=$((i + 1)); done\n",
                 "exit 1\n",
             ),
         )
@@ -4138,6 +4242,103 @@ mod tests {
         .unwrap();
         assert!(!text_of(&vision).contains(NON_VISION_IMAGE_NOTE));
         assert!(vision.content.iter().any(|content| matches!(content, ContentBlock::Image { .. })));
+    }
+    #[tokio::test]
+    async fn read_video_returns_bounded_structured_media() {
+        let cwd = tmpdir();
+        fs::write(cwd.join("capture.webm"), tiny_webm()).unwrap();
+        let tool = read_tool(&cwd.to_string_lossy());
+        let result = (tool.execute)(make_ctx(json!({ "path": "capture.webm" })))
+            .await
+            .unwrap();
+        assert!(text_of(&result).contains("Read video file [video/webm] capture.webm"));
+        let media = media_details(&result);
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0]["kind"], "video");
+        assert_eq!(media[0]["mimeType"], "video/webm");
+        assert_eq!(media[0]["name"], "capture.webm");
+        assert!(media[0]["data"].as_str().unwrap().len() <= MAX_INLINE_VIDEO_BASE64_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_video_rejects_hostile_content_and_oversize() {
+        let cwd = tmpdir();
+        fs::write(cwd.join("fake.webm"), b"not webm").unwrap();
+        let tool = read_tool(&cwd.to_string_lossy());
+        let error = (tool.execute)(make_ctx(json!({ "path": "fake.webm" })))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("extension does not match"), "{error}");
+
+        let mut audio_ogg = b"OggS".to_vec();
+        audio_ogg.extend_from_slice(b"\x01vorbis-audio-only");
+        fs::write(cwd.join("audio.ogg"), audio_ogg).unwrap();
+        let error = (tool.execute)(make_ctx(json!({ "path": "audio.ogg" })))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("extension does not match"), "{error}");
+
+        let oversized = cwd.join("large.mp4");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_INLINE_VIDEO_BYTES + 1).unwrap();
+        let error = (tool.execute)(make_ctx(json!({ "path": "large.mp4" })))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Web preview limit"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn read_media_rejects_outside_workspace_paths() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("image.png"), tiny_png()).unwrap();
+        fs::write(outside.path().join("capture.webm"), tiny_webm()).unwrap();
+        let tool = read_tool(&cwd.path().to_string_lossy());
+        for path in [outside.path().join("image.png"), outside.path().join("capture.webm")] {
+            let error = (tool.execute)(make_ctx(json!({ "path": path })))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("escapes working directory"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_trusted_uri_image_preserves_resolver_contract() {
+        let cwd = tempfile::tempdir().unwrap();
+        let resolved = tempfile::NamedTempFile::new().unwrap();
+        fs::write(resolved.path(), tiny_png()).unwrap();
+        let resolved_path = resolved.path().to_path_buf();
+        let resolver: InternalUriResolverFn = Arc::new(move |_uri| Ok(resolved_path.clone()));
+        let tool = read_tool_with_resolver(&cwd.path().to_string_lossy(), None, Some(resolver));
+        let result = (tool.execute)(make_ctx(json!({ "path": "artifact://image" })))
+            .await
+            .unwrap();
+        assert!(result.content.iter().any(|block| matches!(block, ContentBlock::Image { .. })));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_media_rejects_symlink_escape() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let image = outside.path().join("image.png");
+        let video = outside.path().join("capture.webm");
+        fs::write(&image, tiny_png()).unwrap();
+        fs::write(&video, tiny_webm()).unwrap();
+        std::os::unix::fs::symlink(&image, cwd.path().join("image.png")).unwrap();
+        std::os::unix::fs::symlink(&video, cwd.path().join("capture.webm")).unwrap();
+        let tool = read_tool(&cwd.path().to_string_lossy());
+        for path in ["image.png", "capture.webm"] {
+            let error = (tool.execute)(make_ctx(json!({ "path": path })))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("escapes working directory"), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -4486,6 +4687,30 @@ mod tests {
             for expected in ["recall", "retain", "reflect"] {
                 assert!(names.iter().any(|name| name == expected), "{names:?}");
             }
+        }
+    }
+
+    #[test]
+    fn resolver_factories_include_one_browser_without_duplicate_names() {
+        let cwd = tmpdir();
+        let persona_root = tmpdir();
+        let workspace = crate::WorkspaceRoots::new(&cwd, Vec::<PathBuf>::new()).unwrap();
+        let factories = [
+            create_coding_tools_with_context_and_resolver(
+                &cwd.to_string_lossy(), None, None, None, None, None, None, None,
+            ),
+            create_coding_tools_with_context_and_resolver_for_persona(
+                &cwd.to_string_lossy(), &persona_root, None, None, None, None, None, None, None,
+            ),
+            create_coding_tools_for_workspace_with_context_and_resolver(
+                workspace, None, None, None, None, None, None, None,
+            ),
+        ];
+        for tools in factories {
+            let names = tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>();
+            assert_eq!(names.iter().filter(|name| name.as_str() == "browser").count(), 1, "{names:?}");
+            let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(unique.len(), names.len(), "{names:?}");
         }
     }
 

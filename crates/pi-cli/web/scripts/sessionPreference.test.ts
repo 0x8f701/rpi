@@ -58,6 +58,23 @@ function makeStorage() {
   check('clearing B does not clear A', loadSessionPreference(s, 'hostA:1') === 'sid-A');
 }
 
+// ---- restored listener keeps click-save and reload-load aligned ----
+{
+  const pageHost = 'localhost:8090';
+  const connectionHost = '127.0.0.1:8090';
+  const rows = [
+    { sessionId: 's1', path: 'p1' },
+    { sessionId: 's2', path: 'p2' },
+  ];
+  const s = makeStorage();
+  saveSessionPreference(s, connectionHost, 's2');
+  check('page host has no cross-listener preference', loadSessionPreference(s, pageHost) === '');
+  const restored = selectSessionFromCatalog(rows, loadSessionPreference(s, connectionHost));
+  check('restored listener selects the saved non-first session', restored !== null && restored.sessionId === 's2');
+  check('preference stored under connection authority', s._has(sessionPreferenceKey(connectionHost)));
+  check('preference not stored under page authority', !s._has(sessionPreferenceKey(pageHost)));
+}
+
 // ---- storage exceptions / null storage: degrade to ''/no-op, never throw ----
 {
   const throwing = {

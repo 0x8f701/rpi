@@ -61,6 +61,16 @@ export const MATRIX = [
       'md.link-blocked',
       'md.image-safe',
       'md.image-blocked',
+      'md.extra-blockquote',
+      'md.extra-hr',
+      'md.extra-ol',
+      'md.extra-nested-list',
+      'md.extra-fence-langs',
+      'md.extra-mermaid-empty',
+      'md.extra-mermaid-error',
+      'md.extra-currency',
+      'md.extra-image-relative',
+      'md.extra-url-policy',
     ],
   },
   {
@@ -132,6 +142,22 @@ export const MATRIX = [
     ],
   },
   {
+    feature: 'slash commands',
+    ids: [
+      'slash.snapcompact',
+      'slash.compact-llm',
+      'slash.compact-bare',
+      'slash.snapcompact-tail',
+      'slash.skill-usage-error',
+      'slash.skill-rpc',
+      'slash.code-review-open',
+      'slash.code-review-close',
+      'slash.code-review-range',
+      'slash.code-review-usage-error',
+      'slash.unknown-falls-through',
+    ],
+  },
+  {
     feature: 'sessions',
     ids: [
       'session.sidebar-list',
@@ -151,11 +177,62 @@ export const MATRIX = [
       'T0.1', 'T0.2', 'T0.3',
       'T1.1', 'T1.2', 'T1.3', 'T1.4', 'T1.5', 'T1.6',
       'T2.1', 'T2.2', 'T2.3', 'T2.4', 'T2.5',
-      'T3.1', 'T3.2',
       'T4.1', 'T4.2', 'T4.3',
       'T5.1', 'T5.2', 'T5.3',
       'T6.1', 'T6.2', 'T6.3', 'T6.4',
       'T7.1', 'T7.2', 'T7.3', 'T7.4',
+    ],
+  },
+  {
+    // The real projects lane (E2E.d/web/projects.sh -> projects_test.mjs):
+    // all-project native session catalog + cross-project New-session storage
+    // (seeded A/B sessions under one profile tree, project-B switch, New
+    // records under B's encoded default dir, on-disk proof). Its evidence
+    // file is written by the lane itself at
+    // $EVIDENCE_ROOT/web-projects/coverage-assertions.json; the gate fails
+    // if any of these P0.1-P4.2 contracts did not execute.
+    feature: 'all-project session catalog',
+    ids: [
+      'P0.1', 'P0.2', 'P0.3',
+      'P1.1', 'P1.2',
+      'P2.1', 'P2.2', 'P2.3',
+      'P3.1', 'P3.2', 'P3.3', 'P3.4',
+      'P4.1', 'P4.2',
+    ],
+  },
+  {
+    // The real external_sessions lane (E2E.d/web/external_sessions.sh ->
+    // external_sessions_test.mjs): Web-only default OMP/Codex/Grok discovery
+    // + source grouping, foreign click imports a native rpi copy, foreign
+    // bytes/mtime immutable, lineage reuse, no duplicate rows, and explicit
+    // sessionImportSources:[] native-only. Evidence at
+    // $EVIDENCE_ROOT/web-external_sessions/coverage-assertions.json.
+    feature: 'external sessions',
+    ids: [
+      'X0.1',
+      'X1.1', 'X1.2',
+      'X2.1', 'X2.2', 'X2.3',
+      'X3.1', 'X3.2',
+      'X4.1', 'X4.2',
+      'X5.1', 'X5.2',
+      'X6.1', 'X6.2',
+    ],
+  },
+  {
+    // The real scroll lane (E2E.d/web/scroll.sh -> scroll_test.mjs). Its
+    // evidence file is written by the lane itself at
+    // $EVIDENCE_ROOT/web-scroll/coverage-assertions.json; the gate fails if
+    // any documented S0.1-S7.3 contract did not execute.
+    feature: 'scroll pinning',
+    ids: [
+      'S0.1', 'S0.2', 'S0.3',
+      'S1.1',
+      'S2.1', 'S2.2', 'S2.3',
+      'S3.1', 'S3.2', 'S3.3',
+      'S4.1',
+      'S5.1', 'S5.2',
+      'S6.1', 'S6.2', 'S6.3',
+      'S7.1', 'S7.2', 'S7.3',
     ],
   },
   {
@@ -202,13 +279,138 @@ export const MATRIX = [
     ids: ['switch.model-roundtrip', 'switch.thinking-roundtrip'],
   },
   {
+    // Real Codex Live realtime flow (coverage_test.mjs): the App's
+    // real startRealtime -> setupRealtimeCall path with stubbed WebRTC
+    // platform APIs, a REAL realtime_create_call RPC through the Rust proxy
+    // to the mock's /v1/realtime/calls endpoint (OpenAI-Alpha + Bearer
+    // asserted), oai-events transcript delta/final (deduped), error toast and
+    // delegation frames, and the stop path.
+    feature: 'realtime',
+    ids: [
+      'realtime.overlay-visible',
+      'realtime.proxy-alpha-header',
+      'realtime.transcript-delta',
+      'realtime.transcript-commit',
+      'realtime.transcript-dedup',
+      'realtime.error-toast',
+      'realtime.delegation',
+      'realtime.stop',
+      'realtime.conn-state-connected',
+      'realtime.session-update',
+      'realtime.error-message-only',
+      'realtime.error-code-only',
+      'realtime.error-bare',
+      'realtime.dc-error',
+      'realtime.conn-disconnected',
+      'realtime.conn-failed-teardown',
+    ],
+  },
+  {
     feature: 'app',
     ids: [
       'app.tool-card',
       'app.tool-card-done',
-      'app.primary-submit-send',
-      'app.primary-submit-steer',
+      'app.tool-card-settled',
+      'app.tool-card-web-search',
+      'app.tool-card-edit',
+      'app.tool-card-reconnect',
+      'app.primary-action-send',
+      'app.primary-action-stop',
       'app.maintenance-close',
+    ],
+  },
+  {
+    // Real-wire transcript/tool-title branch journeys (coverage_test.mjs
+    // Phase P): bash_execution_end status/output-bounding variants via the
+    // raw second-session Bash RPC, and unknown tool names whose wire values
+    // exercise humanToolTitle's Title-Case / acronym / credential-redaction
+    // branches through real tool_execution dispatch plus the generic
+    // fallback tool-card view (compact args line, collapsed raw, dispatch
+    // error). Also the structured Todo tool-card contract: a real `todo`
+    // tool call renders the phase/task list in both the running frame
+    // (init-args projection) and the settled frame (details.phases), never
+    // the raw args JSON as the default view. The `wire.*` namespace is
+    // disjoint from every other feature's prefixes.
+    feature: 'wire transcript entries',
+    ids: [
+      'wire.bash-done',
+      'wire.bash-empty',
+      'wire.bash-error',
+      'wire.bash-bound-tail',
+      'wire.title-snake',
+      'wire.title-acronym',
+      'wire.title-kebab',
+      'wire.tool-error-card',
+      // Real `todo` tool execution journey (coverage_test.mjs Phase P): the
+      // structured Todo card — running frame projects the init args via
+      // resolveTodoCardView (phase/task list with typed status markers, never
+      // the raw args JSON as the default view), settled frame projects
+      // details.phases via parseTodoPhases.
+      'wire.todo-card-running',
+      'wire.todo-structured-view',
+    ],
+  },
+  {
+    // Presentation regression lane (E2E.d/web/presentation.sh ->
+    // presentation_test.mjs): real-browser DOM assertions (computed styles,
+    // bounding rects, naturalWidth, video attributes — never source text) for
+    // the Command/process/write/read tool-card presentation, the Thinking
+    // streaming lifecycle, the composer control equal-height, the session
+    // sidebar provider grouping + search, and the inline image/video media
+    // contracts. Includes the Thinking + toolcall no-raw-JSON guard: a
+    // think+bash turn must never render the removed `.assistant-toolcall`
+    // surface or raw `{"command":…}` args — in-flight, after finalize, nor as
+    // a transient element — with the structured Command card the only tool
+    // presentation (MutationObserver watchdog). Evidence at
+    // $EVIDENCE_ROOT/web-presentation/coverage-assertions.json. The `pres.*`
+    // namespace is disjoint from every other feature's prefixes.
+    feature: 'presentation',
+    ids: [
+      'pres.composer-equal-height',
+      'pres.composer-equal-height-mobile',
+      'pres.command-title',
+      'pres.command-no-bash-title',
+      'pres.command-no-default-args',
+      'pres.command-success-green',
+      'pres.command-two-line-clamp',
+      'pres.command-failure-red',
+      'pres.write-summary',
+      'pres.read-summary',
+      'pres.image-render',
+      'pres.process-long',
+      'pres.process-short',
+      'pres.process-summary',
+      'pres.process-equal-width',
+      'pres.process-error-op',
+      'pres.no-raw-json',
+      'pres.no-done-text',
+      'pres.tool-cards-equal-width',
+      'pres.hub-wait-running',
+      'pres.hub-wait-timeout',
+      'pres.hub-wait-typed-running',
+      'pres.hub-wait-typed-irc',
+      'pres.hub-send-card',
+      'pres.thinking-streaming-visible',
+      'pres.thinking-header-icon',
+      'pres.thinking-no-bare-marker',
+      'pres.thinking-multiline-body',
+      'pres.thinking-final-hidden',
+      // Thinking + streamed tool call regression journey: a turn streaming
+      // reasoning AND a bash tool call (incremental tool_calls fragments)
+      // shows the reasoning prose, then the structured Command card — never
+      // the raw `{"command":…}` JSON/args, in-flight, after finalize, or as a
+      // transient element (MutationObserver watchdog proves zero raw surface).
+      'pres.tb.thinking-prose',
+      'pres.tb.card-live-no-raw',
+      'pres.tb.card-done-no-raw',
+      'pres.thinking-narrow-no-overflow',
+      'pres.bash-execution-durable',
+      'pres.session-providers-only',
+      'pres.session-no-tmp-uuid',
+      'pres.session-search-filter',
+      'pres.session-search-clear',
+      'pres.video-controls',
+      'pres.media-hostile-rejected',
     ],
   },
   {

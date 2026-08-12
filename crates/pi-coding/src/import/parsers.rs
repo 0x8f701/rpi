@@ -21,6 +21,10 @@ pub(super) struct ParsedSession {
     pub cwd: PathBuf,
     pub started_at: Option<String>,
     pub messages: Vec<ImportedMessage>,
+    /// User/assistant turns with meaningful content (text or supported
+    /// non-text such as image), counted over the active path. Independent of
+    /// the lossy text projection in `messages`.
+    pub meaningful_count: usize,
 }
 
 #[derive(Debug)]
@@ -32,6 +36,7 @@ struct TreeNode {
     timestamp: Option<String>,
     entry_type: Option<String>,
     first_kept_entry_id: Option<String>,
+    meaningful: bool,
 }
 
 pub(super) fn parse_source(
@@ -167,12 +172,13 @@ fn parse_native(
         .iter()
         .filter_map(native_node)
         .collect::<Vec<_>>();
-    let messages = active_messages(&nodes);
+    let (messages, meaningful_count) = active_messages(&nodes);
     Ok(ParsedSession {
         source_session_id,
         cwd,
         started_at,
         messages,
+        meaningful_count,
     })
 }
 
@@ -207,10 +213,13 @@ fn native_node(value: &Value) -> Option<TreeNode> {
         .and_then(|message| message.get("role"))
         .and_then(Value::as_str)
         .and_then(parse_role);
-    let text = message
-        .and_then(|message| message.get("content"))
-        .and_then(first_text)
-        .map(str::to_owned);
+    let content = message.and_then(|message| message.get("content"));
+    let text = content.and_then(first_text).map(str::to_owned);
+    // Meaningful: a user/assistant turn with non-empty text OR a supported
+    // non-text content block (image attachment). Empty pending assistant
+    // placeholders (no content blocks) and tool/system roles are not meaningful.
+    let meaningful = role.is_some()
+        && content.is_some_and(|content| message_content_meaningful(content));
     Some(TreeNode {
         id,
         parent_id,
@@ -219,17 +228,18 @@ fn native_node(value: &Value) -> Option<TreeNode> {
         timestamp,
         entry_type,
         first_kept_entry_id,
+        meaningful,
     })
 }
 
-fn active_messages(nodes: &[TreeNode]) -> Vec<ImportedMessage> {
+fn active_messages(nodes: &[TreeNode]) -> (Vec<ImportedMessage>, usize) {
     let by_id = nodes
         .iter()
         .enumerate()
         .map(|(index, node)| (node.id.as_str(), index))
         .collect::<HashMap<_, _>>();
     let Some(mut cursor) = nodes.len().checked_sub(1) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let mut path = Vec::new();
     let mut visited = HashSet::new();
@@ -264,17 +274,45 @@ fn active_messages(nodes: &[TreeNode]) -> Vec<ImportedMessage> {
                 })
                 .unwrap_or(position)
         });
-    path[start..]
-        .iter()
-        .filter_map(|index| {
-            let node = &nodes[*index];
-            Some(ImportedMessage {
-                role: node.role?,
-                text: node.text.clone()?,
+    let mut messages = Vec::new();
+    let mut meaningful_count = 0usize;
+    for index in &path[start..] {
+        let node = &nodes[*index];
+        if node.meaningful {
+            meaningful_count += 1;
+        }
+        if let (Some(role), Some(text)) = (node.role, node.text.clone()) {
+            messages.push(ImportedMessage {
+                role,
+                text,
                 timestamp: node.timestamp.clone(),
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    (messages, meaningful_count)
+}
+
+/// Whether message content carries a meaningful user/assistant turn: non-empty
+/// text or a supported non-text block (image attachment). Mirrors
+/// `crate::session_catalog::lineage::message_meaningful` for the import parser.
+fn message_content_meaningful(content: &Value) -> bool {
+    match content {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+                return false;
+            };
+            match block_type {
+                "text" | "input_text" | "output_text" => block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "image" => true,
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
 }
 
 fn parse_codex(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSessionError> {
@@ -323,11 +361,13 @@ fn parse_codex(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSessi
             _ => {}
         }
     }
+    let meaningful_count = messages.len();
     Ok(ParsedSession {
         source_session_id,
         cwd,
         started_at,
         messages,
+        meaningful_count,
     })
 }
 
@@ -385,6 +425,7 @@ fn parse_claude(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSess
             .and_then(first_direct_text)
             .map(str::to_owned);
         let timestamp = string_field(object, &["timestamp"]);
+        let meaningful = role.is_some() && text.is_some();
         nodes.push(TreeNode {
             id: id.to_owned(),
             parent_id,
@@ -393,6 +434,7 @@ fn parse_claude(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSess
             timestamp,
             entry_type: object.get("type").and_then(Value::as_str).map(str::to_owned),
             first_kept_entry_id: None,
+            meaningful,
         });
     }
 
@@ -408,7 +450,7 @@ fn parse_claude(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSess
             nodes.push(leaf_node);
         }
     }
-    let messages = active_messages(&nodes);
+    let (messages, meaningful_count) = active_messages(&nodes);
     let started_at = messages.first().and_then(|message| message.timestamp.clone());
     Ok(ParsedSession {
         source_session_id: source_session_id.or_else(|| {
@@ -419,6 +461,7 @@ fn parse_claude(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSess
         cwd,
         started_at,
         messages,
+        meaningful_count,
     })
 }
 
@@ -473,12 +516,14 @@ fn parse_grok(
                     .find_map(|key| object.get(key).and_then(Value::as_str)),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let meaningful_count = messages.len();
     Ok(ParsedSession {
         source_session_id,
         cwd,
         started_at,
         messages,
+        meaningful_count,
     })
 }
 
@@ -508,11 +553,13 @@ fn parse_droid(path: &Path, file: fs::File) -> Result<ParsedSession, ImportSessi
         })
         .collect::<Vec<_>>();
     let started_at = messages.first().and_then(|message| message.timestamp.clone());
+    let meaningful_count = messages.len();
     Ok(ParsedSession {
         source_session_id,
         cwd,
         started_at,
         messages,
+        meaningful_count,
     })
 }
 

@@ -1560,3 +1560,398 @@ fn catalog_prepared_resume_rejects_final_symlink_replacement() {
         CatalogError::Import(ImportSessionError::InvalidInput { .. })
     ));
 }
+
+#[test]
+fn native_catalog_does_not_count_empty_assistant_placeholders() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let path = catalog
+        .root_for(SessionSourceKind::NativePi)
+        .path
+        .join("--empty--")
+        .join("placeholder.jsonl");
+    fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session","version":3,"id":"placeholder","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/empty"}"#,
+            "\n",
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[]}}"#,
+            "\n"
+        ),
+    )
+    .expect("placeholder session");
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::NativePi],
+        ..CatalogListOptions::default()
+    });
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].message_count, Some(0));
+    assert_eq!(rows[0].summary, "(no messages)");
+}
+
+#[test]
+fn native_image_only_message_counts_as_meaningful() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let path = catalog
+        .root_for(SessionSourceKind::NativePi)
+        .path
+        .join("--image--")
+        .join("image-only.jsonl");
+    fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session","version":3,"id":"image-only","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/image"}"#,
+            "\n",
+            r#"{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"image","data":"aW1n","mimeType":"image/png"}]}}"#,
+            "\n"
+        ),
+    )
+    .expect("image-only session");
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::NativePi],
+        ..CatalogListOptions::default()
+    });
+    assert_eq!(rows.len(), 1);
+    // Image-only user turn is meaningful even though no portable text exists.
+    assert_eq!(rows[0].message_count, Some(1));
+    // Textual summary still takes the first non-empty text; none here.
+    assert_eq!(rows[0].summary, "(no messages)");
+}
+
+#[test]
+fn omp_image_only_message_counts_as_meaningful() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let path = catalog
+        .root_for(SessionSourceKind::Omp)
+        .path
+        .join("--image--")
+        .join("omp-image.jsonl");
+    fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session","version":3,"id":"omp-image","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/image"}"#,
+            "\n",
+            r#"{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"image","data":"aW1n","mimeType":"image/png"}]}}"#,
+            "\n"
+        ),
+    )
+    .expect("omp image-only session");
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        ..CatalogListOptions::default()
+    });
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, SessionSourceKind::Omp);
+    // OMP image-only turn is meaningful for the catalog count even though the
+    // lossy import projection drops it from `messages`.
+    assert_eq!(rows[0].message_count, Some(1));
+    assert_eq!(rows[0].summary, "(no messages)");
+}
+
+/// OMP native listAllSessions only globs `*/*.jsonl`. Deeper files under a
+/// parent session directory (task/subagent child trees) are not native-resumable
+/// and must never enter the catalog — eligibility is path structure only, not
+/// title/body heuristics, and large non-empty child transcripts still drop.
+#[test]
+fn omp_lists_only_native_tree_sessions_and_excludes_child_subagent_trees() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let root = catalog.root_for(SessionSourceKind::Omp).path;
+
+    // Top-level native-resumable shape: `<cwd-dir>/<session>.jsonl`.
+    let top = write_omp(&catalog, "omp-top-level", "/tmp/omp-top");
+
+    // Child/subagent tree under the parent session stem. Real OMP stores these
+    // at depth 3+; they carry real messages and can be large, but native resume
+    // listing never includes them.
+    let parent_stem = top
+        .file_stem()
+        .expect("top stem")
+        .to_str()
+        .expect("utf8 stem");
+    let child_dir = root.join("--injected--").join(parent_stem);
+    fs::create_dir_all(&child_dir).expect("child dir");
+    let padding = "x".repeat(12_000);
+    let child = child_dir.join("ScoutChild.jsonl");
+    fs::write(
+        &child,
+        format!(
+            concat!(
+                r#"{{"type":"title","v":1,"title":"Complete the assignment below...","updatedAt":"2026-01-01T00:00:00Z","pad":"x"}}"#,
+                "\n",
+                r#"{{"type":"session","version":3,"id":"omp-child-id","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/omp-top"}}"#,
+                "\n",
+                r#"{{"type":"session_init","id":"init","parentId":null,"timestamp":"2026-01-01T00:00:00Z","task":"child task","tools":[],"spawns":[]}}"#,
+                "\n",
+                r#"{{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":"child user prompt {padding}"}}}}"#,
+                "\n",
+                r#"{{"type":"message","id":"a","parentId":"u","timestamp":"2026-01-01T00:00:02Z","message":{{"role":"assistant","content":"child assistant reply"}}}}"#,
+                "\n"
+            ),
+            padding = padding
+        ),
+    )
+    .expect("child session");
+    assert!(
+        fs::metadata(&child).expect("child meta").len() > 10_240,
+        "child fixture must be large enough that size alone would not hide it"
+    );
+
+    // Nested grandchild (depth 4) also excluded.
+    let grandchild_dir = child_dir.join("NestedTeam");
+    fs::create_dir_all(&grandchild_dir).expect("grandchild dir");
+    let grandchild = grandchild_dir.join("NestedTeam.RpcScout.jsonl");
+    fs::write(
+        &grandchild,
+        concat!(
+            r#"{"type":"session","version":3,"id":"omp-grandchild","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/omp-top"}"#,
+            "\n",
+            r#"{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"grandchild prompt"}}"#,
+            "\n"
+        ),
+    )
+    .expect("grandchild session");
+
+    // Root-level single-component jsonl is not native `*/*.jsonl`.
+    let shallow = root.join("orphan-root.jsonl");
+    fs::write(
+        &shallow,
+        concat!(
+            r#"{"type":"session","version":3,"id":"omp-shallow","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/omp-top"}"#,
+            "\n",
+            r#"{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"shallow prompt"}}"#,
+            "\n"
+        ),
+    )
+    .expect("shallow session");
+
+    assert!(
+        catalog.is_safe_session_path(SessionSourceKind::Omp, &top),
+        "top-level OMP session must remain native-resumable"
+    );
+    assert!(
+        !catalog.is_safe_session_path(SessionSourceKind::Omp, &child),
+        "depth-3 subagent child must be structurally ineligible"
+    );
+    assert!(
+        !catalog.is_safe_session_path(SessionSourceKind::Omp, &grandchild),
+        "depth-4 nested child must be structurally ineligible"
+    );
+    assert!(
+        !catalog.is_safe_session_path(SessionSourceKind::Omp, &shallow),
+        "root-level jsonl is outside native *//*.jsonl layout"
+    );
+
+    let discovered = catalog.discover(SessionSourceKind::Omp);
+    assert_eq!(discovered, vec![top.clone()]);
+
+    let before_child = fs::read(&child).expect("child bytes before scan");
+    let before_mtime = fs::metadata(&child).expect("child meta").modified().expect("mtime");
+
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        ..CatalogListOptions::default()
+    });
+    assert_eq!(rows.len(), 1, "only the top-level OMP session is listed: {rows:?}");
+    assert_eq!(rows[0].kind, SessionSourceKind::Omp);
+    assert_eq!(rows[0].session_id, "omp-top-level");
+    assert_eq!(rows[0].path, top);
+    assert!(
+        !rows.iter().any(|row| row.session_id == "omp-child-id"
+            || row.session_id == "omp-grandchild"
+            || row.session_id == "omp-shallow"
+            || row.path == child
+            || row.path == grandchild
+            || row.path == shallow),
+        "child/subagent/internal paths must not appear regardless of title/body"
+    );
+
+    // Foreign source bytes + mtime are never mutated by discovery/list.
+    let after_child = fs::read(&child).expect("child bytes after scan");
+    let after_mtime = fs::metadata(&child).expect("child meta").modified().expect("mtime");
+    assert_eq!(before_child, after_child, "foreign child file bytes must stay unchanged");
+    assert_eq!(before_mtime, after_mtime, "foreign child mtime must stay unchanged");
+}
+
+/// Codex native resume lists `rollout-*.jsonl` under the sessions tree and
+/// excludes `archived_sessions`. Grok native discovery is exactly
+/// `<cwd-token>/<session-id>/summary.json`. Keep those structural rules and
+/// reject deeper/non-matching paths without title heuristics.
+#[test]
+fn codex_and_grok_native_resumable_layouts_exclude_non_native_paths() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+
+    let codex_top = write_codex(
+        &catalog,
+        "2026/01/01/rollout-codex-top.jsonl",
+        "codex-top",
+        "/tmp/codex-top",
+        "codex top prompt",
+    );
+    let codex_archived = catalog
+        .root_for(SessionSourceKind::Codex)
+        .path
+        .join("archived_sessions/rollout-archived.jsonl");
+    fs::create_dir_all(codex_archived.parent().expect("archived parent")).expect("archived dir");
+    fs::copy(&codex_top, &codex_archived).expect("archived copy");
+
+    let grok_top = write_grok(&catalog, "grok-top", "/tmp/grok-top");
+    let grok_nested = catalog
+        .root_for(SessionSourceKind::Grok)
+        .path
+        .join("injected-cwd")
+        .join("grok-top")
+        .join("state")
+        .join("summary.json");
+    fs::create_dir_all(grok_nested.parent().expect("nested parent")).expect("nested dir");
+    fs::write(
+        &grok_nested,
+        r#"{"info":{"id":"grok-nested","cwd":"/tmp/grok-top"},"created_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .expect("nested summary");
+    fs::write(
+        grok_nested
+            .parent()
+            .expect("nested parent")
+            .join("chat_history.jsonl"),
+        r#"{"role":"user","content":"nested grok prompt","timestamp":"2026-01-01T00:00:01Z"}
+"#,
+    )
+    .expect("nested chat");
+
+    assert!(catalog.is_safe_session_path(SessionSourceKind::Codex, &codex_top));
+    assert!(!catalog.is_safe_session_path(SessionSourceKind::Codex, &codex_archived));
+    assert!(catalog.is_safe_session_path(SessionSourceKind::Grok, &grok_top));
+    assert!(!catalog.is_safe_session_path(SessionSourceKind::Grok, &grok_nested));
+
+    let codex_before = fs::read(&codex_archived).expect("archived bytes");
+    let grok_before = fs::read(&grok_nested).expect("nested summary bytes");
+
+    let codex_rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Codex],
+        include_foreign: true,
+        ..CatalogListOptions::default()
+    });
+    assert_eq!(codex_rows.len(), 1);
+    assert_eq!(codex_rows[0].session_id, "codex-top");
+    assert_eq!(codex_rows[0].path, codex_top);
+
+    let grok_rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Grok],
+        include_foreign: true,
+        ..CatalogListOptions::default()
+    });
+    assert_eq!(grok_rows.len(), 1);
+    assert_eq!(grok_rows[0].session_id, "grok-top");
+    assert_eq!(grok_rows[0].path, grok_top);
+
+    assert_eq!(
+        codex_before,
+        fs::read(&codex_archived).expect("archived after"),
+        "archived codex foreign source must remain untouched"
+    );
+    assert_eq!(
+        grok_before,
+        fs::read(&grok_nested).expect("nested after"),
+        "nested grok foreign source must remain untouched"
+    );
+}
+
+/// Native Pi already excludes `children/<parent-id>/` by the same two-component
+/// tree rule. Keep that contract explicit next to the OMP structural filter.
+#[test]
+fn native_pi_excludes_children_subtree_from_default_tree_discovery() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let top = write_native(
+        &catalog,
+        "--proj--",
+        "parent.jsonl",
+        "native-parent",
+        "/tmp/proj",
+        "native parent prompt",
+    );
+    let child = catalog
+        .root_for(SessionSourceKind::NativePi)
+        .path
+        .join("--proj--")
+        .join("children")
+        .join("native-parent")
+        .join("child.jsonl");
+    fs::create_dir_all(child.parent().expect("child parent")).expect("child dir");
+    fs::write(
+        &child,
+        concat!(
+            r#"{"type":"session","version":3,"id":"native-child","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/proj","parentSession":"/tmp/parent.jsonl"}"#,
+            "\n",
+            r#"{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":[{"type":"text","text":"native child prompt"}]}}"#,
+            "\n"
+        ),
+    )
+    .expect("native child");
+
+    assert!(catalog.is_safe_session_path(SessionSourceKind::NativePi, &top));
+    assert!(!catalog.is_safe_session_path(SessionSourceKind::NativePi, &child));
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::NativePi],
+        ..CatalogListOptions::default()
+    });
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, "native-parent");
+    assert_eq!(rows[0].path, top);
+}
+
+
+#[test]
+fn grok_aggregate_size_includes_chat_history_for_non_convertible_chat() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let directory = catalog
+        .root_for(SessionSourceKind::Grok)
+        .path
+        .join("agg-cwd")
+        .join("grok-agg");
+    fs::create_dir_all(&directory).expect("grok directory");
+    let summary_path = directory.join("summary.json");
+    fs::write(
+        &summary_path,
+        r#"{"info":{"id":"grok-agg","cwd":"/tmp/agg"}}"#,
+    )
+    .expect("grok summary");
+    // Tiny summary.json stays well under the noise threshold so the row's size
+    // can only reach 10 KiB via the aggregate with chat_history.jsonl.
+    assert!(fs::metadata(&summary_path).expect("summary meta").len() < 1024);
+    // Non-convertible chat records (system role) with no user/assistant text,
+    // padded past 10 KiB so aggregate size crosses the noise threshold while
+    // message_count remains zero.
+    let padding = "x".repeat(11_000);
+    fs::write(
+        directory.join("chat_history.jsonl"),
+        format!(
+            r#"{{"type":"system","content":"{padding}"}}"#
+        ),
+    )
+    .expect("grok chat");
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Grok],
+        include_foreign: true,
+        ..CatalogListOptions::default()
+    });
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, SessionSourceKind::Grok);
+    assert_eq!(rows[0].message_count, Some(0));
+    assert!(rows[0].size >= 10_240, "aggregate size {}", rows[0].size);
+    assert!(
+        rows[0].size > fs::metadata(&summary_path).expect("summary meta").len(),
+        "size must aggregate chat_history, not summary alone"
+    );
+    assert_eq!(rows[0].summary, "(no messages)");
+}

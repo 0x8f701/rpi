@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useScrollPin } from './scrollPin';
+import { createAutoResizeController, type AutoResizeController } from './autoResize';
 import { safeText } from './redact';
 import {
   type Item,
@@ -8,19 +10,26 @@ import {
   applyDeltaToNode,
   streamKey,
   streamBuf,
+  normalizedThinkingKeys,
   StreamingAssistant,
   FinalAssistant,
   ToolCard,
   BashCard,
+  IrcCard,
   ToastList,
 } from './App';
+import { MarkdownBody } from './MarkdownBody';
 import type { ContentBlock } from './types';
 import {
   boundOutput,
   customToItem,
   applyToolSnapshot,
+  applyToolResultToItems,
+  toolMedia,
+  finalizeStreamingAssistant,
   BASH_OUTPUT_LINE_LIMIT,
   TOOL_OUTPUT_LINE_LIMIT,
+  userMessageProjection,
 } from './transcript';
 import {
   CollabGuest,
@@ -47,10 +56,15 @@ function snapshotToItems(snapshot: CollabSnapshot): Item[] {
 /** A toast surfaced to the guest. */
 type GuestToast = { id: string; message: string; error: boolean };
 
-export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
+export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
   // main.tsx parsed the capability fragment exactly once and scrubbed it from
   // the address bar/history before this component mounts. The decoded key is
   // retained only in this in-memory value for the encrypted connection.
+  // `link` is null exactly when the document is a collab guest route but the
+  // capability fragment failed to parse (or is absent): the early return below
+  // renders the safe malformed-link error — the connection effect, composer,
+  // and abort all guard on `link` already, and useScrollPin's null-tolerant
+  // controller makes the transcript effects no-ops instead of crashes.
   const [status, setStatus] = useState<CollabConnState>('connecting');
   const [items, setItems] = useState<Item[]>([]);
   const [streaming, setStreaming] = useState(false);
@@ -61,9 +75,15 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
   const assistantIdRef = useRef<string>('');
   const abortPendingRef = useRef(false);
   const optimisticQueueRef = useRef<string[]>([]);
-  const transcriptRef = useRef<HTMLDivElement>(null);
-  const nearBottomRef = useRef(true);
+  // Same coherent transcript scroll-pin state as the host view (see
+  // ./scrollPin): `transcriptRef` is the scroll container, `transcriptContentRef`
+  // the resize-observed content wrapper.
+  const { transcriptRef, transcriptContentRef, onTranscriptScroll, pinIfPinned } = useScrollPin();
   const promptInputRef = useRef<HTMLTextAreaElement>(null);
+  // Composer auto-resize controller (see ./autoResize): per-keystroke work is
+  // coalesced to one layout pass per animation frame. Declared here so the
+  // unmount cleanup below can cancel pending work.
+  const autoResizeRef = useRef<AutoResizeController<HTMLTextAreaElement> | null>(null);
 
   const toast = useCallback((message: string, error = false) => {
     const id = nextId('t');
@@ -107,17 +127,59 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
     });
   }, [updateItems]);
 
+  const finalizeActiveAssistant = useCallback(() => {
+    const targetId = assistantIdRef.current;
+    if (targetId === '') return;
+    const key = streamKey(sidRef.current, targetId);
+    const streamedText = streamBuf.get(key)?.text ?? '';
+    streamBuf.delete(key);
+    updateItems((prev) => finalizeStreamingAssistant(prev, targetId, streamedText));
+  }, [updateItems]);
+
+  const onBashExecutionEnd = useCallback((frame: CollabEventFrame) => {
+    const message = (frame.message || {}) as {
+      command?: string;
+      output?: string;
+      exitCode?: number | null;
+      cancelled?: boolean;
+    };
+    const status: 'done' | 'error' | undefined = message.cancelled === true
+      || (typeof message.exitCode === 'number' && message.exitCode !== 0)
+      ? 'error'
+      : typeof message.exitCode === 'number'
+        ? 'done'
+        : undefined;
+    pushItem({
+      kind: 'bash',
+      id: nextId('b'),
+      command: message.command || '',
+      output: boundOutput(message.output || '', BASH_OUTPUT_LINE_LIMIT).text,
+      ...(status ? { status } : {}),
+    });
+  }, [pushItem]);
   const onMessageStart = useCallback((frame: CollabEventFrame) => {
-    const message = (frame.message || {}) as { role?: string; content?: unknown };
+    const message = (frame.message || {}) as {
+      role?: string;
+      content?: unknown;
+      toolCallId?: string;
+      details?: unknown;
+    };
 
     switch (message.role) {
       case 'user': {
-        const text = contentText(message.content);
+        const projected = userMessageProjection(message.content);
         const queueId = optimisticQueueRef.current.shift();
         if (queueId) {
           patchItem(queueId, (item) => (item.kind === 'user' ? { ...item, optimistic: false } : item));
         } else {
-          pushItem({ kind: 'user', id: nextId('u'), text, optimistic: false });
+          pushItem({
+            kind: 'user',
+            id: nextId('u'),
+            text: projected.text,
+            optimistic: false,
+            ...(projected.images.length > 0 ? { images: projected.images } : {}),
+            ...(projected.analysis ? { analysis: projected.analysis } : {}),
+          });
         }
         return;
       }
@@ -128,16 +190,33 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
         pushItem({ kind: 'assistant', id, status: 'streaming', blocks: [] });
         return;
       }
-      case 'toolResult':
-        pushItem({ kind: 'toolResult', id: nextId('r'), text: boundOutput(contentText(message.content), TOOL_OUTPUT_LINE_LIMIT).text });
+      case 'toolResult': {
+        // Host parity (App.tsx onMessageStart toolResult): the toolCard
+        // (tool_execution_start/end) already renders this result inline, so
+        // suppress the separate toolResult row when a matching card exists —
+        // the guest transcript must never show one tool's output twice
+        // (restored transcripts merge the same way in messagesToItems).
+        // Unmatched results stay readable; details fold onto a matching card.
+        const text = boundOutput(contentText(message.content), TOOL_OUTPUT_LINE_LIMIT).text;
+        const toolCallId = typeof message.toolCallId === 'string' ? message.toolCallId : '';
+        const media = toolMedia(message.content, message.details);
+        updateItems((prev) => applyToolResultToItems(prev, toolCallId, text, message.details, media));
         return;
+      }
       case 'bashExecution': {
-        const m = message as { command?: string; output?: string };
+        const m = message as { command?: string; output?: string; exitCode?: number | null; cancelled?: boolean };
+        const bashStatus: 'done' | 'error' | undefined =
+          m.cancelled === true || (typeof m.exitCode === 'number' && m.exitCode !== 0)
+            ? 'error'
+            : typeof m.exitCode === 'number'
+              ? 'done'
+              : undefined;
         pushItem({
           kind: 'bash',
           id: nextId('b'),
           command: m.command || '',
           output: boundOutput(m.output || '', BASH_OUTPUT_LINE_LIMIT).text,
+          ...(bashStatus ? { status: bashStatus } : {}),
         });
         return;
       }
@@ -154,7 +233,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
       default:
         return;
     }
-  }, [patchItem, pushItem]);
+  }, [patchItem, pushItem, updateItems]);
 
   const onMessageUpdate = useCallback((frame: CollabEventFrame) => {
     const ev = (frame.assistantMessageEvent || {}) as { type?: string; delta?: string };
@@ -168,7 +247,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
     const key = streamKey(sid, targetId);
     let buf = streamBuf.get(key);
     if (!buf) {
-      buf = { text: '', thinking: '', toolcall: '' };
+      buf = { text: '', thinking: '' };
       streamBuf.set(key, buf);
     }
     if (ev.type === 'text_delta' && ev.delta) {
@@ -177,12 +256,15 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
     } else if (ev.type === 'thinking_delta' && ev.delta) {
       buf.thinking += ev.delta;
       applyDeltaToNode(sid, targetId, ev.delta, 'thinking');
-    } else if (ev.type === 'toolcall_delta' && ev.delta) {
-      buf.toolcall += ev.delta;
-      applyDeltaToNode(sid, targetId, ev.delta, 'toolcall');
     }
+    // toolcall_delta (raw tool-call JSON fragments) is deliberately dropped,
+    // matching the host transcript: the guest's structured tool card is
+    // driven by the tool_execution_* events (onToolStart/Update/End).
+    // Follow the stream synchronously with the delta, exactly like the host
+    // transcript (the pin state decides whether the view moves at all).
+    pinIfPinned();
     // start/end/done/error: message_end re-renders authoritatively.
-  }, []);
+  }, [pinIfPinned]);
 
   const onMessageEnd = useCallback((frame: CollabEventFrame) => {
     const message = (frame.message || {}) as { role?: string; content?: ContentBlock[] };
@@ -207,6 +289,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
           ...(buf && buf.thinking ? [{ type: 'thinking', thinking: buf.thinking } as ContentBlock] : []),
         ];
     streamBuf.delete(key);
+    normalizedThinkingKeys.delete(key);
     patchItem(targetId, (item) =>
       item.kind === 'assistant' ? { ...item, status: 'final' as const, blocks } : item,
     );
@@ -234,12 +317,20 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
 
   const onToolEnd = useCallback((frame: CollabEventFrame) => {
     const toolCallId = (frame.toolCallId as string) || '';
-    const text = contentText((frame.result as { content?: unknown } | undefined)?.content);
+    const rawResult = frame.result;
+    let content: unknown;
+    let details: unknown;
+    if (rawResult && typeof rawResult === 'object') {
+      if ('content' in rawResult) content = rawResult.content;
+      if ('details' in rawResult) details = rawResult.details;
+    }
+    const text = contentText(content);
+    const media = toolMedia(content, details);
     const isError = !!frame.isError;
-    updateItems((prev) => applyToolSnapshot(prev, toolCallId, text, isError ? 'error' : 'done'));
+    updateItems((prev) => applyToolSnapshot(prev, toolCallId, text, isError ? 'error' : 'done', details, media));
   }, [updateItems]);
 
-  /** D94-style projected extension UI requests. Interactive asks (confirm/
+  /** Projected extension UI requests. Interactive asks (confirm/
    *  input/select/editor) cannot be answered remotely by design — for ALL
    *  guests (control included) they surface as a read-only notice card pointing
    *  to the terminal. Notifications become toasts. Host-only approval/lifecycle
@@ -290,13 +381,18 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
       case 'tool_execution_end':
         onToolEnd(frame);
         break;
+      case 'bash_execution_end':
+        onBashExecutionEnd(frame);
+        break;
       case 'agent_settled':
         confirmAllOptimistic();
         setStreaming(false);
+        finalizeActiveAssistant();
         break;
       case 'run_failed':
         confirmAllOptimistic();
         setStreaming(false);
+        finalizeActiveAssistant();
         if (abortPendingRef.current) {
           abortPendingRef.current = false;
           toast('run aborted');
@@ -312,10 +408,12 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
     }
   }, [
     confirmAllOptimistic,
+    finalizeActiveAssistant,
     onMessageStart,
     onMessageUpdate,
     onMessageEnd,
     onToolStart,
+    onBashExecutionEnd,
     onToolUpdate,
     onToolEnd,
     onExtensionUiRequest,
@@ -345,6 +443,9 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
     const prefix = `${sid ?? ''}\u0000`;
     for (const key of streamBuf.keys()) {
       if (key.startsWith(prefix)) streamBuf.delete(key);
+    }
+    for (const key of normalizedThinkingKeys) {
+      if (key.startsWith(prefix)) normalizedThinkingKeys.delete(key);
     }
     assistantIdRef.current = '';
     optimisticQueueRef.current = [];
@@ -386,6 +487,8 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
     return () => {
       guest.stop();
       guestRef.current = null;
+      // Drop any pending composer resize work (coalesced per animation frame).
+      autoResizeRef.current?.cancel();
       // Drop any streaming buffers the guest populated so they can never leak
       // into a later (non-guest) mount of the shared registry.
       const prefix = `${sidRef.current ?? ''}\u0000`;
@@ -398,9 +501,27 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
 
   /* ---------------- composer ---------------- */
 
+  // Guest composer auto-grow: same coalescing controller as the host view
+  // (see ./autoResize) — per-keystroke onInput only schedules the resize, the
+  // layout work (height:auto reset → scrollHeight read → height write) runs
+  // once per animation frame, and the 180px cap is preserved. submit() flushes
+  // so the cleared composer collapses immediately.
   const autoResize = useCallback((input: HTMLTextAreaElement) => {
-    input.style.height = 'auto';
-    input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+    autoResizeRef.current ??= createAutoResizeController<HTMLTextAreaElement>({
+      maxHeight: 180,
+      measure: (el) => {
+        const style = window.getComputedStyle(el);
+        return {
+          lineHeight: parseFloat(style.lineHeight) || 20,
+          paddingVertical:
+            (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0),
+        };
+      },
+    });
+    autoResizeRef.current.resize(input);
+  }, []);
+  const flushComposerResize = useCallback((input: HTMLTextAreaElement) => {
+    autoResizeRef.current?.flush(input);
   }, []);
 
   const submit = useCallback(() => {
@@ -412,13 +533,13 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
     pushItem({ kind: 'user', id: bubbleId, text, optimistic: true });
     optimisticQueueRef.current.push(bubbleId);
     input.value = '';
-    autoResize(input);
+    flushComposerResize(input);
     guestRef.current?.sendCommand('prompt', text, bubbleId).catch((err: Error) => {
       removeItem(bubbleId);
       optimisticQueueRef.current = optimisticQueueRef.current.filter((id) => id !== bubbleId);
       toast(`send failed: ${err.message}`, true);
     });
-  }, [autoResize, link, pushItem, removeItem, toast]);
+  }, [flushComposerResize, link, pushItem, removeItem, toast]);
 
   const abort = useCallback(() => {
     if (!link || link.role !== 'control' || !streaming) return;
@@ -428,18 +549,12 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
     });
   }, [link, streaming]);
 
-  const onTranscriptScroll = useCallback(() => {
-    const el = transcriptRef.current;
-    if (!el) return;
-    nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  }, []);
-
-  // Auto-scroll while pinned to the bottom.
+  // Auto-scroll while pinned to the bottom: item commits follow when the pin
+  // state is live; async content growth is covered by the ResizeObserver in
+  // useScrollPin.
   useEffect(() => {
-    if (nearBottomRef.current && transcriptRef.current) {
-      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
-    }
-  }, [items]);
+    pinIfPinned();
+  }, [items, pinIfPinned]);
 
   if (!link) {
     return (
@@ -476,7 +591,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
       </header>
 
       <main id="transcript" aria-live="polite" ref={transcriptRef} onScroll={onTranscriptScroll}>
-        <div className="transcript-content">
+        <div className="transcript-content" ref={transcriptContentRef}>
         {items.length === 0 && (
           <div className="empty-hint">
             {status === 'connected'
@@ -486,20 +601,48 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
         )}
         {items.map((item) => {
           switch (item.kind) {
-            case 'user':
+            case 'user': {
+              const userImagesList = item.images ?? [];
+              const analysis = item.analysis;
               return (
                 <div key={item.id} className={`msg msg--user${item.optimistic ? ' optimistic' : ''}`}>
-                  {item.text}
+                  {userImagesList.length > 0 && (
+                    <div className={`msg--user__images${userImagesList.length > 1 ? ' msg--user__images--grid' : ''}`}>
+                      {userImagesList.map((image, index) => (
+                        <img
+                          key={`image-${index}`}
+                          className="msg--user__image"
+                          src={`data:${image.mimeType};base64,${image.data}`}
+                          alt="Attached image"
+                          loading="lazy"
+                          onLoad={() => pinIfPinned()}
+                        />
+                      ))}
+                    </div>
+                  )}
+                  {item.text !== '' && (
+                    <MarkdownBody className="msg--user__text" text={item.text} onLayoutChange={pinIfPinned} />
+                  )}
+                  {analysis && (
+                    <details className="msg--user__analysis">
+                      <summary className="msg--user__analysis-summary">
+                        <span className="msg--user__analysis-label">Image analysis</span>
+                        <span className="msg--user__analysis-model">{safeText(analysis.model)}</span>
+                      </summary>
+                      <div className="msg--user__analysis-body">{safeText(analysis.description)}</div>
+                    </details>
+                  )}
                 </div>
               );
+            }
             case 'assistant':
               return item.status === 'streaming' ? (
                 <StreamingAssistant key={item.id} sid={sidRef.current ?? ''} id={item.id} />
               ) : (
-                <FinalAssistant key={item.id} blocks={item.blocks} />
+                <FinalAssistant key={item.id} blocks={item.blocks} onLayoutChange={pinIfPinned} />
               );
             case 'toolCard':
-              return <ToolCard key={item.id} item={item} />;
+              return <ToolCard key={item.id} item={item} onLayoutChange={pinIfPinned} />;
             case 'toolResult':
               return (
                 <BashCard
@@ -509,19 +652,23 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
                 />
               );
             case 'bash':
-              return <BashCard key={item.id} command={item.command} output={item.output} />;
+              return <BashCard key={item.id} command={item.command} output={item.output} status={item.status} />;
             case 'custom':
               return (
                 <div key={item.id} className="msg msg--custom" role="note">
                   <span className="msg--custom__label">{safeText(item.label)}</span>
-                  <span className="msg--custom__text">{safeText(item.text)}</span>
+                  <MarkdownBody className="msg--custom__text" text={item.text} onLayoutChange={pinIfPinned} />
                 </div>
               );
+            case 'irc':
+              // Same shared IrcCard as the host (imported from ./App), so the
+              // guest transcript can never drift from the host rendering.
+              return <IrcCard key={item.id} item={item} onLayoutChange={pinIfPinned} />;
             case 'summary':
               return (
                 <div key={item.id} className="msg msg--summary" role="note">
                   <span className="msg--summary__label">{safeText(item.label)}</span>
-                  <span className="msg--summary__text">{safeText(item.text)}</span>
+                  <MarkdownBody className="msg--summary__text" text={item.text} onLayoutChange={pinIfPinned} />
                 </div>
               );
             case 'approval':
@@ -565,17 +712,17 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink }) {
               onInput={(e) => autoResize(e.currentTarget)}
             />
             <div id="composer-buttons">
-              <button id="send-btn" type="button" disabled={status !== 'connected'} onClick={submit}>
-                Send
-              </button>
               <button
-                id="abort-btn"
+                id="send-btn"
                 type="button"
-                disabled={!streaming || status !== 'connected'}
-                title="Abort the active run (Esc)"
-                onClick={abort}
+                disabled={status !== 'connected'}
+                className={streaming ? 'composer-action composer-action--stop' : 'composer-action composer-action--send'}
+                aria-label={streaming ? 'Stop generating' : 'Send message'}
+                title={streaming ? 'Stop generating (Esc)' : 'Send message (Enter)'}
+                onClick={streaming ? abort : submit}
               >
-                Abort
+                <span aria-hidden="true">{streaming ? '■' : '➤'}</span>
+                <span className="composer-action__label">{streaming ? 'Stop' : 'Send'}</span>
               </button>
             </div>
           </>

@@ -1,7 +1,7 @@
 /* =====================================================================
  * rpi web — OMP titanium theme
  * =====================================================================
- * Design doc: local://rpi-web-design.md (D96).
+ * Design doc: local://rpi-web-design.md.
  *
  * Palette provenance: crates/pi-cli/src/theme.rs — DARK/LIGHT constants are
  * byte-for-byte the OMP v17.2.6 default themes (titanium.json / light.json),
@@ -234,8 +234,13 @@ button:hover:not(:disabled) {
   border-color: var(--border-strong);
 }
 
-/* Primary actions carry the electric-blue accent; abort is error-tinted. */
+/* Primary composer action switches from send to stop while a run is active. */
 #send-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 44px;
   color: var(--accent);
   border-color: rgba(0, 180, 255, 0.45);
   padding: 5px 14px;
@@ -247,11 +252,11 @@ button:hover:not(:disabled) {
   background: rgba(0, 180, 255, 0.12);
   border-color: var(--accent);
 }
-#abort-btn:not(:disabled) {
+#send-btn.composer-action--stop:not(:disabled) {
   color: var(--error);
   border-color: rgba(255, 71, 87, 0.5);
 }
-#abort-btn:not(:disabled):hover {
+#send-btn.composer-action--stop:hover:not(:disabled) {
   background: rgba(255, 71, 87, 0.12);
   border-color: var(--error);
 }
@@ -266,7 +271,7 @@ header {
   gap: 6px 12px;
   padding: calc(10px + env(safe-area-inset-top)) 16px 10px;
   background: var(--bg-panel);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-strong);
 }
 
 .brand {
@@ -354,6 +359,17 @@ header {
   overscroll-behavior: contain;
   width: 100%;
   scrollbar-gutter: stable;
+  /* Explicit surface: pin the transcript to --bg so the region reads as a
+   * defined panel surface (same fill as the TUI background, keeping assistant
+   * markdown parity) rather than relying on body inheritance. The panel frame
+   * (header/footer strong borders + .app-main left/right edges) delineates it
+   * from the rail and the composer without per-card borders. */
+  background: var(--bg);
+  /* The app owns transcript scrolling through one pin state (useScrollPin);
+   * browser scroll anchoring would fight it: an async growth above the
+   * viewport could shift scrollTop (and fire a scroll event that unpins)
+   * without any user scroll. Disable the heuristic entirely. */
+  overflow-anchor: none;
 }
 
 .transcript-content {
@@ -389,9 +405,87 @@ header {
   background: var(--user-bg);
   border: 1px solid var(--border);
   align-self: flex-end;
-  white-space: pre-wrap;
 }
 .msg--user.optimistic { opacity: 0.65; }
+
+/* User bubble attached-image thumbnails. A single image keeps its natural
+ * aspect (contain, bounded height); multiple images tile in a wrapping grid
+ * that shrinks to the bubble width and never overflows the transcript on
+ * mobile. Grid cells crop to a uniform height so a tall screenshot cannot
+ * stretch its row. */
+/* The user's caption renders through the SHARED MarkdownBody (renderMarkdown
+ * + hydrateMermaid): markdown blocks carry the .md-* layout, so the wrapper
+ * must NOT pre-wrap (that would fight block layout with stray blank lines);
+ * the .msg base's overflow-wrap: anywhere keeps long tokens wrapping inside
+ * the bubble on mobile. First/last block margins are trimmed so the caption
+ * keeps the bubble's even padding. */
+.msg--user__text > :first-child { margin-top: 0; }
+.msg--user__text > :last-child { margin-bottom: 0; }
+/* Images render BEFORE the caption (attachment preview first, then the
+ * user's real text). Sibling gaps separate the three surfaces without a
+ * bubble-level flex, so a text-only or image-only bubble keeps even padding. */
+.msg--user__images {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.msg--user__images--grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+}
+.msg--user__image {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+}
+.msg--user__images--grid .msg--user__image {
+  width: 100%;
+  height: 140px;
+  max-height: none;
+  object-fit: cover;
+}
+/* Caption sits below the image previews with a clear gap; a text-only
+ * bubble (no preceding images) keeps the bubble's even padding. */
+.msg--user__images + .msg--user__text { margin-top: 6px; }
+
+/* Auto-vision analysis: a clearly labeled, default-collapsed auxiliary
+ * card. Never rendered as the user's own text; only present when a real
+ * description was produced (typed `analysis` projection). The open body is
+ * bounded + scrollable so a long description never dominates the bubble or
+ * overflows the transcript on mobile; the summary shows the producing model. */
+.msg--user__analysis {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+}
+.msg--user__analysis-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.msg--user__analysis-summary::-webkit-details-marker { display: none; }
+.msg--user__analysis-label { font-weight: 600; color: var(--muted); font-size: 12px; }
+.msg--user__analysis-model { color: var(--accent-dim); font-size: 11px; overflow-wrap: anywhere; }
+.msg--user__analysis-body {
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 220px;
+  overflow-y: auto;
+  color: var(--muted);
+  font-size: 13px;
+}
 
 /* Assistant markdown sits directly on the background, like the TUI. */
 .msg--assistant { align-self: flex-start; width: 92%; }
@@ -404,10 +498,39 @@ header {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   align-self: flex-start;
-  max-width: 92%;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
   overflow: hidden;
   padding: 0;
   font: 13px/1.6 ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+.msg--bash--done { border-color: var(--ok); }
+.msg--bash--error { border-color: var(--error); }
+.bash-cmd--title {
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 13px;
+  font-family: inherit;
+}
+.bash-command-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+.bash-command-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  font-weight: 600;
+  min-width: 0;
 }
 .bash-head {
   display: flex;
@@ -457,7 +580,11 @@ header {
 }
 
 /* Backend custom (display:true) notices: muted label + text, gold label role
- * mirroring the TUI's customMessageLabel. */
+ * mirroring the TUI's customMessageLabel. The text renders through the SHARED
+ * MarkdownBody (renderMarkdown + hydrateMermaid): markdown blocks carry the
+ * .md-* layout, so the wrapper must NOT pre-wrap (that would fight block
+ * layout with stray blank lines); the .msg base's overflow-wrap: anywhere
+ * keeps long tokens wrapping inside the card. */
 .msg--custom {
   align-self: flex-start;
   max-width: 92%;
@@ -475,7 +602,77 @@ header {
   text-transform: uppercase;
   letter-spacing: 0.4px;
 }
-.msg--custom__text { white-space: pre-wrap; }
+.msg--custom__text > :first-child { margin-top: 0; }
+.msg--custom__text > :last-child { margin-bottom: 0; }
+
+/* Typed orchestration IRC cards (shared IrcCard — host App.tsx and
+ * CollabGuestView render the same component). Direction arrow + party in the
+ * title, a visual quote rail around the MarkdownBody-rendered prose (real
+ * markdown blocks carry the .md-* layout — the body must NOT pre-wrap, or
+ * every card would read as one code block), an independent muted reply line,
+ * and a 6-visual-line compact clamp with an expand toggle up to the 40-line
+ * parse bound. The old flat `IRC · from → to` label / raw customType /
+ * XML wrapper never render. */
+.msg--irc {
+  align-self: flex-start;
+  max-width: 92%;
+  min-width: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.msg--irc--incoming { border-left: 3px solid var(--accent); }
+.msg--irc--outgoing { border-left: 3px solid var(--gold); }
+.msg--irc__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.msg--irc__title {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+.msg--irc__reply {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+}
+.msg--irc__body {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  border-left: 2px solid var(--border-strong);
+  padding-left: 8px;
+  margin-left: 2px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  -webkit-line-clamp: 6;
+}
+.msg--irc__body.is-expanded {
+  display: block;
+  overflow: visible;
+}
+.msg--irc__toggle {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--dim);
+  padding: 0 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.msg--irc__toggle:hover { color: var(--fg); border-color: var(--border-strong); }
 
 /* branchSummary / compactionSummary system notices. */
 .msg--summary {
@@ -495,9 +692,16 @@ header {
   text-transform: uppercase;
   letter-spacing: 0.4px;
 }
-.msg--summary__text { white-space: pre-wrap; }
+/* Summary prose renders through the SHARED MarkdownBody (.md-* blocks) — no
+ * pre-wrap on the wrapper (stray blank lines would fight block layout). */
+.msg--summary__text > :first-child { margin-top: 0; }
+.msg--summary__text > :last-child { margin-bottom: 0; }
 
-/* Thinking blocks */
+/* Thinking blocks — header is the shared brain-icon + `Thinking` summary
+ * (markdown.ts thinkingSummaryHtml, used identically by the streaming and
+ * restored paths); the body renders real multiple lines via pre-wrap with
+ * literal-`\n` normalization applied upstream. overflow-wrap keeps long /
+ * CJK lines wrapping inside the transcript, never widening the page. */
 .thinking {
   margin: 0 0 6px;
   border-left: 3px solid var(--dim);
@@ -505,12 +709,20 @@ header {
 }
 .thinking summary,
 .thinking__summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   cursor: pointer;
   color: var(--dim);
   font-size: 12px;
   letter-spacing: 0.4px;
   user-select: none;
-  text-transform: uppercase;
+}
+.thinking__icon {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  opacity: 0.9;
 }
 .thinking summary:hover,
 .thinking__summary:hover { color: var(--muted); }
@@ -518,6 +730,7 @@ header {
   margin-top: 4px;
   color: var(--muted);
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   font-size: 13px;
 }
 
@@ -667,13 +880,6 @@ hr {
 
 img.md-image { max-width: 100%; border-radius: var(--radius-sm); margin: 4px 0; }
 
-.assistant-toolcall {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font-size: 13px;
-  color: var(--muted);
-}
-
 /* ------------------------------------------------------------------ *
  * Tool cards
  * ------------------------------------------------------------------ */
@@ -683,11 +889,13 @@ img.md-image { max-width: 100%; border-radius: var(--radius-sm); margin: 4px 0; 
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   padding: 6px 10px;
-  max-width: 92%;
+  width: 100%;
+  min-width: 0;
   font-size: 13px;
 }
 .tool-card__head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.tool-card__name { font-weight: 700; color: var(--accent); }
+.tool-card__name,
+.tool-card__title { font-weight: 700; color: var(--accent); }
 .tool-card__state {
   font-size: 11px;
   color: var(--muted);
@@ -716,7 +924,302 @@ img.md-image { max-width: 100%; border-radius: var(--radius-sm); margin: 4px 0; 
   max-height: 300px;
   overflow-y: auto;
 }
+.tool-card--done { border-color: var(--ok); }
 .tool-card--error { border-color: var(--error); }
+
+/* Task / Edit / Todo structured default views (TUI parity; raw JSON stays
+ * collapsed behind an explicit expander). */
+.tool-card--task,
+.tool-card--edit,
+.tool-card--todo { width: 100%; min-width: 0; max-width: none; }
+.tool-card__task,
+.tool-card__edit { display: flex; flex-direction: column; gap: 6px; }
+.tool-card__section { display: flex; flex-direction: column; gap: 2px; }
+.tool-card__section-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.tool-card__section-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.tool-card__children { display: flex; flex-direction: column; gap: 6px; margin-top: 2px; }
+.tool-card__child {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+  padding: 6px 8px;
+  background: var(--bg-deep, var(--bg));
+}
+.tool-card__child-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  margin-bottom: 2px;
+}
+.tool-card__child-name { font-weight: 700; color: var(--accent); }
+.tool-card__child-agent { color: var(--muted); font-size: 12px; }
+.tool-card__child-status {
+  margin-left: auto;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--muted);
+}
+.tool-card__child-target,
+.tool-card__child-activity,
+.tool-card__child-result {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.tool-card__child-activity { color: var(--accent); }
+.tool-card__child-result { color: var(--muted); border-top: 1px dashed var(--border); margin-top: 4px; padding-top: 4px; }
+.tool-card__edit-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 2px;
+}
+.tool-card__edit-path { font-weight: 700; color: var(--accent); overflow-wrap: anywhere; }
+.tool-card__edit-op {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--muted);
+}
+.tool-card__diff {
+  margin: 0;
+  max-height: 300px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  background: var(--bash-bg, var(--bg-deep, var(--bg)));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+  padding: 6px 8px;
+}
+.tool-card__diff-line { display: block; }
+.tool-card__diff-line--add { color: var(--ok); }
+.tool-card__diff-line--del { color: var(--error); }
+.tool-card__diff-line--meta { color: var(--muted); }
+.tool-card__diff-line--ctx { color: var(--fg); }
+.tool-card__raw {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.tool-card__raw > summary {
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.tool-card__raw > summary::-webkit-details-marker { display: none; }
+.tool-card__raw[open] > summary { margin-bottom: 4px; }
+
+/* Todo tool card: compact phase/task list (TUI todo_dag_view parity). The
+ * summary prose (Remaining items / Overall / Active phase) is never rendered;
+ * task ids and `ready` stay hidden; blocking reasons surface by content. */
+.tool-card__todo { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.tool-card__todo-phases { display: flex; flex-direction: column; gap: 8px; }
+.tool-card__todo-phase { display: flex; flex-direction: column; gap: 3px; }
+.tool-card__todo-phase-name {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.tool-card__todo-tasks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tool-card__todo-task {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.tool-card__todo-task--active { font-weight: 600; }
+.tool-card__todo-marker { flex: none; font-weight: 700; }
+.tool-card__todo-marker--pending { color: var(--muted); }
+.tool-card__todo-marker--in_progress { color: var(--accent); }
+.tool-card__todo-marker--completed { color: var(--ok); }
+.tool-card__todo-marker--abandoned { color: var(--muted); }
+.tool-card__todo-content { min-width: 0; }
+.tool-card__todo-task--active .tool-card__todo-content { color: var(--accent); }
+.tool-card__todo-blocked { color: var(--muted); font-size: 12px; }
+.tool-card__todo-completed { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.tool-card__todo-empty { color: var(--muted); font-size: 12px; }
+
+/* Command / process / write / read / generic TUI-style card views.
+ * Human-readable summaries replace raw args JSON; status borders convey
+ * success (green) / failure (red) without a "done" text label. */
+.tool-card--command,
+.tool-card--process,
+.tool-card--write,
+.tool-card--read,
+.tool-card--generic { width: 100%; min-width: 0; max-width: none; }
+.tool-card__command { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tool-card__command-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+}
+.tool-card__prompt {
+  color: var(--ok);
+  font-weight: 700;
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  user-select: none;
+  flex: none;
+}
+.tool-card__command-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  font-weight: 600;
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 13px;
+  min-width: 0;
+}
+.tool-card__output {
+  margin: 0;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+  max-height: 300px;
+  overflow-y: auto;
+  background: var(--bash-bg, var(--bg-deep, var(--bg)));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+}
+.tool-card__summary { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tool-card__summary-line {
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.tool-card__summary-path {
+  font-weight: 700;
+  color: var(--accent);
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.tool-card__summary-text {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.tool-card__summary-error {
+  color: var(--error);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* Hub tool card: humanized wait/send view — fixed human title ('Waiting' /
+ * 'IRC') with clear waiting feedback. The raw `{ids, op, timeoutMs}` args
+ * envelope and internal UUIDs never render (no raw-args expander); status
+ * borders convey running/done/error so a wait never looks stuck. */
+.tool-card--hub { width: 100%; min-width: 0; max-width: none; }
+.tool-card__hub { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tool-card__hub-headline {
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.tool-card__hub-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-left: 3px solid var(--accent-dim);
+  padding-left: 8px;
+  min-width: 0;
+}
+/* Hub wait/send Markdown fold: the shared renderMarkdown pipeline's blocks
+ * (md-p / md-list / md-code / md-fence / md-table / md-mermaid-host) render
+ * inside this fold — never raw text. Compact clamps to IRC_COMPACT_LINE_LIMIT
+ * visual lines (mirrors the IRC card fold); the expand toggle removes the
+ * clamp up to the parse-time bound. */
+.tool-card__hub-md {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  -webkit-line-clamp: 6;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.tool-card__hub-md.is-expanded {
+  display: block;
+  overflow: visible;
+}
+.tool-card__hub-toggle {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--dim);
+  padding: 0 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.tool-card__hub-toggle:hover { color: var(--fg); border-color: var(--border-strong); }
+.tool-card__hub-meta { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.tool-card__hub-note { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.tool-card__hub-reply {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tool-media {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  min-width: 0;
+}
+.tool-media__image,
+.tool-media__video {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: 480px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+  object-fit: contain;
+}
+.tool-media__video { width: 100%; }
 
 /* ------------------------------------------------------------------ *
  * Composer (pinned footer)
@@ -727,12 +1230,12 @@ footer {
   align-items: stretch;
   padding: 6px calc(14px + env(safe-area-inset-right)) calc(6px + env(safe-area-inset-bottom)) calc(14px + env(safe-area-inset-left));
   background: var(--bg-panel);
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--border-strong);
 }
 #prompt-input {
   flex: 1;
   resize: none;
-  min-height: 34px; /* compact single line */
+  min-height: 44px; /* match #command-btn so the row stretches evenly */
   max-height: 84px; /* hard guard; autoResize caps at 3 lines */
   padding: 6px 10px;
   font-size: 13px;
@@ -744,17 +1247,153 @@ footer {
   box-shadow: 0 0 0 3px rgba(0, 180, 255, 0.15);
 }
 [data-theme="light"] #prompt-input:focus { box-shadow: 0 0 0 3px rgba(84, 125, 167, 0.18); }
-/* stretch (not flex-end) keeps the send/abort buttons the same height as the
- * textarea at every size, including when #prompt-input auto-grows to 180px. */
-#composer-buttons { display: flex; gap: 6px; flex-wrap: wrap; align-items: stretch; }
+/* Composer-buttons lives inside composer-row so the Command picker, textarea,
+ * and Send/Stop stretch to the same height (align-items: stretch on the row).
+ * flex:none prevents it from growing horizontally; align-items: stretch makes
+ * every button inside fill the row's cross-size (the textarea's height). */
+#composer-buttons { display: flex; gap: 6px; flex-wrap: wrap; align-items: stretch; flex: none; }
 
 /* Composer left column: attachment chips row + textarea. flex-basis must not
  * govern the textarea HEIGHT (that would fight autoResize), so override the
  * shared `flex: 1` inside the column with grow/shrink + auto basis. */
 #composer-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 #composer-main #prompt-input { flex: 0 1 auto; }
+/* Composer row: the Command picker button, textarea, and composer-buttons
+ * (attach/mic/send) all sit in one flex row with align-items: stretch so the
+ * three primary controls (command-btn, textarea, send-btn) are exactly the
+ * same height — the textarea drives the row height; the others stretch to
+ * match, including when #prompt-input auto-grows. */
+#composer-row { display: flex; gap: 6px; align-items: stretch; }
+/* Override #composer-main #prompt-input (flex:0 1 auto) so the textarea
+ * expands horizontally inside the row. Equal specificity → later wins. */
+#composer-row #prompt-input { flex: 1 1 auto; min-width: 0; }
 
-/* File attachment chips (images + PDFs) shown above the textarea before send. */
+/* Command picker (slash menu) ----------------------------------------- */
+.command-picker { position: relative; flex: 0 0 auto; display: flex; }
+#command-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 44px;
+  padding: 8px 10px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--muted);
+  border-color: var(--border);
+  white-space: nowrap;
+}
+#command-btn { height: 100%; }
+#command-btn > span:first-child { font-weight: 700; color: var(--accent); }
+#command-btn:hover:not(:disabled) { color: var(--fg); border-color: var(--border-strong); }
+#command-btn:disabled { opacity: 0.5; cursor: default; }
+#command-btn[aria-expanded="true"] { color: var(--fg); border-color: var(--accent); }
+/* Popover opens upward from the button (the composer is pinned to the
+ * bottom, so growing down would overflow the viewport). Width caps at 320px
+ * but never exceeds the viewport, so mobile keyboards don't crush it. */
+.command-picker__popover {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  width: min(320px, 92vw);
+  max-height: 300px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  z-index: 30;
+  overflow: hidden;
+}
+.command-picker__search {
+  margin: 6px 6px 4px;
+  padding: 6px 8px;
+  font-size: 13px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+}
+.command-picker__search:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+  outline: none;
+}
+.command-picker__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 6px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.command-picker__back {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-size: 12px;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.command-picker__back:hover { background: var(--bg-hover); color: var(--fg); }
+.command-picker__title { font-weight: 600; color: var(--fg); }
+.command-picker__list {
+  list-style: none;
+  margin: 0;
+  padding: 2px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.command-picker__hint { padding: 8px 10px; color: var(--muted); font-size: 12px; }
+/* Persistent skills-mode guidance: the picker never auto-submits, so the
+ * Enter-to-run contract is stated inline every time skills mode renders. */
+.command-picker__tip {
+  margin: 0 6px 4px;
+  padding: 6px 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+  color: var(--accent-dim);
+  font-size: 11px;
+  letter-spacing: 0.2px;
+}
+/* Empty-state guidance: "No skills loaded" (title) + where skills load from
+ * and how to reload (detail). Distinguishes an empty catalog from a query
+ * that merely matched nothing. */
+.command-picker__hint--empty {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.command-picker__hint-title { color: var(--fg); font-weight: 600; }
+.command-picker__hint-detail { color: var(--dim); line-height: 1.5; }
+.command-picker__hint-detail code {
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 11px;
+}
+.command-picker__option {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--fg);
+}
+.command-picker__option.is-active,
+.command-picker__option:hover { background: var(--bg-hover); }
+.command-picker__option.is-active { outline: 1px solid var(--accent-dim); }
+.command-picker__name { font-size: 13px; font-weight: 600; color: var(--fg); overflow-wrap: anywhere; }
+.command-picker__desc { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.command-picker__arg { font-size: 11px; color: var(--accent-dim); overflow-wrap: anywhere; }
+
+/* File attachment chips (image thumbnails + code/text file badges) shown
+ * above the textarea before send. */
 #composer-attachments { display: flex; flex-wrap: wrap; gap: 6px; }
 .composer-attachment {
   display: inline-flex;
@@ -776,8 +1415,10 @@ footer {
   flex: none;
 }
 .composer-attachment__badge {
-  width: 26px;
+  min-width: 26px;
+  max-width: 60px;
   height: 26px;
+  padding: 0 5px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -788,6 +1429,7 @@ footer {
   font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.04em;
+  overflow: hidden;
   flex: none;
 }
 .composer-attachment__meta { display: flex; flex-direction: column; min-width: 0; }
@@ -812,6 +1454,37 @@ footer {
   line-height: 1;
 }
 .composer-attachment__remove:hover { color: var(--error); border-color: var(--error); }
+
+/* Drop target: while a file drag is over the composer, the footer becomes a
+ * drop zone with an accent border + a centered overlay hint. The overlay is
+ * absolutely positioned over the footer (footer gains position: relative while
+ * active) so it never displaces the textarea/buttons. */
+footer[data-drop-active="true"] {
+  position: relative;
+  border-top: 2px dashed var(--accent);
+  background: var(--bg-hover);
+}
+.composer-drop {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+  background: rgba(0, 180, 255, 0.08);
+  pointer-events: none;
+}
+.composer-drop__hint {
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--bg-panel);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+}
+[data-theme="light"] .composer-drop { background: rgba(84, 125, 167, 0.10); }
+[data-theme="light"] .composer-drop__hint { border-color: rgba(84, 125, 167, 0.7); color: var(--accent); }
 
 /* Compact icon buttons (paperclip / mic) beside Send. */
 #attach-btn,
@@ -960,7 +1633,8 @@ footer {
 .todo-panel,
 .workflow-panel,
 .goal-panel,
-.subagents-panel {
+.subagents-panel,
+.code-review-panel {
   position: fixed;
   top: 0;
   right: 0;
@@ -979,6 +1653,14 @@ footer {
 }
 .panel-drawer { overflow: hidden; } /* side chat owns its own inner scroll */
 .workflow-panel { width: 460px; }
+/* The todo head rows "Todos" + full counts line + close chip on one row; at
+ * the shared 400px the counts had ~274px and wrapped, splitting `0 done`
+ * across lines. 460px (workflow/settings parity) gives the counts enough
+ * room for the whole line at desktop. */
+.todo-panel { width: 460px; }
+@media (min-width: 769px) {
+  #settings-panel { width: 460px; }
+}
 
 /* Shared panel head row */
 .panel__head,
@@ -1049,9 +1731,15 @@ footer {
 }
 
 /* ------------------------------------------------------------------ *
- * Todo DAG panel (D89)
+ * Todo DAG panel
  * ------------------------------------------------------------------ */
 .todo-panel__add { display: flex; flex-wrap: wrap; gap: 6px; }
+/* Header counts: each `N label` counter is an atomic chip — the digit and
+ * label never break apart (white-space: nowrap on the span). The line wraps
+ * only between counters on phones; at desktop width the whole line fits one
+ * row (see the .todo-panel width rule above). */
+.todo-panel__counts { min-width: 0; }
+.todo-panel__counts-item { white-space: nowrap; }
 .todo-add__phase { width: 150px; flex: 1 1 130px; }
 .todo-add__content { flex: 2 1 180px; }
 .todo-panel__add button { white-space: nowrap; }
@@ -1158,7 +1846,7 @@ footer {
 .todo-detail__actions { display: flex; gap: 6px; }
 
 /* ------------------------------------------------------------------ *
- * Goal panel (D90)
+ * Goal panel
  * ------------------------------------------------------------------ */
 .goal-panel { width: 380px; gap: 12px; }
 .goal-status {
@@ -1257,7 +1945,7 @@ footer {
 .goal-journal__objective { overflow-wrap: anywhere; }
 
 /* ------------------------------------------------------------------ *
- * Side chat panel (D94)
+ * Side chat panel
  * ------------------------------------------------------------------ */
 .side-chat {
   height: 100%;
@@ -1358,7 +2046,7 @@ footer {
 }
 
 /* ------------------------------------------------------------------ *
- * Workflow panel (D91)
+ * Workflow panel
  * ------------------------------------------------------------------ */
 .workflow-panel__body { display: flex; flex-direction: column; gap: 12px; }
 
@@ -1547,7 +2235,7 @@ footer {
 .workflow-integration__conflicts { color: var(--error); }
 
 /* ------------------------------------------------------------------ *
- * Session panel (D92)
+ * Session panel
  * ------------------------------------------------------------------ */
 .panel__hint {
   color: var(--dim);
@@ -1586,6 +2274,21 @@ footer {
 }
 .session-info__grid dt { color: var(--muted); }
 .session-info__grid dd { margin: 0; overflow-wrap: anywhere; }
+.session-info__path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: min(100%, 42ch);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 11px;
+}
+.session-info__new-hint {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
 
 .session-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .session-fork select { font-size: 12px; }
@@ -1619,7 +2322,7 @@ footer {
 [data-theme="light"] .session-row__switch { border-color: rgba(84, 125, 167, 0.55); }
 
 /* ------------------------------------------------------------------ *
- * Session sidebar (D92) — persistent left rail, drawer on narrow screens
+ * Session sidebar — persistent left rail, drawer on narrow screens
  * ------------------------------------------------------------------ */
 .app-layout {
   flex: 1;
@@ -1634,6 +2337,18 @@ footer {
   min-height: 0; /* let the transcript scroll internally instead of pushing the footer */
   display: flex;
   flex-direction: column;
+  /* Panel frame: the main column reads as its own panel via a strong
+   * border-strong edge against the left rail (rail and transcript both sit on
+   * --bg, so the edge is what separates them) and a matching right edge
+   * against the viewport. box-sizing: border-box keeps the borders inside the
+   * allocated width (no horizontal overflow); the #transcript scrollbar gutter
+   * lives within #transcript, left of the right border, so the scroll lane is
+   * never clipped. The ≤720px block removes both edges on mobile to avoid
+   * edge squeeze. background: var(--bg) fixes the panel base surface so any
+   * transiently-mounted panel without its own fill still reads on --bg. */
+  border-left: 1px solid var(--border-strong);
+  border-right: 1px solid var(--border-strong);
+  background: var(--bg);
 }
 .session-sidebar {
   flex: none;
@@ -1641,7 +2356,9 @@ footer {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  border-right: 1px solid var(--border);
+  /* The panel edge is owned by .app-main's border-left (single strong line);
+   * no border-right here to avoid a doubled 2px seam on desktop. The ≤720px
+   * drawer block re-adds a strong border-right for the off-canvas drawer. */
   background: var(--bg);
   padding: 8px;
   overflow-y: auto;
@@ -1670,6 +2387,38 @@ footer {
   font-size: 12px;
   overflow-wrap: anywhere;
 }
+.session-sidebar__search-box {
+  position: relative;
+  margin: 6px 0 4px;
+}
+.session-sidebar__search {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 12px;
+  padding: 4px 24px 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+}
+.session-sidebar__search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.session-sidebar__search-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  font-size: 12px;
+  padding: 0 4px;
+  cursor: pointer;
+  line-height: 1;
+}
+.session-sidebar__search-clear:hover { color: var(--accent); }
 .session-sidebar__list {
   list-style: none;
   margin: 0;
@@ -1783,17 +2532,6 @@ footer {
   align-items: flex-start;
   gap: 4px;
 }
-.session-sidebar__close {
-  flex-shrink: 0;
-  margin-top: 6px;
-  background: transparent;
-  border: none;
-  color: var(--dim);
-  font-size: 12px;
-  line-height: 1;
-  padding: 2px 4px;
-}
-.session-sidebar__close:hover:not(:disabled) { color: var(--error); }
 /* Feature nav (panel toggles) lives in the sidebar/drawer, not the header. */
 .session-sidebar__nav {
   display: grid;
@@ -1860,6 +2598,10 @@ footer {
     transform: translateX(-110%);
     transition: transform 0.18s ease;
   }
+  /* Mobile: drop the .app-main panel edges so the main column runs flush to
+   * the viewport without squeezing the content; the drawer carries its own
+   * border-right above. */
+  .app-main { border-left: none; border-right: none; }
   .app-layout--drawer-open .session-sidebar {
     transform: translateX(0);
   }
@@ -1890,7 +2632,7 @@ footer {
 }
 
 /* ------------------------------------------------------------------ *
- * Maintenance panel (D94)
+ * Maintenance panel
  * ------------------------------------------------------------------ */
 .maintenance {
   height: 100%;
@@ -1963,7 +2705,7 @@ footer {
 .maintenance__busy { color: var(--warn); font-size: 12px; }
 
 /* ------------------------------------------------------------------ *
- * Settings panel (D92)
+ * Settings panel
  * ------------------------------------------------------------------ */
 .settings-body {
   flex: 1;
@@ -2155,7 +2897,8 @@ footer {
   .todo-panel,
   .workflow-panel,
   .goal-panel,
-  .subagents-panel {
+  .subagents-panel,
+  .code-review-panel {
     width: 100vw;
     max-width: 100vw;
     border-left: none;
@@ -2163,7 +2906,6 @@ footer {
 
   /* Touch targets ≥44px (product requirement; exceeds WCAG 2.5.8 24px) */
   #send-btn,
-  #abort-btn,
   #attach-btn,
   #mic-btn,
   .panel-toggle,
@@ -2173,9 +2915,20 @@ footer {
   input[type="number"],
   input[type="password"],
   #prompt-input,
-  .side-chat__composer textarea {
+  .side-chat__composer textarea,
+  .subagents-panel__filter-btn {
     min-height: 44px;
   }
+
+  /* Composer row wraps on narrow screens: textarea takes the full first
+   * row (≥240px on any screen ≥240px wide), command picker + buttons move
+   * to the second row. All controls keep min-height: 44px (visual height
+   * parity without needing the desktop stretch). DOM order is reordered
+   * via `order` so the textarea leads. */
+  #composer-row { flex-wrap: wrap; }
+  .command-picker { order: 2; }
+  #composer-row #prompt-input { order: 1; flex: 1 1 100%; min-width: 0; }
+  #composer-buttons { order: 2; }
   .pill,
   .badge { min-height: 30px; }
 
@@ -2202,6 +2955,10 @@ footer {
   .md-table,
   .md-fence__pre,
   .md-mermaid-host { -webkit-overflow-scrolling: touch; }
+
+  /* Details modal fills the screen edge-to-edge on small viewports */
+  .subagent-details-backdrop { padding: 8px; align-items: stretch; }
+  .subagent-details { max-height: 94dvh; border-radius: var(--radius-md); }
 }
 
 @media (max-width: 480px) {
@@ -2226,6 +2983,9 @@ footer {
   footer { flex-direction: column; align-items: stretch; }
   #composer-buttons { width: 100%; justify-content: flex-end; gap: 4px; }
   #composer-buttons button { padding: 8px 10px; }
+  /* Command picker: glyph-only on phones so the textarea keeps maximum width. */
+  .command-btn__label { display: none; }
+  #command-btn { padding: 8px 12px; }
 
   /* Rows get slightly larger hit areas on small screens */
   .todo-task,
@@ -2250,7 +3010,7 @@ footer {
 }
 
 /* ------------------------------------------------------------------ *
- * D94: shared panel drawer + side chat + maintenance + approval notices
+ * Shared panel drawer + side chat + maintenance + approval notices
  * ------------------------------------------------------------------ */
 .panel-drawer {
   border-top: 1px solid var(--border);
@@ -2445,7 +3205,7 @@ footer {
 .approval__note { color: var(--muted); font-size: 12px; border-top: 1px dashed var(--border); padding-top: 4px; margin-top: 4px; }
 
 /* ------------------------------------------------------------------ *
- * Subagents panel (D93) — live orchestration job cards + hub actions
+ * Subagents panel — live orchestration job cards + hub actions
  * ------------------------------------------------------------------ */
 .subagents-panel { width: 460px; }
 .subagents-panel__spawn { display: flex; flex-direction: column; gap: 6px; }
@@ -2454,6 +3214,40 @@ footer {
 .subagents-panel__spawn-row input { flex: 1 1 180px; }
 .subagents-panel__spawn-row button { white-space: nowrap; }
 .subagents-panel__empty { color: var(--muted); font-size: 13px; margin-top: 8px; }
+/* Long aggregate strings must wrap inside the drawer, never push the panel
+ * wider than the viewport (the shared counts rule has no wrap guard). */
+.subagents-panel__counts { min-width: 0; overflow-wrap: anywhere; }
+/* Running/Completed segmented filter — titanium tab pattern, one row, no wrap. */
+.subagents-panel__filter {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-deep);
+}
+.subagents-panel__filter-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  font-size: 12px;
+  padding: 5px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.subagents-panel__filter-btn:hover:not(:disabled) { color: var(--fg); background: var(--bg-hover); }
+.subagents-panel__filter-btn.is-active {
+  color: var(--fg);
+  border-color: var(--accent);
+  background: rgba(0, 180, 255, 0.12);
+}
+.subagents-panel__filter-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 .subagents-panel__list { display: flex; flex-direction: column; gap: 12px; }
 .subagent-job {
   border: 1px solid var(--border);
@@ -2463,7 +3257,9 @@ footer {
   flex-direction: column;
   gap: 4px;
   background: var(--bg);
+  cursor: pointer;
 }
+.subagent-job:hover { border-color: var(--border-strong); }
 .subagent-job__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .subagent-job__title { font-weight: 700; overflow-wrap: anywhere; }
 .subagent-job__status {
@@ -2523,4 +3319,860 @@ footer {
   border: 1px solid var(--ok);
   border-radius: var(--radius-sm);
   padding: 4px 8px;
+}
+
+/* Subagent job details modal — full-viewport overlay with bounded live transcript */
+.subagent-details-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.55);
+}
+.subagent-details {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(680px, 100%);
+  max-height: min(85vh, 720px);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  padding: 14px 16px;
+  overflow: hidden;
+}
+.subagent-details__head { display: flex; align-items: flex-start; gap: 10px; }
+.subagent-details__title { flex: 1; font-weight: 700; font-size: 14px; overflow-wrap: anywhere; }
+.subagent-details__head-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.subagent-details__action {
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--fg);
+}
+.subagent-details__action:hover { background: var(--bg-hover); border-color: var(--fg); }
+.subagent-details__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.subagent-details__section { display: flex; flex-direction: column; gap: 4px; min-height: 0; }
+.subagent-details__section--transcript { flex: 1; }
+.subagent-details__label {
+  color: var(--dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.subagent-details__live {
+  color: var(--ok);
+  font-size: 10px;
+  border: 1px solid var(--ok);
+  border-radius: 999px;
+  padding: 0 6px;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.subagent-details__description {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  max-height: 28vh;
+  overflow-y: auto;
+}
+.subagent-details__activity {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  max-height: 12vh;
+  overflow-y: auto;
+}
+.subagent-details__error { color: var(--error); font-size: 12px; overflow-wrap: anywhere; }
+.subagent-details__history {
+  margin: 0;
+  flex: 1;
+  min-height: 140px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-y: auto;
+  background: var(--bash-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fg);
+}
+
+/* ------------------------------------------------------------------ *
+ * Code review workspace — full-viewport review workspace: file list +
+ * diff stage + hunk thread dock; tabbed panes on mobile.
+ * ------------------------------------------------------------------ */
+.code-review-panel {
+  /* Override the shared 400px side-drawer base: code review owns the
+     viewport (inset 0 + 100vw/100dvh, no border or shadow). */
+  inset: 0;
+  width: 100vw;
+  max-width: 100vw;
+  height: 100dvh;
+  z-index: 45;
+  border-left: none;
+  box-shadow: none;
+  overflow: hidden;
+  padding: calc(10px + env(safe-area-inset-top)) 12px calc(10px + env(safe-area-inset-bottom));
+}
+.code-review {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  flex: 1;
+  height: 100%;
+}
+.code-review__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 0 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+.code-review__title {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.4px;
+}
+.code-review__label {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40%;
+}
+.code-review__totals {
+  color: var(--accent-dim);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.code-review__streaming {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--warn);
+  font-size: 11px;
+}
+.code-review__streaming-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: code-review-pulse 1s ease-in-out infinite;
+  flex: none;
+}
+@keyframes code-review-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.code-review__actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.code-review__action {
+  font-size: 12px;
+  padding: 4px 12px;
+  min-height: 32px;
+}
+.code-review__action--warn {
+  color: var(--warn);
+  border-color: rgba(255, 193, 7, 0.45);
+}
+.code-review__close {
+  font-size: 14px;
+}
+.code-review__busy {
+  color: var(--warn);
+  font-size: 12px;
+}
+.code-review__banner {
+  font-size: 12px;
+  padding: 6px 10px;
+  border: 1px solid rgba(255, 193, 7, 0.45);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 193, 7, 0.08);
+  color: var(--warn);
+  overflow-wrap: anywhere;
+}
+.code-review__error {
+  color: var(--error);
+  font-size: 12px;
+  border-left: 3px solid var(--error);
+  padding-left: 8px;
+  overflow-wrap: anywhere;
+}
+.code-review__error-actions {
+  margin-left: 6px;
+}
+.code-review__link {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+  font-size: inherit;
+  min-height: 0;
+}
+.code-review__empty {
+  color: var(--dim);
+  font-size: 12px;
+  padding: 8px 4px;
+}
+
+/* Inline confirm dialog for close/refresh guards when a draft or a
+ * streaming reply would be lost — never window.confirm. */
+.code-review__confirm-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+.code-review__confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: min(420px, 92%);
+  padding: 14px 16px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+.code-review__confirm p {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.code-review__confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* Mobile segmented tab bar (hidden on desktop). */
+.code-review__tab-bar {
+  display: none;
+  gap: 6px;
+}
+.code-review__tab {
+  flex: 1;
+  font-size: 12px;
+  padding: 6px;
+  min-height: 44px;
+}
+.code-review__tab.is-active {
+  border-color: var(--accent);
+  color: var(--fg);
+  background: rgba(0, 180, 255, 0.1);
+}
+
+.code-review__body {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr) minmax(240px, 320px);
+  gap: 10px;
+  min-height: 0;
+  flex: 1;
+  position: relative;
+}
+.code-review__body.is-loading::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+  opacity: 0.85;
+  z-index: 20;
+}
+.code-review__loader {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 21;
+  color: var(--muted);
+  font-size: 13px;
+}
+.code-review__files,
+.code-review__diff,
+.code-review__comments {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+}
+.code-review__files {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px;
+}
+.code-review__file-filter {
+  width: 100%;
+  font-size: 12px;
+  padding: 5px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+}
+.code-review__file-filter:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.code-review__file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.code-review__file-list:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+.code-review__file {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--fg);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.code-review__file:hover { background: var(--bg-hover); }
+.code-review__file.is-active {
+  border-color: var(--accent);
+  background: rgba(0, 180, 255, 0.1);
+}
+.code-review__file-status {
+  font-size: 12px;
+  font-weight: 700;
+  min-width: 14px;
+  text-align: center;
+}
+.code-review__file-status--added { color: var(--ok); }
+.code-review__file-status--deleted { color: var(--error); }
+.code-review__file-status--modified { color: var(--warn); }
+.code-review__file-status--renamed { color: var(--accent); }
+.code-review__file-status--copied { color: var(--ok); }
+.code-review__file-status--binary { color: var(--warn); }
+.code-review__file-status--changed { color: var(--dim); }
+.code-review__file-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.code-review__file-stats {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.code-review__file-badge {
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 14px;
+  min-width: 16px;
+  text-align: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 5px;
+}
+/* Collapsible tree directory row (file rows keep .code-review__file). */
+.code-review__tree-dir {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.code-review__tree-dir:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.code-review__tree-twisty {
+  width: 14px;
+  text-align: center;
+  color: var(--dim);
+  flex: none;
+  user-select: none;
+}
+
+/* Diff stage: sticky file header + selectable hunk cards. */
+.code-review__diff { display: flex; flex-direction: column; }
+.code-review__diff-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+.code-review__diff-path {
+  font-weight: 600;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.code-review__diff-meta { color: var(--muted); font-size: 12px; }
+.code-review__hunks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+}
+.code-review__hunk {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg-deep);
+}
+.code-review__hunk.is-selected {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.code-review__hunk-header-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+.code-review__hunk-header {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--accent-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  padding: 5px 8px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.code-review__hunk-header:hover { color: var(--fg); }
+.code-review__hunk-badge {
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 14px;
+  min-width: 16px;
+  text-align: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 5px;
+  flex: none;
+}
+.code-review__hunk-selected-hint {
+  color: var(--muted);
+  font-size: 10px;
+  flex: none;
+}
+.code-review__hunk-toggle {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+  flex: none;
+}
+.code-review__hunk-toggle:hover { color: var(--fg); }
+.code-review__hunk-lines {
+  margin: 0;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-x: auto;
+}
+.code-review__hunk-lines.is-collapsed { display: none; }
+.code-review__line {
+  display: grid;
+  grid-template-columns: minmax(40px, auto) minmax(40px, auto) 18px 1fr;
+  gap: 0;
+  white-space: pre;
+  cursor: pointer;
+}
+.code-review__line:hover { background: rgba(0, 180, 255, 0.06); }
+.code-review__line-no {
+  color: var(--dim);
+  text-align: right;
+  padding: 0 6px;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+.code-review__line-prefix {
+  text-align: center;
+  user-select: none;
+  color: var(--muted);
+}
+.code-review__line-text { padding-right: 8px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.code-review__line--addition { background: rgba(46, 160, 67, 0.12); }
+.code-review__line--addition .code-review__line-prefix { color: var(--ok); }
+.code-review__line--deletion { background: rgba(248, 81, 73, 0.12); }
+.code-review__line--deletion .code-review__line-prefix { color: var(--error); }
+.code-review__line--meta { color: var(--muted); font-style: italic; }
+/* Backend-loaded lines beyond the snapshot's hunks have no hunk header. */
+.code-review__hunk--continued .code-review__hunk-lines {
+  border-top: 1px dashed var(--border);
+}
+.code-review__hunk-header--muted {
+  color: var(--dim);
+  font-style: italic;
+  cursor: default;
+}
+/* Soft-window controls below the hunks (>4000 lines / backend paging). */
+.code-review__window {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  margin-top: 8px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 180, 255, 0.04);
+}
+.code-review__window-meta {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+.code-review__window-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.code-review__load-more,
+.code-review__load-full {
+  font-size: 12px;
+  padding: 4px 14px;
+  min-height: 30px;
+}
+.code-review__window-error {
+  color: var(--error);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* Thread dock: hunk context + thread + composer (composer always reachable:
+ * the thread scrolls, the composer stays pinned at the pane bottom). */
+.code-review__comments {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+}
+.code-review__comments-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.3px;
+}
+.code-review__back {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+.code-review__hunk-id {
+  font-size: 11px;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.code-review__thread {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+}
+.code-review__thread-stale {
+  color: var(--warn);
+  font-size: 11px;
+}
+.code-review__comment {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  background: var(--bg-panel);
+}
+.code-review__comment.is-partial { border-style: dashed; }
+.code-review__comment-role {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--accent-dim);
+  margin-bottom: 4px;
+}
+.code-review__comment-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.code-review__comment-text > :first-child { margin-top: 0; }
+.code-review__comment-text > :last-child { margin-bottom: 0; }
+.code-review__composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: auto;
+}
+.code-review__streaming-note {
+  color: var(--warn);
+  font-size: 11px;
+}
+.code-review__composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.code-review__composer-hint {
+  color: var(--dim);
+  font-size: 11px;
+}
+.code-review__comment-input {
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+  font-size: 13px;
+}
+
+@media (max-width: 900px) {
+  .code-review-panel { width: 100vw; }
+  .code-review__label { max-width: 100%; }
+  .code-review__tab-bar { display: flex; }
+  .code-review__body { display: block; }
+  .code-review__files,
+  .code-review__diff,
+  .code-review__comments {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .code-review__files.is-hidden,
+  .code-review__diff.is-hidden,
+  .code-review__comments.is-hidden { display: none; }
+}
+
+@media (max-width: 768px) {
+  .code-review__action,
+  .code-review__close,
+  .code-review__file,
+  .code-review__comment-input {
+    min-height: 44px;
+  }
+  .code-review__line {
+    grid-template-columns: minmax(28px, auto) minmax(28px, auto) 14px 1fr;
+    font-size: 11px;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Personas panel (persistent persona definitions; shares the subagents
+ * panel chrome — position/head/close/error/toast rules come from the
+ * .subagents-panel class on the same element, so this section only adds
+ * persona-specific layout. Append-only by convention.
+ * ------------------------------------------------------------------ */
+.personas-panel { width: 480px; }
+.personas-panel__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.personas-panel__toolbar button {
+  white-space: nowrap;
+}
+.personas-panel__list { display: flex; flex-direction: column; gap: 10px; }
+.persona-row {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.persona-row__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.persona-row__title {
+  font-weight: 700;
+  font-family: var(--font-mono, monospace);
+  overflow-wrap: anywhere;
+}
+.persona-row__source {
+  color: var(--muted);
+  font-size: 11px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.persona-row__description {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.persona-row__contract {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.persona-row__persistence {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.persona-row__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.persona-row__actions button,
+.personas-panel__toolbar button {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 4px);
+  background: transparent;
+  color: var(--fg);
+  font-size: 12px;
+  padding: 2px 8px;
+}
+.persona-row__actions button:hover:not(:disabled),
+.personas-panel__toolbar button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.persona-row__actions button:disabled {
+  opacity: 0.55;
+}
+.persona-row__run {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+.persona-row__run input {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+.personas-panel__note {
+  color: var(--dim, var(--muted));
+  font-size: 11px;
+  margin-top: 12px;
+  overflow-wrap: anywhere;
+}
+/* Detail / editor / confirm modals reuse the subagent-details chrome. */
+.personas-detail,
+.personas-editor,
+.personas-confirm {
+  width: min(640px, 90vw);
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.personas-editor__input {
+  width: 100%;
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+}
+.personas-editor__content {
+  width: 100%;
+  min-height: 240px;
+  resize: vertical;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+}
+.personas-editor__template {
+  margin-left: 8px;
+}
+.personas-editor__save-row {
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.personas-confirm__actions {
+  justify-content: flex-end;
+  margin-top: 8px;
+  gap: 8px;
+}
+.personas-confirm__remove,
+.personas-confirm__purge {
+  white-space: normal;
+}
+.personas-confirm__purge {
+  border-color: var(--error);
+  color: var(--error);
+}
+.personas-confirm__purge:hover:not(:disabled) {
+  background: rgba(255, 60, 60, 0.1);
+}
+@media (max-width: 768px) {
+  .personas-panel { width: 100vw; }
+  .personas-panel__toolbar button,
+  .persona-row__actions button,
+  .persona-row__run input,
+  .personas-editor__content {
+    min-height: 44px;
+  }
 }

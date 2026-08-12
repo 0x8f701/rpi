@@ -341,9 +341,10 @@ the inline `1337` fallback with `preserveAspectRatio=1`.
 ## Slash commands
 
 The TUI and line REPL can execute the same built-ins, but `/help`, slash
-completion, and RPC discovery expose only the 22 commands in
+completion, and RPC discovery expose only the 23 commands in
 `PRIMARY_COMMAND_NAMES` (`interactive_commands.rs`). Prompt templates, dynamic
-skills, and extension commands remain executable through their namespaced paths.
+skill commands, and extension commands remain executable through their
+namespaced paths.
 
 | Command | Description |
 |---------|-------------|
@@ -365,6 +366,7 @@ skills, and extension commands remain executable through their namespaced paths.
 | `/goal` | Manage the durable session goal |
 | `/workflow` | Manage isolated concurrent workflows |
 | `/code-review [<from> <to>]` | Open a fullscreen Git diff browser: bare shows tracked HEAD→working-tree changes; two refs compare any two commits/branches/tags |
+| `/skill <name>` | Show a loaded skill's frontmatter summary |
 | `/btw [prompt]` | Open a persistent detached side conversation forked from the active main branch |
 | `/queue [cancel]` | Show pending steering/follow-up prompts (cancel clears them) |
 | `/live` | Hold-to-talk voice input |
@@ -394,11 +396,12 @@ When stdout is not a TTY, `main_run` falls back to `repl::interactive`
 (`lib.rs:142`). The REPL shares the same slash-command
 catalog but lacks the TUI's modal page overlays:
 
-- **No modal pages**: model, settings, trust, saved-session, scoped-model,
-  session-tree, fork, `/btw`, and `/code-review` overlays are TUI-only. In the
-  REPL, `/scoped-models` and `/theme` report that they require the TUI, `/tree`
-  prints JSON, `/fork` with no argument prints candidate messages, and `/model`
-  accepts a concrete spec.
+- **No terminal modal pages**: model, settings, trust, saved-session,
+  scoped-model, session-tree, fork, and `/btw` overlays are TUI-only. The Web
+  client has its own `/code-review` panel; the line REPL has no modal review
+  page. In the REPL, `/scoped-models` and `/theme` report that they require the
+  TUI, `/tree` prints JSON, `/fork` with no argument prints candidate messages,
+  and `/model` accepts a concrete spec.
 - **No configurable keybindings or themes**: the REPL uses a fixed
   line-editing interface and ignores theme files.
 - **No terminal image rendering**: image attachments are processed and sent

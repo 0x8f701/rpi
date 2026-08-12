@@ -173,6 +173,12 @@ struct SessionRuntime {
     selector_agents: RwLock<Vec<crate::AgentDefinition>>,
     branch_summary: RwLock<crate::EffectiveBranchSummarySettings>,
     expose_session_environment: AtomicBool,
+    /// Session-scoped offline contract (see [`Session::set_offline`]): makes
+    /// network-touching session operations (e.g. gist share) fail closed
+    /// without spawning child processes. Never derived from or written to
+    /// the process environment (`std::env::set_var` is `unsafe` in edition
+    /// 2024 and forbidden in this workspace).
+    offline: AtomicBool,
     last_selection: RwLock<Option<crate::SelectionPlan>>,
     /// One-entry cache for hindsight memory injection. The key is a stable
     /// SHA-256 fingerprint of the normalized request and every effective
@@ -371,6 +377,22 @@ struct SessionInner {
     /// Session-scoped MCP server registry; configured from settings on every
     /// resource load so `mcpServers` changes take effect on reload.
     mcp: crate::mcp::McpRegistry,
+    /// Session-level transform hook (application/extension context reduction).
+    /// The agent's `transform_context` is a fixed composite that runs the
+    /// vision projection first and then this hook, so extension context
+    /// reduction still sees the delegated (image-free) transcript exactly as
+    /// it did when delegation ran at ingest. Standalone `Arc` so the composite
+    /// hook can capture it without referencing `SessionInner` (which would
+    /// create a drop cycle through the agent).
+    transform_context: Arc<RwLock<Option<TransformContextFn>>>,
+    /// Cache of vision-delegated projections keyed by a stable hash of the
+    /// original user content. Images are delegated once at ingest (fail-closed,
+    /// before anything is recorded); every later model-context projection —
+    /// retries, follow-up turns, reloaded sessions — is a pure cache hit, so
+    /// historical images never reach a non-vision model and are never
+    /// re-delegated. Standalone `Arc` for the same drop-cycle reason as
+    /// `transform_context`.
+    vision_delegations: Arc<Mutex<HashMap<u64, Vec<ContentBlock>>>>,
 }
 
 struct ActiveBash {
@@ -1090,6 +1112,7 @@ impl Session {
                 skip_prompt: false,
             }),
             expose_session_environment: AtomicBool::new(true),
+            offline: AtomicBool::new(false),
             last_selection: RwLock::new(None),
             hindsight_injection_cache: RwLock::new(None),
             session_id: session_id.clone(),
@@ -1409,8 +1432,7 @@ impl Session {
                 Ok(())
             }
         }))?;
-        Ok(Self {
-            inner: Arc::new(SessionInner {
+        let inner = Arc::new(SessionInner {
                 session_dir: RwLock::new(crate::default_session_dir(&cwd)),
                 cwd,
                 workspace,
@@ -1437,8 +1459,46 @@ impl Session {
                 skill_snapshot,
                 todo,
                 mcp: mcp_registry,
-            }),
-        })
+                transform_context: Arc::new(RwLock::new(None)),
+                vision_delegations: Arc::new(Mutex::new(HashMap::new())),
+            });
+        // The agent's context transform is a fixed composite: the vision
+        // projection runs first (cache-backed, so only images never seen
+        // before hit the provider), then the session-level hook installed via
+        // `set_transform_context` (application/extension context reduction).
+        // The projection keeps the transcript original-preserving: the agent,
+        // recorder, history and UI carry the user's image blocks while the
+        // model context always receives the delegated description instead.
+        // The closure captures only standalone Arcs (shared runtime, resources,
+        // the projection cache, the transform slot) — never `inner` itself —
+        // so it cannot form a reference cycle that would leak the session.
+        {
+            let shared = inner.shared.clone();
+            let resources = inner.resources.clone();
+            let vision_cache = inner.vision_delegations.clone();
+            let transform_slot = inner.transform_context.clone();
+            inner.agent.set_transform_context(Some(Arc::new(move |messages, signal| {
+                let shared = shared.clone();
+                let resources = resources.clone();
+                let vision_cache = vision_cache.clone();
+                let transform_slot = transform_slot.clone();
+                Box::pin(async move {
+                    let projected = Session::delegate_vision_messages_with(
+                        &shared,
+                        &resources,
+                        &vision_cache,
+                        messages,
+                    )
+                    .await?;
+                    let hook = transform_slot.read().clone();
+                    match hook {
+                        Some(hook) => hook(projected, signal).await,
+                        None => Ok(projected),
+                    }
+                }) as pi_agent::BoxFuture<Result<Vec<Message>>>
+            })));
+        }
+        Ok(Self { inner })
     }
 
     #[must_use]
@@ -1451,6 +1511,21 @@ impl Session {
     /// actions never re-read environment variables or settings.
     pub fn set_session_dir(&self, session_dir: PathBuf) {
         *self.inner.session_dir.write() = session_dir;
+    }
+
+    /// Set the session-scoped offline contract: when enabled, network-touching
+    /// session operations (e.g. the gist share path) fail closed without
+    /// spawning child processes. Never touches the process environment — the
+    /// deterministic seam for simulating `PI_OFFLINE` without
+    /// `std::env::set_var` (unsafe in edition 2024 and forbidden here).
+    pub fn set_offline(&self, offline: bool) {
+        self.inner.shared.offline.store(offline, Ordering::Release);
+    }
+
+    /// Current session-scoped offline contract state.
+    #[must_use]
+    pub fn is_offline(&self) -> bool {
+        self.inner.shared.offline.load(Ordering::Acquire)
     }
 
     #[must_use]
@@ -1508,16 +1583,85 @@ impl Session {
     /// configured, sends image content to the configured vision model and
     /// replaces it with the returned description.
     async fn delegate_vision_images(&self, content: Vec<ContentBlock>) -> Result<Vec<ContentBlock>> {
+        Self::delegate_vision_images_with(
+            &self.inner.shared,
+            &self.inner.resources,
+            &self.inner.vision_delegations,
+            content,
+        )
+        .await
+    }
+
+    async fn delegate_vision_messages(&self, messages: Vec<Message>) -> Result<Vec<Message>> {
+        Self::delegate_vision_messages_with(
+            &self.inner.shared,
+            &self.inner.resources,
+            &self.inner.vision_delegations,
+            messages,
+        )
+        .await
+    }
+
+    async fn delegate_vision_message(&self, message: Message) -> Result<Message> {
+        Self::delegate_vision_message_with(
+            &self.inner.shared,
+            &self.inner.resources,
+            &self.inner.vision_delegations,
+            message,
+        )
+        .await
+    }
+
+    /// Free-standing projection shared by the ingest wrappers above and the
+    /// agent's composite `transform_context` hook. The hook cannot capture
+    /// `SessionInner` (that would form a drop cycle through the agent), so the
+    /// delegation logic operates on the standalone Arcs the session owns:
+    /// `shared` (runtime state/auth/streams), `resources` (live vision-model
+    /// settings) and `cache` (per-content delegation results).
+    async fn delegate_vision_messages_with(
+        shared: &SessionRuntime,
+        resources: &RwLock<Option<ResourceManager>>,
+        cache: &Mutex<HashMap<u64, Vec<ContentBlock>>>,
+        messages: Vec<Message>,
+    ) -> Result<Vec<Message>> {
+        let mut delegated = Vec::with_capacity(messages.len());
+        for message in messages {
+            delegated.push(
+                Self::delegate_vision_message_with(shared, resources, cache, message).await?,
+            );
+        }
+        Ok(delegated)
+    }
+
+    async fn delegate_vision_message_with(
+        shared: &SessionRuntime,
+        resources: &RwLock<Option<ResourceManager>>,
+        cache: &Mutex<HashMap<u64, Vec<ContentBlock>>>,
+        message: Message,
+    ) -> Result<Message> {
+        match message {
+            Message::User(mut user) => {
+                user.content = Self::delegate_vision_images_with(shared, resources, cache, user.content).await?;
+                Ok(Message::User(user))
+            }
+            message => Ok(message),
+        }
+    }
+
+    async fn delegate_vision_images_with(
+        shared: &SessionRuntime,
+        resources: &RwLock<Option<ResourceManager>>,
+        cache: &Mutex<HashMap<u64, Vec<ContentBlock>>>,
+        content: Vec<ContentBlock>,
+    ) -> Result<Vec<ContentBlock>> {
         if !content.iter().any(|block| matches!(block, ContentBlock::Image { .. })) {
             return Ok(content);
         }
-        let active_model = self.inner.shared.state.read().model.clone();
+        let active_model = shared.state.read().model.clone();
         if active_model.input.iter().any(|input| input == "image") {
             return Ok(content);
         }
-        let vision_spec = self
-            .inner
-            .resources
+        let vision_spec = resources
             .read()
             .as_ref()
             .and_then(|resources| resources.snapshot().settings.vision_model.clone())
@@ -1525,6 +1669,10 @@ impl Session {
         let Some(vision_spec) = vision_spec else {
             return Ok(content);
         };
+        let key = Self::vision_content_key(&content);
+        if let Some(cached) = cache.lock().get(&key).cloned() {
+            return Ok(cached);
+        }
         let vision_model = crate::resolve_model(&vision_spec)
             .map_err(|error| anyhow!("configured vision model {vision_spec:?} could not be resolved: {error}"))?;
         if !vision_model.input.iter().any(|input| input == "image") {
@@ -1540,11 +1688,11 @@ impl Session {
             .filter(|block| matches!(block, ContentBlock::Image { .. }))
             .cloned()
             .collect::<Vec<_>>();
-        let mut stream_options = self.inner.shared.stream_options.read().clone();
+        let mut stream_options = shared.stream_options.read().clone();
         stream_options.stream.api_key = None;
         stream_options.stream.headers.clear();
         stream_options.stream.env.clear();
-        if let Some(resolver) = &self.inner.shared.auth_resolver {
+        if let Some(resolver) = &shared.auth_resolver {
             let auth = resolver(vision_model.clone()).await.with_context(|| {
                 format!(
                     "resolving authentication for configured vision model {}/{}",
@@ -1555,7 +1703,7 @@ impl Session {
             merge_headers_case_insensitive(&mut stream_options.stream.headers, auth.headers);
             stream_options.stream.env.extend(auth.env);
         } else {
-            stream_options.stream.api_key = Some(self.inner.shared.state.read().api_key.clone());
+            stream_options.stream.api_key = Some(shared.state.read().api_key.clone());
         }
         stream_options.stream.max_tokens = Some(4096);
         stream_options.stream.cache_retention = CacheRetention::None;
@@ -1576,7 +1724,7 @@ impl Session {
             })],
             tools: Vec::new(),
         };
-        let stream_fn = self.inner.shared.stream_fn.clone();
+        let stream_fn = shared.stream_fn.clone();
         let produced = tokio::time::timeout(VISION_DELEGATION_TIMEOUT, async {
             let stream = (stream_fn)(vision_model, context, stream_options).await;
             let mut stream_error = None;
@@ -1640,25 +1788,24 @@ impl Session {
                 replacement.push(block);
             }
         }
+        cache.lock().insert(key, replacement.clone());
         Ok(replacement)
     }
 
-    async fn delegate_vision_messages(&self, messages: Vec<Message>) -> Result<Vec<Message>> {
-        let mut delegated = Vec::with_capacity(messages.len());
-        for message in messages {
-            delegated.push(self.delegate_vision_message(message).await?);
-        }
-        Ok(delegated)
-    }
-
-    async fn delegate_vision_message(&self, message: Message) -> Result<Message> {
-        match message {
-            Message::User(mut user) => {
-                user.content = self.delegate_vision_images(user.content).await?;
-                Ok(Message::User(user))
+    /// Stable in-process key for a user content block list: FNV-1a over the
+    /// JSON encoding. The recorded transcript keeps the original images, so
+    /// the same content reappears in every later model context; the key lets
+    /// the projection reuse the one-time delegation result instead of calling
+    /// the vision provider again.
+    fn vision_content_key(content: &[ContentBlock]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        if let Ok(encoded) = serde_json::to_vec(content) {
+            for byte in encoded {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
             }
-            message => Ok(message),
         }
+        hash
     }
 
     /// Resolver that confines subagent children's process spawns (their bash
@@ -1848,7 +1995,12 @@ impl Session {
             content: content.into_blocks(),
             timestamp: pi_ai::now_millis(),
         });
-        let message = self.delegate_vision_message(message).await?;
+        // Fail-closed delegation before the message is queued or recorded: an
+        // image delegation error surfaces here, nothing is enqueued. The
+        // ORIGINAL message (image intact) is what the queue, recorder and UI
+        // carry; the delegated description is projected only into the model
+        // context when the queue drains or the run starts.
+        self.delegate_vision_message(message.clone()).await?;
         if self.inner.run_slot.lock().active {
             match delivery {
                 MessageDelivery::FollowUp => self.inner.agent.follow_up(message).await,
@@ -3635,7 +3787,10 @@ impl Session {
     }
 
     pub fn set_transform_context(&self, hook: Option<TransformContextFn>) {
-        self.inner.agent.set_transform_context(hook);
+        // The agent's own transform hook is the fixed composite installed at
+        // construction (vision projection first); this slot feeds the
+        // user/extension half of that composite so both always run.
+        *self.inner.transform_context.write() = hook;
     }
 
     #[must_use]
@@ -3966,7 +4121,10 @@ impl Session {
             content.push(ContentBlock::text(prompt));
         }
         content.extend(images);
-        let content = self.delegate_vision_images(content).await?;
+        // Fail-closed delegation before recording; the run keeps the ORIGINAL
+        // content (images intact) for the transcript, with the delegated
+        // description projected only into the model context via the cache.
+        self.delegate_vision_images(content.clone()).await?;
         messages[0] = Message::User(UserMessage {
             content,
             timestamp: pi_ai::now_millis(),
@@ -4061,7 +4219,13 @@ impl Session {
         if messages.is_empty() {
             return Err(anyhow!("messages must not be empty"));
         }
-        let messages = self.delegate_vision_messages(messages).await?;
+        // Fail-closed image delegation BEFORE anything is recorded: errors
+        // propagate here and no unprocessed prompt reaches the recorder or the
+        // agent. The ORIGINAL messages (images intact) are what the run
+        // records and the history/UI carry; the delegated description is
+        // applied per-turn only to the model context by the composite
+        // transform hook, which hits this cache.
+        self.delegate_vision_messages(messages.clone()).await?;
         let messages = self.inject_selection_messages(messages).await;
         let claim = self.begin_run("user").await?;
         let operation = self.execute_with_retries(Some(messages)).await;
@@ -4585,7 +4749,10 @@ impl Session {
     }
 
     pub async fn steer(&self, message: Message) -> Result<()> {
-        let message = self.delegate_vision_message(message).await?;
+        // Fail-closed delegation before enqueue; the ORIGINAL message (image
+        // intact) is queued so history/UI keep the image, and the model-context
+        // projection hits the delegation cache when the queue drains.
+        self.delegate_vision_message(message.clone()).await?;
         self.inner.agent.steer(message).await;
         self.publish_queue_update().await;
         Ok(())
@@ -4626,7 +4793,10 @@ impl Session {
     }
 
     pub async fn follow_up(&self, message: Message) -> Result<()> {
-        let message = self.delegate_vision_message(message).await?;
+        // Fail-closed delegation before enqueue; the ORIGINAL message (image
+        // intact) is queued so history/UI keep the image, and the model-context
+        // projection hits the delegation cache when the queue drains.
+        self.delegate_vision_message(message.clone()).await?;
         self.inner.agent.follow_up(message).await;
         self.publish_queue_update().await;
         Ok(())
@@ -9290,8 +9460,12 @@ mod vision_delegation_tests {
     }
 
     fn image() -> ContentBlock {
+        image_with_data("aW1hZ2U=")
+    }
+
+    fn image_with_data(data: &str) -> ContentBlock {
         ContentBlock::Image {
-            data: "aW1hZ2U=".to_owned(),
+            data: data.to_owned(),
             mime_type: "image/png".to_owned(),
         }
     }
@@ -9472,7 +9646,7 @@ mod vision_delegation_tests {
         let delegated = session.delegate_vision_messages(vec![
             Message::User(UserMessage { content: vec![image()], timestamp: 1 }),
             custom.clone(),
-            Message::User(UserMessage { content: vec![image()], timestamp: 3 }),
+            Message::User(UserMessage { content: vec![image_with_data("aW1hZ2Uy")], timestamp: 3 }),
         ]).await.expect("delegate user images");
 
         let calls = calls.lock();
@@ -9598,7 +9772,7 @@ mod vision_delegation_tests {
     }
 
     #[tokio::test]
-    async fn steer_and_follow_up_delegate_images_before_enqueue() {
+    async fn steer_and_follow_up_delegate_fail_closed_and_queue_originals() {
         let cwd = tempfile::tempdir().expect("cwd");
         let agent_dir = tempfile::tempdir().expect("agent dir");
         let api = format!("vision-queue-api-{}", Uuid::now_v7());
@@ -9621,21 +9795,190 @@ mod vision_delegation_tests {
         )
         .await;
 
-        session.steer(Message::User(UserMessage { content: vec![image()], timestamp: 1 })).await.expect("queue delegated steer");
-        session.follow_up(Message::User(UserMessage { content: vec![image()], timestamp: 2 })).await.expect("queue delegated follow-up");
+        let steer_image = image();
+        let follow_image = image_with_data("aW1hZ2Uy");
+        session.steer(Message::User(UserMessage { content: vec![steer_image.clone()], timestamp: 1 })).await.expect("queue delegated steer");
+        session.follow_up(Message::User(UserMessage { content: vec![follow_image.clone()], timestamp: 2 })).await.expect("queue delegated follow-up");
 
         let (steering, follow_up) = session.queued_messages().await;
-        let steering_text = match steering.as_slice() {
-            [Message::User(user)] => content_text(&user.content),
+        let steering_content = match steering.as_slice() {
+            [Message::User(user)] => &user.content,
             messages => panic!("expected one queued steering user message, got {messages:?}"),
         };
-        let follow_up_text = match follow_up.as_slice() {
-            [Message::User(user)] => content_text(&user.content),
+        let follow_up_content = match follow_up.as_slice() {
+            [Message::User(user)] => &user.content,
             messages => panic!("expected one queued follow-up user message, got {messages:?}"),
         };
-        assert!(steering_text.contains("steer description") && steering_text.contains(&vision_model.id));
-        assert!(follow_up_text.contains("follow description") && follow_up_text.contains(&vision_model.id));
-        assert_eq!(calls.lock().len(), 2, "only the two vision calls should run before dequeue");
+        // The queue carries the ORIGINAL user messages (images intact) so the
+        // transcript/UI keep the images; only the model context is projected.
+        assert_eq!(steering_content, &[steer_image], "queued steer must keep the original image");
+        assert_eq!(follow_up_content, &[follow_image], "queued follow-up must keep the original image");
+        assert!(!content_text(steering_content).contains("Image analyzed") && !content_text(follow_up_content).contains("Image analyzed"), "queued originals must not carry the delegated description");
+        assert_eq!(calls.lock().len(), 2, "fail-closed delegation must run once per unique image before enqueue");
+        registration.unregister();
+    }
+
+    /// Concatenated text of every user message in a model context, in order.
+    fn context_user_text(context: &Context) -> String {
+        context
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(content_text(&user.content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn user_messages_contain_image(messages: &[Message]) -> bool {
+        messages.iter().any(|message| match message {
+            Message::User(user) => user
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. })),
+            _ => false,
+        })
+    }
+
+    #[tokio::test]
+    async fn run_records_original_image_while_model_receives_description() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let api = format!("vision-record-api-{}", Uuid::now_v7());
+        let provider = format!("vision-record-provider-{}", Uuid::now_v7());
+        let main_model = model("main-record-model", &provider, &api, false);
+        let vision_model = model("vision-record-model", &provider, &api, true);
+        let registration = pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+            api,
+            provider: provider.clone(),
+            models: vec![main_model.clone(), vision_model.clone()],
+            chunk_size: 1,
+        });
+        let (stream, calls, _) = recording_stream(vec![Ok("screen description"), Ok("main answer")]);
+        let session = test_session(cwd.path(), main_model, stream, None);
+        attach_vision_settings(
+            &session,
+            agent_dir.path(),
+            cwd.path(),
+            Some(&format!("{provider}/{}", vision_model.id)),
+        )
+        .await;
+        let recorder = crate::start_session_in(
+            cwd.path(), None, None, Some(cwd.path()), Some("vision-recorder-test"), None,
+        )
+        .expect("start recorder");
+        session.record(recorder).expect("attach recorder");
+
+        session.run("inspect", vec![image()]).await.expect("vision run");
+
+        // Model context: the vision model sees the image, the main model sees
+        // only the delegated description.
+        let calls = calls.lock();
+        assert_eq!(calls.len(), 2, "vision delegation must run before the main stream");
+        assert!(only_user_content(&calls[0].context).iter().any(|block| matches!(block, ContentBlock::Image { .. })), "vision context must contain the image");
+        let main_content = only_user_content(&calls[1].context);
+        assert!(!main_content.iter().any(|block| matches!(block, ContentBlock::Image { .. })), "main context must not contain the image");
+        let replacement = content_text(main_content);
+        assert!(replacement.contains("[Image analyzed by vision-record-model: screen description]"), "delegated description must reach the main model: {replacement}");
+        drop(calls);
+
+        // User-visible history keeps the ORIGINAL message with the image.
+        let history = session.history();
+        let recorded_user = match history.as_slice() {
+            [Message::User(user), Message::Assistant(_)] => user,
+            messages => panic!("expected user then assistant in history, got {messages:?}"),
+        };
+        assert!(recorded_user.content.iter().any(|block| matches!(block, ContentBlock::Image { .. })), "history must keep the original image");
+        assert!(!content_text(&recorded_user.content).contains("Image analyzed"), "history must not contain the delegated description");
+
+        // The recorder tree (what reload/build_context replay) keeps the image.
+        let tree = session.current_recorder().expect("recorder").tree().expect("recorder tree");
+        let entries = tree
+            .branch(None)
+            .into_iter()
+            .filter(|entry| entry.entry_type == "message")
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2, "user + assistant recorded");
+        let Message::User(recorded_user) = entries[0].message.as_ref().expect("user entry message") else {
+            panic!("first recorded message must be user");
+        };
+        assert!(recorded_user.content.iter().any(|block| matches!(block, ContentBlock::Image { .. })), "recorder tree must keep the original image");
+        assert!(!content_text(&recorded_user.content).contains("Image analyzed"), "recorder tree must not contain the delegated description");
+        registration.unregister();
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_image_and_next_turn_still_projects_description() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let api = format!("vision-reload-api-{}", Uuid::now_v7());
+        let provider = format!("vision-reload-provider-{}", Uuid::now_v7());
+        let main_model = model("main-reload-model", &provider, &api, false);
+        let vision_model = model("vision-reload-model", &provider, &api, true);
+        let vision_model_id = vision_model.id.clone();
+        let registration = pi_ai::providers::register_faux_provider(pi_ai::providers::FauxProviderOptions {
+            api,
+            provider: provider.clone(),
+            models: vec![main_model.clone(), vision_model.clone()],
+            chunk_size: 1,
+        });
+        let (stream, _, _) = recording_stream(vec![Ok("screen description"), Ok("main answer")]);
+        let session = test_session(cwd.path(), main_model.clone(), stream, None);
+        attach_vision_settings(
+            &session,
+            agent_dir.path(),
+            cwd.path(),
+            Some(&format!("{provider}/{}", vision_model.id)),
+        )
+        .await;
+        let recorder = crate::start_session_in(
+            cwd.path(), None, None, Some(cwd.path()), Some("vision-reload-test"), None,
+        )
+        .expect("start recorder");
+        let session_path = recorder.path();
+        session.record(recorder).expect("attach recorder");
+        session.run("inspect", vec![image()]).await.expect("first turn");
+
+        // Reload: the persisted session replays the ORIGINAL image for
+        // user-visible history, never the delegated description.
+        let tree = crate::load_session_tree(&session_path).expect("reload session");
+        let context = tree.build_context(None);
+        let reloaded_user = match context.messages.as_slice() {
+            [Message::User(user), Message::Assistant(_)] => user,
+            messages => panic!("expected user then assistant after reload, got {messages:?}"),
+        };
+        assert!(reloaded_user.content.iter().any(|block| matches!(block, ContentBlock::Image { .. })), "reloaded context must keep the original image");
+        assert!(!content_text(&reloaded_user.content).contains("Image analyzed"), "reloaded context must not contain the delegated description");
+
+        // A fresh session restored from that file must still send the
+        // description — never the historical image — to the non-vision model
+        // on the next turn.
+        let (stream2, calls2, _) = recording_stream(vec![Ok("screen description"), Ok("second answer")]);
+        let session2 = test_session(cwd.path(), main_model, stream2, None);
+        attach_vision_settings(
+            &session2,
+            agent_dir.path(),
+            cwd.path(),
+            Some(&format!("{provider}/{}", vision_model.id)),
+        )
+        .await;
+        session2
+            .record(crate::resume_session(&session_path).expect("resume recorder"))
+            .expect("attach recorder");
+        session2.load_history(context.messages).await.expect("load history");
+
+        session2.run("second turn", Vec::new()).await.expect("second turn");
+
+        let calls = calls2.lock();
+        assert_eq!(calls.len(), 2, "lazy vision delegation then main stream on the restored session");
+        assert_eq!(calls[0].model.id, vision_model_id, "historical image must be delegated to the vision model");
+        assert!(only_user_content(&calls[0].context).iter().any(|block| matches!(block, ContentBlock::Image { .. })), "vision context must contain the historical image");
+        let main_context = &calls[1].context;
+        assert!(!user_messages_contain_image(&main_context.messages), "main context must not resend the historical image");
+        let main_text = context_user_text(main_context);
+        assert!(main_text.contains("[Image analyzed by vision-reload-model: screen description]"), "historical image must be projected to the description: {main_text}");
+        assert!(main_text.contains("second turn"), "new user text must reach the model");
         registration.unregister();
     }
 }

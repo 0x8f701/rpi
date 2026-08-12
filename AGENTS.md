@@ -4,7 +4,7 @@ Rules for AI agents working in this repository. Adapted from the OMP/pi
 coding-agent conventions with rpi-specific structure, test commands, and
 repository invariants.
 
-## Eight Hard Constraints
+## Nine Hard Constraints
 
 Violating any of these anywhere results in immediate rejection — fix first, continue second.
 
@@ -16,6 +16,7 @@ Violating any of these anywhere results in immediate rejection — fix first, co
 6. **Never rollback with `git checkout --`.** Do not discard local changes via `git checkout --`, `git restore`, or equivalent. Rollbacks require manual review and explicit user action.
 7. **Never print credentials, tokens, API keys, or environment variables.** Do not read, echo, cat, or output the contents of secret files (e.g. `.env`, `.env.*`, `*.pem`, `*.key`, `auth.json`, credentials files) or environment variables (`env`, `printenv`, `echo $VAR`). Never log or display sensitive values.
 8. **Never access cloud service credentials in HOME.** Do not read, list, or access `~/.aws/`, `~/.gcloud/`, `~/.azure/`, `~/.config/gcloud/`, `~/.config/azure/`, `~/.kube/`, or any other cloud provider credential directories under the home directory.
+9. **Prefer agent-browser over curl/wget for web content.** When accessing web pages, use the `agent-browser` tool to render and extract page content instead of `curl`, `wget`, or raw HTTP requests. This saves token usage by getting structured page data rather than dumping raw HTML.
 
 ## Repository Layout
 
@@ -34,6 +35,8 @@ Violating any of these anywhere results in immediate rejection — fix first, co
 6. Do not work around problems by weakening requirements, silently dropping behavior, or simplifying tasks beyond what was requested.
 7. **Single optimal version only.** Do not maintain multiple versions or backward compatibility. Always converge to one best implementation — breaking changes are acceptable. Long-term maintainability takes priority over preserving old interfaces.
 8. **Solve only the current problem.** Do not design data structures, functions, abstractions, or interfaces for hypothetical future needs. Implement what is needed now with the simplest correct approach.
+9. **Agent Execution Discipline.** Concentrate on the primary task. Do not over-diverge into tangential explorations, speculative analysis, or unrelated improvements. Finish the assigned objective before considering anything else.
+10. **TUI/Web parity.** Shared user capabilities are implemented for the TUI and the web UI within the same task whenever the platform can support them; terms, statuses, information hierarchy, safety bounds, and observable effects must stay similar (for example: compact status glyphs, accessible full state, selection/filter semantics, structured Goal/Constraints/Contract Task cards, typed IRC, Waiting/Thinking states, attachment previews/captions, and safe Markdown rendering). Platform differences are allowed only when deliberate (for example: touch targets, responsive layout, terminal column constraints, or browser media APIs), and each platform's behavior must be verified separately.
 
 ## Error Handling
 
@@ -49,6 +52,7 @@ Violating any of these anywhere results in immediate rejection — fix first, co
 3. Abbreviations only for universally understood terms (`ctx`, `id`, `cfg`, `db`, `tx`). Everything else spelled out.
 4. Same concept, same name across the entire codebase.
 5. Booleans prefixed with `is_` / `has_` / `should_` / `can_`.
+6. **No task/spec numbering in code.** Do not embed task IDs (`TASK-01`), spec phase numbers (`Phase 3`), or step numbers (`Step 1/2/3`) into variable names, function names, file names, commit messages, or code comments. These belong in docs and tracking only.
 
 ## Module Boundaries & Imports
 
@@ -130,6 +134,15 @@ Violating any of these anywhere results in immediate rejection — fix first, co
 16. **Log level abuse**: `error` for expected failures; `info` flooded with control flow; critical paths without logging.
 17. **Fake test passes**: asserting `true == true` / `status == 200`, only happy path, mocking real deps without documentation.
 18. **Local paths / sensitive paths**: `/home/...` / `/mnt/...` / `~/.ssh` / `~/.aws` / internal hostnames / private IPs in source, comments, doc examples, commit messages, or test fixtures.
+19. **Non-essential commenting.** Do not comment out code, config, or routes unless the user explicitly states the section must be disabled. Delete or leave active; if disabling is needed, remove the entry entirely rather than commenting it out.
+
+## Architecture
+
+1. **Build incrementally.** Start with the smallest end-to-end working version, then add features on top of a stable, usable product. Do not replace a working product with premature complexity.
+2. **Design for long-term evolution.** Do not adopt stopgap solutions that are expected to be replaced later. Every architectural decision should serve the system beyond the immediate problem.
+3. **Study established solutions first.** Before designing from scratch, research how mature products solve the same class of problems. Prefer proven patterns and conventions over inventing new ones.
+
+These architecture principles apply when choosing among solutions required by the current problem; they do not authorize speculative future-proofing beyond Core Engineering Principle 8.
 
 ## Architecture Invariants
 
@@ -197,3 +210,20 @@ Every review must satisfy these or be rejected as incomplete:
 - If a dependency changes, account for downstream repos and verification.
 - If tmux/multi-agent collaboration is expected, define pane roles and monitoring.
 - A finished spec must be executable, reviewable, and testable.
+
+## Model Change Cross-Review
+
+Any change made by a model MUST be reviewed by a different model before landing. This applies to:
+
+- Code changes (production code, tests, config)
+- Documentation updates
+- Agent configuration modifications
+- Dependency additions or updates
+
+**Procedure:**
+1. Model A completes the change and stages the work.
+2. Model B (different model) reviews the staged changes — reads every diff line, checks correctness, security, and adherence to engineering principles.
+3. Model B reports findings with `<file>:<line>` references.
+4. If Model B approves, commit. If Model B rejects, Model A addresses findings and repeat.
+
+**Never skip cross-model review on substantive changes.** Quick fixes, typo corrections, and single-line obvious fixes may be exempt, but when in doubt, review.

@@ -1,3 +1,8 @@
+use crate::code_review::{
+    DiffFile, DiffHunk, DiffLineKind, FileDiff, FileDiffPage, ReviewScope, ReviewSnapshot,
+    MAX_FILE_PAGE_LINES, load_review_snapshot_for,
+};
+use crate::code_review_panel::{CodeReviewController, ReviewCommentRole};
 use crate::{
     args::Cli,
     extension_ui::{ExtensionUiAdapter, ExtensionUiEvent},
@@ -16,8 +21,9 @@ use pi_coding::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
 };
@@ -26,6 +32,9 @@ use tokio::sync::{mpsc, Semaphore};
 pub(crate) const MAX_RPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const JSONL_CHANNEL_CAPACITY: usize = 8;
 pub(crate) const MAX_CONCURRENT_COMMANDS: usize = 16;
+/// Default transcript lines for `agent_history` when `lines` is omitted.
+/// Bounded by the core `pi_coding::MAX_HISTORY_LINES` cap.
+const DEFAULT_RPC_HISTORY_LINES: usize = 80;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -140,12 +149,16 @@ pub enum RpcCommand {
         #[serde(default)]
         id: Option<String>,
     },
-    /// List the unified resume catalog (native + enabled foreign sessions),
-    /// scoped to the session working directory, mirroring the TUI `/sessions`
-    /// panel. Wire shape: `{ "type": "session_list", "id"?: string }`.
+    /// List the unified resume catalog (native + enabled foreign sessions).
+    /// `scope` defaults to `current`; `all_projects` removes cwd filtering and,
+    /// for the Web listener, scans either the active profile's default native
+    /// tree or the exact configured custom root.
+    /// Wire shape: `{ "type": "session_list", "id"?: string, "scope"?: "current"|"all_projects" }`.
     SessionList {
         #[serde(default)]
         id: Option<String>,
+        #[serde(default)]
+        scope: RpcSessionListScope,
     },
     ExportHtml {
         #[serde(default)]
@@ -585,6 +598,21 @@ pub enum RpcCommand {
         #[serde(rename = "jobId")]
         job_id: String,
     },
+    /// Fetch one child agent's recent transcript (`hub read_history` mirror).
+    /// `lines` defaults to `DEFAULT_RPC_HISTORY_LINES` and must lie within
+    /// the core `1..=MAX_HISTORY_LINES` bound; the returned `text` is
+    /// secret-redacted and byte-capped. Works while the job is queued/running
+    /// (live transcript) and after settle. Never exposes filesystem paths.
+    /// Wire shape:
+    /// `{ "type": "agent_history", "id"?: string, "agentId": string, "lines"?: number }`.
+    AgentHistory {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        #[serde(default)]
+        lines: Option<usize>,
+    },
     /// Start an encrypted room bound to the selected recorded session.
     CollabStart {
         #[serde(default)]
@@ -617,10 +645,12 @@ pub enum RpcCommand {
     /// Exchange a WebRTC SDP offer for a Codex Live realtime call by proxying
     /// `POST {realtimeBaseUrl}/v1/realtime/calls` on the backend (avoids CORS
     /// and keeps the API key server-side). The POST body is
-    /// `{ "sdp": offer, "session": { type, model, audio: { input, output } } }`,
-    /// where `session` is the Quicksilver realtime shape reused verbatim for
-    /// the `oai-events` data channel's `session.update`. The upstream answer is
-    /// a bare SDP body with the call id in the `Location` header. Returns
+    /// `{ "sdp": offer, "session": { type, audio: { input, output } } }` —
+    /// the create-call session is the Quicksilver shape WITHOUT `model`, which
+    /// Codex realtime rejects with 400 (`Field session.model is not allowed`).
+    /// The configured `model` is delivered over the `oai-events` data
+    /// channel's `session.update` instead, where it IS accepted. The upstream
+    /// answer is a bare SDP body with the call id in the `Location` header. Returns
     /// `{ "sdp": "<answer>", "callId": "<call id>" }` for the browser's
     /// `RTCPeerConnection` and the `oai-events` data channel.
     /// Wire shape: `{ "type": "realtime_create_call", "id"?: string, "sdpOffer": string }`.
@@ -636,6 +666,220 @@ pub enum RpcCommand {
     /// any server-side bookkeeping. Returns `{ "stopped": true }`.
     /// Wire shape: `{ "type": "realtime_stop", "id"?: string }`.
     RealtimeStop {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Transcribe a browser-recorded WAV through the backend's configured STT
+    /// endpoint. The browser sends ONLY the bounded base64 audio and its MIME
+    /// type; the endpoint URL and bearer key are read from the server-held
+    /// `live.stt*` settings (never accepted from the client, never exposed to
+    /// the frontend). The decoded audio must be a RIFF/WAVE PCM16 stream
+    /// within the byte cap and the MIME type must be on the allowlist before
+    /// any HTTP request is made. Returns `{ "text": "<transcript>" }`; errors
+    /// are bounded and redacted (the STT client scrubs server-echoed secrets).
+    /// Wire shape:
+    /// `{ "type": "stt_transcribe", "id"?: string, "audioBase64": string, "mimeType": string }`.
+    SttTranscribe {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "audioBase64")]
+        audio_base64: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    /// Open a bounded HEAD→working-tree or two-revision Git diff snapshot
+    /// for code review, forking a read-only review agent. `from`/`to` must
+    /// both be present (two-revision) or both absent (working tree); any
+    /// other combination is rejected. Returns the full review snapshot plus
+    /// controller thread/streaming state.
+    /// Wire shape: `{ "type": "code_review_open", "id"?: string, "from"?: string, "to"?: string }`.
+    CodeReviewOpen {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        to: Option<String>,
+    },
+    /// Re-project the currently open review snapshot and controller state.
+    /// Errors when no review is open. Wire shape:
+    /// `{ "type": "code_review_snapshot", "id"?: string }`.
+    CodeReviewSnapshot {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Reload the review snapshot (re-run the bounded git acquisition) and
+    /// reconcile existing threads onto the new hunk identities.
+    /// Wire shape: `{ "type": "code_review_refresh", "id"?: string }`.
+    CodeReviewRefresh {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Attach a comment to a specific hunk in the current snapshot. The
+    /// full hunk identity (`snapshotId`, `path`, old/new ranges, and
+    /// `contentHash`) must match the current snapshot exactly, else the
+    /// comment is rejected as stale.
+    /// Wire shape:
+    /// `{ "type": "code_review_comment", "id"?: string, "snapshotId": string, "path": string, "oldStart": u32, "oldCount": u32, "newStart": u32, "newCount": u32, "contentHash": string, "comment": string }`.
+    CodeReviewComment {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "snapshotId")]
+        snapshot_id: String,
+        path: String,
+        #[serde(rename = "oldStart")]
+        old_start: u32,
+        #[serde(rename = "oldCount")]
+        old_count: u32,
+        #[serde(rename = "newStart")]
+        new_start: u32,
+        #[serde(rename = "newCount")]
+        new_count: u32,
+        #[serde(rename = "contentHash")]
+        content_hash: String,
+        comment: String,
+    },
+    /// Abort the in-flight review agent turn for the active hunk.
+    /// Wire shape: `{ "type": "code_review_abort", "id"?: string }`.
+    CodeReviewAbort {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Close the open code review: shut down the review agent and drop the
+    /// snapshot/threads. Wire shape:
+    /// `{ "type": "code_review_close", "id"?: string }`.
+    CodeReviewClose {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Load one bounded page of a single file's full diff for the currently
+    /// open review. The `snapshotId` must match the live snapshot (else the
+    /// request is rejected as stale), `path` must be one of the snapshot's
+    /// files (containment), and `cursor` is a 0-based line offset clamped to
+    /// the loaded diff's length. The backend re-runs the same fixed-argv,
+    /// isolated-sandbox, bounded git diff scoped to the file's pathspec
+    /// (with rename provenance) and serves pages from an in-memory cache that
+    /// is invalidated on open/refresh. Read-only; never mutates the repo.
+    /// Every catalogued path is accepted, including on-demand placeholders
+    /// that a globally truncated snapshot could not carry as hunks.
+    /// Wire shape:
+    /// `{ "type": "code_review_file_diff", "id"?: string, "snapshotId": string, "path": string, "cursor"?: usize, "maxLines"?: usize }`.
+    CodeReviewFileDiff {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "snapshotId")]
+        snapshot_id: String,
+        path: String,
+        #[serde(default)]
+        cursor: usize,
+        #[serde(default)]
+        max_lines: Option<usize>,
+    },
+    /// Render a loaded skill's frontmatter summary (the `/skill <name>`
+    /// mirror). Rejects an empty or unknown name. Returns `{ name, summary }`.
+    /// Wire shape: `{ "type": "skill", "id"?: string, "name": string }`.
+    Skill {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+    },
+    /// List loaded persistent personas (the bare `/persona` mirror) with
+    /// bounded contract summaries and memory/session state counts. Never
+    /// exposes filesystem paths. Returns
+    /// `{ "enabled": bool, "personas": [PersonaRow] }` where a row is
+    /// `{ name, description, source, trusted, preferred, contractSummary,
+    ///    memoryEntries, sessionCount, stateError }` (`stateError` is the
+    /// fixed literal `"unreadable"` or null — never path text).
+    /// Wire shape: `{ "type": "persona_list", "id"?: string }`.
+    PersonaList {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Show one persona's definition (the `/persona <name>` mirror): the
+    /// same row fields as `persona_list` plus `content` (the raw
+    /// `persona.md`, bounded to `MAX_PERSONA_RPC_CONTENT_BYTES`) and
+    /// `contentTruncated`. Unknown or non-persona names fail closed.
+    /// Wire shape: `{ "type": "persona_get", "id"?: string, "name": string }`.
+    PersonaGet {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+    },
+    /// Create a persona definition from content (the `/persona new <name>`
+    /// editor-free mirror): validates the frontmatter name matches `name`,
+    /// writes atomically under the user persona scope, and live-reloads the
+    /// catalog so the persona is discoverable on the next read. Returns
+    /// `{ "name": name, "created": true, "message": text }`.
+    /// Wire shape:
+    /// `{ "type": "persona_create", "id"?: string, "name": string, "content": string }`.
+    PersonaCreate {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+        content: String,
+    },
+    /// Overwrite an existing persona definition (the `/persona edit <name>`
+    /// editor-free mirror). The committed content must declare the SAME name
+    /// as the target (rename is rejected), and the file must be a regular
+    /// non-symlink `persona.md` inside the persona scope. Returns
+    /// `{ "name": name, "edited": true, "message": text }`.
+    /// Wire shape:
+    /// `{ "type": "persona_edit", "id"?: string, "name": string, "content": string }`.
+    PersonaEdit {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+        content: String,
+    },
+    /// Remove a persona DEFINITION only, keeping `memory/` and `sessions/`
+    /// under the persona root (the `/persona remove <name> --yes` mirror).
+    /// Requires an explicit `"confirm": true` on the wire — anything else is
+    /// rejected before any filesystem mutation (fail-closed, mirroring the
+    /// CLI `--yes` gate). Returns `{ "name": name, "removed": true,
+    /// "message": text }`.
+    /// Wire shape:
+    /// `{ "type": "persona_remove", "id"?: string, "name": string, "confirm": bool }`.
+    PersonaRemove {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Purge a persona ENTIRELY: delete the whole persona root including
+    /// `persona.md`, `memory/`, and `sessions/` (the
+    /// `/persona remove <name> --purge --yes` mirror). Requires
+    /// `"confirm": true`; anything else is rejected before any filesystem
+    /// mutation. Returns `{ "name": name, "purged": true, "message": text }`.
+    /// Wire shape:
+    /// `{ "type": "persona_purge", "id"?: string, "name": string, "confirm": bool }`.
+    PersonaPurge {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    /// Prefer a persona for unnamed task spawns (the
+    /// `/persona <name> --select` mirror). The persona must be trusted and
+    /// enabled. Returns `{ "name": name, "preferred": true, "message": text }`.
+    /// Wire shape: `{ "type": "persona_select", "id"?: string, "name": string }`.
+    PersonaSelect {
+        #[serde(default)]
+        id: Option<String>,
+        name: String,
+    },
+    /// Clear the preferred persona (the `/persona --clear` mirror). Returns
+    /// `{ "preferred": null, "message": text }`.
+    /// Wire shape: `{ "type": "persona_clear", "id"?: string }`.
+    PersonaClear {
+        #[serde(default)]
+        id: Option<String>,
+    },
+    /// Report the currently preferred agent/persona (the `/persona --current`
+    /// mirror). Returns `{ "name": string | null, "message": text }`.
+    /// Wire shape: `{ "type": "persona_current", "id"?: string }`.
+    PersonaCurrent {
         #[serde(default)]
         id: Option<String>,
     },
@@ -664,7 +908,7 @@ impl RpcCommand {
             | Self::Bash { id, .. }
             | Self::AbortBash { id }
             | Self::GetSessionStats { id }
-            | Self::SessionList { id }
+            | Self::SessionList { id, .. }
             | Self::ExportHtml { id, .. }
             | Self::SwitchSession { id, .. }
             | Self::Fork { id, .. }
@@ -736,12 +980,31 @@ impl RpcCommand {
             | Self::JobCancel { id, .. }
             | Self::HubSend { id, .. }
             | Self::JobOutput { id, .. }
+            | Self::AgentHistory { id, .. }
             | Self::CollabStart { id, .. }
             | Self::CollabStatus { id, .. }
             | Self::CollabStop { id, .. }
-            | Self::CloseSession { id }
             | Self::RealtimeCreateCall { id, .. }
-            | Self::RealtimeStop { id } => id.clone(),
+            | Self::RealtimeStop { id }
+            | Self::SttTranscribe { id, .. }
+            | Self::CodeReviewOpen { id, .. }
+            | Self::CodeReviewSnapshot { id }
+            | Self::CodeReviewRefresh { id }
+            | Self::CodeReviewComment { id, .. }
+            | Self::CodeReviewAbort { id }
+            | Self::CodeReviewClose { id }
+            | Self::CodeReviewFileDiff { id, .. }
+            | Self::CloseSession { id }
+            | Self::Skill { id, .. }
+            | Self::PersonaList { id }
+            | Self::PersonaGet { id, .. }
+            | Self::PersonaCreate { id, .. }
+            | Self::PersonaEdit { id, .. }
+            | Self::PersonaRemove { id, .. }
+            | Self::PersonaPurge { id, .. }
+            | Self::PersonaSelect { id, .. }
+            | Self::PersonaClear { id }
+            | Self::PersonaCurrent { id } => id.clone(),
         }
     }
     pub(crate) const fn command_name(&self) -> &'static str {
@@ -839,12 +1102,31 @@ impl RpcCommand {
             Self::JobCancel { .. } => "job_cancel",
             Self::HubSend { .. } => "hub_send",
             Self::JobOutput { .. } => "job_output",
+            Self::AgentHistory { .. } => "agent_history",
             Self::CollabStart { .. } => "collab_start",
             Self::CollabStatus { .. } => "collab_status",
             Self::CollabStop { .. } => "collab_stop",
             Self::CloseSession { .. } => "close_session",
             Self::RealtimeCreateCall { .. } => "realtime_create_call",
             Self::RealtimeStop { .. } => "realtime_stop",
+            Self::SttTranscribe { .. } => "stt_transcribe",
+            Self::CodeReviewOpen { .. } => "code_review_open",
+            Self::CodeReviewSnapshot { .. } => "code_review_snapshot",
+            Self::CodeReviewRefresh { .. } => "code_review_refresh",
+            Self::CodeReviewComment { .. } => "code_review_comment",
+            Self::CodeReviewAbort { .. } => "code_review_abort",
+            Self::CodeReviewClose { .. } => "code_review_close",
+            Self::CodeReviewFileDiff { .. } => "code_review_file_diff",
+            Self::Skill { .. } => "skill",
+            Self::PersonaList { .. } => "persona_list",
+            Self::PersonaGet { .. } => "persona_get",
+            Self::PersonaCreate { .. } => "persona_create",
+            Self::PersonaEdit { .. } => "persona_edit",
+            Self::PersonaRemove { .. } => "persona_remove",
+            Self::PersonaPurge { .. } => "persona_purge",
+            Self::PersonaSelect { .. } => "persona_select",
+            Self::PersonaClear { .. } => "persona_clear",
+            Self::PersonaCurrent { .. } => "persona_current",
         }
     }
 
@@ -897,6 +1179,10 @@ impl RpcCommand {
                 | Self::CollabStop { .. }
                 | Self::CloseSession { .. }
                 | Self::RealtimeStop { .. }
+                | Self::CodeReviewSnapshot { .. }
+                | Self::CodeReviewComment { .. }
+                | Self::CodeReviewAbort { .. }
+                | Self::CodeReviewClose { .. }
         )
     }
 
@@ -909,9 +1195,10 @@ impl RpcCommand {
                 | Self::LoopCancel { .. }
                 | Self::ProcessSignal { .. }
                 | Self::ProcessStop { .. }
-                | Self::CollabStop { .. }
                 | Self::CloseSession { .. }
                 | Self::RealtimeStop { .. }
+                | Self::CodeReviewAbort { .. }
+                | Self::CodeReviewClose { .. }
         )
     }
 }
@@ -926,8 +1213,16 @@ pub(crate) struct RpcExtensionUiResponse {
     #[serde(default)]
     cancelled: Option<bool>,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcSessionListScope {
+    #[default]
+    Current,
+    AllProjects,
+}
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+
 pub struct RpcSessionState {
     pub model: Option<Model>,
     pub thinking_level: ThinkingLevel,
@@ -989,10 +1284,18 @@ pub struct RpcSessionListRow {
     pub size: u64,
     pub message_count: Option<usize>,
     pub status: String,
+    /// True when the row is an unnamed, tiny, native Pi session whose cwd
+    /// sits lexically under the OS temp root (historical test-harness
+    /// shape). The Web sidebar hides such rows by default but keeps them
+    /// searchable, and loaded/active sessions always stay visible; this is a
+    /// recoverable view signal, never a backend deletion. Computed for the
+    /// Web AllProjects scope; Current-scope rows always report false (the
+    /// current workspace is by definition in active use).
+    pub temporary: bool,
 }
 
 impl RpcSessionListRow {
-    fn from_resume_row(row: crate::resume_catalog::ResumeSelectorRow) -> Self {
+    fn from_resume_row(row: crate::resume_catalog::ResumeSelectorRow, temporary: bool) -> Self {
         Self {
             source: row.source.label(),
             session_id: row.session_id,
@@ -1005,6 +1308,7 @@ impl RpcSessionListRow {
             size: row.size,
             message_count: row.message_count,
             status: row.status.is_native().then_some("native").unwrap_or("foreign").to_owned(),
+            temporary,
         }
     }
 }
@@ -1101,27 +1405,39 @@ pub(crate) struct RpcDispatcher {
     workflows: crate::workflow_rpc::WorkflowRpcState,
     command_slots: Arc<Semaphore>,
     side_chat: SideChatRpcState,
+    code_review: CodeReviewRpcState,
+    session_storage: Option<crate::session_run::SessionStorage>,
 }
 
 impl RpcDispatcher {
     #[must_use]
     pub(crate) fn new(application: Application) -> Self {
+        Self::new_with_session_storage(application, None)
+    }
+
+    #[must_use]
+    pub(crate) fn new_with_session_storage(
+        application: Application,
+        session_storage: Option<crate::session_run::SessionStorage>,
+    ) -> Self {
         Self {
             settings: crate::settings_rpc::SettingsRpcState::default(),
             workflows: crate::workflow_rpc::WorkflowRpcState::for_application(&application),
             application,
             command_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMANDS)),
             side_chat: SideChatRpcState::default(),
+            code_review: CodeReviewRpcState::default(),
+            session_storage,
         }
     }
 
     pub(crate) fn application(&self) -> &Application {
         &self.application
     }
-
-    /// Dispatch a command with this dispatcher's full state. Side-chat
-    /// commands live outside the settings/workflows handler because the tabs
-    /// are controller state owned by the RPC session, not by the application.
+    /// Dispatch a command with this dispatcher's full state. Side-chat and
+    /// code-review commands live outside the settings/workflows handler
+    /// because their controller state is owned by the RPC session, not by the
+    /// application.
     pub(crate) async fn dispatch_inner(&self, command: RpcCommand) -> RpcResponse {
         if matches!(
             command,
@@ -1133,10 +1449,23 @@ impl RpcDispatcher {
         ) {
             return handle_side_chat_command(&self.application, &self.side_chat, command).await;
         }
-        handle_command(
+        if matches!(
+            command,
+            RpcCommand::CodeReviewOpen { .. }
+                | RpcCommand::CodeReviewSnapshot { .. }
+                | RpcCommand::CodeReviewRefresh { .. }
+                | RpcCommand::CodeReviewComment { .. }
+                | RpcCommand::CodeReviewAbort { .. }
+                | RpcCommand::CodeReviewClose { .. }
+                | RpcCommand::CodeReviewFileDiff { .. }
+        ) {
+            return handle_code_review_command(&self.application, &self.code_review, command).await;
+        }
+        handle_command_with_session_storage(
             &self.application,
             &self.settings,
             &self.workflows,
+            self.session_storage.as_ref(),
             command,
         )
         .await
@@ -1168,6 +1497,18 @@ impl RpcDispatcher {
     /// streaming a reply (part of the conservative close busy check).
     pub(crate) async fn side_chat_busy(&self) -> bool {
         self.side_chat.is_streaming().await
+    }
+
+    /// Shut down the RPC-owned code-review controller (session close /
+    /// listener shutdown).
+    pub(crate) async fn shutdown_code_review(&self) {
+        self.code_review.shutdown().await;
+    }
+
+    /// Whether the RPC-owned code-review controller has an in-flight review
+    /// turn (part of the conservative close busy check).
+    pub(crate) async fn code_review_busy(&self) -> bool {
+        self.code_review.is_streaming().await
     }
 }
 
@@ -1347,6 +1688,507 @@ async fn handle_side_chat_command(
         Err(e) => RpcResponse::failure(id, name, e.to_string()),
     }
 }
+/// RPC-owned code-review controller + snapshot state.
+///
+/// `/code-review` is fullscreen TUI controller state (forked read-only agent
+/// + per-hunk threads), so the RPC session owns a lazily-created
+/// [`CodeReviewController`] paired with the last loaded [`ReviewSnapshot`].
+/// Every code-review command serializes through one mutex; the review agent
+/// never touches the main session, mirroring the TUI surface exactly. State
+/// is per-`RpcDispatcher` (per-session), so two Web sessions never share a
+/// review controller.
+struct CodeReviewSession {
+    controller: CodeReviewController,
+    snapshot: ReviewSnapshot,
+    /// Per-path single-file diff cache for the paging RPC. Built lazily on
+    /// first `code_review_file_diff` for a path; cleared on open/refresh so a
+    /// stale snapshot never serves cached pages from an older capture.
+    file_diff_cache: HashMap<String, Arc<FileDiff>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CodeReviewRpcState {
+    session: Arc<tokio::sync::Mutex<Option<CodeReviewSession>>>,
+}
+
+impl CodeReviewRpcState {
+    /// Open a bounded HEAD→working-tree or two-revision diff snapshot and
+    /// fork a fresh read-only review agent. Any previously open review is
+    /// shut down first (clean cutover, no leaked controller). `from`/`to`
+    /// must both be present or both absent.
+    async fn open(
+        &self,
+        app: &Application,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Result<Value> {
+        let scope = match (from, to) {
+            (None, None) => ReviewScope::WorkingTree,
+            (Some(from), Some(to)) => ReviewScope::Revisions { from, to },
+            _ => bail!("code_review_open requires `from` and `to` together, or neither"),
+        };
+        let mut guard = self.session.lock().await;
+        let cwd = app.session().cwd().to_path_buf();
+        // Git acquisition is blocking and must run off the async runtime.
+        let snapshot = tokio::task::spawn_blocking(move || load_review_snapshot_for(&cwd, scope))
+            .await
+            .map_err(|e| anyhow!("code review snapshot load failed: {e}"))?;
+        let mut controller = CodeReviewController::fork_from(app).await?;
+        controller.reconcile_snapshot(&snapshot);
+        if let Some(mut old) = guard.take() {
+            old.controller.shutdown().await;
+        }
+        *guard = Some(CodeReviewSession {
+            controller,
+            snapshot,
+            file_diff_cache: HashMap::new(),
+        });
+        let session = guard.as_ref().expect("code review session stored");
+        Ok(code_review_projection(&session.snapshot, &session.controller))
+    }
+
+    /// Re-project the currently open review snapshot and controller state.
+    async fn snapshot(&self) -> Result<Value> {
+        let mut guard = self.session.lock().await;
+        let Some(session) = guard.as_mut() else {
+            bail!("no open code review; call code_review_open first");
+        };
+        session.controller.poll_events();
+        Ok(code_review_projection(&session.snapshot, &session.controller))
+    }
+
+    /// Reload the review snapshot (re-run the bounded git acquisition) and
+    /// reconcile existing threads onto the new hunk identities.
+    async fn refresh(&self, app: &Application) -> Result<Value> {
+        let mut guard = self.session.lock().await;
+        let Some(session) = guard.as_mut() else {
+            bail!("no open code review; call code_review_open first");
+        };
+        let scope = session.snapshot.scope.clone();
+        let cwd = app.session().cwd().to_path_buf();
+        let snapshot = tokio::task::spawn_blocking(move || load_review_snapshot_for(&cwd, scope))
+            .await
+            .map_err(|e| anyhow!("code review snapshot reload failed: {e}"))?;
+        session.controller.poll_events();
+        session.controller.reconcile_snapshot(&snapshot);
+        session.snapshot = snapshot;
+        session.file_diff_cache.clear();
+        Ok(code_review_projection(&session.snapshot, &session.controller))
+    }
+
+    /// Attach a comment to a specific hunk. The full hunk identity must match
+    /// the current snapshot exactly; a stale snapshot/path/range/contentHash
+    /// is rejected before the review agent is ever prompted.
+    async fn comment(
+        &self,
+        snapshot_id: &str,
+        path: &str,
+        old_start: u32,
+        old_count: u32,
+        new_start: u32,
+        new_count: u32,
+        content_hash: &str,
+        comment: &str,
+    ) -> Result<Value> {
+        let mut guard = self.session.lock().await;
+        let Some(session) = guard.as_mut() else {
+            bail!("no open code review; call code_review_open first");
+        };
+        session.controller.poll_events();
+        let (file, hunk) = resolve_comment_target(
+            &session.snapshot,
+            snapshot_id,
+            path,
+            old_start,
+            old_count,
+            new_start,
+            new_count,
+            content_hash,
+        )?;
+        let accepted = session
+            .controller
+            .submit_comment(&session.snapshot, file, hunk, comment);
+        if !accepted {
+            bail!("code review comment was not accepted (a turn may be streaming or the comment is empty)");
+        }
+        Ok(code_review_projection(&session.snapshot, &session.controller))
+    }
+
+    /// Abort the in-flight review agent turn for the active hunk.
+    async fn abort(&self) -> Result<Value> {
+        let mut guard = self.session.lock().await;
+        let Some(session) = guard.as_mut() else {
+            bail!("no open code review; call code_review_open first");
+        };
+        session.controller.abort().await;
+        session.controller.poll_events();
+        Ok(code_review_projection(&session.snapshot, &session.controller))
+    }
+
+    /// Close the open review: shut down the review agent and drop state.
+    async fn close(&self) -> Result<Value> {
+        let mut guard = self.session.lock().await;
+        let Some(mut session) = guard.take() else {
+            bail!("no open code review; call code_review_open first");
+        };
+        session.controller.shutdown().await;
+        Ok(json!({"closed": true}))
+    }
+
+    /// Shut down any open review controller (RPC session exit / listener
+    /// shutdown). Never errors: a missing review is a no-op.
+    async fn shutdown(&self) {
+        let mut guard = self.session.lock().await;
+        if let Some(mut session) = guard.take() {
+            session.controller.shutdown().await;
+        }
+    }
+
+    /// Whether a review turn is in flight (close busy check). Drains pending
+    /// events first so a just-finished turn is not misclassified as busy.
+    async fn is_streaming(&self) -> bool {
+        let mut guard = self.session.lock().await;
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        session.controller.poll_events();
+        session.controller.is_streaming()
+    }
+    /// Load one bounded page of a single file's full diff. The `snapshotId`
+    /// must match the live snapshot (stale guard), `path` must be one of the
+    /// snapshot's files (containment), and `cursor` is a 0-based line offset.
+    /// The full per-file diff is loaded off the async runtime on first request
+    /// for a path and cached on the session; subsequent pages slice from the
+    /// cache without re-running git. The cache is cleared on open/refresh. If
+    /// the snapshot is refreshed while a load is in flight, the loaded diff is
+    /// discarded (not cached) and the caller sees a stale-snapshot error.
+    async fn file_diff(
+        &self,
+        app: &Application,
+        snapshot_id: &str,
+        path: &str,
+        cursor: usize,
+        max_lines: Option<usize>,
+    ) -> Result<Value> {
+        let normalized = crate::code_review::normalize_repo_path(path);
+        // First pass: validate snapshot id + path containment under the lock
+        // and return a cache hit if present. The lock is released before the
+        // spawn_blocking git call so snapshot polls are not blocked.
+        let (file_clone, scope, cached) = {
+            let mut guard = self.session.lock().await;
+            let Some(session) = guard.as_mut() else {
+                bail!("no open code review; call code_review_open first");
+            };
+            if session.snapshot.snapshot_id != snapshot_id {
+                bail!("code_review_file_diff targets a stale snapshot; refresh the code review");
+            }
+            let file = session
+                .snapshot
+                .files
+                .iter()
+                .find(|f| f.path == normalized)
+                .ok_or_else(|| anyhow!("code_review_file_diff targets an unknown file {path:?}"))?;
+            (
+                file.clone(),
+                session.snapshot.scope.clone(),
+                session.file_diff_cache.get(&normalized).cloned(),
+            )
+        };
+
+        let arc = if let Some(cached) = cached {
+            cached
+        } else {
+            let cwd = app.session().cwd().to_path_buf();
+            let file_for_load = file_clone.clone();
+            let diff = tokio::task::spawn_blocking(move || FileDiff::load(&cwd, &scope, &file_for_load))
+                .await
+                .map_err(|e| anyhow!("code review file diff load failed: {e}"))?;
+            let arc = Arc::new(diff);
+            // Re-lock to store; discard if the snapshot changed meanwhile so a
+            // stale capture never poisons the cache.
+            let mut guard = self.session.lock().await;
+            if let Some(session) = guard.as_mut() {
+                if session.snapshot.snapshot_id == snapshot_id {
+                    session.file_diff_cache.insert(normalized.clone(), arc.clone());
+                }
+            }
+            arc
+        };
+
+        let max = max_lines.unwrap_or(MAX_FILE_PAGE_LINES);
+        let page = arc.slice_page(snapshot_id, cursor, max).map_err(anyhow::Error::msg)?;
+        Ok(file_diff_projection(&page))
+    }
+}
+
+/// Validate that a comment request targets a real hunk in the current
+/// snapshot with a matching identity. Returns the resolved `(file, hunk)` so
+/// the caller can submit the comment. A mismatched `snapshotId`, unknown
+/// path/range, or changed `contentHash` is rejected as stale — this is the
+/// deterministic core (no agent, no network) exercised by unit tests.
+fn resolve_comment_target<'a>(
+    snapshot: &'a ReviewSnapshot,
+    snapshot_id: &str,
+    path: &str,
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+    content_hash: &str,
+) -> Result<(&'a DiffFile, &'a DiffHunk)> {
+    if snapshot.snapshot_id != snapshot_id {
+        bail!("comment targets a stale snapshot; refresh the code review");
+    }
+    let file = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == path)
+        .ok_or_else(|| anyhow!("comment targets an unknown file {path:?}"))?;
+    let hunk = file
+        .hunks
+        .iter()
+        .find(|hunk| {
+            hunk.old_start == old_start
+                && hunk.old_count == old_count
+                && hunk.new_start == new_start
+                && hunk.new_count == new_count
+        })
+        .ok_or_else(|| anyhow!("comment targets an unknown hunk in {path:?}"))?;
+    let identity = snapshot.hunk_identity(file, hunk);
+    if identity.content_hash != content_hash {
+        bail!("comment targets a stale hunk; the diff content has changed");
+    }
+    Ok((file, hunk))
+}
+
+/// Build the wire projection of a review snapshot + controller. The absolute
+/// repository `root` is NEVER included — only repo-relative paths leave the
+/// process. Output stays bounded: git acquisition caps the combined patch at
+/// [`crate::code_review::MAX_DIFF_BYTES`] and the changed-file catalog at
+/// [`crate::code_review::MAX_CATALOG_BYTES`]; files the truncated patch could
+/// not carry project as on-demand placeholders instead of vanishing.
+fn code_review_projection(snapshot: &ReviewSnapshot, controller: &CodeReviewController) -> Value {
+    let files = snapshot
+        .files
+        .iter()
+        .map(|file| {
+            let hunks = file
+                .hunks
+                .iter()
+                .map(|hunk| {
+                    let identity = snapshot.hunk_identity(file, hunk);
+                    let lines = hunk
+                        .lines
+                        .iter()
+                        .map(|line| {
+                            let mut obj = json!({
+                                "kind": diff_line_kind_str(line.kind),
+                                "text": line.text,
+                            });
+                            if let Some(old_no) = line.old_no {
+                                obj["oldNo"] = json!(old_no);
+                            }
+                            if let Some(new_no) = line.new_no {
+                                obj["newNo"] = json!(new_no);
+                            }
+                            obj
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "header": hunk.header,
+                        "oldStart": hunk.old_start,
+                        "oldCount": hunk.old_count,
+                        "newStart": hunk.new_start,
+                        "newCount": hunk.new_count,
+                        "contentHash": identity.content_hash,
+                        "lines": lines,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut file_obj = json!({
+                "path": file.path,
+                "status": file.status.label(),
+                "binary": file.binary,
+                "insertions": file.insertions,
+                "deletions": file.deletions,
+                "truncated": file.truncated,
+                "hunks": hunks,
+            });
+            if let Some(previous_path) = &file.previous_path {
+                file_obj["previousPath"] = json!(previous_path);
+            }
+            if let Some(message) = &file.message {
+                file_obj["message"] = json!(message);
+            }
+            file_obj
+        })
+        .collect::<Vec<_>>();
+
+    let threads = controller
+        .threads()
+        .values()
+        .map(|thread| {
+            json!({
+                "identity": hunk_identity_projection(&thread.identity),
+                "comments": thread.comments.iter().map(|comment| json!({
+                    "role": review_role_str(comment.role),
+                    "text": comment.text,
+                    "partial": comment.partial,
+                })).collect::<Vec<_>>(),
+                "streamingText": thread.streaming_text,
+                "error": thread.error,
+                "stale": thread.stale,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "comparisonLabel": snapshot.comparison_label(),
+        "snapshotId": snapshot.snapshot_id,
+        "truncated": snapshot.truncated,
+        "error": snapshot.error,
+        "totalInsertions": snapshot.total_insertions(),
+        "totalDeletions": snapshot.total_deletions(),
+        "files": files,
+        "threads": threads,
+        "isStreaming": controller.is_streaming(),
+        "activeHunk": controller.active_hunk().map(hunk_identity_projection),
+    })
+}
+
+/// Wire projection of a [`crate::code_review::HunkIdentity`].
+fn hunk_identity_projection(identity: &crate::code_review::HunkIdentity) -> Value {
+    json!({
+        "snapshotId": identity.snapshot_id,
+        "path": identity.path,
+        "oldStart": identity.old_start,
+        "oldCount": identity.old_count,
+        "newStart": identity.new_start,
+        "newCount": identity.new_count,
+        "contentHash": identity.content_hash,
+    })
+}
+
+fn diff_line_kind_str(kind: DiffLineKind) -> &'static str {
+    match kind {
+        DiffLineKind::Context => "context",
+        DiffLineKind::Addition => "addition",
+        DiffLineKind::Deletion => "deletion",
+        DiffLineKind::Meta => "meta",
+    }
+}
+
+/// Wire projection of a single [`FileDiffPage`]. Lines preserve their order
+/// across pages; `nextCursor` is absent on the final page. Output stays well
+/// under the WS frame limit — the page is bounded by line count and bytes in
+/// [`FileDiff::slice_page`].
+fn file_diff_projection(page: &FileDiffPage) -> Value {
+    let lines = page
+        .lines
+        .iter()
+        .map(|line| {
+            let mut obj = json!({
+                "kind": diff_line_kind_str(line.kind),
+                "text": line.text,
+            });
+            if let Some(old_no) = line.old_no {
+                obj["oldNo"] = json!(old_no);
+            }
+            if let Some(new_no) = line.new_no {
+                obj["newNo"] = json!(new_no);
+            }
+            obj
+        })
+        .collect::<Vec<_>>();
+    let mut out = json!({
+        "snapshotId": page.snapshot_id,
+        "path": page.path,
+        "binary": page.binary,
+        "status": page.status.label(),
+        "lines": lines,
+        "cursor": page.cursor,
+        "hasMore": page.has_more,
+        "totalLines": page.total_lines,
+        "truncated": page.truncated,
+    });
+    if let Some(previous_path) = &page.previous_path {
+        out["previousPath"] = json!(previous_path);
+    }
+    if let Some(next_cursor) = page.next_cursor {
+        out["nextCursor"] = json!(next_cursor);
+    }
+    out
+}
+
+fn review_role_str(role: ReviewCommentRole) -> &'static str {
+    match role {
+        ReviewCommentRole::User => "user",
+        ReviewCommentRole::Assistant => "assistant",
+        ReviewCommentRole::System => "system",
+    }
+}
+
+/// Dispatch a code-review RPC command against the RPC-owned controller.
+async fn handle_code_review_command(
+    app: &Application,
+    code_review: &CodeReviewRpcState,
+    c: RpcCommand,
+) -> RpcResponse {
+    let id = c.id();
+    let name = c.command_name();
+    let result: Result<Value> = async {
+        match c {
+            RpcCommand::CodeReviewOpen { from, to, .. } => {
+                code_review.open(app, from, to).await
+            }
+            RpcCommand::CodeReviewSnapshot { .. } => code_review.snapshot().await,
+            RpcCommand::CodeReviewRefresh { .. } => code_review.refresh(app).await,
+            RpcCommand::CodeReviewComment {
+                snapshot_id,
+                path,
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                content_hash,
+                comment,
+                ..
+            } => {
+                code_review
+                    .comment(
+                        &snapshot_id,
+                        &path,
+                        old_start,
+                        old_count,
+                        new_start,
+                        new_count,
+                        &content_hash,
+                        &comment,
+                    )
+                    .await
+            }
+            RpcCommand::CodeReviewAbort { .. } => code_review.abort().await,
+            RpcCommand::CodeReviewClose { .. } => code_review.close().await,
+            RpcCommand::CodeReviewFileDiff {
+                snapshot_id,
+                path,
+                cursor,
+                max_lines,
+                ..
+            } => {
+                code_review
+                    .file_diff(app, &snapshot_id, &path, cursor, max_lines)
+                    .await
+            }
+            _ => unreachable!("dispatch_inner only routes code_review_* commands here"),
+        }
+    }
+    .await;
+    match result {
+        Ok(data) => RpcResponse::success(id, name, Some(data)),
+        Err(e) => RpcResponse::failure(id, name, e.to_string()),
+    }
+}
 
 pub(crate) fn project_application_event(event: ApplicationEvent) -> Result<Value> {
     match event {
@@ -1383,6 +2225,7 @@ pub(crate) fn project_application_event(event: ApplicationEvent) -> Result<Value
         event => Ok(serde_json::to_value(event)?),
     }
 }
+
 
 pub(crate) fn project_extension_ui_event(
     event: ExtensionUiEvent,
@@ -1968,19 +2811,74 @@ async fn handle_command(
     app: &Application,
     settings: &crate::settings_rpc::SettingsRpcState,
     workflows: &crate::workflow_rpc::WorkflowRpcState,
+    command: RpcCommand,
+) -> RpcResponse {
+    handle_command_with_session_storage(app, settings, workflows, None, command).await
+}
+
+async fn handle_command_with_session_storage(
+    app: &Application,
+    settings: &crate::settings_rpc::SettingsRpcState,
+    workflows: &crate::workflow_rpc::WorkflowRpcState,
+    session_storage: Option<&crate::session_run::SessionStorage>,
     c: RpcCommand,
 ) -> RpcResponse {
     let id = c.id();
     let name = c.command_name();
-    match handle_command_inner(app, settings, workflows, c).await {
+    match handle_command_inner(app, settings, workflows, session_storage, c).await {
         Ok(data) => RpcResponse::success(id, name, data),
         Err(e) => RpcResponse::failure(id, name, e.to_string()),
     }
 }
+/// Upper bound for persona definition content returned over RPC. The core
+/// discovery bound (`MAX_AGENT_DEFINITION_BYTES`, 256 KiB) already caps every
+/// discoverable `persona.md`; the wire cap matches it so a get never returns
+/// more than the core would ever load, and the truncation flag keeps the
+/// client honest about partial content.
+const MAX_PERSONA_RPC_CONTENT_BYTES: usize = 256 * 1024;
+
+/// One path-free persona row for the Web catalog (the `/persona` list
+/// mirror). State-count errors collapse to the fixed literal `"unreadable"`
+/// so no filesystem path text ever crosses the wire.
+fn persona_row_json(definition: &pi_coding::AgentDefinition, preferred: Option<&str>) -> Value {
+    let counts = crate::agents_panel::persona_state_counts(definition.persona_root());
+    let source = match definition.source {
+        pi_coding::AgentDefinitionSource::Project => "project",
+        pi_coding::AgentDefinitionSource::User => "user",
+        pi_coding::AgentDefinitionSource::Bundled => "bundled",
+    };
+    json!({
+        "name": definition.name,
+        "description": definition.description,
+        "source": source,
+        "trusted": definition.trusted,
+        "preferred": preferred == Some(definition.name.as_str()),
+        "contractSummary": crate::agents_panel::persona_contract_summary(definition),
+        "memoryEntries": counts.memory_entries,
+        "sessionCount": counts.transcript_count,
+        "stateError": counts.error.as_ref().map(|_| "unreadable"),
+    })
+}
+
+/// Loaded persona definitions (persona-kind only, discovery order) from the
+/// session's resource snapshot; `None` when the session has no resource
+/// manager.
+fn persona_definitions(app: &Application) -> Option<Vec<pi_coding::AgentDefinition>> {
+    app.resource_snapshot().map(|snapshot| {
+        snapshot
+            .agents
+            .iter()
+            .filter(|definition| definition.is_persona())
+            .cloned()
+            .collect::<Vec<_>>()
+    })
+}
+
 async fn handle_command_inner(
     app: &Application,
     settings: &crate::settings_rpc::SettingsRpcState,
     workflows: &crate::workflow_rpc::WorkflowRpcState,
+    session_storage: Option<&crate::session_run::SessionStorage>,
     c: RpcCommand,
 ) -> Result<Option<Value>> {
     match c {
@@ -2167,30 +3065,70 @@ async fn handle_command_inner(
             Ok(None)
         }
         RpcCommand::GetSessionStats { .. } => Ok(Some(serde_json::to_value(app.session_stats())?)),
-        RpcCommand::SessionList { .. } => {
+        RpcCommand::SessionList { scope, .. } => {
             let session = app.session();
-            let catalog = pi_coding::SessionCatalog::from_env()?
-                .with_native_session_root(session.session_dir());
+            let catalog = match scope {
+                RpcSessionListScope::Current => pi_coding::SessionCatalog::from_env()?
+                    .with_native_session_root(session.session_dir()),
+                RpcSessionListScope::AllProjects => session_storage
+                    .ok_or_else(|| anyhow!("all-project session catalog is unavailable outside the Web listener"))?
+                    .catalog()?,
+            };
+            let cwd_scope = matches!(scope, RpcSessionListScope::Current)
+                .then(|| session.cwd().to_path_buf());
             let rows = crate::resume_catalog::load_resume_catalog(
                 &catalog,
                 &crate::resume_catalog::ResumeCatalogRequest {
-                    sources: crate::resume_catalog::effective_resume_sources(app),
-                    cwd_scope: Some(session.cwd().to_path_buf()),
+                    sources: match scope {
+                        RpcSessionListScope::Current => {
+                            crate::resume_catalog::effective_resume_sources(app)
+                        }
+                        RpcSessionListScope::AllProjects => {
+                            crate::resume_catalog::web_resume_sources(app)
+                        }
+                    },
+                    cwd_scope,
                     ..crate::resume_catalog::ResumeCatalogRequest::default()
                 },
             )?;
+            let rows = match scope {
+                RpcSessionListScope::Current => rows
+                    .rows
+                    .into_iter()
+                    .map(|row| (row, false))
+                    .collect::<Vec<_>>(),
+                RpcSessionListScope::AllProjects => {
+                    let rows = crate::resume_catalog::filter_web_noise_rows(
+                        crate::resume_catalog::coalesce_web_import_rows(rows.rows),
+                    );
+                    let (regular, temporary) =
+                        crate::resume_catalog::partition_web_noise_rows(rows);
+                    regular
+                        .into_iter()
+                        .map(|row| (row, false))
+                        .chain(temporary.into_iter().map(|row| (row, true)))
+                        .collect::<Vec<_>>()
+                }
+            };
             // The catalog reads persisted session files; the live recorder's
-            // name is authoritative and may not have flushed yet (a fresh
-            // session with no assistant turn keeps appends in memory), so
-            // overlay it onto the current session's row.
+            // name is authoritative and may not have flushed yet, so overlay
+            // it only onto the row for the same physical recorder.
             let live_name = session.session_name();
-            let live_id = session.recorder_info().map(|(id, _)| id);
+            let live_identity = session.recorder_info().map(|(id, path)| {
+                (id, crate::modes::session_runtime_manager::canonical_session_path(&path))
+            });
             let sessions = rows
-                .rows
                 .into_iter()
-                .map(|row| {
-                    let mut row = RpcSessionListRow::from_resume_row(row);
-                    if live_name.is_some() && Some(row.session_id.as_str()) == live_id.as_deref() {
+                .map(|(row, temporary)| {
+                    let mut row = RpcSessionListRow::from_resume_row(row, temporary);
+                    let row_path = crate::modes::session_runtime_manager::canonical_session_path(
+                        Path::new(&row.path),
+                    );
+                    if live_name.is_some()
+                        && live_identity.as_ref().is_some_and(|(id, path)| {
+                            id == &row.session_id && path == &row_path
+                        })
+                    {
                         row.name = live_name.clone();
                     }
                     row
@@ -2272,17 +3210,171 @@ async fn handle_command_inner(
             Ok(Some(json!({"messages":messages})))
         }
         RpcCommand::GetCommands { .. } => {
-            let commands = crate::interactive_commands::visible_catalog()
+            // Project the Application's collision-free executable catalog —
+            // builtins plus trusted dynamic prompt/skill/extension commands —
+            // so the Web picker can surface loaded skill candidates without a
+            // second hardcoded list. Collision/trust rules reuse
+            // `interactive_commands::executable_catalog` (builtins win, the
+            // first dynamic name wins, conflicting entries are dropped with a
+            // diagnostic). Each skill entry carries a stable `skillName`
+            // (the bare name behind the `skill:<name>` wire name) so the Web
+            // composer can compose `/skill <name>` without re-parsing.
+            let (catalog, _diagnostics) = crate::interactive_commands::executable_catalog(app);
+            let commands = catalog
                 .into_iter()
                 .map(|command| {
+                    let builtin = crate::interactive_commands::builtin(&command.name);
+                    let skill_name =
+                        if command.source == crate::interactive_commands::CommandSource::Skill {
+                            command.name.strip_prefix("skill:").map(str::to_owned)
+                        } else {
+                            None
+                        };
                     json!({
                         "name": command.name,
                         "description": command.description,
                         "source": command_source_str(command.source),
+                        "argumentHint": builtin.and_then(|command| command.argument_hint),
+                        "requiresArguments": builtin.is_some_and(|command| command.requires_arguments),
+                        "skillName": skill_name,
                     })
                 })
                 .collect::<Vec<_>>();
             Ok(Some(json!({"commands":commands})))
+        }
+        RpcCommand::Skill { name, .. } => {
+            let name = name.trim();
+            if name.is_empty() {
+                bail!("skill name is required");
+            }
+            let summary = crate::interactive_commands::skill_frontmatter_summary(app, name)
+                .ok_or_else(|| anyhow!("unknown skill '{name}'"))?;
+            Ok(Some(json!({ "name": name, "summary": summary })))
+        }
+        RpcCommand::PersonaList { .. } => {
+            let Some(personas) = persona_definitions(app) else {
+                return Ok(Some(json!({ "enabled": false, "personas": [] })));
+            };
+            let preferred = crate::interactive_commands::current_preferred_agent(app);
+            let rows = personas
+                .iter()
+                .map(|definition| persona_row_json(definition, preferred.as_deref()))
+                .collect::<Vec<_>>();
+            Ok(Some(json!({ "enabled": true, "personas": rows })))
+        }
+        RpcCommand::PersonaGet { name, .. } => {
+            let Some(personas) = persona_definitions(app) else {
+                bail!("persona catalog is unavailable in this session");
+            };
+            let preferred = crate::interactive_commands::current_preferred_agent(app);
+            let definition = personas
+                .iter()
+                .find(|definition| definition.name == name)
+                .ok_or_else(|| {
+                    anyhow!("unknown persona {name:?}; persona_list lists available personas")
+                })?;
+            let content = crate::interactive_commands::persona_editor_seed(
+                app,
+                &name,
+                crate::interactive_commands::PersonaEditKind::Edit,
+            )
+            .with_context(|| format!("reading persona {name:?} definition"))?;
+            // Byte-cap on a UTF-8 char boundary so truncation never splits a
+            // codepoint (the core bound is 256 KiB of bytes). Walk back at
+            // most 3 continuation bytes — `floor_char_boundary` is not
+            // available on the pinned toolchain.
+            let (content, content_truncated) = if content.len() > MAX_PERSONA_RPC_CONTENT_BYTES {
+                let mut end = MAX_PERSONA_RPC_CONTENT_BYTES;
+                while end > 0 && !content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                (content[..end].to_owned(), true)
+            } else {
+                (content, false)
+            };
+            let mut row = persona_row_json(definition, preferred.as_deref());
+            if let Some(object) = row.as_object_mut() {
+                object.insert("content".to_owned(), json!(content));
+                object.insert("contentTruncated".to_owned(), json!(content_truncated));
+            }
+            Ok(Some(row))
+        }
+        RpcCommand::PersonaCreate { name, content, .. } => {
+            let message = crate::interactive_commands::commit_persona_definition(
+                app,
+                &name,
+                &content,
+                crate::interactive_commands::PersonaEditKind::New,
+            )
+            .await
+            // The commit chain is path-free by construction (relative probe
+            // paths only, persona FS contexts carry fixed labels), so the
+            // FULL chain — including the frontmatter validation root cause —
+            // is safe to surface on the wire.
+            .map_err(|error| anyhow!("{}", format!("{error:#}")))?;
+            Ok(Some(json!({ "name": name, "created": true, "message": message })))
+        }
+        RpcCommand::PersonaEdit { name, content, .. } => {
+            let message = crate::interactive_commands::commit_persona_definition(
+                app,
+                &name,
+                &content,
+                crate::interactive_commands::PersonaEditKind::Edit,
+            )
+            .await
+            .map_err(|error| anyhow!("{}", format!("{error:#}")))?;
+            Ok(Some(json!({ "name": name, "edited": true, "message": message })))
+        }
+        RpcCommand::PersonaRemove { name, confirm, .. } => {
+            if !confirm {
+                bail!(
+                    "persona_remove requires confirm: true (mirrors /persona remove <name> --yes); refusing without confirmation"
+                );
+            }
+            let message = crate::interactive_commands::execute_interactive_persona_command(
+                app,
+                crate::interactive_commands::InteractivePersonaCommand::Remove { name: name.clone() },
+            )
+            .await?;
+            Ok(Some(json!({ "name": name, "removed": true, "message": message })))
+        }
+        RpcCommand::PersonaPurge { name, confirm, .. } => {
+            if !confirm {
+                bail!(
+                    "persona_purge requires confirm: true (mirrors /persona remove <name> --purge --yes); refusing without confirmation"
+                );
+            }
+            let message = crate::interactive_commands::execute_interactive_persona_command(
+                app,
+                crate::interactive_commands::InteractivePersonaCommand::Purge { name: name.clone() },
+            )
+            .await?;
+            Ok(Some(json!({ "name": name, "purged": true, "message": message })))
+        }
+        RpcCommand::PersonaSelect { name, .. } => {
+            let message = crate::interactive_commands::execute_interactive_persona_command(
+                app,
+                crate::interactive_commands::InteractivePersonaCommand::Select { name: name.clone() },
+            )
+            .await?;
+            Ok(Some(json!({ "name": name, "preferred": true, "message": message })))
+        }
+        RpcCommand::PersonaClear { .. } => {
+            let message = crate::interactive_commands::execute_interactive_persona_command(
+                app,
+                crate::interactive_commands::InteractivePersonaCommand::Clear,
+            )
+            .await?;
+            Ok(Some(json!({ "preferred": serde_json::Value::Null, "message": message })))
+        }
+        RpcCommand::PersonaCurrent { .. } => {
+            let message = crate::interactive_commands::execute_interactive_persona_command(
+                app,
+                crate::interactive_commands::InteractivePersonaCommand::Current,
+            )
+            .await?;
+            let name = crate::interactive_commands::current_preferred_agent(app);
+            Ok(Some(json!({ "name": name, "message": message })))
         }
         RpcCommand::SetTodos { workflow_id, phases, .. } => {
             let result = match workflow_id {
@@ -2541,6 +3633,17 @@ async fn handle_command_inner(
                 .ok_or_else(|| anyhow!("no orchestration job with id {job_id:?}"))?;
             Ok(Some(json!({"job": job})))
         }
+        RpcCommand::AgentHistory { agent_id, lines, .. } => {
+            let runtime = app
+                .orchestration_runtime()
+                .ok_or_else(|| anyhow!("orchestration is not enabled in this session"))?;
+            let lines = lines.unwrap_or(DEFAULT_RPC_HISTORY_LINES);
+            if !(1..=pi_coding::MAX_HISTORY_LINES).contains(&lines) {
+                bail!("lines must be between 1 and {}", pi_coding::MAX_HISTORY_LINES);
+            }
+            let text = runtime.read_child_history(&agent_id, lines)?;
+            Ok(Some(json!({"agentId": agent_id, "text": text})))
+        }
         // Side-chat commands never reach the settings/workflows handler:
         // RpcDispatcher::dispatch_inner routes them to
         // handle_side_chat_command with the RPC-owned tab container.
@@ -2550,6 +3653,18 @@ async fn handle_command_inner(
         | RpcCommand::SideChatPrompt { .. }
         | RpcCommand::SideChatList { .. } => {
             unreachable!("side_chat_* commands must be routed by dispatch_inner")
+        }
+        // Code-review commands are RPC-session controller state and are
+        // routed by dispatch_inner to handle_code_review_command; the
+        // settings/workflows handler never sees them.
+        RpcCommand::CodeReviewOpen { .. }
+        | RpcCommand::CodeReviewSnapshot { .. }
+        | RpcCommand::CodeReviewRefresh { .. }
+        | RpcCommand::CodeReviewComment { .. }
+        | RpcCommand::CodeReviewAbort { .. }
+        | RpcCommand::CodeReviewClose { .. }
+        | RpcCommand::CodeReviewFileDiff { .. } => {
+            unreachable!("code_review_* commands must be routed by dispatch_inner")
         }
         // The listen transport intercepts collaboration lifecycle commands;
         // stdio RPC has no room registry or reachable listener origin.
@@ -2567,6 +3682,14 @@ async fn handle_command_inner(
             Ok(Some(realtime_create_call(&live, &sdp_offer).await?))
         }
         RpcCommand::RealtimeStop { .. } => Ok(Some(json!({"stopped": true}))),
+        // STT voice proxy (hold-to-talk): the browser sends ONLY the bounded
+        // recording; the endpoint URL and bearer key stay in the server-held
+        // live settings (never accepted from the client, never exposed to the
+        // frontend).
+        RpcCommand::SttTranscribe { audio_base64, mime_type, .. } => {
+            let live = app.runtime_settings().live.clone();
+            Ok(Some(stt_transcribe(&live, &audio_base64, &mime_type).await?))
+        }
         // The Web control plane's session runtime manager intercepts
         // close_session before any dispatcher sees it; stdio RPC has one
         // Application and nothing to close.
@@ -2587,10 +3710,26 @@ async fn handle_command_inner(
 /// must not wedge the RPC dispatcher indefinitely.
 const REALTIME_PROXY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Maximum bytes accepted for the create-call SDP offer (browser → proxy)
+/// and for the upstream SDP answer (proxy → browser): a real SDP is a few
+/// KiB, so the cap keeps both directions' memory bounded against an
+/// oversized peer.
+const REALTIME_BODY_LIMIT: usize = 256 * 1024;
+
+/// Character cap for redacted diagnostic text in transport/status/body
+/// errors (applied by the shared `pi_coding::redact::redact_bounded` after
+/// redaction); an untrusted upstream echo can never blow up the error.
+const REALTIME_DIAGNOSTIC_LIMIT: usize = 300;
+
 /// Builds `{base}/v1{path}` for a realtime endpoint, de-duplicating a
 /// trailing `/v1` on the configured base (Hyper parity, mirroring
-/// `pi_coding::live::transcriptions_url`).
+/// `pi_coding::live::transcriptions_url`). Only the canonical base PATH is
+/// interpolated: anything from the first `?`/`#` onward is dropped, so a
+/// query/fragment can never swallow the appended API path or leak a secret
+/// into the request URL. (Validation rejects such bases upstream; stripping
+/// here is defense in depth.)
 fn realtime_endpoint(base: &str, path: &str) -> String {
+    let base = base.split(['?', '#']).next().unwrap_or("");
     let base = base.trim().trim_end_matches('/');
     let base = base.strip_suffix("/v1").unwrap_or(base);
     format!("{base}/v1{path}")
@@ -2599,7 +3738,12 @@ fn realtime_endpoint(base: &str, path: &str) -> String {
 /// Validates that `settings` can drive the realtime proxy commands, mirroring
 /// `pi_coding::live::validate_live_settings`: the CLIProxyAPI base URL and
 /// access key must be configured, and plaintext bearer credentials are
-/// rejected unless `allowInsecure` is set.
+/// rejected unless `allowInsecure` is set. The base URL must be a clean
+/// `scheme://authority[/path]`: userinfo (username/password) and
+/// query/fragment are rejected because they can carry secrets and a query
+/// would swallow the appended API path. Errors never echo the raw configured
+/// value — a parse failure uses fixed text, and only the (bounded) scheme is
+/// named when it is unsupported.
 fn validate_realtime_proxy(settings: &pi_coding::LiveRuntimeSettings) -> Result<()> {
     if !settings.enabled {
         bail!(
@@ -2616,12 +3760,22 @@ fn validate_realtime_proxy(settings: &pi_coding::LiveRuntimeSettings) -> Result<
             "Realtime voice is not configured — set `Settings.live.realtimeApiKey` (the CLIProxyAPI access key) in settings.json; it is secret and cannot be written through /settings"
         );
     }
-    let parsed = reqwest::Url::parse(settings.realtime_base_url.trim()).with_context(|| {
-        format!(
-            "`Settings.live.realtimeBaseUrl` is not a valid URL: {}",
-            settings.realtime_base_url
-        )
-    })?;
+    // Fixed text — the raw configured value (which may carry a secret in its
+    // userinfo/query) is never echoed into the error.
+    let parsed = reqwest::Url::parse(settings.realtime_base_url.trim())
+        .context("`Settings.live.realtimeBaseUrl` is not a valid URL")?;
+    // Userinfo and query/fragment are never accepted: they can carry secrets,
+    // and a query would swallow the appended API path.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!(
+            "`Settings.live.realtimeBaseUrl` must not contain a username or password"
+        );
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!(
+            "`Settings.live.realtimeBaseUrl` must not contain a query or fragment"
+        );
+    }
     match parsed.scheme() {
         "https" => Ok(()),
         "http" if settings.allow_insecure => Ok(()),
@@ -2635,16 +3789,19 @@ fn validate_realtime_proxy(settings: &pi_coding::LiveRuntimeSettings) -> Result<
 }
 
 /// Builds the CLIProxyAPI realtime session payload — the `session` object sent
-/// in the create-call POST and reused verbatim for the `oai-events` data
-/// channel's `session.update`. This is the Quicksilver realtime session shape:
-/// `{ type, model, audio: { input: { format: { type, rate } }, output: { voice } } }`.
-/// The configured `realtimeModel`/`voice` are passed through unchanged
+/// in the create-call POST. Codex realtime rejects `session.model` with 400
+/// (`Field session.model is not allowed for this Codex realtime session`), so
+/// the create-call session is the Quicksilver shape WITHOUT `model`:
+/// `{ type, audio: { input: { format: { type, rate } }, output: { voice } } }`.
+/// This is NOT the same object the web side sends as `session.update`: the
+/// data-channel shape (web `buildRealtimeSessionConfig`) additionally carries
+/// the configured `realtimeModel`, which is accepted there. `voice` keeps its
+/// correct nesting under `audio.output.voice` and is passed through unchanged
 /// (custom aliases are not hard-rejected here; the upstream surfaces any
 /// mismatch as a diagnostic error).
 fn realtime_session_payload(settings: &pi_coding::LiveRuntimeSettings) -> Value {
     json!({
         "type": "quicksilver",
-        "model": settings.realtime_model,
         "audio": {
             "input": {
                 "format": {
@@ -2661,81 +3818,265 @@ fn realtime_session_payload(settings: &pi_coding::LiveRuntimeSettings) -> Value 
 
 /// Parses a realtime call id from the last path segment of a `Location`
 /// header. Accepts a non-empty `rtc_`-prefixed suffix or a standard UUID;
-/// rejects anything else. The error names the offending `Location` value so
-/// the caller can diagnose routing, but never echoes auth material (the
-/// header is a server-supplied path/URL, not a credential).
+/// rejects anything else. Errors NEVER echo the raw `Location` value: it may
+/// carry a signed routing/upstream token in its query or fragment, and
+/// non-UTF-8 bytes must not be Debug-printed either. Missing header,
+/// non-UTF-8, and empty-path cases use fixed text; an invalid id error
+/// carries only the derived path segment, length-bounded.
 fn parse_realtime_call_id(location: Option<&reqwest::header::HeaderValue>) -> Result<String> {
     let header = location.context(
         "realtime_create_call: /v1/realtime/calls response has no `Location` header (call id)",
     )?;
     let raw = header
         .to_str()
-        .with_context(|| format!("realtime_create_call: `Location` header is not valid UTF-8: {header:?}"))?;
-    // The call id is the last non-empty path segment, ignoring any query/fragment.
-    let path = raw
-        .split(['?', '#'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(raw);
+        .context("realtime_create_call: `Location` header is not valid UTF-8 (call id)")?;
+    // The call id is the last non-empty path segment of the path part only —
+    // everything from the first `?`/`#` onward (query/fragment) is dropped
+    // before deriving, and is never echoed.
+    let path = raw.split(['?', '#']).next().unwrap_or("");
     let segment = path
         .rsplit('/')
         .find(|s| !s.is_empty())
-        .with_context(|| format!("realtime_create_call: `Location` has no path segment to derive a call id: {raw:?}"))?;
+        .context("realtime_create_call: `Location` has no path segment to derive a call id")?;
     let valid = if let Some(suffix) = segment.strip_prefix("rtc_") {
         !suffix.is_empty()
     } else {
         uuid::Uuid::parse_str(segment).is_ok()
     };
     if !valid {
+        // Echo only the derived segment, truncated to a bounded length —
+        // never the raw Location or its query/fragment.
+        let bounded = segment.chars().take(120).collect::<String>();
         bail!(
-            "realtime_create_call: `Location` call id `{segment}` is neither a non-empty `rtc_` id nor a standard UUID (Location: {raw:?})"
+            "realtime_create_call: `Location` call id `{bounded}` is neither a non-empty `rtc_` id nor a standard UUID"
         );
     }
     Ok(segment.to_owned())
 }
 
-/// Proxies `POST {realtimeBaseUrl}/v1/realtime/calls` with the SDP offer and
-/// the configured model/voice, returning the answer as
-/// `{"sdp": ..., "callId": ...}` for the browser's `RTCPeerConnection` and
-/// `oai-events` data channel. The upstream response is a bare SDP body; the
-/// call id is parsed from the `Location` header.
+/// Redacts credential-like material from a diagnostic string before it can
+/// be echoed. The configured API key and the base/endpoint URLs are replaced
+/// exactly first (so a reqwest error that embeds the request URL never
+/// surfaces it), then the shared
+/// [`pi_coding::redact::redact_bounded`] is applied — it covers the
+/// established credential patterns (`Authorization: Bearer …`, case-
+/// insensitive `bearer`, `token=`/`access_token=`, and the `name=value`
+/// forms such as `API_KEY: …` or `Token : …`) and truncates the result to
+/// `REALTIME_DIAGNOSTIC_LIMIT` characters on char boundaries.
+fn redact_realtime_diagnostics(
+    settings: &pi_coding::LiveRuntimeSettings,
+    url: &str,
+    raw: &str,
+) -> String {
+    let mut out = raw.to_owned();
+    let key = settings.realtime_api_key.trim();
+    if !key.is_empty() {
+        out = out.replace(key, "[REDACTED]");
+    }
+    // Most specific first: the full endpoint URL, then the bare base.
+    if !url.is_empty() {
+        out = out.replace(url, "[endpoint]");
+    }
+    let base = settings.realtime_base_url.trim();
+    if !base.is_empty() {
+        out = out.replace(base, "[endpoint]");
+    }
+    pi_coding::redact::redact_bounded(&out, REALTIME_DIAGNOSTIC_LIMIT)
+}
+
+/// Reads a response body bounded to `REALTIME_BODY_LIMIT` bytes, rejecting an
+/// oversized `Content-Length` before reading anything and bailing as soon as
+/// the cap is exceeded mid-stream. Read errors use fixed context — the
+/// upstream may echo credentials, so no raw body ever lands in them.
+async fn read_bounded_response_body(response: &mut reqwest::Response) -> Result<Vec<u8>> {
+    if let Some(len) = response.content_length() {
+        if len > REALTIME_BODY_LIMIT as u64 {
+            bail!(
+                "realtime_create_call: upstream response body exceeds the {} KiB bound",
+                REALTIME_BODY_LIMIT / 1024
+            );
+        }
+    }
+    let mut buf = Vec::new();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .context("realtime_create_call: reading upstream response body failed")?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        // checked_add keeps the bound arithmetic overflow-safe even in
+        // theory (the cap is far below usize::MAX in practice).
+        let total = buf
+            .len()
+            .checked_add(chunk.len())
+            .context("realtime_create_call: upstream response body length overflow")?;
+        if total > REALTIME_BODY_LIMIT {
+            bail!(
+                "realtime_create_call: upstream response body exceeds the {} KiB bound",
+                REALTIME_BODY_LIMIT / 1024
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Proxies `POST {realtimeBaseUrl}/v1/realtime/calls` as a JSON POST whose
+/// body is exactly `{ "sdp": <offer>, "session": <create-call session> }`
+/// with `Content-Type: application/json`. The create-call session is the
+/// Quicksilver shape WITHOUT `model` — Codex realtime rejects `session.model`
+/// with 400 — so the configured model is NOT sent here; it rides the web
+/// `session.update` frame over the `oai-events` data channel instead (where
+/// the model field IS accepted). Returns the bare SDP answer and call id as
+/// `{"sdp": ..., "callId": ...}` for the browser's
+/// `RTCPeerConnection` and `oai-events` data channel. Transport, status, and
+/// body errors use a fixed endpoint name and redact credential-like content;
+/// the configured base/URL and API key never surface, and both the SDP offer
+/// and the upstream answer are bounded to `REALTIME_BODY_LIMIT`.
 async fn realtime_create_call(
     settings: &pi_coding::LiveRuntimeSettings,
     sdp_offer: &str,
 ) -> Result<Value> {
     validate_realtime_proxy(settings)?;
+    // The offer is bounded (and non-empty) so an oversized browser cannot
+    // push unbounded memory into the request.
+    if sdp_offer.trim().is_empty() {
+        bail!("realtime_create_call: SDP offer must not be empty");
+    }
+    if sdp_offer.len() > REALTIME_BODY_LIMIT {
+        bail!(
+            "realtime_create_call: SDP offer exceeds the {} KiB bound",
+            REALTIME_BODY_LIMIT / 1024
+        );
+    }
     let url = realtime_endpoint(&settings.realtime_base_url, "/realtime/calls");
     let client = reqwest::Client::builder()
         .timeout(REALTIME_PROXY_TIMEOUT)
         .build()
         .context("building realtime proxy client")?;
-    let response = client
+    // Exact wire body: `{sdp, session}` and nothing else. The session object
+    // carries only the quicksilver create-call fields (type + audio, voice
+    // nested under audio.output) — never `model`, which Codex rejects; the
+    // configured model is sent via the data-channel session.update instead.
+    let body = json!({
+        "sdp": sdp_offer,
+        "session": realtime_session_payload(settings),
+    });
+    let mut response = match client
         .post(&url)
         .bearer_auth(settings.realtime_api_key.trim())
-        .json(&json!({ "sdp": sdp_offer, "session": realtime_session_payload(settings) }))
+        .header("OpenAI-Alpha", "quicksilver=v2")
+        .json(&body)
         .send()
         .await
-        .with_context(|| format!("POST {url} (realtime_create_call) failed"))?;
+    {
+        Ok(response) => response,
+        Err(err) => {
+            // Fixed endpoint name; reqwest embeds the request URL in its own
+            // error text, so the full chain is redacted before surfacing.
+            let detail = redact_realtime_diagnostics(settings, &url, &format!("{err}"));
+            bail!("realtime_create_call: POST to the realtime create-call endpoint failed: {detail}");
+        }
+    };
     // Capture the Location header before consuming the body — the call id
     // lives there, not in the (bare SDP) response body.
     let location = response.headers().get(reqwest::header::LOCATION).cloned();
     let status = response.status();
+    let response_body = read_bounded_response_body(&mut response).await?;
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let detail = redact_realtime_diagnostics(
+            settings,
+            &url,
+            &String::from_utf8_lossy(&response_body),
+        );
         bail!(
-            "realtime_create_call: {url} returned {status}: {}",
-            body.chars().take(300).collect::<String>()
+            "realtime_create_call: the realtime create-call endpoint returned {status}: {detail}"
         );
     }
-    let sdp = response
-        .text()
-        .await
-        .context("realtime_create_call: reading /v1/realtime/calls SDP answer body")?;
+    let sdp = String::from_utf8(response_body)
+        .context("realtime_create_call: upstream SDP answer is not valid UTF-8")?;
     if sdp.trim().is_empty() {
         bail!("realtime_create_call: /v1/realtime/calls returned an empty SDP answer body");
     }
     let call_id = parse_realtime_call_id(location.as_ref())?;
     Ok(json!({ "sdp": sdp, "callId": call_id }))
+}
+
+// ---------------------------------------------------------------------------
+// STT proxy (hold-to-talk voice)
+//
+// The web frontend records via MediaRecorder, converts the capture to WAV
+// (blobToWav), and POSTs ONLY the bounded base64 audio + MIME type over the
+// RPC; the endpoint URL and bearer key are read from the server-held live
+// settings (`live.sttBaseUrl`/`live.sttApiKey`), so no credential or endpoint
+// ever crosses the browser wire.
+// ---------------------------------------------------------------------------
+
+/// Decoded-size cap for browser-recorded STT audio: a 44-byte RIFF/WAVE
+/// header plus [`pi_coding::live::MAX_RECORDING_SECONDS`] of
+/// [`pi_coding::live::SAMPLE_RATE`] mono 16-bit PCM. Bounds the base64 wire
+/// payload well under the transport frame limit and the forwarded STT
+/// request.
+const STT_MAX_AUDIO_BYTES: usize = 44
+    + pi_coding::live::SAMPLE_RATE as usize * 2 * pi_coding::live::MAX_RECORDING_SECONDS as usize;
+
+/// MIME allowlist for the `stt_transcribe` RPC. The browser converts the
+/// MediaRecorder container to WAV before sending (blobToWav), so raw
+/// webm/mp4 captures never cross the wire.
+const STT_ALLOWED_MIME_TYPES: [&str; 1] = ["audio/wav"];
+
+/// Validates the browser's STT payload (MIME allowlist, bounded base64,
+/// strict RIFF/WAVE PCM16 parse) and proxies the transcription through
+/// [`pi_coding::live::SttClient`] with the server-held `live.*` settings.
+/// Returns `{ "text": ... }`. Errors are bounded and never echo the bearer
+/// key: the size/MIME/WAV rejections carry no payload contents, and the STT
+/// client redacts server-echoed secrets. The mode gate (TUI-only vs Web
+/// realtime) is a UI concern; this RPC is an explicit STT request, so it
+/// validates as `stt` and lets `SttClient` enforce the security-relevant
+/// checks (enabled, base URL, key, scheme).
+async fn stt_transcribe(
+    settings: &pi_coding::LiveRuntimeSettings,
+    audio_base64: &str,
+    mime_type: &str,
+) -> Result<Value> {
+    let mime = mime_type.trim();
+    if !STT_ALLOWED_MIME_TYPES
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(mime))
+    {
+        // Echo at most a bounded prefix so a hostile client cannot project an
+        // arbitrarily long string into the error surface.
+        let shown = mime_type.chars().take(120).collect::<String>();
+        bail!(
+            "stt_transcribe: unsupported audio MIME type `{shown}` — only audio/wav (the browser converts the recording first) is accepted"
+        );
+    }
+    // Reject a payload that cannot possibly fit before allocating: base64 of
+    // a decoded size at the cap is `ceil(cap / 3) * 4` characters.
+    let max_base64_len = STT_MAX_AUDIO_BYTES.div_ceil(3) * 4;
+    if audio_base64.len() > max_base64_len {
+        bail!(
+            "stt_transcribe: audio payload of {} base64 chars exceeds the {STT_MAX_AUDIO_BYTES}-byte WAV cap",
+            audio_base64.len()
+        );
+    }
+    let wav = base64::engine::general_purpose::STANDARD
+        .decode(audio_base64)
+        .context("stt_transcribe: audioBase64 is not valid base64")?;
+    if wav.len() > STT_MAX_AUDIO_BYTES {
+        bail!(
+            "stt_transcribe: decoded audio of {} bytes exceeds the {STT_MAX_AUDIO_BYTES}-byte WAV cap",
+            wav.len()
+        );
+    }
+    let capture = pi_coding::live::parse_wav_capture(&wav)?;
+    let stt = pi_coding::live::SttClient::new().context("stt_transcribe: building STT client")?;
+    let mut validated = settings.clone();
+    validated.mode = "stt".to_owned();
+    let text = stt.transcribe(&validated, &capture).await?;
+    Ok(json!({ "text": text }))
 }
 
 pub(crate) fn public_message(message: Message) -> Message {
@@ -2859,6 +4200,30 @@ mod tests {
     use futures_util::FutureExt as _;
     fn settings_state() -> crate::settings_rpc::SettingsRpcState {
         crate::settings_rpc::SettingsRpcState::default()
+    }
+
+    fn bash_execution_event_fixture() -> ApplicationEvent {
+        ApplicationEvent::Session(pi_coding::SessionEvent::BashExecutionEnd {
+            message: pi_ai::BashExecutionMessage {
+                command: "echo ok".to_owned(),
+                output: "ok".to_owned(),
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+                full_output_path: None,
+                timestamp: 1,
+                exclude_from_context: None,
+            },
+        })
+    }
+
+    #[test]
+    fn bash_execution_end_projects_web_event_shape() {
+        let projected = project_application_event(bash_execution_event_fixture()).unwrap();
+        assert_eq!(projected["type"], "bash_execution_end");
+        assert_eq!(projected["message"]["command"], "echo ok");
+        assert_eq!(projected["message"]["output"], "ok");
+        assert_eq!(projected["message"]["exitCode"], 0);
     }
 
     fn workflows_state() -> crate::workflow_rpc::WorkflowRpcState {
@@ -2991,6 +4356,27 @@ mod tests {
             json!({"type":"job_cancel","jobIds":["job-1"]}),
             json!({"type":"hub_send","to":"writer","body":"ping"}),
             json!({"type":"job_output","jobId":"job-1"}),
+            json!({"type":"agent_history","agentId":"writer"}),
+            json!({"type":"agent_history","agentId":"writer","lines":80}),
+            json!({"type":"code_review_open"}),
+            json!({"type":"code_review_open","from":"HEAD","to":"feature"}),
+            json!({"type":"code_review_snapshot"}),
+            json!({"type":"code_review_refresh"}),
+            json!({"type":"code_review_comment","snapshotId":"s1","path":"a.rs","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h","comment":"looks good"}),
+            json!({"type":"code_review_abort"}),
+            json!({"type":"code_review_close"}),
+            json!({"type":"code_review_file_diff","snapshotId":"s1","path":"a.rs"}),
+            json!({"type":"code_review_file_diff","snapshotId":"s1","path":"a.rs","cursor":100,"maxLines":50}),
+            json!({"type":"skill","name":"research"}),
+            json!({"type":"persona_list"}),
+            json!({"type":"persona_get","name":"mentor"}),
+            json!({"type":"persona_create","name":"guide","content":"---\nname: guide\ndescription: g\n---\nprompt"}),
+            json!({"type":"persona_edit","name":"mentor","content":"---\nname: mentor\ndescription: m\n---\nprompt"}),
+            json!({"type":"persona_remove","name":"mentor","confirm":true}),
+            json!({"type":"persona_purge","name":"mentor","confirm":true}),
+            json!({"type":"persona_select","name":"mentor"}),
+            json!({"type":"persona_clear"}),
+            json!({"type":"persona_current"}),
         ];
         for f in fixtures {
             assert!(
@@ -3001,6 +4387,91 @@ mod tests {
                 "{f}"
             );
         }
+    }
+
+    #[test]
+    fn persona_commands_parse_and_confirm_defaults_false() {
+        // persona_remove/persona_purge default `confirm` to false so an
+        // omitted confirmation can never deserialize into a destructive op
+        // (fail-closed; the handler rejects without an explicit true).
+        for raw in [
+            &br#"{"type":"persona_remove","name":"mentor"}"#[..],
+            &br#"{"type":"persona_purge","name":"mentor"}"#[..],
+        ] {
+            match parse_input(raw).expect("parse") {
+                RpcInput::Command { command, .. } => {
+                    let confirmed = match command {
+                        RpcCommand::PersonaRemove { confirm, .. }
+                        | RpcCommand::PersonaPurge { confirm, .. } => confirm,
+                        other => panic!("expected destructive persona command, got {other:?}"),
+                    };
+                    assert!(!confirmed, "confirm must default to false");
+                }
+                RpcInput::ExtensionUiResponse(_) => panic!("expected RPC command"),
+            }
+        }
+        let ok = parse_input(br#"{"type":"persona_remove","name":"mentor","confirm":true}"#)
+            .expect("confirmed remove");
+        assert!(matches!(
+            ok,
+            RpcInput::Command {
+                command: RpcCommand::PersonaRemove { name, confirm: true, .. },
+                ..
+            } if name == "mentor"
+        ));
+    }
+
+    #[test]
+    fn agent_history_parses_agent_id_and_optional_lines() {
+        // lines is optional and omitted requests keep the handler default.
+        let defaulted = parse_input(br#"{"type":"agent_history","agentId":"writer"}"#)
+            .expect("agent history without lines");
+        assert!(matches!(
+            defaulted,
+            RpcInput::Command {
+                command: RpcCommand::AgentHistory { agent_id, lines: None, .. },
+                ..
+            } if agent_id == "writer"
+        ));
+        let with_lines = parse_input(br#"{"type":"agent_history","agentId":"writer","lines":120}"#)
+            .expect("agent history with lines");
+        assert!(matches!(
+            with_lines,
+            RpcInput::Command {
+                command: RpcCommand::AgentHistory { agent_id, lines: Some(120), .. },
+                ..
+            } if agent_id == "writer"
+        ));
+        // agentId is required: a payload without it must not deserialize.
+        let missing = parse_input(br#"{"type":"agent_history"}"#);
+        assert!(
+            missing
+                .as_ref()
+                .err()
+                .is_some_and(|response| !response.success && response.command == "agent_history"),
+            "agentId must be required: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn session_list_scope_defaults_current_and_accepts_all_projects() {
+        let current = parse_input(br#"{"type":"session_list"}"#).expect("current scope");
+        assert!(matches!(
+            current,
+            RpcInput::Command {
+                command: RpcCommand::SessionList { scope: RpcSessionListScope::Current, .. },
+                ..
+            }
+        ));
+        let all = parse_input(br#"{"type":"session_list","scope":"all_projects"}"#)
+            .expect("all projects scope");
+        assert!(matches!(
+            all,
+            RpcInput::Command {
+                command: RpcCommand::SessionList { scope: RpcSessionListScope::AllProjects, .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3021,6 +4492,8 @@ mod tests {
             json!({"type":"loop_cancel","taskId":"loop-1"}),
             json!({"type":"process_signal","processId":"00000000-0000-7000-8000-000000000000","signal":"SIGTERM"}),
             json!({"type":"process_stop","processId":"00000000-0000-7000-8000-000000000000"}),
+            json!({"type":"code_review_abort"}),
+            json!({"type":"code_review_close"}),
         ] {
             let command = parse_command(fixture.clone());
             assert!(
@@ -3032,9 +4505,10 @@ mod tests {
         for fixture in [
             json!({"type":"settings_apply","draftId":"draft"}),
             json!({"type":"workflow_create","name":"ship","objective":"bounded"}),
-            json!({"type":"workflow_pause","workflowId":"wf-1"}),
-            json!({"type":"workflow_integrate","workflowId":"wf-1"}),
             json!({"type":"process_wait","processId":"00000000-0000-7000-8000-000000000000"}),
+            json!({"type":"code_review_open"}),
+            json!({"type":"code_review_open","from":"HEAD","to":"feature"}),
+            json!({"type":"code_review_refresh"}),
         ] {
             let command = parse_command(fixture.clone());
             assert!(
@@ -3046,6 +4520,22 @@ mod tests {
         let settings = parse_command(json!({"type":"settings_apply","draftId":"draft"}));
         let workflow = parse_command(json!({"type":"workflow_pause","workflowId":"wf-1"}));
         assert!(settings.runs_inline() && workflow.runs_inline());
+
+        // Code-review snapshot/comment/abort/close run inline (controller state
+        // reads and safety/teardown); open/refresh take a slot (spawn_blocking git).
+        let snapshot = parse_command(json!({"type":"code_review_snapshot"}));
+        let comment = parse_command(json!({"type":"code_review_comment","snapshotId":"s","path":"a","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h","comment":"x"}));
+        let abort = parse_command(json!({"type":"code_review_abort"}));
+        let close = parse_command(json!({"type":"code_review_close"}));
+        let open = parse_command(json!({"type":"code_review_open"}));
+        let refresh = parse_command(json!({"type":"code_review_refresh"}));
+        let file_diff = parse_command(json!({"type":"code_review_file_diff","snapshotId":"s","path":"a"}));
+        assert!(snapshot.runs_inline() && comment.runs_inline() && abort.runs_inline() && close.runs_inline());
+        // file_diff re-runs scoped git via spawn_blocking: it takes a slot like
+        // open/refresh (NOT inline, NOT a bypass).
+        assert!(!open.runs_inline() && !refresh.runs_inline() && !file_diff.runs_inline());
+        assert!(abort.bypasses_command_slots() && close.bypasses_command_slots());
+        assert!(!open.bypasses_command_slots() && !refresh.bypasses_command_slots() && !snapshot.bypasses_command_slots() && !file_diff.bypasses_command_slots());
     }
     #[test]
     fn public_models_never_serialize_headers() {
@@ -3703,6 +5193,7 @@ mod tests {
             .record_message(&Message::user_text("fork text", 1))
             .expect("record fork message");
         recorder.persist_now().expect("persist lifecycle session");
+        session.set_session_dir(cwd.path().to_path_buf());
         session.record(recorder).expect("attach lifecycle recorder");
         if !cancel {
             return (cwd, Application::new(session).await);
@@ -3820,6 +5311,7 @@ mod tests {
         recorder
             .persist_now()
             .expect("persist clone source session");
+        app.session().set_session_dir(session_dir.path().to_path_buf());
         app.session().record(recorder).expect("attach recorder");
         let source_file = app.state().await.session_file.expect("source session file");
 
@@ -3903,7 +5395,7 @@ mod tests {
             &app,
             &settings_state(),
             &workflows_state(),
-            RpcCommand::SessionList { id: Some("list".into()) },
+            RpcCommand::SessionList { id: Some("list".into()), scope: RpcSessionListScope::Current },
         )
         .await;
         assert!(response.success, "{response:?}");
@@ -3949,7 +5441,7 @@ mod tests {
             &app,
             &settings_state(),
             &workflows_state(),
-            RpcCommand::SessionList { id: Some("list2".into()) },
+            RpcCommand::SessionList { id: Some("list2".into()), scope: RpcSessionListScope::Current },
         )
         .await;
         assert!(relisted.success, "{relisted:?}");
@@ -3962,6 +5454,62 @@ mod tests {
             .find(|row| row["sessionId"].as_str() == Some(session_id.as_str()))
             .expect("renamed row");
         assert_eq!(renamed_row["name"], "web demo");
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn session_list_all_projects_uses_typed_default_tree_storage() {
+        // Mirror the production default tree (`<agent>/sessions`): the typed
+        // DefaultTree catalog maps the native root to the native agent dir by
+        // stripping the trailing `sessions` component, so the fixture must use
+        // the production-shaped root rather than a bare directory.
+        let agent = tempfile::tempdir().expect("agent dir");
+        let root = agent.path().join("sessions");
+        let project_a = tempfile::tempdir().expect("project A");
+        let project_b = tempfile::tempdir().expect("project B");
+        let storage = crate::session_run::SessionStorage::DefaultTree {
+            native_root: root,
+        };
+        let dir_a = storage.session_dir_for(project_a.path()).expect("A dir");
+        let dir_b = storage.session_dir_for(project_b.path()).expect("B dir");
+        for (cwd, dir, message) in [
+            (project_a.path(), dir_a.as_path(), "project A"),
+            (project_b.path(), dir_b.as_path(), "project B"),
+        ] {
+            let recorder = pi_coding::start_session_in(cwd, None, None, Some(dir), None, None)
+                .expect("record session");
+            recorder.record_message(&Message::user_text(message, 1)).expect("message");
+            recorder.persist_now().expect("persist");
+        }
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: project_a.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: "test".to_owned(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        }).expect("session");
+        session.set_session_dir(dir_a);
+        let app = Application::new(session).await;
+        let response = handle_command_with_session_storage(
+            &app, &settings_state(), &workflows_state(), Some(&storage),
+            RpcCommand::SessionList { id: None, scope: RpcSessionListScope::AllProjects },
+        ).await;
+        assert!(response.success, "{response:?}");
+        let rows = response.data.expect("catalog")["sessions"].as_array().expect("rows").clone();
+        // Both recorded sessions are unnamed, tiny native Pi sessions in temp
+        // workspaces: the AllProjects pipeline keeps them (they carry real
+        // messages) and flags them `temporary` — never backend-deleted. (The
+        // shared catalog may also carry the ambient HOME's rows, so assert
+        // presence of the two seeded rows, not the total count.)
+        let row_a = rows
+            .iter()
+            .find(|row| row["cwd"] == project_a.path().to_string_lossy().as_ref())
+            .unwrap_or_else(|| panic!("project A row missing: {rows:?}"));
+        let row_b = rows
+            .iter()
+            .find(|row| row["cwd"] == project_b.path().to_string_lossy().as_ref())
+            .unwrap_or_else(|| panic!("project B row missing: {rows:?}"));
+        assert_eq!(row_a["temporary"], true, "temp-workspace row must be marked temporary: {row_a}");
+        assert_eq!(row_b["temporary"], true, "temp-workspace row must be marked temporary: {row_b}");
         app.cleanup().await;
     }
 
@@ -4056,6 +5604,7 @@ mod tests {
             None,
         )
         .expect("record goal journal session");
+        session.set_session_dir(cwd.path().to_path_buf());
         session.record(recorder).expect("attach recorder");
         let app = Application::new(session).await;
         let settings = settings_state();
@@ -4994,18 +6543,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_commands_exactly_projects_ordered_primary_catalog() {
+    async fn get_commands_projects_executable_catalog_with_loaded_skills() {
         let (_cwd, app) = build_command_catalog_app().await;
-        let expected = crate::interactive_commands::visible_catalog()
-            .iter()
-            .map(|command| {
-                json!({
-                    "name": command.name,
-                    "description": command.description,
-                    "source": command_source_str(command.source),
-                })
-            })
-            .collect::<Vec<_>>();
         let response = handle_command(
             &app,
             &settings_state(),
@@ -5016,19 +6555,96 @@ mod tests {
         )
         .await;
         assert!(response.success, "{response:?}");
-        let data = response.data.expect("get_commands data");
-        assert_eq!(data, json!({ "commands": expected }));
-
-        let commands = data["commands"].as_array().expect("commands array");
+        let commands = response.data.expect("get_commands data")["commands"]
+            .as_array()
+            .expect("commands array")
+            .clone();
         let names = commands
             .iter()
             .map(|command| command["name"].as_str().expect("command name"))
             .collect::<Vec<_>>();
-        assert_eq!(names, crate::interactive_commands::PRIMARY_COMMAND_NAMES);
-        assert!(commands.iter().all(|command| command["source"] == "builtin"));
-        assert!(!names.contains(&"prompt-only"));
-        assert!(!names.contains(&"skill:catalog-skill"));
-        assert!(!names.contains(&"extension-only"));
+
+        // The primary builtin surface stays projected (skill is a builtin with
+        // argument metadata so the Web picker can show `/skill` as a parent).
+        let skill_builtin = commands
+            .iter()
+            .find(|command| command["name"] == "skill" && command["source"] == "builtin")
+            .expect("builtin /skill is projected");
+        assert_eq!(skill_builtin["argumentHint"], "<name>");
+        assert_eq!(skill_builtin["requiresArguments"], true);
+        assert!(
+            skill_builtin["skillName"].is_null(),
+            "builtin skill must not carry a skillName"
+        );
+
+        // The real loaded skill projects as a `skill:<name>` wire entry with a
+        // stable bare `skillName` so the Web composer can compose `/skill <name>`.
+        let skill_entry = commands
+            .iter()
+            .find(|command| command["name"] == "skill:catalog-skill")
+            .expect("loaded skill:catalog-skill is projected");
+        assert_eq!(skill_entry["source"], "skill");
+        assert_eq!(skill_entry["skillName"], "catalog-skill");
+        assert_eq!(
+            skill_entry["description"], "Skill only command",
+            "skill description must come from the loaded frontmatter"
+        );
+
+        // Collision-free: the conflicting `help` prompt and `help`/`shared`
+        // extension duplicates are excluded — only the builtin `help` and the
+        // first dynamic `shared` (the prompt) remain.
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command["name"] == "help")
+                .count(),
+            1,
+            "conflicting help prompt must be dropped, builtin help kept"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command["name"] == "help")
+                .next()
+                .map(|command| command["source"].as_str().unwrap_or("")),
+            Some("builtin")
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command["name"] == "shared")
+                .count(),
+            1,
+            "shared prompt/extension collision must resolve to a single entry"
+        );
+        let shared = commands
+            .iter()
+            .find(|command| command["name"] == "shared")
+            .expect("shared winner present");
+        assert_eq!(shared["source"], "prompt", "prompt wins the dynamic collision");
+
+        // Dynamic prompt + extension commands are projected on the wire (the
+        // Web picker filters its own executable surface) — but conflicts never
+        // duplicate a name.
+        assert!(names.contains(&"prompt-only"));
+        assert!(names.contains(&"extension-only"));
+        // Every entry carries a source from the closed set; non-skill entries
+        // project `skillName: null` so the wire shape stays stable.
+        for command in &commands {
+            let source = command["source"].as_str().expect("source string");
+            assert!(
+                matches!(source, "builtin" | "prompt" | "skill" | "extension"),
+                "unexpected source {source:?} for {}",
+                command["name"]
+            );
+            if source != "skill" {
+                assert!(
+                    command["skillName"].is_null(),
+                    "non-skill {} must not carry skillName",
+                    command["name"]
+                );
+            }
+        }
         app.cleanup().await;
     }
 
@@ -5120,6 +6736,35 @@ mod tests {
             auth_resolver: None,
         })
         .expect("session");
+        Application::new(session).await
+    }
+
+    /// Build an Application whose session cwd is `cwd` and whose provider stream
+    /// replies with a fixed assistant message. Used by code-review RPC tests:
+    /// `CodeReviewController::fork_from` forks the side-chat conversation (no
+    /// provider call), and comment submissions resolve through `reply_stream`.
+    async fn build_code_review_app(cwd: &Path) -> Application {
+        let mut model = Model::default();
+        model.id = "faux-rpc-code-review".into();
+        model.name = "faux-rpc-code-review".into();
+        model.api = "faux-rpc-code-review-api".into();
+        model.provider = "faux".into();
+        model.base_url = "http://localhost:0".into();
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model,
+            cwd: cwd.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: "faux".into(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(reply_stream("review reply")),
+            auth_resolver: None,
+        })
+        .expect("code-review session");
         Application::new(session).await
     }
 
@@ -5254,6 +6899,693 @@ mod tests {
         app.cleanup().await;
     }
 
+    #[tokio::test]
+    async fn skill_rpc_returns_frontmatter_summary_and_rejects_unknown() {
+        let (_cwd, app) = build_command_catalog_app().await;
+        let ok = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::Skill {
+                id: Some("skill-ok".into()),
+                name: "catalog-skill".into(),
+            },
+        )
+        .await;
+        assert!(ok.success, "{ok:?}");
+        assert_eq!(ok.command, "skill");
+        let data = ok.data.expect("skill data");
+        assert_eq!(data["name"], "catalog-skill");
+        let summary = data["summary"].as_str().expect("summary text");
+        assert!(summary.contains("name: catalog-skill"), "{summary}");
+        assert!(summary.contains("description: Skill only command"), "{summary}");
+
+        // Empty / whitespace name is rejected with a typed error.
+        let empty = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::Skill {
+                id: Some("skill-empty".into()),
+                name: "   ".into(),
+            },
+        )
+        .await;
+        assert!(!empty.success, "{empty:?}");
+        assert!(
+            empty
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("required")),
+            "{empty:?}"
+        );
+
+        // Unknown skill is rejected (never sent to the model).
+        let unknown = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::Skill {
+                id: Some("skill-unknown".into()),
+                name: "nope".into(),
+            },
+        )
+        .await;
+        assert!(!unknown.success, "{unknown:?}");
+        assert!(
+            unknown
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown skill")),
+            "{unknown:?}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn get_commands_projects_skill_argument_metadata() {
+        let (_cwd, app) = build_command_catalog_app().await;
+        let response = handle_command(
+            &app,
+            &settings_state(),
+            &workflows_state(),
+            RpcCommand::GetCommands {
+                id: Some("catalog-meta".into()),
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        let commands = response.data.expect("data")["commands"]
+            .as_array()
+            .expect("commands")
+            .clone();
+        let skill = commands
+            .iter()
+            .find(|command| command["name"] == "skill")
+            .expect("skill is a visible primary command");
+        assert_eq!(skill["source"], "builtin");
+        assert_eq!(skill["argumentHint"], "<name>");
+        assert_eq!(skill["requiresArguments"], true);
+        // code-review stays primary with an optional argument hint.
+        let code_review = commands
+            .iter()
+            .find(|command| command["name"] == "code-review")
+            .expect("code-review is a visible primary command");
+        assert_eq!(code_review["argumentHint"], "[<from> <to>]");
+        assert_eq!(code_review["requiresArguments"], false);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_open_on_non_git_cwd_surfaces_error_without_root() {
+        let cwd = tempfile::tempdir().expect("non-git cwd");
+        // Intentionally NOT a git repository.
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let response = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-non-git".into()),
+                from: None,
+                to: None,
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.command, "code_review_open");
+        let data = response.data.expect("open data");
+        // The absolute repository root must never be exposed on the wire.
+        let encoded = serde_json::to_string(&data).unwrap();
+        assert!(!encoded.contains("\"root\""), "root must not be exposed: {encoded}");
+        assert!(data["files"].as_array().expect("files").is_empty());
+        assert!(
+            data["error"].as_str().is_some_and(|error| !error.is_empty()),
+            "non-git open must surface an error payload: {data}"
+        );
+        assert_eq!(data["comparisonLabel"], "HEAD → working tree");
+        assert_eq!(data["isStreaming"], false);
+        assert_eq!(data["activeHunk"], Value::Null);
+        assert_eq!(data["threads"].as_array().expect("threads").len(), 0);
+
+        // A bare snapshot re-projects the same error state.
+        let snap = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewSnapshot {
+                id: Some("snap-non-git".into()),
+            },
+        )
+        .await;
+        assert!(snap.success, "{snap:?}");
+        assert!(snap.data.expect("snap data")["error"].as_str().is_some());
+
+        // Close tears down the review controller.
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose {
+                id: Some("close-non-git".into()),
+            },
+        )
+        .await;
+        assert!(closed.success, "{closed:?}");
+        assert_eq!(closed.data.expect("close data")["closed"], true);
+
+        // After close, snapshot errors (no open review).
+        let after = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewSnapshot {
+                id: Some("snap-after-close".into()),
+            },
+        )
+        .await;
+        assert!(!after.success, "{after:?}");
+        assert!(after.error.as_deref().is_some_and(|e| e.contains("no open code review")));
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_open_on_real_git_working_tree_lists_changed_files() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(
+            git(&["init", "-q"]).status.success(),
+            "git init must succeed"
+        );
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("README.md"), "initial\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        // Working-tree changes: modify README.md and add new.txt.
+        std::fs::write(cwd.path().join("README.md"), "initial\nchanged\n").expect("write");
+        std::fs::write(cwd.path().join("new.txt"), "new file\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let response = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-git".into()),
+                from: None,
+                to: None,
+            },
+        )
+        .await;
+        assert!(response.success, "{response:?}");
+        let data = response.data.expect("open data");
+        assert!(data["error"].is_null(), "no error expected on a real repo: {data}");
+        let encoded = serde_json::to_string(&data).unwrap();
+        assert!(!encoded.contains("\"root\""), "root must not be exposed: {encoded}");
+        let files = data["files"].as_array().expect("files");
+        let paths: Vec<&str> = files
+            .iter()
+            .map(|file| file["path"].as_str().expect("path"))
+            .collect();
+        assert!(paths.contains(&"README.md"), "modified file must appear: {paths:?}");
+        assert!(paths.contains(&"new.txt"), "added file must appear: {paths:?}");
+
+        // Hunks carry identity + typed lines.
+        let readme = files
+            .iter()
+            .find(|file| file["path"] == "README.md")
+            .expect("readme");
+        let hunks = readme["hunks"].as_array().expect("hunks");
+        assert!(!hunks.is_empty(), "modified file must have a hunk");
+        let hunk = &hunks[0];
+        assert!(
+            hunk["contentHash"].as_str().is_some_and(|hash| !hash.is_empty()),
+            "hunk must carry a content hash"
+        );
+        assert!(hunk["oldStart"].as_u64().is_some());
+        assert!(hunk["newStart"].as_u64().is_some());
+        assert!(
+            hunk["lines"]
+                .as_array()
+                .expect("lines")
+                .iter()
+                .any(|line| line["kind"] == "addition"),
+            "hunk must include at least one addition line"
+        );
+
+        assert_eq!(data["comparisonLabel"], "HEAD → working tree");
+        assert!(
+            data["totalInsertions"].as_u64().expect("insertions") >= 2,
+            "expected at least two inserted lines: {data}"
+        );
+        assert_eq!(data["isStreaming"], false);
+
+        // Open rejects from+to mismatch (one without the other).
+        let half = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-half".into()),
+                from: Some("HEAD".into()),
+                to: None,
+            },
+        )
+        .await;
+        assert!(!half.success, "{half:?}");
+        assert!(
+            half.error
+                .as_deref()
+                .is_some_and(|e| e.contains("from") && e.contains("to")),
+            "{half:?}"
+        );
+
+        // Close cleans up the review controller.
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose {
+                id: Some("close-git".into()),
+            },
+        )
+        .await;
+        assert!(closed.success, "{closed:?}");
+        assert_eq!(closed.data.expect("close data")["closed"], true);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_file_diff_paginates_single_file_and_rejects_stale_requests() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("big.txt"), "base\n").expect("write");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-q", "-m", "init"]).status.success());
+        let changed = "changed-line\n".repeat(5000);
+        std::fs::write(cwd.path().join("big.txt"), &changed).expect("write");
+        assert!(git(&["add", "."]).status.success());
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen { id: None, from: None, to: None },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let snapshot_id = opened.data.as_ref().expect("open data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+
+        // Unknown path is rejected (containment) before git ever runs.
+        let unknown = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "does/not/exist.rs".into(),
+                cursor: 0,
+                max_lines: None,
+            },
+        )
+        .await;
+        assert!(!unknown.success, "{unknown:?}");
+        assert!(unknown.error.as_deref().is_some_and(|e| e.contains("unknown file")));
+
+        // A traversal path is rejected as unknown (normalize collapses "..").
+        let traversal = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "../etc/passwd".into(),
+                cursor: 0,
+                max_lines: None,
+            },
+        )
+        .await;
+        assert!(!traversal.success, "{traversal:?}");
+
+        // First page loads the big file's full diff and returns a bounded page.
+        let first = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                cursor: 0,
+                max_lines: Some(50),
+            },
+        )
+        .await;
+        assert!(first.success, "{first:?}");
+        let page = first.data.expect("page data");
+        assert_eq!(page["path"], "big.txt");
+        assert_eq!(page["cursor"], 0);
+        assert_eq!(page["lines"].as_array().expect("lines").len(), 50);
+        assert_eq!(page["hasMore"], true);
+        let next = page["nextCursor"].as_u64().expect("next cursor");
+        assert_eq!(next, 50);
+        let total = page["totalLines"].as_u64().expect("total lines");
+        assert!(total > 4000, "the big file should exceed the render cap: {total}");
+
+        // A stale snapshot id is rejected.
+        let stale = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: "wrong-snapshot-id".to_owned(),
+                path: "big.txt".into(),
+                cursor: 0,
+                max_lines: None,
+            },
+        )
+        .await;
+        assert!(!stale.success, "{stale:?}");
+        assert!(stale.error.as_deref().is_some_and(|e| e.contains("stale snapshot")));
+
+        // A cursor past the end is rejected by the slicer.
+        let over_cursor = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                cursor: total as usize + 10,
+                max_lines: None,
+            },
+        )
+        .await;
+        assert!(!over_cursor.success, "{over_cursor:?}");
+        assert!(over_cursor.error.as_deref().is_some_and(|e| e.contains("out of range")));
+
+        // Mutate the working tree before refresh so the snapshot identity
+        // (a digest of the diff bytes) actually changes; an unchanged refresh
+        // is idempotent and reuses the same snapshot id by design.
+        let changed2 = "changed-line\n".repeat(6000);
+        std::fs::write(cwd.path().join("big.txt"), &changed2).expect("write big2");
+        assert!(git(&["add", "big.txt"]).status.success());
+
+        // Refresh invalidates the cache: the old snapshot id is now stale.
+        let refreshed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewRefresh { id: None },
+        )
+        .await;
+        assert!(refreshed.success, "{refreshed:?}");
+        let new_snapshot_id = refreshed.data.as_ref().expect("refresh data")["snapshotId"]
+            .as_str()
+            .expect("snapshot id")
+            .to_owned();
+        let stale_after_refresh = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id,
+                path: "big.txt".into(),
+                cursor: 0,
+                max_lines: None,
+            },
+        )
+        .await;
+        assert!(!stale_after_refresh.success, "{stale_after_refresh:?}");
+        // The new snapshot id still serves pages.
+        let ok_after = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: new_snapshot_id,
+                path: "big.txt".into(),
+                cursor: 0,
+                max_lines: Some(10),
+            },
+        )
+        .await;
+        assert!(ok_after.success, "{ok_after:?}");
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn code_review_file_diff_serves_every_file_after_global_truncation() {
+        // A repo whose combined HEAD→working-tree diff exceeds the 2 MiB
+        // snapshot cap: each of two big files has a ~2.6 MiB diff, so the
+        // first (path-sorted) file consumes the whole cap and the second big
+        // file plus the later files are guaranteed on-demand placeholders.
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", cwd.path().to_str().expect("cwd str")])
+                .args(args)
+                .output()
+                .expect("git invocation")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "test@example.com"]).status.success();
+        git(&["config", "user.name", "Test"]).status.success();
+        std::fs::write(cwd.path().join("big-a.txt"), "base\n").expect("write big-a");
+        std::fs::write(cwd.path().join("big-b.txt"), "base\n").expect("write big-b");
+        std::fs::write(cwd.path().join("rename-old.txt"), "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n")
+            .expect("write rename source");
+        std::fs::write(cwd.path().join("zz-later.txt"), "base\n").expect("write later");
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-q", "-m", "baseline"]).status.success());
+        let changed = "changed-line\n".repeat(200_000);
+        std::fs::write(cwd.path().join("big-a.txt"), &changed).expect("write big-a changed");
+        std::fs::write(cwd.path().join("big-b.txt"), &changed).expect("write big-b changed");
+        std::fs::rename(cwd.path().join("rename-old.txt"), cwd.path().join("rename-new.txt"))
+            .expect("rename");
+        std::fs::write(
+            cwd.path().join("rename-new.txt"),
+            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\nrenamed\n",
+        )
+        .expect("write rename destination");
+        std::fs::write(cwd.path().join("zz-later.txt"), "base\nchanged\n").expect("write later changed");
+        assert!(git(&["add", "-A"]).status.success());
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen { id: None, from: None, to: None },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let data = opened.data.expect("open data");
+        assert_eq!(data["truncated"], true, "snapshot must be globally truncated: {data}");
+        let files = data["files"].as_array().expect("files");
+        let paths: Vec<&str> = files
+            .iter()
+            .map(|file| file["path"].as_str().expect("path"))
+            .collect();
+        for expected in ["big-a.txt", "big-b.txt", "rename-new.txt", "zz-later.txt"] {
+            assert!(
+                paths.contains(&expected),
+                "changed file missing from truncated projection: {paths:?}"
+            );
+        }
+        let snapshot_id = data["snapshotId"].as_str().expect("snapshot id").to_owned();
+
+        // A placeholder (empty hunks + truncated) must be present and must
+        // serve its first page through code_review_file_diff.
+        let placeholder = files
+            .iter()
+            .find(|file| {
+                file["truncated"] == true && file["hunks"].as_array().expect("hunks").is_empty()
+            })
+            .expect("truncated snapshot must expose a placeholder");
+        let placeholder_path = placeholder["path"].as_str().expect("placeholder path").to_owned();
+        assert_eq!(placeholder["message"], "diff omitted: combined diff truncated; loaded on demand");
+        let placeholder_diff = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewFileDiff {
+                id: None,
+                snapshot_id: snapshot_id.clone(),
+                path: placeholder_path,
+                cursor: 0,
+                max_lines: Some(50),
+            },
+        )
+        .await;
+        assert!(placeholder_diff.success, "{placeholder_diff:?}");
+        let placeholder_page = placeholder_diff.data.expect("placeholder page");
+        assert!(placeholder_page["totalLines"].as_u64().expect("total") > 0);
+        assert_eq!(placeholder_page["lines"].as_array().expect("lines").len(), 50);
+
+        // Every catalogued path in the truncated snapshot serves a bounded
+        // first page — containment must accept placeholders like any file.
+        for file in files {
+            let path = file["path"].as_str().expect("path").to_owned();
+            let response = handle_code_review_command(
+                &app,
+                &code_review,
+                RpcCommand::CodeReviewFileDiff {
+                    id: None,
+                    snapshot_id: snapshot_id.clone(),
+                    path,
+                    cursor: 0,
+                    max_lines: Some(25),
+                },
+            )
+            .await;
+            assert!(response.success, "{response:?}");
+            let page = response.data.expect("page data");
+            assert!(
+                page["lines"].as_array().expect("lines").len() > 0,
+                "file diff must be readable after truncation: {page}"
+            );
+        }
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose { id: None },
+        )
+        .await;
+        assert!(closed.success);
+        app.cleanup().await;
+    }
+
+    #[test]
+    fn resolve_comment_target_rejects_stale_identity() {
+        use crate::code_review::{DiffLine, FileStatus, ReviewScope};
+        let file = DiffFile {
+            path: "src/lib.rs".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            insertions: 1,
+            deletions: 1,
+            hunks: vec![DiffHunk {
+                header: "@@ -1,1 +1,1 @@".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Context,
+                    old_no: Some(1),
+                    new_no: Some(1),
+                    text: "old".into(),
+                }],
+            }],
+            truncated: false,
+            message: None,
+        };
+        let snapshot = ReviewSnapshot {
+            root: PathBuf::from("/tmp/fake-root"),
+            scope: ReviewScope::WorkingTree,
+            snapshot_id: "snap-1".into(),
+            files: vec![file],
+            truncated: false,
+            error: None,
+        };
+        let identity = snapshot.hunk_identity(&snapshot.files[0], &snapshot.files[0].hunks[0]);
+
+        // A fully matching identity resolves to the (file, hunk).
+        let (resolved_file, resolved_hunk) = resolve_comment_target(
+            &snapshot,
+            &identity.snapshot_id,
+            "src/lib.rs",
+            1,
+            1,
+            1,
+            1,
+            &identity.content_hash,
+        )
+        .expect("matching identity resolves");
+        assert_eq!(resolved_file.path, "src/lib.rs");
+        assert_eq!(resolved_hunk.old_start, 1);
+
+        // Stale snapshot id is rejected.
+        let err = resolve_comment_target(
+            &snapshot,
+            "other-snapshot",
+            "src/lib.rs",
+            1,
+            1,
+            1,
+            1,
+            &identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stale snapshot"), "{err}");
+
+        // Unknown path is rejected.
+        let err = resolve_comment_target(
+            &snapshot,
+            &identity.snapshot_id,
+            "missing.rs",
+            1,
+            1,
+            1,
+            1,
+            &identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown file"), "{err}");
+
+        // Wrong hunk range is rejected.
+        let err = resolve_comment_target(
+            &snapshot,
+            &identity.snapshot_id,
+            "src/lib.rs",
+            5,
+            1,
+            1,
+            1,
+            &identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown hunk"), "{err}");
+
+        // Stale content hash (diff content changed) is rejected.
+        let err = resolve_comment_target(
+            &snapshot,
+            &identity.snapshot_id,
+            "src/lib.rs",
+            1,
+            1,
+            1,
+            1,
+            "wrong-hash",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stale hunk"), "{err}");
+    }
+
     /// Session with dense history so snap compact has something to archive
     /// (mirrors the pi-coding snap_compact_tests fixture: 12 large turns,
     /// keep 2, never calls the provider).
@@ -5359,6 +7691,7 @@ mod tests {
                 .expect("record message");
         }
         recorder.persist_now().expect("persist");
+        app.session().set_session_dir(session_dir.path().to_path_buf());
         app.session().record(recorder).expect("attach recorder");
 
         let settings = settings_state();
@@ -5566,6 +7899,15 @@ mod tests {
 
     /// Application with orchestration attached and two trusted agents.
     async fn subagents_app() -> (tempfile::TempDir, Application) {
+        subagents_app_with_child_delay(std::time::Duration::ZERO).await
+    }
+
+    /// [`subagents_app`] with an artificial delay before the child's first
+    /// turn finishes, so a spawned job stays `running` long enough to observe
+    /// its live transcript.
+    async fn subagents_app_with_child_delay(
+        child_delay: std::time::Duration,
+    ) -> (tempfile::TempDir, Application) {
         use pi_coding::{AgentCatalog, AgentDefinition, AgentDefinitionSource, OrchestrationConfig};
         let root = tempfile::tempdir().expect("tempdir");
         let agent = |name: &str, description: &str| AgentDefinition { name: name.to_owned(),
@@ -5582,13 +7924,14 @@ mod tests {
         capability_ceiling: None,
         source: AgentDefinitionSource::Bundled,
         path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None };
-        let factory: pi_coding::ChildSessionFactory = Arc::new(|request| {
-            let stream_fn: pi_agent::StreamFn = Arc::new(|model, _context, _options| {
+        let factory: pi_coding::ChildSessionFactory = Arc::new(move |request| {
+            let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
                 use pi_ai::{AssistantMessage, AssistantMessageEvent, StopReason};
                 async move {
                     let events = pi_ai::new_assistant_message_event_stream();
                     let writer = events.clone();
                     tokio::spawn(async move {
+                        tokio::time::sleep(child_delay).await;
                         let mut message = AssistantMessage::pending(&model);
                         message.stop_reason = StopReason::Stop;
                         writer
@@ -5800,6 +8143,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_history_fetches_running_child_transcript() {
+        let (root, app) =
+            subagents_app_with_child_delay(std::time::Duration::from_millis(400)).await;
+
+        let spawned = subagents_handle(
+            &app,
+            RpcCommand::TaskSpawn {
+                id: None,
+                args: json!({"task": "write the release notes", "agent": "writer"}),
+            },
+        )
+        .await;
+        assert!(spawned.success, "{spawned:?}");
+        let spawns = spawned.data.expect("spawns")["spawns"]
+            .as_array()
+            .expect("spawns array")
+            .clone();
+        let agent_id = spawns[0]["agentId"].as_str().expect("agent id").to_owned();
+
+        // The transcript must be readable from the live session while the job
+        // is still running — never gated on the settle-time snapshot.
+        let mut saw_running = false;
+        let mut running_fetch: Option<RpcResponse> = None;
+        loop {
+            let listed = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
+            let jobs = listed.data.expect("job list")["jobs"]
+                .as_array()
+                .expect("jobs array")
+                .clone();
+            assert_eq!(jobs.len(), 1, "{jobs:?}");
+            let status = jobs[0]["status"].as_str().unwrap_or("").to_owned();
+            if status == "running" {
+                saw_running = true;
+            }
+            if saw_running {
+                let fetched = subagents_handle(
+                    &app,
+                    RpcCommand::AgentHistory {
+                        id: None,
+                        agent_id: agent_id.clone(),
+                        lines: None,
+                    },
+                )
+                .await;
+                if fetched.success
+                    && fetched.data.as_ref().is_some_and(|data| {
+                        data["text"].as_str().is_some_and(|text| !text.is_empty())
+                    })
+                {
+                    running_fetch = Some(fetched);
+                    break;
+                }
+            }
+            assert!(
+                !matches!(status.as_str(), "completed" | "failed" | "cancelled"),
+                "job settled before the running transcript became fetchable: {jobs:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let fetched = running_fetch.expect("running fetch");
+        let data = fetched.data.expect("history data");
+        assert_eq!(data["agentId"], json!(agent_id));
+        let text = data["text"].as_str().expect("history text");
+        assert!(!text.is_empty() && text.lines().count() <= 80, "{text:?}");
+        assert!(text.contains("write the release notes"), "{text:?}");
+        let serialized = serde_json::to_string(&data).expect("serialize history");
+        assert!(
+            !serialized.contains(root.path().to_string_lossy().as_ref()),
+            "no filesystem paths may leak: {serialized}"
+        );
+
+        // The same fetch keeps working after the job settles.
+        loop {
+            let listed = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
+            let jobs = listed.data.expect("job list")["jobs"]
+                .as_array()
+                .expect("jobs array")
+                .clone();
+            let status = jobs[0]["status"].as_str().unwrap_or("");
+            if matches!(status, "completed" | "failed" | "cancelled") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let settled = subagents_handle(
+            &app,
+            RpcCommand::AgentHistory {
+                id: None,
+                agent_id,
+                lines: Some(20),
+            },
+        )
+        .await;
+        assert!(settled.success, "{settled:?}");
+        let settled_data = settled.data.expect("settled history");
+        assert_eq!(settled_data["agentId"], data["agentId"]);
+        assert!(
+            settled_data["text"]
+                .as_str()
+                .is_some_and(|text| text.lines().count() <= 20),
+            "{settled_data:?}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn agent_history_rejects_unknown_agent_and_invalid_lines() {
+        let (_root, app) = subagents_app().await;
+
+        // Unknown agent ids fail actionably, naming the offending id.
+        let missing = subagents_handle(
+            &app,
+            RpcCommand::AgentHistory {
+                id: None,
+                agent_id: "no-such-agent".to_owned(),
+                lines: None,
+            },
+        )
+        .await;
+        assert!(!missing.success, "{missing:?}");
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("no-such-agent")),
+            "{missing:?}"
+        );
+
+        // Line counts outside the core bound fail before any history read.
+        for bad_lines in [0, pi_coding::MAX_HISTORY_LINES + 1] {
+            let response = subagents_handle(
+                &app,
+                RpcCommand::AgentHistory {
+                    id: None,
+                    agent_id: "writer".to_owned(),
+                    lines: Some(bad_lines),
+                },
+            )
+            .await;
+            assert!(!response.success, "{response:?}");
+            assert!(
+                response.error.as_deref().is_some_and(|error| {
+                    error.contains("lines")
+                        && error.contains(&pi_coding::MAX_HISTORY_LINES.to_string())
+                }),
+                "{response:?}"
+            );
+        }
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn task_spawn_batch_requires_context_and_rejects_unknown_agents() {
         let (_root, app) = subagents_app().await;
 
@@ -5869,6 +8364,692 @@ mod tests {
         app.cleanup().await;
     }
 
+    // ------------------------------------------------------------------
+    // Persistent persona RPC — persona_list / persona_get / persona_create /
+    // persona_edit / persona_remove / persona_purge / persona_select /
+    // persona_clear / persona_current, plus task_spawn targeting a persona
+    // agent name. Apps mirror the real listen runtime: a ResourceManager
+    // discovers durable personas from a temp agent dir, the session is
+    // recording (persona spawns require a durable parent), and the
+    // orchestration runtime catalog is built from the resource snapshot.
+    // ------------------------------------------------------------------
+
+    /// Seeds `personas/<name>/persona.md` (plus memory/sessions when
+    /// `seed_state`) under the agent dir, returning the persona root.
+    fn seed_persona(agent_dir: &std::path::Path, name: &str, seed_state: bool) -> std::path::PathBuf {
+        let root = agent_dir.join("personas").join(name);
+        std::fs::create_dir_all(&root).expect("persona root");
+        std::fs::write(
+            root.join("persona.md"),
+            format!("---\nname: {name}\ndescription: durable {name}\n---\n{name} prompt"),
+        )
+        .expect("persona.md");
+        if seed_state {
+            let memory = root.join("memory");
+            std::fs::create_dir_all(&memory).expect("memory dir");
+            std::fs::write(
+                memory.join("entries.jsonl"),
+                "{\"id\":\"a\",\"content\":\"persona-memory-note\",\"tags\":[],\"ts\":1,\"session\":\"s\"}\n",
+            )
+            .expect("entries");
+            let sessions = root.join("sessions");
+            std::fs::create_dir_all(&sessions).expect("sessions dir");
+            std::fs::write(sessions.join("Mentor.jsonl"), "{}\n").expect("archive");
+        }
+        root
+    }
+
+    /// Application with a resource-discovered persona, a recording session,
+    /// and an orchestration runtime cataloged from the resource snapshot.
+    /// Returns (temp root, app, provider registration, persona root).
+    async fn persona_rpc_app(seed_state: bool) -> (tempfile::TempDir, Application, pi_ai::providers::FauxProviderRegistration, std::path::PathBuf) {
+        use pi_ai::providers::{FauxProviderOptions, FauxResponse, register_faux_provider};
+        use pi_ai::StopReason;
+        use pi_coding::{
+            AgentCatalog, OrchestrationConfig, OrchestrationRuntime, ResourceManager,
+            ResourceManagerOptions, Session, SessionOptions,
+        };
+        let root = tempfile::tempdir().expect("root");
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let persona_root = seed_persona(&agent_dir, "mentor", seed_state);
+        let cwd = root.path().join("project");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(cwd.join(".pi").join("artifacts")).expect("artifacts");
+
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let api = format!("persona-rpc-api-{suffix}");
+        let provider = format!("persona-rpc-provider-{suffix}");
+        let model = Model {
+            id: format!("persona-rpc-model-{suffix}"),
+            name: "Persona RPC Model".to_owned(),
+            api: api.clone(),
+            provider: provider.clone(),
+            ..Model::default()
+        };
+        let registration = register_faux_provider(FauxProviderOptions {
+            api,
+            provider,
+            models: vec![model.clone()],
+            chunk_size: 1,
+        });
+        registration.set_responses(vec![FauxResponse {
+            content: vec![pi_ai::ContentBlock::text("done")],
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }]);
+
+        let mut options = ResourceManagerOptions::new(&cwd);
+        options.agent_dir = agent_dir;
+        options.disable_extensions = true;
+        options.disable_skills = true;
+        options.disable_prompt_templates = true;
+        options.disable_themes = true;
+        options.disable_context_files = true;
+        let resources = ResourceManager::new(options).expect("resources");
+        let session = Session::new(SessionOptions {
+            model: model.clone(),
+            cwd: cwd.clone(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session");
+        let session_root = root.path().join("session-root");
+        std::fs::create_dir_all(&session_root).expect("session root");
+        session.set_session_dir(session_root);
+        session.start_new_recording().expect("start recording");
+        session
+            .attach_resources(resources)
+            .await
+            .expect("attach resources");
+        let application = Application::new(session).await;
+
+        // Orchestration catalog mirrors the resource snapshot (the real flow
+        // builds it from snapshot.agents at startup and rebuilds on reload).
+        let snapshot = application
+            .resource_snapshot()
+            .expect("resource snapshot after attach");
+        let factory: pi_coding::ChildSessionFactory = Arc::new(move |request| {
+            let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
+                use pi_ai::{AssistantMessage, AssistantMessageEvent, StopReason};
+                async move {
+                    let events = pi_ai::new_assistant_message_event_stream();
+                    let writer = events.clone();
+                    tokio::spawn(async move {
+                        let mut message = AssistantMessage::pending(&model);
+                        message.stop_reason = StopReason::Stop;
+                        writer
+                            .push(AssistantMessageEvent::Done {
+                                reason: StopReason::Stop,
+                                message: message.clone(),
+                            })
+                            .await;
+                        writer.end(Some(message)).await;
+                    });
+                    events
+                }
+                .boxed()
+            });
+            Box::pin(async move {
+                pi_coding::Session::new(pi_coding::SessionOptions {
+                    model: request.model,
+                    cwd: std::env::current_dir().expect("cwd"),
+                    system_prompt: request.system_prompt,
+                    thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
+                    api_key: "persona-rpc-child".to_owned(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(request.orchestration_tools),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(stream_fn),
+                    auth_resolver: None,
+                })
+            })
+        });
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(snapshot.agents.clone()),
+            cwd.join(".pi").join("artifacts"),
+        );
+        config.parent_model = model;
+        let runtime = OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
+        application
+            .attach_orchestration(runtime)
+            .expect("attach orchestration");
+        (root, application, registration, persona_root)
+    }
+
+    #[tokio::test]
+    async fn persona_rpc_list_discloses_seeded_persona_with_state_and_no_paths() {
+        let (_root, app, _registration, persona_root) = persona_rpc_app(true).await;
+
+        let response = subagents_handle(&app, RpcCommand::PersonaList { id: None }).await;
+        assert!(response.success, "{response:?}");
+        let data = response.data.expect("persona list");
+        assert_eq!(data["enabled"], true);
+        let rows = data["personas"].as_array().expect("personas array");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row["name"], json!("mentor"));
+        assert_eq!(row["description"], json!("durable mentor"));
+        assert_eq!(row["source"], json!("user"));
+        assert_eq!(row["trusted"], json!(true));
+        assert_eq!(row["preferred"], json!(false));
+        assert!(row["contractSummary"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(row["memoryEntries"], json!(1));
+        assert_eq!(row["sessionCount"], json!(1));
+        assert_eq!(row["stateError"], json!(null));
+        // No absolute paths may cross the wire (the fixture home lives under
+        // the temp root; persona roots must stay server-side).
+        let serialized = serde_json::to_string(&data).expect("serialize");
+        assert!(
+            !serialized.contains(persona_root.to_string_lossy().as_ref()),
+            "persona_list leaked the persona root path: {serialized}"
+        );
+        assert!(
+            !serialized.contains(std::env::current_dir().expect("cwd").to_string_lossy().as_ref()),
+            "persona_list leaked an absolute path: {serialized}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_rpc_get_returns_bounded_content_and_rejects_unknown() {
+        let (_root, app, _registration, persona_root) = persona_rpc_app(false).await;
+
+        let got = subagents_handle(
+            &app,
+            RpcCommand::PersonaGet {
+                id: None,
+                name: "mentor".to_owned(),
+            },
+        )
+        .await;
+        assert!(got.success, "{got:?}");
+        let data = got.data.expect("persona get");
+        assert_eq!(data["name"], json!("mentor"));
+        assert_eq!(data["contentTruncated"], json!(false));
+        let content = data["content"].as_str().expect("content");
+        assert!(content.contains("durable mentor"), "{content}");
+        assert!(
+            !content.contains(persona_root.to_string_lossy().as_ref()),
+            "persona_get leaked the persona root path"
+        );
+
+        let missing = subagents_handle(
+            &app,
+            RpcCommand::PersonaGet {
+                id: None,
+                name: "ghost".to_owned(),
+            },
+        )
+        .await;
+        assert!(!missing.success, "{missing:?}");
+        assert!(
+            missing
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("ghost")),
+            "{missing:?}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_rpc_create_makes_catalog_discoverable_and_edit_rejects_name_mismatch() {
+        let (_root, app, _registration, _persona_root) = persona_rpc_app(false).await;
+
+        // Config save -> catalog discoverable: after persona_create the very
+        // next persona_list includes the new persona (commit live-reloads).
+        let created = subagents_handle(
+            &app,
+            RpcCommand::PersonaCreate {
+                id: None,
+                name: "guide".to_owned(),
+                content: "---\nname: guide\ndescription: guided assistant\n---\nguide prompt\n".to_owned(),
+            },
+        )
+        .await;
+        assert!(created.success, "{created:?}");
+        assert_eq!(created.data.expect("created")["created"], json!(true));
+        let listed = subagents_handle(&app, RpcCommand::PersonaList { id: None }).await;
+        let list_data = listed.data.expect("list");
+        let rows = list_data["personas"].as_array().expect("rows");
+        let names = rows
+            .iter()
+            .filter_map(|row| row.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            names.contains(&"guide") && names.contains(&"mentor"),
+            "catalog must discover the created persona: {names:?}"
+        );
+
+        // A duplicate create is rejected (name already in use).
+        let duplicate = subagents_handle(
+            &app,
+            RpcCommand::PersonaCreate {
+                id: None,
+                name: "guide".to_owned(),
+                content: "---\nname: guide\ndescription: again\n---\nprompt".to_owned(),
+            },
+        )
+        .await;
+        assert!(!duplicate.success, "{duplicate:?}");
+        assert!(
+            duplicate
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("already in use")),
+            "{duplicate:?}"
+        );
+
+        // Edit with a mismatched frontmatter name is rejected: the committed
+        // content must declare the target name (no silent renames).
+        let mismatch = subagents_handle(
+            &app,
+            RpcCommand::PersonaEdit {
+                id: None,
+                name: "guide".to_owned(),
+                content: "---\nname: other\ndescription: renamed\n---\nprompt".to_owned(),
+            },
+        )
+        .await;
+        assert!(!mismatch.success, "{mismatch:?}");
+        assert!(
+            mismatch
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("must match the target name")),
+            "{mismatch:?}"
+        );
+
+        // A matching-name edit commits and is visible afterwards.
+        let edited = subagents_handle(
+            &app,
+            RpcCommand::PersonaEdit {
+                id: None,
+                name: "guide".to_owned(),
+                content: "---\nname: guide\ndescription: refined guide\n---\nrefined prompt".to_owned(),
+            },
+        )
+        .await;
+        assert!(edited.success, "{edited:?}");
+        let got = subagents_handle(
+            &app,
+            RpcCommand::PersonaGet {
+                id: None,
+                name: "guide".to_owned(),
+            },
+        )
+        .await;
+        assert!(got.success, "{got:?}");
+        assert_eq!(
+            got.data.expect("get")["description"],
+            json!("refined guide")
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_rpc_remove_keeps_state_and_purge_deletes_root_with_confirmation_gates() {
+        let (_root, app, _registration, persona_root) = persona_rpc_app(true).await;
+        let memory = persona_root.join("memory").join("entries.jsonl");
+        let sessions = persona_root.join("sessions").join("Mentor.jsonl");
+        let persona_md = persona_root.join("persona.md");
+
+        // Destructive ops without `confirm: true` are rejected before any
+        // filesystem mutation (fail-closed mirror of the CLI --yes gate).
+        for command in [
+            RpcCommand::PersonaRemove {
+                id: None,
+                name: "mentor".to_owned(),
+                confirm: false,
+            },
+            RpcCommand::PersonaPurge {
+                id: None,
+                name: "mentor".to_owned(),
+                confirm: false,
+            },
+        ] {
+            let response = subagents_handle(&app, command).await;
+            assert!(!response.success, "{response:?}");
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("confirm: true")),
+                "{response:?}"
+            );
+        }
+        assert!(persona_md.exists(), "unconfirmed op must not touch the disk");
+
+        // Unknown personas fail closed even with confirmation.
+        let unknown = subagents_handle(
+            &app,
+            RpcCommand::PersonaRemove {
+                id: None,
+                name: "ghost".to_owned(),
+                confirm: true,
+            },
+        )
+        .await;
+        assert!(!unknown.success, "{unknown:?}");
+
+        // Remove with confirmation deletes persona.md but KEEPS memory and
+        // sessions under the persona root, and the catalog drops the persona.
+        let removed = subagents_handle(
+            &app,
+            RpcCommand::PersonaRemove {
+                id: None,
+                name: "mentor".to_owned(),
+                confirm: true,
+            },
+        )
+        .await;
+        assert!(removed.success, "{removed:?}");
+        assert_eq!(removed.data.expect("removed")["removed"], json!(true));
+        assert!(!persona_md.exists(), "remove must delete persona.md");
+        assert!(memory.exists(), "remove must keep memory/entries.jsonl");
+        assert!(sessions.exists(), "remove must keep sessions archives");
+        let listed = subagents_handle(&app, RpcCommand::PersonaList { id: None }).await;
+        assert_eq!(
+            listed.data.expect("list")["personas"].as_array().expect("rows").len(),
+            0,
+            "removed persona must leave the catalog"
+        );
+
+        // A removed persona cannot be edited (no definition to resolve).
+        let edit_after_remove = subagents_handle(
+            &app,
+            RpcCommand::PersonaEdit {
+                id: None,
+                name: "mentor".to_owned(),
+                content: "---\nname: mentor\ndescription: back\n---\nprompt".to_owned(),
+            },
+        )
+        .await;
+        assert!(!edit_after_remove.success, "{edit_after_remove:?}");
+
+        // Re-create with the same name (the kept state becomes visible again)
+        // so purge can be exercised on a persona with memory.
+        let recreated = subagents_handle(
+            &app,
+            RpcCommand::PersonaCreate {
+                id: None,
+                name: "mentor".to_owned(),
+                content: "---\nname: mentor\ndescription: recreated\n---\nprompt".to_owned(),
+            },
+        )
+        .await;
+        assert!(recreated.success, "{recreated:?}");
+        assert!(memory.exists(), "recreate must reuse the kept memory dir");
+        assert!(persona_md.exists(), "recreate must write persona.md");
+
+        // Purge with confirmation deletes the WHOLE root (definition + state).
+        let purged = subagents_handle(
+            &app,
+            RpcCommand::PersonaPurge {
+                id: None,
+                name: "mentor".to_owned(),
+                confirm: true,
+            },
+        )
+        .await;
+        assert!(purged.success, "{purged:?}");
+        assert_eq!(purged.data.expect("purged")["purged"], json!(true));
+        assert!(!persona_root.exists(), "purge must delete the persona root");
+        let listed_after = subagents_handle(&app, RpcCommand::PersonaList { id: None }).await;
+        assert_eq!(
+            listed_after.data.expect("list")["personas"].as_array().expect("rows").len(),
+            0
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_rpc_select_clear_current_and_task_spawn_target_persona() {
+        let (_root, app, _registration, _persona_root) = persona_rpc_app(false).await;
+
+        // persona_current reports no selection initially.
+        let initial = subagents_handle(&app, RpcCommand::PersonaCurrent { id: None }).await;
+        assert!(initial.success, "{initial:?}");
+        assert_eq!(initial.data.expect("current")["name"], json!(null));
+
+        // Select persists the preference; the list marks the persona.
+        let selected = subagents_handle(
+            &app,
+            RpcCommand::PersonaSelect {
+                id: None,
+                name: "mentor".to_owned(),
+            },
+        )
+        .await;
+        assert!(selected.success, "{selected:?}");
+        assert_eq!(selected.data.expect("select")["preferred"], json!(true));
+        let listed = subagents_handle(&app, RpcCommand::PersonaList { id: None }).await;
+        let row = &listed.data.expect("list")["personas"][0];
+        assert_eq!(row["preferred"], json!(true), "{row:?}");
+        let current = subagents_handle(&app, RpcCommand::PersonaCurrent { id: None }).await;
+        assert_eq!(current.data.expect("current")["name"], json!("mentor"));
+
+        // Selecting an unknown persona fails closed.
+        let unknown = subagents_handle(
+            &app,
+            RpcCommand::PersonaSelect {
+                id: None,
+                name: "ghost".to_owned(),
+            },
+        )
+        .await;
+        assert!(!unknown.success, "{unknown:?}");
+
+        // Clear drops the preference.
+        let cleared = subagents_handle(&app, RpcCommand::PersonaClear { id: None }).await;
+        assert!(cleared.success, "{cleared:?}");
+        let after_clear = subagents_handle(&app, RpcCommand::PersonaCurrent { id: None }).await;
+        assert_eq!(after_clear.data.expect("current")["name"], json!(null));
+
+        // The Web Run button calls task_spawn with `agent` = the persona
+        // name: the spawned job must point at the persona agent.
+        let spawned = subagents_handle(
+            &app,
+            RpcCommand::TaskSpawn {
+                id: None,
+                args: json!({"task": "audit the release notes", "agent": "mentor"}),
+            },
+        )
+        .await;
+        assert!(spawned.success, "{spawned:?}");
+        let spawns = spawned.data.expect("spawns")["spawns"]
+            .as_array()
+            .expect("spawns array")
+            .clone();
+        assert_eq!(spawns.len(), 1, "{spawns:?}");
+        assert_eq!(spawns[0]["agent"], json!("mentor"), "{spawns:?}");
+        let listed_jobs = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
+        let job_list_data = listed_jobs.data.expect("job list");
+        let jobs = job_list_data["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .clone();
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0]["agent"], json!("mentor"), "{jobs:?}");
+        assert!(
+            jobs[0]["agentId"].as_str().is_some_and(|id| !id.is_empty()),
+            "spawn must carry a stable agent id: {jobs:?}"
+        );
+        let serialized = serde_json::to_string(&job_list_data).expect("serialize");
+        assert!(
+            !serialized.to_lowercase().contains("user-mock-key")
+                && !serialized.to_lowercase().contains("api_key"),
+            "no credentials may cross the wire: {serialized}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_rpc_natural_language_prompt_routes_to_persona() {
+        // The natural-language form `让 mentor 审查这次修改` with NO explicit
+        // agent routes through the existing orchestration selector to the
+        // PERSONA agent (durably-bound runtime; no frontend heuristic).
+        let (_root, app, _registration, _persona_root) = persona_rpc_app(false).await;
+        let runtime = app.orchestration_runtime().expect("runtime");
+        let spawned = runtime
+            .spawn_from_natural_language("Main", 0, "让 mentor 审查这次修改")
+            .expect("spawn from natural language")
+            .expect("delegation must produce spawns");
+        assert_eq!(spawned.len(), 1, "{spawned:?}");
+        assert_eq!(spawned[0].agent, "mentor", "{spawned:?}");
+        assert_eq!(spawned[0].agent_id, "mentor", "{spawned:?}");
+        let listed = subagents_handle(&app, RpcCommand::JobList { id: None }).await;
+        let jobs = listed.data.expect("job list")["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .clone();
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0]["agent"], json!("mentor"), "{jobs:?}");
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_rpc_failure_errors_never_embed_absolute_paths() {
+        let (root, app, _registration, persona_root) = persona_rpc_app(false).await;
+
+        // Sabotage the definition AFTER discovery: the snapshot still lists
+        // the persona, but persona_get's definition read fails — the error
+        // surfaced to the Web must carry the operation + persona name only,
+        // never the filesystem path.
+        std::fs::remove_file(persona_root.join("persona.md")).expect("remove persona.md");
+        let got = subagents_handle(
+            &app,
+            RpcCommand::PersonaGet {
+                id: None,
+                name: "mentor".to_owned(),
+            },
+        )
+        .await;
+        assert!(!got.success, "{got:?}");
+        let serialized = serde_json::to_string(&got).expect("serialize");
+        assert!(
+            !serialized.contains(root.path().to_string_lossy().as_ref()),
+            "persona_get failure must not leak the temp root: {serialized}"
+        );
+        assert!(
+            !serialized.contains(std::env::current_dir().expect("cwd").to_string_lossy().as_ref()),
+            "persona_get failure must not leak an absolute path: {serialized}"
+        );
+        assert!(
+            serialized.contains("mentor"),
+            "the error must stay actionable with the persona name: {serialized}"
+        );
+
+        // Destructive ops on an unknown persona fail closed without paths.
+        let unknown = subagents_handle(
+            &app,
+            RpcCommand::PersonaPurge {
+                id: None,
+                name: "ghost".to_owned(),
+                confirm: true,
+            },
+        )
+        .await;
+        assert!(!unknown.success, "{unknown:?}");
+        let serialized_unknown = serde_json::to_string(&unknown).expect("serialize");
+        assert!(
+            !serialized_unknown.contains(root.path().to_string_lossy().as_ref()),
+            "unknown persona error must not leak paths: {serialized_unknown}"
+        );
+
+        // Invalid create content fails validation without paths.
+        let invalid = subagents_handle(
+            &app,
+            RpcCommand::PersonaCreate {
+                id: None,
+                name: "bad".to_owned(),
+                content: "no frontmatter here".to_owned(),
+            },
+        )
+        .await;
+        assert!(!invalid.success, "{invalid:?}");
+        let serialized_invalid = serde_json::to_string(&invalid).expect("serialize");
+        assert!(
+            !serialized_invalid.contains(root.path().to_string_lossy().as_ref()),
+            "invalid content error must not leak paths: {serialized_invalid}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_rpc_create_reports_reload_failure_instead_of_fake_success() {
+        let (root, app, _registration, _persona_root) = persona_rpc_app(false).await;
+        // Sabotage the catalog AFTER startup: an oversized persona definition
+        // (> 256 KiB) makes the reload inside commit_persona_definition fail
+        // deterministically. The persona.md write lands, but the RPC must
+        // report a REAL failure (never created:true) with a fixed, path-free
+        // message so the Web keeps the editor draft instead of loading a
+        // stale catalog.
+        let bad_root = root.path().join("agent").join("personas").join("bad");
+        std::fs::create_dir_all(&bad_root).expect("bad persona dir");
+        let mut oversized = vec![b'x'; 256 * 1024 + 1];
+        oversized[..4].copy_from_slice(b"---\n");
+        std::fs::write(bad_root.join("persona.md"), oversized).expect("oversized persona.md");
+
+        let response = subagents_handle(
+            &app,
+            RpcCommand::PersonaCreate {
+                id: None,
+                name: "scribe".to_owned(),
+                content: "---\nname: scribe\ndescription: scribing\n---\nprompt\n".to_owned(),
+            },
+        )
+        .await;
+        assert!(!response.success, "reload failure must not fake success: {response:?}");
+        let error = response.error.as_deref().expect("error");
+        assert!(
+            error.contains("reload or restart required") && error.contains("scribe"),
+            "{error}"
+        );
+        assert!(
+            !error.contains(root.path().to_string_lossy().as_ref()),
+            "reload-failure wire error must stay path-free: {error}"
+        );
+        let serialized = serde_json::to_string(&response).expect("serialize");
+        assert!(
+            !serialized.contains(root.path().to_string_lossy().as_ref()),
+            "no temp root may cross the wire: {serialized}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn persona_rpc_fails_closed_without_resource_manager() {
+        // A session without a ResourceManager has no persona catalog: list
+        // reports disabled, and read/mutate commands fail instead of
+        // fabricating rows.
+        let app = build_todo_app("faux-rpc-persona-none", "faux-rpc-persona-none-api").await;
+        let listed = subagents_handle(&app, RpcCommand::PersonaList { id: None }).await;
+        assert!(listed.success, "{listed:?}");
+        assert_eq!(listed.data.expect("list")["enabled"], json!(false));
+        let got = subagents_handle(
+            &app,
+            RpcCommand::PersonaGet {
+                id: None,
+                name: "mentor".to_owned(),
+            },
+        )
+        .await;
+        assert!(!got.success, "{got:?}");
+        app.cleanup().await;
+    }
+
     #[tokio::test]
     async fn orchestration_mutations_fail_cleanly_without_runtime() {
         let app = build_todo_app("faux-rpc-jobs2", "faux-rpc-jobs2-api").await;
@@ -5900,6 +9081,14 @@ mod tests {
                 RpcCommand::JobOutput {
                     id: None,
                     job_id: "j".into(),
+                },
+                "orchestration is not enabled",
+            ),
+            (
+                RpcCommand::AgentHistory {
+                    id: None,
+                    agent_id: "writer".into(),
+                    lines: None,
                 },
                 "orchestration is not enabled",
             ),
@@ -5938,9 +9127,11 @@ mod tests {
             stt_model: String::new(),
             realtime_base_url: base_url.to_owned(),
             realtime_api_key: REALTIME_TEST_KEY.to_owned(),
-            // A custom alias (not the upstream's gpt-realtime-1.5) proves the
-            // configured model label is forwarded verbatim, not rewritten or
-            // hard-rejected here.
+            // A custom alias (not the upstream's gpt-realtime-1.5) keeps the
+            // fixture distinct from any hardcoded upstream value. The create-call
+            // session omits `model` entirely (Codex rejects it with 400); the
+            // web `session.update` data-channel shape forwards the configured
+            // label verbatim instead.
             realtime_model: "gpt-5.6-sol".to_owned(),
             voice: "sol".to_owned(),
             language: None,
@@ -5959,6 +9150,164 @@ mod tests {
         assert!(!error.contains(REALTIME_TEST_KEY), "{error}");
     }
 
+    #[test]
+    fn validate_realtime_proxy_rejects_userinfo_without_echoing_secrets() {
+        // A base URL carrying userinfo must fail closed with fixed text —
+        // neither the username nor the password may surface in the error.
+        let settings =
+            realtime_test_settings("http://alice:SUPER-SECRET-PASSWORD@127.0.0.1:1/v1");
+        let error = validate_realtime_proxy(&settings)
+            .expect_err("userinfo base URL must fail closed")
+            .to_string();
+        assert!(error.contains("username or password"), "{error}");
+        assert!(!error.contains("alice"), "{error}");
+        assert!(!error.contains("SUPER-SECRET-PASSWORD"), "{error}");
+        assert!(!error.contains(REALTIME_TEST_KEY), "{error}");
+    }
+
+    #[test]
+    fn validate_realtime_proxy_rejects_query_without_echoing_token() {
+        // A query/fragment (potential routing secret) must fail closed with
+        // fixed text and never be echoed.
+        let settings =
+            realtime_test_settings("http://127.0.0.1:1/v1?token=SUPER-SECRET-QUERY-TOKEN#frag");
+        let error = validate_realtime_proxy(&settings)
+            .expect_err("query base URL must fail closed")
+            .to_string();
+        assert!(error.contains("query or fragment"), "{error}");
+        assert!(!error.contains("SUPER-SECRET-QUERY-TOKEN"), "{error}");
+        assert!(!error.contains("token="), "{error}");
+        assert!(!error.contains(REALTIME_TEST_KEY), "{error}");
+    }
+
+    #[test]
+    fn realtime_endpoint_never_carries_query_or_fragment_into_url() {
+        // Defense in depth: even if a non-canonical base slipped through, the
+        // built URL must never contain its query/fragment (which could carry
+        // a secret) — only the canonical base path is interpolated.
+        let url = realtime_endpoint(
+            "http://127.0.0.1:1/base?token=SUPER-SECRET-QUERY#frag=secret",
+            "/realtime/calls",
+        );
+        assert_eq!(url, "http://127.0.0.1:1/base/v1/realtime/calls");
+        assert!(!url.contains("SUPER-SECRET-QUERY"), "{url}");
+        assert!(!url.contains("secret"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_rejects_empty_offer() {
+        let settings = realtime_test_settings("http://127.0.0.1:1");
+        let err = realtime_create_call(&settings, "   \r\n\t ")
+            .await
+            .expect_err("empty offer must error");
+        assert!(err.to_string().contains("SDP offer"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_rejects_oversized_offer() {
+        let settings = realtime_test_settings("http://127.0.0.1:1");
+        let huge = "v=0\r\n".repeat(REALTIME_BODY_LIMIT / 5 + 1);
+        let err = realtime_create_call(&settings, &huge)
+            .await
+            .expect_err("oversized offer must error");
+        let msg = err.to_string();
+        assert!(msg.contains("SDP offer"), "{msg}");
+        assert!(msg.contains("256 KiB"), "{msg}");
+        assert!(!msg.contains(REALTIME_TEST_KEY), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_network_error_uses_fixed_endpoint_name() {
+        // Bind a listener and immediately drop it so nothing is listening:
+        // the POST fails at connect, and the error must not echo the raw URL.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+        let err = realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER)
+            .await
+            .expect_err("connection refused must error")
+            .to_string();
+        assert!(err.contains("realtime_create_call"), "{err}");
+        assert!(!err.contains(&format!("127.0.0.1:{port}")), "{err}");
+        assert!(!err.contains(REALTIME_TEST_KEY), "{err}");
+        assert!(!err.contains("Bearer"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_redacts_credentials_in_non_2xx_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let _req = read_http_request(&mut sock).await;
+        // The upstream echoes credential-looking material back in every
+        // established form (Authorization header, mixed-case, colon/space and
+        // `=` separators, query-style values, and the bare configured key);
+        // the shared redaction must scrub all of them from the error.
+        let body = format!(
+            "Authorization: Bearer {0}\nAPI_KEY: {0}\nToken : {0}\ntoken={0}\napiKey={1}\n{1}",
+            "SUPER-SECRET-UPSTREAM-TOKEN",
+            REALTIME_TEST_KEY
+        );
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 500 Internal Server Error",
+            &[("Content-Type".to_owned(), "text/plain".to_owned())],
+            body.as_bytes(),
+        )
+        .await;
+
+        let err = call
+            .await
+            .expect("task join")
+            .expect_err("non-2xx must error");
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "{msg}");
+        // The shared contract: every secret VALUE is scrubbed, the redaction
+        // marker is present, and the truncated body stays bounded.
+        assert!(!msg.contains("SUPER-SECRET-UPSTREAM-TOKEN"), "{msg}");
+        assert!(!msg.contains(REALTIME_TEST_KEY), "{msg}");
+        assert!(!msg.contains("Bearer"), "{msg}");
+        assert!(msg.contains("[REDACTED]"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_rejects_oversized_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let _req = read_http_request(&mut sock).await;
+        // Claim an oversized answer via Content-Length only: the pre-check
+        // must reject it on the header, before any body bytes are read.
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nLocation: /v1/realtime/calls/rtc_big\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            REALTIME_BODY_LIMIT + 1
+        );
+        sock.write_all(header.as_bytes()).await.expect("write oversized headers");
+        drop(sock);
+
+        let err = call
+            .await
+            .expect("task join")
+            .expect_err("oversized response body must error");
+        let msg = err.to_string();
+        assert!(msg.contains("256 KiB"), "{msg}");
+        assert!(msg.contains("bound"), "{msg}");
+        assert!(!msg.contains(REALTIME_TEST_KEY), "{msg}");
+    }
+
     struct MockRequest {
         method: String,
         path: String,
@@ -5973,6 +9322,12 @@ mod tests {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.as_str())
         }
+    }
+
+    /// Decodes the captured create-call request body as the contract JSON
+    /// `{sdp, session}` object.
+    fn json_request_body(body: &[u8]) -> Value {
+        serde_json::from_slice(body).expect("JSON request body")
     }
 
     /// Reads one HTTP/1.1 request (request line + headers + exactly
@@ -6072,22 +9427,53 @@ mod tests {
             req.header("authorization").unwrap(),
             format!("Bearer {REALTIME_TEST_KEY}")
         );
-        // Content-Type is JSON.
-        assert!(
-            req.header("content-type")
-                .unwrap()
-                .starts_with("application/json"),
-            "content-type: {:?}",
-            req.header("content-type")
+        // AVAS rejects the create-call request when this exact alpha contract
+        // header is absent or carries a different value.
+        assert_eq!(req.header("openai-alpha"), Some("quicksilver=v2"));
+        // The create-call contract is a JSON POST: `Content-Type:
+        // application/json` and a body that is EXACTLY `{sdp, session}` — no
+        // extra fields, no multipart. The session object is the Quicksilver
+        // create-call shape: `{type, audio}` with `voice` nested under
+        // `audio.output` — `model` is deliberately absent because Codex
+        // realtime rejects `session.model` with 400 (the configured model
+        // rides the data-channel `session.update` instead, where it is
+        // accepted).
+        let content_type = req.header("content-type").expect("content-type");
+        assert_eq!(content_type, "application/json", "content-type: {content_type:?}");
+        let request_body = json_request_body(&req.body);
+        let mut body_keys = request_body
+            .as_object()
+            .expect("request body must be an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        body_keys.sort();
+        assert_eq!(
+            body_keys, ["sdp", "session"],
+            "create-call body must be exactly {{sdp, session}}: {request_body}"
         );
-        // Body is the contract shape: { sdp, session: { type, model, audio } }.
-        let body: Value = serde_json::from_slice(&req.body).expect("json body");
-        assert_eq!(body["sdp"], REALTIME_TEST_SDP_OFFER);
-        let session = body.get("session").expect("session object");
+        assert_eq!(request_body["sdp"], REALTIME_TEST_SDP_OFFER);
+        let session = &request_body["session"];
         assert!(session.is_object(), "session must be an object: {session}");
+        // Exact create-call session shape: `{audio, type}` and nothing else.
+        let mut session_keys = session
+            .as_object()
+            .expect("session must be an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        session_keys.sort();
+        assert_eq!(
+            session_keys, ["audio", "type"],
+            "create-call session must be exactly {{audio, type}}: {session}"
+        );
         assert_eq!(session["type"], "quicksilver");
-        // Configured model alias forwarded verbatim, not rewritten.
-        assert_eq!(session["model"], "gpt-5.6-sol");
+        // The forbidden `model` field must never reach the create-call POST —
+        // Codex rejects it with 400.
+        assert!(
+            session.get("model").is_none(),
+            "create-call session must not carry `model`: {session}"
+        );
         assert_eq!(session["audio"]["input"]["format"]["type"], "audio/pcm");
         assert_eq!(session["audio"]["input"]["format"]["rate"], 24000);
         assert_eq!(session["audio"]["output"]["voice"], "sol");
@@ -6107,6 +9493,122 @@ mod tests {
         let result = call.await.expect("task join").expect("create call ok");
         assert_eq!(result["sdp"], sdp_answer);
         assert_eq!(result["callId"], "rtc_alpha-001");
+    }
+
+    /// Loopback CLIProxyAPI stand-in implementing the reported Codex
+    /// quicksilver create-call contract: a `session` that carries `model` is
+    /// rejected with 400 `Field session.model is not allowed for this Codex
+    /// realtime session`; one without `model` is accepted with 201 +
+    /// `Location` + a bare SDP body. Returns the parsed request and the status
+    /// line sent back.
+    async fn serve_realtime_create_call(listener: &TcpListener) -> (MockRequest, String) {
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let req = read_http_request(&mut sock).await;
+        let request_body = json_request_body(&req.body);
+        let session = &request_body["session"];
+        let (status_line, headers, body): (&str, Vec<(String, String)>, Vec<u8>) =
+            if session.get("model").is_some() {
+                (
+                    "HTTP/1.1 400 Bad Request",
+                    vec![("Content-Type".to_owned(), "text/plain".to_owned())],
+                    b"Field session.model is not allowed for this Codex realtime session".to_vec(),
+                )
+            } else {
+                (
+                    "HTTP/1.1 201 Created",
+                    vec![
+                        (
+                            "Location".to_owned(),
+                            "/v1/realtime/calls/rtc_alpha-001".to_owned(),
+                        ),
+                        ("Content-Type".to_owned(), "application/sdp".to_owned()),
+                    ],
+                    b"v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_vec(),
+                )
+            };
+        write_http_response(&mut sock, status_line, &headers, &body).await;
+        (req, status_line.to_owned())
+    }
+
+    /// Reads just the status line of an HTTP response (the caller only needs
+    /// the status for the mock-fidelity leg).
+    async fn read_http_status_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = reader.read(&mut chunk).await.expect("read response bytes");
+            assert!(n > 0, "mock closed before the status line");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(idx) = buf.windows(2).position(|w| w == b"\r\n") {
+                return String::from_utf8(buf[..idx].to_vec()).expect("ascii status line");
+            }
+            assert!(buf.len() < 64 * 1024, "mock response head unbounded");
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_create_call_omits_model_forbidden_by_codex_create_call() {
+        // Codex realtime (CLIProxyAPI quicksilver) rejects create-call
+        // requests whose `session` carries `model` with 400 "Field
+        // session.model is not allowed for this Codex realtime session". The
+        // loopback mock reproduces exactly that discriminator: a session WITH
+        // `model` → 400, one WITHOUT → 201. The fixed client must land on the
+        // 2xx path, proving the create-call session omits `model` — the
+        // configured model rides the data-channel `session.update` instead.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+
+        // Leg 1: the real client. If `realtime_session_payload` ever sends
+        // `model` again, the mock 400s the request and this leg fails.
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+        let (req, status_line) = serve_realtime_create_call(&listener).await;
+        let request_body = json_request_body(&req.body);
+        let session = &request_body["session"];
+        assert!(
+            session.get("model").is_none(),
+            "create-call session must not carry `model` (Codex rejects it): {session}"
+        );
+        assert!(status_line.starts_with("HTTP/1.1 201"), "{status_line}");
+        let result = call
+            .await
+            .expect("task join")
+            .expect("model-free create call must succeed");
+        assert_eq!(result["callId"], "rtc_alpha-001");
+
+        // Leg 2: mock fidelity — the pre-fix shape (session WITH `model`) must
+        // be rejected with the reported 400, proving the discriminator above
+        // is the real upstream contract and leg 1's pass is not a tautology
+        // (a mock that always 2xx'd would let a regressed client slip through).
+        let old_shape = json!({
+            "sdp": REALTIME_TEST_SDP_OFFER,
+            "session": {
+                "type": "quicksilver",
+                "model": "gpt-5.6-sol",
+                "audio": {
+                    "input": { "format": { "type": "audio/pcm", "rate": 24000 } },
+                    "output": { "voice": "sol" },
+                },
+            },
+        });
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let raw = format!(
+            "POST /v1/realtime/calls HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            old_shape.to_string().len(),
+            old_shape
+        );
+        client
+            .write_all(raw.as_bytes())
+            .await
+            .expect("write pre-fix shape request");
+        let (_req, status_line) = serve_realtime_create_call(&listener).await;
+        let rejected = read_http_status_line(&mut client).await;
+        assert_eq!(status_line, "HTTP/1.1 400 Bad Request", "{status_line}");
+        assert_eq!(rejected, "HTTP/1.1 400 Bad Request", "{rejected}");
     }
 
     #[tokio::test]
@@ -6205,6 +9707,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realtime_create_call_location_error_never_echoes_query_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, REALTIME_TEST_SDP_OFFER).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let _req = read_http_request(&mut sock).await;
+        // A Location carrying a query token must fail on the derived path
+        // segment without ever echoing the raw Location, its query, or the
+        // fragment — the token is server-side routing material.
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 201 Created",
+            &[
+                (
+                    "Location".to_owned(),
+                    "/v1/realtime/calls/not-a-valid-id?token=SUPER-SECRET-QUERY-TOKEN#frag=also-secret".to_owned(),
+                ),
+                ("Content-Type".to_owned(), "application/sdp".to_owned()),
+            ],
+            b"v=0\r\no=- 4 4 IN IP4 127.0.0.1\r\n",
+        )
+        .await;
+
+        let err = call
+            .await
+            .expect("task join")
+            .expect_err("illegal Location must error");
+        let msg = err.to_string();
+        // The derived path segment is the only Location-derived content.
+        assert!(msg.contains("not-a-valid-id"), "{msg}");
+        assert!(msg.contains("Location"), "{msg}");
+        // Query/fragment secrets never surface in the error.
+        assert!(!msg.contains("SUPER-SECRET-QUERY-TOKEN"), "{msg}");
+        assert!(!msg.contains("also-secret"), "{msg}");
+        assert!(!msg.contains("token="), "{msg}");
+        assert!(!msg.contains(REALTIME_TEST_KEY), "{msg}");
+        assert!(!msg.contains("Bearer"), "{msg}");
+    }
+
+    #[test]
+    fn parse_realtime_call_id_non_utf8_location_uses_fixed_text() {
+        // Non-UTF-8 Location bytes must not be Debug-echoed: only fixed text.
+        let bad = reqwest::header::HeaderValue::from_bytes(b"/v1/realtime/calls/\xff\xfe")
+            .expect("HeaderValue accepts high bytes");
+        let err = parse_realtime_call_id(Some(&bad))
+            .expect_err("non-UTF-8 Location must error")
+            .to_string();
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert!(!err.contains("\\xff"), "{err}");
+        assert!(!err.contains("\\xfe"), "{err}");
+        assert!(!err.contains(REALTIME_TEST_KEY), "{err}");
+    }
+
+    #[tokio::test]
     async fn realtime_create_call_rejects_empty_sdp() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("local addr").port();
@@ -6268,5 +9829,279 @@ mod tests {
         // Auth must not leak into the error.
         assert!(!msg.contains(REALTIME_TEST_KEY), "{msg}");
         assert!(!msg.contains("Bearer"), "{msg}");
+    }
+
+    /// A realistic ICE-gathered offer (the shape the browser POSTs after the
+    /// `waitForIceGatheringComplete` fix): it carries `a=candidate` lines and a
+    /// trailing `a=end-of-candidates`. The proxy MUST forward the SDP part
+    /// byte-for-byte so the upstream's answer can actually connect — the
+    /// long-standing silent failure was the browser posting a candidate-less
+    /// offer. This test pins the contract with a gather-complete offer
+    /// containing host-candidate lines.
+    #[tokio::test]
+    async fn realtime_create_call_forwards_ice_gathered_sdp_verbatim() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = realtime_test_settings(&format!("http://127.0.0.1:{port}"));
+        // A gather-complete offer: host candidate + end-of-candidates marker.
+        // This is what pc.localDescription.sdp looks like after ICE gathering
+        // resolves on a loopback/LAN (host candidates only).
+        let gathered_offer =
+            "v=0\r\no=- 42 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             a=mid:0\r\na=rtpmap:111 opus/48000/2\r\n\
+             a=candidate:1 1 udp 2122252543 127.0.0.1 50000 typ host generation 0 ufrag abcd\r\n\
+             a=candidate:1 2 udp 2122252543 127.0.0.1 50000 typ host generation 0 ufrag abcd\r\n\
+             a=end-of-candidates\r\n";
+
+        let offer_for_task = gathered_offer.to_owned();
+        let call = tokio::spawn(async move {
+            realtime_create_call(&settings, &offer_for_task).await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let req = read_http_request(&mut sock).await;
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/realtime/calls");
+        assert_eq!(req.header("openai-alpha"), Some("quicksilver=v2"));
+        let content_type = req.header("content-type").expect("content-type");
+        assert_eq!(content_type, "application/json", "content-type: {content_type:?}");
+        let request_body = json_request_body(&req.body);
+        // The SDP is forwarded VERBATIM, including every a=candidate line and
+        // the end-of-candidates marker — no rewriting, no candidate stripping.
+        // The browser's gathered offer is what the upstream sees.
+        let sdp = request_body["sdp"].as_str().expect("sdp string");
+        assert_eq!(sdp, gathered_offer, "gathered offer must be forwarded byte-for-byte");
+        assert!(sdp.contains("a=candidate:"), "offer must carry ICE candidates: {sdp}");
+        assert!(sdp.contains("a=end-of-candidates"), "offer must mark gather complete: {sdp}");
+        // The session object is unchanged by the ICE fix.
+        let session = &request_body["session"];
+        assert_eq!(session["type"], "quicksilver");
+        assert_eq!(session["audio"]["input"]["format"]["rate"], 24000);
+
+        // Reply with a bare SDP answer + Location; the proxy returns both.
+        let sdp_answer = "v=0\r\no=- 7 7 IN IP4 127.0.0.1\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 201 Created",
+            &[
+                ("Location".to_owned(), "/v1/realtime/calls/rtc_gather_001".to_owned()),
+                ("Content-Type".to_owned(), "application/sdp".to_owned()),
+            ],
+            sdp_answer.as_bytes(),
+        )
+        .await;
+        let result = call.await.expect("task join").expect("realtime_create_call ok");
+        assert_eq!(result["sdp"], sdp_answer);
+        assert_eq!(result["callId"], "rtc_gather_001");
+        // Auth never leaks into the persisted call id or SDP.
+        assert!(!result.to_string().contains(REALTIME_TEST_KEY), "{}", result);
+    }
+
+    // ---- STT voice proxy (stt_transcribe): bounded WAV-only contract ----
+    //
+    // The browser sends ONLY base64 WAV audio + a MIME type; the endpoint
+    // URL and bearer key come from the server-held live settings. These
+    // tests exercise the payload bounds, the strict WAV parse, and the full
+    // forward path against a loopback TCP mock speaking the OpenAI-compatible
+    // transcriptions endpoint. The bearer below is a fixed non-sensitive
+    // placeholder, never a live secret.
+
+    const STT_TEST_KEY: &str = "stt-test-bearer-not-a-real-secret";
+
+    fn stt_test_settings(base_url: &str) -> pi_coding::LiveRuntimeSettings {
+        pi_coding::LiveRuntimeSettings {
+            enabled: true,
+            mode: "stt".to_owned(),
+            stt_base_url: base_url.to_owned(),
+            stt_api_key: STT_TEST_KEY.to_owned(),
+            stt_model: "whisper-1".to_owned(),
+            realtime_base_url: String::new(),
+            realtime_api_key: String::new(),
+            realtime_model: "gpt-realtime-1.5".to_owned(),
+            voice: "sol".to_owned(),
+            language: None,
+            allow_insecure: true,
+        }
+    }
+
+    /// A small valid mono PCM16 WAV (0.5 s of silence at 16 kHz).
+    fn stt_test_wav() -> Vec<u8> {
+        pi_coding::live::encode_wav(&vec![0i16; 8_000], 16_000, 1)
+    }
+
+    fn stt_b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[tokio::test]
+    async fn stt_transcribe_forwards_wav_and_returns_transcript() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let settings = stt_test_settings(&format!("http://127.0.0.1:{port}"));
+        let wav = stt_test_wav();
+
+        // "Audio/WAV": the MIME allowlist is case-insensitive.
+        let call = tokio::spawn(async move {
+            stt_transcribe(&settings, &stt_b64(&wav), "Audio/WAV").await
+        });
+
+        let (mut sock, _addr) = listener.accept().await.expect("accept");
+        let req = read_http_request(&mut sock).await;
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/audio/transcriptions");
+        assert_eq!(
+            req.header("authorization").unwrap(),
+            format!("Bearer {STT_TEST_KEY}")
+        );
+        // The backend's SttClient forwards the WAV as a multipart form
+        // ({file: audio/wav, model}) with the server-held key.
+        let content_type = req.header("content-type").expect("content-type");
+        assert!(
+            content_type.starts_with("multipart/form-data"),
+            "content-type: {content_type:?}"
+        );
+        let body = String::from_utf8_lossy(&req.body);
+        assert!(body.contains("RIFF"), "wav bytes embedded in the multipart body");
+        assert!(body.contains("audio/wav"), "{body}");
+        assert!(body.contains("name=\"file\""), "{body}");
+        assert!(body.contains("name=\"model\""), "{body}");
+        assert!(body.contains("whisper-1"), "{body}");
+
+        write_http_response(
+            &mut sock,
+            "HTTP/1.1 200 OK",
+            &[("Content-Type".to_owned(), "application/json".to_owned())],
+            b"{\"text\":\"stt hello from the mock\"}",
+        )
+        .await;
+
+        let result = call.await.expect("task join").expect("transcribe ok");
+        assert_eq!(result["text"], "stt hello from the mock");
+        // The response carries ONLY the transcript — never settings, keys,
+        // or the audio bytes.
+        assert_eq!(
+            result.as_object().map(|object| object.len()),
+            Some(1),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stt_transcribe_rejects_non_wav_mime() {
+        let settings = stt_test_settings("http://127.0.0.1:1");
+        let wav = stt_test_wav();
+        for mime in [
+            "audio/webm",
+            "audio/webm;codecs=opus",
+            "audio/mp4",
+            "application/octet-stream",
+            "text/plain",
+            "",
+        ] {
+            let err = stt_transcribe(&settings, &stt_b64(&wav), mime)
+                .await
+                .expect_err("non-wav MIME must be rejected")
+                .to_string();
+            assert!(err.contains("unsupported audio MIME type"), "{err}");
+            assert!(!err.contains(STT_TEST_KEY), "{err}");
+            assert!(!err.contains("Bearer"), "{err}");
+        }
+        // A hostile long MIME is echoed only as a bounded prefix.
+        let long_mime = format!("{}/{}", "a".repeat(300), "b".repeat(300));
+        let err = stt_transcribe(&settings, &stt_b64(&wav), &long_mime)
+            .await
+            .expect_err("long MIME must be rejected")
+            .to_string();
+        assert!(err.contains("unsupported audio MIME type"), "{err}");
+        assert!(!err.contains(&long_mime), "full MIME echoed: {err}");
+    }
+
+    #[tokio::test]
+    async fn stt_transcribe_rejects_oversized_audio() {
+        let settings = stt_test_settings("http://127.0.0.1:1");
+        // One byte over the cap: rejected at the decoded-size bound (the
+        // base64 char pre-check cannot distinguish cap+1 bytes from cap
+        // bytes, so the decoded check is the binding one).
+        let oversize = vec![0u8; STT_MAX_AUDIO_BYTES + 1];
+        let err = stt_transcribe(&settings, &stt_b64(&oversize), "audio/wav")
+            .await
+            .expect_err("oversized audio must be rejected")
+            .to_string();
+        assert!(err.contains("exceeds the"), "{err}");
+        assert!(err.contains(&STT_MAX_AUDIO_BYTES.to_string()), "{err}");
+        assert!(!err.contains(STT_TEST_KEY), "{err}");
+
+        // A base64 string far beyond any plausible WAV is rejected by the
+        // char-length pre-check without decoding.
+        let huge = "A".repeat(STT_MAX_AUDIO_BYTES.div_ceil(3) * 4 + 1);
+        let err = stt_transcribe(&settings, &huge, "audio/wav")
+            .await
+            .expect_err("oversized base64 must be rejected")
+            .to_string();
+        assert!(err.contains("exceeds the"), "{err}");
+        assert!(!err.contains(STT_TEST_KEY), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stt_transcribe_rejects_malformed_wav_and_base64() {
+        let settings = stt_test_settings("http://127.0.0.1:1");
+
+        // Non-WAV bytes pass the size bound but fail the strict RIFF parse.
+        let err = stt_transcribe(&settings, &stt_b64(b"definitely not a wav"), "audio/wav")
+            .await
+            .expect_err("non-WAV bytes must be rejected")
+            .to_string();
+        assert!(err.contains("RIFF/WAVE"), "{err}");
+        assert!(!err.contains(STT_TEST_KEY), "{err}");
+
+        // Malformed base64 fails before any parse.
+        let err = stt_transcribe(&settings, "!!!not-base64!!!", "audio/wav")
+            .await
+            .expect_err("malformed base64 must be rejected")
+            .to_string();
+        assert!(err.contains("not valid base64"), "{err}");
+        assert!(!err.contains(STT_TEST_KEY), "{err}");
+
+        // Non-PCM WAV (format 2) is rejected by the strict parse.
+        let mut wav = stt_test_wav();
+        wav[20..22].copy_from_slice(&2u16.to_le_bytes());
+        let err = stt_transcribe(&settings, &stt_b64(&wav), "audio/wav")
+            .await
+            .expect_err("non-PCM WAV must be rejected")
+            .to_string();
+        assert!(err.contains("not PCM"), "{err}");
+        assert!(!err.contains(STT_TEST_KEY), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stt_transcribe_rejects_unconfigured_live() {
+        let mut settings = stt_test_settings("http://127.0.0.1:1");
+        let wav = stt_test_wav();
+        settings.enabled = false;
+        let err = stt_transcribe(&settings, &stt_b64(&wav), "audio/wav")
+            .await
+            .expect_err("disabled live must fail closed")
+            .to_string();
+        assert!(err.contains("Settings.live.enabled"), "{err}");
+        assert!(!err.contains(STT_TEST_KEY), "{err}");
+        assert!(!err.contains("Bearer"), "{err}");
+
+        settings.enabled = true;
+        settings.stt_base_url.clear();
+        let err = stt_transcribe(&settings, &stt_b64(&wav), "audio/wav")
+            .await
+            .expect_err("unconfigured live must fail closed")
+            .to_string();
+        assert!(err.contains("Settings.live.sttBaseUrl"), "{err}");
+        assert!(!err.contains(STT_TEST_KEY), "{err}");
+
+        settings.stt_base_url = "http://127.0.0.1:1".to_owned();
+        settings.allow_insecure = false;
+        let err = stt_transcribe(&settings, &stt_b64(&wav), "audio/wav")
+            .await
+            .expect_err("plaintext live must fail closed")
+            .to_string();
+        assert!(err.contains("allowInsecure"), "{err}");
+        assert!(!err.contains(STT_TEST_KEY), "{err}");
     }
 }

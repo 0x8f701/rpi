@@ -1,4 +1,4 @@
-// Subagents panel (D93) — live mirror of the TUI job cards + hub surface.
+// Subagents panel — live mirror of the TUI job cards + hub surface.
 //
 // Wire shapes mirror pi-coding (serde camelCase) — see
 // crates/pi-coding/src/orchestration/{jobs,runtime}.rs. Every model-derived
@@ -11,48 +11,24 @@
 //   hub_send     -> { receipts }
 //   job_cancel   -> { cancelled }
 //   job_output   -> { job }
+//   agent_history -> { agentId, text }  (bounded redacted child transcript)
 //
 // Live updates arrive as orchestration events over the same WS:
 //   job_updated / agent_updated / message_delivered
 // (ApplicationEvent::Orchestration, serde tag "type", snake_case).
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { safeText } from '../redact';
+import {
+  elapsedMs,
+  formatDuration,
+  SUBAGENT_FILTER_LABEL,
+  subagentJobBucket,
+  type JobStatus,
+  type JobWire,
+  type SubagentJobFilter,
+} from '../jobCard';
 import type { EventFrame } from '../types';
-
-export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
-
-export interface JobResultWire {
-  index: number;
-  id: string;
-  agent: string;
-  status: string;
-  output: string;
-  usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
-  softBudgetExhausted?: boolean;
-  error?: string | null;
-  structuredOutput?: unknown;
-  artifactRef: string;
-  historyRef: string;
-  artifactUri: string;
-}
-
-export interface JobWire {
-  id: string;
-  agentId: string;
-  agent: string;
-  parentId: string;
-  description?: string | null;
-  todoTaskId?: string | null;
-  workflowId?: string | null;
-  workflowGeneration?: number | null;
-  status: JobStatus;
-  createdAt: number;
-  startedAt?: number | null;
-  finishedAt?: number | null;
-  result?: JobResultWire | null;
-  softBudgetExhausted?: boolean;
-}
 
 export interface AgentWire {
   id: string;
@@ -103,25 +79,13 @@ const STATUS_LABEL: Record<JobStatus, string> = {
   cancelled: 'cancelled',
 };
 
-function formatDuration(milliseconds: number): string {
-  if (milliseconds < 1000) return `${milliseconds}ms`;
-  const seconds = Math.floor(milliseconds / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-}
+/** Filter order for the segmented control (roving-tab order). */
+const JOB_FILTERS: SubagentJobFilter[] = ['running', 'completed'];
 
-/** Mirror of job_card_adapter::elapsed_ms: live wall-clock while active. */
-function elapsedMs(job: JobWire, now: number): number | null {
-  if (job.status === 'queued' || job.status === 'running') {
-    if (now === 0) return null;
-    const start = job.startedAt ?? job.createdAt;
-    return Math.max(0, now - start);
-  }
-  if (job.finishedAt != null && job.startedAt != null) {
-    return Math.max(0, job.finishedAt - job.startedAt);
-  }
-  return null;
-}
+/** Lines requested from the agent_history RPC (core clamps to 1..=200). */
+const HISTORY_LINES = 80;
+/** Modal transcript poll cadence while the job is queued/running. */
+const POLL_MS = 2000;
 
 /** Mirror of job_card_adapter::progress_row_text. */
 function progressLine(job: JobWire, view: JobView, now: number): string {
@@ -153,10 +117,14 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
   const [agents, setAgents] = useState<Record<string, AgentWire>>({});
   const [enabled, setEnabled] = useState(false);
   const [catalog, setCatalog] = useState<CatalogAgentWire[]>([]);
-  const [now, setNow] = useState(0);
+  // A real initial clock keeps the running-details elapsed label visible
+  // before the one-second ticker fires.
+  const [now, setNow] = useState(() => Date.now());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
+  // List filter: live work (queued/running) by default; settled history opt-in.
+  const [jobFilter, setJobFilter] = useState<SubagentJobFilter>('running');
   // Spawn form
   const [spawnAgent, setSpawnAgent] = useState('');
   const [spawnTask, setSpawnTask] = useState('');
@@ -164,12 +132,51 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
   const [messageDrafts, setMessageDrafts] = useState<Record<string, string>>({});
   const [outputJobId, setOutputJobId] = useState<string | null>(null);
   const outputJobsRef = useRef<Record<string, JobWire>>({});
+  // Details modal: job under inspection + bounded child transcript state.
+  const [detailsJobId, setDetailsJobId] = useState<string | null>(null);
+  const [historyText, setHistoryText] = useState('');
+  const [historyError, setHistoryError] = useState('');
+  const detailsTriggerRef = useRef<HTMLElement | null>(null);
+  const detailsCloseRef = useRef<HTMLButtonElement | null>(null);
+  const detailsRef = useRef<HTMLDivElement | null>(null);
+  const fetchHistoryRef = useRef<() => void>(() => {});
 
   const order = useMemo(() => {
     return Object.values(jobs)
       .sort((a, b) => a.job.createdAt - b.job.createdAt || a.job.id.localeCompare(b.job.id))
       .map((view) => view.job.id);
   }, [jobs]);
+
+  // Filter only affects the visible list — the jobs map and the header
+  // aggregate stay global so no job state is ever hidden from the panel.
+  const filteredOrder = useMemo(() => {
+    return order.filter((id) => subagentJobBucket(jobs[id].job.status) === jobFilter);
+  }, [order, jobs, jobFilter]);
+
+  const handleFilterKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
+    const index = JOB_FILTERS.indexOf(jobFilter);
+    let next: SubagentJobFilter | null = null;
+    switch (e.key) {
+      case 'ArrowRight':
+      case 'ArrowDown':
+        next = JOB_FILTERS[(index + 1) % JOB_FILTERS.length];
+        break;
+      case 'ArrowLeft':
+      case 'ArrowUp':
+        next = JOB_FILTERS[(index - 1 + JOB_FILTERS.length) % JOB_FILTERS.length];
+        break;
+      case 'Home':
+        next = JOB_FILTERS[0];
+        break;
+      case 'End':
+        next = JOB_FILTERS[JOB_FILTERS.length - 1];
+        break;
+    }
+    if (next === null) return;
+    e.preventDefault();
+    setJobFilter(next);
+    document.getElementById(`subagents-filter-${next}`)?.focus();
+  };
 
   const applyJob = (job: JobWire) => {
     setJobs((prev) => {
@@ -318,6 +325,98 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
       .catch((err: Error) => setError(`job_output failed: ${err.message}`));
   };
 
+  // --- Details modal: bounded child transcript, polled while live. ---
+  const detailsJob = detailsJobId ? jobs[detailsJobId] : null;
+  const detailsLive =
+    !!detailsJob && (detailsJob.job.status === 'queued' || detailsJob.job.status === 'running');
+  const detailsElapsedMs = detailsJob ? elapsedMs(detailsJob.job, now) : null;
+  const detailsElapsedLabel = detailsElapsedMs != null ? formatDuration(detailsElapsedMs) : '';
+
+  const openDetails = (jobId: string) => {
+    detailsTriggerRef.current = document.activeElement as HTMLElement | null;
+    setHistoryText('');
+    setHistoryError('');
+    setDetailsJobId(jobId);
+  };
+
+  const closeDetails = () => {
+    setDetailsJobId(null);
+    const trigger = detailsTriggerRef.current;
+    detailsTriggerRef.current = null;
+    if (trigger && typeof trigger.focus === 'function') trigger.focus();
+  };
+
+  useEffect(() => {
+    if (!detailsJobId || !detailsJob) return;
+    const agentId = detailsJob.job.agentId;
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const fetchHistory = () => {
+      sendCommand({ type: 'agent_history', agentId, lines: HISTORY_LINES })
+        .then((data) => {
+          if (cancelled) return;
+          const d = data as { text?: unknown };
+          setHistoryText(typeof d.text === 'string' ? d.text : '');
+          setHistoryError('');
+        })
+        .catch((err: Error) => {
+          if (cancelled) return;
+          setHistoryError(err.message || 'agent_history failed');
+        });
+    };
+    fetchHistoryRef.current = fetchHistory;
+    fetchHistory();
+
+    // Poll every 2s while queued/running; refetch once per relevant live event.
+    if (detailsLive) timer = window.setInterval(fetchHistory, POLL_MS);
+    const unsubscribe = subscribeEvents((frame) => {
+      const relevant =
+        (frame.type === 'job_updated' &&
+          (frame.job as { id?: string } | undefined)?.id === detailsJobId) ||
+        (frame.type === 'agent_updated' &&
+          (frame.agent as { id?: string } | undefined)?.id === agentId) ||
+        (frame.type === 'message_delivered' &&
+          (frame.message as { from?: string } | undefined)?.from === agentId);
+      if (relevant) fetchHistory();
+    });
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearInterval(timer);
+      unsubscribe();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detailsJobId, detailsJob?.job.agentId, detailsLive, sendCommand, subscribeEvents]);
+
+  // Initial focus: land on the Close button when the modal opens.
+  useEffect(() => {
+    if (detailsJobId) detailsCloseRef.current?.focus();
+  }, [detailsJobId]);
+
+  const handleDetailsKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeDetails();
+      return;
+    }
+    if (e.key !== 'Tab' || !detailsRef.current) return;
+    const focusables = detailsRef.current.querySelectorAll<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    );
+    if (focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+
   return (
     <aside id="subagents-panel" className="subagents-panel" aria-label="Subagents panel">
       <div className="subagents-panel__head">
@@ -384,14 +483,42 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
             </div>
           </div>
 
-          <div className="subagents-panel__list">
-            {order.length === 0 && (
-              <div className="subagents-panel__empty">
-                No subagent jobs yet. Spawn one above, or ask the main agent to
-                delegate (job_updated events refresh this panel live).
+          <div
+            className="subagents-panel__filter"
+            role="tablist"
+            aria-label="Filter subagent jobs by status"
+          >
+            {JOB_FILTERS.map((filter) => (
+              <button
+                key={filter}
+                type="button"
+                id={`subagents-filter-${filter}`}
+                role="tab"
+                aria-selected={jobFilter === filter}
+                aria-pressed={jobFilter === filter}
+                aria-controls="subagents-job-list"
+                data-filter={filter}
+                className={`subagents-panel__filter-btn${jobFilter === filter ? ' is-active' : ''}`}
+                tabIndex={jobFilter === filter ? 0 : -1}
+                onClick={() => setJobFilter(filter)}
+                onKeyDown={handleFilterKeyDown}
+              >
+                {SUBAGENT_FILTER_LABEL[filter]}
+              </button>
+            ))}
+          </div>
+
+          <div className="subagents-panel__list" id="subagents-job-list">
+            {filteredOrder.length === 0 && (
+              <div className="subagents-panel__empty" data-filter-empty>
+                {order.length === 0
+                  ? 'No subagent jobs yet. Spawn one above, or ask the main agent to delegate (job_updated events refresh this panel live).'
+                  : jobFilter === 'running'
+                    ? 'No active subagent jobs right now (queued/running). Settled jobs are listed under Completed.'
+                    : 'No settled subagent jobs yet (completed/failed/cancelled). Active jobs are listed under Running.'}
               </div>
             )}
-            {order.map((id) => {
+            {filteredOrder.map((id) => {
               const view = jobs[id];
               const job = view.job;
               const result = job.result;
@@ -402,6 +529,7 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
                   className="subagent-job"
                   data-job-id={job.id}
                   data-status={job.status}
+                  onClick={() => openDetails(job.id)}
                 >
                   <div className="subagent-job__head">
                     <span className="subagent-job__title" title={safeText(job.id)}>
@@ -426,7 +554,16 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
                       {progressLine(job, view, now)}
                     </div>
                   )}
-                  <div className="subagent-job__actions">
+                  <div className="subagent-job__actions" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      type="button"
+                      className="subagent-job__action"
+                      data-details-trigger
+                      onClick={() => openDetails(job.id)}
+                      title="Open job details and live child transcript"
+                    >
+                      Details
+                    </button>
                     <button
                       type="button"
                       className="subagent-job__action"
@@ -446,7 +583,11 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
                     </button>
                   </div>
                   {outputJobId === job.id && (
-                    <div className="subagent-job__output" data-output-view>
+                    <div
+                      className="subagent-job__output"
+                      data-output-view
+                      onClick={(e) => e.stopPropagation()}
+                    >
                       {result?.error ? (
                         <div className="subagent-job__error">{safeText(result.error)}</div>
                       ) : null}
@@ -464,7 +605,7 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
                       )}
                     </div>
                   )}
-                  <div className="subagent-job__message">
+                  <div className="subagent-job__message" onClick={(e) => e.stopPropagation()}>
                     <input
                       className="subagent-job__message-input"
                       placeholder={`message ${safeText(job.agentId)} (hub send)`}
@@ -505,6 +646,88 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
       {toast && (
         <div className="subagents-panel__toast" data-panel-toast>
           {safeText(toast)}
+        </div>
+      )}
+      {detailsJob && (
+        <div className="subagent-details-backdrop" onClick={closeDetails}>
+          <div
+            ref={detailsRef}
+            className="subagent-details"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Subagent job details"
+            data-details-dialog
+            data-job-id={detailsJob.job.id}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={handleDetailsKeyDown}
+          >
+            <div className="subagent-details__head">
+              <span className="subagent-details__title" data-details-title>
+                {safeText(agentLabel(agents, detailsJob.job.agentId))} ({safeText(detailsJob.job.agent)})
+              </span>
+              <div className="subagent-details__head-actions">
+                <button
+                  type="button"
+                  className="subagent-details__action"
+                  data-details-refresh
+                  onClick={() => fetchHistoryRef.current?.()}
+                  title="Refetch the child transcript now"
+                >
+                  Refresh
+                </button>
+                <button
+                  ref={detailsCloseRef}
+                  type="button"
+                  className="subagent-details__action"
+                  data-details-close
+                  onClick={closeDetails}
+                  title="Close details (Esc)"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="subagent-details__meta" data-details-status>
+              <span className={`subagent-job__status subagent-job__status--${detailsJob.job.status}`}>
+                {STATUS_LABEL[detailsJob.job.status]}
+              </span>
+              <span data-details-elapsed>{detailsElapsedLabel}</span>
+            </div>
+            <div className="subagent-details__section">
+              <div className="subagent-details__label">Task</div>
+              <div className="subagent-details__description" data-details-description>
+                {safeText(detailsJob.job.description || '(no task description)')}
+              </div>
+            </div>
+            <div className="subagent-details__section">
+              <div className="subagent-details__label">Latest activity</div>
+              <div className="subagent-details__activity" data-details-activity>
+                {safeText(detailsJob.activity || STATUS_LABEL[detailsJob.job.status])}
+              </div>
+            </div>
+            <div className="subagent-details__section subagent-details__section--transcript">
+              <div className="subagent-details__label">
+                Recent transcript
+                {detailsLive && (
+                  <span className="subagent-details__live" data-details-live>
+                    live
+                  </span>
+                )}
+              </div>
+              {historyError !== '' && (
+                <div className="subagent-details__error" data-details-error>
+                  {safeText(historyError)}
+                </div>
+              )}
+              <pre className="subagent-details__history" data-details-history>
+                {historyText !== ''
+                  ? safeText(historyText)
+                  : historyError !== ''
+                    ? '(transcript unavailable)'
+                    : '(no transcript yet — waiting for child activity)'}
+              </pre>
+            </div>
+          </div>
         </div>
       )}
     </aside>

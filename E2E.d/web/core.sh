@@ -20,8 +20,11 @@
 #      applies a draft theme change
 #   9. the Session panel renders info, renames, lists saved sessions, and
 #      switches to a fresh session
-#  10. the Subagents panel spawns a faux subagent, messages it, views its
-#      output, and cancels it (task_spawn/hub_send/job_output/job_cancel)
+#  10. the Subagents panel spawns a faux subagent, opens the running-job
+#      detail modal (dialog a11y + task/status/elapsed/activity + non-empty
+#      recent history + Refresh + Escape/Close), messages it, views its
+#      output, and cancels it (task_spawn/agent_history/hub_send/job_output/
+#      job_cancel)
 #
 # Browser driver: playwright via npm (ephemeral install in the scenario work
 # dir) with a system Chrome/Chromium binary or playwright's bundled chromium.
@@ -154,7 +157,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web - GET /web page load, rpi-auth subprotocol WS connect, prompt round-trip streaming, abort + recovery, todo panel, rich content, workflow create/cancel, subagents spawn/live/message/output/cancel (playwright, hard gate)'
+                'web - GET /web page load, rpi-auth subprotocol WS connect, prompt round-trip streaming, abort + recovery, todo panel, rich content, workflow create/cancel, subagents spawn/live/detail-modal/message/output/cancel (playwright, hard gate)'
             return 0
             ;;
         run|all) ;;
@@ -228,7 +231,7 @@ EOF
     local pw_status=0
     run_playwright "$url" "$evidence" "$root/playwright" || pw_status=$?
     if [ "$pw_status" -eq 0 ]; then
-        printf 'playwright: page load, WS connect, prompt round-trip, abort, recovery, todo panel, rich content, workflow create/cancel, subagents spawn/live/message/output/cancel: PASSED\n' | tee "$evidence/playwright-summary.txt"
+        printf 'playwright: page load, WS connect, prompt round-trip, abort, recovery, todo panel, rich content, workflow create/cancel, subagents spawn/live/detail-modal/message/output/cancel: PASSED\n' | tee "$evidence/playwright-summary.txt"
     elif [ "$pw_status" -eq 1 ]; then
         fail "web.$SCENARIO: playwright SETUP FAILED (node/chromium/npm unavailable)"
     else

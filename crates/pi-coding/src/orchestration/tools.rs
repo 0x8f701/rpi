@@ -9,8 +9,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    AgentSnapshot, AgentStatus, DeliveryOutcome, JobSnapshot, JobStatus, OrchestrationRuntime,
-    StructuredOutput, TaskItem, YieldState,
+    AgentSnapshot, AgentStatus, DeliveryOutcome, JobSnapshot, JobStatus, MailboxMessage,
+    OrchestrationRuntime, StructuredOutput, TaskItem, YieldState,
 };
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 120_000;
@@ -376,6 +376,7 @@ async fn execute_hub(
                     }
                 })
                 .collect::<Vec<_>>();
+            let mut reply_message: Option<MailboxMessage> = None;
             if parameters.await_reply
                 && receipts.iter().any(|receipt| receipt.error.is_none())
             {
@@ -397,11 +398,11 @@ async fn execute_hub(
                         Some(abort),
                     )
                     .await?;
-                if let Some(reply) = reply {
-                    lines.push(format!("Reply from {}: {}", reply.from, reply.body));
-                } else {
-                    lines.push(format!("No reply from {await_from} before timeout."));
+                match &reply {
+                    Some(reply) => lines.push(format!("Reply from {}: {}", reply.from, reply.body)),
+                    None => lines.push(format!("No reply from {await_from} before timeout.")),
                 }
+                reply_message = reply;
             }
             Ok(result(
                 if lines.is_empty() {
@@ -409,7 +410,7 @@ async fn execute_hub(
                 } else {
                     lines.join("\n")
                 },
-                json!({ "op": "send", "receipts": receipts }),
+                json!({ "op": "send", "receipts": receipts, "reply": reply_message }),
             ))
         }
         "wait" if parameters.ids.as_ref().is_some_and(|ids| !ids.is_empty()) => {

@@ -118,6 +118,15 @@ fn live_settings(base: &str) -> LiveRuntimeSettings {
 }
 
 /// Build a session bound to a faux provider that answers the delegated turn.
+/// Per-process isolated native session root so `start_new_recording()` never
+/// writes into the real `~/.pi/agent/sessions` tree (Web sidebar source).
+fn test_sessions_root() -> std::path::PathBuf {
+    static ROOT: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+        tempfile::tempdir().expect("test sessions root")
+    });
+    ROOT.path().to_path_buf()
+}
+
 fn session_with_reply(reply: &str) -> (Session, pi_ai::providers::FauxProviderRegistration) {
     let suffix = uuid::Uuid::now_v7().to_string();
     let api = format!("live-delegation-api-{suffix}");
@@ -151,6 +160,7 @@ fn session_with_reply(reply: &str) -> (Session, pi_ai::providers::FauxProviderRe
         auth_resolver: None,
     })
     .expect("build session");
+    session.set_session_dir(test_sessions_root());
     session.start_new_recording().expect("start recording");
     (session, registration)
 }

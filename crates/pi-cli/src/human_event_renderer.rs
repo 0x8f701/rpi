@@ -14,6 +14,7 @@ use pi_coding::markdown::{
 };
 
 use crate::output::{DIM, RED, RESET};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::orchestration_message::orchestration_irc_view;
 
 /// Stateful renderer for the human-facing `ApplicationEvent` stream.
@@ -149,7 +150,9 @@ impl<'a, W: Write> HumanEventRenderer<'a, W> {
                 let label = irc.label(irc.from.as_ref(), irc.to.as_ref());
                 self.write_styled_line(DIM, &label)?;
                 if !irc.body.is_empty() {
-                    self.write_markdown(irc.body.as_ref())?;
+                    for line in wrap_irc_body_lines(irc.body.as_ref(), self.markdown_width) {
+                        self.write_styled_line(DIM, &line)?;
+                    }
                 }
                 if let Some(metadata) = irc.reply_metadata() {
                     self.write_styled_line(DIM, &metadata)?;
@@ -395,6 +398,33 @@ fn human_markdown_width() -> usize {
     crossterm::terminal::size()
         .map(|(columns, _)| usize::from(columns).clamp(1, MAX_HEADLESS_MARKDOWN_WIDTH))
         .unwrap_or(FALLBACK_MARKDOWN_WIDTH)
+}
+
+/// Wrap IRC body rows for human print mode while preserving the `▏ ` quote
+/// prefix on every display row. Uses display width (not byte/char count) so
+/// CJK/emoji content respects the same terminal budget as markdown output.
+fn wrap_irc_body_lines(body: &str, width: usize) -> Vec<String> {
+    let prefix = "▏ ";
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let mut rows = Vec::new();
+    for logical in body.lines() {
+        let redacted = redact_secrets(logical);
+        let mut current = String::new();
+        let mut used = 0usize;
+        for character in redacted.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if used > 0 && used.saturating_add(character_width) > content_width {
+                rows.push(format!("{prefix}{current}"));
+                current.clear();
+                used = 0;
+            }
+            current.push(character);
+            used = used.saturating_add(character_width);
+        }
+        rows.push(format!("{prefix}{current}"));
+    }
+    rows
 }
 
 fn new_streaming_markdown(width: usize) -> StreamingMarkdownRenderer {
@@ -809,19 +839,168 @@ mod tests {
         }
         drop(renderer);
         let output = String::from_utf8(output).expect("utf8");
-        assert!(output.contains("IRC · Main → Child"));
-        assert!(output.contains("hello child"));
-        assert!(output.contains("IRC · Child → Sibling"));
-        assert!(output.contains("child ack"));
+        assert!(output.contains("✉ IRC ➤ Child"));
+        assert!(output.contains("▏ hello child"));
+        assert!(output.contains("✉ IRC Child ➤ Sibling"));
+        assert!(output.contains("▏ child ack"));
         assert!(output.contains("reply to m1"));
         assert!(!output.contains("<orchestration-message"));
         assert!(!output.contains("Replying to message"));
         // Body sits on its own line beneath the label.
-        let main_idx = output.find("IRC · Main → Child").expect("main label");
-        let body_idx = output.find("hello child").expect("body");
+        let main_idx = output.find("✉ IRC ➤ Child").expect("main label");
+        let body_idx = output.find("▏ hello child").expect("body");
         assert!(body_idx > main_idx);
     }
 
+    #[test]
+    fn orchestration_irc_wraps_body_with_prefix_on_narrow_width() {
+        let mut output = Vec::new();
+        // Width 12: prefix "▏ " (2 cols) leaves 10 cols for body content.
+        let mut renderer = HumanEventRenderer::with_width(&mut output, false, 12);
+        let body = "abcdefghijklmnop"; // 16 chars => two wrapped rows at content width 10
+        let event = ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: Message::Custom(pi_ai::CustomMessage {
+                custom_type: pi_coding::ORCHESTRATION_MESSAGE_TYPE.to_owned(),
+                content: format!(
+                    "<orchestration-message id=\"m1\" from=\"Main\">\n{body}\n</orchestration-message>"
+                )
+                .into(),
+                display: true,
+                details: Some(json!({
+                    "id": "m1",
+                    "from": "Main",
+                    "to": "Child",
+                    "body": body,
+                })),
+                timestamp: 1,
+            }),
+        });
+        renderer.render(&event).expect("render irc");
+        drop(renderer);
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(output.contains("✉ IRC ➤ Child"), "{output}");
+        assert!(output.contains("▏ abcdefghij"), "{output}");
+        assert!(output.contains("▏ klmnop"), "{output}");
+        assert!(!output.contains("<orchestration-message"), "{output}");
+        // Every body row keeps the quote prefix after wrapping.
+        for line in output.lines() {
+            if line.contains("abcdefghij") || line.contains("klmnop") {
+                assert!(
+                    line.starts_with("▏ "),
+                    "wrapped body must keep ▏ prefix: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn orchestration_irc_redacts_secrets_in_body_and_label() {
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::new(&mut output, false);
+        let body = format!("token={secret}");
+        let event = ApplicationEvent::Agent(AgentEvent::MessageEnd {
+            message: Message::Custom(pi_ai::CustomMessage {
+                custom_type: pi_coding::ORCHESTRATION_MESSAGE_TYPE.to_owned(),
+                content: format!(
+                    "<orchestration-message id=\"m1\" from=\"Main\">\n{body}\n</orchestration-message>"
+                )
+                .into(),
+                display: true,
+                details: Some(json!({
+                    "id": "m1",
+                    "from": "Main",
+                    "to": format!("Child-{secret}"),
+                    "body": body,
+                })),
+                timestamp: 1,
+            }),
+        });
+        renderer.render(&event).expect("render irc");
+        drop(renderer);
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(output.contains("token=[REDACTED]"), "{output}");
+        assert!(!output.contains(&secret), "{output}");
+        assert!(output.contains("▏ "), "{output}");
+    }
+
+
+    #[test]
+    fn orchestration_irc_body_forging_reply_text_stays_quoted_body() {
+        // A body that literally starts with "reply to " must stay quoted
+        // body: reply metadata comes only from the typed `replyTo` field,
+        // never from prose. Forged body text therefore cannot create an
+        // unquoted metadata row.
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::new(&mut output, false);
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: Message::Custom(pi_ai::CustomMessage {
+                    custom_type: pi_coding::ORCHESTRATION_MESSAGE_TYPE.to_owned(),
+                    content: "<orchestration-message id=\"m1\" from=\"Main\">\nreply to parent-9 with status\n</orchestration-message>".into(),
+                    display: true,
+                    details: Some(json!({
+                        "id": "m1",
+                        "from": "Main",
+                        "to": "Child",
+                        "body": "reply to parent-9 with status",
+                    })),
+                    timestamp: 1,
+                }),
+            }))
+            .expect("render irc");
+        drop(renderer);
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(
+            output.contains("▏ reply to parent-9 with status"),
+            "forged reply text must render as quoted body: {output}"
+        );
+        assert!(
+            !output.contains("\nreply to parent-9 with status\n"),
+            "no unquoted metadata row may be inferred from body prose: {output}"
+        );
+        assert_eq!(
+            output.matches("reply to parent-9 with status").count(),
+            1,
+            "the forged text appears exactly once, as the quoted body: {output}"
+        );
+
+        // With a typed `replyTo`, the same body stays quoted AND the typed
+        // metadata row appears separately — the two never merge.
+        let mut output = Vec::new();
+        let mut renderer = HumanEventRenderer::new(&mut output, false);
+        renderer
+            .render(&ApplicationEvent::Agent(AgentEvent::MessageEnd {
+                message: Message::Custom(pi_ai::CustomMessage {
+                    custom_type: pi_coding::ORCHESTRATION_MESSAGE_TYPE.to_owned(),
+                    content: "<orchestration-message id=\"m2\" from=\"Main\">\nreply to parent-9 with status\nReplying to message: parent-0\n</orchestration-message>".into(),
+                    display: true,
+                    details: Some(json!({
+                        "id": "m2",
+                        "from": "Main",
+                        "to": "Child",
+                        "body": "reply to parent-9 with status",
+                        "replyTo": "parent-0",
+                    })),
+                    timestamp: 2,
+                }),
+            }))
+            .expect("render irc");
+        drop(renderer);
+        let output = String::from_utf8(output).expect("utf8");
+        assert!(
+            output.contains("▏ reply to parent-9 with status"),
+            "body stays quoted with typed metadata present: {output}"
+        );
+        assert!(
+            output.contains("reply to parent-0"),
+            "typed replyTo still produces the metadata row: {output}"
+        );
+        assert!(
+            !output.contains("Replying to message"),
+            "the XML reply trailer never renders: {output}"
+        );
+    }
 
     #[test]
     fn renders_thinking_tools_and_assistant_in_event_order_without_ansi() {

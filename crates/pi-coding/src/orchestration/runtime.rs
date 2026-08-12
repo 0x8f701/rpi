@@ -5357,44 +5357,46 @@ fn validate_persona_archive_candidate(
     sessions_root: &Path,
     candidate: &Path,
 ) -> Result<PathBuf> {
+    // User-visible error contexts stay path-free: persona failures surface on
+    // the job wire (job.result.error / agent history), so the filesystem
+    // layout must never leak.
     let metadata = fs::symlink_metadata(candidate)
-        .with_context(|| format!("reading persona archive metadata {}", candidate.display()))?;
+        .with_context(|| "reading persona archive metadata")?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        bail!("persona archive is not a regular non-symlink file: {}", candidate.display());
+        bail!("persona archive is not a regular non-symlink file");
     }
     let canonical_root = fs::canonicalize(sessions_root)
-        .with_context(|| format!("resolving persona sessions root {}", sessions_root.display()))?;
+        .with_context(|| "resolving persona sessions root")?;
     let canonical = fs::canonicalize(candidate)
-        .with_context(|| format!("resolving persona archive {}", candidate.display()))?;
+        .with_context(|| "resolving persona archive")?;
     if canonical.parent() != Some(canonical_root.as_path())
         || canonical.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
     {
-        bail!("persona archive escapes its sessions root: {}", candidate.display());
+        bail!("persona archive escapes its sessions root");
     }
     Ok(canonical)
 }
 fn validate_persona_sessions_root(persona_root: &Path) -> Result<Option<PathBuf>> {
     let root_metadata = fs::symlink_metadata(persona_root)
-        .with_context(|| format!("reading persona root {}", persona_root.display()))?;
+        .with_context(|| "reading persona root")?;
     if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
         bail!("persona root is not a regular non-symlink directory");
     }
     let canonical_root = fs::canonicalize(persona_root)
-        .with_context(|| format!("resolving persona root {}", persona_root.display()))?;
+        .with_context(|| "resolving persona root")?;
     let sessions = persona_root.join("sessions");
     let metadata = match fs::symlink_metadata(&sessions) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading persona sessions {}", sessions.display()));
+            return Err(error).with_context(|| "reading persona sessions");
         }
     };
     if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         bail!("persona sessions path is not a regular non-symlink directory");
     }
     let canonical_sessions = fs::canonicalize(&sessions)
-        .with_context(|| format!("resolving persona sessions {}", sessions.display()))?;
+        .with_context(|| "resolving persona sessions")?;
     if canonical_sessions.parent() != Some(canonical_root.as_path()) {
         bail!("persona sessions directory escapes its persona root");
     }
@@ -5406,11 +5408,8 @@ fn persona_archives_newest_first(persona_root: &Path) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     };
     let mut archives = Vec::new();
-    for entry in fs::read_dir(&sessions)
-        .with_context(|| format!("reading persona sessions {}", sessions.display()))?
-    {
-        let entry = entry
-            .with_context(|| format!("reading persona sessions {}", sessions.display()))?;
+    for entry in fs::read_dir(&sessions).with_context(|| "reading persona sessions")? {
+        let entry = entry.with_context(|| "reading persona sessions")?;
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
             continue;
@@ -5433,8 +5432,22 @@ fn load_persona_continuity(persona_root: &Path) -> Result<Vec<pi_ai::Message>> {
     let mut newest_to_oldest = Vec::new();
     let mut bytes = 0usize;
     for path in persona_archives_newest_first(persona_root)? {
-        let messages = crate::session_store::load_session_messages(&path)
-            .with_context(|| format!("loading persona continuity archive {}", path.display()))?;
+        let messages = match crate::session_store::load_session_messages(&path) {
+            Ok(messages) => messages,
+            Err(error) => {
+                // The session-store error chain embeds the absolute archive
+                // path, which would surface on the job wire (job.result.error
+                // / agent history). Re-map to a bounded, path-free failure —
+                // the operation stays actionable without leaking the
+                // filesystem layout.
+                let mut message = format!("{error:#}");
+                message = message.replace(&path.to_string_lossy().as_ref(), "");
+                anyhow::bail!(
+                    "loading persona continuity archive: {}",
+                    message.trim().trim_end_matches(':')
+                );
+            }
+        };
         for message in messages.into_iter().rev() {
             if newest_to_oldest.len() >= PERSONA_CONTINUITY_MAX_MESSAGES {
                 break;
@@ -5495,8 +5508,10 @@ fn archive_persona_session(
     source: &Path,
     replace_existing: bool,
 ) -> Result<PathBuf> {
+    // User-visible contexts stay path-free (persona job failures surface on
+    // the job wire); the server-side diagnostics keep the operation label.
     let source_metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("reading canonical child transcript {}", source.display()))?;
+        .with_context(|| "reading canonical child transcript")?;
     if source_metadata.file_type().is_symlink() || !source_metadata.file_type().is_file() {
         bail!("canonical child transcript is not a regular non-symlink file");
     }
@@ -5508,7 +5523,7 @@ fn archive_persona_session(
                 .parent()
                 .ok_or_else(|| anyhow!("persona archive has no parent"))?;
             fs::create_dir(parent)
-                .with_context(|| format!("creating persona sessions directory {}", parent.display()))?;
+                .with_context(|| "creating persona sessions directory")?;
             validate_persona_sessions_root(persona_root)?
                 .ok_or_else(|| anyhow!("persona sessions directory was not created"))?
         }
@@ -5517,14 +5532,14 @@ fn archive_persona_session(
     let temporary = parent.join(format!(".{agent_id}.{}.tmp", Uuid::new_v4().simple()));
     let result = (|| -> Result<()> {
         let mut input = File::open(source)
-            .with_context(|| format!("opening canonical child transcript {}", source.display()))?;
+            .with_context(|| "opening canonical child transcript")?;
         let mut output = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .with_context(|| format!("creating persona archive temporary {}", temporary.display()))?;
+            .with_context(|| "creating persona archive temporary")?;
         std::io::copy(&mut input, &mut output)
-            .with_context(|| format!("copying persona archive {}", destination.display()))?;
+            .with_context(|| "copying persona archive")?;
         output.flush().context("flushing persona archive")?;
         output.sync_all().context("syncing persona archive")?;
         drop(output);
@@ -5538,9 +5553,7 @@ fn archive_persona_session(
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("reading persona archive {}", destination.display())
-                    });
+                    return Err(error).with_context(|| "reading persona archive");
                 }
             }
             match fs::rename(&temporary, &destination) {
@@ -5551,37 +5564,28 @@ fn archive_persona_session(
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
                     ) =>
                 {
-                    let destination_metadata = fs::symlink_metadata(&destination).with_context(|| {
-                        format!("reading persona archive {}", destination.display())
-                    })?;
+                    let destination_metadata = fs::symlink_metadata(&destination)
+                        .with_context(|| "reading persona archive")?;
                     if destination_metadata.file_type().is_symlink()
                         || !destination_metadata.file_type().is_file()
                     {
                         bail!("existing persona archive is not a regular non-symlink file");
                     }
-                    fs::remove_file(&destination).with_context(|| {
-                        format!("replacing persona archive {}", destination.display())
-                    })?;
-                    fs::rename(&temporary, &destination).with_context(|| {
-                        format!("installing persona archive {}", destination.display())
-                    })?;
+                    fs::remove_file(&destination)
+                        .with_context(|| "replacing persona archive")?;
+                    fs::rename(&temporary, &destination)
+                        .with_context(|| "installing persona archive")?;
                 }
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("installing persona archive {}", destination.display())
-                    });
+                    return Err(error).with_context(|| "installing persona archive");
                 }
             }
         } else {
             fs::hard_link(&temporary, &destination)
-                .with_context(|| format!("installing persona archive {}", destination.display()))?;
-            fs::remove_file(&temporary).with_context(|| {
-                format!("removing persona archive temporary {}", temporary.display())
-            })?;
+                .with_context(|| "installing persona archive")?;
+            fs::remove_file(&temporary)
+                .with_context(|| "removing persona archive temporary")?;
         }
-        File::open(&parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("syncing persona sessions directory {}", parent.display()))?;
         Ok(())
     })();
     if result.is_err() {
@@ -6132,16 +6136,17 @@ const ENGLISH_DELEGATION_VERBS: &[&str] = &[
 
 /// Chinese delegation constructions recognized by [`cjk_delegation_construction`].
 /// The single-character tokens (`让`/`请`/`叫`/`派`) must directly abut the
-/// agent name; the two-character tokens (`安排`/`委托`/`交给`) end immediately
-/// before it.
+/// agent name or follow it with exactly one ASCII space (`让 mentor 审查…`);
+/// the two-character tokens (`安排`/`委托`/`交给`) end immediately before it.
 const CJK_DELEGATION_TOKENS: &[&str] = &["让", "请", "叫", "派", "安排", "委托", "交给"];
 
 /// True when the request uses an explicit natural-language delegation
 /// construction: a recognized English delegation verb token anywhere in the
 /// request, or a conservative CJK construction where a Chinese delegation
-/// token abuts `agent_name` and a non-trivial action clause follows it.
-/// Informational mentions ("researcher 是做什么的？", "我在文档里看到researcher")
-/// return false even when they name the agent exactly.
+/// token directly abuts the agent name (or precedes it with exactly one ASCII
+/// space) and a non-trivial action clause follows it. Informational mentions
+/// ("researcher 是做什么的？", "我在文档里看到researcher") return false even
+/// when they name the agent exactly.
 #[must_use]
 fn delegation_intent(request: &str, agent_name: &str) -> bool {
     request_has_delegation_verb(request) || cjk_delegation_construction(request, agent_name)
@@ -6206,22 +6211,26 @@ fn agent_name_span(request: &str, agent_name: &str) -> Option<(usize, usize)> {
 
 /// Conservative CJK delegation construction: a Chinese delegation token
 /// (`让`/`请`/`叫`/`派`/`安排`/`委托`/`交给`) directly abuts the agent name
-/// (no whitespace or intervening characters) and a non-trivial action clause
-/// follows the name. This is deliberately stricter than the English token
-/// path: `请 review the security patch` is not a delegation to an agent named
-/// `review`, and `请使用research技能` names a skill, not an agent.
+/// (`你让researcher…`) or precedes it with exactly one ASCII space
+/// (`让 mentor 审查…`), and a non-trivial action clause follows the name.
+/// This is deliberately stricter than the English token path: `请 review the
+/// security patch` is not a delegation to an agent named `review`, and
+/// `请使用research技能` names a skill, not an agent.
 #[must_use]
 fn cjk_delegation_construction(request: &str, agent_name: &str) -> bool {
     let Some((span_start, span_end)) = agent_name_span(request, agent_name) else {
         return false;
     };
     let before = &request[..span_start];
-    let Some(last) = before.chars().next_back() else {
-        return false;
-    };
+    // The token must directly abut the name (`你让researcher…`) or precede it
+    // with exactly one ASCII space (`让 mentor 审查这次修改`). The single-space
+    // form is the natural spaced typing of `让 <name> <action>`; two or more
+    // spaces stay non-delegations (conservative).
     let token_hit = CJK_DELEGATION_TOKENS.iter().any(|token| {
-        token.chars().last() == Some(last)
-            && before.ends_with(token)
+        before.ends_with(token)
+            || before
+                .strip_suffix(' ')
+                .is_some_and(|prefix| prefix.ends_with(token) && !prefix.ends_with("  "))
     });
     if !token_hit {
         return false;
@@ -7628,6 +7637,11 @@ mod delegation_intent_tests {
             ("委托researcher调研这个仓库", "researcher"),
             ("叫researcher去研究这个bug", "researcher"),
             ("派researcher去处理这个任务", "researcher"),
+            // Spaced single-char-token form: exactly one ASCII space between
+            // the CJK delegation token and the agent name is a delegation.
+            ("让 mentor 审查这次修改", "mentor"),
+            ("请 researcher 去调查", "researcher"),
+            ("叫 writer 检查这段代码", "writer"),
         ] {
             assert!(
                 cjk_delegation_construction(prompt, agent),
@@ -7635,20 +7649,78 @@ mod delegation_intent_tests {
             );
         }
         // Negatives: informational mentions, questions, possessive markers,
-        // and whitespace-separated English after a CJK token.
+        // whitespace-separated English after a CJK token, and double spaces
+        // after the token (only a single space is accepted).
         for (prompt, agent) in [
             ("researcher 是做什么的？", "researcher"),
             ("我在文档里看到researcher", "researcher"),
             ("让researcher的调研完成", "researcher"),
-            ("请 researcher 去调查", "researcher"),
             ("请review the security patch", "review"),
             ("请使用research技能", "research"),
+            ("让  mentor 审查这次修改", "mentor"),
+            ("请  researcher 去调查", "researcher"),
         ] {
             assert!(
                 !cjk_delegation_construction(prompt, agent),
                 "{prompt:?} must NOT be a CJK delegation construction"
             );
         }
+    }
+
+    #[test]
+    fn space_separated_cjk_delegation_routes_persona_through_catalog_selector() {
+        // A Persona-kind definition (durable root under personas/mentor) is
+        // routed exactly like any agent: `让 mentor 审查这次修改` with NO
+        // explicit agent resolves to mentor through the existing catalog/
+        // selector — the delegated agent is the persona itself, never a
+        // frontend heuristic.
+        let root = tempfile::tempdir().expect("root");
+        let persona_root = root.path().join("personas").join("mentor");
+        fs::create_dir_all(&persona_root).expect("persona root");
+        let definition = super::super::definitions::parse_persona_definition(
+            &persona_root.join("persona.md"),
+            "---\nname: mentor\ndescription: mentor\n---\nprompt",
+            super::super::AgentDefinitionSource::User,
+            true,
+        )
+        .expect("persona definition");
+        assert!(definition.is_persona(), "fixture must be kind Persona");
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![definition.clone()]),
+            root.path().join("artifacts"),
+        );
+        config.default_agent = "mentor".to_owned();
+        config.parent_model = pi_ai::Model::default();
+        let runtime = OrchestrationRuntime::new(
+            config,
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .expect("runtime");
+
+        let assignment = "让 mentor 审查这次修改";
+        // The spaced CJK construction is delegation intent for the persona.
+        assert!(delegation_intent(assignment, "mentor"), "{assignment}");
+        // The exact-mention scan finds the persona name in the prompt.
+        assert!(matches!(
+            runtime.exact_agent_mention_in_catalog(assignment),
+            crate::selector::ExactAgentMention::Unique(name) if name == "mentor"
+        ));
+        // The catalog/selector routes the NL task to the persona WITHOUT an
+        // explicit agent, and the persona is spawn-selectable.
+        assert_eq!(
+            runtime.resolve_task_agent(assignment, None).expect("resolve"),
+            "mentor"
+        );
+        assert!(
+            runtime
+                .enabled_agents()
+                .iter()
+                .any(|agent| agent.name == "mentor" && agent.is_persona()),
+            "the persona must be enabled for spawning"
+        );
+        // The informational-mention guard still applies to the persona: a
+        // question about it is not a delegation.
+        assert!(!delegation_intent("mentor 是做什么的？", "mentor"));
     }
 
     #[test]

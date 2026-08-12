@@ -358,14 +358,23 @@ async fn start_listen(
         tls_cert: cli.listen_cert.clone(),
         tls_key: cli.listen_key.clone(),
         session_factory: Some(std::sync::Arc::new(spawner)),
+        // Test-only slow-writer seam; absent from production builds.
+        #[cfg(debug_assertions)]
+        outbound_writer_delay: std::time::Duration::ZERO,
     };
     let handle = modes::listen::start(application.clone(), extension_ui, config).await?;
     let addr = handle.local_addr();
-    // Directly openable Web UI URL: the effective advertised origin (or the
-    // bound address for concrete binds) plus the `/web` route. Wildcard
-    // binds without `--listen-advertised-origin` have no reachable URL.
-    let web_url = handle.base_url().map(|base| format!("{base}/web"));
-    let web_line = web_url.as_deref().map_or_else(String::new, |url| format!(" Web UI: {url}"));
+    // Directly openable Web UI URL: an explicit advertised origin, a
+    // concrete bind, or — for a wildcard bind — a best-effort discovered
+    // LAN IP. When none is reachable the banner still prints a useful
+    // textual fallback rather than an unreachable 0.0.0.0/:: URL. The
+    // collaboration base_url stays fail-closed for wildcard binds; this
+    // display path is human-facing only.
+    let port = addr.port();
+    let web_line = match handle.display_web_url() {
+        Some(base) => format!(" Web UI: {base}/web"),
+        None => format!(" Web UI: use this machine's LAN IP on port {port}"),
+    };
     let auth = if cli.listen_token_file.is_some() {
         "authentication enabled"
     } else {

@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -41,6 +41,13 @@ pub use super::session_runtime_manager::{
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+/// How long an outbound enqueue may wait for one slot in the bounded queue
+/// before the client is declared a slow reader and closed with 1008
+/// ("client is not reading messages"). A browser main-thread long task (e.g.
+/// a Mermaid render) can stall reading for hundreds of milliseconds while
+/// event bursts keep arriving; the grace absorbs that transient losslessly,
+/// and only a sustained no-read (a genuinely slow client) is evicted.
+const SLOW_CLIENT_GRACE: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum time an accepted TLS connection may occupy a connection task
 /// without completing its server-side handshake.
@@ -83,12 +90,18 @@ struct WebSocketTimeouts {
     /// A collaboration guest sending no frame within this window is closed
     /// cleanly and its participant slot released.
     collab_idle: Duration,
+    /// How long a /ws outbound enqueue waits for one slot in the bounded
+    /// queue before the client is closed with 1008. Tests shrink the window
+    /// so slow-client eviction is provable without waiting out the real
+    /// duration.
+    slow_client_grace: Duration,
 }
 
 const DEFAULT_WS_TIMEOUTS: WebSocketTimeouts = WebSocketTimeouts {
     handshake: READ_TIMEOUT,
     collab_ping_interval: COLLAB_PING_INTERVAL,
     collab_idle: COLLAB_IDLE_TIMEOUT,
+    slow_client_grace: SLOW_CLIENT_GRACE,
 };
 
 /// Web client assets (vite build output) embedded into the binary by
@@ -143,6 +156,16 @@ pub struct ListenConfig {
     /// disables lifecycle opens with a clear error; tests inject a faux
     /// factory.
     pub session_factory: Option<std::sync::Arc<dyn SessionSpawner>>,
+    /// Test-only slow-writer seam (compiled only under `debug_assertions`,
+    /// absent from release binaries): when non-zero, every /ws connection's
+    /// outbound writer stalls its first send by this long (interruptible by
+    /// the close path) before delivering it, modeling a client that has
+    /// stopped reading so the bounded outbound queue fills and the
+    /// slow-client grace (1008 eviction) fires deterministically without
+    /// depending on kernel socket-buffer behavior. Production always passes
+    /// [`Duration::ZERO`].
+    #[cfg(debug_assertions)]
+    pub outbound_writer_delay: Duration,
 }
 
 pub struct ListenHandle {
@@ -176,6 +199,26 @@ impl ListenHandle {
     #[must_use]
     pub fn base_url(&self) -> Option<String> {
         advertised_base_url(self.address, self.advertised_origin.as_deref(), self.tls)
+    }
+    /// Directly-openable Web UI origin for the banner.
+    ///
+    /// Like [`base_url`](Self::base_url), an explicit advertised origin
+    /// wins and a concrete bind synthesizes from the bound address; unlike
+    /// it, a wildcard bind performs a best-effort [`discover_lan_ip`] so
+    /// the banner can still offer a reachable URL. Returns `None` only
+    /// when no usable LAN address can be discovered, in which case the
+    /// caller prints a textual fallback. Collaboration link generation
+    /// keeps using [`base_url`](Self::base_url), which stays fail-closed
+    /// for wildcard binds — this method is for human-facing display only.
+    #[must_use]
+    pub fn display_web_url(&self) -> Option<String> {
+        let discovered = discover_lan_ip(self.address);
+        display_web_url(
+            self.address,
+            self.advertised_origin.as_deref(),
+            self.tls,
+            discovered,
+        )
     }
 
     pub async fn stop(self) -> Result<()> {
@@ -214,6 +257,9 @@ struct ServerState {
     /// tokenless browsers are accepted only when same-origin against the
     /// request's own `Host` ([`authorized`]).
     base_url: Option<String>,
+    /// Test-only slow-writer seam, see [`ListenConfig::outbound_writer_delay`].
+    #[cfg(debug_assertions)]
+    outbound_writer_delay: Duration,
 }
 
 pub async fn start(
@@ -271,6 +317,8 @@ pub async fn start(
         collab: collab.clone(),
         token: token.map(Arc::from),
         base_url: advertised_base_url(address, config.advertised_origin.as_deref(), tls_active),
+        #[cfg(debug_assertions)]
+        outbound_writer_delay: config.outbound_writer_delay,
     };
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(run_listener(listener, tls, state, shutdown_rx));
@@ -384,6 +432,97 @@ fn advertised_base_url(bind: SocketAddr, advertised: Option<&str>, tls: bool) ->
             format!("{scheme}://{bind}")
         })
     })
+}
+
+/// Select a directly-openable Web UI origin for the banner.
+///
+/// Unlike [`advertised_base_url`] (which drives collaboration link
+/// generation and stays fail-closed for wildcard binds), this helper
+/// aims to always produce a *displayable* URL. Precedence:
+/// 1. an explicit advertised origin wins, used verbatim;
+/// 2. a concrete (non-wildcard) bind synthesizes `<scheme>://<bind>`;
+/// 3. a wildcard bind uses the best-effort `discovered_lan_ip` when it is
+///    a usable LAN address, formatted with the bound port (IPv6 gets
+///    brackets via [`SocketAddr`] display).
+///
+/// Returns `None` only for a wildcard bind with no usable discovered IP,
+/// in which case the caller prints a textual fallback instead of an
+/// unreachable `0.0.0.0`/`::` URL. `discovered_lan_ip` is validated here
+/// (not just in [`discover_lan_ip`]) so a stale or malformed injection
+/// can never yield a bogus URL. The scheme follows `tls`: `https` for the
+/// default TLS listener, `http` for `--listen-plaintext`.
+fn display_web_url(
+    bind: SocketAddr,
+    advertised: Option<&str>,
+    tls: bool,
+    discovered_lan_ip: Option<IpAddr>,
+) -> Option<String> {
+    if let Some(origin) = advertised {
+        return Some(origin.to_owned());
+    }
+    let scheme = if tls { "https" } else { "http" };
+    let ip = bind.ip();
+    if !ip.is_unspecified() {
+        return Some(format!("{scheme}://{bind}"));
+    }
+    // Wildcard bind: fall back to a discovered LAN address, preserving the
+    // bound port. SocketAddr::new + Display formats IPv6 with brackets.
+    let lan = discovered_lan_ip.filter(|ip| is_usable_lan_ip(ip))?;
+    let lan_addr = SocketAddr::new(lan, bind.port());
+    Some(format!("{scheme}://{lan_addr}"))
+}
+
+/// Whether `ip` is a plausible LAN address to print in the banner.
+///
+/// Rejects the three classes that would produce a misleading or
+/// unreachable URL: unspecified (0.0.0.0/::, the wildcard itself),
+/// loopback (127.0.0.0/8, ::1), and multicast (224.0.0.0/4, ff00::/8).
+/// Matches the contract exactly; link-local addresses are not excluded
+/// because the contract does not require it.
+fn is_usable_lan_ip(ip: &IpAddr) -> bool {
+    !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast()
+}
+
+/// Best-effort discovery of this machine's LAN IP, with no external data
+/// transfer.
+///
+/// Binds a [`UdpSocket`] to the wildcard address and `connect`s it to a
+/// documentation-reserved endpoint so the OS performs a route lookup and
+/// stamps the socket's local address with the egress interface — without
+/// sending any datagram (UDP `connect` only sets the default destination).
+/// The chosen destination is in documentation space (RFC 5737 TEST-NET-3
+/// for IPv4, RFC 3849 `2001:db8::/32` for IPv6) so even a leaked packet
+/// would not reach a real host. The result is validated by
+/// [`is_usable_lan_ip`]; unusable addresses yield `None`.
+///
+/// A wildcard IPv4 bind probes IPv4 only; a wildcard IPv6 bind probes
+/// IPv6 first and falls back to an IPv4 probe (the bound port is
+/// preserved by [`display_web_url`], not by the probe). `None` means no
+/// route was found and the banner must print its textual fallback.
+fn discover_lan_ip(bind: SocketAddr) -> Option<IpAddr> {
+    match bind {
+        SocketAddr::V4(_) => probe_lan_ip_v4(),
+        SocketAddr::V6(_) => probe_lan_ip_v6().or_else(probe_lan_ip_v4),
+    }
+}
+
+/// Probe the LAN IPv4 address by asking the OS for a route to TEST-NET-3.
+fn probe_lan_ip_v4() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("203.0.113.123:9").ok()?;
+    let local = socket.local_addr().ok()?;
+    let ip = local.ip();
+    is_usable_lan_ip(&ip).then_some(ip)
+}
+
+/// Probe the LAN IPv6 address by asking the OS for a route to the
+/// documentation prefix `2001:db8::/32`.
+fn probe_lan_ip_v6() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("[::]:0").ok()?;
+    socket.connect("[2001:db8::123]:9").ok()?;
+    let local = socket.local_addr().ok()?;
+    let ip = local.ip();
+    is_usable_lan_ip(&ip).then_some(ip)
 }
 
 /// Cache directory for the auto-generated self-signed certificate
@@ -560,6 +699,13 @@ async fn run_listener(
             }
         }
     }
+    // Close the listening socket while this task still runs, at loop exit —
+    // before the (potentially slow) connection abort/drain and before the task
+    // completes. `ListenHandle::stop` awaits this task, so a resolved stop is
+    // a true barrier: the accept window ends here and no new TCP connection
+    // can be established once the listener task has completed, independent of
+    // JoinHandle/dealloc timing.
+    drop(listener);
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     Ok(())
@@ -1277,6 +1423,17 @@ where
 
     let (mut websocket_write, mut websocket_read) = websocket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
+    // A full queue is a slow-client signal, not a failure: wait up to the
+    // grace window for one slot (see enqueue_message) so transient writer
+    // stalls never drop events or close the connection.
+    let slow_client_grace = timeouts.slow_client_grace;
+    // Test-only slow-writer seam: model a client that has stopped reading by
+    // stalling the first outbound send. The bounded queue then fills and the
+    // slow-client grace above fires deterministically without depending on
+    // kernel socket-buffer behavior. The close path stays responsive because
+    // the stall is selectable against `writer_control`.
+    #[cfg(debug_assertions)]
+    let outbound_writer_delay = state.outbound_writer_delay;
     // Non-inline commands run on a per-connection task set so a long command
     // never blocks the read/event select below. The set is bounded at
     // MAX_CONCURRENT_COMMANDS (mirroring the stdio RPC session); dropping it
@@ -1284,6 +1441,17 @@ where
     let mut commands = JoinSet::new();
     let (writer_control_tx, mut writer_control_rx) = mpsc::channel::<WriterControl>(1);
     let mut writer = AbortTask::new(tokio::spawn(async move {
+        // Test-only slow-writer seam (compiled only under `debug_assertions`,
+        // absent from release builds): stall this connection's first outbound
+        // send to model a client that has stopped reading, so the bounded
+        // queue fills and the slow-client grace (1008 eviction) fires
+        // deterministically without depending on kernel socket-buffer
+        // behavior. One-shot so a fresh connection's own response (queued
+        // behind any leftover broadcast events) is only delayed by one
+        // window. The close path preempts the stall; every build then shares
+        // the single send select below.
+        #[cfg(debug_assertions)]
+        let mut stalled = false;
         loop {
             let message = tokio::select! {
                 biased;
@@ -1302,6 +1470,24 @@ where
                     None => return Ok(()),
                 },
             };
+            #[cfg(debug_assertions)]
+            if !stalled {
+                stalled = true;
+                tokio::select! {
+                    biased;
+                    control = writer_control_rx.recv() => match control {
+                        Some(WriterControl::Close(frame)) => {
+                            let _ = tokio::time::timeout(
+                                WS_CLOSE_TIMEOUT,
+                                websocket_write.send(Message::Close(frame)),
+                            ).await;
+                            return Ok(());
+                        }
+                        None => return Ok(()),
+                    },
+                    _ = tokio::time::sleep(outbound_writer_delay) => {}
+                }
+            }
             tokio::select! {
                 biased;
                 control = writer_control_rx.recv() => match control {
@@ -1332,12 +1518,12 @@ where
             }
             event = events.recv() => match event {
                 Ok(event) => {
-                    if enqueue_json(&outbound_tx, &event).is_err() {
+                    if enqueue_json(&outbound_tx, &event, slow_client_grace).await.is_err() {
                         break WebSocketExit::SlowClient;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    if enqueue_json(&outbound_tx, &RpcResponse::failure(None, "events", format!("application event stream lagged by {count} records"))).is_err() {
+                    if enqueue_json(&outbound_tx, &RpcResponse::failure(None, "events", format!("application event stream lagged by {count} records")), slow_client_grace).await.is_err() {
                         break WebSocketExit::SlowClient;
                     }
                 }
@@ -1350,12 +1536,12 @@ where
                     // Extension-owned interactions project as read-only
                     // notice cards ("answer in the terminal"); host/TUI-owned
                     // interactions were filtered by the runtime forwarders.
-                    if enqueue_json(&outbound_tx, &event).is_err() {
+                    if enqueue_json(&outbound_tx, &event, slow_client_grace).await.is_err() {
                         break WebSocketExit::SlowClient;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    if enqueue_json(&outbound_tx, &RpcResponse::failure(None, "extension_ui", format!("extension UI event stream lagged by {count} records"))).is_err() {
+                    if enqueue_json(&outbound_tx, &RpcResponse::failure(None, "extension_ui", format!("extension UI event stream lagged by {count} records")), slow_client_grace).await.is_err() {
                         break WebSocketExit::SlowClient;
                     }
                 }
@@ -1382,13 +1568,13 @@ where
                     match parse_input(text.as_bytes()) {
                         Ok(RpcInput::Command { command, session_id }) if command.is_collab_lifecycle() => {
                             let response = dispatch_http_command(&state, command, session_id).await;
-                            if enqueue_json(&outbound_tx, &response).is_err() {
+                            if enqueue_json(&outbound_tx, &response, slow_client_grace).await.is_err() {
                                 break WebSocketExit::SlowClient;
                             }
                         }
                         Ok(RpcInput::Command { command, session_id }) if command.runs_inline() => {
                             let response = state.manager.dispatch_inner(command, session_id).await;
-                            if enqueue_json(&outbound_tx, &response).is_err() {
+                            if enqueue_json(&outbound_tx, &response, slow_client_grace).await.is_err() {
                                 break WebSocketExit::SlowClient;
                             }
                         }
@@ -1398,7 +1584,7 @@ where
                                 command.command_name(),
                                 format!("too many concurrent RPC commands (limit {MAX_CONCURRENT_COMMANDS})"),
                             );
-                            if enqueue_json(&outbound_tx, &response).is_err() {
+                            if enqueue_json(&outbound_tx, &response, slow_client_grace).await.is_err() {
                                 break WebSocketExit::SlowClient;
                             }
                         }
@@ -1407,21 +1593,23 @@ where
                             let outbound_tx = outbound_tx.clone();
                             commands.spawn(async move {
                                 let response = manager.dispatch_spawned(command, session_id).await;
-                                enqueue_json(&outbound_tx, &response)
+                                enqueue_json(&outbound_tx, &response, slow_client_grace).await
                             });
                         }
                         Ok(RpcInput::ExtensionUiResponse(_)) => {
                             if enqueue_json(
                                 &outbound_tx,
                                 &RpcResponse::failure(None, "extension_ui_response", REMOTE_EXTENSION_UI_ERROR),
+                                slow_client_grace,
                             )
+                            .await
                             .is_err()
                             {
                                 break WebSocketExit::SlowClient;
                             }
                         }
                         Err(response) => {
-                            if enqueue_json(&outbound_tx, &response).is_err() {
+                            if enqueue_json(&outbound_tx, &response, slow_client_grace).await.is_err() {
                                 break WebSocketExit::SlowClient;
                             }
                         }
@@ -1435,7 +1623,7 @@ where
                 }
                 Some(Ok(Message::Close(_))) | None => break WebSocketExit::Graceful(None),
                 Some(Ok(Message::Ping(payload))) => {
-                    if enqueue_message(&outbound_tx, Message::Pong(payload)).is_err() {
+                    if enqueue_message(&outbound_tx, Message::Pong(payload), slow_client_grace).await.is_err() {
                         break WebSocketExit::SlowClient;
                     }
                 }
@@ -1502,16 +1690,41 @@ async fn stop_websocket_writer(
     }
 }
 
-fn enqueue_message(sender: &mpsc::Sender<Message>, message: Message) -> Result<()> {
-    sender.try_send(message).map_err(|error| match error {
-        mpsc::error::TrySendError::Full(_) => anyhow!("control plane outbound queue is full"),
-        mpsc::error::TrySendError::Closed(_) => anyhow!("control plane outbound writer stopped"),
-    })
+async fn enqueue_message(
+    sender: &mpsc::Sender<Message>,
+    message: Message,
+    slow_client_grace: Duration,
+) -> Result<()> {
+    match sender.try_send(message) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(message)) => {
+            // The writer is momentarily behind (TCP backpressure while the
+            // client pauses reading, e.g. a browser main-thread long task).
+            // Wait up to the grace window for one slot instead of failing
+            // instantly: the burst is preserved losslessly and the client is
+            // only evicted (1008) when it stays unreadable past the grace.
+            match tokio::time::timeout(slow_client_grace, sender.reserve()).await {
+                Ok(Ok(permit)) => {
+                    permit.send(message);
+                    Ok(())
+                }
+                Ok(Err(_)) => Err(anyhow!("control plane outbound writer stopped")),
+                Err(_) => Err(anyhow!("control plane outbound queue is full")),
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(anyhow!("control plane outbound writer stopped"))
+        }
+    }
 }
 
-fn enqueue_json<T: Serialize>(sender: &mpsc::Sender<Message>, value: &T) -> Result<()> {
+async fn enqueue_json<T: Serialize>(
+    sender: &mpsc::Sender<Message>,
+    value: &T,
+    slow_client_grace: Duration,
+) -> Result<()> {
     let text = serde_json::to_string(value).context("serializing control plane message")?;
-    enqueue_message(sender, Message::Text(text.into()))
+    enqueue_message(sender, Message::Text(text.into()), slow_client_grace).await
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
@@ -1765,6 +1978,8 @@ mod tests {
             collab: CollabService::new(manager),
             token: None,
             base_url: None,
+            #[cfg(debug_assertions)]
+            outbound_writer_delay: Duration::ZERO,
         }
     }
 
@@ -2132,6 +2347,7 @@ mod tests {
                     handshake: Duration::from_millis(150),
                     collab_ping_interval: Duration::from_secs(3600),
                     collab_idle: Duration::from_secs(3600),
+                    slow_client_grace: Duration::from_secs(5),
                 },
             )
             .await
@@ -2170,6 +2386,7 @@ mod tests {
                     handshake: Duration::from_millis(150),
                     collab_ping_interval: Duration::from_secs(3600),
                     collab_idle: Duration::from_secs(3600),
+                    slow_client_grace: Duration::from_secs(5),
                 },
             )
             .await
@@ -2193,6 +2410,7 @@ mod tests {
                 handshake: Duration::from_secs(2),
                 collab_ping_interval: Duration::from_millis(20),
                 collab_idle: Duration::from_millis(120),
+                slow_client_grace: Duration::from_secs(5),
             },
         )
         .await;
@@ -2261,6 +2479,7 @@ mod tests {
                 handshake: Duration::from_secs(2),
                 collab_ping_interval: Duration::from_millis(20),
                 collab_idle: Duration::from_millis(300),
+                slow_client_grace: Duration::from_secs(5),
             },
         )
         .await;
@@ -2406,6 +2625,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn display_web_url_prefers_explicit_origin_then_concrete_bind() {
+        // An explicit advertised origin always wins, even over a concrete
+        // bind, and is used verbatim (scheme comes from the origin itself).
+        let bind: SocketAddr = "198.51.100.7:4321".parse().expect("concrete bind");
+        assert_eq!(
+            display_web_url(bind, Some("https://lan.example:8443"), true, None),
+            Some("https://lan.example:8443".to_owned()),
+            "explicit origin must win over a concrete bind"
+        );
+        // A concrete bind synthesizes from the bound address and ignores any
+        // discovered IP — the bound address is already directly reachable.
+        let discovered: IpAddr = "203.0.113.10".parse().unwrap();
+        assert_eq!(
+            display_web_url(bind, None, true, Some(discovered)),
+            Some("https://198.51.100.7:4321".to_owned()),
+            "concrete bind must synthesize https from the bound address"
+        );
+        assert_eq!(
+            display_web_url(bind, None, false, None),
+            Some("http://198.51.100.7:4321".to_owned()),
+            "plaintext concrete bind must synthesize http"
+        );
+    }
+
+    #[test]
+    fn display_web_url_wildcard_uses_discovered_ipv4_lan_ip() {
+        // IPv4 wildcard + a discovered IPv4 LAN address -> scheme://ip:port.
+        // The discovered IP is in TEST-NET-3 documentation space so the
+        // test never names a real private address.
+        let bind: SocketAddr = "0.0.0.0:4321".parse().expect("wildcard bind");
+        let discovered: IpAddr = "203.0.113.10".parse().unwrap();
+        assert_eq!(
+            display_web_url(bind, None, true, Some(discovered)),
+            Some("https://203.0.113.10:4321".to_owned()),
+            "TLS wildcard must use the discovered LAN IP with the bound port"
+        );
+        assert_eq!(
+            display_web_url(bind, None, false, Some(discovered)),
+            Some("http://203.0.113.10:4321".to_owned()),
+            "plaintext wildcard must use http with the discovered LAN IP"
+        );
+    }
+
+    #[test]
+    fn display_web_url_wildcard_formats_discovered_ipv6_with_brackets() {
+        // IPv6 wildcard + a discovered IPv6 LAN address -> bracketed host.
+        // 2001:db8::/32 is the IPv6 documentation prefix (RFC 3849).
+        let bind: SocketAddr = "[::]:4321".parse().expect("ipv6 wildcard bind");
+        let discovered: IpAddr = "2001:db8::10".parse().unwrap();
+        assert_eq!(
+            display_web_url(bind, None, true, Some(discovered)),
+            Some("https://[2001:db8::10]:4321".to_owned()),
+            "discovered IPv6 address must be bracketed in the URL"
+        );
+    }
+
+    #[test]
+    fn display_web_url_rejects_loopback_unspecified_and_multicast_discovered_ips() {
+        // A wildcard bind must never turn an unusable discovered address
+        // into a URL; each must yield None so the banner falls back to text.
+        let bind: SocketAddr = "0.0.0.0:4321".parse().expect("wildcard bind");
+        for bad in [
+            "0.0.0.0",   // unspecified — the wildcard itself
+            "127.0.0.1", // IPv4 loopback
+            "224.0.0.1", // IPv4 multicast
+            "::",        // IPv6 unspecified
+            "::1",       // IPv6 loopback
+            "ff02::1",   // IPv6 multicast
+        ] {
+            let ip: IpAddr = bad.parse().expect("parse bad discovered ip");
+            assert_eq!(
+                display_web_url(bind, None, true, Some(ip)),
+                None,
+                "discovered {bad:?} must be rejected, not rendered into a URL"
+            );
+        }
+    }
+
+    #[test]
+    fn display_web_url_wildcard_without_usable_ip_yields_none_for_text_fallback() {
+        // No discovered IP at all (no route / offline): the banner prints a
+        // textual fallback, never an unreachable 0.0.0.0/:: URL.
+        let bind4: SocketAddr = "0.0.0.0:4321".parse().expect("ipv4 wildcard");
+        assert_eq!(
+            display_web_url(bind4, None, true, None),
+            None,
+            "ipv4 wildcard with no discovery must yield None for the fallback"
+        );
+        assert_eq!(
+            display_web_url(bind4, None, false, None),
+            None,
+            "plaintext ipv4 wildcard with no discovery must yield None"
+        );
+        let bind6: SocketAddr = "[::]:4321".parse().expect("ipv6 wildcard");
+        assert_eq!(
+            display_web_url(bind6, None, true, None),
+            None,
+            "ipv6 wildcard with no discovery must yield None for the fallback"
+        );
+    }
+
     #[tokio::test]
     async fn collab_host_fails_closed_on_wildcard_without_origin_and_uses_configured_origin() {
         let service = CollabService::with_runtime(CollabTestRuntime::new());
@@ -2462,5 +2783,247 @@ mod tests {
             !output.contains("0.0.0.0") && !output.contains("[::]"),
             "links must never contain the wildcard bind: {output}"
         );
+    }
+
+    #[tokio::test]
+    async fn outbound_enqueue_waits_within_grace_and_times_out_without_drain() {
+        // A full bounded queue with no consumer models a writer stalled by a
+        // client that stopped reading. The old code failed the enqueue
+        // instantly (closing with 1008); the fix waits out the grace window
+        // before declaring the client slow.
+        let (tx, rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
+        for _ in 0..OUTBOUND_QUEUE_CAPACITY {
+            enqueue_message(&tx, Message::Text("fill".into()), Duration::from_secs(5))
+                .await
+                .expect("prefill must fit");
+        }
+        let started = tokio::time::Instant::now();
+        let error = enqueue_message(
+            &tx,
+            Message::Text("overflow".into()),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect_err("an undrained full queue must exhaust the grace and fail");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "the grace window must elapse before failing"
+        );
+        assert!(format!("{error:#}").contains("queue is full"), "{error:#}");
+        drop(rx);
+
+        // Draining one slot within the grace admits the same overflow
+        // losslessly: a transient writer stall must neither drop events nor
+        // close the connection.
+        let (tx, mut rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
+        for _ in 0..OUTBOUND_QUEUE_CAPACITY {
+            enqueue_message(&tx, Message::Text("fill".into()), Duration::from_secs(5))
+                .await
+                .expect("prefill must fit");
+        }
+        // The overflow enqueue runs in a spawned task (the connection loop),
+        // while this task plays the slow-draining writer: it frees one slot
+        // after a delay, which the enqueue's grace wait must absorb.
+        let enqueuer_tx = tx.clone();
+        let enqueuer = tokio::spawn(async move {
+            enqueue_message(&enqueuer_tx, Message::Text("overflow".into()), Duration::from_secs(5))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            matches!(rx.recv().await, Some(Message::Text(_))),
+            "the slow writer must drain one slot"
+        );
+        enqueuer
+            .await
+            .expect("enqueuer task")
+            .expect("a slot freed within the grace must admit the overflow losslessly");
+        let mut received = Vec::new();
+        for _ in 0..OUTBOUND_QUEUE_CAPACITY {
+            received.push(rx.recv().await.expect("queued message"));
+        }
+        assert_eq!(
+            received.len(),
+            OUTBOUND_QUEUE_CAPACITY,
+            "no message may be dropped"
+        );
+        let overflow_count = received
+            .iter()
+            .filter(|message| matches!(message, Message::Text(text) if text.as_str() == "overflow"))
+            .count();
+        assert_eq!(
+            overflow_count, 1,
+            "the overflow message must be delivered exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_client_survives_transient_event_burst_without_policy_close() {
+        let state = ws_server_state().await;
+        let manager = state.manager.clone();
+        // Build the listener from a socket with a tiny send buffer (accepted
+        // sockets inherit SO_SNDBUF), so a few frames congest the server side
+        // of the connection and stall the writer between the client's reads.
+        let listen_socket = tokio::net::TcpSocket::new_v4().expect("new v4 socket");
+        let _ = listen_socket.set_send_buffer_size(4096);
+        listen_socket
+            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("bind listener");
+        let listener = listen_socket.listen(16).expect("listen");
+        let address = listener.local_addr().expect("listener address");
+        let timeouts = WebSocketTimeouts {
+            handshake: Duration::from_secs(2),
+            collab_ping_interval: Duration::from_secs(3600),
+            collab_idle: Duration::from_secs(3600),
+            // Far longer than the client's read pacing: a transient stall is
+            // not a permanently slow client and must not be evicted.
+            slow_client_grace: Duration::from_secs(2),
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept connection");
+            let raw = read_http_request(&mut stream).await.expect("read upgrade request");
+            websocket_connection(stream, raw, state, None, timeouts).await
+        });
+        // Connect with a tiny receive window so a few frames congest the
+        // socket and stall the server's writer between reads.
+        let socket = tokio::net::TcpSocket::new_v4().expect("new v4 socket");
+        let _ = socket.set_recv_buffer_size(4096);
+        let tcp = socket.connect(address).await.expect("connect tcp");
+        let mut request = format!("ws://{address}/ws")
+            .into_client_request()
+            .expect("client request");
+        let (mut socket, _) = tokio_tungstenite::client_async(request, tcp)
+            .await
+            .expect("connect WebSocket");
+
+        // A burst far beyond the 64-frame outbound queue, emitted as fast as
+        // the fan-in broadcast allows while the client keeps reading.
+        const BURST: usize = 200;
+        let pad = "x".repeat(2000);
+        let events_tx = manager.events_tx();
+        let emitter = tokio::spawn(async move {
+            for n in 0..BURST {
+                let frame = json!({"type": "burst_delta", "sessionId": "sess-1", "n": n, "pad": pad});
+                if events_tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Read everything the server sends, pacing so the TCP window stays
+        // mostly closed and the writer is stalled for most of the burst. On
+        // the pre-fix code the first full-queue enqueue closed the connection
+        // with 1008; with the grace the same transient stall must be absorbed
+        // losslessly.
+        let mut received = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while received < BURST && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(20), socket.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let frame: Value = serde_json::from_str(text.as_str()).expect("frame json");
+                    if frame.get("type").and_then(Value::as_str) == Some("burst_delta") {
+                        received += 1;
+                        // Pace the reads so the tiny TCP window stays mostly
+                        // closed: the server writer stalls between reads for
+                        // the whole burst, which is exactly the transient
+                        // stall the grace must absorb.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+                Ok(Some(Ok(Message::Close(frame)))) => {
+                    panic!("transient stall must not close the connection: {frame:?}");
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(error))) => panic!("read error during transient burst: {error}"),
+                Ok(None) => panic!("connection dropped during transient burst"),
+                Err(_) => {} // pacing tick: no frame was ready
+            }
+        }
+        assert_eq!(
+            received, BURST,
+            "every burst delta must be delivered losslessly to a slow reader"
+        );
+        emitter.await.expect("emitter task");
+
+        // The connection stayed up through the burst: close gracefully and
+        // let the server exit cleanly.
+        socket
+            .close(None)
+            .await
+            .expect("close WebSocket gracefully");
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server task must exit after the client disconnects")
+            .expect("server task must not panic")
+            .expect("server result");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sustained_unread_client_is_still_evicted_after_grace() {
+        let state = ws_server_state().await;
+        let manager = state.manager.clone();
+        let listen_socket = tokio::net::TcpSocket::new_v4().expect("new v4 socket");
+        let _ = listen_socket.set_send_buffer_size(4096);
+        listen_socket
+            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("bind listener");
+        let listener = listen_socket.listen(16).expect("listen");
+        let address = listener.local_addr().expect("listener address");
+        let timeouts = WebSocketTimeouts {
+            handshake: Duration::from_secs(2),
+            collab_ping_interval: Duration::from_secs(3600),
+            collab_idle: Duration::from_secs(3600),
+            // A client that reads NOTHING for longer than the grace is a
+            // genuinely slow client: bounded eviction (the 1008 decision)
+            // must still fire.
+            slow_client_grace: Duration::from_millis(300),
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept connection");
+            let raw = read_http_request(&mut stream).await.expect("read upgrade request");
+            websocket_connection(stream, raw, state, None, timeouts).await
+        });
+        let socket = tokio::net::TcpSocket::new_v4().expect("new v4 socket");
+        let _ = socket.set_recv_buffer_size(4096);
+        let tcp = socket.connect(address).await.expect("connect tcp");
+        let mut request = format!("ws://{address}/ws")
+            .into_client_request()
+            .expect("client request");
+        let (socket, _) = tokio_tungstenite::client_async(request, tcp)
+            .await
+            .expect("connect WebSocket");
+
+        // Flood events while the client never reads: the queue fills and
+        // stays full past the grace, so the connection must be torn down.
+        const BURST: usize = 200;
+        let pad = "x".repeat(2000);
+        let events_tx = manager.events_tx();
+        for n in 0..BURST {
+            let frame = json!({"type": "burst_delta", "sessionId": "sess-1", "n": n, "pad": pad});
+            let _ = events_tx.send(frame);
+        }
+
+        // Wait past the grace so the eviction decision fires (queue full,
+        // no drain), then start reading: the close frame can only flush once
+        // the client reads, and the writer's bounded close window (2s) must
+        // still be open — so the server exits cleanly instead of aborting.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let drainer = tokio::spawn(async move {
+            let mut socket = socket;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(50), socket.next()).await {
+                    Ok(Some(Ok(_))) => {}
+                    Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("unread client must be evicted within the bounded grace")
+            .expect("server task must not panic")
+            .expect("slow-client eviction is a clean server exit");
+        drainer.await.ok();
+        manager.shutdown().await;
     }
 }

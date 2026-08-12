@@ -311,10 +311,10 @@ fn primary_command_surface_is_help_and_completion_only() {
         &[
             "settings", "model", "branch", "resume", "fork", "export", "dump", "handoff",
             "agents", "role", "persona", "compact", "rewind", "checkpoint", "ps", "loop",
-            "goal", "workflow", "code-review", "btw", "queue", "live",
+            "goal", "workflow", "code-review", "btw", "queue", "live", "skill",
         ]
     );
-    assert_eq!(PRIMARY_COMMAND_NAMES.len(), 22);
+    assert_eq!(PRIMARY_COMMAND_NAMES.len(), 23);
     let visible = visible_catalog()
         .into_iter()
         .map(|command| command.name)
@@ -496,6 +496,10 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
 
     // share — background share fails closed without gh/network (ShareFailed).
     {
+        // Deterministic offline seam: the session-scoped offline contract
+        // (never the process env, never real gh) makes /share fail closed on
+        // any machine regardless of gh installation, auth state, or network.
+        app.session().set_offline(true);
         let mut events = app.subscribe();
         app.share_session();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -506,6 +510,10 @@ async fn every_builtin_has_minimal_action_usage_or_panel_precursor() {
                     assert!(
                         !message.trim().is_empty(),
                         "ShareFailed must carry an actionable message"
+                    );
+                    assert!(
+                        message.contains("PI_OFFLINE"),
+                        "the offline contract must be the reported failure: {message}"
                     );
                     saw_failure = true;
                     break;

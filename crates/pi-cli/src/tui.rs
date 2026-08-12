@@ -78,7 +78,8 @@ use crate::markdown::ratatui::{
     syntax_spans_unpadded as markdown_syntax_spans,
 };
 use crate::orchestration_message::{
-    OrchestrationIrcView, orchestration_irc_view, orchestration_irc_view_from_mailbox,
+    OrchestrationIrcView, orchestration_irc_view, orchestration_irc_view_from_json,
+    orchestration_irc_view_from_mailbox,
 };
 use crate::process_commands::{
     ProcessKeyResult, ProcessPanel, ProcessPanelAction, render_process_panel,
@@ -99,7 +100,9 @@ use crate::todo_dag_panel::{
     TodoDagPanel, TodoDagPanelResult, TodoDagSnapshot, render_todo_dag_panel,
 };
 use crate::tool_card_adapter::{
-    ToolCardPresentationAdapter, ToolCardRowRole, ToolCardRows, task_delegation_request,
+    ToolCardPresentationAdapter, ToolCardRowRole, ToolCardRows, TASK_SECTION_CHAR_LIMIT,
+    TASK_TARGET_CHAR_LIMIT, bound_display_text, task_delegation_request,
+    task_delegation_sections,
 };
 use crate::tree_panel::{TreePanel, TreePanelMode};
 
@@ -2403,6 +2406,7 @@ enum TranscriptKind {
     Assistant,
     System,
     Custom,
+    Irc,
     Tool,
     Job,
 }
@@ -4013,21 +4017,18 @@ impl TuiState {
         let from = self.job_cards.agent_display_name(view.from.as_ref());
         let to = self.job_cards.agent_display_name(view.to.as_ref());
         let label = view.label(&from, &to);
-        let content = view.body_blocks();
-        if content.is_empty() {
-            self.push_entry(TranscriptEntry {
-                kind: TranscriptKind::Custom,
-                content: Vec::new(),
-                tool_name: Some(label),
-                tool_card: None,
-                job_card: None,
-                is_error: false,
-                is_partial: false,
+        let mut content = vec![ContentBlock::Text {
+            text: view.body.as_ref().to_owned(),
+            text_signature: Some("irc-body".to_owned()),
+        }];
+        if let Some(metadata) = view.reply_metadata() {
+            content.push(ContentBlock::Text {
+                text: metadata,
+                text_signature: Some("irc-reply".to_owned()),
             });
-            return;
         }
         self.push_entry(TranscriptEntry {
-            kind: TranscriptKind::Custom,
+            kind: TranscriptKind::Irc,
             content,
             tool_name: Some(label),
             tool_card: None,
@@ -12528,7 +12529,8 @@ fn transcript_entry_is_visible(entry: &TranscriptEntry, show_thinking: bool) -> 
         TranscriptKind::User
         | TranscriptKind::Assistant
         | TranscriptKind::System
-        | TranscriptKind::Custom => entry.content.iter().any(|block| match block {
+        | TranscriptKind::Custom
+        | TranscriptKind::Irc => entry.content.iter().any(|block| match block {
             ContentBlock::Thinking { .. } => {
                 show_thinking && transcript_block_has_content(block)
             }
@@ -12686,14 +12688,29 @@ fn render_job_card(lines: &mut Vec<Line<'static>>, card: &TaskCardRows, theme: T
     )));
     push_task_box_row(lines, &format!("Task {} agents", card.children.len()), theme.tool_title, border, inner, Modifier::BOLD,
     );
+    // Structured Goal / Constraints / Contract sections (Web parity): the
+    // delegation context is split into labeled, bounded sections instead of
+    // one markdown blob, so long prose (including CJK) stays readable and raw
+    // `# Heading` lines never render.
+    let sections = task_delegation_sections(&card.context);
     if !card.context.trim().is_empty() {
-        for line in render_transcript_markdown(&card.context, theme, theme.text, u16::try_from(inner.saturating_sub(2)).unwrap_or(u16::MAX), false,
-        ) {
-            push_task_box_line(lines, line, border, inner);
+        for (label, body) in [
+            ("Goal", &sections.goal),
+            ("Constraints", &sections.constraints),
+            ("Contract", &sections.contract),
+        ] {
+            if body.is_empty() {
+                continue;
+            }
+            push_task_box_row(lines, label, theme.tool_title, border, inner, Modifier::BOLD);
+            for line in render_transcript_markdown(body, theme, theme.text, u16::try_from(inner.saturating_sub(2)).unwrap_or(u16::MAX), false,
+            ) {
+                push_task_box_line(lines, line, border, inner);
+            }
         }
         push_task_separator(lines, " Agents ", border, inner);
     }
-    for child in &card.children {
+    for (index, child) in card.children.iter().enumerate() {
         let marker = match child.job_status {
             pi_coding::JobStatus::Queued | pi_coding::JobStatus::Running => {
                 ACTIVE_ANIMATION_FRAMES[animation_frame % ACTIVE_ANIMATION_FRAMES.len()]
@@ -12715,12 +12732,15 @@ fn render_job_card(lines: &mut Vec<Line<'static>>, card: &TaskCardRows, theme: T
         } else {
             ""
         };
-        let title = format!("{marker} {} ({}) · {lifecycle}{parked}", child.display_name, child.agent);
+        // Requested child name (Web `childName`); generated runtime ids
+        // (`Agent1-1f3a9b2c`) collapse to their ordinal so raw UUID fragments
+        // never reach the card. The persona (`child.agent`) stays beside it.
+        let title = format!("{marker} {} ({}) · {lifecycle}{parked}", task_child_name(child, index), child.agent);
         push_task_box_row(lines, &title, status_color, border, inner, Modifier::BOLD);
         if let Some(summary) = child.summary.as_deref().or_else(|| {
             child.rows.iter().find(|row| row.role == JobCardRowRole::Description).map(|row| row.text.as_str())
         }) {
-            push_task_box_row(lines, summary, theme.text, border, inner, Modifier::empty());
+            push_task_box_row(lines, &bound_display_text(&redact_secrets(summary), TASK_TARGET_CHAR_LIMIT), theme.text, border, inner, Modifier::empty());
         }
         let activity = child.rows.iter().filter(|row| {
                 !matches!(row.role, JobCardRowRole::Title | JobCardRowRole::Description | JobCardRowRole::Reference)
@@ -12734,6 +12754,50 @@ fn render_job_card(lines: &mut Vec<Line<'static>>, card: &TaskCardRows, theme: T
     );
     lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), Style::default().fg(border),
     )));
+}
+
+/// Task-card child label: the requested child name (the Web `childName`).
+/// Generated runtime ids (`Agent1-1f3a9b2c`, from
+/// `pi_coding::OrchestrationRuntime::generated_agent_id`) collapse to their
+/// ordinal (`Agent 1`) and raw UUID-shaped ids degrade to a `child-N`
+/// ordinal, so raw UUID fragments never reach the card.
+fn task_child_name(child: &JobCardRows, index: usize) -> String {
+    let raw = child.agent_id.trim();
+    if let Some(rest) = raw.strip_prefix("Agent")
+        && let Some((digits, suffix)) = rest.split_once('-')
+        && !digits.is_empty()
+        && digits.chars().all(|character| character.is_ascii_digit())
+        && suffix.len() == 8
+        && suffix.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        return format!("Agent {digits}");
+    }
+    if is_uuid_like(raw) {
+        let display = child.display_name.trim();
+        if display.is_empty() || display == raw {
+            return format!("child-{}", index + 1);
+        }
+        return display.to_owned();
+    }
+    if !raw.is_empty() {
+        return raw.to_owned();
+    }
+    let display = child.display_name.trim();
+    if display.is_empty() {
+        format!("child-{}", index + 1)
+    } else {
+        display.to_owned()
+    }
+}
+
+/// True for canonical UUID text (`8-4-4-4-12` lowercase hex groups), the
+/// `job_id`/`group_id` shape the orchestration runtime allocates.
+fn is_uuid_like(text: &str) -> bool {
+    let parts = text.split('-').collect::<Vec<_>>();
+    parts.len() == 5
+        && parts.iter().zip([8usize, 4, 4, 4, 12]).all(|(part, len)| {
+            part.len() == len && part.chars().all(|character| character.is_ascii_hexdigit())
+        })
 }
 
 fn push_task_separator(lines: &mut Vec<Line<'static>>, label: &str, border: Color, inner: usize) {
@@ -13215,9 +13279,216 @@ fn render_transcript_entry(
     );
 }
 
+fn hub_send_outcome_label(card: &ToolCardRows) -> &'static str {
+    let Some(receipts) = card
+        .details
+        .get("receipts")
+        .and_then(serde_json::Value::as_array)
+        .filter(|receipts| !receipts.is_empty())
+    else {
+        return if card.is_error { "failed" } else { "delivered" };
+    };
+
+    let mut any_failed = false;
+    let mut any_success = false;
+    let mut unanimous: Option<&'static str> = None;
+    for receipt in receipts {
+        let label = match receipt
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+        {
+            "queued" => "queued",
+            "woken" => "injected",
+            "revived" => "revived",
+            "failed" => "failed",
+            // Unknown delivery outcomes fail closed as delivered rather than
+            // inventing a success state the operator cannot trust.
+            _ => "delivered",
+        };
+        if label == "failed" {
+            any_failed = true;
+        } else {
+            any_success = true;
+        }
+        unanimous = match unanimous {
+            None => Some(label),
+            Some(existing) if existing == label => Some(existing),
+            Some(_) => Some(""),
+        };
+    }
+
+    if any_failed && any_success {
+        "partial"
+    } else if any_failed {
+        "failed"
+    } else if let Some(label) = unanimous.filter(|label| !label.is_empty()) {
+        label
+    } else {
+        "delivered"
+    }
+}
+
+fn render_hub_send_card(lines: &mut Vec<Line<'static>>, card: &ToolCardRows, expanded: bool, theme: Theme, width: u16) {
+    let Some(to) = card.arguments.get("to").and_then(serde_json::Value::as_str) else {
+        render_plain_tool_card(lines, card, theme, width);
+        return;
+    };
+    let message = card
+        .arguments
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let outcome = hub_send_outcome_label(card);
+    let title = format!(
+        "✉ IRC ➤ {} {outcome}",
+        clean_terminal_text(&redact_secrets(to))
+    );
+    let inner = usize::from(width.saturating_sub(2).max(1));
+    let border = if card.is_error { theme.error } else { theme.tool_card_border };
+    push_tool_card_top(lines, &title, theme.tool_title, border, inner);
+    if !message.trim().is_empty() {
+        let mut body_rows = redact_secrets(message)
+            .lines()
+            .flat_map(|line| wrap_display_line(line, inner.saturating_sub(4).max(1)))
+            .collect::<Vec<_>>();
+        let limit = if expanded { 20 } else { 3 };
+        let hidden = body_rows.len().saturating_sub(limit);
+        body_rows.truncate(limit);
+        for row in body_rows {
+            push_tool_box_row(lines, &format!("▏ {row}"), theme.tool_output, border, inner);
+        }
+        if hidden > 0 {
+            push_tool_box_row(lines, &format!("▏ … +{hidden} more"), theme.dim, border, inner);
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner)),
+        Style::default().fg(border),
+    )));
+    lines.push(Line::default());
+    // An `await` reply arrives as a typed `details.reply` mailbox projection
+    // (never parsed from the model-facing "Reply from …" prose). Render it as
+    // its own incoming IRC card below the outgoing send frame so the
+    // transcript shows a typed card, not control prose.
+    if let Some(reply_view) = card.details.get("reply").and_then(orchestration_irc_view_from_json) {
+        let reply_title = format!("✉ IRC ⟵ {}", reply_view.from);
+        render_irc_card_from_view(lines, &reply_title, &reply_view, expanded, theme, width);
+    }
+}
+
+/// Render one typed orchestration IRC message as a bounded, redacted card
+/// frame (title + quoted body + muted reply metadata). Shared by the
+/// `hub wait` received-message card and the `hub send`-with-`await` reply
+/// card so both render the same typed IRC vocabulary as live deliveries.
+fn render_irc_card_from_view(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    view: &OrchestrationIrcView<'_>,
+    expanded: bool,
+    theme: Theme,
+    width: u16,
+) {
+    let inner = usize::from(width.saturating_sub(2).max(1));
+    let border = theme.tool_card_border;
+    push_tool_card_top(lines, &redact_secrets(title), theme.custom_message_label, border, inner);
+    render_irc_body_rows(lines, view, expanded, theme, border, inner);
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner)),
+        Style::default().fg(border),
+    )));
+    lines.push(Line::default());
+}
+
+/// Body + reply-metadata rows for one IRC view, redacted and bounded with the
+/// `▏ ` quote prefix on body rows and a muted unquoted reply line. Mirrors
+/// `render_irc_transcript_entry`'s row vocabulary so a delivered card and a
+/// `hub wait`/`hub send`-with-`await` card read identically.
+fn render_irc_body_rows(
+    lines: &mut Vec<Line<'static>>,
+    view: &OrchestrationIrcView<'_>,
+    expanded: bool,
+    theme: Theme,
+    border: Color,
+    inner: usize,
+) {
+    let mut body_rows: Vec<(bool, String)> = Vec::new();
+    for logical_line in view.body.as_ref().lines() {
+        for row in wrap_display_line(&redact_secrets(logical_line), inner.saturating_sub(4).max(1)) {
+            body_rows.push((false, row));
+        }
+    }
+    if let Some(metadata) = view.reply_metadata() {
+        for row in wrap_display_line(&redact_secrets(&metadata), inner.saturating_sub(2).max(1)) {
+            body_rows.push((true, row));
+        }
+    }
+    let limit = if expanded { 40 } else { 6 };
+    let hidden = body_rows.len().saturating_sub(limit);
+    body_rows.truncate(limit);
+    for (is_reply, row) in body_rows {
+        let color = if is_reply { theme.muted } else { theme.custom_message_text };
+        let quoted = if is_reply { row } else { format!("▏ {row}") };
+        push_tool_box_row(lines, &quoted, color, border, inner);
+    }
+    if hidden > 0 {
+        let hint = if expanded {
+            format!("▏ … +{hidden} more")
+        } else {
+            format!("▏ … +{hidden} more · Ctrl+O to expand")
+        };
+        push_tool_box_row(lines, &hint, theme.dim, border, inner);
+    }
+}
+
+/// Render a `hub wait` (message wait) result as a typed incoming IRC card
+/// built from the `details.message` mailbox projection. The model still
+/// receives the body via the tool-result text; the transcript shows the typed
+/// card instead of the `[id] from: body` prose. A timeout (`message: null`)
+/// or a job-wait (`ids` set, no `message`) falls back to the plain tool card.
+fn render_hub_wait_card(lines: &mut Vec<Line<'static>>, card: &ToolCardRows, expanded: bool, theme: Theme, width: u16) {
+    let Some(view) = card
+        .details
+        .get("message")
+        .and_then(orchestration_irc_view_from_json)
+    else {
+        render_plain_tool_card(lines, card, theme, width);
+        return;
+    };
+    let title = format!("✉ IRC ⟵ {}", view.from);
+    render_irc_card_from_view(lines, &title, &view, expanded, theme, width);
+}
+
+fn render_plain_tool_card(lines: &mut Vec<Line<'static>>, card: &ToolCardRows, theme: Theme, width: u16) {
+    let inner = usize::from(width.saturating_sub(2).max(1));
+    let border = if card.is_error { theme.error } else { theme.tool_card_border };
+    let title = card.rows.iter().find(|row| row.role == ToolCardRowRole::Command).map_or(card.tool_name.as_str(), |row| row.text.as_str());
+    push_tool_card_top(lines, title, theme.tool_title, border, inner);
+    for row in &card.rows {
+        if row.role != ToolCardRowRole::Command {
+            push_tool_box_row(lines, &row.text, theme.tool_output, border, inner);
+        }
+    }
+    lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), Style::default().fg(border))));
+    lines.push(Line::default());
+}
+
 fn render_tool_card(lines: &mut Vec<Line<'static>>, tool: &ToolTranscript, expanded: bool, theme: Theme, width: u16,
 ) {
     let card = if expanded { &tool.expanded } else { &tool.compact };
+    if card.tool_name.eq_ignore_ascii_case("hub") {
+        match card.arguments.get("op").and_then(serde_json::Value::as_str) {
+            Some("send") => {
+                render_hub_send_card(lines, card, expanded, theme, width);
+                return;
+            }
+            Some("wait") => {
+                render_hub_wait_card(lines, card, expanded, theme, width);
+                return;
+            }
+            _ => {}
+        }
+    }
     let is_bash = card.tool_name.eq_ignore_ascii_case("bash");
     // Bash cards frame with the command text color (theme.bash_mode) so the
     // border and content read as one unit (OMP style); failed/cancelled cards
@@ -13557,6 +13828,286 @@ fn transcript_block_has_content(block: &ContentBlock) -> bool {
 const ACTIVE_ANIMATION_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
 const ACTIVE_JOB_PREFIXES: &[&str] = &["Task ◐ ", "Task ◓ ", "Task ◑ ", "Task ◒ "];
 
+fn render_irc_transcript_entry(
+    lines: &mut Vec<Line<'static>>,
+    entry: &TranscriptEntry,
+    expanded: bool,
+    theme: Theme,
+    width: u16,
+) {
+    let inner = usize::from(width.saturating_sub(2).max(1));
+    let title = redact_secrets(entry.tool_name.as_deref().unwrap_or("✉ IRC"));
+    push_tool_card_top(
+        lines,
+        &title,
+        theme.custom_message_label,
+        theme.tool_card_border,
+        inner,
+    );
+    let mut body_rows = Vec::new();
+    for block in &entry.content {
+        let ContentBlock::Text {
+            text,
+            text_signature,
+        } = block
+        else {
+            continue;
+        };
+        // Structured signature distinguishes reply metadata from body text.
+        // A body that literally starts with "reply to " must stay quoted body.
+        let is_reply = text_signature.as_deref() == Some("irc-reply");
+        let wrap_width = if is_reply {
+            inner.saturating_sub(2)
+        } else {
+            inner.saturating_sub(4)
+        }
+        .max(1);
+        for logical_line in text.lines() {
+            for row in wrap_display_line(&redact_secrets(logical_line), wrap_width) {
+                body_rows.push((is_reply, row));
+            }
+        }
+    }
+    let limit = if expanded { 40 } else { 6 };
+    let hidden = body_rows.len().saturating_sub(limit);
+    body_rows.truncate(limit);
+    for (is_reply, row) in body_rows {
+        let color = if is_reply {
+            theme.muted
+        } else {
+            theme.custom_message_text
+        };
+        let quoted = if is_reply {
+            row
+        } else {
+            format!("▏ {row}")
+        };
+        push_tool_box_row(lines, &quoted, color, theme.tool_card_border, inner);
+    }
+    if hidden > 0 {
+        let hint = if expanded {
+            format!("▏ … +{hidden} more")
+        } else {
+            format!("▏ … +{hidden} more · Ctrl+O to expand")
+        };
+        push_tool_box_row(lines, &hint, theme.dim, theme.tool_card_border, inner);
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner)),
+        Style::default().fg(theme.tool_card_border),
+    )));
+    lines.push(Line::default());
+}
+
+/// Bound on the auto-vision analysis description shown inside a user card.
+/// The Web renders it in a collapsed `<details>`; the TUI shows a bounded
+/// fold card — the first rows plus an ellipsis marker, the full description
+/// stays in the session record. Mirrors the tool-card output fold.
+const IMAGE_ANALYSIS_LINE_LIMIT: usize = 6;
+
+/// The exact wire marker the backend's vision-delegation path emits when an
+/// active model lacks image support and a vision model is configured: one
+/// text block `[Image analyzed by {model}: {description}]` replaces the image
+/// blocks in the MODEL context only (crates/pi-coding/src/session.rs
+/// `delegate_vision_images_with`). The durable history keeps the ORIGINAL
+/// images; when the marker does reach the client it is a legacy/old-binary or
+/// transport artifact, never the user's own text. Recognized structurally —
+/// the whole trimmed block must match — so a user who types a similar-looking
+/// line is never misclassified (their caption survives verbatim). Mirrors the
+/// Web `IMAGE_ANALYSIS_RE` (same lazy-model / greedy-description semantics).
+///
+/// Returns `(model, description)`.
+fn parse_image_analysis(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("[Image analyzed by ")?;
+    // The model is the shortest run up to the first `: ` (`.+?` in the Web
+    // regex); the description is everything up to the final `]` (`.+` with
+    // dotall, so newlines and `]` inside the description survive).
+    let colon = rest.find(": ")?;
+    let model = &rest[..colon];
+    let description = &rest[colon + 2..];
+    let close = description.rfind(']')?;
+    if close + 1 != description.len()
+        || model.is_empty()
+        || description[..close].trim().is_empty()
+    {
+        return None;
+    }
+    Some((model, &description[..close]))
+}
+
+/// A legacy attachment-transport wrapper block: a text block that is ENTIRELY
+/// a balanced `<attachment ...>...</attachment>` (or self-closing
+/// `<attachment .../>`) XML element. Old binaries wrapped image transport in
+/// this scaffolding; current code never emits it. Recognized structurally
+/// (balanced tags over the whole block, mirroring the Web
+/// `ATTACHMENT_WRAPPER_RE`/`ATTACHMENT_SELF_CLOSE_RE`) so a user who literally
+/// types `<attachment>` as their message is preserved — the strip only applies
+/// when the message also carries real image blocks, proving an attachment was
+/// actually transported.
+fn is_attachment_wrapper(text: &str) -> bool {
+    // The Web regexes tolerate trailing whitespace only (`\s*$`); leading
+    // whitespace would break the anchored `^<attachment`.
+    let text = text.trim_end();
+    let lower = text.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("<attachment") else {
+        return false;
+    };
+    // `<attachment` must be the complete tag name: what follows is `>`, `/>`,
+    // or whitespace-led attributes. `<attachments>`/`<attachment-foo>` are a
+    // different element and never transport wrappers.
+    if let Some(after_open) = rest.strip_prefix('>') {
+        return after_open.ends_with("</attachment>");
+    }
+    if let Some(after_self_close) = rest.strip_prefix("/>") {
+        return after_self_close.is_empty();
+    }
+    if rest.starts_with(char::is_whitespace) {
+        // Attribute section: everything up to the first `>` (Web `[^>]*`).
+        let Some(gt) = rest.find('>') else {
+            return false;
+        };
+        // Self-closing `<attachment …/>`: the attrs end with `/` and nothing
+        // follows the closing `>` (trailing whitespace was already trimmed).
+        // A `/` inside the attribute span (e.g. `<attachment src="a/>b">…`)
+        // is NOT a self-close — fall through to the balanced-wrapper check.
+        if rest[..gt].ends_with('/') && rest[gt + 1..].is_empty() {
+            return true;
+        }
+        return rest[gt + 1..].ends_with("</attachment>");
+    }
+    false
+}
+
+/// Typed projection of a USER message's content blocks for transcript
+/// rendering — parity with the Web's `userMessageProjection`
+/// (web/src/transcript.ts) so both surfaces show the same user-visible
+/// semantics: the user's real caption, real image previews (never reordered),
+/// and an optional auto-vision analysis. Computed once over the WHOLE message
+/// so the wrapper-strip decision sees every image block — a transport wrapper
+/// before OR after the images is dropped the same way.
+///
+/// The renderer consumes the typed groups in the Web user-bubble order:
+/// `images` (relative order preserved) first, then `caption` (text-relative
+/// order preserved), then the `analysis` card — a caption that precedes its
+/// image in the content blocks never renders above the preview.
+struct UserMessageProjection<'a> {
+    /// Real image blocks, in their original content order.
+    images: Vec<&'a ContentBlock>,
+    /// Text blocks that are genuinely the user's caption (transport
+    /// scaffolding excluded), in their original content order.
+    caption: Vec<&'a ContentBlock>,
+    /// Non-text, non-image blocks (defensive — user messages are text+image
+    /// by construction), in their original content order.
+    other: Vec<&'a ContentBlock>,
+    /// First vision-delegation marker as `(model, description)` — the backend
+    /// emits one description for all images; later markers are ignored.
+    analysis: Option<(&'a str, &'a str)>,
+}
+
+impl<'a> UserMessageProjection<'a> {
+    fn new(content: &'a [ContentBlock]) -> Self {
+        // First pass: collect the real image blocks so the wrapper-strip
+        // decision is based on whether the WHOLE message carried a real
+        // attachment transport, not on whether an image block happened to
+        // precede the wrapper text.
+        let images = content
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::Image { .. }))
+            .collect::<Vec<_>>();
+        let mut caption = Vec::new();
+        let mut other = Vec::new();
+        let mut analysis = None;
+        for block in content {
+            match block {
+                ContentBlock::Image { .. } => {}
+                ContentBlock::Text { text, .. } => {
+                    if let Some(parsed) = parse_image_analysis(text) {
+                        // The first marker becomes the typed analysis; later
+                        // markers are dropped, never kept as caption.
+                        if analysis.is_none() {
+                            analysis = Some(parsed);
+                        }
+                        continue;
+                    }
+                    if is_attachment_wrapper(text) && !images.is_empty() {
+                        // A structurally-provable <attachment> wrapper is
+                        // transport scaffolding (a reference marker / image
+                        // transport envelope), never the user's own text —
+                        // dropped entirely. The user's real caption lives in
+                        // the other (non-wrapper) text blocks.
+                        continue;
+                    }
+                    caption.push(block);
+                }
+                _ => other.push(block),
+            }
+        }
+        Self {
+            images,
+            caption,
+            other,
+            analysis,
+        }
+    }
+
+    /// Whether a text block is transport scaffolding and must never render as
+    /// the user's own caption: the backend's `[Image analyzed by …]` marker,
+    /// or — when the message carried real image blocks — a structurally
+    /// provable `<attachment>` wrapper (its inner text is transport
+    /// scaffolding, not the user's caption).
+    fn is_transport_text(&self, text: &str) -> bool {
+        parse_image_analysis(text).is_some()
+            || (!self.images.is_empty() && is_attachment_wrapper(text))
+    }
+}
+
+/// The auto-vision analysis card inside a user card, mirroring the Web's
+/// `<details class="msg--user__analysis">` (summary "Image analysis" + model,
+/// body = description). The description is a generated surface, so it obeys
+/// the TUI bounded/redaction invariant: sanitized, redacted, and folded to
+/// `IMAGE_ANALYSIS_LINE_LIMIT` rows with an ellipsis marker.
+fn render_image_analysis_card(
+    lines: &mut Vec<Line<'static>>,
+    model: &str,
+    description: &str,
+    theme: Theme,
+    width: u16,
+) {
+    let inner = usize::from(width.saturating_sub(2).max(1));
+    let border = theme.tool_card_border;
+    let title = format!(
+        "Image analysis · {}",
+        clean_terminal_text(&redact_secrets(model))
+    );
+    push_tool_card_top(lines, &title, theme.custom_message_label, border, inner);
+    let body = clean_terminal_text(&redact_secrets(description));
+    let mut rows = body
+        .lines()
+        .flat_map(|line| wrap_display_line(line, inner.saturating_sub(2).max(1)))
+        .collect::<Vec<_>>();
+    let omitted = rows.len().saturating_sub(IMAGE_ANALYSIS_LINE_LIMIT);
+    if omitted > 0 {
+        rows.truncate(IMAGE_ANALYSIS_LINE_LIMIT);
+    }
+    for row in &rows {
+        push_tool_box_row(lines, row, theme.dim, border, inner);
+    }
+    if omitted > 0 {
+        push_tool_box_row(
+            lines,
+            &format!("… {omitted} more lines"),
+            theme.dim,
+            border,
+            inner,
+        );
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner)),
+        Style::default().fg(border),
+    )));
+}
+
 fn render_transcript_entry_inner(
     lines: &mut Vec<Line<'static>>,
     entry: &TranscriptEntry,
@@ -13574,7 +14125,13 @@ fn render_transcript_entry_inner(
         return;
     }
     if entry.kind == TranscriptKind::Tool {
-        if let Some(tool) = &entry.tool_card { render_tool_card(lines, tool, expand_tools, theme, width); }
+        if let Some(tool) = &entry.tool_card {
+            render_tool_card(lines, tool, expand_tools, theme, width);
+        }
+        return;
+    }
+    if entry.kind == TranscriptKind::Irc {
+        render_irc_transcript_entry(lines, entry, expand_tools, theme, width);
         return;
     }
     if !entry.content.iter().any(|block| match block {
@@ -13591,7 +14148,8 @@ fn render_transcript_entry_inner(
                 entry
                     .tool_name
                     .as_deref()
-                    .unwrap_or(if entry.is_error { "Error" } else { "System" })),
+                    .unwrap_or(if entry.is_error { "Error" } else { "System" }),
+            ),
             if entry.is_error {
                 theme.error
             } else {
@@ -13604,8 +14162,8 @@ fn render_transcript_entry_inner(
             theme.custom_message_label,
             None,
         ),
-        TranscriptKind::Tool | TranscriptKind::Job => {
-            unreachable!("cards return before generic rendering")
+        TranscriptKind::Irc | TranscriptKind::Tool | TranscriptKind::Job => {
+            unreachable!("specialized transcript entries return before generic rendering")
         }
     };
     if let Some(label) = label {
@@ -13618,9 +14176,30 @@ fn render_transcript_entry_inner(
     if entry.kind == TranscriptKind::User {
         lines.push(user_card_vertical_padding(width));
     }
+    // Typed projection for USER entries (parity with the Web
+    // `userMessageProjection`): computed once over the WHOLE message so the
+    // wrapper-strip decision sees every image block — a transport wrapper
+    // before OR after the images is dropped the same way.
+    let user_projection = (entry.kind == TranscriptKind::User)
+        .then(|| UserMessageProjection::new(&entry.content));
+    // Web user-bubble parity: a USER bubble renders its real images first
+    // (relative order preserved), then the real caption text (text-relative
+    // order preserved), then the analysis card — a caption that precedes its
+    // image in the content blocks never renders above the preview.
+    // Non-user entries keep the authored block order.
+    let ordered_blocks: Vec<&ContentBlock> = match &user_projection {
+        Some(projection) => projection
+            .images
+            .iter()
+            .copied()
+            .chain(projection.caption.iter().copied())
+            .chain(projection.other.iter().copied())
+            .collect(),
+        None => entry.content.iter().collect(),
+    };
     let mut visible_blocks = 0_usize;
     let mut previous_was_thinking = false;
-    for block in &entry.content {
+    for block in &ordered_blocks {
         match block {
             ContentBlock::Text { text, .. } => {
                 if text.trim().is_empty() {
@@ -13629,29 +14208,21 @@ fn render_transcript_entry_inner(
                 if previous_was_thinking {
                     lines.push(Line::default());
                 }
-                let is_irc_reply_meta = entry.kind == TranscriptKind::Custom
-                    && entry
-                        .tool_name
-                        .as_deref()
-                        .is_some_and(|name| name.starts_with("IRC · "))
-                    && text.starts_with("reply to ");
-                let base = if is_irc_reply_meta {
-                    theme.muted
-                } else {
-                    match entry.kind {
-                        TranscriptKind::User => theme.user_message_text,
-                        TranscriptKind::System => {
-                            if entry.is_error {
-                                theme.error
-                            } else {
-                                theme.custom_message_text
-                            }
+                let base = match entry.kind {
+                    TranscriptKind::User => theme.user_message_text,
+                    TranscriptKind::System => {
+                        if entry.is_error {
+                            theme.error
+                        } else {
+                            theme.custom_message_text
                         }
-                        TranscriptKind::Custom => theme.custom_message_text,
-                        TranscriptKind::Assistant => theme.text,
-                        TranscriptKind::Tool | TranscriptKind::Job => {
-                            unreachable!("cards return before generic text rendering")
-                        }
+                    }
+                    TranscriptKind::Custom => theme.custom_message_text,
+                    TranscriptKind::Assistant => theme.text,
+                    TranscriptKind::Irc | TranscriptKind::Tool | TranscriptKind::Job => {
+                        unreachable!(
+                            "specialized transcript entries return before generic text rendering"
+                        )
                     }
                 };
                 let sanitized = clean_terminal_text(text);
@@ -13728,10 +14299,20 @@ fn render_transcript_entry_inner(
                         mime_type: mime_type.clone(),
                     });
                 } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("[image attachment: {}]", clean_terminal_text(mime_type)),
-                        Style::default().fg(theme.muted),
-                    )));
+                    // Bounded fallback: the MIME label is sanitized, redacted,
+                    // and wrapped so a legacy/hostile MIME string can never
+                    // overflow the width as a single row.
+                    let label = format!(
+                        "[image attachment: {}]",
+                        clean_terminal_text(&redact_secrets(mime_type))
+                    );
+                    for row in wrap_display_line(&label, usize::from(width.saturating_sub(1).max(1)))
+                    {
+                        lines.push(Line::from(Span::styled(
+                            row,
+                            Style::default().fg(theme.muted),
+                        )));
+                    }
                 }
                 visible_blocks += 1;
             }
@@ -13750,6 +14331,14 @@ fn render_transcript_entry_inner(
                 ]));
                 visible_blocks += 1;
             }
+        }
+    }
+    // The typed auto-vision analysis renders as its own clearly-marked fold
+    // card (never as the user's caption) after the user's real content.
+    if let Some(projection) = &user_projection {
+        if let Some((model, description)) = projection.analysis {
+            render_image_analysis_card(lines, model, description, theme, width);
+            visible_blocks += 1;
         }
     }
     if visible_blocks > 0 {
@@ -17205,6 +17794,433 @@ mod tests {
         let answer_row = plain.iter().position(|line| line == "answer").unwrap();
         assert_eq!(answer_row, thinking_row + 2);
         assert_eq!(plain[thinking_row + 1], "");
+    }
+
+    // ---- typed user message projection: caption / images / vision analysis ----
+    // Reported regression: the user bubble dumped the raw `<attachment>`
+    // transport wrapper and the auto-vision `[Image analyzed by …]`
+    // description as if they were the user's own text. The TUI now projects
+    // the three surfaces like the Web's `userMessageProjection`: the user's
+    // REAL caption, real image previews (in order), and a typed fold card
+    // labeled "Image analysis".
+
+    fn image_block(data: &str, mime_type: &str) -> ContentBlock {
+        ContentBlock::Image {
+            data: data.to_owned(),
+            mime_type: mime_type.to_owned(),
+        }
+    }
+
+    fn rendered_text(entry: &TranscriptEntry, width: u16) -> Vec<String> {
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, entry, true, true, crate::theme::DARK, width);
+        lines.iter().map(rendered_line_text).collect()
+    }
+
+    #[test]
+    fn user_projection_splits_caption_images_and_vision_analysis() {
+        // Contract: the user bubble shows the user's REAL caption, the image
+        // preview, and a typed `Image analysis` card — never the
+        // `<attachment>` transport wrapper, never the backend's
+        // `[Image analyzed by …]` marker as the user's own text.
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![
+                ContentBlock::text("<attachment type=\"image/png\">ref-1</attachment>"),
+                image_block(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                    "image/png",
+                ),
+                ContentBlock::text("[Image analyzed by vm: a diagram]"),
+                ContentBlock::text("这个图是什么"),
+            ],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = rendered_text(&entry, 60);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("这个图是什么"),
+            "real caption must render: {text}"
+        );
+        assert!(
+            text.contains("[image attachment: image/png]"),
+            "image preview must render: {text}"
+        );
+        assert!(
+            text.contains("Image analysis · vm"),
+            "typed analysis card must render: {text}"
+        );
+        assert!(
+            text.contains("a diagram"),
+            "analysis description must render: {text}"
+        );
+        assert!(
+            !text.contains("<attachment"),
+            "transport wrapper must be dropped: {text}"
+        );
+        assert!(
+            !text.contains("ref-1"),
+            "wrapper inner reference must be dropped: {text}"
+        );
+        assert!(
+            !text.contains("[Image analyzed by"),
+            "marker must never render as user text: {text}"
+        );
+    }
+
+    #[test]
+    fn user_projection_image_only_renders_image_without_caption_noise() {
+        // Image-only user message: the bubble renders just the image preview —
+        // no wrapper, no analysis card, no phantom caption.
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![image_block(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                "image/png",
+            )],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = rendered_text(&entry, 60);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("[image attachment: image/png]"),
+            "image must render: {text}"
+        );
+        assert!(
+            !text.contains("Image analysis"),
+            "no marker -> no analysis card: {text}"
+        );
+        assert!(
+            !text.contains("<attachment"),
+            "no wrapper text: {text}"
+        );
+    }
+
+    #[test]
+    fn user_projection_hostile_attachment_literal_without_image_survives() {
+        // A user who literally types `<attachment>…</attachment>` with NO
+        // image block: the wrapper strip is gated on a real image transport,
+        // so their text survives verbatim. An unbalanced `<attachment>` (no
+        // close) WITH an image also survives — it is not structurally a
+        // wrapper.
+        let literal = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text("<attachment>hello</attachment>")],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = rendered_text(&literal, 60);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("<attachment>hello</attachment>"),
+            "hostile literal must be kept verbatim: {text}"
+        );
+
+        let unbalanced = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![
+                ContentBlock::text("<attachment>not closed"),
+                image_block(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                    "image/png",
+                ),
+            ],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = rendered_text(&unbalanced, 60);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("<attachment>not closed"),
+            "unbalanced <attachment> must stay literal: {text}"
+        );
+        assert!(
+            text.contains("[image attachment: image/png]"),
+            "image still renders: {text}"
+        );
+    }
+
+    #[test]
+    fn user_projection_keeps_multiple_image_order() {
+        // Two real image blocks with a wrapper, an analysis marker, and a
+        // caption interleaved: images must render in their original content
+        // order, the wrapper and marker are typed away, and the caption stays.
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![
+                ContentBlock::text("<attachment>ref</attachment>"),
+                image_block("first-image-bytes", "image/png"),
+                ContentBlock::text("[Image analyzed by vm: chart]"),
+                image_block("second-image-bytes", "image/jpeg"),
+                ContentBlock::text("两张图"),
+            ],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = rendered_text(&entry, 60);
+        let text = rows.join("\n");
+        let first = rows
+            .iter()
+            .position(|row| row.contains("[image attachment: image/png]"))
+            .expect("first image preview");
+        let second = rows
+            .iter()
+            .position(|row| row.contains("[image attachment: image/jpeg]"))
+            .expect("second image preview");
+        assert!(
+            first < second,
+            "image blocks must keep their content order: {text}"
+        );
+        assert!(
+            text.contains("两张图"),
+            "caption must render: {text}"
+        );
+        assert!(
+            !text.contains("<attachment") && !text.contains("[Image analyzed by"),
+            "transport scaffolding must not leak: {text}"
+        );
+    }
+
+    #[test]
+    fn user_projection_renders_images_before_caption_even_when_caption_precedes() {
+        // Web user-bubble parity (AGENTS): the bubble is fixed at images
+        // first → caption → analysis. A caption block that precedes its
+        // image in the content array must still render BELOW the preview,
+        // and caption blocks keep their own relative order.
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![
+                ContentBlock::text("caption before the image"),
+                image_block(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                    "image/png",
+                ),
+                ContentBlock::text("[Image analyzed by vm: chart]"),
+                ContentBlock::text("caption after the image"),
+            ],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = rendered_text(&entry, 60);
+        let text = rows.join("\n");
+        let image_row = rows
+            .iter()
+            .position(|row| row.contains("[image attachment: image/png]"))
+            .expect("image preview");
+        let first_caption = rows
+            .iter()
+            .position(|row| row.contains("caption before the image"))
+            .expect("first caption");
+        let second_caption = rows
+            .iter()
+            .position(|row| row.contains("caption after the image"))
+            .expect("second caption");
+        assert!(
+            image_row < first_caption && first_caption < second_caption,
+            "image first, then captions in text order: {text}"
+        );
+        assert!(
+            !text.contains("[Image analyzed by"),
+            "marker must not leak as caption: {text}"
+        );
+    }
+
+    #[test]
+    fn user_projection_image_fallback_mime_is_clean_redacted_and_width_bounded() {
+        // The `[image attachment: …]` fallback (no renderer / disabled image
+        // display / corrupt payload) must never overflow the width from a
+        // legacy or hostile MIME string: sanitized, redacted, and wrapped.
+        let secret = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let hostile_mime = format!("image/png\u{1b}[31m/{}", secret);
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![image_block("corrupt", &hostile_mime)],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let width = 30;
+        let rows = rendered_text(&entry, width);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("[image attachment:") && text.contains("[REDACTED]"),
+            "fallback must render redacted: {text}"
+        );
+        assert!(
+            !text.contains('\u{1b}'),
+            "CSI escape must be stripped: {text}"
+        );
+        assert!(
+            !text.contains(&secret),
+            "credential must be redacted: {text}"
+        );
+        for row in &rows {
+            assert!(
+                usize::from(display_width(row)) <= usize::from(width),
+                "fallback row must stay within the width: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_projection_analysis_is_bounded_redacted_and_clean() {
+        // The auto-vision description is a generated surface: it must be
+        // bounded (fold card with an ellipsis marker), redacted (credentials
+        // never shown), and terminal-sanitized (CSI escapes stripped) — the
+        // TUI bounded/redaction invariant.
+        let secret = ["gh", "p_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let description = format!(
+            "start {secret}\u{1b}[31m\nline-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\nline-8"
+        );
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![
+                image_block(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                    "image/png",
+                ),
+                ContentBlock::text(format!("[Image analyzed by vm: {description}]")),
+            ],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let rows = rendered_text(&entry, 60);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("Image analysis · vm"),
+            "analysis card must render: {text}"
+        );
+        // Bounded: the first IMAGE_ANALYSIS_LINE_LIMIT body rows plus the
+        // fold marker; the tail stays in the session record.
+        assert!(
+            text.contains("start") && text.contains("line-5"),
+            "leading description rows must render: {text}"
+        );
+        assert!(
+            !text.contains("line-6"),
+            "folded tail must not render: {text}"
+        );
+        assert!(
+            text.contains("… 3 more lines"),
+            "fold marker must render: {text}"
+        );
+        // Redacted + sanitized.
+        assert!(
+            !text.contains(&secret),
+            "credential must be redacted: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED]"),
+            "redaction placeholder must render: {text}"
+        );
+        assert!(
+            !text.contains('\u{1b}'),
+            "CSI escape must be stripped: {text}"
+        );
+        // The marker itself is still never user text.
+        assert!(
+            !text.contains("[Image analyzed by"),
+            "marker must not leak as caption: {text}"
+        );
+    }
+
+    #[test]
+    fn user_projection_structural_classifiers_match_web_semantics() {
+        // Focused classification edges shared with the Web regexes.
+        // parse_image_analysis: whole-block match, multi-line description,
+        // trailing junk / missing close rejected, empty model rejected.
+        assert_eq!(
+            parse_image_analysis("[Image analyzed by vm: short]"),
+            Some(("vm", "short"))
+        );
+        assert_eq!(
+            parse_image_analysis("[Image analyzed by vm: line one\nline two]"),
+            Some(("vm", "line one\nline two"))
+        );
+        assert_eq!(
+            parse_image_analysis("[Image analyzed by vm: a]b]"),
+            Some(("vm", "a]b"))
+        );
+        assert_eq!(
+            parse_image_analysis("  [Image analyzed by vm: x]  "),
+            Some(("vm", "x"))
+        );
+        assert_eq!(parse_image_analysis("[Image analyzed by vm: x] suffix"), None);
+        assert_eq!(parse_image_analysis("[Image analyzed by vm: x"), None);
+        assert_eq!(parse_image_analysis("[Image analyzed by : x]"), None);
+        assert_eq!(parse_image_analysis("[Image analyzed by vm: ]"), None);
+        assert_eq!(parse_image_analysis("user text"), None);
+        // is_attachment_wrapper: balanced, self-closing (with/without attrs
+        // and space), case-insensitive, and the negative edges (unbalanced,
+        // trailing junk, lookalike tag names, embedded `/>` inside attrs).
+        assert!(is_attachment_wrapper("<attachment>ref</attachment>"));
+        assert!(is_attachment_wrapper("<attachment type=\"image/png\">ref-1</attachment>"));
+        assert!(is_attachment_wrapper("<ATTACHMENT src=\"img.png\">x</Attachment>"));
+        assert!(is_attachment_wrapper("<attachment src=\"img.png\"/>"));
+        assert!(is_attachment_wrapper("<attachment src=\"img.png\" />"));
+        assert!(is_attachment_wrapper("<attachment/>"));
+        assert!(is_attachment_wrapper("<attachment>inner</attachment> "));
+        assert!(!is_attachment_wrapper("<attachment>not closed"));
+        assert!(!is_attachment_wrapper("<attachment>a</attachment>b"));
+        assert!(!is_attachment_wrapper("<attachments>a</attachments>"));
+        assert!(!is_attachment_wrapper("<attachment-foo>a</attachment-foo>"));
+        assert!(is_attachment_wrapper("<attachment src=\"a/>b\">x</attachment>"));
+        assert!(!is_attachment_wrapper("<attachment src=\"a/\" />junk"));
+        assert!(!is_attachment_wrapper("prefix <attachment>a</attachment>"));
+        // Projection gating: the wrapper strip requires real image blocks.
+        let no_image_content = [
+            ContentBlock::text("<attachment>ref</attachment>"),
+            ContentBlock::text("[Image analyzed by vm: x]"),
+        ];
+        let projection = UserMessageProjection::new(&no_image_content);
+        assert!(projection.images.is_empty());
+        assert!(projection.is_transport_text("[Image analyzed by vm: x]"));
+        assert!(
+            !projection.is_transport_text("<attachment>ref</attachment>"),
+            "wrapper without real images is the user's literal text"
+        );
+        assert_eq!(
+            projection.caption.len(),
+            1,
+            "wrapper stays literal caption, marker is typed analysis"
+        );
+        assert_eq!(projection.analysis, Some(("vm", "x")));
+        let image_content = [
+            ContentBlock::text("<attachment>ref</attachment>"),
+            image_block("bytes", "image/png"),
+            ContentBlock::text("[Image analyzed by vm: x]"),
+        ];
+        let with_image = UserMessageProjection::new(&image_content);
+        assert_eq!(with_image.images.len(), 1);
+        assert!(with_image.is_transport_text("<attachment>ref</attachment>"));
+        assert_eq!(with_image.analysis, Some(("vm", "x")));
+        assert_eq!(with_image.caption.len(), 0, "wrapper + marker both typed away");
+        assert!(!with_image.is_transport_text("real caption"));
     }
 
     #[test]
@@ -23224,6 +24240,177 @@ mod tests {
     }
 
     #[test]
+    fn task_card_renders_long_chinese_sections_bounded_and_wrapped() {
+        // Mirrors the real long-Chinese delegation contract: three ATX
+        // sections with dense CJK prose + one DeepSeek child. Each section
+        // lands in its own labeled block (no cross-contamination), the bodies
+        // are bounded, and every rendered row stays inside the card width.
+        let goal = "验证用户给出的长中文 Task delegation（Goal/Constraints/Contract + DeepSeek child）在 Web transcript 中是否正确、可读、无溢出地结构化渲染。".repeat(6);
+        let constraints = "只用 DeepSeek。共享工作树并发修改；不得回滚、格式化、提交或运行全套测试。先读现有 Task card 实现与现有真实 E2E；不要重复实现。默认只改测试/E2E；保留 redaction/bounds/raw collapsed。".repeat(5);
+        let contract = "正确渲染：标题 Task；Goal/Constraints/Contract 独立区块；child name/agent/target/status；长中文正常 wrap；无水平 overflow；raw JSON 默认折叠；desktop 和 390px mobile 可读。".repeat(4);
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "task-zh".to_owned(),
+            tool_name: "task".to_owned(),
+            arguments: serde_json::json!({
+                "context": format!("# Goal\n{goal}\n\n# Constraints\n{constraints}\n\n# Contract\n{contract}"),
+                "tasks": [
+                    {"name": "DeepSeek", "agent": "deepseek", "task": "完成长中文 Task delegation 的 focused 验证"}
+                ]
+            }),
+        }));
+        state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::JobUpdated {
+            group_id: "group".to_owned(),
+            job: pi_coding::JobSnapshot { id: "job-zh".to_owned(), agent_id: "DeepSeek".to_owned(), agent: "deepseek".to_owned(), parent_id: "Main".to_owned(), description: Some("完成长中文验证".to_owned()), todo_task_id: None, workflow_id: None, workflow_generation: None, status: pi_coding::JobStatus::Running, created_at: 1_000, started_at: None, finished_at: None, result: None, soft_budget_exhausted: false },
+        }));
+        let entries = state.transcript.iter().filter(|entry| entry.kind == TranscriptKind::Job).collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let card = entries[0].job_card.as_ref().expect("task card");
+        let sections = task_delegation_sections(&card.context);
+        assert!(sections.goal.starts_with("验证用户给出的"), "Goal keeps its Chinese lead: {sections:?}");
+        assert!(sections.constraints.starts_with("只用 DeepSeek。"), "Constraints keeps its Chinese lead");
+        assert!(sections.contract.starts_with("正确渲染：标题 Task；"), "Contract keeps its Chinese lead");
+        assert!(!sections.goal.contains("只用 DeepSeek"), "sections must not cross-contaminate");
+        assert_eq!(sections.goal.chars().count(), TASK_SECTION_CHAR_LIMIT, "overlong Goal bounded");
+        assert!(sections.goal.ends_with('…'));
+        assert_eq!(sections.constraints.chars().count(), TASK_SECTION_CHAR_LIMIT);
+        assert_eq!(sections.contract.chars().count(), TASK_SECTION_CHAR_LIMIT);
+        for width in [32u16, 80] {
+            let mut rendered = Vec::new();
+            render_job_card(&mut rendered, card, crate::theme::DARK, 0, width);
+            assert!(
+                rendered.iter().all(|line| line.width() <= usize::from(width)),
+                "width {width}: {:?}", rendered.iter().map(|line| line.width()).collect::<Vec<_>>()
+            );
+            let text = rendered.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+            assert!(text.contains("Goal"), "section label: {text}");
+            assert!(text.contains("Constraints"), "section label: {text}");
+            assert!(text.contains("Contract"), "section label: {text}");
+            assert!(text.contains("DeepSeek (deepseek)"), "child name/persona: {text}");
+        }
+    }
+
+    #[test]
+    fn task_card_renders_all_child_state_transitions() {
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "task-states".to_owned(),
+            tool_name: "task".to_owned(),
+            arguments: serde_json::json!({
+                "context": "# Goal\nShip states",
+                "tasks": [
+                    {"name": "Q", "agent": "scout", "task": "queue"},
+                    {"name": "R", "agent": "writer", "task": "run"},
+                    {"name": "C", "agent": "task", "task": "complete"},
+                    {"name": "F", "agent": "reviewer", "task": "fail"},
+                    {"name": "X", "agent": "task", "task": "cancel"}
+                ]
+            }),
+        }));
+        for (id, agent_id, status) in [
+            ("job-q", "Q", pi_coding::JobStatus::Queued),
+            ("job-r", "R", pi_coding::JobStatus::Running),
+            ("job-c", "C", pi_coding::JobStatus::Completed),
+            ("job-f", "F", pi_coding::JobStatus::Failed),
+            ("job-x", "X", pi_coding::JobStatus::Cancelled),
+        ] {
+            state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: pi_coding::JobSnapshot { id: id.to_owned(), agent_id: agent_id.to_owned(), agent: "task".to_owned(), parent_id: "Main".to_owned(), description: Some(format!("work for {agent_id}")), todo_task_id: None, workflow_id: None, workflow_generation: None, status, created_at: 1_000, started_at: None, finished_at: None, result: None, soft_budget_exhausted: false },
+            }));
+        }
+        let entries = state.transcript.iter().filter(|entry| entry.kind == TranscriptKind::Job).collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let card = entries[0].job_card.as_ref().expect("task card");
+        let mut rendered = Vec::new();
+        render_job_card(&mut rendered, card, crate::theme::DARK, 0, 96);
+        let text = rendered.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+        for lifecycle in ["queued", "running", "completed", "failed", "cancelled"] {
+            assert!(text.contains(lifecycle), "{lifecycle} must render: {text}");
+        }
+        assert!(text.contains("Q (scout) · queued"), "queued child: {text}");
+        assert!(text.contains("R (writer) · running"), "running child: {text}");
+        assert!(text.contains("F (reviewer) · failed"), "failed child: {text}");
+        // Terminal markers: ✓ completed, ✗ failed, – cancelled.
+        assert!(text.contains('✓'));
+        assert!(text.contains('✗'));
+        assert!(text.contains('–'));
+        // Aggregate counts every state once.
+        assert!(text.contains("1 running · 1 queued · 1 completed · 1 failed · 1 cancelled"), "{text}");
+        assert!(rendered.iter().all(|line| line.width() <= 96));
+    }
+
+    #[test]
+    fn task_card_shows_child_name_persona_activity_and_hides_raw_ids() {
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let mut state = todo_test_state(Vec::new());
+        state.apply(ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "task-raw".to_owned(),
+            tool_name: "task".to_owned(),
+            arguments: serde_json::json!({
+                "context": "# Goal\nHidden raw args",
+                "tasks": [
+                    {"name": "Alpha", "agent": "reviewer", "task": format!("audit the release notes with token={secret}")}
+                ]
+            }),
+        }));
+        // Runtime reality: a named child keeps its requested id; an unnamed
+        // second child gets a generated `AgentN-<uuid-prefix>` id; a raw
+        // UUID-shaped id degrades to a `child-N` ordinal. No AgentSnapshot
+        // has arrived, so display_name falls back to the raw id.
+        for (id, agent_id, status) in [
+            ("job-0197ab01-0000-0000-0000-000000000001", "Alpha", pi_coding::JobStatus::Running),
+            ("job-0197ab01-0000-0000-0000-000000000002", "Agent2-1f3a9b2c", pi_coding::JobStatus::Queued),
+            ("job-0197ab01-0000-0000-0000-000000000003", "0197ab02-0000-0000-0000-000000000099", pi_coding::JobStatus::Queued),
+        ] {
+            state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::JobUpdated {
+                group_id: "group".to_owned(),
+                job: pi_coding::JobSnapshot { id: id.to_owned(), agent_id: agent_id.to_owned(), agent: "task".to_owned(), parent_id: "Main".to_owned(), description: Some("runtime work".to_owned()), todo_task_id: None, workflow_id: None, workflow_generation: None, status, created_at: 1_000, started_at: Some(500), finished_at: None, result: None, soft_budget_exhausted: false },
+            }));
+        }
+        // Live child → Main activity for the running child.
+        state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::MessageDelivered {
+            group_id: "group".to_owned(),
+            message: pi_coding::MailboxMessage {
+                id: "m-live".to_owned(),
+                from: "Alpha".to_owned(),
+                to: "Main".to_owned(),
+                body: "read tools.rs".to_owned(),
+                timestamp: 1_100,
+                reply_to: None,
+            },
+        }));
+        let entries = state.transcript.iter().filter(|entry| entry.kind == TranscriptKind::Job).collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            state.transcript.iter().all(|entry| entry.kind != TranscriptKind::Tool),
+            "task tool events must never produce a raw tool card"
+        );
+        let card = entries[0].job_card.as_ref().expect("task card");
+        assert_eq!(card.children.len(), 3);
+        let mut rendered = Vec::new();
+        render_job_card(&mut rendered, card, crate::theme::DARK, 0, 80);
+        let text = rendered.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+        // Child name + persona (Web parity).
+        assert!(text.contains("Alpha (reviewer)"), "{text}");
+        // Generated runtime id collapses to its ordinal.
+        assert!(text.contains("Agent 2 (task)"), "generated id must collapse: {text}");
+        // A raw UUID-shaped id degrades to a child ordinal.
+        assert!(text.contains("child-3 (task)"), "uuid id must degrade to child-N: {text}");
+        // Activity one-liner from the typed child → Main message.
+        assert!(text.contains("read tools.rs"), "child activity: {text}");
+        // Raw args and ids never reach the card.
+        assert!(!text.contains("1f3a9b2c"), "uuid fragment leaked: {text}");
+        assert!(!text.contains("0197ab01"), "job uuid leaked: {text}");
+        assert!(!text.contains("0197ab02"), "agent uuid leaked: {text}");
+        assert!(!text.contains("\"tasks\""), "raw args JSON leaked: {text}");
+        assert!(!text.contains(&secret), "raw secret leaked: {text}");
+        assert!(text.contains("[REDACTED]"), "secret-shaped summary must redact: {text}");
+        assert!(!text.contains("# Goal"), "raw heading line must not render: {text}");
+        assert!(text.contains("Hidden raw args"), "section body still surfaces: {text}");
+    }
+
+    #[test]
     fn running_job_card_renders_live_progress_one_liner() {
         let mut state = todo_test_state(Vec::new());
         state.job_cards.set_now(12_500);
@@ -24317,10 +25504,10 @@ mod tests {
 
         assert_eq!(state.transcript.len(), 2);
         let first = &state.transcript[0];
-        assert_eq!(first.kind, TranscriptKind::Custom);
+        assert_eq!(first.kind, TranscriptKind::Irc);
         assert_eq!(
             first.tool_name.as_deref(),
-            Some("IRC · Main → task: scout workspace")
+            Some("✉ IRC ➤ task: scout workspace")
         );
         assert_eq!(content_text(&first.content), "please inspect src");
         assert!(!content_text(&first.content).contains("orchestration-message"));
@@ -24328,7 +25515,7 @@ mod tests {
         let second = &state.transcript[1];
         assert_eq!(
             second.tool_name.as_deref(),
-            Some("IRC · task: scout workspace → Main")
+            Some("✉ IRC ⟵ task: scout workspace")
         );
         let second_text = content_text(&second.content);
         assert!(second_text.contains("found three crates"));
@@ -24336,32 +25523,25 @@ mod tests {
         assert!(!second_text.contains("<orchestration-message"));
         assert!(!second_text.contains("Replying to message"));
 
-        // Body on its own row beneath the label.
+        // Header and every body row stay inside one bounded frame.
         let mut lines = Vec::new();
         render_transcript_entry(&mut lines, second, true, true, crate::theme::DARK, 80);
         let texts: Vec<String> = lines
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
             .collect();
-        assert!(texts[0].starts_with("IRC · task: scout workspace → Main"));
-        assert!(texts.iter().any(|line| line.contains("found three crates")));
-        assert!(texts.iter().any(|line| line.contains("reply to m1")));
-        let body_idx = texts.iter().position(|line| line.contains("found three crates")).unwrap();
+        assert!(texts[0].contains("✉ IRC ⟵ task: scout workspace"), "{texts:?}");
+        assert!(texts.iter().any(|line| line.contains("▏ found three crates")), "{texts:?}");
+        assert!(texts.iter().any(|line| line.contains("reply to m1")), "{texts:?}");
+        assert!(texts.last().is_some_and(|line| line.is_empty()), "{texts:?}");
+        assert!(texts[texts.len() - 2].starts_with('╰') && texts[texts.len() - 2].ends_with('╯'));
+        assert!(texts[1..texts.len() - 2]
+            .iter()
+            .all(|line| line.starts_with('│') && line.ends_with('│')), "{texts:?}");
+        assert!(texts[..texts.len() - 1].iter().all(|line| display_width(line) == 80), "{texts:?}");
+
         let reply_idx = texts.iter().position(|line| line.contains("reply to m1")).unwrap();
-        assert!(body_idx > 0, "body must be beneath the IRC label");
-        assert!(reply_idx > body_idx, "reply metadata follows body");
-        assert!(
-            lines[reply_idx]
-                .spans
-                .iter()
-                .any(|span| span.style.fg == Some(crate::theme::DARK.muted)),
-            "reply metadata uses muted style"
-        );
+        assert!(lines[reply_idx].spans.iter().any(|span| span.style.fg == Some(crate::theme::DARK.muted)));
     }
 
     #[test]
@@ -24388,10 +25568,348 @@ mod tests {
         assert_eq!(state.transcript.len(), 1);
         assert_eq!(
             state.transcript[0].tool_name.as_deref(),
-            Some("IRC · Child → Main")
+            Some("✉ IRC ⟵ Child")
         );
         assert_eq!(content_text(&state.transcript[0].content), "status from child");
         assert!(!content_text(&state.transcript[0].content).contains("orchestration-message"));
+    }
+
+    #[test]
+    fn incoming_irc_redacts_secrets_and_keeps_reply_to_body_as_quoted() {
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::Irc,
+            content: vec![
+                ContentBlock::Text {
+                    text: format!("reply to nobody with token={secret}"),
+                    text_signature: Some("irc-body".to_owned()),
+                },
+                ContentBlock::Text {
+                    text: "reply to parent-1".to_owned(),
+                    text_signature: Some("irc-reply".to_owned()),
+                },
+            ],
+            tool_name: Some(format!("✉ IRC ⟵ Worker token={secret}")),
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, false, crate::theme::DARK, 80);
+        let texts: Vec<String> = lines.iter().map(rendered_line_text).collect();
+
+        assert!(
+            texts[0].contains("✉ IRC ⟵ Worker"),
+            "title should keep direction mapping: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|line| line.contains("token=[REDACTED]")),
+            "body secret must redact: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|line| !line.contains(&secret)),
+            "raw secret must never render: {texts:?}"
+        );
+        // Body literally starts with "reply to " but remains a quoted body row.
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.contains("▏ reply to nobody with token=[REDACTED]")),
+            "body starting with reply to must stay quoted body: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.contains("reply to parent-1") && !line.contains("▏ reply to parent-1")),
+            "structured reply metadata is unquoted: {texts:?}"
+        );
+        assert!(
+            texts[1..texts.len() - 2]
+                .iter()
+                .all(|line| line.starts_with('│') && line.ends_with('│')),
+            "full left/right borders required: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn incoming_irc_compact_six_rows_and_expanded_higher_limit() {
+        let body = (1..=10)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::Irc,
+            content: vec![ContentBlock::Text {
+                text: body,
+                text_signature: Some("irc-body".to_owned()),
+            }],
+            tool_name: Some("✉ IRC ⟵ Worker".to_owned()),
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+
+        let mut compact_lines = Vec::new();
+        render_transcript_entry(
+            &mut compact_lines,
+            &entry,
+            true,
+            false,
+            crate::theme::DARK,
+            80,
+        );
+        let compact = compact_lines
+            .iter()
+            .map(rendered_line_text)
+            .collect::<Vec<_>>();
+        let compact_body = compact
+            .iter()
+            .filter(|line| line.contains("▏ line-"))
+            .count();
+        assert_eq!(compact_body, 6, "compact shows 6 wrapped rows: {compact:?}");
+        assert!(
+            compact
+                .iter()
+                .any(|line| line.contains("… +4 more · Ctrl+O to expand")),
+            "compact must advertise expand: {compact:?}"
+        );
+        assert!(
+            !compact.iter().any(|line| line.contains("line-7")),
+            "compact must hide overflow body: {compact:?}"
+        );
+
+        let mut expanded_lines = Vec::new();
+        render_transcript_entry(
+            &mut expanded_lines,
+            &entry,
+            true,
+            true,
+            crate::theme::DARK,
+            80,
+        );
+        let expanded = expanded_lines
+            .iter()
+            .map(rendered_line_text)
+            .collect::<Vec<_>>();
+        let expanded_body = expanded
+            .iter()
+            .filter(|line| line.contains("▏ line-"))
+            .count();
+        assert_eq!(
+            expanded_body, 10,
+            "expanded shows the full 10-line body under the higher limit: {expanded:?}"
+        );
+        assert!(
+            !expanded.iter().any(|line| line.contains("Ctrl+O to expand")),
+            "expanded should not keep the compact expand hint: {expanded:?}"
+        );
+    }
+
+    fn hub_wait_card_rows(message: Option<serde_json::Value>) -> ToolCardRows {
+        use crate::tool_card_adapter::ToolCardRow;
+        let details = serde_json::json!({
+            "op": "wait",
+            "message": message,
+        });
+        ToolCardRows {
+            tool_call_id: "hub-wait-1".to_owned(),
+            tool_name: "hub".to_owned(),
+            ordinal: 1,
+            arguments_summary: "wait".to_owned(),
+            code_language: None,
+            status: ToolCallViewStatus::Succeeded,
+            is_partial: false,
+            is_error: false,
+            cancelled: false,
+            truncated: false,
+            omitted_content_lines: 0,
+            rows: vec![
+                ToolCardRow { tool_call_id: "hub-wait-1".to_owned(), role: ToolCardRowRole::Command, text: "Hub".to_owned() },
+                ToolCardRow { tool_call_id: "hub-wait-1".to_owned(), role: ToolCardRowRole::Content, text: "[m1] Main: hello child".to_owned() },
+            ],
+            skill_name: None,
+            bash_command: None,
+            arguments: serde_json::json!({"op":"wait"}),
+            details,
+        }
+    }
+
+    #[test]
+    fn hub_wait_renders_typed_irc_card_not_control_prose() {
+        // Regression: a parent agent message arriving during a child's
+        // `hub wait` must surface as a typed IRC card built from the typed
+        // `details.message` projection — never as the model-facing
+        // `[id] from: body` prose, and never as a control "your wait was
+        // interrupted" prose. The model still receives the body via the
+        // tool-result text (asserted at the orchestration layer); the
+        // transcript shows only the IRC card.
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let message = serde_json::json!({
+            "id": "m1",
+            "from": "Main",
+            "to": "Child",
+            "body": format!("hello child token={secret}"),
+            "replyTo": "parent-9",
+            "timestamp": 7,
+        });
+        let card = hub_wait_card_rows(Some(message));
+        let entry = tool_transcript_entry(card.clone(), card);
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+        let texts: Vec<String> = lines.iter().map(rendered_line_text).collect();
+
+        // Typed IRC card title (incoming to the waiting child).
+        assert!(texts[0].contains("✉ IRC ⟵ Main"), "typed IRC title: {texts:?}");
+        // Body is quoted and redacted.
+        assert!(
+            texts.iter().any(|line| line.contains("▏ hello child token=[REDACTED]")),
+            "body must render redacted and quoted: {texts:?}"
+        );
+        // Reply metadata is muted and unquoted.
+        assert!(
+            texts.iter().any(|line| line.contains("reply to parent-1") || line.contains("reply to parent-9")),
+            "reply metadata must render: {texts:?}"
+        );
+
+        // The model-facing prose must NOT leak into the visible transcript.
+        assert!(
+            texts.iter().all(|line| !line.contains("[m1] Main:")),
+            "model-facing prose must not render: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|line| !line.contains("interrupted") && !line.contains("interruptible")),
+            "control prose must not render: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|line| !line.contains(&secret)),
+            "raw secret must never render: {texts:?}"
+        );
+        // Bounded frame.
+        assert!(texts[texts.len() - 2].starts_with('╰') && texts[texts.len() - 2].ends_with('╯'));
+        assert!(
+            texts[1..texts.len() - 2].iter().all(|line| line.starts_with('│') && line.ends_with('│')),
+            "full left/right borders: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn hub_wait_timeout_and_job_wait_fall_back_to_plain_tool_card() {
+        // A timeout (`message: null`) renders the plain tool card with the
+        // "No message before timeout." prose — no empty IRC frame.
+        let card = hub_wait_card_rows(None);
+        let entry = tool_transcript_entry(card.clone(), card);
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+        let texts: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        assert!(
+            texts.iter().all(|line| !line.contains("✉ IRC")),
+            "timeout must not render an IRC frame: {texts:?}"
+        );
+        assert!(texts[0].contains("Hub"), "plain tool card title: {texts:?}");
+
+        // A job-wait (`ids` set) carries no `message` — it renders the jobs
+        // tool card, not an IRC card.
+        use crate::tool_card_adapter::ToolCardRow;
+        let job_card = ToolCardRows {
+            tool_call_id: "hub-job-wait".to_owned(),
+            tool_name: "hub".to_owned(),
+            ordinal: 1,
+            arguments_summary: "wait".to_owned(),
+            code_language: None,
+            status: ToolCallViewStatus::Succeeded,
+            is_partial: false,
+            is_error: false,
+            cancelled: false,
+            truncated: false,
+            omitted_content_lines: 0,
+            rows: vec![
+                ToolCardRow { tool_call_id: "hub-job-wait".to_owned(), role: ToolCardRowRole::Command, text: "Hub".to_owned() },
+                ToolCardRow { tool_call_id: "hub-job-wait".to_owned(), role: ToolCardRowRole::Content, text: "No job completed before timeout.".to_owned() },
+            ],
+            skill_name: None,
+            bash_command: None,
+            arguments: serde_json::json!({"op":"wait","ids":["job-1"]}),
+            details: serde_json::json!({"op":"wait","jobs":[]}),
+        };
+        let entry = tool_transcript_entry(job_card.clone(), job_card);
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+        let texts: Vec<String> = lines.iter().map(rendered_line_text).collect();
+        assert!(
+            texts.iter().all(|line| !line.contains("✉ IRC")),
+            "job-wait must not render an IRC frame: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn hub_send_with_await_reply_renders_reply_irc_card_not_prose() {
+        // `hub send` with `await=true`: the reply arrives as a typed
+        // `details.reply` projection and renders as its own incoming IRC card
+        // below the outgoing send frame — not as the "Reply from …" prose.
+        use crate::tool_card_adapter::ToolCardRow;
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let card = ToolCardRows {
+            tool_call_id: "hub-send-1".to_owned(),
+            tool_name: "hub".to_owned(),
+            ordinal: 1,
+            arguments_summary: "send".to_owned(),
+            code_language: None,
+            status: ToolCallViewStatus::Succeeded,
+            is_partial: false,
+            is_error: false,
+            cancelled: false,
+            truncated: false,
+            omitted_content_lines: 0,
+            rows: vec![
+                ToolCardRow { tool_call_id: "hub-send-1".to_owned(), role: ToolCardRowRole::Command, text: "Hub".to_owned() },
+            ],
+            skill_name: None,
+            bash_command: None,
+            arguments: serde_json::json!({"op":"send","to":"Child","message":"please inspect"}),
+            details: serde_json::json!({
+                "op": "send",
+                "receipts": [{"to": "Child", "outcome": "woken"}],
+                "reply": {
+                    "id": "m-reply",
+                    "from": "Child",
+                    "to": "Main",
+                    "body": format!("found three crates token={secret}"),
+                    "replyTo": "m-send",
+                    "timestamp": 9,
+                },
+            }),
+        };
+        let entry = tool_transcript_entry(card.clone(), card);
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+        let texts: Vec<String> = lines.iter().map(rendered_line_text).collect();
+
+        // Outgoing send frame.
+        assert!(texts.iter().any(|line| line.contains("✉ IRC ➤ Child")), "send frame: {texts:?}");
+        // Incoming reply IRC card built from the typed projection.
+        assert!(texts.iter().any(|line| line.contains("✉ IRC ⟵ Child")), "reply IRC card: {texts:?}");
+        assert!(
+            texts.iter().any(|line| line.contains("▏ found three crates token=[REDACTED]")),
+            "reply body redacted and quoted: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|line| line.contains("reply to m-send")),
+            "reply metadata renders: {texts:?}"
+        );
+
+        // The model-facing "Reply from …" prose must not leak into the
+        // visible transcript.
+        assert!(
+            texts.iter().all(|line| !line.contains("Reply from")),
+            "reply prose must not render: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|line| !line.contains(&secret)),
+            "raw secret must never render: {texts:?}"
+        );
     }
 
 
@@ -31484,6 +33002,8 @@ mod tests {
             ],
             skill_name: None,
             bash_command: None,
+            arguments: serde_json::Value::Null,
+            details: serde_json::Value::Null,
         }
     }
 
@@ -31613,6 +33133,166 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn hub_send_card_uses_irc_header_quote_and_full_side_borders() {
+        let mut adapter = ToolCardPresentationAdapter::new();
+        adapter.apply_application_event(&ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "hub-1".to_owned(),
+            tool_name: "hub".to_owned(),
+            arguments: serde_json::json!({
+                "op": "send",
+                "to": "DeepSeekRenderingFinal",
+                "message": "Need immediate status"
+            }),
+        }));
+        let mut result = pi_agent::AgentToolResult::text("- DeepSeekRenderingFinal: woken");
+        result.details = serde_json::json!({
+            "op": "send",
+            "receipts": [{"to":"DeepSeekRenderingFinal","outcome":"woken"}]
+        });
+        adapter.apply_application_event(&ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "hub-1".to_owned(),
+            tool_name: "hub".to_owned(),
+            result,
+            is_error: false,
+        }));
+        let compact = adapter.rows("hub-1", false).expect("compact hub");
+        let expanded = adapter.rows("hub-1", true).expect("expanded hub");
+        let entry = tool_transcript_entry(compact, expanded);
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+        let text = lines.iter().map(rendered_line_text).collect::<Vec<_>>();
+        assert!(text[0].contains("✉ IRC ➤ DeepSeekRenderingFinal injected"), "{text:?}");
+        assert!(text.iter().any(|line| line.contains("▏ Need immediate status")), "{text:?}");
+        assert!(text[1..text.len() - 2].iter().all(|line| line.starts_with('│') && line.ends_with('│')), "{text:?}");
+        assert!(text[..text.len() - 1].iter().all(|line| display_width(line) == 80), "{text:?}");
+    }
+
+    #[test]
+    fn hub_send_card_aggregates_mixed_receipts_to_partial_header() {
+        let mut adapter = ToolCardPresentationAdapter::new();
+        adapter.apply_application_event(&ApplicationEvent::Agent(AgentEvent::ToolExecutionStart {
+            tool_call_id: "hub-mixed".to_owned(),
+            tool_name: "hub".to_owned(),
+            arguments: serde_json::json!({
+                "op": "send",
+                "to": "all",
+                "message": "broadcast status"
+            }),
+        }));
+        let mut result = pi_agent::AgentToolResult::text("- A: woken\n- B: failed");
+        result.details = serde_json::json!({
+            "op": "send",
+            "receipts": [
+                {"to":"A","outcome":"woken"},
+                {"to":"B","outcome":"failed"}
+            ]
+        });
+        adapter.apply_application_event(&ApplicationEvent::Agent(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "hub-mixed".to_owned(),
+            tool_name: "hub".to_owned(),
+            result,
+            is_error: false,
+        }));
+        let compact = adapter.rows("hub-mixed", false).expect("compact hub");
+        let expanded = adapter.rows("hub-mixed", true).expect("expanded hub");
+        let entry = tool_transcript_entry(compact, expanded);
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+        let text = lines.iter().map(rendered_line_text).collect::<Vec<_>>();
+        assert!(
+            text[0].contains("✉ IRC ➤ all partial"),
+            "mixed success+failed receipts must aggregate to partial, not first receipt: {text:?}"
+        );
+        assert!(
+            !text[0].contains("injected"),
+            "must not surface first-receipt-only injected label: {text:?}"
+        );
+    }
+
+    #[test]
+    fn hub_send_card_all_failed_and_unanimous_queued_map_exactly() {
+        let cases = [
+            (
+                "all-failed",
+                serde_json::json!([
+                    {"to":"A","outcome":"failed"},
+                    {"to":"B","outcome":"failed"}
+                ]),
+                "failed",
+            ),
+            (
+                "all-queued",
+                serde_json::json!([
+                    {"to":"A","outcome":"queued"},
+                    {"to":"B","outcome":"queued"}
+                ]),
+                "queued",
+            ),
+            (
+                "all-woken",
+                serde_json::json!([
+                    {"to":"A","outcome":"woken"},
+                    {"to":"B","outcome":"woken"}
+                ]),
+                "injected",
+            ),
+            (
+                "all-revived",
+                serde_json::json!([
+                    {"to":"A","outcome":"revived"},
+                    {"to":"B","outcome":"revived"}
+                ]),
+                "revived",
+            ),
+            (
+                "unknown-fail-closed",
+                serde_json::json!([
+                    {"to":"A","outcome":"mystery"}
+                ]),
+                "delivered",
+            ),
+        ];
+        for (id, receipts, expected) in cases {
+            let mut adapter = ToolCardPresentationAdapter::new();
+            adapter.apply_application_event(&ApplicationEvent::Agent(
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id: id.to_owned(),
+                    tool_name: "hub".to_owned(),
+                    arguments: serde_json::json!({
+                        "op": "send",
+                        "to": "DeepSeekRenderingFinal",
+                        "message": "ping"
+                    }),
+                },
+            ));
+            let mut result = pi_agent::AgentToolResult::text("ok");
+            result.details = serde_json::json!({
+                "op": "send",
+                "receipts": receipts
+            });
+            adapter.apply_application_event(&ApplicationEvent::Agent(
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: id.to_owned(),
+                    tool_name: "hub".to_owned(),
+                    result,
+                    is_error: false,
+                },
+            ));
+            let compact = adapter.rows(id, false).expect("compact hub");
+            let expanded = adapter.rows(id, true).expect("expanded hub");
+            let entry = tool_transcript_entry(compact, expanded);
+            let mut lines = Vec::new();
+            render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+            let text = lines.iter().map(rendered_line_text).collect::<Vec<_>>();
+            let needle = format!("✉ IRC ➤ DeepSeekRenderingFinal {expected}");
+            assert!(
+                text[0].contains(&needle),
+                "case {id}: expected header {needle}, got {text:?}"
+            );
+        }
+    }
     #[test]
     fn read_card_code_lines_keep_exact_source_indentation() {
         use crate::tool_card_adapter::ToolCardRow;
@@ -31648,6 +33328,8 @@ mod tests {
             ],
             skill_name: None,
             bash_command: None,
+            arguments: serde_json::Value::Null,
+            details: serde_json::Value::Null,
         };
         let entry = tool_transcript_entry(card.clone(), card);
         let mut lines = Vec::new();
@@ -31757,6 +33439,8 @@ mod tests {
             ],
             skill_name: None,
             bash_command: None,
+            arguments: serde_json::Value::Null,
+            details: serde_json::Value::Null,
         };
         let entry = tool_transcript_entry(card.clone(), card);
         let mut lines = Vec::new();

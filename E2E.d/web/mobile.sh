@@ -6,15 +6,14 @@
 # in a real browser at a 375×667 phone viewport, and asserts:
 #   1. the core flow works at phone width: connect, prompt round-trip, panel
 #      open
-#   2. while the run streams: primary submit reads "Steer", #abort-btn is
-#      rendered and >= 44px, no horizontal overflow, composer on-screen
+#   2. while the run streams: the unified action switches to Stop, stays
+#      >= 44px, with no horizontal overflow and composer on-screen
 #   3. no horizontal page overflow (page itself, and with the drawer open)
 #   4. the drawer is full-screen width (== viewport)
 #   5. the composer sits above the fold (bottom <= innerHeight)
-#   6. idle composer: #abort-btn is NOT rendered (active-only), the textarea
-#      is the dominant element (usable width >= 240px, height >= 44px)
-#   7. shell touch targets are >= 44px (send/connect/panel toggle; abort is
-#      checked while streaming in #2)
+#   6. idle composer: the unified action returns to Send, the textarea is
+#      dominant (usable width >= 240px, height >= 44px)
+#   7. shell touch targets are >= 44px
 #   8. #thinking-select is hidden at phone width (CSS media query)
 #
 # Browser driver: playwright via npm (ephemeral install in the scenario work
@@ -41,7 +40,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-mobile - 375x667 viewport: core flow, streaming abort+Steer, no overflow, full-screen drawer, idle textarea dominant (active-only abort), 44px targets, thinking-select hidden (playwright, hard gate)'
+                'web-mobile - 375x667 viewport: core flow, unified Send/Stop action, no overflow, full-screen drawer, dominant idle textarea, 44px targets, thinking-select hidden (playwright, hard gate)'
             return 0
             ;;
         run|all) ;;
