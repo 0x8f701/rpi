@@ -28,13 +28,17 @@ import {
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
 } from 'react';
+import { createAutoResizeController, type AutoResizeController } from '../autoResize';
 import { safeText } from '../redact';
 import {
   FILE_DIFF_MAX_UI_LINES,
   FILE_LOAD_CHUNK_LINES,
   FILE_PAGE_REQUEST_LINES,
   FILE_RENDER_SOFT_CAP,
+  CODE_REVIEW_THREAD_WIDTH_MAX,
+  CODE_REVIEW_THREAD_WIDTH_MIN,
   type CodeReviewSnapshot,
   type DiffFile,
   type DiffHunk,
@@ -43,19 +47,25 @@ import {
   type LoadedDiff,
   type ReviewThread,
   appendFileDiffPage,
+  buildCodeReviewAbortPayload,
   buildFileTree,
   emptyCodeReviewSnapshot,
   findThreadForHunk,
+  formatActiveRepliesLabel,
   hunkIdentityFor,
   hunkKeyFor,
   initLoadedDiff,
   normalizeCodeReviewSnapshot,
   normalizeFileDiffPage,
   planDiffWindow,
+  readStoredCodeReviewThreadWidth,
+  stepCodeReviewThreadWidth,
+  threadIsStreaming,
   treeFileIndexAt,
   treeFilterRows,
   treeKeyboardAction,
   treeToggleCollapse,
+  writeStoredCodeReviewThreadWidth,
 } from '../codeReview';
 import { CodeReviewConfirmDialog } from './CodeReviewConfirmDialog';
 import { CodeReviewDiffPane } from './CodeReviewDiffPane';
@@ -122,6 +132,12 @@ export function CodeReviewPanel({
   const [diffViews, setDiffViews] = useState<Record<string, { snapshotId: string; window: number }>>({});
   /** Per-path load-more busy/error state (one in-flight load per file). */
   const [loadStates, setLoadStates] = useState<Record<string, { loading: boolean; error: string | null }>>({});
+  /** Desktop thread-column width (px); drives --code-review-thread-width. */
+  const [threadWidth, setThreadWidth] = useState(() =>
+    readStoredCodeReviewThreadWidth(
+      typeof window !== 'undefined' ? window.localStorage : null,
+    ),
+  );
   const aliveRef = useRef(true);
   // Capture the owning session at mount so unmount close still targets A even
   // if the parent re-rendered with a newer sessionIdRef before cleanup ran.
@@ -133,8 +149,16 @@ export function CodeReviewPanel({
   const snapshotRequestSeqRef = useRef(0);
   /** Request seq per path: bumping discards in-flight code_review_file_diff calls. */
   const loadSeqRef = useRef<Record<string, number>>({});
+  /** Per-path in-flight fetch promises: concurrent callers share one fetch. */
+  const fetchPromisesRef = useRef<Record<string, Promise<LoadedDiff | null>>>({});
   const loadedDiffsRef = useRef<Record<string, LoadedDiff>>({});
   const selectedPathRef = useRef('');
+  /** Drag start snapshot for the desktop thread-column resizer. */
+  const resizeDragRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  /** Live composer textarea (uncontrolled); drafts commit on blur/hunk switch. */
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  /** rAF-coalesced auto-grow/collapse controller for the composer (see ../autoResize). */
+  const composerAutoResizeRef = useRef<AutoResizeController<HTMLTextAreaElement> | null>(null);
 
   /** Stamp every code_review_* payload with the owning sessionId. */
   const reviewCommand = useCallback(
@@ -155,6 +179,7 @@ export function CodeReviewPanel({
   }, []);
 
   const openReview = useCallback(() => {
+    const requestSeq = ++snapshotRequestSeqRef.current;
     setBusy('open');
     setLocalError(null);
     const command: Record<string, unknown> = { type: 'code_review_open' };
@@ -164,17 +189,17 @@ export function CodeReviewPanel({
     }
     sendCommand(reviewCommand(command))
       .then((data) => {
-        if (!aliveRef.current) return;
+        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
         applyData(data);
       })
       .catch((err: unknown) => {
-        if (!aliveRef.current) return;
+        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
         const message = err instanceof Error ? err.message : String(err);
         setLocalError(message);
         setSnapshot(emptyCodeReviewSnapshot(message));
       })
       .finally(() => {
-        if (aliveRef.current) setBusy(null);
+        if (aliveRef.current && requestSeq === snapshotRequestSeqRef.current) setBusy(null);
       });
   }, [applyData, openArgs.from, openArgs.to, reviewCommand, sendCommand]);
 
@@ -240,15 +265,27 @@ export function CodeReviewPanel({
     [snapshot.files, selectedPath],
   );
 
+  // Per-file loaded diff + visible window for the selected file. The loaded
+  // diff persists across polls (same snapshot id); a refresh (new id) resets
+  // both, and in-flight page requests for the path are invalidated.
+  const loadedDiff: LoadedDiff | null = useMemo(
+    () => (selectedFile ? (loadedDiffs[selectedFile.path] ?? null) : null),
+    [loadedDiffs, selectedFile],
+  );
+
   // No fallback to hunks[0]: an invalid or empty selection stays empty so the
-  // user must explicitly pick the hunk they want to comment on.
+  // user must explicitly pick the hunk they want to comment on. The effective
+  // hunk source is the merged per-file hunks once loaded (they carry the
+  // exact backend identities the comment RPC resolves), the snapshot hunks
+  // before that.
   const selectedHunk: DiffHunk | null = useMemo(() => {
     if (!selectedFile || !selectedHunkKey) return null;
+    const source =
+      loadedDiff && loadedDiff.hunks.length > 0 ? loadedDiff.hunks : selectedFile.hunks;
     return (
-      selectedFile.hunks.find((hunk) => hunkKeyFor(selectedFile, hunk) === selectedHunkKey) ??
-      null
+      source.find((hunk) => hunkKeyFor(selectedFile, hunk) === selectedHunkKey) ?? null
     );
-  }, [selectedFile, selectedHunkKey]);
+  }, [loadedDiff, selectedFile, selectedHunkKey]);
 
   const selectedIdentity: HunkIdentity | null = useMemo(() => {
     if (!selectedFile || !selectedHunk) return null;
@@ -265,15 +302,12 @@ export function CodeReviewPanel({
     () => Object.values(drafts).filter((text) => text.trim().length > 0).length,
     [drafts],
   );
-  const hasActiveStream = snapshot.isStreaming;
+  // Aggregate activity (close/refresh confirm + header badge). Composer/abort
+  // gate only on the selected thread so other hunks can stream concurrently.
+  const hasActiveStream = snapshot.isStreaming || snapshot.activeCount > 0;
+  const selectedIsStreaming = threadIsStreaming(selectedThread);
+  const activeRepliesLabel = formatActiveRepliesLabel(snapshot.activeCount);
 
-  // Per-file loaded diff + visible window for the selected file. The loaded
-  // diff persists across polls (same snapshot id); a refresh (new id) resets
-  // both, and in-flight page requests for the path are invalidated.
-  const loadedDiff: LoadedDiff | null = useMemo(
-    () => (selectedFile ? (loadedDiffs[selectedFile.path] ?? null) : null),
-    [loadedDiffs, selectedFile],
-  );
   const selectedView = selectedPath ? diffViews[selectedPath] : undefined;
   const windowLimit =
     selectedView && selectedView.snapshotId === snapshot.snapshotId
@@ -398,54 +432,108 @@ export function CodeReviewPanel({
   }, [confirmAction]);
 
   const refresh = useCallback(() => {
-    snapshotRequestSeqRef.current += 1;
+    const requestSeq = ++snapshotRequestSeqRef.current;
     setBusy('refresh');
     setLocalError(null);
     sendCommand(reviewCommand({ type: 'code_review_refresh' }))
       .then((data) => {
-        if (!aliveRef.current) return;
+        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
         applyData(data);
       })
       .catch((err: unknown) => {
-        if (!aliveRef.current) return;
+        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
         setLocalError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
-        if (aliveRef.current) setBusy(null);
+        if (aliveRef.current && requestSeq === snapshotRequestSeqRef.current) setBusy(null);
       });
   }, [applyData, reviewCommand, sendCommand]);
 
   const abort = useCallback(() => {
-    snapshotRequestSeqRef.current += 1;
+    if (!selectedIdentity) return;
+    // Capture identity at click time so a later selection change cannot
+    // apply a stale abort response against a different hunk.
+    const identity = selectedIdentity;
+    const requestSeq = ++snapshotRequestSeqRef.current;
     setBusy('abort');
-    sendCommand(reviewCommand({ type: 'code_review_abort' }))
+    setLocalError(null);
+    sendCommand(reviewCommand(buildCodeReviewAbortPayload(identity)))
       .then((data) => {
-        if (!aliveRef.current) return;
+        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
         applyData(data);
       })
       .catch((err: unknown) => {
-        if (!aliveRef.current) return;
+        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
         setLocalError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
-        if (aliveRef.current) setBusy(null);
+        if (aliveRef.current && requestSeq === snapshotRequestSeqRef.current) setBusy(null);
       });
-  }, [applyData, reviewCommand, sendCommand]);
+  }, [applyData, reviewCommand, selectedIdentity, sendCommand]);
 
   const retry = useCallback(() => {
     if (snapshot.snapshotId) refresh();
     else openReview();
   }, [openReview, refresh, snapshot.snapshotId]);
 
+  // The composer is uncontrolled; typing never touches panel state. Auto-grow
+  // mirrors the main composer fix: per-keystroke onInput only SCHEDULES the
+  // resize, and the controller coalesces every frame's work into one layout
+  // pass with static metrics measured once (see ./autoResize). flush() makes
+  // a cleared composer collapse immediately after submit.
+  const onComposerInput = useCallback((input: HTMLTextAreaElement) => {
+    composerAutoResizeRef.current ??= createAutoResizeController<HTMLTextAreaElement>({
+      maxLines: 6,
+      measure: (el) => {
+        const style = window.getComputedStyle(el);
+        return {
+          lineHeight: parseFloat(style.lineHeight) || 20,
+          paddingVertical:
+            (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0),
+        };
+      },
+    });
+    composerAutoResizeRef.current.resize(input);
+  }, []);
+  const flushComposerResize = useCallback((input: HTMLTextAreaElement) => {
+    composerAutoResizeRef.current?.flush(input);
+  }, []);
+
+  /** Wire the uncontrolled composer textarea into the panel ref + autosize. */
+  const setComposerRef = useCallback(
+    (el: HTMLTextAreaElement | null) => {
+      composerRef.current = el;
+      if (el) onComposerInput(el);
+    },
+    [onComposerInput],
+  );
+
+  /** Commit the live (uncontrolled) composer text into the per-hunk draft map. */
+  const commitSelectedDraft = useCallback(() => {
+    const key = selectedHunkKey;
+    const el = composerRef.current;
+    if (!key || !el) return;
+    const text = el.value;
+    setDrafts((prev) => {
+      if ((prev[key] ?? '') === text) return prev;
+      const next = { ...prev };
+      if (text) next[key] = text;
+      else delete next[key];
+      return next;
+    });
+  }, [selectedHunkKey]);
+
   const selectFile = useCallback(
     (path: string, visibleIndex: number) => {
+      // Commit the outgoing hunk's live text before the composer remounts.
+      commitSelectedDraft();
       setSelectedPath(path);
       setSelectedHunkKey(null);
       setHasUserSelectedFile(true);
       setFileFocusIndex(visibleIndex);
       if (isNarrow) setMobileTab('diff');
     },
-    [isNarrow],
+    [commitSelectedDraft, isNarrow],
   );
 
   const toggleTreeDir = useCallback((nodeIndex: number, visibleIndex: number) => {
@@ -455,6 +543,8 @@ export function CodeReviewPanel({
 
   const selectHunk = useCallback(
     (key: string) => {
+      // Commit the outgoing hunk's live text before the composer remounts.
+      commitSelectedDraft();
       setSelectedHunkKey(key);
       // Selecting a collapsed hunk reveals it so the user sees what they
       // picked.
@@ -466,7 +556,7 @@ export function CodeReviewPanel({
       });
       if (isNarrow) setMobileTab('thread');
     },
-    [isNarrow],
+    [commitSelectedDraft, isNarrow],
   );
 
   const toggleHunkCollapsed = useCallback((key: string) => {
@@ -478,72 +568,92 @@ export function CodeReviewPanel({
     });
   }, []);
 
-  const updateSelectedDraft = useCallback(
-    (text: string) => {
-      if (!selectedHunkKey) return;
-      setDrafts((prev) => ({ ...prev, [selectedHunkKey]: text }));
-    },
-    [selectedHunkKey],
-  );
-
   const submitComment = useCallback(() => {
     const key = selectedHunkKey;
-    if (!key || !selectedIdentity || !snapshot.snapshotId) return;
-    const text = (drafts[key] ?? '').trim();
+    const input = composerRef.current;
+    if (!key || !selectedIdentity || !snapshot.snapshotId || !input) return;
+    // The composer is uncontrolled; read the live text at submit time. A
+    // streaming reply no longer blocks submit — the backend queues (bounded)
+    // on the same hunk, so consecutive comments are allowed.
+    const text = input.value.trim();
     if (!text) return;
-    snapshotRequestSeqRef.current += 1;
+    // Capture identity + element + raw text at submit time so a later hunk
+    // switch cannot clear the wrong draft or apply a stale response.
+    const identity = selectedIdentity;
+    const submittedEl = input;
+    const submittedText = input.value;
+    const requestSeq = ++snapshotRequestSeqRef.current;
     setBusy('comment');
     setLocalError(null);
     sendCommand(
       reviewCommand({
         type: 'code_review_comment',
-        snapshotId: snapshot.snapshotId,
-        path: selectedIdentity.path,
-        oldStart: selectedIdentity.oldStart,
-        oldCount: selectedIdentity.oldCount,
-        newStart: selectedIdentity.newStart,
-        newCount: selectedIdentity.newCount,
-        contentHash: selectedIdentity.contentHash,
+        snapshotId: identity.snapshotId || snapshot.snapshotId,
+        path: identity.path,
+        oldStart: identity.oldStart,
+        oldCount: identity.oldCount,
+        newStart: identity.newStart,
+        newCount: identity.newCount,
+        contentHash: identity.contentHash,
         comment: text,
       }),
     )
       .then((data) => {
-        if (!aliveRef.current) return;
+        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
         applyData(data);
-        // Clear only the submitted hunk's draft; other drafts survive.
-        setDrafts((prev) => {
-          if (!(key in prev)) return prev;
-          const next = { ...prev };
-          delete next[key];
-          return next;
-        });
+        // Clear only when the composer still holds exactly the submitted
+        // text on the same hunk element; anything typed after submit must
+        // survive (no stale-draft loss under async responses).
+        const live = composerRef.current;
+        if (live === submittedEl && live.value === submittedText) {
+          live.value = '';
+          flushComposerResize(live);
+          setDrafts((prev) => {
+            if (!(key in prev)) return prev;
+            const next = { ...prev };
+            delete next[key];
+            return next;
+          });
+        }
       })
       .catch((err: unknown) => {
-        if (!aliveRef.current) return;
+        if (!aliveRef.current || requestSeq !== snapshotRequestSeqRef.current) return;
         setLocalError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
-        if (aliveRef.current) setBusy(null);
+        if (aliveRef.current && requestSeq === snapshotRequestSeqRef.current) setBusy(null);
       });
-  }, [applyData, drafts, reviewCommand, selectedHunkKey, selectedIdentity, sendCommand, snapshot.snapshotId]);
+  }, [
+    applyData,
+    flushComposerResize,
+    reviewCommand,
+    selectedHunkKey,
+    selectedIdentity,
+    sendCommand,
+    snapshot.snapshotId,
+  ]);
 
   // Close/refresh are guarded: with a streaming reply or unsent drafts they
   // surface an inline confirmation instead of acting (or window.confirm).
+  // The live (uncommitted) composer text is committed first so the guard and
+  // the confirm message count every unsent draft, typed or not.
   const requestRefresh = useCallback(() => {
+    commitSelectedDraft();
     if (draftCount > 0 || hasActiveStream) {
       setConfirmAction({ kind: 'refresh' });
       return;
     }
     refresh();
-  }, [draftCount, hasActiveStream, refresh]);
+  }, [commitSelectedDraft, draftCount, hasActiveStream, refresh]);
 
   const requestClose = useCallback(() => {
+    commitSelectedDraft();
     if (draftCount > 0 || hasActiveStream) {
       setConfirmAction({ kind: 'close' });
       return;
     }
     onClose();
-  }, [draftCount, hasActiveStream, onClose]);
+  }, [commitSelectedDraft, draftCount, hasActiveStream, onClose]);
 
   const confirmPrimary = useCallback(() => {
     const action = confirmAction;
@@ -554,110 +664,196 @@ export function CodeReviewPanel({
   }, [confirmAction, onClose, refresh]);
 
   const handleComposerKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-      e.preventDefault();
-      submitComment();
-    }
-  };
-
-  const handleFileListKeyDown = (e: ReactKeyboardEvent<HTMLUListElement>) => {
-    if (rows.length === 0) return;
-    const activeIndex = rowButtonRefs.current.findIndex((el) => el === document.activeElement);
-    const base = activeIndex >= 0 ? activeIndex : Math.max(0, fileFocusIndex);
-    const action = treeKeyboardAction(rows, fileTree, base, e.key);
-    if (action.kind === 'none') return;
+    // Enter submits; Shift+Enter inserts a newline; the Enter that confirms
+    // an IME composition (nativeEvent.isComposing) must never submit.
+    // Modifiers other than Shift do not prevent submit.
+    if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return;
     e.preventDefault();
-    setFileFocusIndex(action.nextIndex);
-    if (action.kind === 'move') {
-      rowButtonRefs.current[action.nextIndex]?.focus();
-      return;
-    }
-    if (action.kind === 'toggle') {
-      setFileTree((prev) => treeToggleCollapse(prev, action.nodeIndex));
-      rowButtonRefs.current[action.nextIndex]?.focus();
-      return;
-    }
-    // select: open the focused file row.
-    const fileIndex = treeFileIndexAt(rows, fileTree, action.nextIndex);
-    const file = fileIndex >= 0 ? snapshot.files[fileIndex] : undefined;
-    if (file) selectFile(file.path, action.nextIndex);
-    rowButtonRefs.current[action.nextIndex]?.focus();
+    submitComment();
   };
 
-  // Fetch backend pages until the loaded diff reaches `target` lines. Stale
-  // guards: the owning session is stamped by reviewCommand (session), the
-  // request carries the loaded diff's snapshot id (snapshot), responses must
-  // match path + cursor (per-file, via appendFileDiffPage), and a per-path
-  // request seq + selected-path check discard responses that raced a refresh
-  // or a file switch (request).
+  const handleFileListKeyDown = useCallback(
+    (e: ReactKeyboardEvent<HTMLUListElement>) => {
+      if (rows.length === 0) return;
+      const activeIndex = rowButtonRefs.current.findIndex((el) => el === document.activeElement);
+      const base = activeIndex >= 0 ? activeIndex : Math.max(0, fileFocusIndex);
+      const action = treeKeyboardAction(rows, fileTree, base, e.key);
+      if (action.kind === 'none') return;
+      e.preventDefault();
+      setFileFocusIndex(action.nextIndex);
+      if (action.kind === 'move') {
+        rowButtonRefs.current[action.nextIndex]?.focus();
+        return;
+      }
+      if (action.kind === 'toggle') {
+        setFileTree((prev) => treeToggleCollapse(prev, action.nodeIndex));
+        rowButtonRefs.current[action.nextIndex]?.focus();
+        return;
+      }
+      // select: open the focused file row.
+      const fileIndex = treeFileIndexAt(rows, fileTree, action.nextIndex);
+      const file = fileIndex >= 0 ? snapshot.files[fileIndex] : undefined;
+      if (file) selectFile(file.path, action.nextIndex);
+      rowButtonRefs.current[action.nextIndex]?.focus();
+    },
+    [fileFocusIndex, fileTree, rows, selectFile, snapshot.files],
+  );
+
+  // Desktop-only thread-column resizer: pointer drag + arrow keys. Mobile
+  // never mounts handlers (resizer is not rendered when narrow).
+  const applyThreadWidth = useCallback((next: number) => {
+    const stored = writeStoredCodeReviewThreadWidth(
+      typeof window !== 'undefined' ? window.localStorage : null,
+      next,
+    );
+    setThreadWidth(stored);
+  }, []);
+
+  const onThreadResizePointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (isNarrow) return;
+      e.preventDefault();
+      const target = e.currentTarget;
+      target.setPointerCapture(e.pointerId);
+      resizeDragRef.current = { startX: e.clientX, startWidth: threadWidth };
+    },
+    [isNarrow, threadWidth],
+  );
+
+  const onThreadResizePointerMove = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      const drag = resizeDragRef.current;
+      if (!drag) return;
+      // Dragging left grows the thread column (resizer sits left of comments).
+      applyThreadWidth(drag.startWidth + (drag.startX - e.clientX));
+    },
+    [applyThreadWidth],
+  );
+
+  const onThreadResizePointerUp = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!resizeDragRef.current) return;
+    resizeDragRef.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* already released */
+    }
+  }, []);
+
+  const onThreadResizeKeyDown = useCallback(
+    (e: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (isNarrow) return;
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        applyThreadWidth(stepCodeReviewThreadWidth(threadWidth, 1));
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        applyThreadWidth(stepCodeReviewThreadWidth(threadWidth, -1));
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        applyThreadWidth(CODE_REVIEW_THREAD_WIDTH_MAX);
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        applyThreadWidth(CODE_REVIEW_THREAD_WIDTH_MIN);
+      }
+    },
+    [applyThreadWidth, isNarrow, threadWidth],
+  );
+
+  // Fetch backend pages until the loaded diff's backend line stream is fully
+  // consumed (a terminal page with hasMore=false, or the 8 MiB per-file byte
+  // cap). This makes the merged hunks complete — every hunk's descriptors and
+  // line subsets arrive, so the file becomes comment-ready without any Load
+  // more click. Per-path single-flight: concurrent callers (the eager effect
+  // and a Load more retry) share one in-flight fetch. Stale guards: the
+  // owning session is stamped by reviewCommand (session), the request carries
+  // the loaded diff's snapshot id (snapshot), responses must match path +
+  // cursor (per-file, via appendFileDiffPage), and a per-path request seq +
+  // selected-path check discard responses that raced a refresh or a file
+  // switch (request). The seq is bumped only by the init/refresh effect, so
+  // an in-flight loop is never invalidated by a second fetch call.
   const fetchPagesUntil = useCallback(
-    async (path: string, target: number): Promise<LoadedDiff | null> => {
+    async (path: string): Promise<LoadedDiff | null> => {
       const start = loadedDiffsRef.current[path];
       if (!start) return null;
-      const seq = (loadSeqRef.current[path] = (loadSeqRef.current[path] ?? 0) + 1);
-      let next = start;
-      try {
-        while (next.lines.length < target && next.hasMoreBackend) {
-          if (!aliveRef.current || seq !== loadSeqRef.current[path]) return null;
-          if (selectedPathRef.current !== path) return null;
-          const data = await sendCommand(
-            reviewCommand({
-              type: 'code_review_file_diff',
-              snapshotId: next.snapshotId,
-              path: next.path,
-              cursor: next.nextCursor,
-              maxLines: FILE_PAGE_REQUEST_LINES,
-            }),
-          );
-          if (!aliveRef.current || seq !== loadSeqRef.current[path]) return null;
-          if (selectedPathRef.current !== path) return null;
-          const page = normalizeFileDiffPage(data);
-          if (!page) throw new Error('Invalid code_review_file_diff response');
-          const merged = appendFileDiffPage(next, page);
-          if (merged === next) {
-            // Stale/duplicate page (snapshot, path, or cursor mismatch) —
-            // stop; the window advances only as far as what is verified.
-            break;
+      const seq = loadSeqRef.current[path];
+      const existing = fetchPromisesRef.current[path];
+      if (existing) return existing;
+      const promise = (async () => {
+        let next = start;
+        try {
+          let fetchedOnce = false;
+          while (!next.hunksComplete && (next.hasMoreBackend || !fetchedOnce)) {
+            if (!aliveRef.current || seq !== loadSeqRef.current[path]) return null;
+            if (selectedPathRef.current !== path) return null;
+            const data = await sendCommand(
+              reviewCommand({
+                type: 'code_review_file_diff',
+                snapshotId: next.snapshotId,
+                path: next.path,
+                cursor: next.nextCursor,
+                maxLines: FILE_PAGE_REQUEST_LINES,
+              }),
+            );
+            if (!aliveRef.current || seq !== loadSeqRef.current[path]) return null;
+            if (selectedPathRef.current !== path) return null;
+            const page = normalizeFileDiffPage(data);
+            if (!page) throw new Error('Invalid code_review_file_diff response');
+            const merged = appendFileDiffPage(next, page);
+            if (merged === next) {
+              // Stale/duplicate page (snapshot, path, or cursor mismatch) —
+              // stop; the stream advances only as far as what is verified.
+              break;
+            }
+            fetchedOnce = true;
+            next = merged;
+            loadedDiffsRef.current = { ...loadedDiffsRef.current, [path]: next };
+            setLoadedDiffs(loadedDiffsRef.current);
           }
-          next = merged;
+          if (!aliveRef.current || seq !== loadSeqRef.current[path]) return null;
+          return next;
+        } catch (err) {
+          if (!aliveRef.current || seq !== loadSeqRef.current[path]) return null;
+          const message = err instanceof Error ? err.message : String(err);
+          setLoadStates((prev) => ({ ...prev, [path]: { loading: false, error: message } }));
+          return null;
+        } finally {
+          delete fetchPromisesRef.current[path];
         }
-        if (!aliveRef.current || seq !== loadSeqRef.current[path]) return null;
-        loadedDiffsRef.current = { ...loadedDiffsRef.current, [path]: next };
-        setLoadedDiffs(loadedDiffsRef.current);
-        return next;
-      } catch (err) {
-        if (!aliveRef.current || seq !== loadSeqRef.current[path]) return null;
-        const message = err instanceof Error ? err.message : String(err);
-        setLoadStates((prev) => ({ ...prev, [path]: { loading: false, error: message } }));
-        return null;
+      })();
+      fetchPromisesRef.current[path] = promise;
+      setLoadStates((prev) => ({ ...prev, [path]: { loading: true, error: null } }));
+      const result = await promise;
+      if (aliveRef.current && seq === loadSeqRef.current[path]) {
+        setLoadStates((prev) => ({ ...prev, [path]: { loading: false, error: null } }));
       }
+      return result;
     },
     [reviewCommand, sendCommand],
   );
 
-  /** Advance the selected file's visible window by one chunk (or to the end). */
+  /** Advance the selected file's visible window by one chunk (or to the end).
+   *  Data is already eagerly fetched; this only widens the DOM window (an
+   *  in-flight eager fetch is awaited via the single-flight promise). When
+   *  an earlier fetch errored, Retry re-runs the fetch first. */
   const growDiffWindow = useCallback(
     async (path: string, toEnd: boolean) => {
       const loaded = loadedDiffsRef.current[path];
-      if (!loaded || loadStates[path]?.loading) return;
-      const plan = planDiffWindow(
-        loaded,
-        diffViews[path]?.window ?? 0,
-        FILE_LOAD_CHUNK_LINES,
-        toEnd,
-      );
-      if (!plan.canLoadMore) return;
-      setLoadStates((prev) => ({ ...prev, [path]: { loading: true, error: null } }));
-      const fetched = await fetchPagesUntil(path, plan.target);
+      if (!loaded) return;
+      const currentWindow = diffViews[path]?.window ?? 0;
+      const plan = planDiffWindow(loaded, currentWindow, FILE_LOAD_CHUNK_LINES, toEnd);
+      const hasError = loadStates[path]?.error != null;
+      if (!plan.canLoadMore && !hasError) return;
+      const fetched = await fetchPagesUntil(path);
       if (!fetched) return; // stale (dropped silently) or error already surfaced
+      const target = toEnd ? plan.target : Math.max(currentWindow, plan.target);
       setDiffViews((prev) => ({
         ...prev,
         [path]: {
           snapshotId: fetched.snapshotId,
-          window: Math.min(plan.target, fetched.lines.length, FILE_DIFF_MAX_UI_LINES),
+          window: Math.min(target, fetched.lines.length, FILE_DIFF_MAX_UI_LINES),
         },
       }));
-      setLoadStates((prev) => ({ ...prev, [path]: { loading: false, error: null } }));
     },
     [diffViews, fetchPagesUntil, loadStates],
   );
@@ -672,35 +868,48 @@ export function CodeReviewPanel({
     void growDiffWindow(selectedPath, true);
   }, [growDiffWindow, selectedPath]);
 
-  // A globally-truncated placeholder (file body absent from the combined
-  // patch, zero snapshot lines) auto-fetches its first bounded pages as soon
-  // as its loaded diff exists with an empty window — no Refresh/Load click
-  // needed. Guards mirror the manual load flow: the owning session is stamped
-  // by reviewCommand, the request carries the loaded diff's snapshot id,
-  // responses are per-path cursor-checked, and the per-path request seq +
-  // selected-path ref discard races. Fires only from the initial empty
-  // window; a loaded or errored placeholder never retries on its own.
+  // Eager per-file fetch on selection: every non-binary selected file pulls
+  // its backend pages until the line stream is fully consumed, so all hunk
+  // descriptors are known and every complete hunk becomes selectable without
+  // any Load more click. The window stays at the soft cap (see the init
+  // effect + the zero-window bump below); loading is lazy, metadata is not.
+  // Fires once per file (hunksComplete flips after the fetch) and never
+  // retries on its own after an error — Retry re-runs through Load more.
   useEffect(() => {
     if (busy !== null) return;
     if (!selectedPath || !loadedDiff) return;
     if (loadedDiff.snapshotId !== snapshot.snapshotId) return;
-    if (loadedDiff.snapshotLineCount !== 0 || !loadedDiff.hasMoreBackend) return;
-    const view = diffViews[selectedPath];
-    if (!view || view.window !== 0) return;
+    if (loadedDiff.hunksComplete) return;
+    if (selectedFile?.binary) return;
     if (loadState.loading || loadState.error) return;
-    if (!diffPlan || !diffPlan.needsFetch) return;
-    void growDiffWindow(selectedPath, false);
+    void fetchPagesUntil(selectedPath);
   }, [
     busy,
-    diffPlan,
-    diffViews,
-    growDiffWindow,
+    fetchPagesUntil,
     loadState.error,
     loadState.loading,
     loadedDiff,
+    selectedFile?.binary,
     selectedPath,
     snapshot.snapshotId,
   ]);
+
+  // A file whose initial window was zero (a placeholder with no snapshot
+  // lines) gets its first soft-cap window as soon as lines arrive.
+  useEffect(() => {
+    if (!selectedPath || !loadedDiff) return;
+    if (loadedDiff.snapshotId !== snapshot.snapshotId) return;
+    if (loadedDiff.lines.length === 0) return;
+    const view = diffViews[selectedPath];
+    if (view && view.snapshotId === snapshot.snapshotId && view.window > 0) return;
+    setDiffViews((prev) => ({
+      ...prev,
+      [selectedPath]: {
+        snapshotId: snapshot.snapshotId,
+        window: Math.min(FILE_RENDER_SOFT_CAP, loadedDiff.lines.length),
+      },
+    }));
+  }, [diffViews, loadedDiff, selectedPath, snapshot.snapshotId]);
 
   // Escape + focus trap on the modal shell. Escape in the composer blurs it
   // (never closes); elsewhere it dismisses a pending confirm or requests close
@@ -764,12 +973,22 @@ export function CodeReviewPanel({
 
   const displayError = localError || snapshot.error;
   const totals = `+${snapshot.totalInsertions} / -${snapshot.totalDeletions}`;
+  // open/refresh remain global busy (snapshot mutation); comment/abort are
+  // scoped to the selected thread and do not freeze Refresh/file navigation.
+  const globalBusy = busy === 'open' || busy === 'refresh';
+  const threadBusy = busy === 'comment' || busy === 'abort' ? busy : null;
 
   let confirmMessage = '';
   let confirmPrimaryLabel = '';
   if (confirmAction?.kind === 'close') {
     const reasons: string[] = [];
-    if (hasActiveStream) reasons.push('a review reply is streaming');
+    if (hasActiveStream) {
+      reasons.push(
+        snapshot.activeCount > 1
+          ? `${snapshot.activeCount} review replies are streaming`
+          : 'a review reply is streaming',
+      );
+    }
     if (draftCount > 0) reasons.push(`${draftCount} unsent draft${draftCount === 1 ? '' : 's'}`);
     confirmMessage = `Close anyway? ${reasons.join(' and ')} will be discarded.`;
     confirmPrimaryLabel = 'Close panel';
@@ -777,7 +996,9 @@ export function CodeReviewPanel({
     confirmMessage =
       draftCount > 0
         ? `Refresh anyway? Your ${draftCount} draft${draftCount === 1 ? '' : 's'} will be kept, but threads may go stale.`
-        : 'Refresh anyway? A review reply is streaming.';
+        : snapshot.activeCount > 1
+          ? `Refresh anyway? ${snapshot.activeCount} review replies are streaming.`
+          : 'Refresh anyway? A review reply is streaming.';
     confirmPrimaryLabel = 'Refresh now';
   }
 
@@ -789,10 +1010,13 @@ export function CodeReviewPanel({
       role="dialog"
       aria-modal="true"
       aria-label="Code review"
-      aria-busy={busy !== null}
+      aria-busy={globalBusy}
       onKeyDown={handlePanelKeyDown}
     >
-      <div className="code-review">
+      <div
+        className="code-review"
+        style={{ ['--code-review-thread-width' as string]: `${threadWidth}px` }}
+      >
         <div className="code-review__head">
           <span className="code-review__title">Code review</span>
           <span className="code-review__label" title={safeText(snapshot.comparisonLabel)}>
@@ -802,33 +1026,22 @@ export function CodeReviewPanel({
             {totals}
             {snapshot.truncated ? ' · truncated' : ''}
           </span>
-          {snapshot.isStreaming && (
+          {activeRepliesLabel && (
             <span className="code-review__streaming" role="status">
               <span className="code-review__streaming-dot" aria-hidden="true" />
-              streaming reply…
+              {activeRepliesLabel}
             </span>
           )}
           <div className="code-review__actions">
             <button
               type="button"
               className="code-review__action"
-              disabled={busy !== null}
+              disabled={globalBusy}
               onClick={requestRefresh}
               title="Reload the diff snapshot"
             >
               Refresh
             </button>
-            {snapshot.isStreaming && (
-              <button
-                type="button"
-                className="code-review__action code-review__action--warn"
-                disabled={busy !== null}
-                onClick={abort}
-                title="Abort the in-flight review reply"
-              >
-                Abort
-              </button>
-            )}
             <button
               type="button"
               className="code-review__close panel-close"
@@ -836,24 +1049,14 @@ export function CodeReviewPanel({
               title="Close code review"
               aria-label="Close code review panel"
             >
-              Close <span aria-hidden="true">×</span>
+              ×
             </button>
           </div>
         </div>
 
-        {busy && busy !== 'open' && (
+        {busy === 'refresh' && (
           <div className="code-review__busy" role="status">
-            {busy === 'refresh'
-              ? 'Refreshing…'
-              : busy === 'comment'
-                ? 'Sending comment…'
-                : 'Aborting…'}
-          </div>
-        )}
-        {snapshot.truncated && (
-          <div className="code-review__banner code-review__banner--truncated" role="status">
-            Large diff — all changed files are listed; file bodies load in bounded pages on
-            demand.
+            Refreshing…
           </div>
         )}
         {displayError && (
@@ -866,7 +1069,7 @@ export function CodeReviewPanel({
             </span>
           </div>
         )}
-        {pollFailed && !busy && !displayError && (
+        {pollFailed && !globalBusy && !displayError && (
           <div className="code-review__banner code-review__banner--stale" role="status">
             Snapshot update failed — showing the last good data.{' '}
             <button type="button" className="code-review__link" onClick={refresh}>
@@ -927,7 +1130,7 @@ export function CodeReviewPanel({
             threads={snapshot.threads}
             selectedPath={selectedPath}
             fileQuery={fileQuery}
-            busy={busy}
+            busy={globalBusy ? busy : null}
             isHidden={isNarrow && mobileTab !== 'files'}
             rowButtonRefs={rowButtonRefs}
             onFileQueryChange={setFileQuery}
@@ -943,7 +1146,6 @@ export function CodeReviewPanel({
             filesCount={snapshot.files.length}
             snapshotId={snapshot.snapshotId}
             threads={snapshot.threads}
-            activeHunk={snapshot.activeHunk}
             selectedHunkKey={selectedHunkKey}
             collapsedHunks={collapsedHunks}
             isHidden={isNarrow && mobileTab !== 'diff'}
@@ -966,20 +1168,42 @@ export function CodeReviewPanel({
             onLoadFull={loadFull}
           />
 
+          {!isNarrow && (
+            <div
+              className="code-review__thread-resizer"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize comment column"
+              aria-valuemin={CODE_REVIEW_THREAD_WIDTH_MIN}
+              aria-valuemax={CODE_REVIEW_THREAD_WIDTH_MAX}
+              aria-valuenow={threadWidth}
+              tabIndex={0}
+              onPointerDown={onThreadResizePointerDown}
+              onPointerMove={onThreadResizePointerMove}
+              onPointerUp={onThreadResizePointerUp}
+              onPointerCancel={onThreadResizePointerUp}
+              onKeyDown={onThreadResizeKeyDown}
+            />
+          )}
+
           <CodeReviewThreadDock
             selectedIdentity={selectedIdentity}
             selectedThread={selectedThread}
             selectedDraft={selectedDraft}
+            composerKey={selectedHunkKey}
+            composerRef={setComposerRef}
             isNarrow={isNarrow}
             isHidden={isNarrow && mobileTab !== 'thread'}
-            isStreaming={snapshot.isStreaming}
-            busy={busy}
+            isStreaming={selectedIsStreaming}
+            busy={threadBusy}
             snapshotId={snapshot.snapshotId}
             onBackToDiff={() => setMobileTab('diff')}
             onRefresh={refresh}
-            onDraftChange={updateSelectedDraft}
+            onComposerInput={onComposerInput}
+            onDraftCommit={commitSelectedDraft}
             onComposerKeyDown={handleComposerKeyDown}
             onSubmitComment={submitComment}
+            onAbort={abort}
           />
         </div>
       </div>

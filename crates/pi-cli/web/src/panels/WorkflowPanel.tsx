@@ -441,6 +441,7 @@ export function WorkflowPanel({ sendCommand, onClose }: WorkflowPanelProps) {
           type="button"
           className="workflow-panel__close"
           title="Close workflow panel"
+          aria-label="Close workflow panel"
           onClick={onClose}
         >
           ×

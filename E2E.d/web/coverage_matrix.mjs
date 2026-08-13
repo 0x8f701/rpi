@@ -256,10 +256,6 @@ export const MATRIX = [
     ids: ['sidechat.default-tab', 'sidechat.new-tab', 'sidechat.tab-activated', 'sidechat.prompt-reply'],
   },
   {
-    feature: 'maintenance',
-    ids: ['maintenance.snapcompact-ab', 'maintenance.rewind-list', 'maintenance.handoff', 'maintenance.queue-cancel'],
-  },
-  {
     feature: 'desktop navigation',
     ids: ['nav.panel-open-close', 'nav.header-session-name'],
   },
@@ -316,7 +312,6 @@ export const MATRIX = [
       'app.tool-card-reconnect',
       'app.primary-action-send',
       'app.primary-action-stop',
-      'app.maintenance-close',
     ],
   },
   {
@@ -430,9 +425,6 @@ export const MATRIX = [
       'fallback.app-close-session',
       'fallback.goal-unpin',
       'fallback.app-close-goal',
-      'fallback.maintenance-compact',
-      'fallback.maintenance-rewind-apply',
-      'fallback.app-close-maintenance',
       'fallback.sidechat-enter-prompt',
       'fallback.sidechat-tab-switch',
       'fallback.sidechat-tab-close',

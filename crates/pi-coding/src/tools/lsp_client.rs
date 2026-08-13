@@ -6,9 +6,13 @@
 //! to the child's stdin and the matching response is read back on stdout with
 //! no background reader task. Notifications pushed while waiting (notably
 //! `textDocument/publishDiagnostics`) are collected in arrival order so the
-//! `diagnostics` action can observe them, and a dedicated
-//! [`LspClient::wait_for_diagnostics`] waits for the push targeted at a
-//! specific document URI.
+//! `diagnostics` action can observe them; per document, the NEWEST push wins
+//! ([`LspClient::wait_for_diagnostics`] and the shared
+//! [`LspClient::wait_ready_diagnostics`] both select from the tail), so a
+//! cold-starting server's initial empty push cannot shadow the real set.
+//! [`LspClient::wait_ready_diagnostics`] additionally pumps a same-document
+//! `textDocument/documentSymbol` analysis barrier past an empty first push
+//! before reporting readiness.
 //!
 //! Server stderr is captured (bounded) and surfaced in error messages, so a
 //! server that fails to initialize reports why instead of failing silently.
@@ -34,6 +38,12 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for `textDocument/publishDiagnostics` after a didOpen
 /// before reporting the wait as failed.
 pub(crate) const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(15);
+/// Brief settle window after the first (possibly empty) diagnostics push
+/// before issuing the documentSymbol analysis barrier in
+/// [`LspClient::wait_ready_diagnostics`]: a cold-starting server publishes an
+/// initial empty set before its first analysis of the document even begins,
+/// and the barrier must not race that kick-off.
+const DIAGNOSTICS_SETTLE: Duration = Duration::from_millis(250);
 /// Grace allowed for the server to exit after the `exit` notification before
 /// it is killed.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -53,6 +63,15 @@ fn is_content_modified(error: &anyhow::Error) -> bool {
     text.contains(&format!("\"code\":{CONTENT_MODIFIED_CODE}"))
         || text.contains("content modified")
         || text.contains("ContentModified")
+}
+
+/// True when a `publishDiagnostics` params object carries no diagnostics (a
+/// missing/absent list is treated as empty, i.e. not yet meaningful).
+fn diagnostics_are_empty(params: &Value) -> bool {
+    params
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .map_or(true, Vec::is_empty)
 }
 
 /// Re-export of the shared `Content-Length` framing writer (see `framing`).
@@ -272,17 +291,13 @@ impl LspClient {
         Ok(result)
     }
 
-    /// Waits for the next `textDocument/publishDiagnostics` notification for
-    /// `uri` and returns its params (which may carry an empty diagnostics
-    /// array). Diagnostics pushed for other documents are kept in
-    /// [`Self::diagnostics`].
+    /// Waits for `textDocument/publishDiagnostics` for `uri` and returns the
+    /// NEWEST params observed for it (an older push, e.g. a cold-start
+    /// server's initial empty set, never shadows a later one). Diagnostics
+    /// pushed for other documents are kept in [`Self::diagnostics`].
     pub(crate) async fn wait_for_diagnostics(&mut self, uri: &str) -> Result<Value> {
-        if let Some(params) = self
-            .diagnostics
-            .iter()
-            .find(|p| p.get("uri").and_then(Value::as_str) == Some(uri))
-        {
-            return Ok(params.clone());
+        if let Some(params) = self.latest_diagnostics(uri) {
+            return Ok(params);
         }
         let deadline = tokio::time::Instant::now() + DIAGNOSTICS_TIMEOUT;
         loop {
@@ -311,11 +326,59 @@ impl LspClient {
                 continue;
             }
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            // Queue the matching push too, so the tail stays authoritative for
+            // later readiness checks and diagnostics reporting.
+            self.diagnostics.push(params.clone());
             if params.get("uri").and_then(Value::as_str) == Some(uri) {
                 return Ok(params);
             }
-            self.diagnostics.push(params);
         }
+    }
+
+    /// Newest `textDocument/publishDiagnostics` params observed for `uri`,
+    /// if any (the tail of the arrival-order queue wins over earlier pushes).
+    fn latest_diagnostics(&self, uri: &str) -> Option<Value> {
+        self.diagnostics
+            .iter()
+            .rev()
+            .find(|params| params.get("uri").and_then(Value::as_str) == Some(uri))
+            .cloned()
+    }
+
+    /// Waits until the server's analysis of `uri` is reflected in its
+    /// `publishDiagnostics` pushes and returns the LATEST params for the URI.
+    ///
+    /// A cold-starting server (rust-analyzer) publishes an initial EMPTY set
+    /// for a document before its first analysis completes, then the real set
+    /// once analysis finishes. Treating the first push as final reports false
+    /// "no diagnostics" results and lets analysis-gated requests (rename)
+    /// race the initial load. So when the first push for the URI is empty,
+    /// the helper gives the server a brief settle window, then sends a
+    /// same-document read-only request (`textDocument/documentSymbol`) as an
+    /// analysis/stream barrier: the server can only answer it after analyzing
+    /// the document, and any diagnostics queued behind it are pumped into
+    /// [`Self::diagnostics`] while the response is read back. The barrier's
+    /// own result is discarded (a request error must not fail the readiness
+    /// wait — the document may simply have no symbols), but the read still
+    /// completes so queued notifications are never stranded. Both phases are
+    /// bounded (no mid-frame cancellation: the settle is a pure sleep and the
+    /// barrier is a normal fully-consumed request).
+    pub(crate) async fn wait_ready_diagnostics(&mut self, uri: &str) -> Result<Value> {
+        let first = self.wait_for_diagnostics(uri).await?;
+        if !diagnostics_are_empty(&first) {
+            return Ok(first);
+        }
+        tokio::time::sleep(DIAGNOSTICS_SETTLE).await;
+        let _ = self
+            .request_timeout(
+                lsp_types::request::DocumentSymbolRequest::METHOD,
+                json!({ "textDocument": { "uri": uri } }),
+                REQUEST_TIMEOUT,
+            )
+            .await;
+        Ok(self
+            .latest_diagnostics(uri)
+            .unwrap_or_else(|| json!({ "uri": uri, "diagnostics": [] })))
     }
 
     /// Best-effort LSP shutdown handshake, then reaps (and if necessary
@@ -505,6 +568,14 @@ mod tests {
             // initialize error is answered, so the tail is captured.
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        // Progressive mode (PI_FAKE_LSP_PROGRESSIVE=1): a deterministic
+        // cold-starting rust-analyzer stand-in — didOpen publishes an EMPTY
+        // diagnostics set, the real set is published only once a
+        // `textDocument/documentSymbol` analysis barrier arrives, and rename
+        // is refused (-32602) until that barrier. No sleeps: every state
+        // transition is driven by which requests arrive.
+        let progressive = std::env::var_os("PI_FAKE_LSP_PROGRESSIVE").is_some();
+        let mut analysis_ready = false;
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         let mut reader = std::io::BufReader::new(stdin.lock());
@@ -550,6 +621,19 @@ mod tests {
                         .pointer("/params/textDocument/uri")
                         .and_then(Value::as_str)
                         .unwrap_or("file:///fake");
+                    let diagnostics = if progressive {
+                        json!([])
+                    } else {
+                        json!([{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 5 }
+                            },
+                            "severity": 1,
+                            "source": "fake",
+                            "message": "fake diagnostic message"
+                        }])
+                    };
                     send(
                         &mut writer,
                         &json!({
@@ -558,17 +642,47 @@ mod tests {
                             "params": {
                                 "uri": uri,
                                 "version": 1,
-                                "diagnostics": [{
-                                    "range": {
-                                        "start": { "line": 0, "character": 0 },
-                                        "end": { "line": 0, "character": 5 }
-                                    },
-                                    "severity": 1,
-                                    "source": "fake",
-                                    "message": "fake diagnostic message"
-                                }]
+                                "diagnostics": diagnostics
                             }
                         }),
+                    );
+                }
+                (Some("textDocument/documentSymbol"), Some(id)) => {
+                    // The analysis barrier: only now is the document analyzed.
+                    // In progressive mode the real diagnostics are published
+                    // BEFORE the barrier's own response, so the client's
+                    // readiness helper observes them while reading the
+                    // response back.
+                    if progressive {
+                        let uri = message
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .unwrap_or("file:///fake");
+                        send(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/publishDiagnostics",
+                                "params": {
+                                    "uri": uri,
+                                    "version": 1,
+                                    "diagnostics": [{
+                                        "range": {
+                                            "start": { "line": 0, "character": 0 },
+                                            "end": { "line": 0, "character": 5 }
+                                        },
+                                        "severity": 1,
+                                        "source": "fake",
+                                        "message": "progressive real diagnostic"
+                                    }]
+                                }
+                            }),
+                        );
+                    }
+                    analysis_ready = true;
+                    send(
+                        &mut writer,
+                        &json!({ "jsonrpc": "2.0", "id": id, "result": [] }),
                     );
                 }
                 (Some("textDocument/hover"), Some(id)) => send(
@@ -596,10 +710,26 @@ mod tests {
                     }),
                 ),
                 (Some("textDocument/rename"), Some(id)) => {
-                    // Resource-op mode: answer with a create-file
-                    // documentChange plus a text edit, exercising the lsp
-                    // tool's explicit resource-operation rejection end to end.
-                    if std::env::var_os("PI_FAKE_LSP_RENAME_RESOURCE_OP").is_some() {
+                    // Progressive mode gates rename on the analysis barrier: a
+                    // rename racing the initial load is refused with -32602,
+                    // the deterministic stand-in for a real server's
+                    // not-yet-analyzed failure.
+                    if progressive && !analysis_ready {
+                        send(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32602,
+                                    "message": "rename refused before analysis barrier"
+                                }
+                            }),
+                        );
+                    } else if std::env::var_os("PI_FAKE_LSP_RENAME_RESOURCE_OP").is_some() {
+                        // Resource-op mode: answer with a create-file
+                        // documentChange plus a text edit, exercising the lsp
+                        // tool's explicit resource-operation rejection end to end.
                         send(
                             &mut writer,
                             &json!({
@@ -692,8 +822,9 @@ mod tests {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// Spawns the fake server (this test binary in fake-server mode).
-    async fn spawn_fake_server() -> LspClient {
+    /// Spawns the fake server (this test binary in fake-server mode) with
+    /// extra environment overrides (e.g. `PI_FAKE_LSP_PROGRESSIVE`).
+    async fn spawn_fake_server_with(extra: &[(&str, &str)]) -> LspClient {
         let exe = std::env::current_exe().expect("test binary path");
         let mut command = Command::new(exe);
         // Substring filter (no --exact) so only the fake-server test runs in
@@ -704,7 +835,15 @@ mod tests {
             .arg("tools::lsp_client::tests::fake_lsp_server_process")
             .arg("--nocapture")
             .env("PI_FAKE_LSP_SERVER", "1");
+        for (key, value) in extra {
+            command.env(key, value);
+        }
         LspClient::spawn_command(command).await.expect("fake server spawn")
+    }
+
+    /// Spawns the fake server in its default (non-progressive) mode.
+    async fn spawn_fake_server() -> LspClient {
+        spawn_fake_server_with(&[]).await
     }
 
     #[test]
@@ -773,6 +912,48 @@ mod tests {
             assert_eq!(definitions[0]["uri"], "file:///tmp/fake_definition.rs");
 
             // Graceful shutdown handshake must complete.
+            client.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn wait_ready_diagnostics_skips_initial_empty_progressive_push() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let mut client = spawn_fake_server_with(&[("PI_FAKE_LSP_PROGRESSIVE", "1")]).await;
+            client.initialize("/tmp").await.expect("initialize handshake");
+
+            client
+                .notify(
+                    lsp_types::notification::DidOpenTextDocument::METHOD,
+                    json!({
+                        "textDocument": {
+                            "uri": "file:///tmp/fake.rs",
+                            "languageId": "rust",
+                            "version": 1,
+                            "text": "fn main() {}"
+                        }
+                    }),
+                )
+                .await
+                .expect("didOpen");
+            // didOpen triggers an EMPTY push; the readiness helper must give
+            // the server its settle window, pump the documentSymbol analysis
+            // barrier, and return the real diagnostics published behind it —
+            // never the stale empty set.
+            let params = client
+                .wait_ready_diagnostics("file:///tmp/fake.rs")
+                .await
+                .expect("ready diagnostics");
+            assert_eq!(
+                params["diagnostics"][0]["message"],
+                "progressive real diagnostic"
+            );
+            assert!(
+                params["diagnostics"].as_array().is_some_and(|list| !list.is_empty()),
+                "readiness must not report the initial empty push"
+            );
+
             client.shutdown().await;
         });
     }

@@ -42,6 +42,17 @@ function setupFail(message) {
 // integration-test exception (deterministic time control cannot drive a real
 // ICE/DTLS stack); the node-side test file uses NO real timers.
 const LOOPBACK = async () => {
+  // Deferred (promise + resolve/reject) built on plain `new Promise` — the
+  // local replacement for the ES2024 `Promise.withResolvers` (Node >= 22
+  // only; the web E2E lanes run under Node 20). page.evaluate serializes
+  // this function's source into the browser, so the helper MUST be defined
+  // here inside the page function, not at module top.
+  const deferred = () => {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  };
   const H = window.__rtHelpers;
   const out = { steps: [], errors: [] };
   const log = (s) => out.steps.push(s);
@@ -87,19 +98,19 @@ const LOOPBACK = async () => {
     out._ondatachannelFired = false;
     out._ontrackFired = false;
     out._connectedFired = false;
-    const dcOpen = Promise.withResolvers();
+    const dcOpen = deferred();
     dc.onopen = () => { out._dcOpenFired = true; dcOpen.resolve('caller-open'); };
     let answererDc = null;
-    const answererDcReady = Promise.withResolvers();
+    const answererDcReady = deferred();
     answerer.ondatachannel = (e) => { answererDc = e.channel; out._ondatachannelFired = true; answererDcReady.resolve('answerer-dc'); };
-    const remoteTrack = Promise.withResolvers();
+    const remoteTrack = deferred();
     answerer.ontrack = (e) => {
       out._ontrackFired = true;
       // Keep the actual remote MediaStream for the real play() evidence.
       out._remoteStream = e.streams[0] || null;
       remoteTrack.resolve({ kind: e.track.kind, streams: e.streams.length, trackEnabled: e.track.enabled });
     };
-    const connected = Promise.withResolvers();
+    const connected = deferred();
     const settleConn = () => {
       const s = H.classifyRealtimeConnectionState(caller.connectionState);
       if (s === 'connected') { out._connectedFired = true; connected.resolve(s); }
@@ -148,7 +159,7 @@ const LOOPBACK = async () => {
 
     // 6. Round-trip a message over the oai-events datachannel (the transport
     //    session.update + server events ride in production).
-    const msgArrived = Promise.withResolvers();
+    const msgArrived = deferred();
     answererDc.onmessage = (e) => msgArrived.resolve(e.data);
     dc.send('oai-events-ping');
     const echoed = await Promise.race([
@@ -213,6 +224,15 @@ const LOOPBACK = async () => {
 // forwards the offer to a real answerer peer and returns its answer. Proves the
 // whole fix path with real WebRTC, not just the helper in isolation.
 const SETUP_LOOPBACK = async () => {
+  // Deferred (promise + resolve/reject) on plain `new Promise` — same local
+  // replacement for `Promise.withResolvers` as LOOPBACK above; defined here
+  // because page.evaluate only transfers this function's source to the page.
+  const deferred = () => {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  };
   const H = window.__rtHelpers;
   const out = { steps: [], errors: [] };
   const log = (s) => out.steps.push(s);
@@ -220,12 +240,12 @@ const SETUP_LOOPBACK = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const answerer = new RTCPeerConnection();
     let answererDc = null;
-    const sessionUpdate = Promise.withResolvers();
+    const sessionUpdate = deferred();
     answerer.ondatachannel = (e) => {
       answererDc = e.channel;
       answererDc.onmessage = (event) => sessionUpdate.resolve(event.data);
     };
-    const remoteTrack = Promise.withResolvers();
+    const remoteTrack = deferred();
     answerer.ontrack = (e) => remoteTrack.resolve({ kind: e.track.kind });
 
     const result = await H.setupRealtimeCall({
@@ -266,7 +286,7 @@ const SETUP_LOOPBACK = async () => {
     log('setupRealtimeCall returned callId=' + out.callId + ' dcLabel=' + out.dcLabel);
 
     // Wait for the answerer datachannel + remote track + caller connected.
-    const adReady = Promise.withResolvers();
+    const adReady = deferred();
     const checkAd = setInterval(() => { if (answererDc) { clearInterval(checkAd); adReady.resolve(true); } }, 30);
     const safety = new Promise((_, rej) => setTimeout(() => rej(new Error('setup loopback timeout')), 10000));
     const [adRes, trackRes] = await Promise.race([

@@ -60,6 +60,54 @@ esac
 if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
 EOF
 chmod 0755 "$MOCK_BIN/uname" "$MOCK_BIN/curl"
+
+NETWORK_MOCK_BIN="$ROOT/network-mock-bin"
+mkdir -p "$NETWORK_MOCK_BIN"
+cp "$MOCK_BIN/uname" "$NETWORK_MOCK_BIN/uname"
+cat > "$NETWORK_MOCK_BIN/curl" <<'EOF'
+#!/bin/sh
+out=''; url=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -H) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+case "$url" in
+  */releases/latest) src="$TEST_FIXTURES/release.json" ;;
+  */rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz)
+    count_file="$TEST_STATE/archive-attempts"
+    count="$(cat "$count_file" 2>/dev/null || printf 0)"
+    count=$((count + 1)); printf '%s\n' "$count" > "$count_file"
+    [ "$count" -ge "${TEST_ARCHIVE_SUCCEEDS_AT:-4}" ] || exit 35
+    src="$TEST_FIXTURES/rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+    ;;
+  */SHA256SUMS) src="$TEST_FIXTURES/SHA256SUMS" ;;
+  *) exit 3 ;;
+esac
+if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
+EOF
+cat > "$NETWORK_MOCK_BIN/sleep" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 0755 "$NETWORK_MOCK_BIN/uname" "$NETWORK_MOCK_BIN/curl" "$NETWORK_MOCK_BIN/sleep"
+
+RETRY_ROOT="$ROOT/retry"; RETRY_STATE="$ROOT/retry-state"; mkdir -p "$RETRY_STATE"
+TEST_FIXTURES="$FIXTURES" TEST_STATE="$RETRY_STATE" TEST_ARCHIVE_SUCCEEDS_AT=3 HOME="$ROOT/home-retry" PI_HOME="$RETRY_ROOT" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$NETWORK_MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/retry.out" 2>&1
+[ "$(cat "$RETRY_STATE/archive-attempts")" = 3 ]
+[ -L "$RETRY_ROOT/bin/rpi" ]
+grep -Fq 'Download attempt failed; retrying (2/3)' "$ROOT/retry.out"
+grep -Fq 'Download attempt failed; retrying (3/3)' "$ROOT/retry.out"
+
+FAILED_ROOT="$ROOT/network-failed"; FAILED_STATE="$ROOT/network-failed-state"; mkdir -p "$FAILED_STATE"
+if TEST_FIXTURES="$FIXTURES" TEST_STATE="$FAILED_STATE" TEST_ARCHIVE_SUCCEEDS_AT=4 HOME="$ROOT/home-network-failed" PI_HOME="$FAILED_ROOT" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$NETWORK_MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >"$ROOT/network-failed.out" 2>&1; then exit 1; fi
+grep -Fq 'download failed: https://example.test/rpi-0.1.0-x86_64-unknown-linux-gnu.tar.gz' "$ROOT/network-failed.out"
+if grep -Eq 'release_install_lock: (not found|command not found)|command not found.*release_install_lock' "$ROOT/network-failed.out"; then exit 1; fi
+[ ! -e "$FAILED_ROOT/.install.lock" ]
+[ ! -e "$FAILED_ROOT/bin/rpi" ] && [ ! -L "$FAILED_ROOT/bin/rpi" ]
 run_install() {
   install_root="$1"; home_dir="$2"; mkdir -p "$home_dir"
   TEST_FIXTURES="$FIXTURES" HOME="$home_dir" PI_HOME="$install_root" PI_UPDATE_BASE_URL='https://example.test/releases' PATH="$MOCK_BIN:$PATH" SHELL=/bin/sh sh "$INSTALLER" >/dev/null
@@ -174,4 +222,4 @@ API_CALL_LINE="$(grep -Fn 'Invoke-RestMethod -Uri $ReleaseUrl -Headers $ApiHeade
 [ -n "$TOKEN_BASE_LINE" ] && [ -n "$AUTH_HEADER_LINE" ] && [ -n "$API_CALL_LINE" ]
 [ "$TOKEN_BASE_LINE" -lt "$AUTH_HEADER_LINE" ]
 [ "$AUTH_HEADER_LINE" -lt "$API_CALL_LINE" ]
-printf 'install.sh focused behavior tests passed (11 install attempts, 1 identity mismatch rejection, 4 PowerShell identity contracts, 1 umask-hardening install, 6 PowerShell token-scoping contracts)\n'
+printf 'install.sh focused behavior tests passed (14 install attempts, 1 identity mismatch rejection, 2 bounded network retries, 4 PowerShell identity contracts, 1 umask-hardening install, 6 PowerShell token-scoping contracts)\n'

@@ -1,10 +1,10 @@
 // Fallback coverage matrix driver — closes the zero-hit margin on the panels
 // the core steering driver (coverage_test.mjs) does not exhaustively exercise:
 // SessionPanel refresh / rename-via-Enter / clone / fork / switch-row;
-// GoalPanel unpin; MaintenancePanel compact + actual rewind apply;
-// SideChatPanel Enter-prompt / tab switch / tab close; redact.redactSecrets
-// credential-shape branches through real panel safeText rendering; and the App
-// panel close callbacks (onClose / onClosePanel -> setActivePanel('')).
+// GoalPanel unpin; SideChatPanel Enter-prompt / tab switch / tab close;
+// redact.redactSecrets credential-shape branches through real panel safeText
+// rendering; and the App panel close callbacks (onClose / onClosePanel ->
+// setActivePanel('')).
 //
 // Run against the REAL `rpi --listen` steering fixture (loopback mock +
 // RPI_WEB_DEV_DIR coverage bundle) with concrete, machine-readable assertion
@@ -99,19 +99,6 @@ async function primeTurn(page, text, label) {
   );
 }
 
-
-// Click a maintenance action button by visible label (mirrors the core driver's
-// clickMaintenanceAction — the actions are <button class="maintenance__action">
-// labeled Compact / Snapcompact / Rewind… / Handoff / Queue…).
-async function clickMaintenanceAction(page, label) {
-  const clicked = await page.evaluate((want) => {
-    const btn = Array.from(document.querySelectorAll('.maintenance__action')).find((b) => (b.textContent || '').includes(want));
-    if (!btn) return false;
-    btn.click();
-    return true;
-  }, label);
-  if (!clicked) fail(`maintenance action "${label}" not found`);
-}
 
 // Wait for the SessionPanel to report a lifecycle outcome. runLifecycle sets
 // the panel status to "<label> ok" on success or "<label> failed: <err>" on
@@ -331,77 +318,6 @@ async function main() {
     await page.click('#goal-close-btn');
     await waitFor(page, () => document.getElementById('goal-panel') === null, 'goal panel did not close via the close callback');
     record('fallback.app-close-goal');
-
-    // ==================== Maintenance panel ====================
-    // Prime two more turns so get_entries has enough records for a safe rewind
-    // (rewind to the last entry retains N-1, drops 1 — valid for N>=2). The
-    // active session (after the row switch) carries the primed phase-1 turn.
-    await primeTurn(page, 'fallback maintenance prime a', 'phase-4-prime-a');
-    await primeTurn(page, 'fallback maintenance prime b', 'phase-4-prime-b');
-
-    await page.click('#maintenance-toggle-btn');
-    await waitFor(page, () => document.querySelector('.maintenance') !== null, 'maintenance panel did not open');
-
-    // Compact -> MaintenancePanel.run('compact', {type:'compact'}) -> compact
-    // RPC (real LLM summarization through the mock) -> tokenReport. The core
-    // driver only exercises Snapcompact; Compact's LLM-summarizer path is
-    // unique to this journey.
-    await clickMaintenanceAction(page, 'Compact');
-    await waitFor(
-      page,
-      () =>
-        Array.from(document.querySelectorAll('.maintenance__result')).some((r) => {
-          const t = r.textContent || '';
-          // run('compact', ...) renders a result titled "compact:" on BOTH
-          // success (tokenReport "Compact: N → M estimated tokens") and error
-          // ("compact: <err>"). Either proves the compact RPC + run() +
-          // tokenReport/error path executed; prefer the A→B arrow when the
-          // fixture permits a real LLM summarization.
-          return t.includes('compact:');
-        }),
-      'compact never rendered a result',
-      45000
-    );
-    record('fallback.maintenance-compact');
-
-    // Rewind list, then APPLY rewind by clicking a real entry — the core
-    // driver only opens the list (maintenance.rewind-list); doRewind + the
-    // rewind RPC are zero-hit without this click.
-    await clickMaintenanceAction(page, 'Rewind…');
-    await waitFor(
-      page,
-      () => document.querySelector('.maintenance__list') !== null,
-      'rewind entry list never appeared'
-    );
-    await waitFor(
-      page,
-      () => document.querySelectorAll('.maintenance__list-row').length >= 2,
-      'rewind entry list has fewer than 2 rows — a safe rewind target is unavailable'
-    );
-    // Click the LAST row: rewind(index = N-1) retains N-1 records, drops 1
-    // (mirrors the rpc.rs rewind test, which rewinds to count-1). doRewind's
-    // run() renders a result titled "rewind:" on success ("rewind: Rewound to
-    // …") or error ("rewind: <err>"); either proves doRewind + the rewind RPC
-    // executed. Prefer the success text when the fixture permits a real rewind.
-    await page.evaluate(() => {
-      const rows = Array.from(document.querySelectorAll('.maintenance__list-row'));
-      const last = rows[rows.length - 1];
-      if (!last) throw new Error('no maintenance__list-row to rewind to');
-      last.click();
-    });
-    await waitFor(
-      page,
-      () =>
-        Array.from(document.querySelectorAll('.maintenance__result')).some((r) => (r.textContent || '').includes('rewind:')),
-      'rewind apply never rendered a result',
-      30000
-    );
-    record('fallback.maintenance-rewind-apply');
-
-    // Close callback -> MaintenancePanel onClosePanel -> App.setActivePanel('').
-    await page.click('.maintenance .panel-close');
-    await waitFor(page, () => document.querySelector('.maintenance') === null, 'maintenance panel did not close via the close callback');
-    record('fallback.app-close-maintenance');
 
     // ==================== Side chat panel ====================
     await page.click('#sidechat-toggle-btn');

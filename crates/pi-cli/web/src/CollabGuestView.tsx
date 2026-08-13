@@ -729,7 +729,7 @@ export function CollabGuestView({ link }: { link: ParsedCollabLink | null }) {
         ) : (
           <div className="collab-viewonly-notice">
             <strong>View-only guest.</strong> Prompt and abort are disabled for view guests. Host-only
-            operations (approvals, session lifecycle, settings, maintenance) are not available to any
+            operations (approvals, session lifecycle, settings) are not available to any
             guest — approvals surface as read-only notices to be answered in the terminal.
           </div>
         )}

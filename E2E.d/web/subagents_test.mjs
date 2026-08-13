@@ -292,17 +292,18 @@ async function main() {
     if (!detailsContent.elapsed) fail('detail modal elapsed never rendered while running');
     if (!detailsContent.activity) fail('detail modal latest activity never rendered');
     if (!detailsContent.live) fail('detail modal live badge missing while the job is running');
-    // Recent history MUST be non-empty while the job is still running — the
-    // core acceptance: a long-running job must expose recent activity/history
-    // details, not just status/output.
+    // Recent history MUST be non-empty while the job is still running and must
+    // carry the CONCRETE tool action the child took — the history projection
+    // renders the read call as `assistant · read seed.txt`, never a history
+    // that reduces the child's work to generic `[tool: read]`/`[bash]` tags.
     await waitFor(
       page,
       () => {
         const pre = document.querySelector('[data-details-history]');
         const text = pre ? pre.textContent.trim() : '';
-        return text !== '' && !text.startsWith('(no transcript yet') && !text.startsWith('(transcript unavailable)');
+        return text.includes('read seed.txt');
       },
-      'detail modal recent history never became non-empty while the job was running',
+      'detail modal recent history never showed the concrete read seed.txt action',
       15000
     );
     const historyErrorShown = await page.evaluate(
@@ -313,15 +314,19 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/modal-running.png`, fullPage: true });
     // Refresh re-fetches the child transcript: the dialog stays open, history
-    // remains non-empty, and no error appears.
+    // keeps the concrete read action, and no error appears.
     await page.evaluate(() => document.querySelector('[data-details-refresh]').click());
     await waitFor(
       page,
       () => {
         const pre = document.querySelector('[data-details-history]');
-        return !!pre && pre.textContent.trim() !== '' && document.querySelector('[data-details-error]') === null;
+        return (
+          !!pre &&
+          pre.textContent.includes('read seed.txt') &&
+          document.querySelector('[data-details-error]') === null
+        );
       },
-      'detail modal Refresh broke the recent history view',
+      'detail modal Refresh broke the concrete recent history view',
       10000
     );
     // Close via Escape dismisses the modal.

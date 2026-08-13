@@ -220,6 +220,7 @@ async function main() {
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
     let reachedClosed = false;
+    let closedLabel = '';
     if (markerSeen) {
       try {
         await page.waitForFunction(
@@ -230,16 +231,24 @@ async function main() {
           { timeout: stopTimeout },
         );
         await page.waitForTimeout(500);
-        reachedClosed = await page.evaluate(() =>
-          document.getElementById('conn-state')?.dataset?.state === 'closed' &&
-          !document.body.textContent.includes('reconnecting')
-        );
+        const closedState = await page.evaluate(() => {
+          const el = document.getElementById('conn-state');
+          return {
+            state: el ? el.dataset.state || '' : '',
+            label: el ? el.textContent?.trim() || '' : '',
+            reconnecting: document.body.textContent.includes('reconnecting'),
+          };
+        });
+        reachedClosed = closedState.state === 'closed' && !closedState.reconnecting;
+        closedLabel = closedState.label;
       } catch {
         reachedClosed = false;
       }
     }
     assert('VG-09', 'host stop leaves the view WS stably closed with no reconnect status',
       markerSeen && reachedClosed, `stopMarkerSeen=${markerSeen} reachedClosed=${reachedClosed}`);
+    assert('VG-09b', 'the closed conn pill renders the "offline" label (never "error" or "reconnecting")',
+      markerSeen && reachedClosed && closedLabel === 'offline', `label=${JSON.stringify(closedLabel)}`);
 
     await page.screenshot({ path: path.join(evidence, 'view-stopped.png'), fullPage: true });
 

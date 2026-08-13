@@ -184,6 +184,7 @@ export function GoalPanel({ state, journal, sendCommand, onChanged, onClose }: G
           type="button"
           className="goal-panel__close"
           title="Close the Goal panel"
+          aria-label="Close goal panel"
           onClick={onClose}
         >
           {'\u00D7'}

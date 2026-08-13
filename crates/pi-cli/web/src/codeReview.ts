@@ -82,6 +82,8 @@ export interface ReviewComment {
   role: 'user' | 'assistant' | 'system';
   text: string;
   partial: boolean;
+  /** Model id for assistant replies when the backend stamps one. */
+  model?: string;
 }
 
 export interface ReviewThread {
@@ -90,6 +92,10 @@ export interface ReviewThread {
   streamingText: string;
   error: string | null;
   stale: boolean;
+  /** True while this thread has an in-flight review reply. */
+  isStreaming: boolean;
+  /** Model used for the active/last assistant reply on this thread. */
+  model?: string;
 }
 
 export interface CodeReviewSnapshot {
@@ -101,8 +107,10 @@ export interface CodeReviewSnapshot {
   totalDeletions: number;
   files: DiffFile[];
   threads: ReviewThread[];
+  /** Aggregate: true when any review reply is active. */
   isStreaming: boolean;
-  activeHunk: HunkIdentity | null;
+  /** Number of concurrently active review replies. */
+  activeCount: number;
 }
 
 const LINE_KINDS: Record<string, true> = {
@@ -251,10 +259,12 @@ function normalizeComment(raw: unknown): ReviewComment | null {
   if (!obj) return null;
   const roleRaw = stringField(obj.role);
   const role = roleRaw in COMMENT_ROLES ? (roleRaw as ReviewComment['role']) : 'system';
+  const model = optionalString(obj.model);
   return {
     role,
     text: stringField(obj.text),
     partial: boolField(obj.partial),
+    ...(model ? { model } : {}),
   };
 }
 
@@ -269,12 +279,20 @@ function normalizeThread(raw: unknown): ReviewThread | null {
     const comment = normalizeComment(entry);
     if (comment) comments.push(comment);
   }
+  const streamingText = stringField(obj.streamingText);
+  // Prefer an explicit wire flag; fall back to a non-empty stream buffer so
+  // older/partial payloads still light the per-hunk indicator.
+  const isStreaming =
+    typeof obj.isStreaming === 'boolean' ? obj.isStreaming : streamingText.length > 0;
+  const model = optionalString(obj.model);
   return {
     identity,
     comments,
-    streamingText: stringField(obj.streamingText),
+    streamingText,
     error: nullableString(obj.error),
     stale: boolField(obj.stale),
+    isStreaming,
+    ...(model ? { model } : {}),
   };
 }
 
@@ -314,7 +332,7 @@ export function emptyCodeReviewSnapshot(error: string | null = null): CodeReview
     files: [],
     threads: [],
     isStreaming: false,
-    activeHunk: null,
+    activeCount: 0,
   };
 }
 
@@ -336,7 +354,19 @@ export function normalizeCodeReviewSnapshot(data: unknown): CodeReviewSnapshot {
     if (file) files.push(file);
   }
 
-  const activeHunk = obj.activeHunk == null ? null : normalizeIdentity(obj.activeHunk);
+  const threads = normalizeThreads(obj.threads);
+  const streamingThreadCount = threads.reduce(
+    (count, thread) => count + (thread.isStreaming ? 1 : 0),
+    0,
+  );
+  // Prefer the wire activeCount when present; otherwise derive from threads so
+  // partial payloads still report concurrent activity.
+  const activeCount =
+    obj.activeCount == null || obj.activeCount === ''
+      ? streamingThreadCount
+      : uintField(obj.activeCount);
+  const isStreaming =
+    typeof obj.isStreaming === 'boolean' ? obj.isStreaming : activeCount > 0;
 
   return {
     comparisonLabel: stringField(obj.comparisonLabel),
@@ -346,9 +376,9 @@ export function normalizeCodeReviewSnapshot(data: unknown): CodeReviewSnapshot {
     totalInsertions: uintField(obj.totalInsertions),
     totalDeletions: uintField(obj.totalDeletions),
     files,
-    threads: normalizeThreads(obj.threads),
-    isStreaming: boolField(obj.isStreaming),
-    activeHunk,
+    threads,
+    isStreaming,
+    activeCount,
   };
 }
 
@@ -403,6 +433,101 @@ export function hunkIdentityFor(
 /** Number of comments on a thread (0 when there is no thread). */
 export function countThreadComments(thread: ReviewThread | undefined): number {
   return thread ? thread.comments.length : 0;
+}
+
+/** True when a thread currently has an in-flight review reply. */
+export function threadIsStreaming(thread: ReviewThread | undefined | null): boolean {
+  if (!thread) return false;
+  return thread.isStreaming || thread.streamingText.length > 0;
+}
+
+/**
+ * Full identity payload for `code_review_abort` — same HunkIdentity fields as
+ * `code_review_comment`, plus the command type. Session stamping is the caller's job.
+ */
+export function buildCodeReviewAbortPayload(
+  identity: Pick<
+    HunkIdentity,
+    'snapshotId' | 'path' | 'oldStart' | 'oldCount' | 'newStart' | 'newCount' | 'contentHash'
+  >,
+): Record<string, unknown> {
+  return {
+    type: 'code_review_abort',
+    snapshotId: identity.snapshotId,
+    path: identity.path,
+    oldStart: identity.oldStart,
+    oldCount: identity.oldCount,
+    newStart: identity.newStart,
+    newCount: identity.newCount,
+    contentHash: identity.contentHash,
+  };
+}
+
+/** Header aggregate: `N replies` while any review replies are active; null when idle. */
+export function formatActiveRepliesLabel(activeCount: number): string | null {
+  const n = Number.isFinite(activeCount) ? Math.max(0, Math.floor(activeCount)) : 0;
+  if (n <= 0) return null;
+  return `${n} ${n === 1 ? 'reply' : 'replies'}`;
+}
+
+// ---------------------------------------------------------------------------
+// Desktop thread-column width (CSS var + localStorage). Bounds are pure so
+// the panel/resizer and regression tests share one clamp.
+// ---------------------------------------------------------------------------
+
+export const CODE_REVIEW_THREAD_WIDTH_STORAGE_KEY = 'rpi-code-review-thread-width';
+export const CODE_REVIEW_THREAD_WIDTH_MIN = 240;
+export const CODE_REVIEW_THREAD_WIDTH_MAX = 480;
+export const CODE_REVIEW_THREAD_WIDTH_DEFAULT = 280;
+export const CODE_REVIEW_THREAD_WIDTH_STEP = 16;
+
+/** Minimal storage surface for width persistence (localStorage-compatible). */
+export interface CodeReviewWidthStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+/** Clamp a candidate thread width into the supported desktop range. */
+export function clampCodeReviewThreadWidth(value: number): number {
+  if (!Number.isFinite(value)) return CODE_REVIEW_THREAD_WIDTH_DEFAULT;
+  return Math.min(
+    CODE_REVIEW_THREAD_WIDTH_MAX,
+    Math.max(CODE_REVIEW_THREAD_WIDTH_MIN, Math.round(value)),
+  );
+}
+
+/** Read + clamp a stored thread width; storage errors / missing → default. */
+export function readStoredCodeReviewThreadWidth(
+  storage: CodeReviewWidthStorage | null | undefined,
+): number {
+  if (!storage) return CODE_REVIEW_THREAD_WIDTH_DEFAULT;
+  try {
+    const raw = storage.getItem(CODE_REVIEW_THREAD_WIDTH_STORAGE_KEY);
+    if (raw == null || raw === '') return CODE_REVIEW_THREAD_WIDTH_DEFAULT;
+    return clampCodeReviewThreadWidth(Number(raw));
+  } catch {
+    return CODE_REVIEW_THREAD_WIDTH_DEFAULT;
+  }
+}
+
+/** Persist a clamped thread width; storage errors are swallowed (private mode). */
+export function writeStoredCodeReviewThreadWidth(
+  storage: CodeReviewWidthStorage | null | undefined,
+  width: number,
+): number {
+  const next = clampCodeReviewThreadWidth(width);
+  if (!storage) return next;
+  try {
+    storage.setItem(CODE_REVIEW_THREAD_WIDTH_STORAGE_KEY, String(next));
+  } catch {
+    /* private mode / quota: width still applies in-session */
+  }
+  return next;
+}
+
+/** Keyboard step for the thread-column separator (direction +1 grows, -1 shrinks; resizer is left of the comments column so ArrowLeft maps to +1). */
+export function stepCodeReviewThreadWidth(current: number, direction: -1 | 1): number {
+  return clampCodeReviewThreadWidth(current + direction * CODE_REVIEW_THREAD_WIDTH_STEP);
 }
 
 /** Total comment count for a file across all its hunks (file-row badge). */
@@ -682,17 +807,37 @@ export const FILE_RENDER_SOFT_CAP = 4000;
 /** Hard UI memory cap: the panel refuses to load more lines beyond this. */
 export const FILE_DIFF_MAX_UI_LINES = 20_000;
 
+export interface FileDiffPageHunk {
+  /** 0-based hunk index across the file's hunks. */
+  index: number;
+  header: string;
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  /** SHA-256 over the COMPLETE hunk (never the page fragment). */
+  contentHash: string;
+  /** Total lines of the complete hunk; comment-ready once merged lines reach it. */
+  totalLines: number;
+  /** Backend parse was complete (not cut by the per-file byte cap). */
+  complete: boolean;
+  /** Hunk-local line offset where this page's subset starts. */
+  lineStart: number;
+  lines: DiffLine[];
+}
+
 export interface FileDiffPage {
   snapshotId: string;
   path: string;
   previousPath?: string;
   binary: boolean;
   status: FileStatus;
-  lines: DiffLine[];
+  hunks: FileDiffPageHunk[];
   cursor: number;
   nextCursor?: number;
   hasMore: boolean;
   totalLines: number;
+  hunkCount: number;
   truncated: boolean;
 }
 
@@ -703,41 +848,98 @@ export function normalizeFileDiffPage(raw: unknown): FileDiffPage | null {
   const path = stringField(obj.path);
   const snapshotId = stringField(obj.snapshotId);
   if (!path || !snapshotId) return null;
-  const lines = Array.isArray(obj.lines) ? obj.lines.map(normalizeLine).filter((l): l is DiffLine => l !== null) : [];
   const status = stringField(obj.status);
   const nextCursor =
     typeof obj.nextCursor === 'number' && Number.isFinite(obj.nextCursor)
       ? Math.max(0, Math.floor(obj.nextCursor))
       : undefined;
+  const hunks = Array.isArray(obj.hunks)
+    ? obj.hunks
+        .map((rawHunk): FileDiffPageHunk | null => {
+          const h = asRecord(rawHunk);
+          if (!h) return null;
+          const header = stringField(h.header);
+          if (!header) return null;
+          const contentHash = stringField(h.contentHash);
+          if (!contentHash) return null;
+          const lines = Array.isArray(h.lines)
+            ? h.lines.map(normalizeLine).filter((l): l is DiffLine => l !== null)
+            : [];
+          return {
+            index: uintField(h.index),
+            header,
+            oldStart: uintField(h.oldStart),
+            oldCount: uintField(h.oldCount),
+            newStart: uintField(h.newStart),
+            newCount: uintField(h.newCount),
+            contentHash,
+            totalLines: uintField(h.totalLines),
+            complete: boolField(h.complete),
+            lineStart: uintField(h.lineStart),
+            lines,
+          };
+        })
+        .filter((h): h is FileDiffPageHunk => h !== null)
+    : [];
+  const hunkCount = uintField(obj.hunkCount);
+  const maxIndex = hunks.reduce((max, h) => Math.max(max, h.index + 1), 0);
   return {
     snapshotId,
     path,
     previousPath: optionalString(obj.previousPath),
     binary: boolField(obj.binary),
     status: FILE_STATUSES[status] ? (status as FileStatus) : 'changed',
-    lines,
+    hunks,
     cursor: uintField(obj.cursor),
     nextCursor,
     hasMore: boolField(obj.hasMore),
     totalLines: uintField(obj.totalLines),
+    hunkCount: Math.max(hunkCount, maxIndex),
     truncated: boolField(obj.truncated),
   };
 }
 
 /**
- * Accumulated loaded diff for one file: the snapshot's hunk lines (always
- * present) plus any backend pages appended for a globally-truncated file.
- * `nextCursor` is the backend cursor for the next page. The panel owns one of
- * these per selected file.
+ * One hunk of the merged per-file diff. The snapshot seeds these from its
+ * own hunks (instant first render); backend page descriptors then UPGRADE
+ * the metadata (authoritative ranges/content hash/total lines/completeness)
+ * and merge line subsets. A hunk is comment-ready only when
+ * `complete && lines.length === totalLines` — page-split or byte-capped
+ * hunks are never exposed as selectable.
+ */
+export interface LoadedHunk {
+  index: number;
+  header: string;
+  oldStart: number;
+  oldCount: number;
+  newCount: number;
+  newStart: number;
+  contentHash: string;
+  /** Lines of the complete hunk (backend descriptor; snapshot seed approx). */
+  totalLines: number;
+  /** Backend parse was complete (not cut by the per-file byte cap). */
+  complete: boolean;
+  /** Merged lines across the snapshot seed and pages, in hunk order. */
+  lines: DiffLine[];
+}
+
+/**
+ * Accumulated loaded diff for one file. The merged hunks REPLACE the
+ * snapshot's hunk structure for rendering/selection once loaded (catalog
+ * stats and snapshot identity stay with the snapshot file entry); `lines` is
+ * the derived flat view used for window math. The panel owns one of these
+ * per selected file.
  */
 export interface LoadedDiff {
   snapshotId: string;
   path: string;
-  /** Snapshot hunk lines followed by backend-loaded extra lines. */
+  /** Merged hunks in index order (snapshot seed first, then page merges). */
+  hunks: LoadedHunk[];
+  /** Derived flat line stream (window math / rendering), hunk order. */
   lines: DiffLine[];
-  /** Count of `lines` that came from the snapshot (hunk-structured). */
-  snapshotLineCount: number;
-  /** Backend cursor for the next page (=== lines.length when no backend page yet). */
+  /** Backend total hunks (0 until the first page arrives). */
+  hunkCount: number;
+  /** Backend cursor for the next page (=== lines.length when none pending). */
   nextCursor: number;
   hasMoreBackend: boolean;
   totalLines: number;
@@ -745,6 +947,8 @@ export interface LoadedDiff {
   backendTruncated: boolean;
   /** True when the backend per-file byte cap was hit: no further pages exist. */
   byteCapped: boolean;
+  /** True when every hunk descriptor the backend knows has been merged. */
+  hunksComplete: boolean;
   loading: boolean;
   error: string | null;
 }
@@ -755,44 +959,210 @@ export function isDiffPlaceholder(file: DiffFile): boolean {
   return file.truncated && !file.binary && file.hunks.length === 0;
 }
 
-/** Initialize a LoadedDiff from the snapshot's file entry. */
-export function initLoadedDiff(snapshotId: string, file: DiffFile, snapshotTruncated: boolean): LoadedDiff {
+/** Content/context line counts of a hunk (meta lines excluded). */
+function hunkCounts(hunk: Pick<DiffHunk, 'lines'>): { content: number; context: number } {
+  let content = 0;
+  let context = 0;
+  for (const line of hunk.lines) {
+    if (line.kind === 'meta') continue;
+    content += 1;
+    if (line.kind === 'context') context += 1;
+  }
+  return { content, context };
+}
+
+/**
+ * Whether a hunk's parsed body matches its header counts (the same
+ * completeness check the backend applies to byte-capped loads). A hunk cut
+ * mid-body never satisfies `content === oldCount + newCount - context`, so a
+ * globally-truncated snapshot's partial last hunk is detected here too.
+ */
+export function hunkIsComplete(
+  hunk: Pick<DiffHunk, 'oldCount' | 'newCount' | 'lines'>,
+): boolean {
+  const { content, context } = hunkCounts(hunk);
+  return content === hunk.oldCount + hunk.newCount - context;
+}
+
+/** True when a merged hunk is comment-ready: complete and fully merged. */
+export function loadedHunkReady(hunk: LoadedHunk): boolean {
+  return hunk.complete && hunk.lines.length === hunk.totalLines;
+}
+
+/** Seed a LoadedDiff from the snapshot's file entry. */
+export function initLoadedDiff(
+  snapshotId: string,
+  file: DiffFile,
+  snapshotTruncated: boolean,
+): LoadedDiff {
+  const hunks: LoadedHunk[] = file.hunks.map((hunk, index) => ({
+    index,
+    header: hunk.header,
+    oldStart: hunk.oldStart,
+    oldCount: hunk.oldCount,
+    newStart: hunk.newStart,
+    newCount: hunk.newCount,
+    contentHash: hunk.contentHash,
+    totalLines: hunk.lines.length,
+    complete: hunkIsComplete(hunk),
+    lines: hunk.lines.slice(),
+  }));
   const lines: DiffLine[] = [];
-  for (const hunk of file.hunks) for (const line of hunk.lines) lines.push(line);
+  for (const hunk of hunks) for (const line of hunk.lines) lines.push(line);
   return {
     snapshotId,
     path: file.path,
+    hunks,
     lines,
-    snapshotLineCount: lines.length,
-    nextCursor: lines.length,
+    hunkCount: 0,
+    // The eager per-file fetch starts at cursor 0 (NOT at the seeded line
+    // count): the backend pages are the authoritative hunk source and
+    // replace/upgrade the snapshot seed. Exact dedupe keeps the merged lines
+    // byte-identical to the backend stream (see appendFileDiffPage).
+    nextCursor: 0,
+    // Backend pages exist beyond the snapshot body only when the global
+    // snapshot was truncated AND this file was itself marked truncated
+    // (partially cut by the patch cap, >4000 rendered lines, or a
+    // placeholder). The backend diff is still fetched eagerly for every
+    // non-binary file (making the RPC cache the authoritative hunk source);
+    // binary files never fetch.
     hasMoreBackend: snapshotTruncated && file.truncated,
     totalLines: lines.length,
     backendTruncated: file.truncated,
     byteCapped: false,
+    // The backend stream is complete only once a terminal page (hasMore
+    // false) has been consumed — the loop forces at least one page for
+    // non-binary files regardless of hasMoreBackend.
+    hunksComplete: file.binary,
     loading: false,
     error: null,
   };
 }
 
+/** Rebuild the flat line stream from the merged hunks, in index order. */
+function flattenHunks(hunks: LoadedHunk[]): DiffLine[] {
+  const lines: DiffLine[] = [];
+  for (const hunk of hunks) for (const line of hunk.lines) lines.push(line);
+  return lines;
+}
+
+/** Whether the backend line stream has been fully consumed (a terminal page
+ *  with hasMore=false arrived), meaning every hunk's descriptors AND line
+ *  subsets are merged. */
+function hunksCompleteFor(hasMore: boolean): boolean {
+  return !hasMore;
+}
+
 /**
  * Merge a backend page into the loaded diff. Stale guards: the page's
  * snapshot id and path must match, and its cursor must equal the expected next
- * cursor (dedup — a duplicate or out-of-order page is dropped). On a successful
- * merge the page's lines append in order and the next cursor advances.
+ * cursor (a duplicate or out-of-order page is dropped). On a successful merge
+ * every descriptor upgrades its hunk's metadata (header/ranges/content hash/
+ * total lines/completeness — the backend is authoritative) and merges the
+ * page's line subset at `lineStart`. Exact dedupe rules (identity matches
+ * mean byte-identical hunk text, so the seed is a prefix/superset of the
+ * page subsets):
+ *   - subset fully inside the merged lines → skipped (seed already covers it)
+ *   - subset starting at/after the merged end → appended (continuation)
+ *   - partial overlap → only the not-yet-merged tail is appended
+ * A descriptor whose identity differs from the seed (a globally-truncated
+ * partial hunk replaced by the complete per-file hunk) REPLACES the seed
+ * wholesale. Page-split hunks therefore merge deterministically by index in
+ * cursor order with no duplicated lines.
  */
 export function appendFileDiffPage(state: LoadedDiff, page: FileDiffPage): LoadedDiff {
   if (page.snapshotId !== state.snapshotId || page.path !== state.path) return state;
   if (page.cursor !== state.nextCursor) return state;
-  const lines = state.lines.concat(page.lines);
+  let hunks = state.hunks;
+  for (const descriptor of page.hunks) {
+    const existing = hunks.find((hunk) => hunk.index === descriptor.index);
+    if (!existing) {
+      hunks = hunks.concat([
+        {
+          index: descriptor.index,
+          header: descriptor.header,
+          oldStart: descriptor.oldStart,
+          oldCount: descriptor.oldCount,
+          newStart: descriptor.newStart,
+          newCount: descriptor.newCount,
+          contentHash: descriptor.contentHash,
+          totalLines: descriptor.totalLines,
+          complete: descriptor.complete,
+          lines: descriptor.lines.slice(),
+        },
+      ]);
+      continue;
+    }
+    const identityMatches =
+      existing.oldStart === descriptor.oldStart &&
+      existing.oldCount === descriptor.oldCount &&
+      existing.newStart === descriptor.newStart &&
+      existing.newCount === descriptor.newCount &&
+      existing.contentHash === descriptor.contentHash;
+    if (!identityMatches) {
+      // The per-file data supersedes the snapshot seed (e.g. a partial
+      // globally-truncated hunk replaced by the complete hunk).
+      hunks = hunks.map((hunk) =>
+        hunk.index === descriptor.index
+          ? {
+              index: descriptor.index,
+              header: descriptor.header,
+              oldStart: descriptor.oldStart,
+              oldCount: descriptor.oldCount,
+              newStart: descriptor.newStart,
+              newCount: descriptor.newCount,
+              contentHash: descriptor.contentHash,
+              totalLines: descriptor.totalLines,
+              complete: descriptor.complete,
+              lines: descriptor.lines.slice(),
+            }
+          : hunk,
+      );
+      continue;
+    }
+    // Identity matches: the seed lines are a prefix/superset of the backend
+    // subsets (same hash ⟹ same text). Apply the AUTHORITATIVE descriptor
+    // metadata (header/ranges/content hash/total lines/completeness), then
+    // merge only the not-yet-merged tail: fully-covered subsets dedupe,
+    // continuations append, partial overlaps append the missing tail.
+    let mergedLines = existing.lines;
+    const subsetEnd = descriptor.lineStart + descriptor.lines.length;
+    if (subsetEnd > existing.lines.length) {
+      const appendFrom = Math.max(descriptor.lineStart, existing.lines.length);
+      mergedLines = existing.lines.concat(descriptor.lines.slice(appendFrom - descriptor.lineStart));
+    }
+    hunks = hunks.map((hunk) =>
+      hunk.index === descriptor.index
+        ? {
+            ...hunk,
+            header: descriptor.header,
+            oldStart: descriptor.oldStart,
+            oldCount: descriptor.oldCount,
+            newStart: descriptor.newStart,
+            newCount: descriptor.newCount,
+            contentHash: descriptor.contentHash,
+            totalLines: descriptor.totalLines,
+            complete: descriptor.complete,
+            lines: mergedLines,
+          }
+        : hunk,
+    );
+  }
+  hunks.sort((a, b) => a.index - b.index);
+  const lines = flattenHunks(hunks);
   const nextCursor = page.nextCursor ?? lines.length;
+  const hunkCount = Math.max(state.hunkCount, page.hunkCount);
   return {
     ...state,
+    hunks,
     lines,
+    hunkCount,
     nextCursor,
     hasMoreBackend: page.hasMore,
     totalLines: Math.max(state.totalLines, page.totalLines),
     backendTruncated: page.truncated || state.backendTruncated,
     byteCapped: page.truncated || state.byteCapped,
+    hunksComplete: hunksCompleteFor(page.hasMore),
     loading: false,
     error: null,
   };
@@ -835,13 +1205,19 @@ export function planDiffWindow(
   const known = Math.max(loaded.lines.length, loaded.totalLines);
   const localAvailable = Math.min(loaded.lines.length, FILE_DIFF_MAX_UI_LINES);
   const backendAvailable = loaded.hasMoreBackend;
-  const totalAvailable = backendAvailable ? FILE_DIFF_MAX_UI_LINES : localAvailable;
+  // While backend pages are still arriving, the true total is unknown and
+  // the window may plan up to the UI hard cap; once the stream is fully
+  // consumed, the loaded total is authoritative and bounds the window.
+  const totalAvailable =
+    backendAvailable && !loaded.hunksComplete
+      ? FILE_DIFF_MAX_UI_LINES
+      : Math.min(known, FILE_DIFF_MAX_UI_LINES);
   const current = Math.max(0, Math.min(windowLimit, totalAvailable));
   const hardCapped =
     known > FILE_DIFF_MAX_UI_LINES || (backendAvailable && current >= FILE_DIFF_MAX_UI_LINES);
   const rawTarget = toEnd ? totalAvailable : current + chunk;
   const target = Math.max(current, Math.min(rawTarget, totalAvailable));
-  const needsFetch = target > localAvailable && backendAvailable;
+  const needsFetch = target > localAvailable && backendAvailable && !loaded.hunksComplete;
   return {
     target,
     localAvailable,

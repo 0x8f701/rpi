@@ -23,10 +23,10 @@ use pi_agent::{AgentEvent, ThinkingLevel};
 use pi_ai::{AssistantMessageEvent, ContentBlock, Message, Model};
 use pi_coding::{
     Application, ApplicationEvent, CONFIG_DIR_NAME, DoubleEscapeAction, ExtensionUiRequest,
-    GoalLifecycle, GoalState, JobStatus, LiveRuntimeSettings, LoopEvent, LoopTask, ProcessEvent,
+    GoalLifecycle, GoalPauseReason, GoalState, JobStatus, LiveRuntimeSettings, LoopEvent, LoopTask, ProcessEvent,
     ProcessId, ProcessKey, ProcessLogs, ProcessState, Session, SessionContextUsage,
     SessionTokenStats, SettingApplyBehavior, SettingSource, SettingsScope, StreamingBehavior,
-    TodoItem, TodoPhase, TodoStatus, ToolCallViewStatus, UiNotificationLevel, UiSelectOption,
+    TodoItem, TodoOp, TodoPhase, TodoStatus, ToolCallViewStatus, UiNotificationLevel, UiSelectOption,
     UiWidgetPlacement, WorkflowStatus,
 };
 use pi_coding::live::{
@@ -55,11 +55,12 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agents_panel::{AgentsPanel, AgentsPanelAction};
+use crate::ansi::{ansi_plain_text, parse_ansi_runs};
 use crate::clipboard::{self, ClipboardContent};
 use crate::code_review::ReviewScope;
 use crate::code_review_panel::{
-    CodeReviewController, CodeReviewPanel, CodeReviewPanelResult, render_code_review_panel,
-    sync_code_review_layout,
+    CodeReviewController, CodeReviewPanel, CodeReviewPanelResult, CommentSubmitResult,
+    MAX_PENDING_COMMENTS, render_code_review_panel, sync_code_review_layout,
 };
 use crate::extension_ui::{ExtensionUiAdapter, ExtensionUiEvent, ExtensionUiInteraction};
 use crate::file_search::{self, AtPrefix};
@@ -5729,7 +5730,7 @@ impl TuiState {
             self.shutdown_code_review().await;
             return Err(error);
         }
-        self.status = "Code review · c comment · [/] hunk · r refresh · Alt+R refork · Esc close".to_owned();
+        self.status = "Code review · c comment · [/] hunk · r refresh · Alt+R refork · Esc abort selected · q close".to_owned();
         Ok(())
     }
 
@@ -5881,60 +5882,7 @@ impl TuiState {
         self.editor.clear();
         self.scoped_model_selector = None;
         self.goal_state = application.goal_state();
-        let items = match self.goal_state.current.as_ref() {
-            None => vec![
-                PanelItem {
-                    label: "Create goal".to_owned(),
-                    description: "Enter an objective and optional token budget".to_owned(),
-                    value: PanelValue::GoalCreate,
-                    checked: true,
-                },
-                PanelItem {
-                    label: "Show details".to_owned(),
-                    description: "Confirm that no goal is active".to_owned(),
-                    value: PanelValue::GoalShow,
-                    checked: false,
-                },
-            ],
-            Some(goal) => {
-                let mut items = vec![PanelItem {
-                    label: "Show details".to_owned(),
-                    description: crate::goal_commands::format_goal_state(&self.goal_state),
-                    value: PanelValue::GoalShow,
-                    checked: true,
-                }];
-                match goal.lifecycle {
-                    GoalLifecycle::Active => items.push(PanelItem {
-                        label: "Pause".to_owned(),
-                        description: "Pause work without dropping the objective".to_owned(),
-                        value: PanelValue::GoalPause,
-                        checked: false,
-                    }),
-                    GoalLifecycle::Paused => items.push(PanelItem {
-                        label: "Resume".to_owned(),
-                        description: "Continue work toward this objective".to_owned(),
-                        value: PanelValue::GoalResume,
-                        checked: false,
-                    }),
-                    GoalLifecycle::Completed | GoalLifecycle::Dropped => {}
-                }
-                if !goal.lifecycle.is_terminal() {
-                    items.push(PanelItem {
-                        label: "Complete".to_owned(),
-                        description: "Mark the objective complete".to_owned(),
-                        value: PanelValue::GoalComplete,
-                        checked: false,
-                    });
-                    items.push(PanelItem {
-                        label: "Drop".to_owned(),
-                        description: "Permanently stop pursuing this goal".to_owned(),
-                        value: PanelValue::GoalDrop,
-                        checked: false,
-                    });
-                }
-                items
-            }
-        };
+        let items = goal_panel_items(&self.goal_state);
         self.completions.clear();
         self.completion_query = None;
         self.panel = Some(SelectorPanel {
@@ -5945,6 +5893,78 @@ impl TuiState {
             query: String::new(),
         });
         Ok(())
+    }
+}
+
+/// Panel actions offered for the current goal state. A paused goal shows a
+/// Resume action only when the pause is recoverable (manual or
+/// resume-safety); a budget-exhausted pause cannot be resumed, so no Resume
+/// action is presented that would fail. The Show details row carries the
+/// one-line state, which explains the pause reason.
+fn goal_panel_items(state: &GoalState) -> Vec<PanelItem> {
+    match state.current.as_ref() {
+        None => vec![
+            PanelItem {
+                label: "Create goal".to_owned(),
+                description: "Enter an objective and optional token budget".to_owned(),
+                value: PanelValue::GoalCreate,
+                checked: true,
+            },
+            PanelItem {
+                label: "Show details".to_owned(),
+                description: "Confirm that no goal is active".to_owned(),
+                value: PanelValue::GoalShow,
+                checked: false,
+            },
+        ],
+        Some(goal) => {
+            let mut items = vec![PanelItem {
+                label: "Show details".to_owned(),
+                description: crate::goal_commands::format_goal_state(state),
+                value: PanelValue::GoalShow,
+                checked: true,
+            }];
+            match goal.lifecycle {
+                GoalLifecycle::Active => items.push(PanelItem {
+                    label: "Pause".to_owned(),
+                    description: "Pause work without dropping the objective".to_owned(),
+                    value: PanelValue::GoalPause,
+                    checked: false,
+                }),
+                GoalLifecycle::Paused => match goal.pause_reason {
+                    Some(GoalPauseReason::BudgetExhausted) => {}
+                    Some(GoalPauseReason::ResumeSafety) => items.push(PanelItem {
+                        label: "Resume".to_owned(),
+                        description: "Session resumed; continue work toward this objective"
+                            .to_owned(),
+                        value: PanelValue::GoalResume,
+                        checked: false,
+                    }),
+                    _ => items.push(PanelItem {
+                        label: "Resume".to_owned(),
+                        description: "Continue work toward this objective".to_owned(),
+                        value: PanelValue::GoalResume,
+                        checked: false,
+                    }),
+                },
+                GoalLifecycle::Completed | GoalLifecycle::Dropped => {}
+            }
+            if !goal.lifecycle.is_terminal() {
+                items.push(PanelItem {
+                    label: "Complete".to_owned(),
+                    description: "Mark the objective complete".to_owned(),
+                    value: PanelValue::GoalComplete,
+                    checked: false,
+                });
+                items.push(PanelItem {
+                    label: "Drop".to_owned(),
+                    description: "Permanently stop pursuing this goal".to_owned(),
+                    value: PanelValue::GoalDrop,
+                    checked: false,
+                });
+            }
+            items
+        }
     }
 }
 
@@ -6777,7 +6797,7 @@ fn handle_todo_dag_panel_key(state: &mut TuiState,
     Some(false)
 }
 
-fn submit_code_review_comment(state: &mut TuiState) -> bool {
+fn submit_code_review_comment(state: &mut TuiState) -> CommentSubmitResult {
     let Some((snapshot, file, hunk, comment)) = state.code_review_panel.as_ref().and_then(|panel| {
         Some((
             panel.snapshot().clone(),
@@ -6786,19 +6806,38 @@ fn submit_code_review_comment(state: &mut TuiState) -> bool {
             panel.comment_editor()?.to_owned(),
         ))
     }) else {
-        return false;
+        return CommentSubmitResult::Failed;
     };
-    let accepted = state
+    let result = state
         .code_review_controller
         .as_mut()
-        .is_some_and(|controller| controller.submit_comment(&snapshot, &file, &hunk, &comment));
+        .map(|controller| controller.submit_comment(&snapshot, &file, &hunk, &comment))
+        .unwrap_or(CommentSubmitResult::Failed);
     if let Some(panel) = state.code_review_panel.as_mut() {
-        panel.complete_comment_submit(accepted);
+        panel.complete_comment_submit(result);
         if let Some(controller) = state.code_review_controller.as_ref() {
             panel.sync_controller(controller);
         }
     }
-    accepted
+    result
+}
+
+/// Status line for a code-review comment submission result. Each rejection
+/// names its cause truthfully: a full FIFO surfaces the bounded queue cap
+/// with wait-or-abort guidance, a failed agent start is reported as such, and
+/// an empty draft says so. The draft itself is kept by the panel for every
+/// non-Accepted result.
+fn code_review_submit_status(result: CommentSubmitResult) -> String {
+    match result {
+        CommentSubmitResult::Accepted => "Code review comment submitted".to_owned(),
+        CommentSubmitResult::Empty => "Code review comment draft is empty · draft kept".to_owned(),
+        CommentSubmitResult::QueueFull => format!(
+            "Code review queue full ({MAX_PENDING_COMMENTS} pending) · wait or Esc to abort selected hunk"
+        ),
+        CommentSubmitResult::Failed => {
+            "Code review failed: the review agent could not start · draft kept".to_owned()
+        }
+    }
 }
 
 async fn handle_code_review_panel_key(
@@ -6818,20 +6857,25 @@ async fn handle_code_review_panel_key(
             state.close_code_review_panel(terminal)?;
         }
         CodeReviewPanelResult::SubmitComment => {
-            if submit_code_review_comment(state) {
-                state.status = "Code review comment submitted".to_owned();
-            } else {
-                state.status = "Code review busy · draft kept".to_owned();
-            }
+            state.status = code_review_submit_status(submit_code_review_comment(state));
         }
         CodeReviewPanelResult::AbortReview => {
+            let identity = state
+                .code_review_panel
+                .as_ref()
+                .and_then(CodeReviewPanel::selected_hunk_identity);
             if let Some(controller) = state.code_review_controller.as_mut() {
-                controller.abort().await;
+                if let Some(identity) = identity {
+                    controller.abort_hunk(&identity).await;
+                    state.status = "Code review hunk aborted".to_owned();
+                } else {
+                    // No selected identity: full abort remains the close/shutdown path only.
+                    state.status = "No selected hunk to abort".to_owned();
+                }
                 if let Some(panel) = state.code_review_panel.as_mut() {
                     panel.sync_controller(controller);
                 }
             }
-            state.status = "Code review aborted".to_owned();
         }
         CodeReviewPanelResult::Refork => {
             if let Some(controller) = state.code_review_controller.as_mut() {
@@ -6847,7 +6891,7 @@ async fn handle_code_review_panel_key(
             state.status = "Refreshing code review…".to_owned();
         }
         CodeReviewPanelResult::Busy => {
-            state.status = "Code review busy · wait or Esc to abort".to_owned();
+            state.status = "Code review hunk busy · wait or Esc to abort selected".to_owned();
         }
         CodeReviewPanelResult::Unknown => state.status = overlay_unknown_key_status(key),
         CodeReviewPanelResult::Handled => {}
@@ -7974,7 +8018,11 @@ fn handle_paste(state: &mut TuiState, payload: &str) {
     // non-capturing extension overlay does NOT capture: the paste reaches the
     // composer, the single input owner.
     if page_overlay_capturing(state) {
-        state.set_bounded_status("Paste consumed by active overlay".to_owned());
+        // The paste was NOT applied and is not recoverable, so the bounded
+        // hint must say both facts: it was dropped, and how to retry it.
+        state.set_bounded_status(
+            "Paste not applied · Esc closes the active overlay, then paste again".to_owned(),
+        );
         return;
     }
     state.handle_paste(payload);
@@ -8804,9 +8852,26 @@ fn reject_missing_required_arguments(state: &mut TuiState, name: &str, arg: Opti
     true
 }
 
-/// `/todo list` (and bare `/todo`) open the TodoDagPanel page; any other
-/// argument is parsed as todo markdown and applied to the session. The TUI
-/// keeps the text list path for non-TUI callers (REPL/print/RPC).
+/// Full `/todo` usage shown when an operation verb is missing its task or the
+/// argument is neither a known verb nor todo markdown.
+const TODO_SLASH_USAGE: &str =
+    "Usage: /todo [list|start <task>|done <task>|drop <task>|clear|<markdown>] \
+     (task text matches exactly, spaces allowed; <markdown> sets the plan)";
+
+/// Honest explanation for `/todo block`/`unblock`: the model has no manual
+/// blocked status — tasks are blocked only while an unfinished dependency
+/// holds them (`depends_on`), so dependency blocking is managed through the
+/// todo tool/API, never invented by a slash op.
+const TODO_BLOCKING_NOTE: &str =
+    "block/unblock: tasks are blocked only by unfinished dependencies (depends_on); \
+     there is no manual blocked status — manage dependencies via the todo tool/API";
+
+/// `/todo list` (and bare `/todo`) open the TodoDagPanel page; the verbs
+/// `start|done|drop <exact task>` and `clear` apply the matching
+/// [`pi_coding::TodoOp`] through the application; `block`/`unblock` explain
+/// dependency-derived blocking; any other argument is parsed as todo
+/// markdown and replaces the session plan. The TUI keeps the text list path
+/// for non-TUI callers (REPL/print/RPC).
 fn dispatch_todo_command(
     application: &Application,
     state: &mut TuiState,
@@ -8818,8 +8883,21 @@ fn dispatch_todo_command(
         state.open_todo_dag_panel(application, mouse)?;
         return Ok(true);
     }
-    let markdown = argument.expect("non-list todo argument");
-    match pi_coding::parse_todo_markdown(markdown) {
+    let argument = argument.expect("non-list todo argument").trim();
+    match parse_todo_slash_op(argument) {
+        Some(Ok(op)) => return apply_todo_op(application, state, op),
+        Some(Err(message)) => {
+            state.push_status(message.to_owned(), true);
+            return Ok(true);
+        }
+        None => {}
+    }
+    // Not a recognized verb: either a markdown plan or an unknown operation.
+    if !looks_like_todo_markdown(argument) {
+        state.push_status(TODO_SLASH_USAGE.to_owned(), true);
+        return Ok(true);
+    }
+    match pi_coding::parse_todo_markdown(argument) {
         Ok(phases) => match application.set_todos(phases) {
             Ok(result) => {
                 state.todo_phases = result.phases;
@@ -8836,6 +8914,68 @@ fn dispatch_todo_command(
             Ok(true)
         }
     }
+}
+
+/// Apply a human `/todo` verb op through the application and mirror the
+/// resulting phases into the TUI state (same contract as the markdown path).
+fn apply_todo_op(application: &Application, state: &mut TuiState, op: TodoOp) -> Result<bool> {
+    match application.apply_todo(op) {
+        Ok(result) => {
+            state.todo_phases = result.phases;
+            state.push_status(format!("Todo: {}", result.summary), false);
+            Ok(true)
+        }
+        Err(error) => {
+            state.push_status(format!("Failed to apply todo: {error:#}"), true);
+            Ok(true)
+        }
+    }
+}
+
+/// Parse a human `/todo` slash verb. `None` means the argument is not a verb
+/// (it may be a markdown plan); `Some(Err(message))` means it looked like a
+/// verb but is malformed — an unknown or task-less operation gets the full
+/// usage, `block`/`unblock` get the dependency-blocking note.
+fn parse_todo_slash_op(argument: &str) -> Option<Result<TodoOp, &'static str>> {
+    let (verb, rest) = match argument.split_once(char::is_whitespace) {
+        Some((verb, rest)) => (verb, rest.trim()),
+        None => (argument, ""),
+    };
+    let verb = verb.to_ascii_lowercase();
+    match verb.as_str() {
+        "start" | "done" | "drop" => {
+            if rest.is_empty() {
+                return Some(Err(TODO_SLASH_USAGE));
+            }
+            let op = match verb.as_str() {
+                "start" => TodoOp::Start { task: rest.to_owned() },
+                "done" => TodoOp::Done { task: Some(rest.to_owned()), phase: None },
+                _ => TodoOp::Drop { task: Some(rest.to_owned()), phase: None },
+            };
+            Some(Ok(op))
+        }
+        "clear" => {
+            if !rest.is_empty() {
+                return Some(Err(TODO_SLASH_USAGE));
+            }
+            Some(Ok(TodoOp::Rm { task: None, phase: None, cascade: true }))
+        }
+        "block" | "unblock" => Some(Err(TODO_BLOCKING_NOTE)),
+        _ => None,
+    }
+}
+
+/// Whether a `/todo` argument looks like a markdown plan: a heading (`#`) or
+/// a checklist item (`- ` / `* ` / `+ `) on its first non-empty line. Markdown
+/// never starts with a bare word, so anything else is an unknown operation.
+fn looks_like_todo_markdown(argument: &str) -> bool {
+    argument
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            let line = line.trim_start();
+            line.starts_with('#') || line.starts_with("- ") || line.starts_with("* ") || line.starts_with("+ ")
+        })
 }
 
 /// `/queue` — surface the pending steering/follow-up queue and (with
@@ -10849,6 +10989,8 @@ fn steering_preview(text: &str) -> String {
 ///
 /// - pending follow-up prompts → `/queue` (inspect or cancel them),
 /// - an active session goal → `/goal`,
+/// - a paused goal → `/goal resume` when the pause is recoverable
+///   (manual/resume-safety), otherwise `/goal` (budget exhausted),
 /// - live workflows → `/workflow list`.
 ///
 /// Returns `None` when nothing applies so the idle row stays blank.
@@ -10857,13 +10999,16 @@ fn next_suggestion(state: &TuiState) -> Option<String> {
     if state.queued_follow_up > 0 {
         parts.push("/queue");
     }
-    if state
-        .goal_state
-        .current
-        .as_ref()
-        .is_some_and(|goal| goal.lifecycle == GoalLifecycle::Active)
-    {
-        parts.push("/goal");
+    match state.goal_state.current.as_ref() {
+        Some(goal) if goal.lifecycle == GoalLifecycle::Active => parts.push("/goal"),
+        Some(goal) if goal.lifecycle == GoalLifecycle::Paused => {
+            if goal.pause_reason == Some(GoalPauseReason::BudgetExhausted) {
+                parts.push("/goal");
+            } else {
+                parts.push("/goal resume");
+            }
+        }
+        _ => {}
     }
     if state
         .workflow_snapshots
@@ -10953,7 +11098,8 @@ fn composer_token_k(n: i64) -> String {
 /// the activity text truncated to the row width, and a `⟦esc⟧` hint when the
 /// activity can be aborted with Esc. Idle renders a subtle deterministic
 /// `Next:` suggestion ([`next_suggestion`] — dim, one line, no spinner,
-/// derived from state: pending follow-ups, an active goal, or live
+/// derived from state: pending follow-ups, the session goal (active or
+/// paused), or live
 /// workflows) when one applies, otherwise an empty line: the row is always
 /// always reserved by the layout so the input box never sits flush against content
 /// above it. Visible status text reserves a second row beneath it so the text
@@ -13585,18 +13731,32 @@ fn render_tool_card(lines: &mut Vec<Line<'static>>, tool: &ToolTranscript, expan
             }
             ToolCardRowRole::Error => theme.error,
         };
-        for text in clean_terminal_text(&redact_secrets(&row.text)).lines() {
-            if row.role == ToolCardRowRole::Content
-                && let Some(language) = card.code_language.as_deref()
-            {
+        if row.role == ToolCardRowRole::Content
+            && let Some(language) = card.code_language.as_deref()
+        {
+            // Syntax-highlighted content (read/write/edit with a trusted
+            // file extension): keep the existing hljs-style spans; the
+            // text is cleaned of control sequences before highlighting.
+            for text in clean_terminal_text(&redact_secrets(&row.text)).lines() {
                 for line in wrap_styled_line(
                     Line::from(markdown_syntax_spans(text, Some(language), code_styles)),
                     inner.saturating_sub(2).max(1),
                 ) {
                     push_tool_box_line(lines, line, border, inner);
                 }
-            } else {
-                push_tool_box_row(lines, text, color, border, inner);
+            }
+        } else {
+            // Output rows: ANSI SGR styling through the shared parser.
+            // Newlines become separate card rows (style carries across),
+            // each wrapped by the width-safe wrapper. Titles/args stay
+            // cleaned plain text. Redaction is fail-closed inside
+            // ansi_styled_lines (parse raw -> redact full plain).
+            for line in ansi_styled_lines(
+                &row.text,
+                Style::default().fg(color),
+                inner.saturating_sub(2).max(1),
+            ) {
+                push_tool_box_line(lines, line, border, inner);
             }
         }
     }
@@ -13815,6 +13975,78 @@ fn push_tool_box_row(lines: &mut Vec<Line<'static>>, text: &str, color: Color, b
     }
 }
 
+/// Render untrusted tool/bash output text as width-wrapped styled lines.
+///
+/// The one-pass ANSI parser ([`crate::ansi::parse_ansi_runs`]) turns SGR runs
+/// into styled spans; newlines split into separate card rows (matching the
+/// previous plain-text flattening), with SGR state carrying across the split
+/// so a color opened on one logical line continues onto the next. Each row is
+/// then wrapped with the existing width-safe wrapper and is ready for
+/// [`push_tool_box_line`]. Titles, arguments, and metadata still go through
+/// `clean_terminal_text` plain text; only this output path is styled.
+///
+/// Redaction is FAIL-CLOSED: the raw input is parsed first and the full
+/// plain text is then redacted. If redaction changed anything, a credential
+/// shape was present — possibly split across an SGR boundary in the raw
+/// input — so the whole row collapses to one base-style plain run of the
+/// redacted text; styled spans can never carry a secret.
+fn ansi_styled_lines(text: &str, base: Style, width: usize) -> Vec<Line<'static>> {
+    // `str::lines` drops a single trailing newline; mirror that so the styled
+    // path renders the same rows as the old plain flattening.
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let runs = parse_ansi_runs(text);
+    let plain: String = runs.iter().map(|run| run.text.as_str()).collect();
+    let redacted = redact_secrets(&plain);
+    let styled: Vec<(String, Style)> = if redacted != plain {
+        if redacted.is_empty() {
+            return Vec::new();
+        }
+        vec![(redacted, base)]
+    } else {
+        runs.into_iter()
+            .map(|run| {
+                let mut style = base;
+                if let Some(fg) = run.fg {
+                    style = style.fg(fg);
+                }
+                if let Some(bg) = run.bg {
+                    style = style.bg(bg);
+                }
+                style = style.add_modifier(run.modifier);
+                (run.text, style)
+            })
+            .collect()
+    };
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut saw_text = false;
+    for (text, style) in styled {
+        if text.is_empty() {
+            continue;
+        }
+        saw_text = true;
+        let mut segments = text.split('\n');
+        if let Some(first) = segments.next() {
+            if !first.is_empty() {
+                rows.last_mut().expect("one styled row").push(Span::styled(first.to_owned(), style));
+            }
+        }
+        for segment in segments {
+            rows.push(Vec::new());
+            if !segment.is_empty() {
+                rows.last_mut().expect("one styled row").push(Span::styled(segment.to_owned(), style));
+            }
+        }
+    }
+    if !saw_text {
+        // Nothing but control sequences (or empty input): no card rows, same
+        // as the old `cleaned.lines()` flattening.
+        return Vec::new();
+    }
+    rows.into_iter()
+        .flat_map(|spans| wrap_styled_line(Line::from(spans), width.max(1)))
+        .collect()
+}
+
 fn transcript_block_has_content(block: &ContentBlock) -> bool {
     match block {
         ContentBlock::Text { text, .. } => !text.trim().is_empty(),
@@ -13904,6 +14136,39 @@ fn render_irc_transcript_entry(
 /// fold card — the first rows plus an ellipsis marker, the full description
 /// stays in the session record. Mirrors the tool-card output fold.
 const IMAGE_ANALYSIS_LINE_LIMIT: usize = 6;
+
+/// Maximum rows one user text block may render in the transcript. A large
+/// pasted/fenced block (up to the 1 MiB `MAX_PASTE_BYTES` ceiling) would
+/// otherwise materialize one row per payload line into the render buffer
+/// every frame; the card keeps a bounded head plus a fold marker, and the
+/// final row cap reserves slots for the optional frame bottom and the marker
+/// so kept head + frame bottom + marker never exceed this limit (Web
+/// large-paste-preview parity). Storage keeps the full text — only the
+/// rendered card is bounded.
+const USER_CARD_RENDER_ROW_LIMIT: usize = 120;
+
+/// Maximum source lines of one user text block fed to the line-driven
+/// markdown renderer. The fold applies it only over the byte-bounded head
+/// ([`USER_CARD_TEXT_CHAR_BUDGET`] first), so the renderer never walks more
+/// than this many lines AND never scans the payload tail to count them —
+/// the omitted-line count is known exactly only when the head holds the
+/// whole (at most 16 KiB) text.
+const USER_CARD_TEXT_LINE_BUDGET: usize = 120;
+
+/// Maximum bytes of one user text block's rendering head, regardless of
+/// source-line count. The line budget alone cannot bound a megabyte block
+/// that arrives as ONE line (a paste with no newlines): a line scan would
+/// walk the whole payload, which would then survive into the cleaner and
+/// the line-driven markdown pass and inflate to thousands of painted rows
+/// during the grapheme re-wrap. So this budget is the FIRST cut, applied to
+/// the raw text before any full-payload line scan, count, join, or markdown
+/// work: it takes a grapheme-safe prefix (never splitting a multi-byte UTF-8
+/// sequence or grapheme cluster) and the unbounded tail is never walked.
+/// Bytes are the conservative unit — every grapheme is at least one byte,
+/// so a byte cap is always a grapheme cap — and 16 KiB is comfortably above
+/// any realistic multi-line message (the 120-line budget at 80 chars/line is
+/// ~9.6 KiB), so normal content is unaffected.
+const USER_CARD_TEXT_CHAR_BUDGET: usize = 16 * 1024;
 
 /// The exact wire marker the backend's vision-delegation path emits when an
 /// active model lacks image support and a vision model is configured: one
@@ -14225,10 +14490,41 @@ fn render_transcript_entry_inner(
                         )
                     }
                 };
-                let sanitized = clean_terminal_text(text);
-                let mut rendered = if entry.kind == TranscriptKind::User {
-                    render_markdown(&sanitized, theme, base, width)
+                let rendered = if entry.kind == TranscriptKind::User {
+                    // Bounded projection for the user card: a large
+                    // pasted/fenced block (up to the `MAX_PASTE_BYTES`
+                    // ceiling) is cut to a grapheme-safe byte-bounded head
+                    // FIRST — before any full-payload line scan, count,
+                    // join, sanitize, or markdown work — then folded by the
+                    // line budget over that bounded head. The final row cap
+                    // reserves slots for the optional frame bottom and the
+                    // fold marker so kept head + frame bottom + marker never
+                    // exceed `USER_CARD_RENDER_ROW_LIMIT`, and the marker
+                    // reports what the bounded work actually knows (byte-cut
+                    // content as `… more content`, folded source lines as
+                    // `… N more lines`, capped painted rows as `… N more
+                    // rows`). Storage keeps the full text in the session
+                    // record.
+                    let (head, fold_omission) =
+                        fold_user_text_head(text, USER_CARD_TEXT_LINE_BUDGET);
+                    let sanitized = clean_terminal_text(&head);
+                    let markdown_lines = render_markdown(&sanitized, theme, base, width);
+                    let mut wrapped = render_user_card_lines(markdown_lines, width);
+                    let painted_omitted = bound_user_card_rendered_rows(
+                        &mut wrapped,
+                        theme,
+                        width,
+                        fold_omission.any(),
+                    );
+                    if let Some(marker) = user_card_fold_marker(fold_omission, painted_omitted) {
+                        wrapped.push(Line::from(Span::styled(
+                            marker,
+                            Style::default().fg(theme.dim),
+                        )));
+                    }
+                    wrapped
                 } else {
+                    let sanitized = clean_terminal_text(text);
                     render_transcript_markdown(
                         &sanitized,
                         theme,
@@ -14236,9 +14532,6 @@ fn render_transcript_entry_inner(
                         width,
                         entry.is_partial)
                 };
-                if entry.kind == TranscriptKind::User {
-                    rendered = render_user_card_lines(rendered, width);
-                }
                 lines.extend(rendered);
                 visible_blocks += 1;
                 previous_was_thinking = false;
@@ -14363,6 +14656,181 @@ fn render_transcript_entry_inner(
 
 fn user_card_vertical_padding(width: u16) -> Line<'static> {
     Line::from(Span::raw(" ".repeat(usize::from(width.max(1)))))
+}
+
+/// Omission facts learned by the bounded user-card fold. Line counts are
+/// only ever computed over the byte-bounded head (at most
+/// [`USER_CARD_TEXT_CHAR_BUDGET`] bytes); the payload tail is never scanned
+/// to count what the byte cut hid, so that omission is reported as a boolean
+/// instead of a fabricated line count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FoldOmission {
+    /// True when the byte budget cut the head: the tail's size is known but
+    /// its line structure is not without a full scan, so the fold marker
+    /// says `… more content` rather than a count.
+    bytes: bool,
+    /// Source lines cut by the line budget over the bounded head. Exact when
+    /// the head holds the whole text (no byte cut); merely informational
+    /// when the byte budget cut first (the tail's lines are uncounted).
+    lines: usize,
+}
+
+impl FoldOmission {
+    const NONE: FoldOmission = FoldOmission {
+        bytes: false,
+        lines: 0,
+    };
+
+    fn any(self) -> bool {
+        self.bytes || self.lines > 0
+    }
+}
+
+/// Builds the truthful fold marker for a user card: `… more content` when
+/// the byte budget cut the head (the omitted tail's line count is unknown
+/// without scanning it), `… N more lines` when the line budget folded a
+/// known number of source lines over the bounded head, and `… N more rows`
+/// when the final row cap dropped exactly N painted rows (the count always
+/// matches the dropped painted rows). Returns `None` when nothing was
+/// omitted.
+fn user_card_fold_marker(omission: FoldOmission, painted_omitted: usize) -> Option<String> {
+    if omission.bytes {
+        return Some("… more content".to_owned());
+    }
+    if omission.lines > 0 {
+        return Some(format!("… {} more lines", omission.lines));
+    }
+    if painted_omitted > 0 {
+        return Some(format!("… {painted_omitted} more rows"));
+    }
+    None
+}
+
+/// Folds a user text block to a bounded head for rendering. The text is
+/// FIRST cut to at most [`USER_CARD_TEXT_CHAR_BUDGET`] bytes at a grapheme
+/// boundary — before any full-payload line scan, count, or join — so a
+/// megabyte newline-free paste is never walked in full; only then is the
+/// line budget applied over that bounded head (at most `line_budget` source
+/// lines, each counted without touching the tail). A fence left open at the
+/// cut is closed synthetically so `render_markdown` always emits a real
+/// frame bottom. Returns the head text and the omission facts learned from
+/// the bounded work. Only the rendered card is bounded — the session record
+/// keeps the full text.
+fn fold_user_text_head(text: &str, line_budget: usize) -> (Cow<'_, str>, FoldOmission) {
+    // Byte-bound first: a grapheme-safe prefix of at most
+    // USER_CARD_TEXT_CHAR_BUDGET bytes. The grapheme scan is lazy and stops
+    // at the budget, so the unbounded tail is never walked.
+    let (prefix, cut) = truncate_head_graphemes(text, USER_CARD_TEXT_CHAR_BUDGET);
+    // Line fold over the bounded prefix only: `lines.count()` walks at most
+    // USER_CARD_TEXT_CHAR_BUDGET bytes, never the payload tail.
+    let mut lines = prefix.lines();
+    let head: Vec<&str> = lines.by_ref().take(line_budget).collect();
+    let remaining = lines.count();
+    if cut.is_none() && remaining == 0 {
+        return (Cow::Borrowed(text), FoldOmission::NONE);
+    }
+    let mut fenced = false;
+    for line in &head {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        }
+    }
+    let mut out = head.join("\n");
+    if fenced {
+        // The fold cut inside a fence: close it so the frame renders a real
+        // bottom instead of leaving body rows dangling.
+        out.push_str("\n```");
+    }
+    (
+        Cow::Owned(out),
+        FoldOmission {
+            bytes: cut.is_some(),
+            lines: remaining,
+        },
+    )
+}
+
+/// Truncates `text` to at most `budget` bytes at a grapheme boundary, so a
+/// multi-byte UTF-8 sequence or grapheme cluster is never split. The
+/// grapheme scan is lazy and stops at the budget, so the unbounded tail of a
+/// megabyte paste is never walked. Returns the bounded head and, when a cut
+/// happened, the byte offset of the cut (the caller uses `is_some` to flag
+/// byte-cut omission; it never counts the uncounted tail). Every grapheme is
+/// at least one byte, so a byte fit is always a grapheme fit.
+fn truncate_head_graphemes(text: &str, budget: usize) -> (Cow<'_, str>, Option<usize>) {
+    if text.len() <= budget {
+        return (Cow::Borrowed(text), None);
+    }
+    let mut cut = text.len();
+    for (start, grapheme) in text.grapheme_indices(true) {
+        if start + grapheme.len() > budget {
+            cut = start;
+            break;
+        }
+    }
+    if cut == text.len() {
+        return (Cow::Borrowed(text), None);
+    }
+    (Cow::Owned(text[..cut].to_owned()), Some(cut))
+}
+
+/// Bounds a user card's painted rows in place so the final card — kept
+/// head, optional frame bottom, and fold marker — never exceeds
+/// [`USER_CARD_RENDER_ROW_LIMIT`] rows. When `marker_reserved` (any bounded
+/// fold omission exists) or the cap itself must drop rows, a fold marker
+/// will be shown, so the cap keeps at most `LIMIT - 1` original rows and
+/// reserves one more slot for a synthetic frame bottom when the cut lands
+/// inside an open code fence (no side-bordered row may dangle). Returns the
+/// exact number of ORIGINAL painted rows dropped — the count the fold
+/// marker reports as `… N more rows`. The full payload stays in the session
+/// record.
+fn bound_user_card_rendered_rows(
+    rendered: &mut Vec<Line<'static>>,
+    theme: Theme,
+    width: u16,
+    marker_reserved: bool,
+) -> usize {
+    // Nothing to drop and no marker coming: leave the card untouched.
+    if rendered.len() <= USER_CARD_RENDER_ROW_LIMIT && !marker_reserved {
+        return 0;
+    }
+    // From here a fold marker will be shown (one already exists from the
+    // bounded fold, or this cap is about to create one), so the cap leaves
+    // one slot for it and one more for a frame bottom when the cut lands
+    // inside an open fence.
+    let keep_base = USER_CARD_RENDER_ROW_LIMIT - 1;
+    let cut_inside_fence = rendered.len() > keep_base
+        && (rendered
+            .get(keep_base.saturating_sub(1))
+            .is_some_and(is_fence_body_row)
+            || rendered.get(keep_base).is_some_and(is_fence_body_row));
+    let keep = keep_base - usize::from(cut_inside_fence);
+    let omitted = rendered.len().saturating_sub(keep);
+    rendered.truncate(keep);
+    if cut_inside_fence {
+        // The cut landed inside a fenced block: cap the frame with a real
+        // bottom border (the same shape `render_markdown` emits for a closed
+        // fence) so the head never dangles side-bordered rows.
+        let frame_width = usize::from(width.max(1)).saturating_sub(1).max(1);
+        rendered.push(Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(frame_width.saturating_sub(2))),
+            Style::default().fg(theme.tool_card_border),
+        )));
+    }
+    omitted
+}
+
+/// A `render_markdown` code-frame body row: `│ … │`. These are the only rows
+/// with a trailing side border (blockquote rows start with `│ ` but never
+/// end with one), so this detects a fold cut that lands inside an open
+/// fence. The user-card re-wrap appends one trailing padding cell to every
+/// painted row, so the trailing border is matched after trimming that.
+fn is_fence_body_row(line: &Line<'_>) -> bool {
+    let mut text = String::new();
+    for span in &line.spans {
+        text.push_str(span.content.as_ref());
+    }
+    text.starts_with("│ ") && text.trim_end().ends_with(" │")
 }
 
 fn render_user_card_lines(rendered: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
@@ -15781,44 +16249,14 @@ fn is_markdown_rule(text: &str) -> bool {
             .all(|character| character == '-' || character == '*' || character == '_')
 }
 
+/// Strip terminal control sequences from untrusted text, expanding tabs to
+/// four spaces, so the result is safe to display as plain text (titles, args,
+/// editor content, exports). This is the plain-text projection of the shared
+/// one-pass ANSI parser ([`crate::ansi::parse_ansi_runs`] /
+/// [`ansi_plain_text`]), so the plain and styled display paths are
+/// byte-identical by construction.
 pub(crate) fn clean_terminal_text(text: &str) -> String {
-    let mut clean = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\u{1b}' {
-            // CSI cursor controls and OSC8 hyperlinks are stripped; a bare ESC
-            // not opening a sequence is dropped without swallowing the next
-            // character, so trailing plain text survives (ESC <plain> -> <plain>).
-            match characters.peek() {
-                Some('[') => {
-                    characters.next();
-                    for value in characters.by_ref() {
-                        if ('@'..='~').contains(&value) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    characters.next();
-                    while let Some(value) = characters.next() {
-                        if value == '\u{7}' {
-                            break;
-                        }
-                        if value == '\u{1b}' && characters.peek() == Some(&'\\') {
-                            characters.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        } else if character == '\t' {
-            clean.push_str("    ");
-        } else if character == '\n' || !character.is_control() {
-            clean.push(character);
-        }
-    }
-    clean
+    ansi_plain_text(text)
 }
 
 fn normalize_newlines(text: &str) -> Cow<'_, str> {
@@ -17735,6 +18173,334 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(plain[0].trim_end(), "🙂🙂🙂🙂");
         assert_eq!(plain[1].trim_end(), "🙂abc");
+    }
+
+    #[test]
+    fn user_card_bounds_megabyte_fenced_block_with_fold_marker() {
+        // A 1 MiB fenced/wrapped user block (the `MAX_PASTE_BYTES` paste
+        // ceiling) must not materialize one row per payload line through the
+        // real projection helper: the card keeps a bounded head with a
+        // byte-truncation `… more content` fold marker and never renders the
+        // payload tail. Storage keeps the full text; only the rendered card
+        // is bounded.
+        let line = format!("let value = 0x0f; // {}", "x".repeat(80));
+        let body = std::iter::repeat_n(line.as_str(), 10_500)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.len() >= MAX_PASTE_BYTES, "fixture must reach the paste ceiling");
+        let tail_sentinel = "PAYLOAD_TAIL_SENTINEL_9f3c";
+        let payload = format!("```rust\n{body}\n{tail_sentinel}\n```");
+        assert!(payload.len() >= MAX_PASTE_BYTES);
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text(payload)],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+
+        // Bounded: a fixed-size card, not one row per payload line. The card
+        // is exactly two vertical padding rows around at most
+        // `USER_CARD_RENDER_ROW_LIMIT` content rows (kept head + frame
+        // bottom + fold marker) — the cap reserves both slots.
+        assert!(
+            lines.len() <= USER_CARD_RENDER_ROW_LIMIT + 2,
+            "user card must stay bounded: {} rows for a 1 MiB block (limit {} + 2 padding)",
+            lines.len(),
+            USER_CARD_RENDER_ROW_LIMIT
+        );
+        assert!(
+            lines.len().saturating_sub(2) <= USER_CARD_RENDER_ROW_LIMIT,
+            "card content rows must respect the row limit"
+        );
+        // No full-payload output: the payload tail never reaches the card.
+        let plain = lines.iter().map(rendered_line_text).collect::<String>();
+        assert!(
+            !plain.contains(tail_sentinel),
+            "fold must drop the payload tail: {plain}"
+        );
+        // The byte budget cut the head inside the fence, so the marker is
+        // the truthful byte-truncation shape: the tail's line count is
+        // unknown without scanning it, and no fake line/row count may be
+        // claimed.
+        let marker = lines
+            .iter()
+            .map(rendered_line_text)
+            .position(|row| row.contains("… more content"))
+            .expect("fold marker must render");
+        assert!(
+            !plain.contains("more lines") && !plain.contains("more rows"),
+            "byte-cut marker must not fake a count: {plain}"
+        );
+        // The cut landed inside the fence, so the head frame is capped with
+        // a real bottom border directly above the marker — no dangling
+        // side-bordered rows.
+        assert!(
+            rendered_line_text(&lines[marker - 1]).starts_with('╰'),
+            "frame bottom must close the folded head: {:?}",
+            lines[marker - 1]
+        );
+        // The card structure stays intact: symmetric padding edges and the
+        // styled card background on every row.
+        assert!(lines.first().is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty())));
+        assert!(lines.last().is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty())));
+        assert!(lines.iter().flat_map(|line| &line.spans).all(|span| {
+            span.style.bg == Some(crate::theme::DARK.user_message_bg)
+        }));
+    }
+
+    #[test]
+    fn user_card_bounds_megabyte_single_line_block_with_fold_marker() {
+        // A 1 MiB SINGLE-LINE (unfenced) user block bypasses the source-line
+        // fold: the payload has no newlines, so the line budget keeps all of
+        // it. The byte budget must cut the head FIRST (before any full
+        // line scan, join, or markdown walk of the megabyte), and the final
+        // row cap must bound the painted rows while keeping the fold marker
+        // visible and the payload tail out of the card.
+        let line = format!("let value = 0x0f; // {}", "x".repeat(80));
+        let mut body = String::with_capacity(MAX_PASTE_BYTES + line.len());
+        while body.len() < MAX_PASTE_BYTES {
+            body.push_str(&line);
+        }
+        let tail_sentinel = "PAYLOAD_TAIL_SENTINEL_9f3c";
+        let payload = format!("{body}{tail_sentinel}");
+        assert!(payload.len() >= MAX_PASTE_BYTES, "fixture must reach the paste ceiling");
+        assert!(!payload.contains('\n'), "fixture must be a single unfenced line");
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text(payload)],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+
+        // Strictly bounded: the card is exactly two vertical padding rows
+        // around at most `USER_CARD_RENDER_ROW_LIMIT` content rows — not one
+        // row per wrapped payload chunk.
+        assert!(
+            lines.len() <= USER_CARD_RENDER_ROW_LIMIT + 2,
+            "user card must stay bounded: {} rows for a 1 MiB single-line block (limit {} + 2 padding)",
+            lines.len(),
+            USER_CARD_RENDER_ROW_LIMIT
+        );
+        assert!(
+            lines.len().saturating_sub(2) <= USER_CARD_RENDER_ROW_LIMIT,
+            "card content rows must respect the row limit"
+        );
+        // No full-payload output: the payload tail never reaches the card.
+        let plain = lines.iter().map(rendered_line_text).collect::<String>();
+        assert!(
+            !plain.contains(tail_sentinel),
+            "fold must drop the payload tail: {plain}"
+        );
+        // The byte budget cut the newline-free head, so the marker is the
+        // truthful byte-truncation shape: the omitted tail is one line of
+        // unknown length, and no fake line/row count may be claimed (the old
+        // code reported a count from scanning the whole megabyte).
+        let marker = lines
+            .iter()
+            .map(rendered_line_text)
+            .position(|row| row.contains("… more content"))
+            .expect("fold marker must render");
+        assert!(
+            !plain.contains("more lines") && !plain.contains("more rows"),
+            "byte-cut marker must not fake a count: {plain}"
+        );
+        // The card structure stays intact: symmetric padding edges and the
+        // styled card background on every row.
+        assert!(lines.first().is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty())));
+        assert!(lines.last().is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty())));
+        assert!(lines.iter().flat_map(|line| &line.spans).all(|span| {
+            span.style.bg == Some(crate::theme::DARK.user_message_bg)
+        }));
+    }
+
+    #[test]
+    fn user_card_bounds_megabyte_multibyte_single_line_block_with_fold_marker() {
+        // A 1 MiB SINGLE-LINE block of multi-byte/combined graphemes (a ZWJ
+        // family) must be cut by the byte budget at a grapheme boundary: the
+        // rendered card stays bounded, the payload tail never reaches it,
+        // and no cluster is split — the head is a clean prefix ending on a
+        // whole grapheme even when the budget lands mid-cluster.
+        let grapheme = "👨\u{200d}👩\u{200d}👧\u{200d}👦"; // one 11-byte ZWJ family
+        let prefix = "xyz"; // odd-byte prefix so the budget lands mid-grapheme
+        let mut payload = String::with_capacity(MAX_PASTE_BYTES + grapheme.len());
+        payload.push_str(prefix);
+        while payload.len() < MAX_PASTE_BYTES {
+            payload.push_str(grapheme);
+        }
+        let tail_sentinel = "PAYLOAD_TAIL_SENTINEL_9f3c";
+        payload.push_str(tail_sentinel);
+        assert!(payload.len() >= MAX_PASTE_BYTES, "fixture must reach the paste ceiling");
+        assert!(!payload.contains('\n'), "fixture must be a single unfenced line");
+
+        // The bounded fold cuts at a whole grapheme: the head is a clean
+        // prefix of the payload, never splits a cluster, and reports the
+        // byte-truncation omission without counting the tail.
+        let (head, omission) = fold_user_text_head(&payload, USER_CARD_TEXT_LINE_BUDGET);
+        assert!(omission.bytes, "1 MiB single line must be byte-cut");
+        assert_eq!(omission.lines, 0, "no source lines were folded");
+        assert!(
+            payload.starts_with(head.as_ref()),
+            "head must be a clean prefix of the payload"
+        );
+        let cut = head.len();
+        assert!(cut <= USER_CARD_TEXT_CHAR_BUDGET);
+        assert!(payload.is_char_boundary(cut), "cut must not split a multi-byte char");
+        assert_eq!(
+            cut,
+            prefix.len() + ((USER_CARD_TEXT_CHAR_BUDGET - prefix.len()) / grapheme.len()) * grapheme.len(),
+            "cut must land exactly on a whole-grapheme boundary"
+        );
+        let rest = &payload[cut..];
+        let next_grapheme = rest.graphemes(true).next().expect("tail must not be empty");
+        assert!(
+            rest.starts_with(next_grapheme),
+            "the cluster at the cut must be complete"
+        );
+
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text(payload)],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+
+        // Strictly bounded: exactly two padding rows around at most the row
+        // limit of content rows.
+        assert!(
+            lines.len() <= USER_CARD_RENDER_ROW_LIMIT + 2,
+            "user card must stay bounded: {} rows for a 1 MiB multi-byte single-line block (limit {} + 2 padding)",
+            lines.len(),
+            USER_CARD_RENDER_ROW_LIMIT
+        );
+        assert!(lines.len().saturating_sub(2) <= USER_CARD_RENDER_ROW_LIMIT);
+        // No full-payload output and a truthful byte-truncation marker.
+        let plain = lines.iter().map(rendered_line_text).collect::<String>();
+        assert!(!plain.contains(tail_sentinel), "fold must drop the payload tail: {plain}");
+        assert!(plain.contains("… more content"), "byte-cut marker must render: {plain}");
+        assert!(
+            !plain.contains("more lines") && !plain.contains("more rows"),
+            "byte-cut marker must not fake a count: {plain}"
+        );
+        // The card structure stays intact: symmetric padding edges and the
+        // styled card background on every row.
+        assert!(lines.first().is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty())));
+        assert!(lines.last().is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty())));
+        assert!(lines.iter().flat_map(|line| &line.spans).all(|span| {
+            span.style.bg == Some(crate::theme::DARK.user_message_bg)
+        }));
+    }
+
+    #[test]
+    fn user_card_folds_long_multiline_block_with_exact_line_count() {
+        // A multi-line message under the byte budget is folded by the line
+        // budget only: the omitted count is exact because it is counted over
+        // the whole (at most 16 KiB) text — the marker reports the true
+        // omitted source lines, and the final cap reserves the marker slot
+        // so kept head + marker never exceed the row limit.
+        let line = "short line content";
+        let body = std::iter::repeat_n(line, 300)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.len() < USER_CARD_TEXT_CHAR_BUDGET,
+            "fixture must stay under the byte budget"
+        );
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text(body)],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &entry, true, true, crate::theme::DARK, 80);
+
+        // 300 short lines → 120-line head painting 120 rows; the cap keeps
+        // 119 (reserving the marker slot) and the marker reports the exact
+        // 180 folded source lines: 2 padding + 119 kept + 1 marker = 122.
+        assert_eq!(
+            lines.len(),
+            USER_CARD_RENDER_ROW_LIMIT + 2,
+            "2 padding + reserved-head + marker must be exactly limit + padding: {}",
+            lines.len()
+        );
+        let plain = lines.iter().map(rendered_line_text).collect::<String>();
+        assert!(
+            plain.contains("… 180 more lines"),
+            "fold marker must report the exact omitted source lines: {plain}"
+        );
+        assert!(
+            !plain.contains("more rows") && !plain.contains("more content"),
+            "line fold must not borrow the row/byte wording: {plain}"
+        );
+        assert!(lines.first().is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty())));
+        assert!(lines.last().is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty())));
+    }
+
+    #[test]
+    fn user_card_megabyte_block_keeps_full_projection_window_bounded() {
+        // Whole-transcript projection (the real frame path): after the fold
+        // the assembled transcript stays tiny, follow-mode scroll lands
+        // exactly at the bottom window, and the payload tail never enters
+        // the projection.
+        let line = format!("let value = 0x0f; // {}", "x".repeat(80));
+        let body = std::iter::repeat_n(line.as_str(), 10_500)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail_sentinel = "PAYLOAD_TAIL_SENTINEL_9f3c";
+        let payload = format!("```rust\n{body}\n{tail_sentinel}\n```");
+        let mut state = todo_test_state(Vec::new());
+        state.push_entry(TranscriptEntry {
+            kind: TranscriptKind::User,
+            content: vec![ContentBlock::text(payload)],
+            tool_name: None,
+            tool_card: None,
+            job_card: None,
+            is_error: false,
+            is_partial: false,
+        });
+        let mut renderer = TerminalImageRenderer::default();
+        let mut candidates = Vec::new();
+        let mut image_context = TranscriptImageContext {
+            renderer: &mut renderer,
+            candidates: &mut candidates,
+            config: ImageDisplayConfig {
+                show_images: false,
+                width_cells: 50,
+            },
+            viewport_columns: 80,
+            viewport_rows: 24,
+            cell_size: TerminalCellSize::default(),
+        };
+        let (lines, starts) =
+            render_transcript_lines(&state, crate::theme::DARK, 80, &mut image_context);
+        let total_rows = wrapped_line_count(&lines, 80);
+        assert!(
+            total_rows <= USER_CARD_RENDER_ROW_LIMIT + 16,
+            "projection must stay bounded: {total_rows} rows"
+        );
+        let scroll = transcript_scroll_offset(&state, &starts, total_rows, 24);
+        assert_eq!(scroll, total_rows.saturating_sub(24), "follow mode sits at the bottom window");
+        let plain = lines.iter().map(rendered_line_text).collect::<String>();
+        assert!(!plain.contains(tail_sentinel), "payload tail must not reach the projection");
+        assert!(plain.contains("… more content"), "fold marker must render: {plain}");
     }
 
     #[test]
@@ -21630,6 +22396,80 @@ mod tests {
         assert!(rows.iter().all(|row| display_width(row) <= 100));
     }
 
+    #[test]
+    fn goal_panel_items_follow_pause_reason() {
+        let state = |lifecycle: &str, pause_reason: serde_json::Value| -> GoalState {
+            serde_json::from_value(serde_json::json!({
+                "current": {
+                    "id": "goal-1",
+                    "objective": "ship the release",
+                    "lifecycle": lifecycle,
+                    "pauseReason": pause_reason,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "usage": { "tokensUsed": 0, "activeTimeSeconds": 0 }
+                },
+                "revision": 1
+            }))
+            .expect("goal state json")
+        };
+        fn labels(items: &[PanelItem]) -> Vec<&str> {
+            items.iter().map(|item| item.label.as_str()).collect()
+        }
+        fn resume(items: &[PanelItem]) -> Option<&PanelItem> {
+            items
+                .iter()
+                .find(|item| matches!(item.value, PanelValue::GoalResume))
+        }
+
+        // No goal: create flow, no lifecycle actions.
+        let items = goal_panel_items(&GoalState::default());
+        assert_eq!(labels(&items), vec!["Create goal", "Show details"]);
+        assert!(resume(&items).is_none());
+
+        // Active goal: pause, no resume.
+        let items = goal_panel_items(&state("active", serde_json::Value::Null));
+        assert!(labels(&items).contains(&"Pause"), "{:?}", labels(&items));
+        assert!(resume(&items).is_none());
+
+        // Manual pause stays recoverable with the plain resume action.
+        let items = goal_panel_items(&state("paused", serde_json::json!("manual")));
+        let resume_item = resume(&items).expect("manual pause offers Resume");
+        assert_eq!(resume_item.description, "Continue work toward this objective");
+        assert!(!labels(&items).contains(&"Pause"), "{:?}", labels(&items));
+
+        // Resume-safety pause is recoverable too; the description says why.
+        let items = goal_panel_items(&state("paused", serde_json::json!("resume_safety")));
+        let resume_item = resume(&items).expect("resume-safety pause offers Resume");
+        assert_eq!(
+            resume_item.description,
+            "Session resumed; continue work toward this objective"
+        );
+
+        // Budget-exhausted pause cannot be resumed: no Resume action at all.
+        let items = goal_panel_items(&state("paused", serde_json::json!("budget_exhausted")));
+        assert!(!labels(&items).contains(&"Resume"), "{:?}", labels(&items));
+        assert!(
+            labels(&items).contains(&"Complete") && labels(&items).contains(&"Drop"),
+            "terminal actions remain available: {:?}",
+            labels(&items)
+        );
+
+        // Terminal lifecycles offer no pause/resume actions.
+        for lifecycle in ["completed", "dropped"] {
+            let items = goal_panel_items(&state(lifecycle, serde_json::Value::Null));
+            assert_eq!(labels(&items), vec!["Show details"], "{lifecycle}: {:?}", labels(&items));
+        }
+
+        // The Show details row explains the pause reason in the one-liner.
+        let items = goal_panel_items(&state("paused", serde_json::json!("resume_safety")));
+        let show = items
+            .iter()
+            .find(|item| item.label == "Show details")
+            .expect("Show details row");
+        assert!(show.description.contains("session resumed; run /goal resume"), "{}", show.description);
+    }
+
 
     #[tokio::test]
     async fn goal_dispatch_starts_work_and_preserves_editor_on_usage_error() {
@@ -23414,6 +24254,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn todo_slash_ops_start_done_drop_clear_transition_state() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: cwd.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        }).expect("session");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        let mut mouse = TestCodeReviewMouse::default();
+        application
+            .set_todos(pi_coding::parse_todo_markdown("# Plan\n- [ ] write the code\n- [ ] review the code\n- [ ] ship the build").expect("seed markdown"))
+            .expect("seed todos");
+
+        fn task_status(phases: &[TodoPhase], content: &str) -> TodoStatus {
+            phases.iter().flat_map(|phase| &phase.tasks).find(|task| task.content == content).expect("seeded task").status
+        }
+
+        // `/todo start <exact task>` (spaces included) marks it in progress.
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("start review the code")).expect("dispatch start"));
+        assert_eq!(task_status(&application.todo_state().phases, "review the code"), TodoStatus::InProgress);
+        assert_eq!(task_status(&state.todo_phases, "review the code"), TodoStatus::InProgress, "state mirror must follow the application");
+
+        // `/todo done <exact task>` completes it.
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("done review the code")).expect("dispatch done"));
+        assert_eq!(task_status(&application.todo_state().phases, "review the code"), TodoStatus::Completed);
+        assert_eq!(task_status(&state.todo_phases, "review the code"), TodoStatus::Completed);
+
+        // `/todo drop <exact task>` abandons it (slash op stays `drop`; the
+        // status is `abandoned`).
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("drop ship the build")).expect("dispatch drop"));
+        assert_eq!(task_status(&application.todo_state().phases, "ship the build"), TodoStatus::Abandoned);
+        assert_eq!(task_status(&state.todo_phases, "ship the build"), TodoStatus::Abandoned);
+
+        // `/todo clear` removes every task through the application.
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("clear")).expect("dispatch clear"));
+        assert!(application.todo_state().phases.iter().flat_map(|phase| &phase.tasks).next().is_none(), "clear must empty the plan");
+        assert!(state.todo_phases.iter().flat_map(|phase| &phase.tasks).next().is_none(), "state mirror must empty too");
+        assert!(state.status.contains("Todo list cleared"), "clear must surface the summary: {}", state.status);
+
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn todo_slash_ops_unknown_missing_and_blocking_show_usage_or_note() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model: Model::default(), cwd: cwd.path().to_path_buf(), system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off, api_key: String::new(), compaction: None,
+            stream_options: Default::default(), tools: Some(Vec::new()), before_tool_call: None,
+            after_tool_call: None, stream_fn: None, auth_resolver: None,
+        }).expect("session");
+        let application = Application::new(session).await;
+        let mut state = todo_test_state(Vec::new());
+        let mut mouse = TestCodeReviewMouse::default();
+        application
+            .set_todos(pi_coding::parse_todo_markdown("# Plan\n- [ ] write the code").expect("seed markdown"))
+            .expect("seed todos");
+
+        // `/todo start` with no task shows the full usage and mutates nothing.
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("start")).expect("dispatch bare start"));
+        assert!(state.composer_error.as_deref().is_some_and(|message| message.contains("Usage: /todo")), "missing task must show usage");
+        assert_eq!(application.todo_state().phases.iter().flat_map(|phase| &phase.tasks).count(), 1, "no-task op must not mutate the plan");
+
+        // An unknown operation shows the same full usage.
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("frobnicate the plan")).expect("dispatch unknown"));
+        assert!(state.composer_error.as_deref().is_some_and(|message| message.contains("Usage: /todo")), "unknown op must show usage");
+
+        // `/todo block`/`unblock` explain dependency-derived blocking without
+        // inventing a status (the model has no manual blocked state).
+        let before = application.todo_state().phases;
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("block write the code")).expect("dispatch block"));
+        let note = state.composer_error.as_deref().expect("blocking note");
+        assert!(note.contains("depends_on"), "blocking note must point at dependency edges: {note}");
+        assert_eq!(application.todo_state().phases, before, "block must not fake a status transition");
+
+        // A task reference that does not exist fails actionably through the
+        // application's own resolver.
+        assert!(dispatch_todo_command(&application, &mut state, &mut mouse, Some("done no such task")).expect("dispatch missing task"));
+        assert!(state.composer_error.as_deref().is_some_and(|message| message.contains("not found")), "missing task must surface the application error");
+
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn code_review_command_opens_page_and_escape_closes() {
         let cwd = tempfile::tempdir().expect("cwd");
         let session = pi_coding::Session::new(pi_coding::SessionOptions {
@@ -23553,13 +24479,14 @@ mod tests {
 
         // The process panel has no paste editor, so the paste is consumed by
         // the overlay with a bounded visible status and never mutates the
-        // hidden main composer.
+        // hidden main composer. The hint must say the paste was NOT applied
+        // and how to recover it (Esc then paste again).
         assert_eq!(state.editor.text(), "main draft", "main composer must be untouched");
         assert!(state.process_panel.is_some(), "process panel must remain open");
         assert_eq!(
             state.composer_error.as_deref(),
-            Some("Paste consumed by active overlay"),
-            "non-editor overlay must surface a bounded consume status"
+            Some("Paste not applied · Esc closes the active overlay, then paste again"),
+            "non-editor overlay must surface a bounded not-applied status"
         );
         assert!(
             state.status.is_empty(),
@@ -23586,10 +24513,29 @@ mod tests {
         assert!(state.panel.is_some(), "selector panel must remain open");
         assert_eq!(
             state.composer_error.as_deref(),
-            Some("Paste consumed by active overlay"),
-            "non-editor overlay must surface a bounded consume status"
+            Some("Paste not applied · Esc closes the active overlay, then paste again"),
+            "non-editor overlay must surface a bounded not-applied status"
         );
         assert!(state.status.is_empty());
+    }
+
+    #[test]
+    fn overlay_paste_hint_says_not_applied_and_escape_route() {
+        let mut state = todo_test_state(Vec::new());
+        state.editor.set_text("main draft");
+        state.workflow_panel = Some(WorkflowPanel::new(Vec::new()));
+        assert!(page_overlay_open(&state));
+
+        handle_paste(&mut state, "overlay payload");
+
+        // The hint must state that the paste was dropped (not "consumed",
+        // which read as silently lost) and exactly how to retry it.
+        assert_eq!(state.editor.text(), "main draft", "main composer must be untouched");
+        let hint = state.composer_error.as_deref().expect("bounded overlay hint");
+        assert!(hint.contains("Esc"), "hint must name the Esc escape route: {hint}");
+        assert!(hint.contains("not applied"), "hint must state the paste was not applied: {hint}");
+        assert!(!hint.contains("consumed"), "hint must not claim the paste was consumed: {hint}");
+        assert!(state.status.is_empty(), "overlay hint must stay bounded");
     }
 
     #[tokio::test]
@@ -23901,10 +24847,78 @@ mod tests {
         assert!(panel.handle_paste("draft survives"));
         state.code_review_panel = Some(panel);
 
-        assert!(!submit_code_review_comment(&mut state));
+        // No controller: the comment cannot start a review run, so the submit
+        // reports Failed and the draft survives untouched.
+        assert_eq!(
+            submit_code_review_comment(&mut state),
+            CommentSubmitResult::Failed
+        );
         assert_eq!(
             state.code_review_panel.as_ref().and_then(CodeReviewPanel::comment_editor),
             Some("draft survives")
+        );
+    }
+
+    #[test]
+    fn code_review_submit_status_messages_are_truthful() {
+        assert_eq!(
+            code_review_submit_status(CommentSubmitResult::Accepted),
+            "Code review comment submitted"
+        );
+        let empty = code_review_submit_status(CommentSubmitResult::Empty);
+        assert!(empty.contains("draft is empty"), "{empty}");
+        let full = code_review_submit_status(CommentSubmitResult::QueueFull);
+        assert!(full.contains(&MAX_PENDING_COMMENTS.to_string()), "{full}");
+        assert!(full.contains("wait"), "{full}");
+        assert!(full.contains("Esc"), "{full}");
+        let failed = code_review_submit_status(CommentSubmitResult::Failed);
+        assert!(failed.contains("review agent could not start"), "{failed}");
+    }
+
+    #[test]
+    fn code_review_abort_review_uses_selected_hunk_identity_path() {
+        // Panel-level selected-hunk gating lives in code_review_panel tests.
+        // Here we only assert the public panel contract the TUI abort path
+        // depends on: Esc on a non-streaming selection closes; Esc while the
+        // selected identity streams returns AbortReview for abort_hunk.
+        let mut panel = CodeReviewPanel::from_snapshot(crate::code_review::ReviewSnapshot {
+            root: PathBuf::from("repo"),
+            scope: ReviewScope::WorkingTree,
+            snapshot_id: "gate".to_owned(),
+            files: vec![crate::code_review::DiffFile {
+                path: "src/lib.rs".to_owned(),
+                previous_path: None,
+                status: crate::code_review::FileStatus::Modified,
+                binary: false,
+                insertions: 1,
+                deletions: 0,
+                hunks: vec![crate::code_review::DiffHunk {
+                    header: "@@ -1 +1 @@".to_owned(),
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 1,
+                    new_count: 1,
+                    lines: Vec::new(),
+                }],
+                truncated: false,
+                message: None,
+            }],
+            truncated: false,
+            error: None,
+        });
+        assert!(panel.selected_hunk_identity().is_some());
+        // Without a streaming selected thread, Esc closes the page.
+        assert_eq!(
+            panel.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            CodeReviewPanelResult::Close
+        );
+        // Comment editor remains openable when the selected hunk is idle.
+        assert!(panel.open_comment_editor());
+        panel.cancel_comment();
+        // Refresh is never gated by aggregate streaming (only snapshot load).
+        assert_eq!(
+            panel.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            CodeReviewPanelResult::Refresh
         );
     }
 
@@ -31468,23 +32482,46 @@ mod tests {
             Some("Next: /queue · /goal".to_owned())
         );
 
-        // A paused goal is not an active directive and never suggests /goal.
-        let paused: pi_coding::GoalState = serde_json::from_value(serde_json::json!({
-            "current": {
-                "id": "goal-1",
-                "objective": "ship the release",
-                "lifecycle": "paused",
-                "createdAt": "2026-01-01T00:00:00Z",
-                "updatedAt": "2026-01-01T00:00:00Z",
-                "usage": { "tokensUsed": 0, "activeTimeSeconds": 0 }
-            },
-            "revision": 2
-        }))
-        .expect("goal state json");
-        state.goal_state = paused;
-        assert_eq!(next_suggestion(&state), Some("Next: /queue".to_owned()));
+        // A paused goal stays visible: recoverable pauses (manual,
+        // resume-safety) suggest /goal resume; a budget-exhausted pause is
+        // not resumable and only suggests /goal (details).
+        let paused = |reason: serde_json::Value| -> pi_coding::GoalState {
+            serde_json::from_value(serde_json::json!({
+                "current": {
+                    "id": "goal-1",
+                    "objective": "ship the release",
+                    "lifecycle": "paused",
+                    "pauseReason": reason,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "usage": { "tokensUsed": 0, "activeTimeSeconds": 0 }
+                },
+                "revision": 2
+            }))
+            .expect("goal state json")
+        };
+        state.goal_state = paused(serde_json::json!("manual"));
+        assert_eq!(
+            next_suggestion(&state),
+            Some("Next: /queue · /goal resume".to_owned())
+        );
+        state.goal_state = paused(serde_json::json!("resume_safety"));
+        assert_eq!(
+            next_suggestion(&state),
+            Some("Next: /queue · /goal resume".to_owned())
+        );
+        state.goal_state = paused(serde_json::json!("budget_exhausted"));
+        assert_eq!(next_suggestion(&state), Some("Next: /queue · /goal".to_owned()));
+        // A legacy paused goal without a recorded reason defaults to recoverable.
+        state.goal_state = paused(serde_json::Value::Null);
+        assert_eq!(
+            next_suggestion(&state),
+            Some("Next: /queue · /goal resume".to_owned())
+        );
 
-        // Live workflows add /workflow list; terminal ones do not.
+        // No goal: workflow suggestions stand alone; live ones add
+        // /workflow list, terminal ones do not.
+        state.goal_state = pi_coding::GoalState::default();
         state.workflow_snapshots.push(WorkflowPanelSnapshot::from(&workflow_snapshot(
             1,
             pi_coding::WorkflowStatus::Running,
@@ -33133,6 +34170,185 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn tool_output_ansi_sgr_renders_styled_spans() {
+        // The exact user-visible fragments: bright fg (96/94), 256-color fg +
+        // bg, and reset isolation — rendered as styled spans with no escape
+        // bytes or literal `[96m` reaching the card.
+        use crate::tool_card_adapter::ToolCardRow;
+        let theme = crate::theme::DARK;
+        let text = "\u{1b}[96mnew zk sign circuit\u{1b}[0m\n\
+                    \u{1b}[94mbuild inner circuit\u{1b}[0m\n\
+                    \u{1b}[38;5;230m\u{1b}[48;5;34m 11ms \u{1b}[0m";
+        let card = ToolCardRows {
+            tool_call_id: "ansi-1".to_owned(),
+            tool_name: "read".to_owned(),
+            ordinal: 1,
+            arguments_summary: String::new(),
+            code_language: None,
+            status: ToolCallViewStatus::Succeeded,
+            is_partial: false,
+            is_error: false,
+            cancelled: false,
+            truncated: false,
+            omitted_content_lines: 0,
+            rows: vec![
+                ToolCardRow { tool_call_id: "ansi-1".to_owned(), role: ToolCardRowRole::Command, text: "read circuit.zk".to_owned() },
+                ToolCardRow { tool_call_id: "ansi-1".to_owned(), role: ToolCardRowRole::Content, text: text.to_owned() },
+            ],
+            skill_name: None,
+            bash_command: None,
+            arguments: serde_json::Value::Null,
+            details: serde_json::Value::Null,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &tool_transcript_entry(card.clone(), card), true, true, theme, 80);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(!rendered.contains('\u{1b}'), "escape bytes must never reach spans: {rendered:?}");
+        assert!(
+            !rendered.contains("[96m") && !rendered.contains("[94m") && !rendered.contains("[0m"),
+            "SGR fragments must not render literally: {rendered:?}"
+        );
+        let content_span = |needle: &str| -> Vec<&Span<'static>> {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .filter(|span| span.content.contains(needle))
+                .collect()
+        };
+        let cyan = content_span("new zk sign circuit");
+        assert_eq!(cyan.len(), 1, "{lines:?}");
+        assert_eq!(cyan[0].content.as_ref(), "new zk sign circuit");
+        assert_eq!(cyan[0].style.fg, Some(Color::LightCyan), "{lines:?}");
+        assert_eq!(cyan[0].style.bg, None);
+        let blue = content_span("build inner circuit");
+        assert_eq!(blue.len(), 1, "{lines:?}");
+        assert_eq!(blue[0].content.as_ref(), "build inner circuit");
+        assert_eq!(blue[0].style.fg, Some(Color::LightBlue), "{lines:?}");
+        let timing = content_span(" 11ms ");
+        assert_eq!(timing.len(), 1, "{lines:?}");
+        assert_eq!(timing[0].content.as_ref(), " 11ms ");
+        assert_eq!(timing[0].style.fg, Some(Color::Indexed(230)), "{lines:?}");
+        assert_eq!(timing[0].style.bg, Some(Color::Indexed(34)), "{lines:?}");
+    }
+
+    #[test]
+    fn tool_output_ansi_modifiers_and_reset_stay_isolated() {
+        // Modifiers land on the span; a reset returns the following text to
+        // the card's role color (theme.tool_output) — never a leaked ANSI
+        // color. Command/title text stays cleaned plain text with the role
+        // color.
+        use crate::tool_card_adapter::ToolCardRow;
+        let theme = crate::theme::DARK;
+        let card = ToolCardRows {
+            tool_call_id: "ansi-2".to_owned(),
+            tool_name: "read".to_owned(),
+            ordinal: 1,
+            arguments_summary: String::new(),
+            code_language: None,
+            status: ToolCallViewStatus::Succeeded,
+            is_partial: false,
+            is_error: false,
+            cancelled: false,
+            truncated: false,
+            omitted_content_lines: 0,
+            rows: vec![
+                ToolCardRow { tool_call_id: "ansi-2".to_owned(), role: ToolCardRowRole::Command, text: "read circuit.zk".to_owned() },
+                ToolCardRow { tool_call_id: "ansi-2".to_owned(), role: ToolCardRowRole::Content, text: "\u{1b}[1;3;4;96mstyled\u{1b}[0mplain".to_owned() },
+            ],
+            skill_name: None,
+            bash_command: None,
+            arguments: serde_json::Value::Null,
+            details: serde_json::Value::Null,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &tool_transcript_entry(card.clone(), card), true, true, theme, 80);
+        let content_span = |needle: &str| -> Vec<&Span<'static>> {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .filter(|span| span.content.contains(needle))
+                .collect()
+        };
+        let styled = content_span("styled");
+        assert_eq!(styled.len(), 1, "{lines:?}");
+        assert_eq!(styled[0].style.fg, Some(Color::LightCyan), "{lines:?}");
+        assert!(
+            styled[0].style.add_modifier.contains(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED),
+            "{lines:?}"
+        );
+        let plain = content_span("plain");
+        assert_eq!(plain.len(), 1, "{lines:?}");
+        assert_eq!(plain[0].style.fg, Some(theme.tool_output), "{lines:?}");
+        assert_eq!(plain[0].style.add_modifier, Modifier::empty(), "{lines:?}");
+        // The command/title row never parses ANSI: plain cleaned text, role
+        // color only.
+        let title = content_span("read circuit.zk");
+        assert_eq!(title.len(), 1, "{lines:?}");
+        assert_eq!(title[0].style.fg, Some(theme.tool_title), "{lines:?}");
+        assert_eq!(title[0].style.add_modifier, Modifier::empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn tool_output_split_secret_collapses_to_plain_redacted_run() {
+        // A credential split across an SGR boundary (sk- ... ESC[31m ...
+        // rest) must fail closed: redact the full PLAIN text after parsing
+        // and render one base-style plain [REDACTED] run — no styled span
+        // carries any part of the secret.
+        use crate::tool_card_adapter::ToolCardRow;
+        let theme = crate::theme::DARK;
+        let text = format!(
+            "prefix \u{1b}[96m{}\u{1b}[31m{}\u{1b}[0m suffix",
+            ["sk", "-"].concat(),
+            "ABCDEFGHIJKLMNOPQRST"
+        );
+        let card = ToolCardRows {
+            tool_call_id: "ansi-3".to_owned(),
+            tool_name: "read".to_owned(),
+            ordinal: 1,
+            arguments_summary: String::new(),
+            code_language: None,
+            status: ToolCallViewStatus::Succeeded,
+            is_partial: false,
+            is_error: false,
+            cancelled: false,
+            truncated: false,
+            omitted_content_lines: 0,
+            rows: vec![
+                ToolCardRow { tool_call_id: "ansi-3".to_owned(), role: ToolCardRowRole::Command, text: "read circuit.zk".to_owned() },
+                ToolCardRow { tool_call_id: "ansi-3".to_owned(), role: ToolCardRowRole::Content, text },
+            ],
+            skill_name: None,
+            bash_command: None,
+            arguments: serde_json::Value::Null,
+            details: serde_json::Value::Null,
+        };
+        let mut lines = Vec::new();
+        render_transcript_entry(&mut lines, &tool_transcript_entry(card.clone(), card), true, true, theme, 80);
+        let rendered: Vec<&Span<'static>> = lines.iter().flat_map(|line| line.spans.iter()).collect();
+        let all_text: String = rendered.iter().map(|span| span.content.as_ref()).collect();
+        assert!(all_text.contains("[REDACTED]"), "{all_text:?}");
+        assert!(!all_text.contains("sk-"), "split secret must never render: {all_text:?}");
+        assert!(!all_text.contains('\u{1b}'), "escape bytes must never reach spans: {all_text:?}");
+        let redacted: Vec<&&Span<'static>> = rendered
+            .iter()
+            .filter(|span| span.content.contains("[REDACTED]"))
+            .collect();
+        assert_eq!(redacted.len(), 1, "{all_text:?}");
+        assert_eq!(redacted[0].style.fg, Some(theme.tool_output), "{all_text:?}");
+        assert_eq!(redacted[0].style.add_modifier, Modifier::empty(), "{all_text:?}");
+        // The ANSI cyan from the raw input must NOT survive the fail-closed
+        // collapse (no span may carry LightCyan).
+        assert!(
+            rendered.iter().all(|span| span.style.fg != Some(Color::LightCyan)),
+            "{all_text:?}"
+        );
+    }
 
     #[test]
     fn hub_send_card_uses_irc_header_quote_and_full_side_borders() {

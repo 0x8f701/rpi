@@ -16,17 +16,20 @@ embedded into the `rpi` binary by `crates/pi-cli/build.rs`.
 
 ```console
 $ cd crates/pi-cli/web
-$ npm ci             # installs the committed, pinned dependency set (package-lock.json)
+$ npm ci             # installs the pinned dependency set (package-lock.json)
 $ npm run build      # tsc --noEmit && vite build -> dist/index.html
 ```
 
-`dist/index.html` is **committed** — it is the pre-embedded artifact, so
-`cargo build` (and release CI, cargo-install users, offline builders) never
-needs node. `package-lock.json` is **committed** too, so the frontend build is
-reproducible from the same locked dependency set that produced the checked-in
-artifact. Rebuild `dist/` whenever `src/` or `package.json` changes and commit
-the result together with the source change. `npm run build` fails on
-TypeScript errors.
+`dist/` is **generated build output and is not tracked by git** (ignored via
+the repository `.gitignore`). `crates/pi-cli/build.rs` embeds it into the
+binary, so it must exist before the first cargo command: test and release CI
+generate it from a clean checkout, and a local source build needs the one-time
+`npm ci && npm run build` above. `package-lock.json` is **committed**, so the
+frontend build is reproducible from the same locked dependency set CI uses.
+Regenerate `dist/` whenever `src/` or `package.json` changes; rebuilding the
+Rust binary embeds the new bundle. `npm run build` fails on TypeScript errors.
+The released binary embeds the bundle, so runtime and binary-only installs
+never need node.
 
 ## Development
 
@@ -91,4 +94,4 @@ from disk.
 - Measured coverage: `bash E2E.d/web/coverage.sh` builds a TEMPORARY
   conditionally-instrumented bundle (`vite.coverage.config.ts`) into the
   evidence root, serves it via `RPI_WEB_DEV_DIR`, and drives it with the
-  real Playwright lanes — the tracked `dist/` is never modified.
+  real Playwright lanes — the generated (gitignored) `dist/` is never modified.

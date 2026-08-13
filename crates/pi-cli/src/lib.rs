@@ -5,6 +5,7 @@
 //! and the REPL) without spawning a subprocess.
 
 mod agents_panel;
+mod ansi;
 pub mod approval;
 pub mod args;
 pub mod auth_commands;
@@ -358,9 +359,6 @@ async fn start_listen(
         tls_cert: cli.listen_cert.clone(),
         tls_key: cli.listen_key.clone(),
         session_factory: Some(std::sync::Arc::new(spawner)),
-        // Test-only slow-writer seam; absent from production builds.
-        #[cfg(debug_assertions)]
-        outbound_writer_delay: std::time::Duration::ZERO,
     };
     let handle = modes::listen::start(application.clone(), extension_ui, config).await?;
     let addr = handle.local_addr();

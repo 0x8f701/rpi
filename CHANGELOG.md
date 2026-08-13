@@ -2,6 +2,32 @@
 
 All notable changes to `rpi` are documented in this file.
 
+## [0.2.11] - 2026-08-13
+
+### Added
+
+- Web personas, server-proxied voice, cross-project session discovery, rich
+  attachment previews, and backend-authoritative skill completion.
+- Concurrent per-hunk code review with bounded complete-hunk paging,
+  cache-authoritative comment identities, safe Markdown/Mermaid replies, and
+  responsive file, diff, and thread panes.
+- Safe ANSI SGR rendering in the Web UI and TUI, including 16/256/truecolor
+  output and fail-closed credential redaction across escape boundaries.
+
+### Changed
+
+- Web and TUI task, todo, hub, waiting, thinking, IRC, attachment, and persona
+  surfaces now share terminology, state, information hierarchy, and bounds.
+- Release builds remap Rust and native compiler paths and reject binaries that
+  retain workspace, home, Cargo, or rustup path prefixes.
+
+### Fixed
+
+- Realtime WebRTC and STT now keep endpoints and credentials server-side,
+  enforce bounded wire formats, and surface redacted connection errors.
+- LSP cold-start analysis races, Node 20 Web test compatibility, interrupted
+  installer downloads, listener backpressure, and session restore shutdown.
+
 ## [0.2.10] - 2026-08-12
 
 ### Added
@@ -580,6 +606,7 @@ All notable changes to `rpi` are documented in this file.
 - `npm:` package sources are not implemented; attempting to install one fails
   with a clear error.
 
+[0.2.11]: https://github.com/0x8f701/rpi/releases/tag/v0.2.11
 [0.2.10]: https://github.com/0x8f701/rpi/releases/tag/v0.2.10
 [0.2.9]: https://github.com/0x8f701/rpi/releases/tag/v0.2.9
 [0.2.8]: https://github.com/0x8f701/rpi/releases/tag/v0.2.8

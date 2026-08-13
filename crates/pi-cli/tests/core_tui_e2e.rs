@@ -1234,7 +1234,7 @@ fn pty_todo_overview_detail_navigation() {
             .wait_for_live_after(open_start, Duration::from_secs(10), |live| {
                 live.contains("Main session")
                     && live.contains("[main]")
-                    && live.contains("open 5 active 2 blocked 0")
+                    && live.contains("0 completed · 5 open · 2 active · 0 blocked")
             })
             .is_some(),
         "todo overview must project the main DAG row and counts: {}",

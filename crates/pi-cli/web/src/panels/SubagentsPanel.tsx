@@ -429,6 +429,7 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
           type="button"
           className="subagents-panel__close"
           title="Close subagents panel"
+          aria-label="Close subagents panel"
           onClick={onClose}
         >
           ×
@@ -682,6 +683,7 @@ export function SubagentsPanel({ sendCommand, subscribeEvents, onClose }: Subage
                   data-details-close
                   onClick={closeDetails}
                   title="Close details (Esc)"
+                  aria-label="Close job details"
                 >
                   Close
                 </button>

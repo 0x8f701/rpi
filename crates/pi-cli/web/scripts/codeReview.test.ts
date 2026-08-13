@@ -6,12 +6,20 @@
 // Exit codes: 0 = every assertion held; 1 = a regression.
 // Assertions exercise BEHAVIOR (what normalize returns), not source strings.
 import {
+  buildCodeReviewAbortPayload,
+  clampCodeReviewThreadWidth,
+  CODE_REVIEW_THREAD_WIDTH_DEFAULT,
+  CODE_REVIEW_THREAD_WIDTH_MAX,
+  CODE_REVIEW_THREAD_WIDTH_MIN,
+  CODE_REVIEW_THREAD_WIDTH_STEP,
+  CODE_REVIEW_THREAD_WIDTH_STORAGE_KEY,
   countFileThreads,
   countThreadComments,
   emptyCodeReviewSnapshot,
   FILE_STATUS_LETTERS,
   fileStatusLetter,
   findThreadForHunk,
+  formatActiveRepliesLabel,
   hunkIdentityFor,
   hunkKey,
   hunkKeyFor,
@@ -20,15 +28,21 @@ import {
   parseCodeReviewArgs,
   appendFileDiffPage,
   buildFileTree,
+  hunkIsComplete,
   initLoadedDiff,
   isDiffPlaceholder,
+  loadedHunkReady,
   normalizeFileDiffPage,
   planDiffWindow,
+  readStoredCodeReviewThreadWidth,
+  stepCodeReviewThreadWidth,
+  threadIsStreaming,
   treeFileIndexAt,
   treeFilterRows,
   treeKeyboardAction,
   treeToggleCollapse,
   treeVisibleRows,
+  writeStoredCodeReviewThreadWidth,
 } from '../src/codeReview.ts';
 
 const failures = [];
@@ -107,22 +121,19 @@ function check(name, cond, detail) {
           newCount: 4,
           contentHash: 'h1',
         },
-        comments: [{ role: 'user', text: 'looks off', partial: false }],
+        comments: [
+          { role: 'user', text: 'looks off', partial: false },
+          { role: 'assistant', text: 'checking', partial: false, model: 'gpt-test' },
+        ],
         streamingText: 'partial…',
         error: null,
         stale: false,
+        isStreaming: true,
+        model: 'gpt-test',
       },
     ],
     isStreaming: true,
-    activeHunk: {
-      snapshotId: 'snap-1',
-      path: 'src/a.ts',
-      oldStart: 1,
-      oldCount: 3,
-      newStart: 1,
-      newCount: 4,
-      contentHash: 'h1',
-    },
+    activeCount: 1,
   };
   const snap = normalizeCodeReviewSnapshot(wire);
   check('label preserved', snap.comparisonLabel === 'HEAD → working tree');
@@ -131,6 +142,7 @@ function check(name, cond, detail) {
   check('error null preserved', snap.error === null);
   check('totals', snap.totalInsertions === 3 && snap.totalDeletions === 1);
   check('isStreaming', snap.isStreaming === true);
+  check('activeCount', snap.activeCount === 1);
   check('files length', snap.files.length === 2);
   check('file path', snap.files[0].path === 'src/a.ts');
   check('file status', snap.files[0].status === 'modified');
@@ -143,8 +155,11 @@ function check(name, cond, detail) {
   check('line text', snap.files[0].hunks[0].lines[2].text === '+new');
   check('threads length', snap.threads.length === 1);
   check('thread comment', snap.threads[0].comments[0].text === 'looks off');
+  check('comment model', snap.threads[0].comments[1].model === 'gpt-test');
+  check('thread model', snap.threads[0].model === 'gpt-test');
+  check('thread isStreaming', snap.threads[0].isStreaming === true);
   check('streamingText', snap.threads[0].streamingText === 'partial…');
-  check('activeHunk path', snap.activeHunk && snap.activeHunk.path === 'src/a.ts');
+  check('no activeHunk field', !('activeHunk' in snap));
 }
 
 // ---- defensive coercion: malformed nested entries dropped, scalars coerced ----
@@ -184,7 +199,7 @@ function check(name, cond, detail) {
     ],
     threads: null,
     isStreaming: 'no',
-    activeHunk: { path: '', contentHash: 'x' }, // incomplete identity → null
+    activeCount: -3,
   };
   const snap = normalizeCodeReviewSnapshot(wire);
   check('non-string label -> empty', snap.comparisonLabel === '');
@@ -204,7 +219,7 @@ function check(name, cond, detail) {
   check('valid line kept', snap.files[0].hunks[0].lines[1].text === 'ok');
   check('null threads -> []', snap.threads.length === 0);
   check('non-bool isStreaming -> false', snap.isStreaming === false);
-  check('bad activeHunk -> null', snap.activeHunk === null);
+  check('negative activeCount -> 0', snap.activeCount === 0);
 }
 
 // ---- threads map form (defensive normalize) ----
@@ -220,18 +235,23 @@ function check(name, cond, detail) {
         newCount: 1,
         contentHash: 'c',
       },
-      comments: [{ role: 'assistant', text: 'hi', partial: true }],
+      comments: [{ role: 'assistant', text: 'hi', partial: true, model: 'm1' }],
       streamingText: '',
       error: 'boom',
       stale: true,
+      isStreaming: false,
+      model: 'm1',
     },
     bad: null,
     incomplete: { identity: { path: 'x' } },
   });
   check('map threads length', mapThreads.length === 1);
   check('map thread role', mapThreads[0].comments[0].role === 'assistant');
+  check('map thread comment model', mapThreads[0].comments[0].model === 'm1');
+  check('map thread model', mapThreads[0].model === 'm1');
   check('map thread error', mapThreads[0].error === 'boom');
   check('map thread stale', mapThreads[0].stale === true);
+  check('map thread isStreaming false', mapThreads[0].isStreaming === false);
 
   const arrThreads = normalizeThreads([
     {
@@ -245,12 +265,14 @@ function check(name, cond, detail) {
         contentHash: 'c',
       },
       comments: [],
-      streamingText: '',
+      streamingText: '…',
+      // omit isStreaming: derive from streamingText
       error: null,
       stale: false,
     },
   ]);
   check('array threads length', arrThreads.length === 1);
+  check('derived isStreaming from text', arrThreads[0].isStreaming === true);
   check('non-collection threads -> []', normalizeThreads(undefined).length === 0);
 }
 
@@ -375,7 +397,7 @@ function check(name, cond, detail) {
   check('file with no threads -> 0', countFileThreads([], file) === 0);
 }
 
-// ---- isDiffPlaceholder / placeholder LoadedDiff + byte cap ----
+// ---- isDiffPlaceholder / placeholder LoadedDiff ----
 {
   const placeholder = {
     path: 'big3.txt',
@@ -396,30 +418,47 @@ function check(name, cond, detail) {
   check('binary empty file is NOT a placeholder', isDiffPlaceholder({ ...placeholder, binary: true }) === false);
 
   const loaded = initLoadedDiff('snap-1', placeholder, true);
-  check('placeholder loaded diff starts empty', loaded.lines.length === 0 && loaded.snapshotLineCount === 0);
-  check('placeholder paging enabled at cursor 0', loaded.hasMoreBackend === true && loaded.nextCursor === 0);
+  check('placeholder loaded diff starts empty', loaded.lines.length === 0 && loaded.hunks.length === 0);
+  check('placeholder eager fetch starts at cursor 0', loaded.nextCursor === 0);
+  check('placeholder paging enabled', loaded.hasMoreBackend === true);
+  check('placeholder not complete until a page arrives', loaded.hunksComplete === false);
   check('placeholder not byte-capped initially', loaded.byteCapped === false);
   const noPaging = initLoadedDiff('snap-1', placeholder, false);
   check('placeholder without global truncation does not page', noPaging.hasMoreBackend === false);
+  check('binary files never fetch', initLoadedDiff('snap-1', { ...placeholder, binary: true }, true).hunksComplete === true);
+}
 
-  const page = {
-    snapshotId: 'snap-1',
-    path: 'big3.txt',
-    binary: false,
-    status: 'modified',
-    lines: [{ kind: 'addition', newNo: 1, text: '+a' }],
-    cursor: 0,
-    nextCursor: undefined,
-    hasMore: false,
-    totalLines: 1,
-    truncated: true,
+// ---- hunk completeness checks (frontend mirror of the backend) ----
+{
+  const completeHunk = {
+    header: '@@ -1,3 +1,3 @@',
+    oldStart: 1,
+    oldCount: 2,
+    newStart: 1,
+    newCount: 2,
+    contentHash: 'h',
+    lines: [
+      { kind: 'context', oldNo: 1, newNo: 1, text: ' a' },
+      { kind: 'deletion', oldNo: 2, text: '-b' },
+      { kind: 'addition', newNo: 2, text: '+c' },
+    ],
   };
-  const merged = appendFileDiffPage(loaded, page);
-  check('byte cap surfaced from page', merged.byteCapped === true);
-  check('byte cap stops paging', merged.hasMoreBackend === false && merged.totalLines === 1);
-  const normalPage = { ...page, truncated: false, lines: [{ kind: 'addition', newNo: 2, text: '+b' }], cursor: 1, nextCursor: 2, hasMore: true, totalLines: 2 };
-  const loaded2 = appendFileDiffPage(loaded, { ...page, truncated: false, lines: [{ kind: 'addition', newNo: 1, text: '+a' }], nextCursor: 1, hasMore: true });
-  check('byte cap absent on clean pages', appendFileDiffPage(loaded2, normalPage).byteCapped === false);
+  check('complete hunk passes content check', hunkIsComplete(completeHunk) === true);
+  const cutHunk = {
+    ...completeHunk,
+    lines: completeHunk.lines.slice(0, 2),
+  };
+  check('cut hunk fails content check', hunkIsComplete(cutHunk) === false);
+  const loadedHunk = {
+    index: 0,
+    ...completeHunk,
+    totalLines: 3,
+    complete: true,
+    lines: completeHunk.lines,
+  };
+  check('fully merged hunk is ready', loadedHunkReady(loadedHunk) === true);
+  check('page-split hunk not ready', loadedHunkReady({ ...loadedHunk, lines: completeHunk.lines.slice(0, 1) }) === false);
+  check('byte-capped hunk never ready', loadedHunkReady({ ...loadedHunk, complete: false }) === false);
 }
 
 // ---- planDiffWindow for an empty placeholder (zero snapshot lines) ----
@@ -427,13 +466,15 @@ function check(name, cond, detail) {
   const loaded = {
     snapshotId: 's',
     path: 'p.rs',
+    hunks: [],
     lines: [],
-    snapshotLineCount: 0,
+    hunkCount: 0,
     nextCursor: 0,
     hasMoreBackend: true,
     totalLines: 0,
     backendTruncated: true,
     byteCapped: false,
+    hunksComplete: false,
     loading: false,
     error: null,
   };
@@ -560,42 +601,61 @@ function check(name, cond, detail) {
   check('out-of-range row -> -1', treeFileIndexAt(rows, tree, 99) === -1);
 }
 
-// ---- normalizeFileDiffPage ----
+// ---- normalizeFileDiffPage (hunk-window wire shape) ----
 {
   const valid = normalizeFileDiffPage({
     snapshotId: 'snap-1',
     path: 'a.rs',
     binary: false,
     status: 'modified',
-    lines: [
-      { kind: 'addition', text: '+x', newNo: 1 },
-      { kind: 'deletion', text: '-y', oldNo: 2 },
-      { kind: 'context', text: ' z', oldNo: 3, newNo: 3 },
+    hunks: [
+      {
+        index: 0,
+        header: '@@ -1,2 +1,2 @@',
+        oldStart: 1,
+        oldCount: 1,
+        newStart: 1,
+        newCount: 1,
+        contentHash: 'cafebabe',
+        totalLines: 3,
+        complete: true,
+        lineStart: 0,
+        lines: [
+          { kind: 'addition', text: '+x', newNo: 1 },
+          { kind: 'deletion', text: '-y', oldNo: 2 },
+          { kind: 'context', text: ' z', oldNo: 3, newNo: 3 },
+        ],
+      },
     ],
     cursor: 0,
     nextCursor: 3,
     hasMore: true,
     totalLines: 200,
+    hunkCount: 2,
     truncated: false,
   });
   check('page normalized', !!valid);
   check('page fields', valid.snapshotId === 'snap-1' && valid.path === 'a.rs' && valid.cursor === 0);
   check('page nextCursor', valid.nextCursor === 3);
   check('page hasMore', valid.hasMore === true && valid.totalLines === 200);
-  check('page lines kinds', valid.lines.map((l) => l.kind).join(',') === 'addition,deletion,context');
-  check('page line numbers', valid.lines[0].newNo === 1 && valid.lines[1].oldNo === 2);
-  check('page no nextCursor when absent', normalizeFileDiffPage({ snapshotId: 's', path: 'a', lines: [], cursor: 0, hasMore: false, totalLines: 0, truncated: false }).nextCursor === undefined);
-  check('page missing path -> null', normalizeFileDiffPage({ snapshotId: 's', lines: [] }) === null);
-  check('page missing snapshotId -> null', normalizeFileDiffPage({ path: 'a', lines: [] }) === null);
+  check('page hunkCount', valid.hunkCount === 2);
+  check('page hunk descriptor', valid.hunks.length === 1 && valid.hunks[0].index === 0 && valid.hunks[0].contentHash === 'cafebabe');
+  check('page hunk complete identity', valid.hunks[0].oldStart === 1 && valid.hunks[0].oldCount === 1 && valid.hunks[0].newStart === 1 && valid.hunks[0].newCount === 1);
+  check('page hunk window', valid.hunks[0].totalLines === 3 && valid.hunks[0].complete === true && valid.hunks[0].lineStart === 0);
+  check('page hunk lines kinds', valid.hunks[0].lines.map((l) => l.kind).join(',') === 'addition,deletion,context');
+  check('page line numbers', valid.hunks[0].lines[0].newNo === 1 && valid.hunks[0].lines[1].oldNo === 2);
+  check('page no nextCursor when absent', normalizeFileDiffPage({ snapshotId: 's', path: 'a', hunks: [], cursor: 0, hasMore: false, totalLines: 0, hunkCount: 0, truncated: false }).nextCursor === undefined);
+  check('page missing path -> null', normalizeFileDiffPage({ snapshotId: 's', hunks: [] }) === null);
+  check('page missing snapshotId -> null', normalizeFileDiffPage({ path: 'a', hunks: [] }) === null);
   check('page null -> null', normalizeFileDiffPage(null) === null);
   check('page garbage -> null', normalizeFileDiffPage('nope') === null);
-  const badStatus = normalizeFileDiffPage({ snapshotId: 's', path: 'a', lines: [], cursor: 0, hasMore: false, totalLines: 0, truncated: false, status: 'weird' });
+  const badStatus = normalizeFileDiffPage({ snapshotId: 's', path: 'a', hunks: [], cursor: 0, hasMore: false, totalLines: 0, hunkCount: 0, truncated: false, status: 'weird' });
   check('page unknown status -> changed', badStatus.status === 'changed');
-  const badLine = normalizeFileDiffPage({ snapshotId: 's', path: 'a', lines: [{ kind: 'bogus', text: 9 }, null], cursor: 0, hasMore: false, totalLines: 0, truncated: false });
-  check('page malformed lines coerced/dropped', badLine.lines.length === 1 && badLine.lines[0].kind === 'meta' && badLine.lines[0].text === '');
+  const badHunk = normalizeFileDiffPage({ snapshotId: 's', path: 'a', hunks: [{ index: 0, lines: [{ kind: 'bogus', text: 9 }, null] }, null], cursor: 0, hasMore: false, totalLines: 0, hunkCount: 1, truncated: false });
+  check('page malformed hunks coerced/dropped', badHunk.hunks.length === 0);
 }
 
-// ---- initLoadedDiff / appendFileDiffPage ----
+// ---- initLoadedDiff / appendFileDiffPage (structured hunk merge) ----
 {
   const lines = [
     { kind: 'deletion', oldNo: 1, text: '-a' },
@@ -612,57 +672,321 @@ function check(name, cond, detail) {
     hunks: [{ header: '@@ -1,2 +1,2 @@', oldStart: 1, oldCount: 2, newStart: 1, newCount: 2, contentHash: 'h1', lines }],
   };
   const loaded = initLoadedDiff('snap-1', file, true);
-  check('loaded snapshot lines', loaded.lines.length === 3 && loaded.snapshotLineCount === 3);
-  check('loaded cursor starts at snapshot lines', loaded.nextCursor === 3);
+  check('loaded snapshot lines', loaded.lines.length === 3 && loaded.hunks.length === 1);
+  check('loaded seed hunk structured', loaded.hunks[0].index === 0 && loaded.hunks[0].header === '@@ -1,2 +1,2 @@');
+  check('loaded seed hunk identity', loaded.hunks[0].contentHash === 'h1' && loaded.hunks[0].oldCount === 2);
+  check('loaded seed hunk complete', loaded.hunks[0].complete === true && loaded.hunks[0].totalLines === 3);
+  check('loaded eager fetch starts at cursor 0', loaded.nextCursor === 0);
   check('loaded backend paging enabled', loaded.hasMoreBackend === true);
   check('loaded truncated state', loaded.backendTruncated === true && loaded.totalLines === 3);
+  check('loaded not complete until stream consumed', loaded.hunksComplete === false);
   const noPaging = initLoadedDiff('snap-1', file, false);
   check('loaded paging off when snapshot not truncated', noPaging.hasMoreBackend === false);
   const smallFile = initLoadedDiff('snap-1', { ...file, truncated: false }, true);
   check('loaded paging off when file not truncated', smallFile.hasMoreBackend === false);
 
-  const page = {
+  const descriptor = (over) => ({
+    index: 0,
+    header: '@@ -1,2 +1,2 @@',
+    oldStart: 1,
+    oldCount: 2,
+    newStart: 1,
+    newCount: 2,
+    contentHash: 'h1',
+    totalLines: 5,
+    complete: true,
+    lineStart: 0,
+    lines: [
+      { kind: 'deletion', oldNo: 1, text: '-a' },
+      { kind: 'addition', newNo: 1, text: '+b' },
+      { kind: 'context', oldNo: 2, newNo: 2, text: ' c' },
+      { kind: 'addition', newNo: 3, text: '+d' },
+      { kind: 'addition', newNo: 4, text: '+e' },
+    ],
+    ...over,
+  });
+  // First page starts at cursor 0 (the eager fetch is authoritative from the
+  // start): the subset overlaps the seed byte-identically and dedupes.
+  const page1 = {
     snapshotId: 'snap-1',
     path: 'big.rs',
     binary: false,
     status: 'modified',
-    lines: [{ kind: 'addition', newNo: 3, text: '+d' }, { kind: 'addition', newNo: 4, text: '+e' }],
-    cursor: 3,
-    nextCursor: 5,
+    hunks: [descriptor({ lineStart: 0, lines: descriptor().lines.slice(0, 3) })],
+    cursor: 0,
+    nextCursor: 3,
     hasMore: true,
     totalLines: 5,
+    hunkCount: 1,
+    truncated: false,
+  };
+  const merged1 = appendFileDiffPage(loaded, page1);
+  check('seed dedupes the overlapping first page', merged1.lines.length === 3 && merged1.lines[2].text === ' c');
+  check('merged hunk upgraded to backend identity', merged1.hunks[0].totalLines === 5 && merged1.hunks[0].complete === true);
+  check('partial merge not ready yet', loadedHunkReady(merged1.hunks[0]) === false);
+  check('page cursor advances', merged1.nextCursor === 3);
+  check('page total updated', merged1.totalLines === 5);
+  check('page hasMore carried', merged1.hasMoreBackend === true);
+  check('page not complete mid-stream', merged1.hunksComplete === false);
+  check('page clears error/loading', merged1.loading === false && merged1.error === null);
+  // Second page continues at hunk-local 3 and completes the stream.
+  const page2 = {
+    ...page1,
+    hunks: [descriptor({ lineStart: 3, lines: descriptor().lines.slice(3) })],
+    cursor: 3,
+    nextCursor: undefined,
+    hasMore: false,
+  };
+  const merged = appendFileDiffPage(merged1, page2);
+  check('page continuation appended in order', merged.lines.length === 5 && merged.lines[3].text === '+d' && merged.lines[4].text === '+e');
+  check('merged hunk becomes ready', loadedHunkReady(merged.hunks[0]) === true);
+  check('final page completes the stream', merged.hasMoreBackend === false && merged.hunksComplete === true && merged.nextCursor === 5);
+  const dupPage = appendFileDiffPage(merged, page2);
+  check('duplicate cursor page dropped', dupPage === merged && dupPage.lines.length === 5);
+  const staleSnap = appendFileDiffPage(loaded, { ...page1, snapshotId: 'other-snap' });
+  check('stale snapshot page dropped', staleSnap === loaded);
+  const wrongPath = appendFileDiffPage(loaded, { ...page1, path: 'other.rs' });
+  check('wrong path page dropped', wrongPath === loaded);
+  const wrongCursor = appendFileDiffPage(loaded, { ...page1, cursor: 99 });
+  check('wrong cursor page dropped', wrongCursor === loaded);
+}
+
+// ---- contract: globally truncated placeholder yields complete loaded hunk identities ----
+{
+  // A placeholder file the 2 MiB snapshot never carried: zero snapshot hunks.
+  const placeholder = {
+    path: 'zz-later.txt',
+    status: 'modified',
+    binary: false,
+    insertions: 0,
+    deletions: 0,
+    truncated: true,
+    hunks: [],
+  };
+  const loaded = initLoadedDiff('snap-1', placeholder, true);
+  check('placeholder seeds no hunks', loaded.hunks.length === 0 && loaded.lines.length === 0);
+
+  // The first backend page carries the complete hunk descriptor + lines.
+  const page = {
+    snapshotId: 'snap-1',
+    path: 'zz-later.txt',
+    binary: false,
+    status: 'modified',
+    hunks: [
+      {
+        index: 0,
+        header: '@@ -1 +1 @@',
+        oldStart: 1,
+        oldCount: 1,
+        newStart: 1,
+        newCount: 1,
+        contentHash: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+        totalLines: 2,
+        complete: true,
+        lineStart: 0,
+        lines: [
+          { kind: 'deletion', oldNo: 1, text: '-later base' },
+          { kind: 'addition', newNo: 1, text: '+later changed' },
+        ],
+      },
+    ],
+    cursor: 0,
+    nextCursor: undefined,
+    hasMore: false,
+    totalLines: 2,
+    hunkCount: 1,
     truncated: false,
   };
   const merged = appendFileDiffPage(loaded, page);
-  check('page appended in order', merged.lines.length === 5 && merged.lines[3].text === '+d' && merged.lines[4].text === '+e');
-  check('page cursor advances', merged.nextCursor === 5);
-  check('page total updated', merged.totalLines === 5);
-  check('page hasMore carried', merged.hasMoreBackend === true);
-  check('page clears error/loading', merged.loading === false && merged.error === null);
-  const dupPage = appendFileDiffPage(merged, page);
-  check('duplicate cursor page dropped', dupPage === merged && dupPage.lines.length === 5);
-  const staleSnap = appendFileDiffPage(loaded, { ...page, snapshotId: 'other-snap' });
-  check('stale snapshot page dropped', staleSnap === loaded);
-  const wrongPath = appendFileDiffPage(loaded, { ...page, path: 'other.rs' });
-  check('wrong path page dropped', wrongPath === loaded);
-  const wrongCursor = appendFileDiffPage(loaded, { ...page, cursor: 0 });
-  check('wrong cursor page dropped', wrongCursor === loaded);
-  const finalPage = appendFileDiffPage(merged, { ...page, cursor: 5, nextCursor: undefined, hasMore: false, lines: [{ kind: 'context', oldNo: 5, newNo: 5, text: ' f' }] });
-  check('final page stops paging', finalPage.lines.length === 6 && finalPage.hasMoreBackend === false && finalPage.nextCursor === 6);
+  check('placeholder hunk merged', merged.hunks.length === 1 && merged.lines.length === 2);
+  check('placeholder hunk is a real hunk with header/ranges/hash', merged.hunks[0].header === '@@ -1 +1 @@' && merged.hunks[0].oldStart === 1 && merged.hunks[0].contentHash === page.hunks[0].contentHash);
+  check('placeholder hunk complete and ready', merged.hunks[0].complete === true && loadedHunkReady(merged.hunks[0]) === true);
+  check('placeholder stream complete', merged.hunksComplete === true && merged.hasMoreBackend === false);
 }
 
-// ---- planDiffWindow (soft cap + UI hard cap + backend fetch) ----
+// ---- contract: partial last snapshot hunk is replaced by the per-file hunk ----
+{
+  // A file partially cut by the 2 MiB global patch: the snapshot carries its
+  // last hunk with a WRONG identity (partial lines -> different content hash).
+  const seedLines = [
+    { kind: 'context', oldNo: 1, newNo: 1, text: ' a' },
+    { kind: 'deletion', oldNo: 2, text: '-b' },
+  ];
+  const file = {
+    path: 'cut.rs',
+    status: 'modified',
+    binary: false,
+    insertions: 0,
+    deletions: 1,
+    truncated: true,
+    hunks: [
+      { header: '@@ -1,3 +1,3 @@', oldStart: 1, oldCount: 3, newStart: 1, newCount: 3, contentHash: 'partial-hash', lines: seedLines },
+    ],
+  };
+  const loaded = initLoadedDiff('snap-1', file, true);
+  check('partial seed hunk detected incomplete', loaded.hunks[0].complete === false);
+  check('partial seed hunk not selectable', loadedHunkReady(loaded.hunks[0]) === false);
+
+  // The per-file page carries the COMPLETE hunk (different hash, all lines).
+  const page = {
+    snapshotId: 'snap-1',
+    path: 'cut.rs',
+    binary: false,
+    status: 'modified',
+    hunks: [
+      {
+        index: 0,
+        header: '@@ -1,3 +1,3 @@',
+        oldStart: 1,
+        oldCount: 3,
+        newStart: 1,
+        newCount: 3,
+        contentHash: 'complete-hash',
+        totalLines: 5,
+        complete: true,
+        lineStart: 0,
+        lines: [
+          { kind: 'context', oldNo: 1, newNo: 1, text: ' a' },
+          { kind: 'deletion', oldNo: 2, text: '-b' },
+          { kind: 'deletion', oldNo: 3, text: '-b2' },
+          { kind: 'addition', newNo: 2, text: '+c' },
+          { kind: 'addition', newNo: 3, text: '+c2' },
+        ],
+      },
+    ],
+    cursor: 0,
+    nextCursor: undefined,
+    hasMore: false,
+    totalLines: 5,
+    hunkCount: 1,
+    truncated: false,
+  };
+  const merged = appendFileDiffPage(loaded, page);
+  check('partial hunk replaced by per-file hunk', merged.hunks[0].contentHash === 'complete-hash' && merged.hunks[0].lines.length === 5);
+  check('replacement hunk complete and ready', merged.hunks[0].complete === true && loadedHunkReady(merged.hunks[0]) === true);
+  check('replacement produced no duplicate lines', merged.lines.length === 5);
+}
+
+// ---- contract: page-split hunk merges with no duplication ----
+{
+  // One 8200-line hunk delivered in cursor-0 pages while the snapshot seed
+  // already carried the full body: the seed dedupes byte-identically.
+  const makeLines = (n, offset = 0) =>
+    Array.from({ length: n }, (_, i) => ({ kind: 'addition', newNo: offset + i + 1, text: `+l${offset + i}` }));
+  const bigHunk = {
+    header: '@@ -0,0 +1,8200 @@',
+    oldStart: 0,
+    oldCount: 0,
+    newStart: 1,
+    newCount: 8200,
+    contentHash: 'big-hash',
+    lines: makeLines(8200),
+  };
+  const loaded = initLoadedDiff('snap-1', {
+    path: 'big.txt',
+    status: 'modified',
+    binary: false,
+    insertions: 8200,
+    deletions: 0,
+    truncated: true,
+    hunks: [bigHunk],
+  }, true);
+  check('seeded big hunk ready immediately', loadedHunkReady(loaded.hunks[0]) === true);
+  // Page 1 (cursor 0) covers lines 0..1000 — fully inside the seed.
+  const p1 = appendFileDiffPage(loaded, {
+    snapshotId: 'snap-1',
+    path: 'big.txt',
+    binary: false,
+    status: 'modified',
+    hunks: [{ index: 0, header: bigHunk.header, oldStart: 0, oldCount: 0, newStart: 1, newCount: 8200, contentHash: 'big-hash', totalLines: 8200, complete: true, lineStart: 0, lines: makeLines(1000) }],
+    cursor: 0,
+    nextCursor: 1000,
+    hasMore: true,
+    totalLines: 8200,
+    hunkCount: 1,
+    truncated: false,
+  });
+  check('seed dedupes page-1 subset', p1.lines.length === 8200 && p1.lines[999].text === '+l999');
+  // Page 2 covers 1000..2000 — also inside the seed.
+  const p2 = appendFileDiffPage(p1, {
+    snapshotId: 'snap-1',
+    path: 'big.txt',
+    binary: false,
+    status: 'modified',
+    hunks: [{ index: 0, header: bigHunk.header, oldStart: 0, oldCount: 0, newStart: 1, newCount: 8200, contentHash: 'big-hash', totalLines: 8200, complete: true, lineStart: 1000, lines: makeLines(1000, 1000) }],
+    cursor: 1000,
+    nextCursor: 2000,
+    hasMore: true,
+    totalLines: 8200,
+    hunkCount: 1,
+    truncated: false,
+  });
+  check('seed dedupes page-2 subset', p2.lines.length === 8200);
+  // A placeholder file (no seed) with the same hunk split across pages:
+  // page 1 covers 0..1000, page 2 continues 1000..2000 — pure appends.
+  const empty = initLoadedDiff('snap-1', { ...bigHunk, path: 'huge.txt', hunks: [], truncated: true }, true);
+  const hp1 = appendFileDiffPage(empty, {
+    snapshotId: 'snap-1',
+    path: 'huge.txt',
+    binary: false,
+    status: 'modified',
+    hunks: [{ index: 0, header: bigHunk.header, oldStart: 0, oldCount: 0, newStart: 1, newCount: 8200, contentHash: 'big-hash', totalLines: 8200, complete: true, lineStart: 0, lines: makeLines(1000) }],
+    cursor: 0,
+    nextCursor: 1000,
+    hasMore: true,
+    totalLines: 8200,
+    hunkCount: 1,
+    truncated: false,
+  });
+  check('split hunk page 1 appends', hp1.lines.length === 1000 && loadedHunkReady(hp1.hunks[0]) === false);
+  const hp2 = appendFileDiffPage(hp1, {
+    snapshotId: 'snap-1',
+    path: 'huge.txt',
+    binary: false,
+    status: 'modified',
+    hunks: [{ index: 0, header: bigHunk.header, oldStart: 0, oldCount: 0, newStart: 1, newCount: 8200, contentHash: 'big-hash', totalLines: 8200, complete: true, lineStart: 1000, lines: makeLines(1000, 1000) }],
+    cursor: 1000,
+    nextCursor: 2000,
+    hasMore: true,
+    totalLines: 8200,
+    hunkCount: 1,
+    truncated: false,
+  });
+  check('split hunk page 2 continues in order', hp2.lines.length === 2000 && hp2.lines[1999].text === '+l1999');
+  check('split hunk not ready until all lines arrive', loadedHunkReady(hp2.hunks[0]) === false);
+  // Byte-capped incomplete hunk: descriptor complete=false, never ready.
+  const capped = appendFileDiffPage(hp2, {
+    snapshotId: 'snap-1',
+    path: 'huge.txt',
+    binary: false,
+    status: 'modified',
+    hunks: [{ index: 0, header: bigHunk.header, oldStart: 0, oldCount: 0, newStart: 1, newCount: 8200, contentHash: 'big-hash', totalLines: 2500, complete: false, lineStart: 2000, lines: makeLines(500, 2000) }],
+    cursor: 2000,
+    nextCursor: undefined,
+    hasMore: false,
+    totalLines: 2500,
+    hunkCount: 1,
+    truncated: true,
+  });
+  check('byte-capped hunk surfaces the cap', capped.byteCapped === true && capped.hunksComplete === true);
+  check('byte-capped hunk stays unselectable', loadedHunkReady(capped.hunks[0]) === false);
+}
+
+// ---- planDiffWindow (soft cap + UI hard cap + backend stream) ----
 {
   const manyLines = (n) => Array.from({ length: n }, (_, i) => ({ kind: 'addition', newNo: i + 1, text: `+l${i}` }));
   const loaded8200 = {
     snapshotId: 's',
     path: 'big.rs',
+    hunks: [],
     lines: manyLines(8200),
-    snapshotLineCount: 8200,
+    hunkCount: 1,
     nextCursor: 8200,
     hasMoreBackend: false,
     totalLines: 8200,
     backendTruncated: true,
+    byteCapped: false,
+    hunksComplete: true,
     loading: false,
     error: null,
   };
@@ -675,16 +999,22 @@ function check(name, cond, detail) {
   check('plan no more at end', p3.canLoadMore === false);
   const pEnd = planDiffWindow(loaded8200, 4000, 4000, true);
   check('plan toEnd jumps to local end', pEnd.target === 8200);
+  // Initial window: a fully loaded 8200-line diff still renders only the
+  // first 4000 lines (DOM bound unchanged), with Load more growing it.
+  check('initial window never exceeds the soft cap', p1.localAvailable === 8200 && planDiffWindow(loaded8200, 0).target === 4000);
 
   const loadedBackend = {
     snapshotId: 's',
     path: 'big.rs',
+    hunks: [],
     lines: manyLines(4000),
-    snapshotLineCount: 4000,
+    hunkCount: 1,
     nextCursor: 4000,
     hasMoreBackend: true,
     totalLines: 4000,
     backendTruncated: true,
+    byteCapped: false,
+    hunksComplete: false,
     loading: false,
     error: null,
   };
@@ -698,12 +1028,15 @@ function check(name, cond, detail) {
   const loadedHuge = {
     snapshotId: 's',
     path: 'huge.rs',
+    hunks: [],
     lines: manyLines(25000),
-    snapshotLineCount: 25000,
+    hunkCount: 1,
     nextCursor: 25000,
     hasMoreBackend: false,
     totalLines: 25000,
     backendTruncated: true,
+    byteCapped: false,
+    hunksComplete: true,
     loading: false,
     error: null,
   };
@@ -712,6 +1045,228 @@ function check(name, cond, detail) {
   check('plan huge file window still grows locally', ph.target === 8000 && ph.canLoadMore === true);
   const phEnd = planDiffWindow(loadedHuge, 20000, 4000, true);
   check('plan huge file toEnd capped at 20000', phEnd.target === 20000 && phEnd.canLoadMore === false);
+}
+
+// ---- concurrent thread state / model / activeCount normalization ----
+{
+  const multi = normalizeCodeReviewSnapshot({
+    comparisonLabel: 'x',
+    snapshotId: 's2',
+    files: [],
+    threads: [
+      {
+        identity: {
+          snapshotId: 's2',
+          path: 'a.ts',
+          oldStart: 1,
+          oldCount: 1,
+          newStart: 1,
+          newCount: 1,
+          contentHash: 'a',
+        },
+        comments: [{ role: 'assistant', text: 'done', partial: false, model: 'alpha' }],
+        streamingText: '',
+        isStreaming: false,
+        model: 'alpha',
+        error: null,
+        stale: false,
+      },
+      {
+        identity: {
+          snapshotId: 's2',
+          path: 'b.ts',
+          oldStart: 2,
+          oldCount: 1,
+          newStart: 2,
+          newCount: 1,
+          contentHash: 'b',
+        },
+        comments: [],
+        streamingText: 'working…',
+        isStreaming: true,
+        model: 'beta',
+        error: null,
+        stale: false,
+      },
+      {
+        identity: {
+          snapshotId: 's2',
+          path: 'c.ts',
+          oldStart: 3,
+          oldCount: 1,
+          newStart: 3,
+          newCount: 1,
+          contentHash: 'c',
+        },
+        comments: [],
+        streamingText: '',
+        isStreaming: true,
+        error: null,
+        stale: false,
+      },
+    ],
+    // omit isStreaming/activeCount → derive from threads
+  });
+  check('derived activeCount from threads', multi.activeCount === 2);
+  check('derived aggregate isStreaming', multi.isStreaming === true);
+  check('thread a not streaming', multi.threads[0].isStreaming === false);
+  check('thread b streaming', multi.threads[1].isStreaming === true);
+  check('thread b model', multi.threads[1].model === 'beta');
+  check('comment model preserved', multi.threads[0].comments[0].model === 'alpha');
+  check('empty model omitted', multi.threads[2].model === undefined);
+  check(
+    'threadIsStreaming helper',
+    threadIsStreaming(multi.threads[1]) === true && threadIsStreaming(multi.threads[0]) === false,
+  );
+  check('threadIsStreaming null', threadIsStreaming(null) === false);
+
+  const wireCount = normalizeCodeReviewSnapshot({
+    threads: [
+      {
+        identity: {
+          snapshotId: 's',
+          path: 'a.ts',
+          oldStart: 1,
+          oldCount: 1,
+          newStart: 1,
+          newCount: 1,
+          contentHash: 'a',
+        },
+        comments: [],
+        streamingText: '',
+        isStreaming: true,
+      },
+    ],
+    isStreaming: true,
+    activeCount: 5, // wire wins over derived (1)
+  });
+  check('wire activeCount preferred', wireCount.activeCount === 5);
+  check('wire isStreaming preferred', wireCount.isStreaming === true);
+
+  // empty-string model is dropped (optionalString)
+  const emptyModel = normalizeThreads([
+    {
+      identity: {
+        snapshotId: 's',
+        path: 'a.ts',
+        oldStart: 1,
+        oldCount: 1,
+        newStart: 1,
+        newCount: 1,
+        contentHash: 'a',
+      },
+      comments: [{ role: 'assistant', text: 'x', partial: false, model: '' }],
+      streamingText: '',
+      isStreaming: false,
+      model: '',
+    },
+  ]);
+  check('empty comment model omitted', emptyModel[0].comments[0].model === undefined);
+  check('empty thread model omitted', emptyModel[0].model === undefined);
+}
+
+// ---- buildCodeReviewAbortPayload full identity ----
+{
+  const payload = buildCodeReviewAbortPayload({
+    snapshotId: 'snap-9',
+    path: 'src/x.ts',
+    oldStart: 10,
+    oldCount: 2,
+    newStart: 12,
+    newCount: 3,
+    contentHash: 'hash-x',
+  });
+  check('abort type', payload.type === 'code_review_abort');
+  check('abort snapshotId', payload.snapshotId === 'snap-9');
+  check('abort path', payload.path === 'src/x.ts');
+  check('abort oldStart', payload.oldStart === 10);
+  check('abort oldCount', payload.oldCount === 2);
+  check('abort newStart', payload.newStart === 12);
+  check('abort newCount', payload.newCount === 3);
+  check('abort contentHash', payload.contentHash === 'hash-x');
+  check(
+    'abort has no sessionId (caller stamps)',
+    !Object.prototype.hasOwnProperty.call(payload, 'sessionId'),
+  );
+}
+
+// ---- formatActiveRepliesLabel ----
+{
+  check('0 replies -> null', formatActiveRepliesLabel(0) === null);
+  check('negative -> null', formatActiveRepliesLabel(-2) === null);
+  check('1 reply singular', formatActiveRepliesLabel(1) === '1 reply');
+  check('2 replies plural', formatActiveRepliesLabel(2) === '2 replies');
+  check('float floors', formatActiveRepliesLabel(3.9) === '3 replies');
+  check('NaN -> null', formatActiveRepliesLabel(Number.NaN) === null);
+}
+
+// ---- thread width bounds / persistence helpers ----
+{
+  check('default width', CODE_REVIEW_THREAD_WIDTH_DEFAULT === 280);
+  check('min width', CODE_REVIEW_THREAD_WIDTH_MIN === 240);
+  check('max width', CODE_REVIEW_THREAD_WIDTH_MAX === 480);
+  check('storage key', CODE_REVIEW_THREAD_WIDTH_STORAGE_KEY === 'rpi-code-review-thread-width');
+  check('clamp mid', clampCodeReviewThreadWidth(300) === 300);
+  check('clamp below min', clampCodeReviewThreadWidth(100) === CODE_REVIEW_THREAD_WIDTH_MIN);
+  check('clamp above max', clampCodeReviewThreadWidth(999) === CODE_REVIEW_THREAD_WIDTH_MAX);
+  check('clamp NaN -> default', clampCodeReviewThreadWidth(Number.NaN) === CODE_REVIEW_THREAD_WIDTH_DEFAULT);
+  check('clamp rounds', clampCodeReviewThreadWidth(300.6) === 301);
+  check(
+    'step shrink (-1)',
+    stepCodeReviewThreadWidth(280, -1) === 280 - CODE_REVIEW_THREAD_WIDTH_STEP,
+  );
+  check(
+    'step grow clamps at max',
+    stepCodeReviewThreadWidth(CODE_REVIEW_THREAD_WIDTH_MAX, 1) === CODE_REVIEW_THREAD_WIDTH_MAX,
+  );
+  check(
+    'step shrink clamps at min',
+    stepCodeReviewThreadWidth(CODE_REVIEW_THREAD_WIDTH_MIN, -1) === CODE_REVIEW_THREAD_WIDTH_MIN,
+  );
+  check(
+    'step grow (+1)',
+    stepCodeReviewThreadWidth(280, 1) === 280 + CODE_REVIEW_THREAD_WIDTH_STEP,
+  );
+
+  const mem = new Map();
+  const storage = {
+    getItem(key) {
+      return mem.has(key) ? mem.get(key) : null;
+    },
+    setItem(key, value) {
+      mem.set(key, value);
+    },
+  };
+  check('read missing -> default', readStoredCodeReviewThreadWidth(storage) === CODE_REVIEW_THREAD_WIDTH_DEFAULT);
+  check('read null storage -> default', readStoredCodeReviewThreadWidth(null) === CODE_REVIEW_THREAD_WIDTH_DEFAULT);
+  const written = writeStoredCodeReviewThreadWidth(storage, 350);
+  check('write returns clamped', written === 350);
+  check('write persists', mem.get(CODE_REVIEW_THREAD_WIDTH_STORAGE_KEY) === '350');
+  check('read persisted', readStoredCodeReviewThreadWidth(storage) === 350);
+  writeStoredCodeReviewThreadWidth(storage, 50);
+  check('write clamps min', mem.get(CODE_REVIEW_THREAD_WIDTH_STORAGE_KEY) === String(CODE_REVIEW_THREAD_WIDTH_MIN));
+  mem.set(CODE_REVIEW_THREAD_WIDTH_STORAGE_KEY, 'not-a-number');
+  check(
+    'read garbage -> default',
+    readStoredCodeReviewThreadWidth(storage) === CODE_REVIEW_THREAD_WIDTH_DEFAULT,
+  );
+
+  const throwing = {
+    getItem() {
+      throw new Error('blocked');
+    },
+    setItem() {
+      throw new Error('blocked');
+    },
+  };
+  check(
+    'read throws -> default',
+    readStoredCodeReviewThreadWidth(throwing) === CODE_REVIEW_THREAD_WIDTH_DEFAULT,
+  );
+  check(
+    'write throws still returns clamp',
+    writeStoredCodeReviewThreadWidth(throwing, 400) === 400,
+  );
 }
 
 console.log(`\ncodeReview.test: ${ran} assertions, ${failures.length} failure(s)`);

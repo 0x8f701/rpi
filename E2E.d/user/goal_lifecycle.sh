@@ -50,8 +50,8 @@ TERM=xterm-256color \
         || fail "goal details block missing Status: active"
     tmux_wait_for "$session" 15 'Tokens: 0 / 100' >/dev/null \
         || fail "goal details block missing Tokens: 0 / 100"
-    tmux_wait_for "$session" 15 '🎯 Goal 0/100' >"$evidence/create-chip.txt" \
-        || fail "composer header goal chip missing (expected 🎯 Goal 0/100)"
+    tmux_wait_for "$session" 15 '🎯 Goal' >"$evidence/create-chip.txt" \
+        || fail "composer header goal chip missing (expected 🎯 Goal lifecycle marker)"
     # The goal work turn answered with the faux reply.
     tmux_wait_for "$session" 15 "$FAUX_REPLY" >/dev/null || true
 
@@ -81,18 +81,18 @@ TERM=xterm-256color \
     # --- Pause ---
     tmux send-keys -t "$session":0 -l '/goal pause'
     tmux send-keys -t "$session":0 Enter
-    tmux_wait_for "$session" 15 'paused · 0/100 tokens · ship the widget' >"$evidence/pause.txt" \
-        || fail "goal pause did not report 'paused · 0/100 tokens · ship the widget'"
-    tmux_wait_for "$session" 15 '⏸ Goal 0/100' >/dev/null \
-        || fail "paused goal chip missing (expected ⏸ Goal 0/100)"
+    tmux_wait_for "$session" 15 'paused (manually paused) · 0/100 tokens · ship the widget' >"$evidence/pause.txt" \
+        || fail "goal pause did not report 'paused (manually paused) · 0/100 tokens · ship the widget'"
+    tmux_wait_for "$session" 15 '⏸ Goal' >/dev/null \
+        || fail "paused goal chip missing (expected ⏸ Goal lifecycle marker)"
 
     # --- Resume ---
     tmux send-keys -t "$session":0 -l '/goal resume'
     tmux send-keys -t "$session":0 Enter
     # Resume restarts goal work (a turn starts, so the status line shows the
     # busy label); the observable proof is the chip returning to active.
-    tmux_wait_for "$session" 25 '🎯 Goal 0/100' >"$evidence/resume.txt" \
-        || fail "resumed goal chip missing (expected 🎯 Goal 0/100)"
+    tmux_wait_for "$session" 25 '🎯 Goal' >"$evidence/resume.txt" \
+        || fail "resumed goal chip missing (expected 🎯 Goal lifecycle marker)"
     tmux send-keys -t "$session":0 -l '/goal show'
     tmux send-keys -t "$session":0 Enter
     tmux_wait_for "$session" 15 'Status: active' >/dev/null \
@@ -103,8 +103,8 @@ TERM=xterm-256color \
     tmux send-keys -t "$session":0 Enter
     tmux_wait_for "$session" 15 'completed · 0/100 tokens · ship the widget' >"$evidence/complete.txt" \
         || fail "goal complete did not report 'completed · 0/100 tokens · ship the widget'"
-    tmux_wait_for "$session" 15 '✓ Goal 0/100' >/dev/null \
-        || fail "completed goal chip missing (expected ✓ Goal 0/100)"
+    tmux_wait_for "$session" 15 '✓ Goal' >/dev/null \
+        || fail "completed goal chip missing (expected ✓ Goal lifecycle marker)"
 
     # --- Bare /goal opens the goal panel; Esc restores the composer ---
     tmux send-keys -t "$session":0 -l '/goal'

@@ -46,9 +46,18 @@
 //   - comment bodies render markdown (strong, lists, ```rust fences with
 //     hljs highlight) while hostile HTML stays literal text — no element is
 //     created, no script runs, no dialog opens (user AND assistant comments)
-//   - Ctrl+Enter submits a comment; the steering mock's slow review stream
-//     surfaces the streaming state (Abort available), and Abort leaves a
-//     partial assistant comment
+//   - plain Enter submits a comment; Shift+Enter inserts a newline without
+//     submitting and a synthetic IME-composing Enter never submits; while
+//     the first reply streams the composer stays ENABLED with no streaming
+//     warning note, a second comment submits immediately and renders as a
+//     queued card, and Abort clears the active stream AND drops the queued
+//     (not-yet-started) comment while leaving the partial assistant reply
+//   - the >4000-line fixture keeps the file-level 'Large file — the diff
+//     loads in bounded pages' banner/paging (Load more/Load full), the
+//     removed panel-level 'Large diff — all changed files…' notice stays
+//     ABSENT, and typing into the composer with the large diff rendered
+//     stays responsive (stable textarea identity, bounded per-keystroke
+//     DOM mutation, bounded edit time — never an inflated test timeout)
 //   - the panel polls code_review_snapshot at the 1.5s contract while open
 //     (≥2 frames ~1.5s apart) and polling stops after the panel closes
 //   - a session switch closes the owning review workspace (code_review_close
@@ -58,13 +67,28 @@
 //     keeps the workspace + draft; Escape with no draft closes the panel
 //   - mobile (≤900px): Files→Diff→Thread tab transitions, composer visible
 //     without scrolling, Back-to-diff, and button.code-review__close removes
-//     #code-review-panel from the DOM
+//     #code-review-panel from the DOM; `.code-review__thread-resizer` hidden
+//   - desktop thread column: `.code-review__thread-resizer` ARIA separator,
+//     `--code-review-thread-width` (default 280, bounds 240–480), pointer +
+//     keyboard + localStorage `rpi-code-review-thread-width` reload persistence
 //   - selecting /skill drills the picker into skills mode; the REAL on-disk
 //     fixture skill candidate (greet) renders with name + description;
 //     selecting it inserts `/skill greet` (no auto-submit) and Enter renders
 //     the loaded skill's frontmatter summary bubble
 //   - /compact dispatches the compact RPC — observed on the outgoing WS frame
 //     (deterministic; the provider round-trip is never required for this lane)
+//   - slash-command variants: /compact --snap dispatches snapcompact and
+//     renders the REAL deterministic A→B token report bubble; /compact
+//     <instructions> and bare /compact dispatch compact (with/without
+//     customInstructions) and surface the truthful "session too small"
+//     error bubble + toast; /skill greet extra uses only the first token
+//     as the skill name; /skill bare is a usage-error toast with no RPC;
+//     /unknowncmd falls through to a normal prompt (user bubble + prompt RPC)
+//   - code-review error/close: /code-review HEAD~1 HEAD opens the panel with
+//     the from/to revisions and closes via the × button; /code-review
+//     <bad-ref> HEAD renders the real git revision error state with Retry
+//     and closes cleanly; /code-review a b c is a client-side arity toast
+//     that never opens the panel
 
 import { chromium } from 'playwright';
 
@@ -338,6 +362,183 @@ async function main() {
       )
     , addedFile);
     if (!hasAdded) fail(`code-review file list missing the staged new file ${addedFile}`);
+
+    // ---- Thread column width: stable empty column + desktop resizer ----
+    // Contract: `.code-review__thread-resizer` (ARIA separator) between Diff
+    // and Thread, CSS var `--code-review-thread-width` on `.code-review`,
+    // localStorage `rpi-code-review-thread-width`, bounds 240–480 (default 280).
+    // Review React owns the DOM mount; this lane asserts the full desktop
+    // pointer/keyboard/bounds/reload journey once it is present.
+    await waitFor(
+      page,
+      () => document.querySelector('.code-review__thread-resizer') !== null,
+      'code-review thread resizer (.code-review__thread-resizer) never mounted on desktop'
+    );
+    const threadInitial = await page.evaluate(() => {
+      const root = document.querySelector('.code-review');
+      const resizer = document.querySelector('.code-review__thread-resizer');
+      const comments = document.querySelector('.code-review__comments');
+      if (!root || !resizer || !comments) return null;
+      const raw = getComputedStyle(root).getPropertyValue('--code-review-thread-width').trim();
+      const px = Number.parseFloat(raw);
+      return {
+        raw,
+        px,
+        role: resizer.getAttribute('role'),
+        tabIndex: resizer.tabIndex,
+        commentsW: comments.getBoundingClientRect().width,
+        stored: window.localStorage.getItem('rpi-code-review-thread-width'),
+      };
+    });
+    if (!threadInitial) fail('code-review thread width probes missing (.code-review / resizer / comments)');
+    if (threadInitial.role !== 'separator') {
+      fail(`thread resizer role must be separator (got "${threadInitial.role}")`);
+    }
+    if (threadInitial.tabIndex < 0) fail('thread resizer must be keyboard-focusable');
+    if (!(threadInitial.px >= 240 && threadInitial.px <= 480)) {
+      fail(`--code-review-thread-width must be within 240–480 (got "${threadInitial.raw}")`);
+    }
+    // Empty thread column stays stable (width tracks the CSS var, not content).
+    if (Math.abs(threadInitial.commentsW - threadInitial.px) > 12) {
+      fail(`empty thread column width ${threadInitial.commentsW}px must track --code-review-thread-width ${threadInitial.raw}`);
+    }
+
+    // Keyboard: Home → max 480, End → min 240 (or ArrowRight/Left steps).
+    await page.focus('.code-review__thread-resizer');
+    await page.keyboard.press('Home');
+    const afterThreadHome = await page.evaluate(() => {
+      const root = document.querySelector('.code-review');
+      const raw = root ? getComputedStyle(root).getPropertyValue('--code-review-thread-width').trim() : '';
+      const stored = window.localStorage.getItem('rpi-code-review-thread-width');
+      return { raw, px: Number.parseFloat(raw), stored };
+    });
+    if (afterThreadHome.px !== 480 && afterThreadHome.stored !== '480') {
+      // Some implementations only step via arrows; fall back to many Right presses.
+      for (let i = 0; i < 20; i++) await page.keyboard.press('ArrowRight');
+    }
+    const afterMax = await page.evaluate(() => {
+      const root = document.querySelector('.code-review');
+      const raw = root ? getComputedStyle(root).getPropertyValue('--code-review-thread-width').trim() : '';
+      const stored = window.localStorage.getItem('rpi-code-review-thread-width');
+      const commentsW = document.querySelector('.code-review__comments')?.getBoundingClientRect().width || 0;
+      return { raw, px: Number.parseFloat(raw), stored, commentsW };
+    });
+    if (afterMax.px !== 480) {
+      fail(`thread resizer must clamp to max 480px (got "${afterMax.raw}", stored="${afterMax.stored}")`);
+    }
+    if (afterMax.stored !== '480') {
+      fail(`thread max must persist rpi-code-review-thread-width=480 (got "${afterMax.stored}")`);
+    }
+    await page.keyboard.press('End');
+    let afterMin = await page.evaluate(() => {
+      const root = document.querySelector('.code-review');
+      const raw = root ? getComputedStyle(root).getPropertyValue('--code-review-thread-width').trim() : '';
+      const stored = window.localStorage.getItem('rpi-code-review-thread-width');
+      return { raw, px: Number.parseFloat(raw), stored };
+    });
+    if (afterMin.px !== 240 && afterMin.stored !== '240') {
+      for (let i = 0; i < 20; i++) await page.keyboard.press('ArrowLeft');
+      afterMin = await page.evaluate(() => {
+        const root = document.querySelector('.code-review');
+        const raw = root ? getComputedStyle(root).getPropertyValue('--code-review-thread-width').trim() : '';
+        const stored = window.localStorage.getItem('rpi-code-review-thread-width');
+        return { raw, px: Number.parseFloat(raw), stored };
+      });
+    }
+    if (afterMin.px !== 240) {
+      fail(`thread resizer must clamp to min 240px (got "${afterMin.raw}", stored="${afterMin.stored}")`);
+    }
+    if (afterMin.stored !== '240') {
+      fail(`thread min must persist rpi-code-review-thread-width=240 (got "${afterMin.stored}")`);
+    }
+
+    // Pointer drag: pull resizer left → thread column grows.
+    const threadBox = await page.locator('.code-review__thread-resizer').boundingBox();
+    if (!threadBox) fail('thread resizer has no bounding box');
+    const tx = threadBox.x + threadBox.width / 2;
+    const ty = threadBox.y + threadBox.height / 2;
+    await page.mouse.move(tx, ty);
+    await page.mouse.down();
+    await page.mouse.move(tx - 80, ty, { steps: 8 });
+    await page.mouse.up();
+    const afterThreadDrag = await page.evaluate(() => {
+      const root = document.querySelector('.code-review');
+      const raw = root ? getComputedStyle(root).getPropertyValue('--code-review-thread-width').trim() : '';
+      const px = Number.parseFloat(raw);
+      const stored = window.localStorage.getItem('rpi-code-review-thread-width');
+      const commentsW = document.querySelector('.code-review__comments')?.getBoundingClientRect().width || 0;
+      return { raw, px, stored, commentsW };
+    });
+    if (!(afterThreadDrag.px > 240 && afterThreadDrag.px <= 480)) {
+      fail(`thread pointer drag must grow width above 240 within bounds (got "${afterThreadDrag.raw}")`);
+    }
+    {
+      const storedN = Number(afterThreadDrag.stored);
+      if (!(Number.isFinite(storedN) && Math.abs(storedN - afterThreadDrag.px) < 1.5)) {
+        fail(`thread drag must persist rpi-code-review-thread-width≈${afterThreadDrag.px} (got "${afterThreadDrag.stored}")`);
+      }
+    }
+    if (Math.abs(afterThreadDrag.commentsW - afterThreadDrag.px) > 12) {
+      fail(`thread column width ${afterThreadDrag.commentsW}px must track var ${afterThreadDrag.raw}`);
+    }
+    const persistedThreadW = afterThreadDrag.px;
+    await page.screenshot({ path: `${evidence}/code-review-thread-resize.png`, fullPage: true });
+
+    // Reload persistence for the thread width.
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
+    await waitFor(page, () => document.getElementById('conn-state') !== null, 'thread reload: conn-state missing');
+    await waitFor(
+      page,
+      () => document.getElementById('conn-state').dataset.state === 'on',
+      'thread reload: WS did not reach connected'
+    );
+    // Re-open the review panel via the command surface.
+    await openPicker(page);
+    await chooseCommand(page, 'code-review');
+    await waitFor(
+      page,
+      () => (document.getElementById('prompt-input')?.value.trim() || '').startsWith('/code-review'),
+      'thread reload: /code-review draft missing'
+    );
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'thread reload: panel did not reopen');
+    await waitFor(
+      page,
+      () => document.querySelector('.code-review__thread-resizer') !== null,
+      'thread reload: resizer missing after reopen'
+    );
+    const afterThreadReload = await page.evaluate((want) => {
+      const root = document.querySelector('.code-review');
+      const raw = root ? getComputedStyle(root).getPropertyValue('--code-review-thread-width').trim() : '';
+      const px = Number.parseFloat(raw);
+      const stored = window.localStorage.getItem('rpi-code-review-thread-width');
+      return { raw, px, stored, want };
+    }, persistedThreadW);
+    if (!(Number.isFinite(afterThreadReload.px) && Math.abs(afterThreadReload.px - persistedThreadW) < 1.5)) {
+      fail(`thread reload must restore --code-review-thread-width≈${persistedThreadW} (got "${afterThreadReload.raw}", stored="${afterThreadReload.stored}")`);
+    }
+
+    // Re-select the dirty file so later hunk/thread journeys still have a stage.
+    await waitFor(
+      page,
+      (want) => Array.from(document.querySelectorAll('.code-review__file')).some((b) =>
+        b.getAttribute('data-file-path') === want
+      ),
+      `thread reload: dirty file ${dirtyFile} missing after reopen`,
+      20000,
+      dirtyFile
+    );
+    await page.evaluate((want) => {
+      const btn = Array.from(document.querySelectorAll('.code-review__file')).find((b) =>
+        b.getAttribute('data-file-path') === want
+      );
+      if (btn) btn.click();
+    }, dirtyFile);
+    await waitFor(
+      page,
+      () => document.querySelector('.code-review__line--deletion') !== null,
+      'thread reload: dirty file diff did not re-render'
+    );
 
     // ---- TUI/Web parity: compact status glyphs + basename tree rows ----
     // The changed-file rail mirrors the TUI file tree: one colored compact
@@ -686,6 +887,89 @@ async function main() {
       )
     );
     if (!finalLineVisible) fail('Load full did not reveal the final changed line');
+    // The panel-level "Large diff — all changed files are listed; file
+    // bodies load in bounded pages on demand" notice was REMOVED from the
+    // panel: with the truncated file open, NO banner anywhere may carry that
+    // text — the file-level 'Large file — the diff loads in bounded pages'
+    // banner (asserted above) is the only truncation surface now.
+    const panelLevelNotice = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('.code-review__banner, .code-review__banner--truncated, [role="status"]')).some((el) =>
+        (el.textContent || '').includes('Large diff — all changed files')
+      )
+    );
+    if (panelLevelNotice) {
+      fail('the removed panel-level "Large diff — all changed files…" notice still renders');
+    }
+
+    // ---- Large-diff input responsiveness ----
+    // With the full ~8200-line diff rendered (the heaviest DOM this panel
+    // produces), typing into the comment composer must stay responsive: the
+    // textarea NODE is never remounted per keystroke (stable identity), the
+    // whole edit causes bounded DOM mutation (the rAF-coalesced auto-resize,
+    // never a full subtree re-render per keystroke), and the edit completes
+    // within a strict wall-clock bound. This is a real-browser measurement
+    // of the composed edit — not an inflated test timeout.
+    const bigHunkClicked = await page.evaluate(() => {
+      const header = document.querySelector('button.code-review__hunk-header');
+      if (!header) return false;
+      header.click();
+      return true;
+    });
+    if (!bigHunkClicked) fail('large-diff responsiveness: no hunk header in the big file diff');
+    await waitFor(
+      page,
+      () => document.querySelector('.code-review__comment-input') !== null,
+      'large-diff responsiveness: composer did not open for the big file hunk'
+    );
+    const responsiveness = await page.evaluate(() => {
+      const input = document.querySelector('.code-review__comment-input');
+      if (!input) return null;
+      input.dataset.responsivenessProbe = '1';
+      const stats = { mutations: 0 };
+      const observer = new MutationObserver((records) => {
+        stats.mutations += records.length;
+      });
+      observer.observe(input.parentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true,
+      });
+      const text = 'responsiveness probe line one\nline two\nline three ' + 'x'.repeat(40);
+      const t0 = performance.now();
+      for (let i = 0; i < text.length; i++) {
+        input.value = text.slice(0, i + 1);
+        input.dispatchEvent(
+          new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text[i] })
+        );
+      }
+      const elapsed = performance.now() - t0;
+      observer.disconnect();
+      const live = document.querySelector('.code-review__comment-input');
+      const stillSameNode = live !== null && live.dataset.responsivenessProbe === '1';
+      delete input.dataset.responsivenessProbe;
+      return { elapsed, mutations: stats.mutations, chars: text.length, stillSameNode, value: input.value };
+    });
+    if (!responsiveness) fail('large-diff responsiveness probe could not bind the composer');
+    if (!responsiveness.stillSameNode) {
+      fail('large-diff responsiveness: the composer textarea was REMOUNTED during typing (identity changed)');
+    }
+    if (responsiveness.value.length !== responsiveness.chars) {
+      fail(`large-diff responsiveness: keystrokes lost (value ${responsiveness.value.length}/${responsiveness.chars})`);
+    }
+    // Bounded DOM churn: the auto-resize coalesces per-frame work, so the
+    // whole edit must not rewrite the composer subtree per keystroke.
+    if (responsiveness.mutations > responsiveness.chars * 6) {
+      fail(`large-diff responsiveness: per-keystroke DOM churn too high (${responsiveness.mutations} mutations for ${responsiveness.chars} keystrokes)`);
+    }
+    // Bounded main-thread time for the full edit with ~8200 diff lines in
+    // the DOM (a per-keystroke O(n) re-render would blow this bound).
+    if (responsiveness.elapsed > 1000) {
+      fail(`large-diff responsiveness: edit took ${responsiveness.elapsed.toFixed(1)}ms (bound 1000ms)`);
+    }
+    // Clear the probe draft so the close guards never see an unsent draft.
+    await page.fill('.code-review__comment-input', '');
+    await page.screenshot({ path: `${evidence}/large-diff-responsive.png`, fullPage: true });
     // Back to the full list + the dirty file for the remaining phases.
     await page.fill('.code-review__file-filter', '');
     await waitFor(
@@ -819,31 +1103,121 @@ async function main() {
       'composer did not appear after explicit hunk selection'
     );
 
-    // ---- Ctrl+Enter submits the comment ----
+    // ---- Enter submits; Shift+Enter and IME-composing Enter do not ----
+    // The composer keybinding is "Enter to submit · Shift+Enter for a newline"
+    // (the composer hint). Shift+Enter must only insert a newline — never
+    // dispatch a comment. A synthetic composing Enter (the keydown that
+    // confirms an IME composition, isComposing=true) must likewise never
+    // submit. Plain Enter is the real submit path.
+    const commentInputSel = '.code-review__comment-input';
     const commentText = 'explicit hunk comment from the e2e lane';
-    await page.fill('.code-review__comment-input', commentText);
-    await page.press('.code-review__comment-input', 'Control+Enter');
+    const userCommentCount = () =>
+      page.evaluate(() => document.querySelectorAll('.code-review__comment--user').length);
+    // (a) Shift+Enter: the textarea value grows by a newline and no comment
+    // is submitted (no user card, no streaming state).
+    await page.fill(commentInputSel, 'first line');
+    await page.press(commentInputSel, 'Shift+Enter');
+    const afterShiftEnter = await page.evaluate(
+      () => document.querySelector('.code-review__comment-input')?.value || ''
+    );
+    if (!afterShiftEnter.includes('\n')) {
+      fail(`Shift+Enter must insert a newline without submitting (value=${JSON.stringify(afterShiftEnter)})`);
+    }
+    const commentsBeforeShift = await userCommentCount();
+    await page.waitForTimeout(700);
+    const commentsAfterShift = await userCommentCount();
+    if (commentsAfterShift !== commentsBeforeShift) {
+      fail(`Shift+Enter submitted a comment (user cards ${commentsBeforeShift} -> ${commentsAfterShift}) — it must only insert a newline`);
+    }
+    if (await page.evaluate(() => document.querySelector('.code-review__streaming') !== null)) {
+      fail('Shift+Enter started a review reply — it must only insert a newline');
+    }
+    // (b) Synthetic composing Enter (IME confirm): must not submit and must
+    // not be preventDefault-ed (the composing Enter keeps its native role).
+    await page.fill(commentInputSel, 'ime draft');
+    const composingEnter = await page.evaluate(() => {
+      const el = document.querySelector('.code-review__comment-input');
+      const ev = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+      Object.defineProperty(ev, 'isComposing', { value: true });
+      const prevented = !el.dispatchEvent(ev);
+      return { prevented };
+    });
+    if (composingEnter.prevented) {
+      fail('a composing Enter was preventDefault-ed — the IME-confirm Enter must never submit');
+    }
+    const commentsBeforeComposing = await userCommentCount();
+    await page.waitForTimeout(700);
+    const commentsAfterComposing = await userCommentCount();
+    if (commentsAfterComposing !== commentsBeforeComposing) {
+      fail('a composing Enter submitted the draft — the IME-confirm Enter must never submit');
+    }
+    // (c) Plain Enter submits.
+    await page.fill(commentInputSel, commentText);
+    await page.press(commentInputSel, 'Enter');
     await waitFor(
       page,
       (want) =>
         Array.from(document.querySelectorAll('.code-review__comment--user')).some((el) =>
           (el.querySelector('.code-review__comment-text')?.textContent || '').includes(want)
         ),
-      'Ctrl+Enter did not submit the comment (user comment missing from the thread)',
+      'Enter did not submit the comment (user comment missing from the thread)',
       20000,
       commentText
     );
 
-    // ---- Streaming reply + abort ----
-    // The steering mock streams the review reply slowly (request #1 is odd),
-    // so the snapshot reports the streaming state until it completes. Abort
-    // while streaming finishes the reply as a partial assistant comment.
+    // ---- Streaming: composer enabled, queued comment, Abort ----
+    // The steering mock streams the review reply slowly (odd request), so
+    // the snapshot reports the streaming state until it completes. A
+    // streaming reply must NOT block the composer (no disabled textarea, no
+    // streaming-warning note): a second comment submits immediately and
+    // renders as a queued card behind the first reply. Abort clears the
+    // active stream AND drops the queued (not-yet-started) comment with the
+    // queue (the backend FIFO contract) while leaving the partial assistant
+    // reply.
     await waitFor(
       page,
       () => document.querySelector('.code-review__streaming') !== null,
       'streaming state did not appear after the comment (steering mock slow stream)',
       10000
     );
+    const streamComposerState = await page.evaluate(() => {
+      const el = document.querySelector('.code-review__comment-input');
+      return {
+        present: el !== null,
+        disabled: el ? el.disabled : true,
+        warningNote: document.querySelector('.code-review__streaming-note') !== null,
+        hint: document.querySelector('.code-review__composer-hint')?.textContent?.trim() || '',
+      };
+    });
+    if (!streamComposerState.present || streamComposerState.disabled) {
+      fail(`composer must stay ENABLED while the reply streams (present=${streamComposerState.present} disabled=${streamComposerState.disabled})`);
+    }
+    if (streamComposerState.warningNote) {
+      fail('the streaming-warning note must be ABSENT while the reply streams (.code-review__streaming-note present)');
+    }
+    if (!streamComposerState.hint.includes('Shift+Enter')) {
+      fail(`composer hint must document Enter/Shift+Enter (hint=${JSON.stringify(streamComposerState.hint)})`);
+    }
+    // Second comment while the first reply streams: submits immediately and
+    // renders as a queued user card (the backend FIFO, not a rejection).
+    const queuedText = 'queued-second-comment';
+    await page.fill(commentInputSel, queuedText);
+    await page.press(commentInputSel, 'Enter');
+    await waitFor(
+      page,
+      (want) =>
+        Array.from(document.querySelectorAll('.code-review__comment--user')).some((el) =>
+          (el.querySelector('.code-review__comment-text')?.textContent || '').includes(want)
+        ),
+      'second comment did not submit + render while the first reply streams',
+      20000,
+      queuedText
+    );
+    if (!(await page.evaluate(() => document.querySelector('.code-review__streaming') !== null))) {
+      fail('the second comment should sit queued behind the still-streaming first reply');
+    }
+    // Abort: clears the stream and drops the queued (not-yet-started)
+    // comment; the aborted in-flight reply stays as a partial comment.
     await page.click('button.code-review__action--warn');
     await waitFor(
       page,
@@ -851,6 +1225,16 @@ async function main() {
       'abort did not clear the streaming state',
       15000
     );
+    const queuedGone = await page.evaluate(
+      (want) =>
+        !Array.from(document.querySelectorAll('.code-review__comment--user')).some((el) =>
+          (el.querySelector('.code-review__comment-text')?.textContent || '').includes(want)
+        ),
+      queuedText
+    );
+    if (!queuedGone) {
+      fail('abort did not drop the queued (not-yet-started) comment from the thread');
+    }
     const partialText = await page.evaluate(() => {
       const el = document.querySelector('.code-review__comment--assistant.is-partial');
       return el ? (el.querySelector('.code-review__comment-text')?.textContent || '') : '';
@@ -878,7 +1262,7 @@ async function main() {
     }
     const secondHunkComment = 'hunk-two-exclusive-comment';
     await page.fill('.code-review__comment-input', secondHunkComment);
-    await page.press('.code-review__comment-input', 'Control+Enter');
+    await page.press('.code-review__comment-input', 'Enter');
     await waitFor(
       page,
       (want) =>
@@ -931,7 +1315,7 @@ async function main() {
       secondHunkComment
     );
     // Let the (instant, even-numbered) assistant reply land before the next
-    // comment — the backend rejects a new comment while a turn is streaming.
+    // comment so the next submit starts a fresh run on this hunk.
     await waitFor(
       page,
       () =>
@@ -981,7 +1365,7 @@ async function main() {
     );
     // Submit A (the odd-numbered slow mock request: streaming state must
     // appear, then clear; the reply completes on its own).
-    await page.press('.code-review__comment-input', 'Control+Enter');
+    await page.press('.code-review__comment-input', 'Enter');
     await waitFor(
       page,
       (want) =>
@@ -1029,7 +1413,7 @@ async function main() {
     // it as inert text and must never execute it or open a dialog.
     const hostileComment = '<script>window.__crPwned=3</script><img src=x onerror="window.__crPwned=4">';
     await page.fill('.code-review__comment-input', hostileComment);
-    await page.press('.code-review__comment-input', 'Control+Enter');
+    await page.press('.code-review__comment-input', 'Enter');
     await waitFor(
       page,
       (want) =>
@@ -1082,7 +1466,7 @@ async function main() {
       '```rust\nfn main() {\n    let x = 1;\n}\n```\n\n' +
       '<script>window.__crPwned=5</script>';
     await page.fill('.code-review__comment-input', markdownComment);
-    await page.press('.code-review__comment-input', 'Control+Enter');
+    await page.press('.code-review__comment-input', 'Enter');
     await waitFor(
       page,
       (want) =>
@@ -1336,6 +1720,13 @@ async function main() {
       () => document.getElementById('code-review-panel') !== null,
       'mobile code-review panel did not open'
     );
+    // Mobile ≤900px: the thread resizer is CSS-hidden (no desktop column drag).
+    const mobileResizerHidden = await mobilePage.evaluate(() => {
+      const r = document.querySelector('.code-review__thread-resizer');
+      if (!r) return true; // absent is fine on mobile
+      return getComputedStyle(r).display === 'none';
+    });
+    if (!mobileResizerHidden) fail('mobile must hide .code-review__thread-resizer');
     // Files tab is active on open; the Diff pane is hidden.
     const mobileTabs = await mobilePage.evaluate(() =>
       Array.from(document.querySelectorAll('.code-review__tab')).map((t) => t.textContent.trim())
@@ -1543,6 +1934,399 @@ async function main() {
       fail(`/compact did not dispatch a compact RPC on the WS (sent ${sentFrames.length - compactBefore} frames after submit; last=${sentFrames.slice(-3).join(' | ') || 'none'})`);
     }
     await page.screenshot({ path: `${evidence}/compact-dispatch.png`, fullPage: true });
+
+    // ------------------------------------------------------------------
+    // Slash-command variants (coverage journeys). The session here is still
+    // tiny (no provider-turn accumulation), so EVERY compact variant hits
+    // the same deterministic boundary: the RPC goes out with the right wire
+    // shape and the backend answers truthfully with "Nothing to compact
+    // (session too small)" — surfaced as a summary bubble + error toast.
+    // No staged-prompt accumulation is involved (the archive's turn-count
+    // precondition is not staged here), so the journeys stay fast and
+    // deterministic.
+    // ------------------------------------------------------------------
+
+    // /compact --snap: dispatches the snapcompact RPC (the deterministic
+    // offline archive wire) and surfaces the truthful error boundary.
+    await page.fill('#prompt-input', '/compact --snap');
+    const snapBefore = sentFrames.length;
+    await page.press('#prompt-input', 'Enter');
+    let snapFrame = null;
+    const snapDeadline = Date.now() + 15000;
+    while (Date.now() < snapDeadline) {
+      for (let f = snapBefore; f < sentFrames.length; f++) {
+        let frame;
+        try {
+          frame = JSON.parse(sentFrames[f]);
+        } catch {
+          continue;
+        }
+        if (frame && frame.type === 'snapcompact') {
+          snapFrame = frame;
+          break;
+        }
+      }
+      if (snapFrame) break;
+      await page.waitForTimeout(100);
+    }
+    if (!snapFrame) {
+      fail(`/compact --snap did not dispatch a snapcompact RPC (last frames: ${sentFrames.slice(-3).join(' | ')})`);
+    }
+    await waitFor(
+      page,
+      () => {
+        const bubbles = Array.from(document.querySelectorAll('.msg--summary'));
+        const hasBubble = bubbles.some((b) => {
+          const label = b.querySelector('.msg--summary__label')?.textContent?.trim() || '';
+          const text = b.querySelector('.msg--summary__text')?.textContent || '';
+          return label === 'snapcompact' && text.includes('Nothing to compact');
+        });
+        const hasToast = Array.from(document.querySelectorAll('.toast--error')).some((t) =>
+          (t.textContent || '').includes('Snapcompact failed: Nothing to compact')
+        );
+        return hasBubble && hasToast;
+      },
+      '/compact --snap did not surface the truthful "session too small" error bubble + toast',
+      20000
+    );
+    await page.screenshot({ path: `${evidence}/snapcompact-error.png`, fullPage: true });
+
+    // /compact <instructions>: the LLM path carries the custom instructions
+    // on the compact RPC and, with a sub-threshold session, surfaces the
+    // truthful "Nothing to compact (session too small)" error bubble + toast.
+    await page.fill('#prompt-input', '/compact keep the key decisions');
+    const llmBefore = sentFrames.length;
+    await page.press('#prompt-input', 'Enter');
+    let llmFrame = null;
+    const llmDeadline = Date.now() + 15000;
+    while (Date.now() < llmDeadline) {
+      for (let f = llmBefore; f < sentFrames.length; f++) {
+        let frame;
+        try {
+          frame = JSON.parse(sentFrames[f]);
+        } catch {
+          continue;
+        }
+        if (frame && frame.type === 'compact') {
+          llmFrame = frame;
+          break;
+        }
+      }
+      if (llmFrame) break;
+      await page.waitForTimeout(100);
+    }
+    if (!llmFrame) {
+      fail(`/compact <instructions> did not dispatch a compact RPC (last frames: ${sentFrames.slice(-3).join(' | ')})`);
+    }
+    if (llmFrame.customInstructions !== 'keep the key decisions') {
+      fail(`/compact <instructions> RPC must carry customInstructions (got ${JSON.stringify(llmFrame.customInstructions)})`);
+    }
+    await waitFor(
+      page,
+      () => {
+        const bubbles = Array.from(document.querySelectorAll('.msg--summary'));
+        const hasBubble = bubbles.some((b) => {
+          const label = b.querySelector('.msg--summary__label')?.textContent?.trim() || '';
+          const text = b.querySelector('.msg--summary__text')?.textContent || '';
+          return label === 'compact' && text.includes('Nothing to compact');
+        });
+        const hasToast = Array.from(document.querySelectorAll('.toast--error')).some((t) =>
+          (t.textContent || '').includes('Compact failed: Nothing to compact')
+        );
+        return hasBubble && hasToast;
+      },
+      '/compact <instructions> did not surface the truthful "session too small" error bubble + toast',
+      20000
+    );
+    await page.screenshot({ path: `${evidence}/compact-instructions-error.png`, fullPage: true });
+
+    // /compact bare: the RPC carries NO customInstructions key and the same
+    // deterministic error boundary surfaces (bubble + toast).
+    await page.fill('#prompt-input', '/compact');
+    const bareBefore = sentFrames.length;
+    await page.press('#prompt-input', 'Enter');
+    let bareFrame = null;
+    const bareDeadline = Date.now() + 15000;
+    while (Date.now() < bareDeadline) {
+      for (let f = bareBefore; f < sentFrames.length; f++) {
+        let frame;
+        try {
+          frame = JSON.parse(sentFrames[f]);
+        } catch {
+          continue;
+        }
+        if (frame && frame.type === 'compact') {
+          bareFrame = frame;
+          break;
+        }
+      }
+      if (bareFrame) break;
+      await page.waitForTimeout(100);
+    }
+    if (!bareFrame) {
+      fail(`bare /compact did not dispatch a compact RPC (last frames: ${sentFrames.slice(-3).join(' | ')})`);
+    }
+    if ('customInstructions' in bareFrame) {
+      fail(`bare /compact RPC must NOT carry customInstructions (got ${JSON.stringify(bareFrame.customInstructions)})`);
+    }
+    await waitFor(
+      page,
+      () => {
+        const bubbles = Array.from(document.querySelectorAll('.msg--summary'));
+        return bubbles.some((b) => {
+          const label = b.querySelector('.msg--summary__label')?.textContent?.trim() || '';
+          const text = b.querySelector('.msg--summary__text')?.textContent || '';
+          return label === 'compact' && text.includes('Nothing to compact');
+        });
+      },
+      'bare /compact did not surface the "session too small" error bubble',
+      20000
+    );
+    await page.screenshot({ path: `${evidence}/compact-bare-error.png`, fullPage: true });
+
+    // /skill greet extra words: only the FIRST token is the skill name (a
+    // pasted description tail must never poison the RPC); the skill RPC goes
+    // out with name=greet and the summary bubble renders the frontmatter.
+    await page.fill('#prompt-input', `/skill ${skillName} extra words after the name`);
+    const skillBefore = sentFrames.length;
+    await page.press('#prompt-input', 'Enter');
+    let skillFrame = null;
+    const skillDeadline = Date.now() + 15000;
+    while (Date.now() < skillDeadline) {
+      for (let f = skillBefore; f < sentFrames.length; f++) {
+        let frame;
+        try {
+          frame = JSON.parse(sentFrames[f]);
+        } catch {
+          continue;
+        }
+        if (frame && frame.type === 'skill') {
+          skillFrame = frame;
+          break;
+        }
+      }
+      if (skillFrame) break;
+      await page.waitForTimeout(100);
+    }
+    if (!skillFrame) {
+      fail(`/skill ${skillName} extra words did not dispatch a skill RPC (last frames: ${sentFrames.slice(-3).join(' | ')})`);
+    }
+    if (skillFrame.name !== skillName) {
+      fail(`/skill with a trailing tail must use only the first token as the skill name (got ${JSON.stringify(skillFrame.name)})`);
+    }
+    await waitFor(
+      page,
+      (args) => {
+        const bubbles = Array.from(document.querySelectorAll('.msg--summary'));
+        return bubbles.some((b) => {
+          const label = b.querySelector('.msg--summary__label')?.textContent?.trim() || '';
+          const text = b.querySelector('.msg--summary__text')?.textContent || '';
+          return label === 'skill' && text.includes(`name: ${args.skillName}`);
+        });
+      },
+      `/skill ${skillName} extra words did not render the skill summary bubble`,
+      20000,
+      { skillName }
+    );
+    await page.screenshot({ path: `${evidence}/skill-first-token.png`, fullPage: true });
+
+    // /skill bare: a client-side usage error toast, the composer clears, and
+    // NO skill RPC ever goes out.
+    const skillRpcBefore = sentFrames.filter((p) => { try { return JSON.parse(p).type === 'skill'; } catch { return false; } }).length;
+    await page.fill('#prompt-input', '/skill');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => Array.from(document.querySelectorAll('.toast--error')).some((t) => (t.textContent || '').includes('usage: /skill <name>')),
+      '/skill bare did not surface the usage: /skill <name> error toast',
+      15000
+    );
+    await page.waitForTimeout(1200); // window long enough for a wrongly-dispatched skill RPC to appear
+    const skillRpcAfter = sentFrames.filter((p) => { try { return JSON.parse(p).type === 'skill'; } catch { return false; } }).length;
+    if (skillRpcAfter !== skillRpcBefore) {
+      fail(`/skill bare must not dispatch a skill RPC (frames before=${skillRpcBefore} after=${skillRpcAfter})`);
+    }
+    const skillBareValue = await page.evaluate(() => document.getElementById('prompt-input')?.value || '');
+    if (skillBareValue !== '') {
+      fail(`/skill bare must clear the composer after the usage error (value=${JSON.stringify(skillBareValue)})`);
+    }
+    await page.screenshot({ path: `${evidence}/skill-bare-error.png`, fullPage: true });
+
+    // /unknowncmd: NOT a Web-supported slash — it falls through to a normal
+    // prompt: an optimistic user bubble renders and a prompt RPC carries the
+    // exact text (the fallback is the user's message, not an error).
+    const userBubblesBefore = await page.evaluate(() => document.querySelectorAll('.msg--user').length);
+    await page.fill('#prompt-input', '/unknowncmd');
+    const unknownBefore = sentFrames.length;
+    await page.press('#prompt-input', 'Enter');
+    let unknownFrame = null;
+    const unknownDeadline = Date.now() + 15000;
+    while (Date.now() < unknownDeadline) {
+      for (let f = unknownBefore; f < sentFrames.length; f++) {
+        let frame;
+        try {
+          frame = JSON.parse(sentFrames[f]);
+        } catch {
+          continue;
+        }
+        if (frame && frame.type === 'prompt' && frame.message === '/unknowncmd') {
+          unknownFrame = frame;
+          break;
+        }
+      }
+      if (unknownFrame) break;
+      await page.waitForTimeout(100);
+    }
+    if (!unknownFrame) {
+      fail(`/unknowncmd did not fall through to a prompt RPC (last frames: ${sentFrames.slice(-3).join(' | ')})`);
+    }
+    await waitFor(
+      page,
+      (args) => document.querySelectorAll('.msg--user').length > args,
+      '/unknowncmd fallthrough never rendered an optimistic user bubble',
+      15000,
+      userBubblesBefore
+    );
+    // Wait for the fallthrough's own turn to settle (confirmed bubble +
+    // badge hidden) so the following /code-review Enter is never raced into
+    // a steer.
+    await waitFor(
+      page,
+      () => {
+        const badge = document.getElementById('stream-badge');
+        if (badge && badge.hidden !== true) return false;
+        return !Array.from(document.querySelectorAll('.msg--user')).some(
+          (b) => (b.textContent || '').includes('/unknowncmd') && b.classList.contains('optimistic')
+        );
+      },
+      'slash variants: /unknowncmd turn never settled (badge hidden + confirmed bubble)',
+      30000
+    );
+    await page.screenshot({ path: `${evidence}/unknowncmd-fallthrough.png`, fullPage: true });
+
+    // ------------------------------------------------------------------
+    // Code Review error/close (coverage journeys). The panel is closed here;
+    // each variant opens it fresh, exercises the boundary, and closes it.
+    // ------------------------------------------------------------------
+
+    // /code-review HEAD~1 HEAD: two revisions reach code_review_open and the
+    // comparison label renders "HEAD~1 → HEAD"; the × close button removes
+    // the panel.
+    await page.fill('#prompt-input', '/code-review HEAD~1 HEAD');
+    const revBefore = sentFrames.length;
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'code-review panel did not open for /code-review HEAD~1 HEAD');
+    let revFrame = null;
+    const revDeadline = Date.now() + 15000;
+    while (Date.now() < revDeadline) {
+      for (let f = revBefore; f < sentFrames.length; f++) {
+        let frame;
+        try {
+          frame = JSON.parse(sentFrames[f]);
+        } catch {
+          continue;
+        }
+        if (frame && frame.type === 'code_review_open') {
+          revFrame = frame;
+          break;
+        }
+      }
+      if (revFrame) break;
+      await page.waitForTimeout(100);
+    }
+    if (!revFrame || revFrame.from !== 'HEAD~1' || revFrame.to !== 'HEAD') {
+      fail(`/code-review HEAD~1 HEAD must send code_review_open with from=HEAD~1 to=HEAD (got ${JSON.stringify(revFrame)})`);
+    }
+    await waitFor(
+      page,
+      () => {
+        const label = document.querySelector('.code-review__label')?.textContent || '';
+        return label.includes('HEAD~1') && label.includes('HEAD');
+      },
+      'code-review panel did not render the HEAD~1 → HEAD comparison label'
+    );
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.code-review__file').length > 0,
+      'code-review HEAD~1 HEAD panel never rendered the changed-file list'
+    );
+    await page.screenshot({ path: `${evidence}/code-review-revisions.png`, fullPage: true });
+    await page.click('button.code-review__close');
+    await waitFor(
+      page,
+      () => document.getElementById('code-review-panel') === null,
+      'code-review panel did not close via the × close button'
+    );
+    await page.screenshot({ path: `${evidence}/code-review-revisions-closed.png`, fullPage: true });
+
+    // /code-review <bad-ref> HEAD: the REAL git revision resolution error
+    // renders in the panel (.code-review__error with "invalid source
+    // revision"), Retry re-runs the open (same error), and the × close
+    // button closes the error state cleanly.
+    await page.fill('#prompt-input', '/code-review invalid-ref-xyz HEAD');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(page, () => document.getElementById('code-review-panel') !== null, 'code-review panel did not open for the bad-ref variant');
+    await waitFor(
+      page,
+      () => {
+        const label = document.querySelector('.code-review__label')?.textContent || '';
+        return label.includes('invalid-ref-xyz') && label.includes('HEAD');
+      },
+      'code-review bad-ref panel did not render the invalid-ref-xyz → HEAD comparison label'
+    );
+    await waitFor(
+      page,
+      () => {
+        const error = document.querySelector('.code-review__error');
+        return error !== null && (error.textContent || '').includes('invalid source revision');
+      },
+      'code-review bad-ref panel never rendered the real git revision error (.code-review__error with invalid source revision)'
+    );
+    const retryVisible = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('.code-review__error-actions button.code-review__link'));
+      return buttons.some((b) => (b.textContent || '').trim() === 'Retry');
+    });
+    if (!retryVisible) fail('code-review error state must offer a Retry action');
+    await page.screenshot({ path: `${evidence}/code-review-error.png`, fullPage: true });
+    await page.click('.code-review__error-actions button.code-review__link');
+    // Retry re-runs the open against the same workspace; the same real error
+    // must render again (the boundary is stable, never a transient blank).
+    await waitFor(
+      page,
+      () => {
+        const error = document.querySelector('.code-review__error');
+        return error !== null && (error.textContent || '').includes('invalid source revision');
+      },
+      'code-review Retry did not re-surface the real git revision error'
+    );
+    await page.click('button.code-review__close');
+    await waitFor(
+      page,
+      () => document.getElementById('code-review-panel') === null,
+      'code-review error panel did not close via the × close button'
+    );
+    await page.screenshot({ path: `${evidence}/code-review-error-closed.png`, fullPage: true });
+
+    // /code-review a b c: the client-side arity guard toasts the usage error
+    // and NEVER opens the panel (zero or two revisions only).
+    await page.fill('#prompt-input', '/code-review a b c');
+    await page.press('#prompt-input', 'Enter');
+    await waitFor(
+      page,
+      () => Array.from(document.querySelectorAll('.toast--error')).some((t) =>
+        (t.textContent || '').includes('usage: /code-review [from to] — pass zero or two revisions')
+      ),
+      '/code-review a b c did not surface the arity usage error toast',
+      15000
+    );
+    await page.waitForTimeout(800);
+    const panelAfterArity = await page.evaluate(() => document.getElementById('code-review-panel') !== null);
+    if (panelAfterArity) fail('/code-review a b c opened the panel — the arity guard must reject before any RPC');
+    const arityValue = await page.evaluate(() => document.getElementById('prompt-input')?.value || '');
+    if (arityValue !== '') {
+      fail(`/code-review a b c must clear the composer after the usage error (value=${JSON.stringify(arityValue)})`);
+    }
+    await page.screenshot({ path: `${evidence}/code-review-arity-error.png`, fullPage: true });
 
     console.log('web-commands-review: PASSED (command button left of textarea; picker lists /compact /skill /code-review; /code-review draft + no auto-submit; Enter opens real review panel with HEAD→working tree + dirty file + changed lines; two separated hunks; second-hunk thread ownership; per-hunk drafts A/B survive switches + submit A leaves B; file switch clears composer/hunk selection; hostile diff/comment literal with no dialog/script side effect; explicit hunk selection; file filter; collapsible path tree + tree keyboard nav; 4000-line soft window with Load more/Load full; TUI parity: M/A compact glyphs + basename-only rows with full path/state in data/title/aria + no rail overflow (desktop + mobile); comment markdown (strong/list/rust hljs) with hostile HTML literal; Ctrl+Enter comment + streaming/abort; 1.5s snapshot polling cadence observed + stops after close; session switch stamped code_review_close + no stale rev args; inline close confirm; Escape close; mobile Files/Diff/Thread tabs + close button; /skill visible summary; /compact WS dispatch)');
   } finally {

@@ -1,8 +1,10 @@
 use crate::code_review::{
-    DiffFile, DiffHunk, DiffLineKind, FileDiff, FileDiffPage, ReviewScope, ReviewSnapshot,
-    MAX_FILE_PAGE_LINES, load_review_snapshot_for,
+    DiffFile, DiffHunk, DiffLineKind, FileDiff, FileDiffPage, HunkIdentity, ReviewScope,
+    ReviewSnapshot, MAX_FILE_PAGE_LINES, load_review_snapshot_for,
 };
-use crate::code_review_panel::{CodeReviewController, ReviewCommentRole};
+use crate::code_review_panel::{
+    CodeReviewController, CommentSubmitResult, MAX_PENDING_COMMENTS, ReviewCommentRole,
+};
 use crate::{
     args::Cli,
     extension_ui::{ExtensionUiAdapter, ExtensionUiEvent},
@@ -739,11 +741,27 @@ pub enum RpcCommand {
         content_hash: String,
         comment: String,
     },
-    /// Abort the in-flight review agent turn for the active hunk.
-    /// Wire shape: `{ "type": "code_review_abort", "id"?: string }`.
+    /// Abort the in-flight review agent turn for a specific hunk. The full
+    /// hunk identity must match the current snapshot exactly (same fields as
+    /// `code_review_comment`); a stale identity is rejected before any abort.
+    /// Wire shape:
+    /// `{ "type": "code_review_abort", "id"?: string, "snapshotId": string, "path": string, "oldStart": u32, "oldCount": u32, "newStart": u32, "newCount": u32, "contentHash": string }`.
     CodeReviewAbort {
         #[serde(default)]
         id: Option<String>,
+        #[serde(rename = "snapshotId")]
+        snapshot_id: String,
+        path: String,
+        #[serde(rename = "oldStart")]
+        old_start: u32,
+        #[serde(rename = "oldCount")]
+        old_count: u32,
+        #[serde(rename = "newStart")]
+        new_start: u32,
+        #[serde(rename = "newCount")]
+        new_count: u32,
+        #[serde(rename = "contentHash")]
+        content_hash: String,
     },
     /// Close the open code review: shut down the review agent and drop the
     /// snapshot/threads. Wire shape:
@@ -991,7 +1009,7 @@ impl RpcCommand {
             | Self::CodeReviewSnapshot { id }
             | Self::CodeReviewRefresh { id }
             | Self::CodeReviewComment { id, .. }
-            | Self::CodeReviewAbort { id }
+            | Self::CodeReviewAbort { id, .. }
             | Self::CodeReviewClose { id }
             | Self::CodeReviewFileDiff { id, .. }
             | Self::CloseSession { id }
@@ -1777,8 +1795,11 @@ impl CodeReviewRpcState {
     }
 
     /// Attach a comment to a specific hunk. The full hunk identity must match
-    /// the current snapshot exactly; a stale snapshot/path/range/contentHash
-    /// is rejected before the review agent is ever prompted.
+    /// the current snapshot exactly (or, once the per-file diff for the path
+    /// is loaded, the authoritative cached hunks — which carry the exact
+    /// identities the paging RPC projected); a stale snapshot/path/range/
+    /// contentHash or a byte-capped incomplete hunk is rejected before the
+    /// review agent is ever prompted.
     async fn comment(
         &self,
         snapshot_id: &str,
@@ -1795,8 +1816,9 @@ impl CodeReviewRpcState {
             bail!("no open code review; call code_review_open first");
         };
         session.controller.poll_events();
-        let (file, hunk) = resolve_comment_target(
+        let target = resolve_comment_target(
             &session.snapshot,
+            Some(&session.file_diff_cache),
             snapshot_id,
             path,
             old_start,
@@ -1805,22 +1827,73 @@ impl CodeReviewRpcState {
             new_count,
             content_hash,
         )?;
-        let accepted = session
-            .controller
-            .submit_comment(&session.snapshot, file, hunk, comment);
-        if !accepted {
-            bail!("code review comment was not accepted (a turn may be streaming or the comment is empty)");
+        let result = match &target {
+            ResolvedHunk::Snapshot { file, hunk } => {
+                session
+                    .controller
+                    .submit_comment(&session.snapshot, file, hunk, comment)
+            }
+            ResolvedHunk::Loaded {
+                file,
+                diff,
+                hunk_index,
+            } => session
+                .controller
+                .submit_comment(&session.snapshot, file, &diff.hunks[*hunk_index], comment),
+        };
+        match result {
+            CommentSubmitResult::Accepted => {}
+            CommentSubmitResult::Empty => {
+                bail!("code review comment was not accepted (comment is empty)");
+            }
+            CommentSubmitResult::QueueFull => bail!(
+                "code review comment was not accepted (this hunk has {MAX_PENDING_COMMENTS} replies queued; wait for a reply to settle or abort the review)"
+            ),
+            CommentSubmitResult::Failed => bail!(
+                "code review comment was not accepted (the review agent could not be started)"
+            ),
         }
         Ok(code_review_projection(&session.snapshot, &session.controller))
     }
 
-    /// Abort the in-flight review agent turn for the active hunk.
-    async fn abort(&self) -> Result<Value> {
+    /// Abort the in-flight review agent turn for a specific hunk identity.
+    /// Resolves the target against the live snapshot / authoritative loaded
+    /// hunks first so a stale identity never reaches the controller.
+    async fn abort(
+        &self,
+        snapshot_id: &str,
+        path: &str,
+        old_start: u32,
+        old_count: u32,
+        new_start: u32,
+        new_count: u32,
+        content_hash: &str,
+    ) -> Result<Value> {
         let mut guard = self.session.lock().await;
         let Some(session) = guard.as_mut() else {
             bail!("no open code review; call code_review_open first");
         };
-        session.controller.abort().await;
+        session.controller.poll_events();
+        let target = resolve_comment_target(
+            &session.snapshot,
+            Some(&session.file_diff_cache),
+            snapshot_id,
+            path,
+            old_start,
+            old_count,
+            new_start,
+            new_count,
+            content_hash,
+        )?;
+        let identity = match &target {
+            ResolvedHunk::Snapshot { file, hunk } => session.snapshot.hunk_identity(file, hunk),
+            ResolvedHunk::Loaded {
+                file,
+                diff,
+                hunk_index,
+            } => HunkIdentity::new(&session.snapshot.snapshot_id, &file.path, &diff.hunks[*hunk_index]),
+        };
+        session.controller.abort_hunk(&identity).await;
         session.controller.poll_events();
         Ok(code_review_projection(&session.snapshot, &session.controller))
     }
@@ -1921,13 +1994,43 @@ impl CodeReviewRpcState {
     }
 }
 
-/// Validate that a comment request targets a real hunk in the current
-/// snapshot with a matching identity. Returns the resolved `(file, hunk)` so
-/// the caller can submit the comment. A mismatched `snapshotId`, unknown
-/// path/range, or changed `contentHash` is rejected as stale — this is the
-/// deterministic core (no agent, no network) exercised by unit tests.
+/// Where a validated comment target lives. Once the per-file diff for a path
+/// is cached, it is the AUTHORITATIVE hunk source for that path: snapshot
+/// placeholder/partial hunks are never resolvable, so a comment can only
+/// attach to a hunk identity that exists in the loaded per-file data (or, for
+/// a path never loaded, in the snapshot itself when the hunk is complete).
+#[derive(Debug)]
+enum ResolvedHunk<'a> {
+    /// Hunk in the snapshot (no per-file cache for this path yet).
+    Snapshot {
+        file: &'a DiffFile,
+        hunk: &'a DiffHunk,
+    },
+    /// Hunk in the authoritative per-file cache for this path. The `file`
+    /// catalog entry still comes from the snapshot (stats/provenance are
+    /// preserved); the hunk body and identity come from the loaded diff.
+    Loaded {
+        file: &'a DiffFile,
+        diff: Arc<FileDiff>,
+        hunk_index: usize,
+    },
+}
+
+/// Validate that a comment request targets a real, COMPLETE hunk with a
+/// matching identity. Returns the resolved target so the caller can submit
+/// the comment. A mismatched `snapshotId`, unknown path/range, changed
+/// `contentHash`, or a byte-capped incomplete hunk is rejected as stale —
+/// this is the deterministic core (no agent, no network) exercised by unit
+/// tests.
+///
+/// The cached per-file diff (when present and error-free) is the only hunk
+/// source for its path: loaded hunk identities are exactly the identities
+/// the paging RPC projected (both derive from the same cached [`FileDiff`]
+/// via [`HunkIdentity::new`]), so whatever the frontend selected from a page
+/// resolves here, and snapshot partial/placeholder identities are rejected.
 fn resolve_comment_target<'a>(
     snapshot: &'a ReviewSnapshot,
+    file_diff_cache: Option<&'a HashMap<String, Arc<FileDiff>>>,
     snapshot_id: &str,
     path: &str,
     old_start: u32,
@@ -1935,7 +2038,7 @@ fn resolve_comment_target<'a>(
     new_start: u32,
     new_count: u32,
     content_hash: &str,
-) -> Result<(&'a DiffFile, &'a DiffHunk)> {
+) -> Result<ResolvedHunk<'a>> {
     if snapshot.snapshot_id != snapshot_id {
         bail!("comment targets a stale snapshot; refresh the code review");
     }
@@ -1944,6 +2047,38 @@ fn resolve_comment_target<'a>(
         .iter()
         .find(|file| file.path == path)
         .ok_or_else(|| anyhow!("comment targets an unknown file {path:?}"))?;
+    if let Some(loaded) = file_diff_cache.and_then(|cache| cache.get(path)) {
+        if loaded.error.is_none() {
+            let hunk_index = loaded
+                .hunks
+                .iter()
+                .position(|hunk| {
+                    hunk.old_start == old_start
+                        && hunk.old_count == old_count
+                        && hunk.new_start == new_start
+                        && hunk.new_count == new_count
+                })
+                .ok_or_else(|| anyhow!("comment targets an unknown hunk in the loaded diff {path:?}"))?;
+            let hunk = &loaded.hunks[hunk_index];
+            if !hunk.is_complete() {
+                bail!(
+                    "comment targets an incomplete hunk in {path:?}; the per-file body was cut by the size limit"
+                );
+            }
+            let identity = HunkIdentity::new(snapshot_id, &file.path, hunk);
+            if identity.content_hash != content_hash {
+                bail!("comment targets a stale hunk; the diff content has changed");
+            }
+            return Ok(ResolvedHunk::Loaded {
+                file,
+                diff: loaded.clone(),
+                hunk_index,
+            });
+        }
+    }
+    // No authoritative loaded diff for this path: resolve against the
+    // snapshot hunks, still requiring a COMPLETE hunk — a globally truncated
+    // patch's partial last hunk has a bogus identity and is rejected.
     let hunk = file
         .hunks
         .iter()
@@ -1954,11 +2089,16 @@ fn resolve_comment_target<'a>(
                 && hunk.new_count == new_count
         })
         .ok_or_else(|| anyhow!("comment targets an unknown hunk in {path:?}"))?;
+    if !hunk.is_complete() {
+        bail!(
+            "comment targets an incomplete hunk in {path:?}; the diff body was truncated"
+        );
+    }
     let identity = snapshot.hunk_identity(file, hunk);
     if identity.content_hash != content_hash {
         bail!("comment targets a stale hunk; the diff content has changed");
     }
-    Ok((file, hunk))
+    Ok(ResolvedHunk::Snapshot { file, hunk })
 }
 
 /// Build the wire projection of a review snapshot + controller. The absolute
@@ -2030,14 +2170,22 @@ fn code_review_projection(snapshot: &ReviewSnapshot, controller: &CodeReviewCont
         .map(|thread| {
             json!({
                 "identity": hunk_identity_projection(&thread.identity),
-                "comments": thread.comments.iter().map(|comment| json!({
-                    "role": review_role_str(comment.role),
-                    "text": comment.text,
-                    "partial": comment.partial,
-                })).collect::<Vec<_>>(),
+                "comments": thread.comments.iter().map(|comment| {
+                    let mut obj = json!({
+                        "role": review_role_str(comment.role),
+                        "text": comment.text,
+                        "partial": comment.partial,
+                    });
+                    if let Some(model) = comment.model.as_deref() {
+                        obj["model"] = json!(model);
+                    }
+                    obj
+                }).collect::<Vec<_>>(),
                 "streamingText": thread.streaming_text,
                 "error": thread.error,
                 "stale": thread.stale,
+                "isStreaming": thread.is_streaming,
+                "model": thread.model,
             })
         })
         .collect::<Vec<_>>();
@@ -2052,7 +2200,7 @@ fn code_review_projection(snapshot: &ReviewSnapshot, controller: &CodeReviewCont
         "files": files,
         "threads": threads,
         "isStreaming": controller.is_streaming(),
-        "activeHunk": controller.active_hunk().map(hunk_identity_projection),
+        "activeCount": controller.active_count(),
     })
 }
 
@@ -2078,26 +2226,44 @@ fn diff_line_kind_str(kind: DiffLineKind) -> &'static str {
     }
 }
 
-/// Wire projection of a single [`FileDiffPage`]. Lines preserve their order
-/// across pages; `nextCursor` is absent on the final page. Output stays well
-/// under the WS frame limit — the page is bounded by line count and bytes in
-/// [`FileDiff::slice_page`].
+/// Wire projection of a single [`FileDiffPage`]. Hunks preserve their order
+/// across pages; each descriptor carries the COMPLETE hunk identity (header,
+/// ranges, content hash over the full hunk) plus the in-page line subset and
+/// its hunk-local offset, so a page-split hunk keeps one stable identity and
+/// the frontend merges deterministically by index. `nextCursor` is absent on
+/// the final page. Output stays well under the WS frame limit — the page is
+/// bounded by line count and bytes in [`FileDiff::slice_page`].
 fn file_diff_projection(page: &FileDiffPage) -> Value {
-    let lines = page
-        .lines
+    let line_projection = |line: &crate::code_review::DiffLine| {
+        let mut obj = json!({
+            "kind": diff_line_kind_str(line.kind),
+            "text": line.text,
+        });
+        if let Some(old_no) = line.old_no {
+            obj["oldNo"] = json!(old_no);
+        }
+        if let Some(new_no) = line.new_no {
+            obj["newNo"] = json!(new_no);
+        }
+        obj
+    };
+    let hunks = page
+        .hunks
         .iter()
-        .map(|line| {
-            let mut obj = json!({
-                "kind": diff_line_kind_str(line.kind),
-                "text": line.text,
-            });
-            if let Some(old_no) = line.old_no {
-                obj["oldNo"] = json!(old_no);
-            }
-            if let Some(new_no) = line.new_no {
-                obj["newNo"] = json!(new_no);
-            }
-            obj
+        .map(|hunk| {
+            json!({
+                "index": hunk.index,
+                "header": hunk.header,
+                "oldStart": hunk.old_start,
+                "oldCount": hunk.old_count,
+                "newStart": hunk.new_start,
+                "newCount": hunk.new_count,
+                "contentHash": hunk.content_hash,
+                "totalLines": hunk.total_lines,
+                "complete": hunk.complete,
+                "lineStart": hunk.line_start,
+                "lines": hunk.lines.iter().map(line_projection).collect::<Vec<_>>(),
+            })
         })
         .collect::<Vec<_>>();
     let mut out = json!({
@@ -2105,10 +2271,11 @@ fn file_diff_projection(page: &FileDiffPage) -> Value {
         "path": page.path,
         "binary": page.binary,
         "status": page.status.label(),
-        "lines": lines,
+        "hunks": hunks,
         "cursor": page.cursor,
         "hasMore": page.has_more,
         "totalLines": page.total_lines,
+        "hunkCount": page.hunk_count,
         "truncated": page.truncated,
     });
     if let Some(previous_path) = &page.previous_path {
@@ -2167,7 +2334,28 @@ async fn handle_code_review_command(
                     )
                     .await
             }
-            RpcCommand::CodeReviewAbort { .. } => code_review.abort().await,
+            RpcCommand::CodeReviewAbort {
+                snapshot_id,
+                path,
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                content_hash,
+                ..
+            } => {
+                code_review
+                    .abort(
+                        &snapshot_id,
+                        &path,
+                        old_start,
+                        old_count,
+                        new_start,
+                        new_count,
+                        &content_hash,
+                    )
+                    .await
+            }
             RpcCommand::CodeReviewClose { .. } => code_review.close().await,
             RpcCommand::CodeReviewFileDiff {
                 snapshot_id,
@@ -4290,7 +4478,6 @@ mod tests {
             json!({"type":"get_last_assistant_text"}),
             json!({"type":"set_session_name","name":"n"}),
             json!({"type":"get_messages"}),
-            json!({"type":"get_commands"}),
             json!({"type":"set_todos","workflowId":"wf-1","phases":[]}),
             json!({"type":"todo_op","op":"append","phase":"Plan","items":["ship it"]}),
             json!({"type":"todo_op","op":"done","task":"task-x"}),
@@ -4363,7 +4550,7 @@ mod tests {
             json!({"type":"code_review_snapshot"}),
             json!({"type":"code_review_refresh"}),
             json!({"type":"code_review_comment","snapshotId":"s1","path":"a.rs","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h","comment":"looks good"}),
-            json!({"type":"code_review_abort"}),
+            json!({"type":"code_review_abort","snapshotId":"s1","path":"a.rs","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h"}),
             json!({"type":"code_review_close"}),
             json!({"type":"code_review_file_diff","snapshotId":"s1","path":"a.rs"}),
             json!({"type":"code_review_file_diff","snapshotId":"s1","path":"a.rs","cursor":100,"maxLines":50}),
@@ -4452,7 +4639,6 @@ mod tests {
             "agentId must be required: {missing:?}"
         );
     }
-
     #[test]
     fn session_list_scope_defaults_current_and_accepts_all_projects() {
         let current = parse_input(br#"{"type":"session_list"}"#).expect("current scope");
@@ -4492,7 +4678,7 @@ mod tests {
             json!({"type":"loop_cancel","taskId":"loop-1"}),
             json!({"type":"process_signal","processId":"00000000-0000-7000-8000-000000000000","signal":"SIGTERM"}),
             json!({"type":"process_stop","processId":"00000000-0000-7000-8000-000000000000"}),
-            json!({"type":"code_review_abort"}),
+            json!({"type":"code_review_abort","snapshotId":"s1","path":"a.rs","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h"}),
             json!({"type":"code_review_close"}),
         ] {
             let command = parse_command(fixture.clone());
@@ -4525,7 +4711,7 @@ mod tests {
         // reads and safety/teardown); open/refresh take a slot (spawn_blocking git).
         let snapshot = parse_command(json!({"type":"code_review_snapshot"}));
         let comment = parse_command(json!({"type":"code_review_comment","snapshotId":"s","path":"a","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h","comment":"x"}));
-        let abort = parse_command(json!({"type":"code_review_abort"}));
+        let abort = parse_command(json!({"type":"code_review_abort","snapshotId":"s","path":"a","oldStart":1,"oldCount":1,"newStart":1,"newCount":1,"contentHash":"h"}));
         let close = parse_command(json!({"type":"code_review_close"}));
         let open = parse_command(json!({"type":"code_review_open"}));
         let refresh = parse_command(json!({"type":"code_review_refresh"}));
@@ -7025,7 +7211,7 @@ mod tests {
         );
         assert_eq!(data["comparisonLabel"], "HEAD → working tree");
         assert_eq!(data["isStreaming"], false);
-        assert_eq!(data["activeHunk"], Value::Null);
+        assert_eq!(data["activeCount"], 0);
         assert_eq!(data["threads"].as_array().expect("threads").len(), 0);
 
         // A bare snapshot re-projects the same error state.
@@ -7260,12 +7446,162 @@ mod tests {
         let page = first.data.expect("page data");
         assert_eq!(page["path"], "big.txt");
         assert_eq!(page["cursor"], 0);
-        assert_eq!(page["lines"].as_array().expect("lines").len(), 50);
+        let hunks = page["hunks"].as_array().expect("hunks");
+        assert!(!hunks.is_empty(), "page must carry hunk descriptors: {page}");
+        let page_lines: usize = hunks
+            .iter()
+            .map(|hunk| hunk["lines"].as_array().expect("hunk lines").len())
+            .sum();
+        assert_eq!(page_lines, 50);
+        assert!(hunks.iter().all(|hunk| hunk["complete"] == true), "{page}");
+        assert_eq!(
+            hunks[0]["contentHash"].as_str().expect("hash").len(),
+            64,
+            "descriptor must carry the full sha256 content hash"
+        );
         assert_eq!(page["hasMore"], true);
         let next = page["nextCursor"].as_u64().expect("next cursor");
         assert_eq!(next, 50);
         let total = page["totalLines"].as_u64().expect("total lines");
         assert!(total > 4000, "the big file should exceed the render cap: {total}");
+        let hunk_count = page["hunkCount"].as_u64().expect("hunk count");
+        assert!(hunk_count >= 1);
+
+        // The page's hunk descriptor is the exact identity a comment targets:
+        // a comment carrying ranges + contentHash from the loaded page resolves
+        // against the cached per-file hunks and queues on the review thread.
+        let hunk = &hunks[0];
+        let identity = (
+            hunk["oldStart"].as_u64().expect("oldStart") as u32,
+            hunk["oldCount"].as_u64().expect("oldCount") as u32,
+            hunk["newStart"].as_u64().expect("newStart") as u32,
+            hunk["newCount"].as_u64().expect("newCount") as u32,
+            hunk["contentHash"].as_str().expect("hash").to_owned(),
+        );
+        let commented = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: Some("comment-loaded".into()),
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                old_start: identity.0,
+                old_count: identity.1,
+                new_start: identity.2,
+                new_count: identity.3,
+                content_hash: identity.4.clone(),
+                comment: "loaded hunk comment".into(),
+            },
+        )
+        .await;
+        assert!(commented.success, "{commented:?}");
+        let thread = commented
+            .data
+            .as_ref()
+            .expect("comment data")["threads"]
+            .as_array()
+            .expect("threads")
+            .first()
+            .expect("thread")
+            .clone();
+        assert_eq!(thread["identity"]["path"], "big.txt");
+        assert_eq!(
+            thread["identity"]["contentHash"].as_str().expect("hash"),
+            identity.4
+        );
+        assert_eq!(
+            thread["comments"].as_array().expect("comments").len(),
+            1,
+            "the accepted comment must be queued on the thread"
+        );
+        assert_eq!(thread["comments"][0]["text"], "loaded hunk comment");
+        // A second comment on the same loaded hunk queues behind the first.
+        let second = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: Some("comment-loaded-2".into()),
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                old_start: identity.0,
+                old_count: identity.1,
+                new_start: identity.2,
+                new_count: identity.3,
+                content_hash: identity.4.clone(),
+                comment: "queued follow-up".into(),
+            },
+        )
+        .await;
+        assert!(second.success, "{second:?}");
+        let thread = second
+            .data
+            .as_ref()
+            .expect("comment data")["threads"]
+            .as_array()
+            .expect("threads")
+            .first()
+            .expect("thread")
+            .clone();
+        assert_eq!(
+            thread["comments"].as_array().expect("comments").len(),
+            2,
+            "the second comment must queue on the same loaded hunk thread"
+        );
+        // Wrong range and wrong hash for the same path are rejected (the
+        // authoritative cache never falls back to the snapshot hunks).
+        let wrong_hash = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: Some("comment-wrong-hash".into()),
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                old_start: identity.0,
+                old_count: identity.1,
+                new_start: identity.2,
+                new_count: identity.3,
+                content_hash: "deadbeef".into(),
+                comment: "stale".into(),
+            },
+        )
+        .await;
+        assert!(!wrong_hash.success, "{wrong_hash:?}");
+        assert!(wrong_hash.error.as_deref().is_some_and(|e| e.contains("stale hunk")));
+        let wrong_range = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewComment {
+                id: Some("comment-wrong-range".into()),
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                old_start: 999,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                content_hash: identity.4.clone(),
+                comment: "stale".into(),
+            },
+        )
+        .await;
+        assert!(!wrong_range.success, "{wrong_range:?}");
+        assert!(wrong_range.error.as_deref().is_some_and(|e| e.contains("unknown hunk")));
+        // Abort with the exact loaded identity resolves against the cache.
+        let aborted = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewAbort {
+                id: Some("abort-loaded".into()),
+                snapshot_id: snapshot_id.clone(),
+                path: "big.txt".into(),
+                old_start: identity.0,
+                old_count: identity.1,
+                new_start: identity.2,
+                new_count: identity.3,
+                content_hash: identity.4.clone(),
+            },
+        )
+        .await;
+        assert!(aborted.success, "{aborted:?}");
 
         // A stale snapshot id is rejected.
         let stale = handle_code_review_command(
@@ -7442,7 +7778,13 @@ mod tests {
         assert!(placeholder_diff.success, "{placeholder_diff:?}");
         let placeholder_page = placeholder_diff.data.expect("placeholder page");
         assert!(placeholder_page["totalLines"].as_u64().expect("total") > 0);
-        assert_eq!(placeholder_page["lines"].as_array().expect("lines").len(), 50);
+        let placeholder_hunks = placeholder_page["hunks"].as_array().expect("hunks");
+        assert!(!placeholder_hunks.is_empty(), "{placeholder_page}");
+        let placeholder_lines: usize = placeholder_hunks
+            .iter()
+            .map(|hunk| hunk["lines"].as_array().expect("hunk lines").len())
+            .sum();
+        assert_eq!(placeholder_lines, 50);
 
         // Every catalogued path in the truncated snapshot serves a bounded
         // first page — containment must accept placeholders like any file.
@@ -7462,8 +7804,14 @@ mod tests {
             .await;
             assert!(response.success, "{response:?}");
             let page = response.data.expect("page data");
+            let page_lines: usize = page["hunks"]
+                .as_array()
+                .expect("hunks")
+                .iter()
+                .map(|hunk| hunk["lines"].as_array().expect("hunk lines").len())
+                .sum();
             assert!(
-                page["lines"].as_array().expect("lines").len() > 0,
+                page_lines > 0,
                 "file diff must be readable after truncation: {page}"
             );
         }
@@ -7515,8 +7863,9 @@ mod tests {
         let identity = snapshot.hunk_identity(&snapshot.files[0], &snapshot.files[0].hunks[0]);
 
         // A fully matching identity resolves to the (file, hunk).
-        let (resolved_file, resolved_hunk) = resolve_comment_target(
+        let resolved = resolve_comment_target(
             &snapshot,
+            None,
             &identity.snapshot_id,
             "src/lib.rs",
             1,
@@ -7526,12 +7875,18 @@ mod tests {
             &identity.content_hash,
         )
         .expect("matching identity resolves");
-        assert_eq!(resolved_file.path, "src/lib.rs");
-        assert_eq!(resolved_hunk.old_start, 1);
+        match resolved {
+            ResolvedHunk::Snapshot { file, hunk } => {
+                assert_eq!(file.path, "src/lib.rs");
+                assert_eq!(hunk.old_start, 1);
+            }
+            ResolvedHunk::Loaded { .. } => panic!("no cache: must resolve against the snapshot"),
+        }
 
         // Stale snapshot id is rejected.
         let err = resolve_comment_target(
             &snapshot,
+            None,
             "other-snapshot",
             "src/lib.rs",
             1,
@@ -7546,6 +7901,7 @@ mod tests {
         // Unknown path is rejected.
         let err = resolve_comment_target(
             &snapshot,
+            None,
             &identity.snapshot_id,
             "missing.rs",
             1,
@@ -7560,6 +7916,7 @@ mod tests {
         // Wrong hunk range is rejected.
         let err = resolve_comment_target(
             &snapshot,
+            None,
             &identity.snapshot_id,
             "src/lib.rs",
             5,
@@ -7574,6 +7931,7 @@ mod tests {
         // Stale content hash (diff content changed) is rejected.
         let err = resolve_comment_target(
             &snapshot,
+            None,
             &identity.snapshot_id,
             "src/lib.rs",
             1,
@@ -7585,6 +7943,346 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("stale hunk"), "{err}");
     }
+
+    #[test]
+    fn resolve_comment_target_uses_cached_loaded_hunks_authoritatively() {
+        use crate::code_review::{DiffLine, FileStatus, ReviewScope};
+        use std::sync::Arc;
+        // A globally-truncated placeholder file: the snapshot carries NO hunks
+        // (the frontend loads them per-file). The cached FileDiff is the only
+        // valid hunk source; snapshot identities must never resolve.
+        let snapshot_file = DiffFile {
+            path: "placeholder.txt".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            insertions: 0,
+            deletions: 0,
+            hunks: Vec::new(),
+            truncated: true,
+            message: Some("diff omitted: combined diff truncated; loaded on demand".into()),
+        };
+        let snapshot = ReviewSnapshot {
+            root: PathBuf::from("/tmp/fake-root"),
+            scope: ReviewScope::WorkingTree,
+            snapshot_id: "snap-1".into(),
+            files: vec![snapshot_file],
+            truncated: true,
+            error: None,
+        };
+        let loaded_hunk = DiffHunk {
+            header: "@@ -1,2 +1,2 @@".into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Deletion,
+                    old_no: Some(1),
+                    new_no: None,
+                    text: "later base".into(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Addition,
+                    old_no: None,
+                    new_no: Some(1),
+                    text: "later changed".into(),
+                },
+            ],
+        };
+        let loaded = FileDiff {
+            path: "placeholder.txt".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![loaded_hunk.clone()],
+            truncated: false,
+            error: None,
+        };
+        let mut cache = HashMap::new();
+        cache.insert("placeholder.txt".into(), Arc::new(loaded));
+
+        // The loaded hunk identity resolves to the cached hunk, not the
+        // snapshot's (empty) placeholder set.
+        let identity = HunkIdentity::new("snap-1", "placeholder.txt", &loaded_hunk);
+        let resolved = resolve_comment_target(
+            &snapshot,
+            Some(&cache),
+            &identity.snapshot_id,
+            "placeholder.txt",
+            identity.old_start,
+            identity.old_count,
+            identity.new_start,
+            identity.new_count,
+            &identity.content_hash,
+        )
+        .expect("cached loaded hunk resolves");
+        match resolved {
+            ResolvedHunk::Loaded { file, diff, hunk_index } => {
+                assert_eq!(file.path, "placeholder.txt");
+                assert_eq!(diff.hunks[hunk_index], loaded_hunk);
+            }
+            ResolvedHunk::Snapshot { .. } => panic!("cached path must resolve via the cache"),
+        }
+
+        // Wrong hash for the cached hunk is rejected (never falls back).
+        let err = resolve_comment_target(
+            &snapshot,
+            Some(&cache),
+            &identity.snapshot_id,
+            "placeholder.txt",
+            identity.old_start,
+            identity.old_count,
+            identity.new_start,
+            identity.new_count,
+            "wrong-hash",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stale hunk"), "{err}");
+
+        // Wrong range for the cached path is rejected as an unknown hunk.
+        let err = resolve_comment_target(
+            &snapshot,
+            Some(&cache),
+            &identity.snapshot_id,
+            "placeholder.txt",
+            42,
+            1,
+            1,
+            1,
+            &identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown hunk"), "{err}");
+
+        // A byte-capped INCOMPLETE cached hunk is rejected: its identity is
+        // not a valid comment target (content cut by the size limit).
+        let partial_hunk = DiffHunk {
+            header: "@@ -1,3 +1,3 @@".into(),
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    old_no: Some(1),
+                    new_no: Some(1),
+                    text: "a".into(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Deletion,
+                    old_no: Some(2),
+                    new_no: None,
+                    text: "b".into(),
+                },
+            ],
+        };
+        assert!(!partial_hunk.is_complete());
+        let mut capped_cache = HashMap::new();
+        capped_cache.insert(
+            "placeholder.txt".into(),
+            Arc::new(FileDiff {
+                path: "placeholder.txt".into(),
+                previous_path: None,
+                status: FileStatus::Modified,
+                binary: false,
+                hunks: vec![partial_hunk.clone()],
+                truncated: true,
+                error: None,
+            }),
+        );
+        let partial_identity = HunkIdentity::new("snap-1", "placeholder.txt", &partial_hunk);
+        let err = resolve_comment_target(
+            &snapshot,
+            Some(&capped_cache),
+            &partial_identity.snapshot_id,
+            "placeholder.txt",
+            partial_identity.old_start,
+            partial_identity.old_count,
+            partial_identity.new_start,
+            partial_identity.new_count,
+            &partial_identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("incomplete hunk"), "{err}");
+
+        // A snapshot with a COMPLETE hunk still resolves against the snapshot
+        // when no cache exists (the pre-load window for non-truncated files).
+        let mut complete_snapshot = snapshot.clone();
+        complete_snapshot.files[0].hunks = vec![loaded_hunk.clone()];
+        complete_snapshot.files[0].truncated = false;
+        let resolved = resolve_comment_target(
+            &complete_snapshot,
+            None,
+            &identity.snapshot_id,
+            "placeholder.txt",
+            identity.old_start,
+            identity.old_count,
+            identity.new_start,
+            identity.new_count,
+            &identity.content_hash,
+        )
+        .expect("complete snapshot hunk resolves without a cache");
+        assert!(matches!(resolved, ResolvedHunk::Snapshot { .. }));
+
+        // A globally truncated snapshot's PARTIAL last hunk is rejected even
+        // without a cache (its identity is incomplete).
+        let mut partial_snapshot = snapshot.clone();
+        partial_snapshot.files[0].hunks = vec![partial_hunk.clone()];
+        let partial_identity = HunkIdentity::new("snap-1", "placeholder.txt", &partial_hunk);
+        let err = resolve_comment_target(
+            &partial_snapshot,
+            None,
+            &partial_identity.snapshot_id,
+            "placeholder.txt",
+            partial_identity.old_start,
+            partial_identity.old_count,
+            partial_identity.new_start,
+            partial_identity.new_count,
+            &partial_identity.content_hash,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("incomplete hunk"), "{err}");
+    }
+
+    #[test]
+    fn code_review_abort_requires_full_hunk_identity_on_wire() {
+        // Clean cutover: bare abort (no identity) no longer deserializes.
+        let bare = parse_input(br#"{"type":"code_review_abort"}"#);
+        assert!(
+            bare.as_ref().err().is_some_and(|response| {
+                !response.success && response.command == "code_review_abort"
+            }),
+            "code_review_abort must require full hunk identity: {bare:?}"
+        );
+
+        // Full identity matches code_review_comment's identity fields.
+        let full = parse_input(
+            br#"{"type":"code_review_abort","snapshotId":"s1","path":"a.rs","oldStart":1,"oldCount":1,"newStart":2,"newCount":3,"contentHash":"hash"}"#,
+        )
+        .expect("full identity abort");
+        match full {
+            RpcInput::Command {
+                command:
+                    RpcCommand::CodeReviewAbort {
+                        snapshot_id,
+                        path,
+                        old_start,
+                        old_count,
+                        new_start,
+                        new_count,
+                        content_hash,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(snapshot_id, "s1");
+                assert_eq!(path, "a.rs");
+                assert_eq!(old_start, 1);
+                assert_eq!(old_count, 1);
+                assert_eq!(new_start, 2);
+                assert_eq!(new_count, 3);
+                assert_eq!(content_hash, "hash");
+            }
+            other => panic!("expected CodeReviewAbort, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn code_review_projection_exposes_active_count_and_thread_model_fields() {
+        let cwd = tempfile::tempdir().expect("git cwd");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .status()
+                .expect("git")
+        };
+        assert!(git(&["init", "-q"]).success());
+        assert!(git(&["config", "user.email", "t@example.com"]).success());
+        assert!(git(&["config", "user.name", "t"]).success());
+        std::fs::write(cwd.path().join("a.rs"), "fn main() {}\n").expect("write");
+        assert!(git(&["add", "a.rs"]).success());
+        assert!(git(&["commit", "-q", "-m", "init"]).success());
+        std::fs::write(cwd.path().join("a.rs"), "fn main() { println!(\"x\"); }\n").expect("write");
+
+        let app = build_code_review_app(cwd.path()).await;
+        let code_review = CodeReviewRpcState::default();
+        let opened = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewOpen {
+                id: Some("open-proj".into()),
+                from: None,
+                to: None,
+            },
+        )
+        .await;
+        assert!(opened.success, "{opened:?}");
+        let data = opened.data.expect("open data");
+        // Aggregate streaming + bounded active count; activeHunk is gone.
+        assert_eq!(data["isStreaming"], false);
+        assert_eq!(data["activeCount"], 0);
+        assert!(data.get("activeHunk").is_none(), "activeHunk must be removed: {data}");
+        assert!(data["threads"].as_array().expect("threads").is_empty());
+
+        // Snapshot re-projects the same shape.
+        let snap = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewSnapshot {
+                id: Some("snap-proj".into()),
+            },
+        )
+        .await;
+        assert!(snap.success, "{snap:?}");
+        let snap_data = snap.data.expect("snap");
+        assert_eq!(snap_data["activeCount"], 0);
+        assert!(snap_data.get("activeHunk").is_none());
+
+        // Abort without a matching identity is rejected as stale/unknown.
+        let abort = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewAbort {
+                id: Some("abort-stale".into()),
+                snapshot_id: "wrong".into(),
+                path: "a.rs".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                content_hash: "h".into(),
+            },
+        )
+        .await;
+        assert!(!abort.success, "{abort:?}");
+        assert!(
+            abort
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("stale snapshot")),
+            "{abort:?}"
+        );
+
+        let closed = handle_code_review_command(
+            &app,
+            &code_review,
+            RpcCommand::CodeReviewClose {
+                id: Some("close-proj".into()),
+            },
+        )
+        .await;
+        assert!(closed.success, "{closed:?}");
+        app.cleanup().await;
+    }
+
 
     /// Session with dense history so snap compact has something to archive
     /// (mirrors the pi-coding snap_compact_tests fixture: 12 large turns,

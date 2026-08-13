@@ -1,9 +1,8 @@
-// Side chat + maintenance web E2E lane (playwright half of E2E.d/web/extras.sh).
+// Side chat web E2E lane (playwright half of E2E.d/web/extras.sh).
 //
 // Environment:
 //   RPI_URL        http://127.0.0.1:<port>/web
 //   RPI_TOKEN      token file content (served via rpi-auth.<token> subprotocol)
-//   RPI_SLOW_TAIL  tail of the FIRST slow mock reply ("chunk-four-done")
 //   RPI_CHROME     executable path of the system Chrome (optional)
 //   RPI_EVIDENCE   evidence dir for screenshots
 //
@@ -16,20 +15,11 @@
 //        the assistant entry renders the streamed mock reply (the side-agent
 //        turn may land on either the odd slow or the even instant path, so
 //        any non-empty assistant text satisfies the assertion)
-//   Maintenance (compact A→B / rewind / handoff / queue):
-//     4. Snapcompact renders the A→B token report ("N → M estimated tokens")
-//     5. Rewind lists session records (block appears)
-//     6. Handoff renders the envelope
-//     7. the queue view renders and Cancel queue reports the drain
-//
-// The MAIN session is primed with one prompt first so the maintenance panel
-// has real session records to compact/rewind against.
 
 import { chromium } from 'playwright';
 
 const url = process.env.RPI_URL;
 const token = process.env.RPI_TOKEN || '';
-const slowTail = process.env.RPI_SLOW_TAIL || 'chunk-four-done';
 const chromePath = process.env.RPI_CHROME || '';
 const evidence = process.env.RPI_EVIDENCE || '.';
 
@@ -47,19 +37,6 @@ async function waitFor(page, fn, label, timeoutMs = 25000, arg) {
   } catch {
     fail(`${label} (timeout ${timeoutMs}ms)`);
   }
-}
-
-/** Click the maintenance action button whose text includes `label`. */
-async function clickMaintenanceAction(page, label) {
-  const clicked = await page.evaluate((want) => {
-    const btn = Array.from(document.querySelectorAll('.maintenance__action')).find((b) =>
-      b.textContent.includes(want)
-    );
-    if (!btn) return false;
-    btn.click();
-    return true;
-  }, label);
-  if (!clicked) fail(`maintenance action "${label}" not found`);
 }
 
 async function main() {
@@ -83,27 +60,6 @@ async function main() {
       page,
       () => document.getElementById('conn-state').dataset.state === 'on',
       'WS did not reach "connected"'
-    );
-
-    // Prime the MAIN session with two turns (request 1 = slow stream,
-    // request 2 = instant) so the maintenance panel has compactible records.
-    await page.fill('#prompt-input', 'prime the main session');
-    await page.press('#prompt-input', 'Enter');
-    await waitFor(
-      page,
-      (tail) => document.body.textContent.includes(tail),
-      'main-session reply never streamed into the DOM',
-      30000,
-      slowTail
-    );
-    await page.fill('#prompt-input', 'prime again');
-    await page.press('#prompt-input', 'Enter');
-    await waitFor(
-      page,
-      (tail) => document.body.textContent.includes(tail),
-      'second main-session reply never arrived',
-      30000,
-      'steering-followup-reply'
     );
 
     // ---------- Side chat ----------
@@ -165,73 +121,7 @@ async function main() {
     if (sideEntry.error) fail(`side-chat turn ended in an error entry: ${sideEntry.text}`);
     await page.screenshot({ path: `${evidence}/sidechat-reply.png`, fullPage: true });
 
-    // ---------- Maintenance ----------
-    // The side-chat drawer overlays the header; close it first (the single
-    // `activePanel` state shows one panel at a time).
-    await page.click('.side-chat .panel-close');
-    await waitFor(page, () => document.querySelector('.side-chat') === null, 'side chat panel did not close');
-    await page.click('#maintenance-toggle-btn');
-    await waitFor(page, () => document.querySelector('.maintenance') !== null, 'maintenance panel did not open');
-
-    // 4. Snapcompact A→B token report.
-    await clickMaintenanceAction(page, 'Snapcompact');
-    await waitFor(
-      page,
-      () =>
-        Array.from(document.querySelectorAll('.maintenance__result')).some((r) =>
-          r.textContent.includes('estimated tokens')
-        ),
-      'snapcompact never rendered the A→B token report'
-    );
-    const ab = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('.maintenance__result'))
-        .map((r) => r.textContent)
-        .join(' | ')
-    );
-    if (!ab.includes('→')) fail(`snapcompact report has no A→B arrow: ${ab}`);
-    await page.screenshot({ path: `${evidence}/maintain-snapcompact.png`, fullPage: true });
-
-    // 5. Rewind lists session records.
-    await clickMaintenanceAction(page, 'Rewind…');
-    await waitFor(
-      page,
-      () =>
-        document.querySelector('.maintenance__list') !== null ||
-        Array.from(document.querySelectorAll('.maintenance__result')).some((r) =>
-          r.textContent.includes('rewind')
-        ),
-      'rewind list never appeared'
-    );
-    await page.screenshot({ path: `${evidence}/maintain-rewind.png`, fullPage: true });
-
-    // 6. Handoff envelope renders.
-    await clickMaintenanceAction(page, 'Handoff');
-    await waitFor(
-      page,
-      () => document.querySelector('.maintenance__handoff') !== null,
-      'handoff envelope never rendered'
-    );
-    await page.screenshot({ path: `${evidence}/maintain-handoff.png`, fullPage: true });
-
-    // 7. Queue view + cancel.
-    await clickMaintenanceAction(page, 'Queue…');
-    await waitFor(
-      page,
-      () => document.querySelector('.maintenance__queue') !== null,
-      'queue view never rendered'
-    );
-    await clickMaintenanceAction(page, 'Cancel queue');
-    await waitFor(
-      page,
-      () =>
-        Array.from(document.querySelectorAll('.maintenance__result')).some((r) =>
-          r.textContent.includes('Cancelled')
-        ),
-      'queue cancel never reported'
-    );
-    await page.screenshot({ path: `${evidence}/maintain-queue.png`, fullPage: true });
-
-    console.log('web-extras: PASSED (side chat multi-tab + prompt round-trip; snapcompact A→B, rewind, handoff, queue/cancel)');
+    console.log('web-extras: PASSED (side chat multi-tab + prompt round-trip)');
   } finally {
     await browser.close().catch(() => {});
   }

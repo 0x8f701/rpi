@@ -1,12 +1,7 @@
 /target
 dist
-# The web client's production build (vite-plugin-singlefile) emits exactly one
-# self-contained file, crates/pi-cli/web/dist/index.html, which is COMMITTED so
-# `cargo build` never requires node (see crates/pi-cli/build.rs). Re-include
-# only that single artifact; everything else named `dist` stays ignored.
-!crates/pi-cli/web/dist/
-crates/pi-cli/web/dist/*
-!crates/pi-cli/web/dist/index.html
+# The web client's production build (vite-plugin-singlefile) emits
+# crates/pi-cli/web/dist/index.html; it is generated output, never tracked.
 node_modules
 crates/pi-cli/web/.web-test-build/
 crates/pi-cli/web/.transcript-test-build/

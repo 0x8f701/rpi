@@ -4,14 +4,14 @@
 //! TUI only while this page is open so ordinary terminal selection is preserved.
 //! Pure Rust/ratatui — no external diff server, browser, or HTML.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use pi_agent::{Agent, AgentEvent, ToolCapability};
-use pi_ai::{AssistantMessage, AssistantMessageEvent, ContentBlock, Message, StopReason};
+use pi_ai::{AssistantMessage, AssistantMessageEvent, ContentBlock, Message, Model, StopReason};
 use pi_coding::{
     Application, SideChatFork, create_read_only_tools, filter_tools_by_capabilities,
     tools_include_mutation,
@@ -74,6 +74,10 @@ pub struct ReviewComment {
     pub role: ReviewCommentRole,
     pub text: String,
     pub partial: bool,
+    /// Model that produced this comment (assistant replies only; user
+    /// comments carry `None`). Resolved from the assistant message's
+    /// `response_model`/`model`, falling back to the base fork's model.
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +87,11 @@ pub struct HunkThread {
     pub streaming_text: String,
     pub error: Option<String>,
     pub stale: bool,
+    /// Projection of the hunk run's live state: true while this hunk's agent
+    /// is streaming a reply.
+    pub is_streaming: bool,
+    /// Projection of the hunk run's actual model display.
+    pub model: Option<String>,
 }
 
 impl HunkThread {
@@ -93,6 +102,8 @@ impl HunkThread {
             streaming_text: String::new(),
             error: None,
             stale: false,
+            is_streaming: false,
+            model: None,
         }
     }
 
@@ -107,7 +118,7 @@ impl HunkThread {
         }
     }
 
-    fn finish_assistant_message(&mut self, assistant: &AssistantMessage) {
+    fn finish_assistant_message(&mut self, assistant: &AssistantMessage, model: Option<String>) {
         if assistant.stop_reason == StopReason::Error {
             let message = assistant
                 .error_message
@@ -137,11 +148,12 @@ impl HunkThread {
                 role: ReviewCommentRole::Assistant,
                 text,
                 partial,
+                model,
             });
         }
     }
 
-    fn finish_streaming(&mut self, partial: bool) {
+    fn finish_streaming(&mut self, partial: bool, model: Option<String>) {
         if self.streaming_text.is_empty() {
             return;
         }
@@ -149,6 +161,7 @@ impl HunkThread {
             role: ReviewCommentRole::Assistant,
             text: std::mem::take(&mut self.streaming_text),
             partial,
+            model,
         };
         if self
             .comments
@@ -164,60 +177,126 @@ impl HunkThread {
 
 #[derive(Clone, Debug)]
 enum ReviewInternalEvent {
-    Agent { generation: u64, event: AgentEvent },
-    PromptFailed {
-        generation: u64,
+    Agent {
         identity: HunkIdentity,
+        generation: u64,
+        event: AgentEvent,
+    },
+    PromptFailed {
+        identity: HunkIdentity,
+        generation: u64,
         message: String,
     },
 }
 
-/// Page-scoped detached Agent and per-hunk thread store. Events are consumed
-/// only by this controller and never forwarded to the main Application.
-pub struct CodeReviewController {
+/// Maximum number of comments a single hunk may have queued behind its
+/// streaming reply. A FIFO chain of at most this many prompts runs on the
+/// hunk's agent after the current reply settles; the next comment beyond the
+/// cap is rejected with [`CommentSubmitResult::QueueFull`].
+pub(crate) const MAX_PENDING_COMMENTS: usize = 4;
+
+/// Result of [`CodeReviewController::submit_comment`]: whether the comment
+/// was accepted (streamed or queued) or rejected, and why. The RPC layer
+/// distinguishes the cases so queue overflow surfaces a bounded, actionable
+/// error instead of an ambiguous boolean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommentSubmitResult {
+    /// The comment was appended to the thread and its prompt is either
+    /// streaming (idle start) or queued FIFO behind at most
+    /// [`MAX_PENDING_COMMENTS`] other prompts.
+    Accepted,
+    /// The comment was empty/whitespace; nothing changed.
+    Empty,
+    /// The hunk already has [`MAX_PENDING_COMMENTS`] prompts queued behind
+    /// the streaming reply; the comment was rejected.
+    QueueFull,
+    /// The comment was appended but its prompt could not start (agent
+    /// creation failed); the reason is stored on the thread's error.
+    Failed,
+}
+
+impl CommentSubmitResult {
+    /// Whether the comment was accepted (streaming or queued). The TUI
+    /// composer path clears its draft exactly when this holds.
+    #[must_use]
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+}
+
+/// One hunk's detached review run: its own [`Agent`] (created from the base
+/// fork on first comment, reused afterwards so the conversation persists),
+/// its in-flight prompt task, and its live state. The per-prompt
+/// `Subscription` lives inside the spawned prompt task so events are tagged
+/// with this hunk's identity and generation; the agent handle stays here so
+/// abort/wait can address the run directly.
+struct HunkRun {
     agent: Agent,
+    prompt_task: Option<JoinHandle<()>>,
+    /// FIFO of prompts awaiting this hunk's agent while the current reply
+    /// streams (bounded by [`MAX_PENDING_COMMENTS`]). Drained one at a time
+    /// on `AgentEnd`/`PromptFailed` so queued replies settle in order on the
+    /// same agent/conversation; cleared by abort/refork/reconcile when the
+    /// hunk disappears. Each item carries the index of its visible user
+    /// comment so abort can drop the not-yet-started comments with the queue.
+    pending: VecDeque<PendingPrompt>,
+    /// Controller generation at run creation; events from other generations
+    /// are stale and ignored.
+    generation: u64,
+    abort_requested: bool,
+    is_streaming: bool,
+    /// Actual model display: `response_model`/`model` from the assistant
+    /// message, falling back to the base fork's model name/id. Never a
+    /// provider key or credential.
+    model: Option<String>,
+}
+
+/// One comment queued behind a streaming reply: the prompt that will start
+/// on the hunk's agent once the run settles, plus the index of the comment's
+/// already-visible user card in the hunk's thread. While queued, comments
+/// are only ever appended to the thread (never removed except on abort), so
+/// the index stays stable until the prompt starts; abort uses it to remove
+/// exactly the not-yet-started visible comments.
+struct PendingPrompt {
+    prompt: String,
+    comment_index: usize,
+}
+
+/// Page-scoped detached review Agents (one per hunk) and per-hunk thread
+/// store. Events are consumed only by this controller and never forwarded to
+/// the main Application.
+pub struct CodeReviewController {
+    /// Immutable base fork; per-hunk agents are created from it on first
+    /// comment and replaced only by `refork`.
     fork: SideChatFork,
     main_application: Application,
     threads: BTreeMap<HunkIdentity, HunkThread>,
     stale_threads: Vec<HunkThread>,
-    active_hunk: Option<HunkIdentity>,
+    runs: BTreeMap<HunkIdentity, HunkRun>,
+    /// Monotonic controller generation; bumped by `refork`. Events tagged
+    /// with an older generation are ignored.
     generation: u64,
     event_tx: mpsc::UnboundedSender<ReviewInternalEvent>,
     event_rx: mpsc::UnboundedReceiver<ReviewInternalEvent>,
-    prompt_task: Option<JoinHandle<()>>,
-    subscription: Option<pi_agent::Subscription>,
-    abort_requested: bool,
-    is_streaming: bool,
 }
 
 impl CodeReviewController {
     pub async fn fork_from(application: &Application) -> Result<Self> {
         let fork = application.fork_side_chat().await?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let generation = 1;
-        let (agent, subscription) = Self::create_agent(&fork, generation, &event_tx).await?;
         Ok(Self {
-            agent,
             fork,
             main_application: application.clone(),
             threads: BTreeMap::new(),
             stale_threads: Vec::new(),
-            active_hunk: None,
-            generation,
+            runs: BTreeMap::new(),
+            generation: 1,
             event_tx,
             event_rx,
-            prompt_task: None,
-            subscription: Some(subscription),
-            abort_requested: false,
-            is_streaming: false,
         })
     }
 
-    async fn create_agent(
-        fork: &SideChatFork,
-        generation: u64,
-        event_tx: &mpsc::UnboundedSender<ReviewInternalEvent>,
-    ) -> Result<(Agent, pi_agent::Subscription)> {
+    fn create_agent_for_fork(fork: &SideChatFork) -> Result<Agent> {
         let cwd = fork.cwd.to_string_lossy();
         let tools = filter_tools_by_capabilities(
             create_read_only_tools(&cwd),
@@ -226,18 +305,7 @@ impl CodeReviewController {
         if tools_include_mutation(&tools) {
             return Err(anyhow!("code-review Agent contains mutating tools"));
         }
-        let agent = Application::create_side_chat_agent(fork, tools);
-        let tx = event_tx.clone();
-        let subscription = agent
-            .subscribe_simple(move |event| {
-                let tx = tx.clone();
-                async move {
-                    let _ = tx.send(ReviewInternalEvent::Agent { generation, event });
-                    Ok(())
-                }
-            })
-            .await;
-        Ok((agent, subscription))
+        Ok(Application::create_side_chat_agent(fork, tools))
     }
 
     #[must_use]
@@ -255,14 +323,24 @@ impl CodeReviewController {
         self.threads.get(identity)
     }
 
+    /// True while any hunk run is streaming (aggregate activity gate).
     #[must_use]
     pub fn is_streaming(&self) -> bool {
-        self.is_streaming
+        self.runs.values().any(|run| run.is_streaming)
     }
 
+    /// Number of hunk runs currently streaming.
     #[must_use]
-    pub fn active_hunk(&self) -> Option<&HunkIdentity> {
-        self.active_hunk.as_ref()
+    pub fn active_count(&self) -> usize {
+        self.runs.values().filter(|run| run.is_streaming).count()
+    }
+
+    /// Per-hunk gate: is the given hunk's run currently streaming?
+    #[must_use]
+    pub fn is_hunk_streaming(&self, identity: &HunkIdentity) -> bool {
+        self.runs
+            .get(identity)
+            .is_some_and(|run| run.is_streaming)
     }
 
     pub fn poll_events(&mut self) -> bool {
@@ -270,40 +348,73 @@ impl CodeReviewController {
         while let Ok(event) = self.event_rx.try_recv() {
             changed = true;
             match event {
-                ReviewInternalEvent::Agent { generation, event }
-                    if generation == self.generation => self.apply_agent_event(event),
-                ReviewInternalEvent::PromptFailed {
-                    generation,
+                ReviewInternalEvent::Agent {
                     identity,
-                    message,
-                } if generation == self.generation => {
-                    if let Some(thread) = self.threads.get_mut(&identity) {
-                        thread.streaming_text.clear();
-                        thread.error = Some(message);
+                    generation,
+                    event,
+                } => {
+                    if let Some(key) = self.resolve_run_identity(&identity, generation) {
+                        self.apply_agent_event(&key, generation, event);
                     }
-                    self.is_streaming = false;
-                    self.active_hunk = None;
-                    self.abort_requested = false;
                 }
-                ReviewInternalEvent::Agent { .. } | ReviewInternalEvent::PromptFailed { .. } => {}
+                ReviewInternalEvent::PromptFailed {
+                    identity,
+                    generation,
+                    message,
+                } => {
+                    if let Some(key) = self.resolve_run_identity(&identity, generation) {
+                        self.apply_prompt_failed(&key, message);
+                    }
+                }
             }
         }
-        if self.prompt_task.as_ref().is_some_and(|handle| handle.is_finished()) {
-            self.prompt_task = None;
+        for run in self.runs.values_mut() {
+            if run
+                .prompt_task
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+            {
+                run.prompt_task = None;
+            }
         }
+        // Settled runs with queued prompts chain the next prompt on the same
+        // agent (FIFO), keeping the hunk "streaming" across the whole queue.
+        self.pump_pending_prompts();
         changed
     }
 
-    fn apply_agent_event(&mut self, event: AgentEvent) {
-        let Some(identity) = self.active_hunk.clone() else {
+    /// Resolve the run key an event (tagged `identity` + `generation`)
+    /// belongs to. A direct key hit wins; otherwise a snapshot migration may
+    /// have re-keyed the run to a matching identity
+    /// (`matches_across_snapshots`). Events from a different generation are
+    /// stale and ignored.
+    fn resolve_run_identity(&self, identity: &HunkIdentity, generation: u64) -> Option<HunkIdentity> {
+        if let Some(run) = self.runs.get(identity) {
+            return (run.generation == generation).then(|| identity.clone());
+        }
+        self.runs
+            .iter()
+            .find(|(key, run)| {
+                key.matches_across_snapshots(identity) && run.generation == generation
+            })
+            .map(|(key, _)| key.clone())
+    }
+
+    fn apply_agent_event(&mut self, identity: &HunkIdentity, generation: u64, event: AgentEvent) {
+        let Some(run) = self.runs.get_mut(identity) else {
             return;
         };
-        let Some(thread) = self.threads.get_mut(&identity) else {
+        if run.generation != generation {
+            return;
+        }
+        let Some(thread) = self.threads.get_mut(identity) else {
             return;
         };
         match event {
             AgentEvent::AgentStart => {
-                self.is_streaming = true;
+                run.is_streaming = true;
+                run.abort_requested = false;
+                run.model = fork_model_display(&self.fork.model);
                 thread.streaming_text.clear();
                 thread.error = None;
             }
@@ -318,39 +429,95 @@ impl CodeReviewController {
             }
             | AgentEvent::MessageEnd {
                 message: Message::Assistant(assistant),
-            } => thread.replace_pending_assistant(&assistant),
+            } => {
+                thread.replace_pending_assistant(&assistant);
+                if let Some(model) = assistant_model(&assistant, &self.fork) {
+                    run.model = Some(model);
+                }
+            }
             AgentEvent::AgentEnd { messages } => {
                 if let Some(Message::Assistant(mut assistant)) = messages
                     .into_iter()
                     .rev()
                     .find(|message| matches!(message, Message::Assistant(_)))
                 {
-                    if self.abort_requested {
+                    if run.abort_requested {
                         assistant.stop_reason = StopReason::Aborted;
                     }
-                    thread.finish_assistant_message(&assistant);
+                    let model = assistant_model(&assistant, &self.fork).or_else(|| run.model.clone());
+                    if let Some(model) = &model {
+                        run.model = Some(model.clone());
+                    }
+                    thread.finish_assistant_message(&assistant, model);
                 } else {
-                    thread.finish_streaming(self.abort_requested);
+                    thread.finish_streaming(run.abort_requested, run.model.clone());
                 }
-                self.is_streaming = false;
-                self.active_hunk = None;
+                run.is_streaming = false;
+                run.abort_requested = false;
             }
             _ => {}
         }
+        self.sync_thread_projection(identity);
     }
 
+    fn apply_prompt_failed(&mut self, identity: &HunkIdentity, message: String) {
+        let Some(run) = self.runs.get_mut(identity) else {
+            return;
+        };
+        if let Some(thread) = self.threads.get_mut(identity) {
+            thread.streaming_text.clear();
+            thread.error = Some(message);
+        }
+        run.is_streaming = false;
+        run.abort_requested = false;
+        self.sync_thread_projection(identity);
+    }
+
+    /// Copy a run's live state (streaming flag + model) into its thread's
+    /// projection fields.
+    fn sync_thread_projection(&mut self, identity: &HunkIdentity) {
+        let Some(run) = self.runs.get(identity) else {
+            return;
+        };
+        let is_streaming = run.is_streaming;
+        let model = run.model.clone();
+        if let Some(thread) = self.threads.get_mut(identity) {
+            thread.is_streaming = is_streaming;
+            thread.model = model;
+        }
+    }
+
+    /// Submit a review comment for one hunk. Empty comments are rejected;
+    /// different hunks may prompt concurrently. The first comment on a hunk
+    /// creates its agent from the base fork; later comments reuse it,
+    /// preserving the conversation.
+    ///
+    /// An idle hunk starts streaming immediately. A hunk whose reply is
+    /// already streaming (or whose bounded FIFO has pending prompts) appends
+    /// the visible user comment to the thread and queues its prompt (with
+    /// the comment's thread index, so abort can remove exactly the
+    /// not-yet-started visible comments), preserving the current streaming
+    /// buffer/error. Queued prompts run on the same agent, one at a time,
+    /// after the current reply settles.
     pub fn submit_comment(
         &mut self,
         snapshot: &ReviewSnapshot,
         file: &DiffFile,
         hunk: &DiffHunk,
         comment: &str,
-    ) -> bool {
+    ) -> CommentSubmitResult {
         let comment = comment.trim();
-        if comment.is_empty() || self.is_streaming {
-            return false;
+        if comment.is_empty() {
+            return CommentSubmitResult::Empty;
         }
         let identity = snapshot.hunk_identity(file, hunk);
+        if self
+            .runs
+            .get(&identity)
+            .is_some_and(|run| run.pending.len() >= MAX_PENDING_COMMENTS)
+        {
+            return CommentSubmitResult::QueueFull;
+        }
         let thread = self
             .threads
             .entry(identity.clone())
@@ -359,68 +526,236 @@ impl CodeReviewController {
             role: ReviewCommentRole::User,
             text: comment.to_owned(),
             partial: false,
+            model: None,
         });
-        thread.streaming_text.clear();
-        thread.error = None;
+        // The just-appended comment is the visible card for this prompt;
+        // record its index so abort can drop it together with the queue.
+        let comment_index = thread.comments.len() - 1;
         let prompt = review_prompt(file, hunk, comment);
-        let agent = self.agent.clone();
+
+        // While the run is active (streaming or awaiting a queued prompt),
+        // the visible comment is already appended: enqueue the prompt and
+        // keep the current streaming buffer/error untouched.
+        let active = self
+            .runs
+            .get(&identity)
+            .is_some_and(|run| run.is_streaming || !run.pending.is_empty());
+        if active {
+            self.runs
+                .get_mut(&identity)
+                .expect("active run exists")
+                .pending
+                .push_back(PendingPrompt {
+                    prompt,
+                    comment_index,
+                });
+            self.sync_thread_projection(&identity);
+            return CommentSubmitResult::Accepted;
+        }
+
+        // First comment or an idle run: start a fresh reply on the hunk's
+        // agent, creating the run from the base fork when needed.
+        if let Err(error) = self.start_prompt(&identity, prompt) {
+            let thread = self.threads.get_mut(&identity).expect("thread exists");
+            thread.error = Some(format!("Review failed: {error:#}"));
+            return CommentSubmitResult::Failed;
+        }
+        CommentSubmitResult::Accepted
+    }
+
+    /// Create the hunk's run (agent from the base fork) if it does not exist
+    /// and spawn one prompt task on the run's agent. The agent is reused
+    /// across queued prompts so the conversation persists; at most one
+    /// prompt task runs per hunk at a time. The prompt task tags every event
+    /// with this hunk's identity and generation and holds its per-prompt
+    /// subscription until the prompt settles.
+    fn start_prompt(&mut self, identity: &HunkIdentity, prompt: String) -> Result<()> {
+        let (agent, generation) = match self.runs.get(identity) {
+            Some(run) => (run.agent.clone(), run.generation),
+            None => {
+                let agent = Self::create_agent_for_fork(&self.fork)?;
+                self.runs.insert(
+                    identity.clone(),
+                    HunkRun {
+                        agent: agent.clone(),
+                        prompt_task: None,
+                        pending: VecDeque::new(),
+                        generation: self.generation,
+                        abort_requested: false,
+                        is_streaming: false,
+                        model: fork_model_display(&self.fork.model),
+                    },
+                );
+                (agent, self.generation)
+            }
+        };
+        // Fresh reply: drop residue from the previous one. (The queue path
+        // never calls this, so a streaming reply's buffer/error survive.)
+        if let Some(thread) = self.threads.get_mut(identity) {
+            thread.streaming_text.clear();
+            thread.error = None;
+        }
+        let run = self.runs.get_mut(identity).expect("run exists");
+        run.abort_requested = false;
+        run.is_streaming = true;
+
         let tx = self.event_tx.clone();
-        let generation = self.generation;
         let failed_identity = identity.clone();
-        self.active_hunk = Some(identity);
-        self.abort_requested = false;
-        self.is_streaming = true;
-        self.prompt_task = Some(tokio::spawn(async move {
+        let event_identity = identity.clone();
+        let generation_for_task = generation;
+        run.prompt_task = Some(tokio::spawn(async move {
+            // Per-prompt subscription: events are tagged with this hunk's
+            // identity and generation. Held for the task's lifetime so an
+            // abort can still deliver `AgentEnd`; dropped once the prompt
+            // settles. The agent clone shares the run's inner state.
+            let subscription_tx = tx.clone();
+            let subscription = agent
+                .subscribe_simple(move |event| {
+                    let tx = subscription_tx.clone();
+                    let identity = event_identity.clone();
+                    async move {
+                        let _ = tx.send(ReviewInternalEvent::Agent {
+                            identity,
+                            generation: generation_for_task,
+                            event,
+                        });
+                        Ok(())
+                    }
+                })
+                .await;
             if let Err(error) = agent.prompt(prompt).await {
                 let _ = tx.send(ReviewInternalEvent::PromptFailed {
-                    generation,
                     identity: failed_identity,
+                    generation: generation_for_task,
                     message: format!("Review failed: {error:#}"),
                 });
             }
+            drop(subscription);
         }));
-        true
+        self.sync_thread_projection(identity);
+        Ok(())
     }
 
-    pub async fn abort(&mut self) {
-        let was_streaming = self.is_streaming || self.agent.state().await.is_streaming;
-        self.abort_requested = was_streaming;
-        if was_streaming {
-            self.agent.abort().await;
+    /// Start one queued prompt per idle run, draining each hunk's FIFO. A
+    /// run chains only after its previous prompt task has finished, so the
+    /// agent's claim is released before the next prompt acquires it; FIFO
+    /// order is preserved because only this pump pops the queue.
+    fn pump_pending_prompts(&mut self) {
+        let identities = self.runs.keys().cloned().collect::<Vec<_>>();
+        for identity in identities {
+            let Some(run) = self.runs.get(&identity) else {
+                continue;
+            };
+            let ready = !run.is_streaming
+                && !run.pending.is_empty()
+                && !run
+                    .prompt_task
+                    .as_ref()
+                    .is_some_and(|handle| !handle.is_finished());
+            if !ready {
+                continue;
+            }
+            // Only the prompt is needed to start the reply; the queued
+            // comment's visible card is already in the thread.
+            let PendingPrompt { prompt, .. } = self
+                .runs
+                .get_mut(&identity)
+                .expect("run exists")
+                .pending
+                .pop_front()
+                .expect("pending is non-empty");
+            // The run already exists here, so `start_prompt` cannot fail on
+            // agent creation; keep any error on the thread defensively.
+            if let Err(error) = self.start_prompt(&identity, prompt) {
+                if let Some(thread) = self.threads.get_mut(&identity) {
+                    thread.error = Some(format!("Review failed: {error:#}"));
+                }
+            }
         }
-        if let Some(handle) = self.prompt_task.take() {
+    }
+
+    /// Abort a single hunk's run; other hunks keep streaming.
+    pub async fn abort_hunk(&mut self, identity: &HunkIdentity) {
+        let Some(mut run) = self.runs.remove(identity) else {
+            return;
+        };
+        // Queued prompts die with the run: aborting a hunk drops everything
+        // not yet prompted, so nothing resumes after the abort. Remove the
+        // dropped prompts' visible user comments too, in reverse index order
+        // so removals never shift an earlier still-queued comment. If any
+        // recorded index does not identify a user comment, nothing is
+        // removed (fail closed) rather than deleting unrelated content such
+        // as a settled assistant reply.
+        if let Some(thread) = self.threads.get_mut(identity) {
+            let queued_indices = run
+                .pending
+                .iter()
+                .map(|pending| pending.comment_index)
+                .collect::<Vec<_>>();
+            if queued_indices.iter().all(|&index| {
+                thread
+                    .comments
+                    .get(index)
+                    .is_some_and(|comment| comment.role == ReviewCommentRole::User)
+            }) {
+                for index in queued_indices.into_iter().rev() {
+                    thread.comments.remove(index);
+                }
+            }
+        }
+        run.pending.clear();
+        let was_streaming = run.is_streaming || run.agent.state().await.is_streaming;
+        run.abort_requested = was_streaming;
+        if was_streaming {
+            run.agent.abort().await;
+        }
+        if let Some(handle) = run.prompt_task.take() {
             handle.abort();
             let _ = handle.await;
         }
-        self.agent.wait_for_idle().await;
+        run.agent.wait_for_idle().await;
         self.poll_events();
-        if let Some(identity) = self.active_hunk.take()
-            && let Some(thread) = self.threads.get_mut(&identity)
-        {
-            thread.finish_streaming(true);
+        if let Some(thread) = self.threads.get_mut(identity) {
+            thread.finish_streaming(true, run.model.clone());
         }
-        self.is_streaming = false;
-        self.abort_requested = false;
+        run.is_streaming = false;
+        run.abort_requested = false;
+        self.runs.insert(identity.clone(), run);
+        self.sync_thread_projection(identity);
     }
 
+    /// Abort every active hunk run (used by shutdown/refork and the TUI's
+    /// global Esc). Idle runs keep their agents so conversations are
+    /// preserved for the next comment.
+    pub async fn abort(&mut self) {
+        let identities = self.runs.keys().cloned().collect::<Vec<_>>();
+        for identity in identities {
+            self.abort_hunk(&identity).await;
+        }
+    }
+
+    /// Capture a fresh base fork once, bump the generation, and drop all runs
+    /// (threads are preserved). New comments lazily create agents from the
+    /// new fork.
     pub async fn refork(&mut self) -> Result<()> {
         self.abort().await;
         let fork = self.main_application.fork_side_chat().await?;
         self.generation = self.generation.wrapping_add(1);
-        let (agent, subscription) =
-            Self::create_agent(&fork, self.generation, &self.event_tx).await?;
-        self.agent = agent;
         self.fork = fork;
-        self.subscription = Some(subscription);
+        self.runs.clear();
         Ok(())
     }
 
     pub async fn shutdown(&mut self) {
         self.abort().await;
-        self.subscription = None;
+        self.runs.clear();
         while self.event_rx.try_recv().is_ok() {}
     }
 
+    /// Re-key threads and runs whose hunk survived the snapshot change
+    /// (`matches_across_snapshots`); threads whose hunk vanished become
+    /// stale, and their runs are safely aborted (in-flight prompts are
+    /// killed and the stream is finalized as partial).
     pub fn reconcile_snapshot(&mut self, snapshot: &ReviewSnapshot) {
         let mut identities = Vec::new();
         for file in &snapshot.files {
@@ -428,33 +763,76 @@ impl CodeReviewController {
                 identities.push(snapshot.hunk_identity(file, hunk));
             }
         }
-        let mut old = std::mem::take(&mut self.threads);
-        let mut next = BTreeMap::new();
-        let mut next_active = None;
-        for identity in identities {
-            let matched = old
+        // Threads: migrate matched identities; unmatched become stale.
+        let mut old_threads = std::mem::take(&mut self.threads);
+        let mut next_threads = BTreeMap::new();
+        for identity in &identities {
+            let matched = old_threads
                 .keys()
-                .find(|candidate| candidate.matches_across_snapshots(&identity))
+                .find(|candidate| candidate.matches_across_snapshots(identity))
                 .cloned();
             if let Some(matched) = matched
-                && let Some(mut thread) = old.remove(&matched)
+                && let Some(mut thread) = old_threads.remove(&matched)
             {
-                if self.active_hunk.as_ref() == Some(&matched) {
-                    next_active = Some(identity.clone());
-                }
                 thread.identity = identity.clone();
                 thread.stale = false;
-                next.insert(identity, thread);
+                next_threads.insert(identity.clone(), thread);
             }
         }
-        self.active_hunk = next_active;
-        self.stale_threads.extend(old.into_values().map(|mut thread| {
-            thread.stale = true;
-            thread
-        }));
+        self.stale_threads.extend(
+            old_threads
+                .into_values()
+                .map(|mut thread| {
+                    thread.stale = true;
+                    thread
+                }),
+        );
         self.stale_threads
             .sort_by(|left, right| left.identity.cmp(&right.identity));
-        self.threads = next;
+        self.threads = next_threads;
+
+        // Runs: migrate matched run identities; safely abort runs whose hunk
+        // disappeared. `JoinHandle::abort` drops the prompt future, whose
+        // agent ClaimGuard (pi-agent drop safety) aborts the in-flight
+        // controller and clears its active claim on a background thread, so
+        // the agent is left idle; the matching stale thread's stream is then
+        // finalized as partial. Any events already queued for the old
+        // identity find no run and are dropped. Queued prompts ride on the
+        // run and drop with it, so a disappeared hunk never resumes them.
+        let mut old_runs = std::mem::take(&mut self.runs);
+        let mut next_runs = BTreeMap::new();
+        let mut stale_runs = Vec::new();
+        for identity in &identities {
+            let matched = old_runs
+                .keys()
+                .find(|candidate| candidate.matches_across_snapshots(identity))
+                .cloned();
+            if let Some(matched) = matched
+                && let Some(run) = old_runs.remove(&matched)
+            {
+                next_runs.insert(identity.clone(), run);
+            }
+        }
+        stale_runs.extend(old_runs.into_iter());
+        self.runs = next_runs;
+        let migrated = self.runs.keys().cloned().collect::<Vec<_>>();
+        for (old_identity, mut run) in stale_runs {
+            run.abort_requested = true;
+            if let Some(handle) = run.prompt_task.take() {
+                handle.abort();
+            }
+            run.is_streaming = false;
+            run.abort_requested = false;
+            for thread in &mut self.stale_threads {
+                if thread.identity.matches_across_snapshots(&old_identity) {
+                    thread.finish_streaming(true, run.model.clone());
+                    break;
+                }
+            }
+        }
+        for identity in migrated {
+            self.sync_thread_projection(&identity);
+        }
     }
 }
 fn content_text(content: &[ContentBlock]) -> String {
@@ -466,6 +844,31 @@ fn content_text(content: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Actual model display for an assistant message: prefer the
+/// provider-reported `response_model`, then the requested `model`, then the
+/// base fork's model name/id. Never surfaces provider keys, base URLs, or
+/// credentials.
+fn assistant_model(assistant: &AssistantMessage, fork: &SideChatFork) -> Option<String> {
+    assistant
+        .response_model
+        .as_deref()
+        .filter(|model| !model.is_empty())
+        .or_else(|| (!assistant.model.is_empty()).then_some(assistant.model.as_str()))
+        .map(str::to_owned)
+        .or_else(|| fork_model_display(&fork.model))
+}
+
+/// Display string for a configured model: the human-readable name when
+/// present, else the id.
+fn fork_model_display(model: &Model) -> Option<String> {
+    let name = model.name.trim();
+    if name.is_empty() {
+        (!model.id.is_empty()).then(|| model.id.clone())
+    } else {
+        Some(name.to_owned())
+    }
 }
 
 #[must_use]
@@ -500,7 +903,10 @@ pub struct CodeReviewPanel {
     collapsed_threads: BTreeSet<HunkIdentity>,
     stale_thread_count: usize,
     snapshot_loading: bool,
+    /// Aggregate: any hunk is streaming (header/activeCount source).
     review_streaming: bool,
+    /// Bounded count of currently streaming hunk runs (header display).
+    active_count: usize,
     /// Last known content viewport for clamping.
     tree_viewport_rows: usize,
     diff_viewport_rows: usize,
@@ -508,6 +914,7 @@ pub struct CodeReviewPanel {
     /// Hit-test regions from the most recent render (or layout sync).
     hits: CodeReviewHitRegions,
 }
+
 
 impl CodeReviewPanel {
     #[must_use]
@@ -535,6 +942,7 @@ impl CodeReviewPanel {
             stale_thread_count: 0,
             snapshot_loading: false,
             review_streaming: false,
+            active_count: 0,
             tree_viewport_rows: 1,
             diff_viewport_rows: 1,
             diff_viewport_cols: 1,
@@ -627,8 +1035,28 @@ impl CodeReviewPanel {
         self.review_streaming
     }
 
-    pub fn complete_comment_submit(&mut self, accepted: bool) {
-        if accepted {
+    /// Number of currently streaming hunk runs (bounded header display).
+    #[must_use]
+    pub const fn active_count(&self) -> usize {
+        self.active_count
+    }
+
+    /// True when the currently selected hunk has an active streaming run.
+    #[must_use]
+    pub fn is_selected_hunk_streaming(&self) -> bool {
+        self.selected_hunk_identity()
+            .is_some_and(|identity| {
+                self.threads
+                    .get(&identity)
+                    .is_some_and(|thread| thread.is_streaming)
+            })
+    }
+
+    /// Finalize a comment submission: only an accepted comment (streamed or
+    /// queued) clears the draft; Empty, QueueFull, and Failed keep it so the
+    /// user can edit and resubmit.
+    pub fn complete_comment_submit(&mut self, result: CommentSubmitResult) {
+        if result.is_accepted() {
             self.cancel_comment();
         }
     }
@@ -649,7 +1077,7 @@ impl CodeReviewPanel {
     }
 
     pub fn open_comment_editor(&mut self) -> bool {
-        if self.review_streaming || self.snapshot_loading || self.selected_hunk().is_none() {
+        if self.snapshot_loading || self.selected_hunk().is_none() {
             return false;
         }
         self.focus = CodeReviewFocus::Diff;
@@ -661,11 +1089,14 @@ impl CodeReviewPanel {
     pub fn sync_controller(&mut self, controller: &CodeReviewController) {
         self.threads = controller.threads().clone();
         self.reconcile_collapsed_threads();
-        if let Some(active) = controller.active_hunk() {
-            self.collapsed_threads.remove(active);
+        for identity in self.threads.keys() {
+            if self.threads[identity].is_streaming {
+                self.collapsed_threads.remove(identity);
+            }
         }
         self.stale_thread_count = controller.stale_threads().len();
         self.review_streaming = controller.is_streaming();
+        self.active_count = controller.active_count();
     }
 
     pub fn set_snapshot_loading(&mut self, loading: bool) {
@@ -727,14 +1158,16 @@ impl CodeReviewPanel {
         if self.comment_editor.is_some() {
             return self.handle_comment_key(key);
         }
-        if key.code == KeyCode::Esc && self.review_streaming {
+        // Esc aborts only the selected hunk's identity; other hunks may keep streaming.
+        if key.code == KeyCode::Esc && self.is_selected_hunk_streaming() {
             return CodeReviewPanelResult::AbortReview;
         }
         if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::ALT) {
             return CodeReviewPanelResult::Refork;
         }
+        // Refresh is allowed while other hunks stream; only snapshot load blocks it.
         if key.code == KeyCode::Char('r') && key.modifiers.is_empty() {
-            return if self.review_streaming || self.snapshot_loading {
+            return if self.snapshot_loading {
                 CodeReviewPanelResult::Busy
             } else {
                 CodeReviewPanelResult::Refresh
@@ -743,7 +1176,7 @@ impl CodeReviewPanel {
         if key.modifiers.is_empty() && key.code == KeyCode::Char('c') {
             return if self.open_comment_editor() {
                 CodeReviewPanelResult::Handled
-            } else if self.review_streaming || self.snapshot_loading {
+            } else if self.snapshot_loading {
                 CodeReviewPanelResult::Busy
             } else {
                 CodeReviewPanelResult::Unknown
@@ -1469,9 +1902,16 @@ pub fn render_code_review_panel(
         CodeReviewFocus::Tree => "tree",
         CodeReviewFocus::Diff => "diff",
     };
-    let footer_text = format!(
-        "focus:{focus_label} · Tab pane · j/k hunk · c comment · Space fold · click select · r refresh · Alt+R refork · Esc close"
-    );
+    let active = panel.active_count;
+    let footer_text = if active > 0 {
+        format!(
+            "focus:{focus_label} · active:{active} · Tab pane · j/k hunk · c comment · Space fold · r refresh · Esc abort selected · q close"
+        )
+    } else {
+        format!(
+            "focus:{focus_label} · Tab pane · j/k hunk · c comment · Space fold · click select · r refresh · Alt+R refork · Esc close"
+        )
+    };
     frame.render_widget(
         Paragraph::new(truncate_width(
             &footer_text,
@@ -1653,6 +2093,9 @@ fn render_diff_pane(
         }
         if panel.snapshot.truncated {
             suffix.push_str(" · snapshot truncated");
+        }
+        if panel.active_count > 0 {
+            suffix.push_str(&format!(" · active {}", panel.active_count));
         }
         let meta_bg = theme.tool_pending_bg;
         let meta_text_width = UnicodeWidthStr::width(file.status.label())
@@ -1909,6 +2352,23 @@ fn push_annotation_card(
 /// row per terminal row (`╭─ label ─╮` / `│ … │` / `╰─…─╯`). The full source
 /// rides on every row so the draw pass re-renders with the live theme; `text`
 /// carries the plain row content for tests and width metrics.
+/// Label for an assistant reply / streaming card: `Answer N`, optional model,
+/// and optional `· aborted` / `· streaming` status. Model is the actual
+/// display string stored on the comment/thread (never provider secrets).
+fn answer_label(exchange: usize, model: Option<&str>, partial: bool, streaming: bool) -> String {
+    let mut label = format!("Answer {exchange}");
+    if let Some(model) = model.filter(|model| !model.is_empty()) {
+        label.push_str(" · ");
+        label.push_str(model);
+    }
+    if streaming {
+        label.push_str(" · streaming");
+    } else if partial {
+        label.push_str(" · aborted");
+    }
+    label
+}
+
 fn push_reply_box(
     out: &mut Vec<DiffDisplayLine>,
     hunk_index: usize,
@@ -2080,11 +2540,13 @@ fn build_diff_display_lines(panel: &CodeReviewPanel, file: &DiffFile) -> Vec<Dif
                     }
                     ReviewCommentRole::Assistant => {
                         // Replies render as markdown (tables included) inside a
-                        // bordered box labeled with the answer number.
-                        let label = format!(
-                            "Answer {}{}",
+                        // bordered box labeled with the answer number and the
+                        // actual model that produced the reply.
+                        let label = answer_label(
                             exchange_number.max(1),
-                            if comment.partial { " · aborted" } else { "" },
+                            comment.model.as_deref(),
+                            comment.partial,
+                            false,
                         );
                         if !push_reply_box(
                             &mut out,
@@ -2114,7 +2576,12 @@ fn build_diff_display_lines(panel: &CodeReviewPanel, file: &DiffFile) -> Vec<Dif
                 && !push_reply_box(
                     &mut out,
                     hunk_index,
-                    format!("Answer {} · streaming", exchange_number.max(1)),
+                    answer_label(
+                        exchange_number.max(1),
+                        thread.model.as_deref(),
+                        false,
+                        true,
+                    ),
                     &thread.streaming_text,
                     annotation_width,
                 )
@@ -3177,10 +3644,13 @@ mod tests {
                 role: ReviewCommentRole::Assistant,
                 text: "safe\u{1b}[2Janswer".to_owned(),
                 partial: false,
+                model: None,
             }],
             streaming_text: String::new(),
             error: None,
             stale: false,
+            is_streaming: false,
+            model: None,
         });
         let lines = build_diff_display_lines(&panel, panel.selected_file().expect("file"));
         let text = lines.into_iter().map(|line| line.text).collect::<Vec<_>>().join("\n");
@@ -3196,6 +3666,7 @@ mod tests {
             role: ReviewCommentRole::User,
             text: "Explain this change".to_owned(),
             partial: false,
+            model: None,
         });
         let progress = AssistantMessage {
             content: vec![ContentBlock::text("I will inspect the code first.")],
@@ -3212,27 +3683,77 @@ mod tests {
             ..progress
         };
         thread.replace_pending_assistant(&final_answer);
-        thread.finish_assistant_message(&final_answer);
+        thread.finish_assistant_message(&final_answer, None);
 
         assert_eq!(thread.comments.len(), 2);
         assert_eq!(thread.comments[1].text, "The visible catalog contains only primary commands.");
     }
 
     #[test]
-    fn busy_review_rejects_refresh_and_new_editor() {
+    fn selected_hunk_streaming_allows_draft_abort_and_refresh() {
         let mut panel = CodeReviewPanel::from_snapshot(sample_snapshot());
+        // Aggregate streaming from another hunk must not block refresh or a
+        // non-streaming selected hunk's comment editor.
         panel.review_streaming = true;
-
+        panel.active_count = 1;
         assert_eq!(
             panel.handle_key(key(KeyCode::Char('r'))),
-            CodeReviewPanelResult::Busy
+            CodeReviewPanelResult::Refresh
         );
         assert_eq!(
             panel.handle_key(key(KeyCode::Char('c'))),
-            CodeReviewPanelResult::Busy
+            CodeReviewPanelResult::Handled
+        );
+        assert!(panel.comment_editor().is_some());
+        panel.cancel_comment();
+
+        let identity = panel.selected_hunk_identity().expect("hunk identity");
+        let mut thread = HunkThread::new(identity.clone());
+        thread.is_streaming = true;
+        thread.model = Some("grok-4".to_owned());
+        panel.threads.insert(identity, thread);
+
+        // `c` opens a draft even while the selected hunk streams; Esc with an
+        // open draft cancels only the draft, and a subsequent Esc aborts the
+        // selected streaming hunk. Refresh stays allowed throughout.
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char('c'))),
+            CodeReviewPanelResult::Handled
+        );
+        assert!(panel.comment_editor().is_some());
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Esc)),
+            CodeReviewPanelResult::Handled
         );
         assert_eq!(panel.comment_editor(), None);
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Esc)),
+            CodeReviewPanelResult::AbortReview
+        );
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Char('r'))),
+            CodeReviewPanelResult::Refresh
+        );
     }
+
+    #[test]
+    fn answer_labels_include_actual_model() {
+        assert_eq!(
+            answer_label(1, Some("grok-4"), false, false),
+            "Answer 1 · grok-4"
+        );
+        assert_eq!(
+            answer_label(2, Some("grok-4"), true, false),
+            "Answer 2 · grok-4 · aborted"
+        );
+        assert_eq!(
+            answer_label(1, Some("grok-4"), false, true),
+            "Answer 1 · grok-4 · streaming"
+        );
+        assert_eq!(answer_label(1, None, false, true), "Answer 1 · streaming");
+        assert_eq!(answer_label(1, None, true, false), "Answer 1 · aborted");
+    }
+
 
     #[test]
     fn rejected_comment_submit_retains_draft() {
@@ -3240,11 +3761,18 @@ mod tests {
         assert!(panel.open_comment_editor());
         assert!(panel.handle_paste("keep this draft"));
 
-        panel.complete_comment_submit(false);
-        assert_eq!(panel.comment_editor(), Some("keep this draft"));
-        assert_eq!(panel.comment_cursor(), "keep this draft".len());
+        // Every rejected result keeps the draft; only Accepted clears it.
+        for result in [
+            CommentSubmitResult::Empty,
+            CommentSubmitResult::QueueFull,
+            CommentSubmitResult::Failed,
+        ] {
+            panel.complete_comment_submit(result);
+            assert_eq!(panel.comment_editor(), Some("keep this draft"));
+            assert_eq!(panel.comment_cursor(), "keep this draft".len());
+        }
 
-        panel.complete_comment_submit(true);
+        panel.complete_comment_submit(CommentSubmitResult::Accepted);
         assert_eq!(panel.comment_editor(), None);
         assert_eq!(panel.comment_cursor(), 0);
     }
@@ -3268,13 +3796,14 @@ mod tests {
             error_message: None,
             raw_stop_reason: None,
             timestamp: 0,
-        });
+        }, Some("test".to_owned()));
         assert_eq!(thread.comments.len(), 1);
         assert_eq!(thread.comments[0].text, "partial answer");
         assert!(thread.comments[0].partial);
+        assert_eq!(thread.comments[0].model.as_deref(), Some("test"));
 
         thread.streaming_text = "aborted before MessageEnd".to_owned();
-        thread.finish_streaming(true);
+        thread.finish_streaming(true, None);
         assert_eq!(thread.comments.len(), 1);
         assert_eq!(thread.comments[0].text, "aborted before MessageEnd");
         assert!(thread.comments[0].partial);
@@ -3292,6 +3821,7 @@ mod tests {
                     role: source,
                     text: many_lines,
                     partial: false,
+                    model: None,
                 }),
                 ReviewCommentRole::System => thread.error = Some(many_lines),
             }
@@ -3369,6 +3899,8 @@ mod tests {
             streaming_text: String::new(),
             error: None,
             stale: false,
+            is_streaming: false,
+            model: None,
         });
         identity
     }
@@ -3378,7 +3910,7 @@ mod tests {
         let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
         panel.focus = CodeReviewFocus::Diff;
         panel.set_viewports(5, 3, 70);
-        let identity = add_thread(&mut panel, 0, vec![ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false }]);
+        let identity = add_thread(&mut panel, 0, vec![ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false, model: None }]);
         assert_eq!(panel.selected_hunk, 0);
         assert_eq!(panel.handle_key(key(KeyCode::Char('j'))), CodeReviewPanelResult::Handled);
         assert_eq!(panel.selected_hunk, 1);
@@ -3396,7 +3928,7 @@ mod tests {
         let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
         panel.focus = CodeReviewFocus::Diff;
         panel.set_viewports(5, 3, 70);
-        let identity = add_thread(&mut panel, 1, vec![ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false }]);
+        let identity = add_thread(&mut panel, 1, vec![ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false, model: None }]);
         let area = Rect::new(0, 0, 100, 12);
         sync_code_review_layout(&mut panel, area);
         let layout = compute_layout(area);
@@ -3443,11 +3975,12 @@ mod tests {
         let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
         panel.set_viewports(5, 10, 34);
         add_thread(&mut panel, 0, vec![
-            ReviewComment { role: ReviewCommentRole::User, text: "a long markdown **question** that wraps across display rows".to_owned(), partial: false },
-            ReviewComment { role: ReviewCommentRole::Assistant, text: "a long analysis response that also wraps without repeated labels".to_owned(), partial: true },
+            ReviewComment { role: ReviewCommentRole::User, text: "a long markdown **question** that wraps across display rows".to_owned(), partial: false, model: None },
+            ReviewComment { role: ReviewCommentRole::Assistant, text: "a long analysis response that also wraps without repeated labels".to_owned(), partial: true, model: Some("grok-4".to_owned()) },
         ]);
         let identity = panel.snapshot.hunk_identity(&panel.snapshot.files[0], &panel.snapshot.files[0].hunks[0]);
         panel.threads.get_mut(&identity).expect("thread").streaming_text = "more streamed analysis".to_owned();
+        panel.threads.get_mut(&identity).expect("thread").model = Some("grok-4".to_owned());
         panel.threads.get_mut(&identity).expect("thread").error = Some("review failed safely".to_owned());
         let display = build_diff_display_lines(&panel, panel.selected_file().expect("file"));
         let text = display.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n");
@@ -3461,8 +3994,8 @@ mod tests {
             .filter_map(|line| line.markdown.as_ref())
             .map(|md| md.label.as_str())
             .collect::<Vec<_>>();
-        assert!(labels.contains(&"Answer 1 · aborted"), "{labels:?}");
-        assert!(labels.contains(&"Answer 1 · streaming"), "{labels:?}");
+        assert!(labels.contains(&"Answer 1 · grok-4 · aborted"), "{labels:?}");
+        assert!(labels.contains(&"Answer 1 · grok-4 · streaming"), "{labels:?}");
         assert!(!text.contains("Analysis"), "{text}");
         assert!(text.contains("⚠ Error"), "{text}");
         assert!(!text.contains("you:"), "{text}");
@@ -3508,10 +4041,10 @@ mod tests {
     fn review_thread_ux_repeated_cycles_share_thread_and_refresh_preserves_fold() {
         let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
         let identity = add_thread(&mut panel, 0, vec![
-            ReviewComment { role: ReviewCommentRole::User, text: "first".to_owned(), partial: false },
-            ReviewComment { role: ReviewCommentRole::Assistant, text: "first answer".to_owned(), partial: false },
-            ReviewComment { role: ReviewCommentRole::User, text: "second".to_owned(), partial: false },
-            ReviewComment { role: ReviewCommentRole::Assistant, text: "second answer".to_owned(), partial: false },
+            ReviewComment { role: ReviewCommentRole::User, text: "first".to_owned(), partial: false, model: None },
+            ReviewComment { role: ReviewCommentRole::Assistant, text: "first answer".to_owned(), partial: false, model: None },
+            ReviewComment { role: ReviewCommentRole::User, text: "second".to_owned(), partial: false, model: None },
+            ReviewComment { role: ReviewCommentRole::Assistant, text: "second answer".to_owned(), partial: false, model: None },
         ]);
         panel.collapsed_threads.insert(identity.clone());
         let mut next = panel.snapshot.clone();
@@ -3534,7 +4067,7 @@ mod tests {
     fn review_thread_ux_total_cap_and_footer_hints_hold() {
         let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
         let many_lines = "annotation row\n".repeat(crate::code_review::MAX_FILE_RENDER_LINES + 100);
-        add_thread(&mut panel, 0, vec![ReviewComment { role: ReviewCommentRole::Assistant, text: many_lines, partial: false }]);
+        add_thread(&mut panel, 0, vec![ReviewComment { role: ReviewCommentRole::Assistant, text: many_lines, partial: false, model: None }]);
         let display = build_diff_display_lines(&panel, panel.selected_file().expect("file"));
         assert_eq!(display.len(), crate::code_review::MAX_FILE_RENDER_LINES);
         assert_eq!(display.last().map(|line| line.text.as_str()), Some("… truncated …"));
@@ -3553,8 +4086,8 @@ mod tests {
         panel.focus = CodeReviewFocus::Diff;
         panel.set_viewports(5, 3, 70);
         let identity = add_thread(&mut panel, 0, vec![
-            ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false },
-            ReviewComment { role: ReviewCommentRole::Assistant, text: "answer".to_owned(), partial: false },
+            ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false, model: None },
+            ReviewComment { role: ReviewCommentRole::Assistant, text: "answer".to_owned(), partial: false, model: None },
         ]);
         let hunk_zero_diffs = |panel: &CodeReviewPanel| {
             let file = panel.selected_file().expect("file");
@@ -3741,8 +4274,8 @@ mod tests {
         let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
         let table = "| Feature | Status |\n| ------- | ------ |\n| Tables | Working |";
         add_thread(&mut panel, 0, vec![
-            ReviewComment { role: ReviewCommentRole::User, text: "Does this support tables?".to_owned(), partial: false },
-            ReviewComment { role: ReviewCommentRole::Assistant, text: table.to_owned(), partial: false },
+            ReviewComment { role: ReviewCommentRole::User, text: "Does this support tables?".to_owned(), partial: false, model: None },
+            ReviewComment { role: ReviewCommentRole::Assistant, text: table.to_owned(), partial: false, model: None },
         ]);
         sync_code_review_layout(&mut panel, Rect::new(0, 0, 160, 60));
         let backend = TestBackend::new(160, 60);
@@ -3780,8 +4313,8 @@ mod tests {
     fn reply_box_keeps_plain_text_replies_readable() {
         let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
         add_thread(&mut panel, 0, vec![
-            ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false },
-            ReviewComment { role: ReviewCommentRole::Assistant, text: "plain prose reply **with bold** and `code`".to_owned(), partial: false },
+            ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false, model: None },
+            ReviewComment { role: ReviewCommentRole::Assistant, text: "plain prose reply **with bold** and `code`".to_owned(), partial: false, model: None },
         ]);
         sync_code_review_layout(&mut panel, Rect::new(0, 0, 160, 60));
         let backend = TestBackend::new(160, 60);
@@ -3836,7 +4369,7 @@ mod tests {
             let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
             panel.set_viewports(5, 10, pane_width);
             let identity = add_thread(&mut panel, 0, vec![
-                ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false },
+                ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false, model: None },
             ]);
             // A single long streaming line that must wrap across the inner
             // width, plus a line exactly at the max content width.
@@ -3878,7 +4411,7 @@ mod tests {
         // `│`, and the bottom `╯` of the streaming answer box on one column.
         let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
         let identity = add_thread(&mut panel, 0, vec![
-            ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false },
+            ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false, model: None },
         ]);
         panel.threads.get_mut(&identity).expect("thread").streaming_text =
             "streamed answer ".repeat(30);
@@ -3982,7 +4515,7 @@ mod tests {
             let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
             panel.set_viewports(5, 10, pane_width);
             let identity = add_thread(&mut panel, 0, vec![
-                ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false },
+                ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false, model: None },
             ]);
             // One long line that must wrap across the inner width, plus a line
             // exactly at the max content width, so the frame covers both.
@@ -4024,7 +4557,7 @@ mod tests {
         for theme in [crate::theme::DARK, crate::theme::LIGHT] {
             let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
             add_thread(&mut panel, 0, vec![
-                ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false },
+                ReviewComment { role: ReviewCommentRole::User, text: "question".to_owned(), partial: false, model: None },
             ]);
             let display = build_diff_display_lines(&panel, panel.selected_file().expect("file"));
             let frame_rows: Vec<Line<'static>> = display
@@ -4058,7 +4591,7 @@ mod tests {
         // every content │, and the bottom ╯ on one column, in green.
         let mut panel = CodeReviewPanel::from_snapshot(two_hunk_snapshot());
         add_thread(&mut panel, 0, vec![
-            ReviewComment { role: ReviewCommentRole::User, text: "a wrapping question ".repeat(4), partial: false },
+            ReviewComment { role: ReviewCommentRole::User, text: "a wrapping question ".repeat(4), partial: false, model: None },
         ]);
         sync_code_review_layout(&mut panel, Rect::new(0, 0, 120, 40));
         let layout = compute_layout(Rect::new(0, 0, 120, 40));
@@ -4135,5 +4668,660 @@ mod tests {
             (u16::try_from(title_col).expect("title column"), u16::try_from(top).expect("title row"))
         ];
         assert_eq!(title_cell.fg, green, "comment title must be green: {card_rows:?}");
+    }
+
+    // ---- CodeReviewController: multi-hunk concurrency behavior ----
+
+    /// Provider stream that blocks each prompt until the semaphore grants it
+    /// one permit, keeping runs genuinely active so concurrency/abort
+    /// ordering is deterministic.
+    fn gated_review_stream(permits: std::sync::Arc<tokio::sync::Semaphore>) -> pi_agent::StreamFn {
+        std::sync::Arc::new(move |model, _context, _options| {
+            let permits = permits.clone();
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let _permit = permits.acquire().await.expect("release permit");
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(ContentBlock::text("gated review reply"));
+                    message.stop_reason = StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    /// Stream that never produces events; the run stays active until aborted
+    /// or dropped, so tests can drive lifecycle events manually.
+    fn silent_review_stream() -> pi_agent::StreamFn {
+        std::sync::Arc::new(move |_model, _context, _options| {
+            Box::pin(async move { pi_ai::new_assistant_message_event_stream() })
+        })
+    }
+
+    fn assistant_message(
+        text: &str,
+        stop_reason: StopReason,
+        response_model: Option<&str>,
+    ) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::text(text)],
+            api: "test".into(),
+            provider: "test".into(),
+            model: "faux-review-42".to_owned(),
+            response_model: response_model.map(str::to_owned),
+            response_id: None,
+            diagnostics: Vec::new(),
+            usage: Default::default(),
+            stop_reason,
+            error_message: None,
+            raw_stop_reason: None,
+            timestamp: 0,
+        }
+    }
+
+    /// Controller forked from a faux Application whose provider stream is
+    /// `stream`; the fork model is id "faux-review-42" / name "Faux Review 42".
+    async fn test_controller(stream: pi_agent::StreamFn) -> CodeReviewController {
+        let mut model = Model::default();
+        model.id = "faux-review-42".to_owned();
+        model.name = "Faux Review 42".to_owned();
+        model.api = "faux-review-api".to_owned();
+        model.provider = "faux".to_owned();
+        model.base_url = "http://localhost:0".to_owned();
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let session = pi_coding::Session::new(pi_coding::SessionOptions {
+            model,
+            cwd: cwd.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: pi_agent::ThinkingLevel::Off,
+            api_key: "faux".to_owned(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: Some(stream),
+            auth_resolver: None,
+        })
+        .expect("code-review test session");
+        let application = Application::new(session).await;
+        CodeReviewController::fork_from(&application).await.expect("fork")
+    }
+
+    /// Drain controller events until no hunk run is streaming (bounded).
+    async fn drain_until_idle(controller: &mut CodeReviewController) {
+        for _ in 0..100 {
+            controller.poll_events();
+            if !controller.is_streaming() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("controller never went idle");
+    }
+
+    #[tokio::test]
+    async fn two_hunks_run_concurrently_and_same_hunk_queues_while_streaming() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut controller = test_controller(gated_review_stream(gate.clone())).await;
+        let snapshot = two_hunk_snapshot();
+        let file = &snapshot.files[0];
+        let hunk0 = &file.hunks[0];
+        let hunk1 = &file.hunks[1];
+        let identity0 = snapshot.hunk_identity(file, hunk0);
+        let identity1 = snapshot.hunk_identity(file, hunk1);
+
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk0, "First question"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk1, "Second question"),
+            CommentSubmitResult::Accepted
+        );
+        // Both hunks are active simultaneously.
+        assert_eq!(controller.active_count(), 2);
+        assert!(controller.is_streaming());
+        assert!(controller.is_hunk_streaming(&identity0));
+        assert!(controller.is_hunk_streaming(&identity1));
+
+        // A same-hunk comment while streaming is queued (FIFO), not rejected.
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk0, "Follow-up A"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk1, "Follow-up B"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.active_count(),
+            2,
+            "queued prompts do not create extra runs"
+        );
+        assert_eq!(
+            controller.thread(&identity0).expect("thread0").comments.len(),
+            2,
+            "both user comments are visible while the first reply streams"
+        );
+
+        // Let both runs finish; queued prompts settle on the same agents.
+        gate.add_permits(4);
+        drain_until_idle(&mut controller).await;
+        assert_eq!(controller.active_count(), 0);
+        assert!(!controller.is_streaming());
+        assert_eq!(controller.thread(&identity0).expect("thread0").comments.len(), 4);
+        assert_eq!(controller.thread(&identity1).expect("thread1").comments.len(), 4);
+
+        // A follow-up on an idle hunk is accepted (agent reused) and runs
+        // again without disturbing the other hunk.
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk1, "Follow-up"),
+            CommentSubmitResult::Accepted
+        );
+        assert!(controller.is_hunk_streaming(&identity1));
+        assert!(!controller.is_hunk_streaming(&identity0));
+        gate.add_permits(1);
+        drain_until_idle(&mut controller).await;
+        assert_eq!(controller.thread(&identity1).expect("thread1").comments.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn scoped_abort_stops_only_its_hunk() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut controller = test_controller(gated_review_stream(gate.clone())).await;
+        let snapshot = two_hunk_snapshot();
+        let file = &snapshot.files[0];
+        let hunk0 = &file.hunks[0];
+        let hunk1 = &file.hunks[1];
+        let identity0 = snapshot.hunk_identity(file, hunk0);
+        let identity1 = snapshot.hunk_identity(file, hunk1);
+
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk0, "Question A"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk1, "Question B"),
+            CommentSubmitResult::Accepted
+        );
+
+        controller.abort_hunk(&identity0).await;
+        // Only hunk 0 stopped; hunk 1 is untouched and still streaming.
+        assert!(!controller.is_hunk_streaming(&identity0));
+        assert!(controller.is_hunk_streaming(&identity1));
+        assert_eq!(controller.active_count(), 1);
+        assert_eq!(
+            controller.thread(&identity0).expect("thread0").comments.len(),
+            1,
+            "aborted hunk keeps only its user comment"
+        );
+
+        // Let hunk 1 finish normally and verify it was never aborted.
+        gate.add_permits(1);
+        drain_until_idle(&mut controller).await;
+        assert_eq!(controller.active_count(), 0);
+        assert_eq!(controller.thread(&identity1).expect("thread1").comments.len(), 2);
+        assert!(!controller.thread(&identity1).expect("thread1").comments[1].partial);
+    }
+
+    #[tokio::test]
+    async fn stale_generation_events_are_ignored() {
+        let mut controller = test_controller(silent_review_stream()).await;
+        let snapshot = two_hunk_snapshot();
+        let file = &snapshot.files[0];
+        let hunk0 = &file.hunks[0];
+        let identity0 = snapshot.hunk_identity(file, hunk0);
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk0, "Question"),
+            CommentSubmitResult::Accepted
+        );
+
+        // A stale-generation event for the live run must be dropped entirely.
+        let _ = controller.event_tx.send(ReviewInternalEvent::Agent {
+            identity: identity0.clone(),
+            generation: controller.generation.wrapping_add(1),
+            event: AgentEvent::AgentEnd {
+                messages: vec![Message::Assistant(assistant_message(
+                    "stale answer",
+                    StopReason::Stop,
+                    None,
+                ))],
+            },
+        });
+        assert!(controller.poll_events());
+        assert!(controller.is_hunk_streaming(&identity0), "stale event must not settle the run");
+        assert_eq!(
+            controller.thread(&identity0).expect("thread0").comments.len(),
+            1,
+            "stale event must not commit a comment"
+        );
+
+        // An event for a hunk with no run is ignored too.
+        let identity1 = snapshot.hunk_identity(file, &file.hunks[1]);
+        let _ = controller.event_tx.send(ReviewInternalEvent::Agent {
+            identity: identity1.clone(),
+            generation: controller.generation,
+            event: AgentEvent::AgentEnd {
+                messages: vec![Message::Assistant(assistant_message(
+                    "orphan answer",
+                    StopReason::Stop,
+                    None,
+                ))],
+            },
+        });
+        assert!(controller.poll_events());
+        assert!(controller.thread(&identity1).is_none());
+    }
+
+    #[tokio::test]
+    async fn comment_model_reflects_actual_response_model() {
+        // Drive the lifecycle manually (silent provider) so the resolved
+        // model is deterministic: response_model wins over the message's
+        // requested model, which wins over the fork display name.
+        let mut controller = test_controller(silent_review_stream()).await;
+        let snapshot = two_hunk_snapshot();
+        let file = &snapshot.files[0];
+        let hunk0 = &file.hunks[0];
+        let identity0 = snapshot.hunk_identity(file, hunk0);
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk0, "Question"),
+            CommentSubmitResult::Accepted
+        );
+
+        let _ = controller.event_tx.send(ReviewInternalEvent::Agent {
+            identity: identity0.clone(),
+            generation: controller.generation,
+            event: AgentEvent::AgentStart,
+        });
+        controller.poll_events();
+        assert!(controller.is_hunk_streaming(&identity0));
+        assert_eq!(
+            controller.thread(&identity0).expect("thread").model.as_deref(),
+            Some("Faux Review 42"),
+            "before any assistant message the fork display name is the fallback"
+        );
+
+        let _ = controller.event_tx.send(ReviewInternalEvent::Agent {
+            identity: identity0.clone(),
+            generation: controller.generation,
+            event: AgentEvent::MessageEnd {
+                message: Message::Assistant(assistant_message(
+                    "final answer",
+                    StopReason::Stop,
+                    Some("actual-model-9b"),
+                )),
+            },
+        });
+        let _ = controller.event_tx.send(ReviewInternalEvent::Agent {
+            identity: identity0.clone(),
+            generation: controller.generation,
+            event: AgentEvent::AgentEnd {
+                messages: vec![Message::Assistant(assistant_message(
+                    "final answer",
+                    StopReason::Stop,
+                    Some("actual-model-9b"),
+                ))],
+            },
+        });
+        controller.poll_events();
+        assert!(!controller.is_hunk_streaming(&identity0));
+        let thread = controller.thread(&identity0).expect("thread");
+        assert_eq!(thread.model.as_deref(), Some("actual-model-9b"));
+        assert_eq!(thread.comments.len(), 2);
+        assert_eq!(thread.comments[1].text, "final answer");
+        assert_eq!(thread.comments[1].model.as_deref(), Some("actual-model-9b"));
+        assert!(!thread.comments[1].partial);
+
+        // Without response_model, the message's requested model is used.
+        let mut controller = test_controller(silent_review_stream()).await;
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk0, "Second question"),
+            CommentSubmitResult::Accepted
+        );
+        let _ = controller.event_tx.send(ReviewInternalEvent::Agent {
+            identity: identity0.clone(),
+            generation: controller.generation,
+            event: AgentEvent::AgentEnd {
+                messages: vec![Message::Assistant(assistant_message(
+                    "fallback answer",
+                    StopReason::Stop,
+                    None,
+                ))],
+            },
+        });
+        controller.poll_events();
+        let thread = controller.thread(&identity0).expect("thread");
+        assert_eq!(thread.comments[1].text, "fallback answer");
+        assert_eq!(thread.comments[1].model.as_deref(), Some("faux-review-42"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_runs_and_events() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut controller = test_controller(gated_review_stream(gate.clone())).await;
+        let snapshot = two_hunk_snapshot();
+        let file = &snapshot.files[0];
+        let hunk0 = &file.hunks[0];
+        let hunk1 = &file.hunks[1];
+        let identity0 = snapshot.hunk_identity(file, hunk0);
+        let identity1 = snapshot.hunk_identity(file, hunk1);
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk0, "A"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk1, "B"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(controller.active_count(), 2);
+
+        controller.shutdown().await;
+        assert_eq!(controller.active_count(), 0);
+        assert!(controller.runs.is_empty(), "shutdown clears all runs");
+        assert!(controller.event_rx.try_recv().is_err(), "shutdown drains the event channel");
+        // Threads (with their user comments) survive shutdown.
+        assert!(controller.thread(&identity0).is_some());
+        assert!(controller.thread(&identity1).is_some());
+
+        // Late events for the cleared runs cannot resurrect anything.
+        let _ = controller.event_tx.send(ReviewInternalEvent::Agent {
+            identity: identity0.clone(),
+            generation: 1,
+            event: AgentEvent::AgentEnd {
+                messages: vec![Message::Assistant(assistant_message(
+                    "late answer",
+                    StopReason::Stop,
+                    None,
+                ))],
+            },
+        });
+        assert!(controller.poll_events());
+        assert_eq!(controller.active_count(), 0);
+        assert_eq!(controller.thread(&identity0).expect("thread").comments.len(), 1);
+    }
+
+    /// Provider stream like [`gated_review_stream`] but each stream instance
+    /// replies with a distinct monotonically increasing text ("reply 0",
+    /// "reply 1", …) so a test can prove queued replies settle in FIFO order.
+    fn counting_gated_review_stream(
+        permits: std::sync::Arc<tokio::sync::Semaphore>,
+        replies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> pi_agent::StreamFn {
+        std::sync::Arc::new(move |model, _context, _options| {
+            let permits = permits.clone();
+            let replies = replies.clone();
+            Box::pin(async move {
+                let stream = pi_ai::new_assistant_message_event_stream();
+                let producer = stream.clone();
+                tokio::spawn(async move {
+                    let _permit = permits.acquire().await.expect("release permit");
+                    let index = replies.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut message = pi_ai::AssistantMessage::pending(&model);
+                    message.content.push(ContentBlock::text(format!("reply {index}")));
+                    message.stop_reason = StopReason::Stop;
+                    producer.end(Some(message)).await;
+                });
+                stream
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn same_hunk_queued_comments_are_visible_and_replies_settle_in_order() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let replies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut controller =
+            test_controller(counting_gated_review_stream(gate.clone(), replies.clone())).await;
+        let snapshot = two_hunk_snapshot();
+        let file = &snapshot.files[0];
+        let hunk = &file.hunks[0];
+        let identity = snapshot.hunk_identity(file, hunk);
+
+        // First comment starts the hunk's stream; the second queues behind it.
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "First"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "Second"),
+            CommentSubmitResult::Accepted
+        );
+        assert!(controller.is_hunk_streaming(&identity));
+        let thread = controller.thread(&identity).expect("thread");
+        // Both user comments are visible immediately, before any reply lands.
+        assert_eq!(thread.comments.len(), 2);
+        assert_eq!(thread.comments[0].role, ReviewCommentRole::User);
+        assert_eq!(thread.comments[0].text, "First");
+        assert_eq!(thread.comments[1].role, ReviewCommentRole::User);
+        assert_eq!(thread.comments[1].text, "Second");
+        assert!(thread.error.is_none(), "queuing preserves the current stream state");
+        drop(thread);
+
+        // Settle the first reply: only it lands, and the queued prompt is
+        // chained on the same agent (still streaming, not idle).
+        gate.add_permits(1);
+        for _ in 0..100 {
+            controller.poll_events();
+            let settled = controller.thread(&identity).is_some_and(|thread| {
+                thread.comments.len() == 3
+            }) && controller.is_hunk_streaming(&identity);
+            if settled {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let thread = controller.thread(&identity).expect("thread");
+        assert_eq!(
+            thread.comments.len(),
+            3,
+            "the first reply settles before the second"
+        );
+        assert_eq!(thread.comments[2].role, ReviewCommentRole::Assistant);
+        assert_eq!(thread.comments[2].text, "reply 0");
+        assert!(!thread.comments[2].partial);
+        assert!(
+            controller.is_hunk_streaming(&identity),
+            "queued prompt is chained on the same agent"
+        );
+        drop(thread);
+
+        // Settle the second reply: replies land in FIFO submission order.
+        gate.add_permits(1);
+        drain_until_idle(&mut controller).await;
+        let thread = controller.thread(&identity).expect("thread");
+        assert_eq!(thread.comments.len(), 4);
+        assert_eq!(thread.comments[2].text, "reply 0");
+        assert_eq!(thread.comments[3].text, "reply 1");
+        assert!(thread.comments[2..].iter().all(|comment| !comment.partial));
+        assert_eq!(
+            thread.comments.iter().map(|comment| comment.role).collect::<Vec<_>>(),
+            vec![
+                ReviewCommentRole::User,
+                ReviewCommentRole::User,
+                ReviewCommentRole::Assistant,
+                ReviewCommentRole::Assistant,
+            ]
+        );
+        assert!(!controller.is_streaming());
+    }
+
+    #[tokio::test]
+    async fn same_hunk_queue_rejects_overflow() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut controller = test_controller(gated_review_stream(gate.clone())).await;
+        let snapshot = two_hunk_snapshot();
+        let file = &snapshot.files[0];
+        let hunk = &file.hunks[0];
+        let identity = snapshot.hunk_identity(file, hunk);
+
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "c1"),
+            CommentSubmitResult::Accepted
+        );
+        for index in 2..=MAX_PENDING_COMMENTS + 1 {
+            assert_eq!(
+                controller.submit_comment(&snapshot, file, hunk, &format!("c{index}")),
+                CommentSubmitResult::Accepted,
+                "comment {index} fits in the bounded queue"
+            );
+        }
+        // The queue is full (MAX_PENDING_COMMENTS queued behind the streaming
+        // reply): the next comment is rejected with a distinct result.
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "overflow"),
+            CommentSubmitResult::QueueFull
+        );
+        let thread = controller.thread(&identity).expect("thread");
+        assert_eq!(
+            thread.comments.len(),
+            MAX_PENDING_COMMENTS + 1,
+            "all accepted comments are visible immediately"
+        );
+        assert!(thread.comments.iter().all(|comment| comment.role == ReviewCommentRole::User));
+        drop(thread);
+
+        // The full queue still drains: every accepted comment gets a reply.
+        gate.add_permits(MAX_PENDING_COMMENTS + 1);
+        drain_until_idle(&mut controller).await;
+        let thread = controller.thread(&identity).expect("thread");
+        assert_eq!(thread.comments.len(), 2 * (MAX_PENDING_COMMENTS + 1));
+        let user_count = thread
+            .comments
+            .iter()
+            .filter(|comment| comment.role == ReviewCommentRole::User)
+            .count();
+        let assistant_count = thread
+            .comments
+            .iter()
+            .filter(|comment| comment.role == ReviewCommentRole::Assistant)
+            .count();
+        assert_eq!(user_count, MAX_PENDING_COMMENTS + 1);
+        assert_eq!(assistant_count, MAX_PENDING_COMMENTS + 1);
+    }
+
+    #[tokio::test]
+    async fn abort_drops_queued_prompts() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut controller = test_controller(gated_review_stream(gate.clone())).await;
+        let snapshot = two_hunk_snapshot();
+        let file = &snapshot.files[0];
+        let hunk = &file.hunks[0];
+        let identity = snapshot.hunk_identity(file, hunk);
+
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "first"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "second"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "third"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.thread(&identity).expect("thread").comments.len(),
+            3,
+            "queued comments are visible before the abort"
+        );
+
+        controller.abort_hunk(&identity).await;
+        assert!(!controller.is_hunk_streaming(&identity));
+        assert!(controller.thread(&identity).is_some());
+
+        // The queued prompts are gone, and so are their visible user
+        // comments: abort removes exactly the not-yet-started cards while
+        // the active comment/reply state survives.
+        let thread = controller.thread(&identity).expect("thread");
+        assert_eq!(
+            thread.comments.len(),
+            1,
+            "queued visible comments disappear on abort"
+        );
+        assert_eq!(thread.comments[0].role, ReviewCommentRole::User);
+        assert_eq!(
+            thread.comments[0].text, "first",
+            "the active (already-started) user comment remains"
+        );
+        assert!(
+            thread
+                .comments
+                .iter()
+                .all(|comment| !matches!(comment.text.as_str(), "second" | "third")),
+            "no queued comment text survives the abort"
+        );
+        drop(thread);
+
+        // The dropped queue produces no replies either.
+        gate.add_permits(3);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        controller.poll_events();
+        let thread = controller.thread(&identity).expect("thread");
+        assert_eq!(
+            thread.comments.len(),
+            1,
+            "abort drops queued prompts; only the first user comment remains"
+        );
+        assert!(!controller.is_streaming());
+        drop(thread);
+
+        // A fresh comment after abort starts a new run on the same agent.
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "after abort"),
+            CommentSubmitResult::Accepted
+        );
+        assert!(controller.is_hunk_streaming(&identity));
+        gate.add_permits(1);
+        drain_until_idle(&mut controller).await;
+        let thread = controller.thread(&identity).expect("thread");
+        assert_eq!(thread.comments.len(), 3);
+        assert_eq!(thread.comments[1].text, "after abort");
+        assert_eq!(thread.comments[2].role, ReviewCommentRole::Assistant);
+        assert!(!thread.comments[2].partial);
+    }
+
+    #[tokio::test]
+    async fn abort_fails_closed_when_a_pending_comment_index_is_stale() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut controller = test_controller(gated_review_stream(gate.clone())).await;
+        let snapshot = two_hunk_snapshot();
+        let file = &snapshot.files[0];
+        let hunk = &file.hunks[0];
+        let identity = snapshot.hunk_identity(file, hunk);
+
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "first"),
+            CommentSubmitResult::Accepted
+        );
+        assert_eq!(
+            controller.submit_comment(&snapshot, file, hunk, "second"),
+            CommentSubmitResult::Accepted
+        );
+        // Corrupt the queued association so it no longer identifies a user
+        // comment: abort must fail closed and delete no visible content.
+        controller
+            .runs
+            .get_mut(&identity)
+            .expect("run")
+            .pending
+            .back_mut()
+            .expect("queued item")
+            .comment_index = usize::MAX;
+
+        controller.abort_hunk(&identity).await;
+        let thread = controller.thread(&identity).expect("thread");
+        assert_eq!(
+            thread.comments.len(),
+            2,
+            "a stale pending index deletes nothing (fail closed)"
+        );
+        assert_eq!(thread.comments[0].text, "first");
+        assert_eq!(thread.comments[1].text, "second");
+        assert!(!controller.is_hunk_streaming(&identity));
     }
 }

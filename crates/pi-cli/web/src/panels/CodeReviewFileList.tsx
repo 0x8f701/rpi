@@ -5,6 +5,7 @@
 // forced expanded). Directory rows and file rows share the rail so the
 // keyboard traversal spans the whole tree.
 
+import { memo } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, MutableRefObject } from 'react';
 import { safeText } from '../redact';
 import {
@@ -42,7 +43,7 @@ export interface CodeReviewFileListProps {
 }
 
 /** Filter + collapsible path tree of changed files with thread badges. */
-export function CodeReviewFileList({
+export const CodeReviewFileList = memo(function CodeReviewFileList({
   files,
   tree,
   rows,
@@ -169,4 +170,4 @@ export function CodeReviewFileList({
       </ul>
     </aside>
   );
-}
+});

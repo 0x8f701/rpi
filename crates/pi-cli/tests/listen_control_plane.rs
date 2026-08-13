@@ -64,8 +64,6 @@ async fn listen_tls(application: Application) -> (ListenHandle, String, TempDir)
             tls_cert: Some(certificate_path),
             tls_key: Some(key_path),
             session_factory: None,
-            #[cfg(debug_assertions)]
-            outbound_writer_delay: Duration::ZERO,
         },
     )
     .await
@@ -760,8 +758,6 @@ async fn non_loopback_policy_requires_explicit_opt_in() {
                 tls_cert: None,
                 tls_key: None,
                 session_factory: None,
-                #[cfg(debug_assertions)]
-                outbound_writer_delay: Duration::ZERO,
             },
         )
         .await
@@ -811,8 +807,6 @@ async fn tls_remote_without_token_is_rejected_pre_bind() {
                 tls_cert: None,
                 tls_key: None,
                 session_factory: None,
-                #[cfg(debug_assertions)]
-                outbound_writer_delay: Duration::ZERO,
             },
         )
         .await
@@ -857,8 +851,6 @@ async fn tokenless_wildcard_opt_in_accepts_same_origin_browser_without_advertise
             tls_cert: None,
             tls_key: None,
             session_factory: None,
-            #[cfg(debug_assertions)]
-            outbound_writer_delay: Duration::ZERO,
         },
     )
     .await
@@ -1004,8 +996,6 @@ async fn wildcard_listener_with_opt_in_enforces_token_over_loopback_connection()
             tls_cert: None,
             tls_key: None,
             session_factory: None,
-            #[cfg(debug_assertions)]
-            outbound_writer_delay: Duration::ZERO,
         },
     )
     .await
@@ -1062,8 +1052,6 @@ async fn loopback_listen_accepts_v4_and_v6_with_and_without_token() {
                     tls_cert: None,
                     tls_key: None,
                     session_factory: None,
-                    #[cfg(debug_assertions)]
-                    outbound_writer_delay: Duration::ZERO,
                 },
             )
             .await
@@ -1150,8 +1138,6 @@ async fn stop_handle_closes_listener_and_cleanup_still_runs() {
             tls_cert: None,
             tls_key: None,
             session_factory: None,
-            #[cfg(debug_assertions)]
-            outbound_writer_delay: Duration::ZERO,
         },
     )
     .await
@@ -2411,16 +2397,22 @@ fn binary_web_prompt_persists_and_restores_after_listener_restart() {
     assert_eq!(second_code, 0, "second shutdown stdout={second_out} stderr={second_err}");
 }
 
+/// Real TCP backpressure evicts a client that never reads: the flood must
+/// exceed the kernel's buffering so the writer blocks and the bounded
+/// outbound queue fills, and the client must not read during the grace
+/// window — draining would reopen the TCP window, unblock the writer, and
+/// reset the grace timer.
 #[tokio::test]
-#[cfg(debug_assertions)]
 async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
+    // Mirrors modes::listen::SLOW_CLIENT_GRACE, kept literal here like
+    // MAX_CONCURRENT_COMMANDS in the saturation test below.
+    const SLOW_CLIENT_GRACE: Duration = Duration::from_secs(5);
+    // Mirrors modes::listen::WS_CLOSE_TIMEOUT: how long the teardown waits
+    // for the writer to deliver the 1008 close before aborting it.
+    const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
     let app = faux_application("listen-ws-slow-reader").await;
-    // The test-only slow-writer seam stalls the /ws outbound writer's first
-    // message for 6s — longer than the 5s slow-client grace — so the bounded
-    // outbound queue fills and the 1008 eviction fires deterministically
-    // without depending on kernel socket-buffer behavior.
-    let (handle, extension_ui) =
-        listen_with_writer_delay(app.application.clone(), Duration::from_secs(6)).await;
+    let (handle, extension_ui) = listen(app.application.clone()).await;
     let addr = handle.local_addr();
     let socket = tokio::net::TcpSocket::new_v4().expect("create slow-reader TCP socket");
     socket
@@ -2440,12 +2432,11 @@ async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
         .0;
     let mut slow = slow.into_inner();
 
-    // Flood well past the 64-message outbound queue while the client never
-    // reads: the writer is stalled by the seam, the queue fills, and the
-    // enqueue grace (5s) expires — the connection must be torn down.
+    // 512 x 128 KiB (64 MiB) guarantees the kernel buffers fill and the
+    // writer blocks no matter how the machine sizes its sockets.
     let payload = "x".repeat(128 * 1024);
     tokio::time::timeout(DEADLINE, async {
-        for _ in 0..128 {
+        for _ in 0..512 {
             extension_ui
                 .request(
                     ExtensionUiContext {
@@ -2456,7 +2447,7 @@ async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
                         mode: ExtensionMode::Tui,
                     },
                     ExtensionUiRequest::Status {
-                        key: "bounded-flood".into(),
+                        key: "backpressure-flood".into(),
                         text: Some(payload.clone()),
                     },
                     ExtensionCancellation::new(),
@@ -2469,6 +2460,13 @@ async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
     .await
     .expect("bounded public event flood timed out");
 
+    // Do not read during the grace window: draining would unblock the writer
+    // and reset the grace timer. The close is only observed after the grace
+    // and the writer close timeout elapse.
+    tokio::time::sleep(SLOW_CLIENT_GRACE + WS_CLOSE_TIMEOUT + Duration::from_secs(2)).await;
+
+    // The eviction close (1008) or the dropped stream must surface within
+    // the deadline once draining resumes.
     tokio::time::timeout(DEADLINE, async {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -2481,6 +2479,8 @@ async fn ws_evicts_slow_reader_without_blocking_fresh_clients() {
     .await
     .expect("slow WebSocket TCP socket was not closed within the deadline");
 
+    // The eviction is per-connection; the listener stays healthy for a fresh
+    // client (loopback connections are authenticated by the address policy).
     let mut fresh = ws_connect(addr, None).await;
     fresh
         .send(WsMessage::Text(

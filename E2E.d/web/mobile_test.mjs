@@ -154,9 +154,187 @@ async function main() {
     // Todo panel from there while the drawer is still open.
     await page.click('#todos-toggle-btn');
     await waitFor(page, () => document.getElementById('todo-panel') !== null, 'todo panel did not open');
+    // Opening a panel from the feature nav MUST close the session drawer on
+    // phones so the full-screen panel is not covered and its close control
+    // stays reachable (z-index alone is not enough for the return path).
+    const panelOpenState = await page.evaluate(() => {
+      const layout = document.querySelector('.app-layout');
+      const panel = document.getElementById('todo-panel');
+      const close = document.getElementById('todo-close-btn');
+      const pr = panel?.getBoundingClientRect();
+      const cr = close?.getBoundingClientRect();
+      return {
+        drawerOpen: !!layout?.classList.contains('app-layout--drawer-open'),
+        panelW: pr ? pr.width : -1,
+        panelH: pr ? pr.height : -1,
+        closeW: cr ? cr.width : -1,
+        closeH: cr ? cr.height : -1,
+        closeAria: close?.getAttribute('aria-label') || '',
+        scrollWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+      };
+    });
+    if (panelOpenState.drawerOpen) {
+      fail('session sidebar stayed open after opening the Todo panel (mobile dead-end)');
+    }
+    if (panelOpenState.panelW < panelOpenState.innerWidth - 1) {
+      fail(`todo panel is not full-screen width: ${panelOpenState.panelW} vs ${panelOpenState.innerWidth}`);
+    }
+    if (panelOpenState.panelH < 100) {
+      fail(`todo panel content height is ${panelOpenState.panelH} (must be non-zero / usable)`);
+    }
+    if (panelOpenState.closeW < 44 || panelOpenState.closeH < 44) {
+      fail(`#todo-close-btn touch target is ${panelOpenState.closeW}x${panelOpenState.closeH} (must be >= 44px)`);
+    }
+    if (!panelOpenState.closeAria) {
+      fail('#todo-close-btn is missing aria-label');
+    }
+    if (panelOpenState.scrollWidth > panelOpenState.innerWidth + 1) {
+      fail(`horizontal overflow with todo panel open: ${panelOpenState.scrollWidth} > ${panelOpenState.innerWidth}`);
+    }
     await page.screenshot({ path: `${evidence}/mobile-panel.png`, fullPage: true });
 
+    // Close must work and return to the shell (no dead-end full-screen panel).
+    await page.click('#todo-close-btn');
+    await waitFor(page, () => document.getElementById('todo-panel') === null, 'todo panel did not close');
+
+    // Re-open the session drawer after closing a panel (return path).
+    await page.click('#sidebar-toggle-btn');
+    await waitFor(
+      page,
+      () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
+      'session sidebar did not reopen after panel close'
+    );
+
+    // Goal + Workflows open/close with the same shell contract (no overflow,
+    // close >= 44, drawer collapses on open).
+    for (const { toggle, panel, close } of [
+      { toggle: '#goal-panel-btn', panel: '#goal-panel', close: '#goal-close-btn' },
+      { toggle: '#workflow-toggle-btn', panel: '#workflow-panel', close: '#workflow-close-btn' },
+    ]) {
+      const open = await page.evaluate(
+        () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true
+      );
+      if (!open) {
+        await page.click('#sidebar-toggle-btn');
+        await waitFor(
+          page,
+          () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
+          `sidebar open before ${panel}`
+        );
+      }
+      await page.click(toggle);
+      await waitFor(page, (sel) => document.querySelector(sel) !== null, `${panel} did not open`, 15000, panel);
+      const state = await page.evaluate(({ panelSel, closeSel }) => {
+        const p = document.querySelector(panelSel);
+        const c = document.querySelector(closeSel);
+        const pr = p?.getBoundingClientRect();
+        const cr = c?.getBoundingClientRect();
+        return {
+          drawerOpen: document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
+          panelW: pr ? pr.width : -1,
+          panelH: pr ? pr.height : -1,
+          closeW: cr ? cr.width : -1,
+          closeH: cr ? cr.height : -1,
+          closeAria: c?.getAttribute('aria-label') || '',
+          scrollWidth: document.documentElement.scrollWidth,
+          innerWidth: window.innerWidth,
+        };
+      }, { panelSel: panel, closeSel: close });
+      if (state.drawerOpen) fail(`${panel}: session sidebar stayed open`);
+      if (state.panelW < state.innerWidth - 1) fail(`${panel}: width ${state.panelW} vs viewport ${state.innerWidth}`);
+      if (state.panelH < 100) fail(`${panel}: height ${state.panelH}`);
+      if (state.closeW < 44 || state.closeH < 44) fail(`${close} is ${state.closeW}x${state.closeH}`);
+      if (!state.closeAria) fail(`${close} missing aria-label`);
+      if (state.scrollWidth > state.innerWidth + 1) fail(`${panel}: horizontal overflow`);
+      await page.click(close);
+      await waitFor(page, (sel) => document.querySelector(sel) === null, `${panel} did not close`, 10000, panel);
+    }
+
     // 2-6. Shell contract at 375×667 (idle state — the run has finished).
+    // Ensure no feature panel remains open for the composer metrics.
+    await page.evaluate(() => {
+      for (const id of ['todo-close-btn', 'workflow-close-btn', 'goal-close-btn', 'subagents-close-btn']) {
+        document.getElementById(id)?.click();
+      }
+    });
+    // Re-open the drawer so the feature-nav touch targets are on-screen.
+    const drawerOpen = await page.evaluate(
+      () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true
+    );
+    if (!drawerOpen) {
+      await page.click('#sidebar-toggle-btn');
+      await waitFor(
+        page,
+        () => document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true,
+        'sidebar open for shell contract metrics'
+      );
+    }
+    // The drawer class flips immediately but the open transition runs 0.18s;
+    // wait for it to settle so geometry is measured fully on-screen (a
+    // mid-transition drawer would still be translated off-screen).
+    await waitFor(
+      page,
+      () => (document.querySelector('.session-sidebar')?.getBoundingClientRect().left ?? -999) >= -1,
+      'session drawer did not finish opening'
+    );
+    // Feature-nav touch targets are measured WHILE THE DRAWER IS OPEN: a
+    // closed drawer is translated off-screen (translateX(-110%)), so any
+    // hidden/occluded/offscreen target fails the geometry checks below instead
+    // of passing a pure CSS-height probe of invisible buttons.
+    const navTargets = await page.evaluate(() => {
+      const rect = (sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height };
+      };
+      const ids = ['#send-btn', '#settings-toggle-btn', '#todos-toggle-btn', '#goal-panel-btn', '#workflow-toggle-btn'];
+      return {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        targets: ids.map((sel) => {
+          const r = rect(sel);
+          return {
+            sel,
+            left: r ? r.left : -1,
+            right: r ? r.right : -1,
+            top: r ? r.top : -1,
+            bottom: r ? r.bottom : -1,
+            width: r ? r.width : -1,
+            height: r ? r.height : -1,
+          };
+        }),
+      };
+    });
+    for (const t of navTargets.targets) {
+      if (t.height < 44) fail(`touch target ${t.sel} is ${t.height}px (must be >= 44px)`);
+      // Structurally fail hidden/offscreen targets: with the drawer open every
+      // feature-nav button must sit inside the viewport horizontally (the
+      // closed drawer's translateX(-110%) pushes right edge < 0) and not be
+      // clipped above/below the viewport.
+      if (t.left < -1 || t.right > navTargets.innerWidth + 1) {
+        fail(`touch target ${t.sel} is off-screen in the open drawer: left ${t.left}, right ${t.right} (viewport ${navTargets.innerWidth}px)`);
+      }
+      if (t.top > navTargets.innerHeight || t.bottom < 0) {
+        fail(`touch target ${t.sel} is off-screen vertically: top ${t.top}, bottom ${t.bottom} (viewport ${navTargets.innerHeight}px)`);
+      }
+    }
+    // Open Todo from the open drawer; opening a panel closes the drawer by
+    // design, so the full-screen width is asserted on the PANEL itself in a
+    // separate step (not on the drawer, which is closed again).
+    await page.click('#todos-toggle-btn');
+    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'todo panel re-open for metrics');
+    const todoMetrics = await page.evaluate(() => {
+      const pr = document.getElementById('todo-panel')?.getBoundingClientRect();
+      return {
+        innerWidth: window.innerWidth,
+        panelW: pr ? pr.width : -1,
+      };
+    });
+    if (todoMetrics.panelW < todoMetrics.innerWidth - 1) {
+      fail(`todo panel is not full-screen width: ${todoMetrics.panelW} vs viewport ${todoMetrics.innerWidth}`);
+    }
     const metrics = await page.evaluate(() => {
       const rect = (sel) => {
         const el = document.querySelector(sel);
@@ -166,11 +344,6 @@ async function main() {
       };
       const footer = rect('.app-main > footer');
       const ta = rect('#prompt-input');
-      const drawer = rect('#todo-panel');
-      const targets = ['#send-btn', '#settings-toggle-btn', '#todos-toggle-btn'].map((sel) => ({
-        sel,
-        height: rect(sel) ? rect(sel).height : -1,
-      }));
       const thinking = document.getElementById('thinking-select');
       const thinkingDisplay = thinking ? getComputedStyle(thinking).display : 'missing';
       return {
@@ -180,8 +353,6 @@ async function main() {
         composerBottom: footer ? footer.bottom : -1,
         textareaW: ta ? ta.width : -1,
         textareaH: ta ? ta.height : -1,
-        drawerWidth: drawer ? drawer.width : -1,
-        targets,
         actionLabel: document.getElementById('send-btn')?.getAttribute('aria-label') || '',
         thinkingDisplay,
       };
@@ -189,9 +360,6 @@ async function main() {
 
     if (metrics.scrollWidth > metrics.innerWidth + 1) {
       fail(`horizontal overflow: scrollWidth ${metrics.scrollWidth} > viewport ${metrics.innerWidth}`);
-    }
-    if (metrics.drawerWidth < metrics.innerWidth - 1) {
-      fail(`drawer is not full-screen width: ${metrics.drawerWidth} vs viewport ${metrics.innerWidth}`);
     }
     if (metrics.composerBottom < 0 || metrics.composerBottom > metrics.innerHeight) {
       fail(`composer sits below the fold: bottom ${metrics.composerBottom} > innerHeight ${metrics.innerHeight}`);
@@ -207,15 +375,12 @@ async function main() {
     if (metrics.actionLabel !== 'Send message') {
       fail(`unified action did not return to Send while idle: "${metrics.actionLabel}"`);
     }
-    for (const t of metrics.targets) {
-      if (t.height < 44) fail(`touch target ${t.sel} is ${t.height}px (must be >= 44px)`);
-    }
     if (metrics.thinkingDisplay !== 'none') {
       fail(`#thinking-select should be hidden at phone width, computed display = ${metrics.thinkingDisplay}`);
     }
     await page.screenshot({ path: `${evidence}/mobile-contract.png`, fullPage: true });
 
-    console.log('web-mobile: PASSED (core flow + unified Send/Stop action + no overflow + full-screen drawer + 44px targets + composer on-screen + usable mobile textarea)');
+    console.log('web-mobile: PASSED (core flow + panel open/close + no overflow + full-screen drawer + 44px targets + composer on-screen + usable mobile textarea)');
   } finally {
     await browser.close().catch(() => {});
   }

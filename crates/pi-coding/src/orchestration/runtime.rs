@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -88,6 +88,17 @@ impl ChildSession {
 
     async fn run(&self, assignment: &str) -> Result<crate::RunResult> {
         self.session.run(assignment, Vec::new()).await
+    }
+
+    /// Names of the tools this child actually possesses: the session's active
+    /// tool set — role-filtered base tools plus orchestration plumbing and the
+    /// child-only `yield` tool — as built by the child factory at spawn. This
+    /// is the structural reference for last-failure classification: a tool
+    /// call whose name is absent from this set was denied by the child's own
+    /// restricted tool set (e.g. a read-only child calling `write`), never
+    /// executed, and is not an execution failure.
+    fn available_tool_names(&self) -> BTreeSet<String> {
+        self.session.get_active_tool_names().into_iter().collect()
     }
 
     async fn abort(&self) {
@@ -3437,7 +3448,31 @@ soft_budget: None,
         execution_ceiling_reached: bool,
     ) -> (String, Option<String>, pi_ai::Usage) {
         let (mut output, error, usage) = match outcome {
-            Ok(result) => (result.text, result.error_message, result.usage),
+            Ok(result) => {
+                // An unrecovered final tool failure is authoritative: when
+                // the last actual ToolResult/BashExecution failed and no
+                // later tool result succeeded, the child's final prose must
+                // never mask it into a Completed job (the workflow would
+                // otherwise mark the task Done and integrate work whose last
+                // step failed). Denied/unavailable attempts caused by the
+                // child's own restricted tool set (an error ToolResult for a
+                // tool the child does not possess, e.g. a read-only child
+                // calling `write`) remain visible in the transcript as
+                // `is_error` results but never fail an otherwise completed
+                // read-only run. A provider-reported error still wins when
+                // present; the synthesized summary is bounded and carries no
+                // tool output.
+                let tool_failure = last_failed_tool_kind(
+                    &result.messages,
+                    &child.available_tool_names(),
+                )
+                .map(|kind| format!("last tool execution failed: {kind}"));
+                (
+                    result.text,
+                    result.error_message.or(tool_failure),
+                    result.usage,
+                )
+            }
             Err(error) => (
                 child.last_assistant_text(),
                 Some(error),
@@ -4693,6 +4728,61 @@ soft_budget: None,
         self.cleanup_retained_jobs();
         REGISTRY.remove_group(&self.inner.group_id);
     }
+}
+
+/// Structural scan of a settled child run's transcript for the FINAL tool
+/// outcome. Returns a bounded kind label — the failing tool's name, or
+/// `"bash"` — when the last actual `ToolResult`/`BashExecution` failed and no
+/// later tool result succeeded, or `None` when the run ended on a successful
+/// tool result.
+///
+/// Failures are structural, never content-derived: `ToolResult.is_error`, or
+/// a `BashExecution` with a non-zero exit code or `cancelled`. Assistant and
+/// user text, custom messages and summaries are ignored — prose after a
+/// failed tool can never mask the failure — and a subsequent successful tool
+/// result clears an earlier failure (a child that recovered is not failed).
+///
+/// Denied/unavailable attempts are structural too, and are NOT failures: an
+/// error `ToolResult` for a tool name outside `available_tools` (the child's
+/// own role-filtered tool set — e.g. a read-only child calling `write`) stays
+/// visible in the transcript as an `is_error` result but neither fails the
+/// run nor clears an earlier real failure. Only error results for tools the
+/// child actually possesses — real execution errors and strict schema errors
+/// — are authoritative failures. `BashExecution` outcomes are unaffected: a
+/// child that runs bash necessarily possesses it, so non-zero/cancelled bash
+/// always fails.
+///
+/// The returned label is bounded and contains no tool output, so it is safe
+/// to surface on the job wire.
+fn last_failed_tool_kind(
+    messages: &[pi_ai::Message],
+    available_tools: &BTreeSet<String>,
+) -> Option<String> {
+    let mut failed: Option<String> = None;
+    for message in messages {
+        match message {
+            pi_ai::Message::ToolResult(result) => {
+                if !result.is_error {
+                    failed = None;
+                } else if available_tools.contains(&result.tool_name) {
+                    failed = Some(result.tool_name.clone());
+                }
+            }
+            pi_ai::Message::BashExecution(bash) => {
+                failed = if bash.cancelled || bash.exit_code.is_some_and(|code| code != 0) {
+                    Some("bash".to_owned())
+                } else {
+                    None
+                };
+            }
+            pi_ai::Message::User(_)
+            | pi_ai::Message::Assistant(_)
+            | pi_ai::Message::Custom(_)
+            | pi_ai::Message::BranchSummary(_)
+            | pi_ai::Message::CompactionSummary(_) => {}
+        }
+    }
+    failed
 }
 
 struct ActiveChildGuard {
@@ -6406,56 +6496,159 @@ fn escape_xml(value: &str) -> String {
 const HISTORY_LABEL_MAX_CHARS: usize = 120;
 
 /// Renders a session transcript file into compact single-line labels, keeping
-/// the last `lines` records. The file is either a durable child JSONL (session
-/// records) or the settle-time `.history.json` snapshot (a JSON array of
-/// [`pi_ai::Message`]); the format is sniffed from the first non-whitespace byte.
+/// the last `lines` FLAT rows. Labels are flattened into rows before the tail
+/// so a message that projects several rows (an assistant turn with multiple
+/// tool calls) cannot smuggle more than `lines` rows past the bound — the
+/// `lines` contract counts rendered lines, not messages. The file is either a
+/// durable child JSONL (session records) or the settle-time `.history.json`
+/// snapshot (a JSON array of [`pi_ai::Message`]); the format is sniffed from
+/// the first non-whitespace byte.
 fn render_history_file(path: &Path, lines: usize) -> Result<String> {
     let data = fs::read(path).with_context(|| format!("reading history {}", path.display()))?;
     if data.iter().copied().find(|byte| !byte.is_ascii_whitespace()) == Some(b'[') {
         let messages: Vec<pi_ai::Message> = serde_json::from_slice(&data)
             .with_context(|| format!("parsing history snapshot {}", path.display()))?;
-        let rendered: Vec<String> = messages.iter().map(history_message_label).collect();
+        let rendered = messages
+            .iter()
+            .flat_map(|message| history_message_label(message).lines().map(str::to_owned).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
         let start = rendered.len().saturating_sub(lines);
         return Ok(rendered[start..].join("\n"));
     }
     let tree = crate::session_store::load_session_tree(path)
         .with_context(|| format!("parsing session transcript {}", path.display()))?;
-    let rendered: Vec<String> = tree
+    let rendered = tree
         .entries
         .iter()
         .filter(|entry| entry.entry_type != "label" && entry.entry_type != "checkpoint")
-        .map(history_entry_label)
-        .collect();
+        .flat_map(|entry| history_entry_label(entry).lines().map(str::to_owned).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
     let start = rendered.len().saturating_sub(lines);
     Ok(rendered[start..].join("\n"))
 }
 
-/// Compact single-line label for one transcript message, mirroring the
-/// tree-panel style: a type prefix plus a first-line preview; tool results
-/// render as just `[tool: <name>]` so their output never floods the rendering.
+/// Compact single-line labels for one transcript message, mirroring the
+/// tree-panel style: a type prefix plus a first-line preview. Assistant
+/// messages additionally project one readable line per tool call — the
+/// concrete action (target/selector/command/operation) — so a rendered
+/// history never reduces a child's work to generic `[tool: <name>]` tags;
+/// tool results stay tag-only with a reliably-known `· ok`/`· error` outcome
+/// so their output never floods the rendering.
 fn history_message_label(message: &pi_ai::Message) -> String {
-    let (prefix, body) = match message {
-        pi_ai::Message::User(user) => ("user: ".to_owned(), content_list_text(&user.content)),
-        pi_ai::Message::Assistant(assistant) => ("assistant: ".to_owned(), assistant.text()),
-        pi_ai::Message::ToolResult(result) => (format!("[tool: {}]", result.tool_name), String::new()),
-        pi_ai::Message::BashExecution(bash) => ("[bash] ".to_owned(), bash.command.clone()),
+    let mut lines = Vec::new();
+    match message {
+        pi_ai::Message::User(user) => {
+            lines.push(format!("user: {}", first_line(&content_list_text(&user.content))));
+        }
+        pi_ai::Message::Assistant(assistant) => {
+            let text = assistant.text();
+            if !text.trim().is_empty() {
+                lines.push(format!("assistant: {}", first_line(&text)));
+            }
+            // One readable line per call, in content order. `text()` above
+            // drops ToolCall blocks, so walk `content` directly for the
+            // concrete actions the child took.
+            for block in &assistant.content {
+                if let pi_ai::ContentBlock::ToolCall(tool) = block {
+                    lines.push(format!("assistant · {}", tool_call_summary(tool)));
+                }
+            }
+            if lines.is_empty() {
+                lines.push("assistant".to_owned());
+            }
+        }
+        pi_ai::Message::ToolResult(result) => {
+            // Output is never previewed; only the tool and its outcome. The
+            // `is_error` flag is authoritative, so nothing is fabricated.
+            let outcome = if result.is_error { " · error" } else { " · ok" };
+            lines.push(format!("[tool: {}]{outcome}", result.tool_name));
+        }
+        pi_ai::Message::BashExecution(bash) => {
+            lines.push(format!("[bash] {}", first_line(&bash.command)));
+        }
         pi_ai::Message::Custom(custom) => {
-            ("custom: ".to_owned(), custom_content_text(&custom.content))
+            lines.push(format!("custom: {}", first_line(&custom_content_text(&custom.content))));
         }
         pi_ai::Message::BranchSummary(summary) => {
-            ("[branch summary] ".to_owned(), summary.summary.clone())
+            lines.push(format!("[branch summary] {}", first_line(&summary.summary)));
         }
         pi_ai::Message::CompactionSummary(summary) => {
-            ("[compaction] ".to_owned(), summary.summary.clone())
+            lines.push(format!("[compaction] {}", first_line(&summary.summary)));
         }
-    };
-    let preview = if matches!(message, pi_ai::Message::ToolResult(_)) {
-        ""
+    }
+    lines
+        .into_iter()
+        .map(|line| truncate_label(line.trim_end(), HISTORY_LABEL_MAX_CHARS))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Compact human-facing summary of one assistant tool call for history
+/// labels. Reuses [`crate::tool_presentation::compact_tool_arguments`] so the
+/// redaction rules stay a single source of truth — no second secret-filtering
+/// implementation here: file tools surface their repo-relative
+/// target/selector, `bash` its first concrete command, planning/messaging
+/// tools their operation + target, and unknown tools a safe compact digest
+/// (never raw JSON). Absolute machine paths never leak: a bare absolute
+/// path/selector shrinks to its final component, and absolute path tokens
+/// embedded anywhere in a command or argument digest are redacted to `[PATH]`
+/// (http/https URLs are preserved as targets).
+fn tool_call_summary(tool: &pi_ai::ToolCall) -> String {
+    let compact = crate::tool_presentation::compact_tool_arguments(&tool.arguments);
+    let digest = compact.split_whitespace().collect::<Vec<_>>().join(" ");
+    let digest = if is_absolute_path(&digest) && !is_http_url(&digest) {
+        digest.rsplit(['/', '\\']).next().unwrap_or(&digest).to_owned()
     } else {
-        first_line(&body)
+        digest
     };
-    let composed = if preview.is_empty() { prefix } else { format!("{prefix}{preview}") };
-    truncate_label(composed.trim_end(), HISTORY_LABEL_MAX_CHARS)
+    let digest = redact_absolute_path_tokens(&digest);
+    if digest.is_empty() {
+        return tool.name.clone();
+    }
+    format!("{} {}", tool.name, digest)
+}
+
+/// True when `value` is an absolute machine path: Unix (`/…`), home-relative
+/// (`~…`), or a Windows drive path (`X:\…` / `X:/…`).
+fn is_absolute_path(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with('~')
+        || (value.len() >= 3
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':')
+}
+
+/// True when `value` is an http/https URL, which is a target, not a machine
+/// path, and is preserved verbatim.
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+/// Redact absolute machine-path tokens (Unix, home-relative, Windows drive)
+/// from a tool-call digest, keeping any `key=` prefix readable and preserving
+/// http/https URLs. Used ONLY for path redaction; secret shapes stay with the
+/// shared redactor ([`crate::tool_presentation::compact_tool_arguments`]).
+fn redact_absolute_path_tokens(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|token| {
+            if is_http_url(token) {
+                return token.to_owned();
+            }
+            // A key=value digest carries the path after the last '='.
+            let candidate = token.rsplit('=').next().unwrap_or(token);
+            if is_absolute_path(candidate) {
+                if candidate.len() == token.len() {
+                    "[PATH]".to_owned()
+                } else {
+                    format!("{}[PATH]", &token[..token.len() - candidate.len()])
+                }
+            } else {
+                token.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Compact single-line label for one session record. Message records delegate
@@ -6536,6 +6729,173 @@ fn truncate_label(value: &str, max_chars: usize) -> String {
     let mut out: String = value.chars().take(max_chars - 1).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod history_label_tests {
+    use super::*;
+    use pi_ai::{AssistantMessage, ContentBlock, ToolCall};
+
+    fn tool_call(name: &str, arguments: serde_json::Value) -> ContentBlock {
+        ContentBlock::ToolCall(ToolCall {
+            id: format!("call-{name}"),
+            name: name.to_owned(),
+            arguments,
+            thought_signature: None,
+        })
+    }
+
+    fn assistant(content: Vec<ContentBlock>) -> pi_ai::Message {
+        let mut message = AssistantMessage::pending(&pi_ai::Model::default());
+        message.content = content;
+        pi_ai::Message::Assistant(message)
+    }
+
+    #[test]
+    fn assistant_tool_calls_render_concrete_actions_not_generic_tags() {
+        let message = assistant(vec![
+            ContentBlock::text("checking the seed"),
+            tool_call("read", serde_json::json!({ "path": "seed.txt" })),
+            tool_call("bash", serde_json::json!({ "command": "cargo build --release" })),
+            tool_call("hub", serde_json::json!({ "op": "send", "to": "worker", "message": "go" })),
+            tool_call("yield", serde_json::json!({ "text": "deliverable done" })),
+        ]);
+        let label = history_message_label(&message);
+        // Assistant text is preserved alongside the projected calls.
+        assert!(label.contains("assistant: checking the seed"), "{label}");
+        assert!(label.contains("assistant · read seed.txt"), "{label}");
+        assert!(label.contains("assistant · bash cargo build --release"), "{label}");
+        // Planning/messaging tools surface operation + target key fields.
+        assert!(label.contains("assistant · hub message=go, op=send, to=worker"), "{label}");
+        // Unknown tools get a safe compact digest, never raw JSON.
+        assert!(label.contains("assistant · yield text=deliverable done"), "{label}");
+        // One readable line per call (text line + 4 call lines).
+        assert_eq!(label.lines().count(), 5, "{label}");
+        assert!(!label.contains("\"path\""), "no raw JSON dump: {label}");
+    }
+
+    #[test]
+    fn tool_call_summary_redacts_secrets_in_workspace_paths_and_commands() {
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        // Repo-allowed `<workspace>/...` placeholder target: the secret-shaped
+        // filename is redacted while the safe placeholder stays readable.
+        let read = tool_call_summary(&ToolCall {
+            id: "call-1".to_owned(),
+            name: "read".to_owned(),
+            arguments: serde_json::json!({ "path": format!("<workspace>/secrets/{secret}.txt") }),
+            thought_signature: None,
+        });
+        assert_eq!(read, "read <workspace>/secrets/[REDACTED].txt", "{read}");
+        assert!(!read.contains(&secret), "secret must be redacted: {read}");
+        assert!(read.starts_with("read "), "{read}");
+        assert!(!read.contains('\n'), "summary must stay one line: {read}");
+
+        let bash = tool_call_summary(&ToolCall {
+            id: "call-2".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::json!({ "command": format!("echo {secret}\nsecond line") }),
+            thought_signature: None,
+        });
+        assert_eq!(bash, "bash echo [REDACTED] second line", "{bash}");
+        assert!(!bash.contains(&secret), "secret must be redacted: {bash}");
+        assert!(!bash.contains('\n'), "command must collapse to one line: {bash}");
+    }
+
+    #[test]
+    fn tool_call_summary_keeps_workspace_paths_safe_inside_commands() {
+        // A `<workspace>/...` placeholder embedded in a command is a repo-relative
+        // target, so it stays readable in the safe display; only credential-shaped
+        // content inside it is redacted.
+        let bash = tool_call_summary(&ToolCall {
+            id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::json!({ "command": "cat <workspace>/secrets/secret.txt" }),
+            thought_signature: None,
+        });
+        assert_eq!(bash, "bash cat <workspace>/secrets/secret.txt", "{bash}");
+
+        // Secret-shaped filenames inside a command never leak.
+        let secret = ["s", "k-", "abcdefghijklmnop1234"].concat();
+        let leaky = tool_call_summary(&ToolCall {
+            id: "call-2".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::json!({ "command": format!("cat <workspace>/secrets/{secret}.txt") }),
+            thought_signature: None,
+        });
+        assert_eq!(leaky, "bash cat <workspace>/secrets/[REDACTED].txt", "{leaky}");
+        assert!(!leaky.contains(&secret), "secret must be redacted: {leaky}");
+
+        // http/https URLs are targets, not machine paths: preserved verbatim.
+        let curl = tool_call_summary(&ToolCall {
+            id: "call-3".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::json!({ "command": "curl https://example.com/api" }),
+            thought_signature: None,
+        });
+        assert_eq!(curl, "bash curl https://example.com/api", "{curl}");
+    }
+
+    #[test]
+    fn tool_result_labels_carry_ok_error_outcome_without_output() {
+        let ok = history_message_label(&pi_ai::Message::ToolResult(pi_ai::ToolResultMessage {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read".to_owned(),
+            content: vec![pi_ai::ContentBlock::text("raw output that must not appear")],
+            usage: None,
+            details: None,
+            added_tool_names: Vec::new(),
+            is_error: false,
+            timestamp: 0,
+        }));
+        assert_eq!(ok, "[tool: read] · ok", "{ok}");
+
+        let failed = history_message_label(&pi_ai::Message::ToolResult(pi_ai::ToolResultMessage {
+            tool_call_id: "call-2".to_owned(),
+            tool_name: "bash".to_owned(),
+            content: vec![pi_ai::ContentBlock::text("boom")],
+            usage: None,
+            details: None,
+            added_tool_names: Vec::new(),
+            is_error: true,
+            timestamp: 0,
+        }));
+        assert_eq!(failed, "[tool: bash] · error", "{failed}");
+    }
+
+    #[test]
+    fn history_label_lines_stay_under_the_per_line_cap() {
+        let long = "x".repeat(400);
+        let message = assistant(vec![
+            tool_call("read", serde_json::json!({ "path": long.clone() })),
+            tool_call("bash", serde_json::json!({ "command": long })),
+        ]);
+        let label = history_message_label(&message);
+        assert!(label.lines().all(|line| line.chars().count() <= HISTORY_LABEL_MAX_CHARS), "{label}");
+    }
+
+    #[test]
+    fn render_history_tails_flat_rows_not_messages() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("history.json");
+        // One assistant message projects four flat rows (text + three calls);
+        // a message-level tail would hand back all four for `lines: 2`.
+        let messages = vec![
+            pi_ai::Message::user_text("ask", 0),
+            assistant(vec![
+                ContentBlock::text("line one"),
+                tool_call("read", serde_json::json!({ "path": "a.txt" })),
+                tool_call("bash", serde_json::json!({ "command": "cargo check" })),
+                tool_call("read", serde_json::json!({ "path": "b.txt" })),
+            ]),
+        ];
+        fs::write(&path, serde_json::to_vec(&messages).expect("snapshot")).expect("write history");
+        let rendered = render_history_file(&path, 2).expect("render");
+        assert_eq!(rendered.lines().count(), 2, "lines bound must count flat rows: {rendered}");
+        assert!(rendered.contains("cargo check"), "last two flat rows kept: {rendered}");
+        assert!(rendered.contains("read b.txt"), "last two flat rows kept: {rendered}");
+        assert!(!rendered.contains("a.txt"), "older rows dropped: {rendered}");
+        assert!(!rendered.contains("line one"), "older rows dropped: {rendered}");
+    }
 }
 
 impl OrchestrationRuntime {
@@ -8865,5 +9225,390 @@ mod memory_child_factory_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod settle_tool_failure_tests {
+    //! The last-tool-failure contract for settled child runs: when the final
+    //! actual `ToolResult`/`BashExecution` failed and no later tool result
+    //! succeeded, `settle_child_outcome` must surface a bounded error so the
+    //! job settles `Failed` (never Completed/Done/Integrated), while a
+    //! recovery (a later successful tool result) settles cleanly. Assistant
+    //! prose is ignored — the check is structural, never content-derived.
+    //!
+    //! Denied/unavailable attempts are structural too, and are not failures:
+    //! an error `ToolResult` for a tool outside the child's own role-filtered
+    //! tool set (a read-only child calling `write`) stays visible as an
+    //! `is_error` result but settles the job Completed — only error results
+    //! for tools the child actually possesses, plus non-zero/cancelled bash,
+    //! are authoritative failures.
+
+    use super::*;
+    use crate::{AgentDefinitionSource, SessionOptions};
+
+    fn tool_result(tool_name: &str, is_error: bool, timestamp: i64) -> pi_ai::Message {
+        pi_ai::Message::ToolResult(pi_ai::ToolResultMessage {
+            tool_call_id: format!("call-{timestamp}"),
+            tool_name: tool_name.to_owned(),
+            content: vec![pi_ai::ContentBlock::text(if is_error { "boom" } else { "ok" })],
+            usage: None,
+            details: None,
+            added_tool_names: Vec::new(),
+            is_error,
+            timestamp,
+        })
+    }
+
+    fn bash(command: &str, exit_code: Option<i32>, cancelled: bool, timestamp: i64) -> pi_ai::Message {
+        pi_ai::Message::BashExecution(pi_ai::BashExecutionMessage {
+            command: command.to_owned(),
+            output: String::new(),
+            exit_code,
+            cancelled,
+            truncated: false,
+            full_output_path: None,
+            timestamp,
+            exclude_from_context: None,
+        })
+    }
+
+    fn prose(text: &str) -> pi_ai::Message {
+        pi_ai::Message::Assistant(pi_ai::AssistantMessage {
+            content: vec![pi_ai::ContentBlock::text(text.to_owned())],
+            ..pi_ai::AssistantMessage::pending(&pi_ai::Model::default())
+        })
+    }
+
+    fn tool_names(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    fn task_definition() -> AgentDefinition {
+        super::super::definitions::parse_agent_definition(
+            Path::new("task.md"),
+            "---\nname: task\ndescription: task\n---\nprompt",
+            AgentDefinitionSource::Bundled,
+            true,
+        )
+        .expect("definition")
+    }
+
+    fn session_with_tools(root: &Path, names: &[&str]) -> Session {
+        let tools = names
+            .iter()
+            .map(|name| {
+                AgentTool::new(*name, *name, pi_ai::Schema::default(), |_| async {
+                    Ok(pi_agent::AgentToolResult::text("ok"))
+                })
+            })
+            .collect::<Vec<_>>();
+        Session::new(SessionOptions {
+            model: pi_ai::Model::default(),
+            cwd: root.to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(tools),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("session")
+    }
+
+    fn session(root: &Path) -> Session {
+        session_with_tools(root, &[])
+    }
+
+    fn settled_run(
+        text: &str,
+        messages: Vec<pi_ai::Message>,
+        error_message: Option<String>,
+    ) -> crate::RunResult {
+        crate::RunResult {
+            text: text.to_owned(),
+            messages,
+            tool_calls: Vec::new(),
+            usage: pi_ai::Usage::default(),
+            stop_reason: pi_ai::StopReason::Stop,
+            error_message,
+        }
+    }
+
+    #[test]
+    fn failed_tool_result_is_last_failure_despite_trailing_prose() {
+        // fail tool → final prose still error: assistant text after the
+        // failure never clears the authoritative structural failure.
+        let messages = vec![
+            prose("starting work"),
+            tool_result("read", false, 1),
+            tool_result("edit", true, 2),
+            prose("wrapping up after the edit failed"),
+        ];
+        assert_eq!(
+            last_failed_tool_kind(&messages, &tool_names(&["read", "edit"])).as_deref(),
+            Some("edit")
+        );
+    }
+
+    #[test]
+    fn failed_tool_then_successful_tool_recovers() {
+        // fail → success recovery: a later successful tool result clears the
+        // earlier failure, so the run is allowed to complete normally.
+        let messages = vec![
+            tool_result("edit", true, 1),
+            prose("retrying"),
+            tool_result("edit", false, 2),
+            prose("fixed"),
+        ];
+        assert_eq!(last_failed_tool_kind(&messages, &tool_names(&["edit"])), None);
+    }
+
+    #[test]
+    fn successful_or_tool_free_transcripts_are_not_failures() {
+        assert_eq!(last_failed_tool_kind(&[], &tool_names(&[])), None);
+        assert_eq!(
+            last_failed_tool_kind(&[tool_result("read", false, 1)], &tool_names(&["read"])),
+            None
+        );
+        assert_eq!(
+            last_failed_tool_kind(
+                &[prose("no tools called"), prose("still no tools")],
+                &tool_names(&[])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn bash_nonzero_cancelled_and_zero_outcomes() {
+        // Bash behavior is independent of the tool set: a child that runs
+        // bash necessarily possesses it, so non-zero/cancelled bash always
+        // fails regardless of `available_tools`.
+        assert_eq!(
+            last_failed_tool_kind(&[bash("false", Some(1), false, 1)], &tool_names(&[])).as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            last_failed_tool_kind(&[bash("sleep", None, true, 1)], &tool_names(&[])).as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            last_failed_tool_kind(&[bash("true", Some(0), false, 1)], &tool_names(&[])),
+            None
+        );
+        // A zero exit clears an earlier non-zero failure (recovery).
+        assert_eq!(
+            last_failed_tool_kind(
+                &[bash("false", Some(1), false, 1), bash("true", Some(0), false, 2)],
+                &tool_names(&[])
+            ),
+            None
+        );
+        // No exit code reported and not cancelled is not a failure signal.
+        assert_eq!(
+            last_failed_tool_kind(&[bash("?", None, false, 1)], &tool_names(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn denied_tool_outside_child_tool_set_is_visible_but_not_fatal() {
+        // A read-only child (tool set {"read"}) deliberately calls `write`;
+        // the denial is recorded as an is_error ToolResult but is not a
+        // failure — the run completes despite the trailing prose.
+        let messages = vec![
+            tool_result("read", false, 1),
+            tool_result("write", true, 2),
+            prose("scout finished without write"),
+        ];
+        assert_eq!(
+            last_failed_tool_kind(&messages, &tool_names(&["read"])),
+            None
+        );
+    }
+
+    #[test]
+    fn denied_tool_does_not_clear_an_earlier_real_failure() {
+        // A denial is neither a success nor a failure: it must not mask an
+        // unrecovered real failure that precedes it.
+        let messages = vec![
+            tool_result("edit", true, 1),
+            tool_result("write", true, 2),
+            prose("wrapping up"),
+        ];
+        assert_eq!(
+            last_failed_tool_kind(&messages, &tool_names(&["edit"])).as_deref(),
+            Some("edit")
+        );
+    }
+
+    #[test]
+    fn real_failure_of_possessed_tool_still_fails() {
+        // A genuine execution failure of a tool the child actually possesses
+        // stays authoritative even when a later tool is denied.
+        let messages = vec![
+            tool_result("read", false, 1),
+            tool_result("write", true, 2),
+            tool_result("read", true, 3),
+            prose("done"),
+        ];
+        assert_eq!(
+            last_failed_tool_kind(&messages, &tool_names(&["read", "write"])).as_deref(),
+            Some("read")
+        );
+        // Same transcript against a write-less role: the write attempt is a
+        // denial, but the possessed read failure still fails the run.
+        assert_eq!(
+            last_failed_tool_kind(&messages, &tool_names(&["read"])).as_deref(),
+            Some("read")
+        );
+        // A real write failure (the child possesses write) is authoritative
+        // even after a successful read — only a later success would clear it.
+        assert_eq!(
+            last_failed_tool_kind(
+                &[tool_result("read", false, 1), tool_result("write", true, 2)],
+                &tool_names(&["read", "write"])
+            )
+            .as_deref(),
+            Some("write")
+        );
+    }
+
+    #[test]
+    fn settle_failed_last_tool_keeps_prose_and_surfaces_bounded_error() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = session(root.path());
+        let snapshot = parent.child_session_options_snapshot();
+        let child = ChildSession::new(session_with_tools(root.path(), &["read", "edit"]));
+        let config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![task_definition()]),
+            root.path().join("artifacts"),
+        );
+        let runtime =
+            OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
+                .expect("runtime");
+        let result = settled_run(
+            "final prose after the failed tool",
+            vec![
+                tool_result("read", false, 1),
+                tool_result("edit", true, 2),
+                prose("wrapping up"),
+            ],
+            None,
+        );
+        let (output, error, _) = runtime.settle_child_outcome(
+            Ok(result),
+            &child,
+            &YieldState::default(),
+            false,
+        );
+        // The final prose stands as output, but the authoritative tool
+        // failure still errors the job — prose never masks it.
+        assert_eq!(output, "final prose after the failed tool");
+        assert_eq!(error.as_deref(), Some("last tool execution failed: edit"));
+    }
+
+    #[test]
+    fn settle_denied_write_on_read_only_child_completes() {
+        // A read-only child whose only tool is `read` deliberately calls
+        // `write`: the denial stays visible in the transcript as an is_error
+        // result, but the run completes without error (the campaign contract:
+        // the write denial is recorded while the scout finishes read-only).
+        let root = tempfile::tempdir().expect("root");
+        let parent = session(root.path());
+        let snapshot = parent.child_session_options_snapshot();
+        let child = ChildSession::new(session_with_tools(root.path(), &["read"]));
+        let config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![task_definition()]),
+            root.path().join("artifacts"),
+        );
+        let runtime =
+            OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
+                .expect("runtime");
+        let result = settled_run(
+            "scout finished without write",
+            vec![
+                tool_result("read", false, 1),
+                tool_result("write", true, 2),
+                prose("scout finished without write"),
+            ],
+            None,
+        );
+        let (output, error, _) = runtime.settle_child_outcome(
+            Ok(result),
+            &child,
+            &YieldState::default(),
+            false,
+        );
+        assert_eq!(
+            output,
+            format!("scout finished without write\n\n{MISSING_YIELD_WARNING}")
+        );
+        assert!(
+            error.is_none(),
+            "denied write on a read-only child must not error the job: {error:?}"
+        );
+    }
+
+    #[test]
+    fn settle_recovered_tool_failure_completes_without_error() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = session(root.path());
+        let snapshot = parent.child_session_options_snapshot();
+        let child = ChildSession::new(session_with_tools(root.path(), &["edit"]));
+        let config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![task_definition()]),
+            root.path().join("artifacts"),
+        );
+        let runtime =
+            OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
+                .expect("runtime");
+        let result = settled_run(
+            "recovered and done",
+            vec![tool_result("edit", true, 1), tool_result("edit", false, 2), prose("done")],
+            None,
+        );
+        let (output, error, _) = runtime.settle_child_outcome(
+            Ok(result),
+            &child,
+            &YieldState::default(),
+            false,
+        );
+        assert_eq!(output, format!("recovered and done\n\n{MISSING_YIELD_WARNING}"));
+        assert!(error.is_none(), "recovered tool failure must not error: {error:?}");
+    }
+
+    #[test]
+    fn settle_provider_error_keeps_priority_over_tool_failure() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = session(root.path());
+        let snapshot = parent.child_session_options_snapshot();
+        let child = ChildSession::new(session_with_tools(root.path(), &["read"]));
+        let config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![task_definition()]),
+            root.path().join("artifacts"),
+        );
+        let runtime =
+            OrchestrationRuntime::new(config, OrchestrationRuntime::child_factory_from_snapshot(snapshot))
+                .expect("runtime");
+        let result = settled_run(
+            "partial prose",
+            vec![tool_result("read", true, 1)],
+            Some("provider: upstream request failed".to_owned()),
+        );
+        let (_, error, _) = runtime.settle_child_outcome(
+            Ok(result),
+            &child,
+            &YieldState::default(),
+            false,
+        );
+        // The provider's own error wins; the tool failure summary must not
+        // replace or be appended to it.
+        assert_eq!(error.as_deref(), Some("provider: upstream request failed"));
     }
 }

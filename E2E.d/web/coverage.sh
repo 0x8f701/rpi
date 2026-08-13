@@ -338,14 +338,14 @@ EOF
     # An INDEPENDENT steering-fixture driver (coverage_fallback.mjs) that
     # closes the zero-hit margin on panels the core steering driver does not
     # exhaustively exercise: SessionPanel refresh/rename-Enter/clone/fork/
-    # switch-row, GoalPanel unpin, MaintenancePanel compact + actual rewind
-    # apply, SideChatPanel Enter-prompt/tab-switch/tab-close, redact
-    # credential-shape branches through real panel safeText rendering, and the
-    # App panel close callbacks. Uses its OWN dedicated deterministic steering
-    # fixture (own mock + rpi --listen on a fresh port) so it never collides
-    # with the core driver's reconnect sequence; collects V8 coverage through
-    # the same standard hook (lane = coverage-fallback). No overlap with the
-    # core driver's files — coverage_test.mjs / coverage_xss.mjs are untouched.
+    # switch-row, GoalPanel unpin, SideChatPanel Enter-prompt/tab-switch/
+    # tab-close, redact credential-shape branches through real panel safeText
+    # rendering, and the App panel close callbacks. Uses its OWN dedicated
+    # deterministic steering fixture (own mock + rpi --listen on a fresh port)
+    # so it never collides with the core driver's reconnect sequence; collects
+    # V8 coverage through the same standard hook (lane = coverage-fallback).
+    # No overlap with the core driver's files — coverage_test.mjs /
+    # coverage_xss.mjs are untouched.
     local froot fevidence fport furl pw_status=0
     froot="$(scenario_workspace "coverage-fallback")"
     fevidence="$EVIDENCE_DIR/driver-fallback"
@@ -359,13 +359,6 @@ EOF
     printf 'web coverage fallback seed\n' >"$froot/workspace/seed.txt"
     git -C "$froot/workspace" add -- seed.txt
     git -C "$froot/workspace" -c commit.gpgsign=false commit -q -m seed
-    cat >"$froot/home/.pi/agent/settings.json" <<EOF
-{
-  "compaction": {
-    "snapKeepTurns": 1
-  }
-}
-EOF
     fport="$(web_start_mock "$froot" "$fevidence")"
     web_spawn_rpi "$froot" "$fevidence" "$fport"
     furl="$(web_wait_for_listener "$fevidence")"

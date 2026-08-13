@@ -331,8 +331,6 @@ async fn harness(label: &str) -> Harness {
             tls_cert: None,
             tls_key: None,
             session_factory: Some(Arc::new(spawner.clone())),
-            #[cfg(debug_assertions)]
-            outbound_writer_delay: Duration::ZERO,
         },
     )
     .await

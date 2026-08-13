@@ -49,7 +49,6 @@ exits non-zero when any lane failed.
 | settings panel (browse/edit/apply/secret refusal) | `core` | category browse, secret key redacted + not editable, theme draft → apply → persisted |
 | subagents (spawn/live/modal/cancel/output) | `core` + `web-subagents` | task_spawn → live card + activity → running-detail modal (dialog a11y, task/status/elapsed/activity, non-empty recent history, Refresh, Escape/Close) → hub_send receipt → job_output pane → job_cancel |
 | side chat (multi-tab) | `extras` | default tab, new tab via form, prompt round-trip into the tab transcript |
-| maintenance (compact A→B / rewind / handoff / queue) | `extras` | snapcompact `N → M estimated tokens`, rewind list, handoff envelope, queue view + cancel |
 | XSS safety (hostile model output) | `xss` | `<img onerror>`/`<script>` render as inert escaped text: no dialog, no `window.__xss`, no injected elements |
 | secret redaction | `xss` | `sk-*` credential renders as `[REDACTED]`; raw secret never in the page |
 | extension_ui_request approval card | `xss` | fixture QuickJS extension's input hook issues an interactive confirm: card renders hostile title/message as inert text, no toast carries the payload, no error toast, embedded credential redacted |
@@ -104,8 +103,8 @@ thresholds. Every step is a hard gate — no skips, no agent-browser fallback:
 
 1. Build a TEMPORARY conditionally-instrumented bundle
    (`vite.coverage.config.ts`: inline source map, unminified) into the
-   evidence root (`$EVIDENCE_ROOT/coverage/web-coverage-dist`) — the tracked
-   `dist/` is never modified; the bundle is served via `RPI_WEB_DEV_DIR`.
+   evidence root (`$EVIDENCE_ROOT/coverage/web-coverage-dist`) — the generated
+   (gitignored) `dist/` is never modified; the bundle is served via `RPI_WEB_DEV_DIR`.
 2. Verify playwright installs and that chromium actually launches (missing
    `node`/`npm`, a failed playwright install, or no usable Chromium FAILS the
    run).

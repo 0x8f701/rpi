@@ -1,8 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
 import { useScrollPin } from './scrollPin';
 import { createAutoResizeController, type AutoResizeController } from './autoResize';
-import { safeText } from './redact';
+import { redactSecrets, safeText } from './redact';
+import { ansiToPlainText } from './ansi';
+import { AnsiText } from './AnsiText';
 import { humanToolTitle } from './toolTitle';
+import { withResolvers } from './withResolvers';
 import { renderBlocks, hydrateMermaid, thinkingSummaryHtml } from './markdown';
 import { MarkdownBody } from './MarkdownBody';
 import { TodoPanel } from './panels/TodoPanel';
@@ -13,7 +16,6 @@ import { GoalPanel, type GoalEventWire, type GoalStateWire } from './panels/Goal
 import { WorkflowPanel, dispatchWorkflowEvents } from './panels/WorkflowPanel';
 import { SideChatPanel } from './panels/SideChatPanel';
 import type { SideChatSnapshot } from './panels/SideChatPanel';
-import { MaintenancePanel } from './panels/MaintenancePanel';
 import { SessionPanel } from './panels/SessionPanel';
 import { SettingsPanel } from './panels/SettingsPanel';
 import { SessionSidebar } from './panels/SessionSidebar';
@@ -156,6 +158,50 @@ const HEARTBEAT_PING_INTERVAL_MS = 30000;
 const HEARTBEAT_TIMEOUT_MS = 60000;
 const HEARTBEAT_STABILITY_MS = 5000;
 const TRANSPORT_STALE_CLOSE_CODE = 4001;
+
+/* ------------------------------------------------------------------ *
+ * Shared bottom-drawer height for ordinary `.panel` mounts
+ * ------------------------------------------------------------------ *
+ * Desktop only: one resizer + one localStorage key for every ordinary
+ * side panel (todo/goal/workflow/session/settings/subagents/personas/
+ * sidechat). Code review owns the full viewport and is
+ * excluded. Mobile never mounts the resizer. */
+const PANEL_DRAWER_SIZE_KEY = 'rpi-panel-drawer-size';
+const PANEL_DRAWER_MIN_VH = 25;
+const PANEL_DRAWER_MAX_VH = 90;
+const PANEL_DRAWER_DEFAULT_VH = 90;
+
+function clampPanelDrawerVh(vh: number): number {
+  if (!Number.isFinite(vh)) return PANEL_DRAWER_DEFAULT_VH;
+  return Math.min(PANEL_DRAWER_MAX_VH, Math.max(PANEL_DRAWER_MIN_VH, vh));
+}
+
+function readStoredPanelDrawerVh(): number {
+  try {
+    const raw = window.localStorage.getItem(PANEL_DRAWER_SIZE_KEY);
+    if (raw == null || raw === '') return PANEL_DRAWER_DEFAULT_VH;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return PANEL_DRAWER_DEFAULT_VH;
+    return clampPanelDrawerVh(n);
+  } catch {
+    return PANEL_DRAWER_DEFAULT_VH;
+  }
+}
+
+function writeStoredPanelDrawerVh(vh: number): void {
+  try {
+    window.localStorage.setItem(PANEL_DRAWER_SIZE_KEY, String(clampPanelDrawerVh(vh)));
+  } catch {
+    /* private mode / blocked storage: height lives in CSS only */
+  }
+}
+
+function applyPanelDrawerVh(vh: number): void {
+  document.documentElement.style.setProperty(
+    '--panel-drawer-height',
+    `${clampPanelDrawerVh(vh)}vh`,
+  );
+}
 
 type ConnState = 'off' | 'connecting' | 'on' | 'reconnecting';
 
@@ -618,7 +664,7 @@ export function ToolCard({ item, onLayoutChange }: { item: Extract<Item, { kind:
             <span className="tool-card__prompt">$</span>
             <span className="tool-card__command-text">{safeText(commandView.command)}</span>
           </div>
-          {item.result !== '' && <pre className="tool-card__output">{safeText(item.result)}</pre>}
+          {item.result !== '' && <pre className="tool-card__output"><AnsiText text={item.result} /></pre>}
         </div>
       ) : processView ? (
         <div className="tool-card__summary">
@@ -627,7 +673,7 @@ export function ToolCard({ item, onLayoutChange }: { item: Extract<Item, { kind:
             <div className="tool-card__summary-error">{safeText(item.result)}</div>
           )}
           {item.status !== 'error' && item.result !== '' && (
-            <pre className="tool-card__output">{safeText(item.result)}</pre>
+            <pre className="tool-card__output"><AnsiText text={item.result} /></pre>
           )}
         </div>
       ) : writeView ? (
@@ -638,7 +684,7 @@ export function ToolCard({ item, onLayoutChange }: { item: Extract<Item, { kind:
       ) : readView ? (
         <div className="tool-card__summary">
           <div className="tool-card__summary-path">{safeText(readView.path)}</div>
-          {item.result !== '' && <pre className="tool-card__output">{safeText(item.result)}</pre>}
+          {item.result !== '' && <pre className="tool-card__output"><AnsiText text={item.result} /></pre>}
         </div>
       ) : todoView ? (
         <div className="tool-card__todo">
@@ -685,7 +731,7 @@ export function ToolCard({ item, onLayoutChange }: { item: Extract<Item, { kind:
               ))}
             </div>
           ) : todoView.fallback !== '' ? (
-            <pre className="tool-card__output">{safeText(todoView.fallback)}</pre>
+            <pre className="tool-card__output"><AnsiText text={todoView.fallback} /></pre>
           ) : (
             <div className="tool-card__todo-empty">no tasks</div>
           )}
@@ -740,7 +786,7 @@ export function ToolCard({ item, onLayoutChange }: { item: Extract<Item, { kind:
           {compactToolArgs(item.args) !== '' && (
             <div className="tool-card__summary-line">{safeText(compactToolArgs(item.args))}</div>
           )}
-          {item.result !== '' && <pre className="tool-card__output">{safeText(item.result)}</pre>}
+          {item.result !== '' && <pre className="tool-card__output"><AnsiText text={item.result} /></pre>}
           <details className="tool-card__raw">
             <summary>raw args</summary>
             <pre className="tool-card__args">{safeText(JSON.stringify(item.args, null, 2))}</pre>
@@ -786,15 +832,20 @@ export function ToolCard({ item, onLayoutChange }: { item: Extract<Item, { kind:
 export function BashCard({ command, label, output, status }: { command?: string; label?: string; output: string; status?: string }) {
   const [copied, setCopied] = useState(false);
   const copyOutput = () => {
+    // Copy the redacted plain text — parser plain first, then redact the
+    // full plain text so even a credential split across an SGR boundary in
+    // the raw output is caught. No ANSI/control escape sequences ever reach
+    // the clipboard.
+    const plain = redactSecrets(ansiToPlainText(output));
     const flash = () => {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1200);
     };
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-      navigator.clipboard.writeText(output).then(flash, flash);
+      navigator.clipboard.writeText(plain).then(flash, flash);
     } else {
       const textarea = document.createElement('textarea');
-      textarea.value = output;
+      textarea.value = plain;
       textarea.style.position = 'fixed';
       textarea.style.opacity = '0';
       document.body.appendChild(textarea);
@@ -832,7 +883,7 @@ export function BashCard({ command, label, output, status }: { command?: string;
           <span className="bash-command-text">{command}</span>
         </div>
       )}
-      <pre className="bash-output">{output}</pre>
+      <pre className="bash-output"><AnsiText text={output} /></pre>
     </div>
   );
 }
@@ -871,6 +922,7 @@ import {
   reconcileIntakeBudget,
   removeSentAttachments,
 } from './attachments';
+import { PASTED_TEXT_ATTACHMENT_NAME, largeTextDisplay, planLargeTextPaste } from './composerPaste';
 
 /** Live voice settings as projected by the backend's Web wire
  *  (`runtimeSettings.live`): `enabled`, `mode`, `sttConfigured`,
@@ -1328,6 +1380,7 @@ export function App() {
   // Todo DAG panel. `activePanel` is the single shared panel-name state;
   // each web panel registers its own name + a mount-point render line below.
   const [activePanel, setActivePanel] = useState<string>('');
+
   // Revisions captured when `/code-review [from to]` opens the panel. Cleared
   // on close/session reset so a later bare open does not reuse stale revs.
   const [codeReviewOpenArgs, setCodeReviewOpenArgs] = useState<CodeReviewOpenArgs>({});
@@ -1343,6 +1396,57 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() =>
     typeof window !== 'undefined' && window.matchMedia('(min-width: 721px)').matches
   );
+  // Open/toggle a feature panel. The updater is PURE (no other state setter,
+  // no matchMedia read) — the mobile-drawer close below is driven by state in
+  // a separate effect, so React never re-runs a side effect inside an
+  // updater. On phone widths the session drawer sits at z-index 44 while
+  // ordinary panels are 46; still, opening a panel MUST close the drawer so
+  // the user isn't left with two competing full-height surfaces and a
+  // dead-end return path. Desktop keeps the rail open.
+  const openPanel = useCallback((name: string, opts?: { force?: boolean }) => {
+    setActivePanel((current) => (!opts?.force && current === name ? '' : name));
+  }, []);
+
+  // Any non-empty activePanel (feature-nav toggle, Manage session, /code-review
+  // slash command) collapses the mobile drawer at <=720px before paint; the
+  // drawer-close is keyed off state here instead of firing from inside
+  // openPanel's updater. Desktop (>=721px) keeps the rail open.
+  useLayoutEffect(() => {
+    if (activePanel !== '' && window.matchMedia('(max-width: 720px)').matches) {
+      setSidebarOpen(false);
+    }
+  }, [activePanel]);
+
+  // Keep the mobile session drawer top edge flush with the live header height
+  // (phone chrome wraps; a fixed 48px top left the feature nav under the bar).
+  // useLayoutEffect so the INITIAL measurement lands before first paint — a
+  // post-paint write made the drawer visibly jump down one frame on a wrapped
+  // header; the ResizeObserver + resize listener keep it live afterward.
+  useLayoutEffect(() => {
+    const header = document.querySelector('header');
+    if (!header || typeof ResizeObserver === 'undefined') return;
+    const apply = () => {
+      const h = Math.round(header.getBoundingClientRect().height);
+      document.documentElement.style.setProperty('--app-header-height', `${Math.max(44, h)}px`);
+    };
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(header);
+    window.addEventListener('resize', apply);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', apply);
+    };
+  }, []);
+
+  // Shared desktop height for ordinary bottom drawers (vh). Applied as
+  // --panel-drawer-height on <html>; one resizer serves every ordinary panel.
+  const [panelDrawerVh, setPanelDrawerVh] = useState(() =>
+    typeof window !== 'undefined' ? readStoredPanelDrawerVh() : PANEL_DRAWER_DEFAULT_VH
+  );
+  const panelDrawerVhRef = useRef(panelDrawerVh);
+  panelDrawerVhRef.current = panelDrawerVh;
+  const panelResizeDragRef = useRef<{ startY: number; startVh: number } | null>(null);
   // Active session's derived view (empty until that session has items).
   const [todoPhasesBySessionId, setTodoPhasesBySessionId] = useState<Record<string, TodoPhaseWire[]>>({});
   // Goal panel — current goal snapshot + journal replay (live via
@@ -1637,7 +1741,7 @@ export function App() {
       if (bubbleId) removeItem(bubbleId);
       return Promise.reject(new Error('not connected'));
     }
-    const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+    const { promise, resolve, reject } = withResolvers<unknown>();
     const id = `c${++seqRef.current}`;
     // MultiSessionRuntimeManager contract: every command carries a top-level
     // sessionId so the listener routes it to the owning runtime. An explicit
@@ -1720,7 +1824,7 @@ export function App() {
       });
   }, [sendCommand, toast]);
 
-  /* ---------------- side chat + maintenance ---------------- */
+  /* ---------------- side chat ---------------- */
 
   /** Snapshot responses are applied to the sid captured at SEND time, so a
    *  session cutover mid-poll can never mis-route the reply. */
@@ -1785,9 +1889,6 @@ export function App() {
         if (!err.rpc) toast(`side chat send failed: ${err.message}`, true);
       });
   }, [sendCommand, toast]);
-
-  /** Maintenance panel RPC: the panel receives sendCommand directly (its
-   *  commands target the active session via the top-level sessionId). */
 
   // Poll the side-chat snapshot while the panel is open (the side agent runs
   // detached; snapshots drain controller events on the server). The polled
@@ -2679,7 +2780,7 @@ export function App() {
     // Route every event to its session: explicit sessionId wins (backend
     // contract), else the active session. Background-session events update
     // ONLY the owning session's cache/unread — never the active panel's state
-    // (Todo/Goal/Workflow/Subagents/Side chat/Maintenance/model/thinking).
+    // (Todo/Goal/Workflow/Subagents/Side chat/model/thinking).
     const sid = frameSession(frame);
     const active = sid === sessionIdRef.current;
     const setStreaming = (on: boolean) => markStreamingFor(sid, on);
@@ -2899,7 +3000,7 @@ export function App() {
             openArgs.to = action.to;
           }
           setCodeReviewOpenArgs(openArgs);
-          setActivePanel('code-review');
+          openPanel('code-review', { force: true });
           return;
         }
 
@@ -3015,7 +3116,7 @@ export function App() {
         // Failed transport: retain the chips and budget for retry.
         if (!err.rpc) toast(`send failed: ${err.message}`, true);
       });
-  }, [attachments, flushComposerResize, pushItemFor, sendCommand, toast]);
+  }, [attachments, flushComposerResize, openPanel, pushItemFor, sendCommand, toast]);
 
   const abortActiveRun = useCallback(() => {
     const sid = sessionIdRef.current;
@@ -3085,6 +3186,45 @@ export function App() {
     },
     [toast],
   );
+  const onComposerPaste = useCallback(
+    (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const files = event.clipboardData.files;
+      if (files.length > 0) {
+        event.preventDefault();
+        void onFilesChosen(files);
+        return;
+      }
+
+      const plan = planLargeTextPaste(event.clipboardData.getData('text/plain'));
+      if (plan.type === 'native') return;
+
+      event.preventDefault();
+      if (plan.type === 'oversize') {
+        toast(`pasted text exceeds the attachment limit (${plan.size} bytes)`, true);
+        return;
+      }
+
+      const budget = intakeBudgetRef.current;
+      const classified = classifyAttachments(
+        [{ type: plan.attachment.mimeType, name: plan.attachment.name, size: plan.attachment.size }],
+        { currentCount: budget.count, currentWire: budget.wire },
+      );
+      if (classified.accepted.length === 0) {
+        const summary = formatSkipSummary(classified.skipped);
+        toast(summary ?? 'pasted text could not be attached', true);
+        return;
+      }
+
+      setAttachments((prev) => {
+        const next = [...prev, plan.attachment];
+        intakeBudgetRef.current = reconcileIntakeBudget(next);
+        return next;
+      });
+      toast(`large paste attached as ${PASTED_TEXT_ATTACHMENT_NAME}`);
+    },
+    [onFilesChosen, toast],
+  );
+
 
   const removeAttachment = useCallback((id: string) => {
     setAttachments((prev) => {
@@ -3634,6 +3774,64 @@ export function App() {
     forcePin();
   }, [sessionId, forcePin]);
 
+  // Keep the shared drawer CSS variable in sync with state (and the
+  // initial localStorage read). Mobile CSS ignores the variable.
+  useLayoutEffect(() => {
+    applyPanelDrawerVh(panelDrawerVh);
+  }, [panelDrawerVh]);
+
+  const onPanelResizerPointerDown = useCallback((e: PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    // Desktop only — mobile never shows the resizer, but guard anyway.
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) return;
+    e.preventDefault();
+    const target = e.currentTarget;
+    target.setPointerCapture(e.pointerId);
+    panelResizeDragRef.current = {
+      startY: e.clientY,
+      startVh: panelDrawerVhRef.current,
+    };
+  }, []);
+
+  const onPanelResizerPointerMove = useCallback((e: PointerEvent<HTMLDivElement>) => {
+    const drag = panelResizeDragRef.current;
+    if (!drag) return;
+    // Dragging the top edge UP increases height (negative dy → +vh).
+    const dyPx = drag.startY - e.clientY;
+    const dyVh = (dyPx / window.innerHeight) * 100;
+    const next = clampPanelDrawerVh(drag.startVh + dyVh);
+    panelDrawerVhRef.current = next;
+    setPanelDrawerVh(next);
+    applyPanelDrawerVh(next);
+  }, []);
+
+  const endPanelResizeDrag = useCallback((e: PointerEvent<HTMLDivElement>) => {
+    if (!panelResizeDragRef.current) return;
+    panelResizeDragRef.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* already released */
+    }
+    writeStoredPanelDrawerVh(panelDrawerVhRef.current);
+  }, []);
+
+  const onPanelResizerKeyDown = useCallback((e: KeyboardEvent<HTMLDivElement>) => {
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) return;
+    const step = e.shiftKey ? 10 : 2;
+    let next: number | null = null;
+    if (e.key === 'ArrowUp') next = clampPanelDrawerVh(panelDrawerVhRef.current + step);
+    else if (e.key === 'ArrowDown') next = clampPanelDrawerVh(panelDrawerVhRef.current - step);
+    else if (e.key === 'Home') next = PANEL_DRAWER_MAX_VH;
+    else if (e.key === 'End') next = PANEL_DRAWER_MIN_VH;
+    if (next == null) return;
+    e.preventDefault();
+    panelDrawerVhRef.current = next;
+    setPanelDrawerVh(next);
+    applyPanelDrawerVh(next);
+    writeStoredPanelDrawerVh(next);
+  }, []);
+
   /* ---------------- render ---------------- */
 
   return (
@@ -3727,10 +3925,10 @@ export function App() {
           onLifecycleResult={onLifecycleResult}
           activeSessionId={sessionId}
           unreadBySessionId={unreadBySessionId}
+          onCollapse={() => setSidebarOpen(false)}
           onReopenRail={() => setSidebarOpen(true)}
           onOpenManage={() => {
-            setSidebarOpen(false);
-            setActivePanel('session');
+            openPanel('session', { force: true });
           }}
           onSwitchComplete={() => {
             // Mobile: closing the drawer after a pick; desktop keeps the rail.
@@ -3744,7 +3942,8 @@ export function App() {
                 className={activePanel === 'todo' ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
                 aria-pressed={activePanel === 'todo'}
                 title="Todo DAG panel (phases, tasks, dependencies, live updates)"
-                onClick={() => setActivePanel(activePanel === 'todo' ? '' : 'todo')}
+                aria-label={activePanel === 'todo' ? 'Close Todos panel' : 'Open Todos panel'}
+                onClick={() => openPanel('todo')}
               >
                 Todos
               </button>
@@ -3754,7 +3953,8 @@ export function App() {
                 className={activePanel === 'goal' ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
                 aria-pressed={activePanel === 'goal'}
                 title="Goal panel (objective, status, token budget, pins, journal)"
-                onClick={() => setActivePanel(activePanel === 'goal' ? '' : 'goal')}
+                aria-label={activePanel === 'goal' ? 'Close Goal panel' : 'Open Goal panel'}
+                onClick={() => openPanel('goal')}
               >
                 Goal
               </button>
@@ -3764,7 +3964,8 @@ export function App() {
                 className={activePanel === 'workflow' ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
                 aria-pressed={activePanel === 'workflow'}
                 title="Workflow panel (list, detail, live workers, create/pause/resume/cancel/integrate/remove)"
-                onClick={() => setActivePanel(activePanel === 'workflow' ? '' : 'workflow')}
+                aria-label={activePanel === 'workflow' ? 'Close Workflows panel' : 'Open Workflows panel'}
+                onClick={() => openPanel('workflow')}
               >
                 Workflows
               </button>
@@ -3774,19 +3975,10 @@ export function App() {
                 className={activePanel === 'sidechat' ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
                 aria-pressed={activePanel === 'sidechat'}
                 title="Side chat: parallel /btw sessions (own tab, transcript, prompt)"
-                onClick={() => setActivePanel(activePanel === 'sidechat' ? '' : 'sidechat')}
+                aria-label={activePanel === 'sidechat' ? 'Close Side chat panel' : 'Open Side chat panel'}
+                onClick={() => openPanel('sidechat')}
               >
                 Side chat
-              </button>
-              <button
-                id="maintenance-toggle-btn"
-                type="button"
-                className={activePanel === 'maintenance' ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
-                aria-pressed={activePanel === 'maintenance'}
-                title="Maintenance: compact (A→B tokens), snapcompact, rewind, handoff, queue"
-                onClick={() => setActivePanel(activePanel === 'maintenance' ? '' : 'maintenance')}
-              >
-                Maintain
               </button>
               <button
                 id="subagents-toggle-btn"
@@ -3794,7 +3986,8 @@ export function App() {
                 className={activePanel === 'subagents' ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
                 aria-pressed={activePanel === 'subagents'}
                 title="Subagents: live jobs (id/type/status/activity/elapsed), spawn task, hub message, cancel, output view"
-                onClick={() => setActivePanel(activePanel === 'subagents' ? '' : 'subagents')}
+                aria-label={activePanel === 'subagents' ? 'Close Subagents panel' : 'Open Subagents panel'}
+                onClick={() => openPanel('subagents')}
               >
                 Subagents
               </button>
@@ -3804,7 +3997,8 @@ export function App() {
                 className={activePanel === 'personas' ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
                 aria-pressed={activePanel === 'personas'}
                 title="Personas: persistent persona definitions (list/view/create/edit/remove/purge/select/run)"
-                onClick={() => setActivePanel(activePanel === 'personas' ? '' : 'personas')}
+                aria-label={activePanel === 'personas' ? 'Close Personas panel' : 'Open Personas panel'}
+                onClick={() => openPanel('personas')}
               >
                 Personas
               </button>
@@ -3814,7 +4008,8 @@ export function App() {
                 className={activePanel === 'session' ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
                 aria-pressed={activePanel === 'session'}
                 title="Session panel: current session info, new/switch/fork/clone/rename"
-                onClick={() => setActivePanel(activePanel === 'session' ? '' : 'session')}
+                aria-label={activePanel === 'session' ? 'Close Session panel' : 'Open Session panel'}
+                onClick={() => openPanel('session')}
               >
                 Session
               </button>
@@ -3824,7 +4019,8 @@ export function App() {
                 className={activePanel === 'settings' ? 'panel-toggle panel-toggle--open' : 'panel-toggle'}
                 aria-pressed={activePanel === 'settings'}
                 title="Settings panel: browse by category, typed edit, draft/apply"
-                onClick={() => setActivePanel(activePanel === 'settings' ? '' : 'settings')}
+                aria-label={activePanel === 'settings' ? 'Close Settings panel' : 'Open Settings panel'}
+                onClick={() => openPanel('settings')}
               >
                 Settings
               </button>
@@ -3853,6 +4049,7 @@ export function App() {
             case 'user': {
               const userImagesList = item.images ?? [];
               const analysis = item.analysis;
+              const largeText = item.text !== '' ? largeTextDisplay(item.text) : null;
               return (
                 <div key={item.id} className={`msg msg--user${item.optimistic ? ' optimistic' : ''}`}>
                   {userImagesList.length > 0 && (
@@ -3864,14 +4061,20 @@ export function App() {
                           src={`data:${image.mimeType};base64,${image.data}`}
                           alt="Attached image"
                           loading="lazy"
-                          onLoad={pinIfPinned}
                         />
                       ))}
                     </div>
                   )}
-                  {item.text !== '' && (
+                  {largeText ? (
+                    <details className="msg--user__large-text">
+                      <summary>
+                        Large message · {largeText.characters} characters · {largeText.bytes} bytes
+                      </summary>
+                      <pre>{largeText.preview}</pre>
+                    </details>
+                  ) : item.text !== '' ? (
                     <MarkdownBody className="msg--user__text" text={item.text} onLayoutChange={pinIfPinned} />
-                  )}
+                  ) : null}
                   {analysis && (
                     <details className="msg--user__analysis">
                       <summary className="msg--user__analysis-summary">
@@ -3937,11 +4140,33 @@ export function App() {
 
       {/* panel mount point — every panel is KEYED by (panel, session) so its
           internal drafts/controllers (todo form, goal objective, workflow
-          create fields, side-chat prompt, settings draft, maintenance result,
-          subagent message drafts) can never survive an A→B session switch as
+          create fields, side-chat prompt, settings draft, subagent message
+          drafts) can never survive an A→B session switch as
           though they belonged to B. Each panel re-fetches from the backend
           for the active session on mount (sendCommand injects the top-level
-          sessionId). */}
+          sessionId).
+
+          Ordinary panels share ONE desktop height resizer (ARIA separator)
+          mounted here — never per-panel handlers. Code review is excluded
+          (full-viewport, owns its own thread-column resizer). */}
+      {activePanel !== '' && activePanel !== 'code-review' && (
+        <div
+          id="panel-drawer-resizer"
+          className="panel-drawer-resizer"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize panel height"
+          aria-valuemin={PANEL_DRAWER_MIN_VH}
+          aria-valuemax={PANEL_DRAWER_MAX_VH}
+          aria-valuenow={Math.round(panelDrawerVh)}
+          tabIndex={0}
+          onPointerDown={onPanelResizerPointerDown}
+          onPointerMove={onPanelResizerPointerMove}
+          onPointerUp={endPanelResizeDrag}
+          onPointerCancel={endPanelResizeDrag}
+          onKeyDown={onPanelResizerKeyDown}
+        />
+      )}
       {activePanel === 'todo' && (
         <TodoPanel
           key={`todo:${sessionId ?? ''}`}
@@ -3990,13 +4215,6 @@ export function App() {
           onSwitch={sideChatSwitch}
           onClose={sideChatClose}
           onPrompt={sideChatPrompt}
-          onClosePanel={() => setActivePanel('')}
-        />
-      )}
-      {activePanel === 'maintenance' && (
-        <MaintenancePanel
-          key={`maintenance:${sessionId ?? ''}`}
-          rpc={sendCommand}
           onClosePanel={() => setActivePanel('')}
         />
       )}
@@ -4163,15 +4381,10 @@ export function App() {
                 }
               }}
               onInput={(e) => autoResize(e.currentTarget)}
-              // Paste: only intercept when the clipboard carries FILE items
-              // (e.g. a screenshot). Plain text paste is left untouched.
-              onPaste={(e) => {
-                const files = e.clipboardData?.files;
-                if (files && files.length > 0) {
-                  e.preventDefault();
-                  void onFilesChosen(files);
-                }
-              }}
+              // File paste uses the normal attachment reader. Large plain-text
+              // paste becomes a text attachment so Chromium never lays out
+              // millions of textarea glyphs on the main thread.
+              onPaste={onComposerPaste}
             />
         <div id="composer-buttons">
           <button

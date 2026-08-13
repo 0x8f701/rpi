@@ -272,6 +272,8 @@ interface SessionSidebarProps {
   unreadBySessionId?: Record<string, number>;
   /** Feature nav (panel toggles) rendered at the top of the rail/drawer. */
   featureNav?: React.ReactNode;
+  /** Collapse the desktop rail (or close the mobile drawer). */
+  onCollapse: () => void;
   /** Reopen the desktop rail from its collapsed strip. */
   onReopenRail: () => void;
   /** Open the full Session panel (detail + rename + fork/clone). */
@@ -286,6 +288,7 @@ export function SessionSidebar({
   activeSessionId,
   unreadBySessionId,
   featureNav,
+  onCollapse,
   onReopenRail,
   onOpenManage,
   onSwitchComplete,
@@ -425,22 +428,38 @@ export function SessionSidebar({
         <button
           id="rail-reopen-btn"
           type="button"
+          className="session-sidebar__icon-btn"
           title="Expand the session sidebar"
+          aria-label="Expand the session sidebar"
           onClick={onReopenRail}
         >
           »
         </button>
-        <button
-          id="sidebar-new-session-btn"
-          type="button"
-          title="Start a fresh session (new_session)"
-          onClick={() =>
-            run(() => sendCommand({ type: 'new_session' })).then(onSwitchComplete).catch(() => {})
-          }
-          disabled={busy}
-        >
-          New
-        </button>
+        <div className="session-sidebar__head-actions" role="toolbar" aria-label="Session actions">
+          <button
+            id="sidebar-new-session-btn"
+            type="button"
+            className="session-sidebar__primary-btn"
+            title="Start a fresh session"
+            aria-label="Start a fresh session"
+            onClick={() =>
+              run(() => sendCommand({ type: 'new_session' })).then(onSwitchComplete).catch(() => {})
+            }
+            disabled={busy}
+          >
+            New
+          </button>
+          <button
+            id="sidebar-collapse-btn"
+            type="button"
+            className="session-sidebar__icon-btn"
+            title="Collapse the session sidebar"
+            aria-label="Collapse the session sidebar"
+            onClick={onCollapse}
+          >
+            «
+          </button>
+        </div>
       </header>
 
       {error !== '' && <div className="session-sidebar__error">{safeText(error)}</div>}
@@ -564,7 +583,9 @@ export function SessionSidebar({
         <button
           id="sidebar-manage-btn"
           type="button"
+          className="session-sidebar__secondary-btn"
           title="Open the session panel (info, rename, fork, clone)"
+          aria-label="Open session management panel"
           onClick={onOpenManage}
         >
           Manage session…

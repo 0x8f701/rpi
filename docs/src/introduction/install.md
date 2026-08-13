@@ -53,14 +53,14 @@ installer fails without changing the existing installation.
 Pin both the installer script and the requested release tag:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.10/install.sh | bash -s -- --version v0.2.10
+curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/v0.2.11/install.sh | bash -s -- --version v0.2.11
 ```
 
 On Windows, download the script from the same tag before invoking it:
 
 ```powershell
-irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.10/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.10
+irm https://raw.githubusercontent.com/0x8f701/rpi/v0.2.11/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File ./install.ps1 -Version v0.2.11
 ```
 
 ## What the installer does
@@ -100,17 +100,21 @@ and `rpi update --self` all apply the same scoping.
 
 ## Developer source build
 
-This is not the normal installation path. It requires Rust **1.88** or later.
+This is not the normal installation path. Building from source requires Rust
+**1.88** or later and Node.js **20** (with npm): the embedded web client
+bundle (`crates/pi-cli/web/dist/`, gitignored build output) must be generated
+before the first cargo command.
 
 ```sh
 git clone https://github.com/0x8f701/rpi.git
 cd rpi
+(cd crates/pi-cli/web && npm ci && npm run build)
 cargo install --path crates/pi-cli --locked --bin rpi
 rpi --version
 ```
 
 To build a distribution binary in-tree without installing into Cargo's bin
-directory:
+directory (the web bundle must already be present from the step above):
 
 ```sh
 cargo build --package pi-cli --bin rpi --profile release-dist --locked
@@ -119,6 +123,9 @@ cargo build --package pi-cli --bin rpi --profile release-dist --locked
 
 The JSONL RPC control plane is the `rpi rpc` subcommand (≡ `--mode rpc`), so no
 companion binary is built or installed separately.
+
+The released binaries embed the bundle, so **binary installs (installer,
+release asset, self-update) do not require Node.js**.
 
 ## Verifying a downloaded release
 

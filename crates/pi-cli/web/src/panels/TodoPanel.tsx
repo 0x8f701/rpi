@@ -165,7 +165,7 @@ export function TodoPanel({ phases, onOp, onClose }: TodoPanelProps) {
           <span className="todo-panel__counts-item">{counts.blocked} blocked</span> ·{' '}
           <span className="todo-panel__counts-item">{counts.completed} done</span>
         </span>
-        <button id="todo-close-btn" type="button" className="todo-panel__close" title="Close todos panel" onClick={onClose}>
+        <button id="todo-close-btn" type="button" className="todo-panel__close" title="Close todos panel" aria-label="Close todos panel" onClick={onClose}>
           ×
         </button>
       </div>

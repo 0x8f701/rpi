@@ -2,13 +2,15 @@
 //!
 //! `crates/pi-cli/web/` is a vite + react + typescript project. Its
 //! production build (`npm run build`, vite-plugin-singlefile) emits one
-//! self-contained `web/dist/index.html` (JS + CSS inlined), which is checked
-//! in so `cargo build` never requires node — release CI, cargo-install users,
-//! and offline builders all get the committed artifact. This build script
-//! turns `web/dist/` into an embedded asset table
+//! self-contained `web/dist/index.html` (JS + CSS inlined). `web/dist/` is
+//! generated build output and is not tracked by git, so `cargo build`
+//! requires it to have been generated first: CI generates it from a clean
+//! checkout before any cargo command, and a local source build needs a
+//! one-time `npm ci && npm run build` inside `crates/pi-cli/web`. This build
+//! script turns `web/dist/` into an embedded asset table
 //! (`path -> (mime, bytes)`) at `$OUT_DIR/web_assets.rs`.
 //!
-//! To rebuild the assets: `cd crates/pi-cli/web && npm install && npm run build`.
+//! To generate the assets: `cd crates/pi-cli/web && npm ci && npm run build`.
 
 use std::{
     env,
@@ -23,15 +25,16 @@ fn main() {
     let dist = manifest.join("web").join("dist");
     let files = match collect_files(&dist, &dist) {
         Ok(files) if files.is_empty() => panic!(
-            "no web client assets found in {}: run `npm install && npm run build` inside crates/pi-cli/web \
-             (the committed dist/ artifact is missing)",
+            "no web client assets found in {}: web/dist is generated build output and not \
+             tracked by git — generate it first with `npm ci && npm run build` inside \
+             crates/pi-cli/web",
             dist.display()
         ),
         Ok(files) => files,
         Err(err) => panic!(
             "failed to collect web client assets from {}: {err}\n\
-             run `npm install && npm run build` inside crates/pi-cli/web and make sure the committed \
-             dist/ artifact is present and complete",
+             generate it with `npm ci && npm run build` inside crates/pi-cli/web and make sure \
+             web/dist is present and complete (it is generated output, not tracked by git)",
             dist.display()
         ),
     };

@@ -899,7 +899,11 @@ fn repl_goal_lifecycle_create_pause_resume_complete_and_invalid_transitions() {
     );
 
     let paused = repl.command("/goal pause");
-    assert_eq!(paused.trim(), "paused · 0/100 tokens · ship the widget");
+    assert_eq!(
+        paused.trim(),
+        "paused (manually paused) · 0/100 tokens · ship the widget",
+        "manual pause must explain the human reason"
+    );
 
     thread::sleep(Duration::from_secs(1));
 
@@ -1508,13 +1512,14 @@ fn pty_tui_goal_panel_and_footer_chip_lifecycle() {
     // wide-glyph-aware Screen models 🎯/📁 as two cells so those unchanged
     // cells land on the correct columns and the chip reads `⏸ Goal 0/100`.
     // Synchronize first on the authoritative composer status line
-    // (`paused · 0/100 tokens · ship the widget`, from `state.status`) via the
-    // cumulative RAW PTY stream as a best-effort settle barrier — the in-flight
-    // goal turn's abort can clear `state.status` before a frame renders, so it
-    // is not a reliable pass/fail signal — then wait for the footer chip as
+    // (`paused (manually paused) · 0/100 tokens · ship the widget`, from
+    // `state.status`) via the cumulative RAW PTY stream as a best-effort
+    // settle barrier — the in-flight goal turn's abort can clear
+    // `state.status` before a frame renders, so it is not a reliable
+    // pass/fail signal — then wait for the footer chip as
     // the authoritative paused-status + `0/100` budget check: one snapshot
     // showing ⏸ without the active 🎯 chip.
-    let _ = probe.wait_for("paused · 0/100 tokens · ship the widget", Duration::from_secs(8));
+    let _ = probe.wait_for("paused (manually paused) · 0/100 tokens · ship the widget", Duration::from_secs(8));
     assert!(
         wait_for_screen_transition(
             &probe,

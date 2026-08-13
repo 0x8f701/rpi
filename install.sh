@@ -9,7 +9,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/0x8f701/rpi/master/install.sh | sh
-#   sh install.sh --version v0.2.10      # pin a specific release
+#   sh install.sh --version v0.2.11      # pin a specific release
 #
 # Environment:
 #   PI_HOME                install root (default: ~/.rpi)
@@ -131,38 +131,59 @@ is_fixed_github_api_url() {
 }
 
 if command -v curl >/dev/null 2>&1; then
-    fetch() {
+    fetch_once() {
         if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$1"; then
-            curl -fsSL -H "$AUTH_HDR" -o "$2" "$1" || return 1
+            curl -fsSL -H "$AUTH_HDR" -o "$2" "$1"
         else
-            curl -fsSL -o "$2" "$1" || return 1
+            curl -fsSL -o "$2" "$1"
         fi
     }
-    fetch_stdout() {
+    fetch_stdout_once() {
         if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$1"; then
-            curl -fsSL -H "$AUTH_HDR" "$1" || return 1
+            curl -fsSL -H "$AUTH_HDR" "$1"
         else
-            curl -fsSL "$1" || return 1
+            curl -fsSL "$1"
         fi
     }
 elif command -v wget >/dev/null 2>&1; then
-    fetch() {
+    fetch_once() {
         if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$1"; then
-            wget -q --header="$AUTH_HDR" -O "$2" "$1" || return 1
+            wget -q --header="$AUTH_HDR" -O "$2" "$1"
         else
-            wget -q -O "$2" "$1" || return 1
+            wget -q -O "$2" "$1"
         fi
     }
-    fetch_stdout() {
+    fetch_stdout_once() {
         if [ -n "$AUTH_HDR" ] && is_fixed_github_api_url "$1"; then
-            wget -q --header="$AUTH_HDR" -O - "$1" || return 1
+            wget -q --header="$AUTH_HDR" -O - "$1"
         else
-            wget -q -O - "$1" || return 1
+            wget -q -O - "$1"
         fi
     }
 else
     err "neither curl nor wget found"
 fi
+
+fetch() {
+    attempt=1
+    while ! fetch_once "$1" "$2"; do
+        [ "$attempt" -lt 3 ] || return 1
+        attempt=$((attempt + 1))
+        printf 'Download attempt failed; retrying (%s/3)...\n' "$attempt" >&2
+        sleep 1 || return 1
+    done
+}
+
+fetch_stdout() {
+    attempt=1
+    while ! response="$(fetch_stdout_once "$1")"; do
+        [ "$attempt" -lt 3 ] || return 1
+        attempt=$((attempt + 1))
+        printf 'Request attempt failed; retrying (%s/3)...\n' "$attempt" >&2
+        sleep 1 || return 1
+    done
+    printf '%s' "$response"
+}
 
 # ── SHA-256 tool ─────────────────────────────────────────────────────────────
 if command -v sha256sum >/dev/null 2>&1; then
@@ -172,6 +193,16 @@ elif command -v shasum >/dev/null 2>&1; then
 else
     err "neither sha256sum nor shasum found"
 fi
+
+release_install_lock() {
+    [ "${LOCK_HELD:-0}" = 1 ] || return 0
+    [ -n "${LOCKFILE:-}" ] || return 0
+    if [ -f "$LOCKFILE" ]; then
+        owner="$(cat "$LOCKFILE" 2>/dev/null || true)"
+        [ "$owner" = "$$" ] && rm -f "$LOCKFILE" 2>/dev/null
+    fi
+    LOCK_HELD=0
+}
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rpi-install.XXXXXX")"
 STAGED=""
@@ -405,15 +436,6 @@ acquire_install_lock() {
         sleep 1 || return 1
         waited=$((waited + 1))
     done
-}
-release_install_lock() {
-    [ "${LOCK_HELD:-0}" = 1 ] || return 0
-    [ -n "${LOCKFILE:-}" ] || return 0
-    if [ -f "$LOCKFILE" ]; then
-        owner="$(cat "$LOCKFILE" 2>/dev/null || true)"
-        [ "$owner" = "$$" ] && rm -f "$LOCKFILE" 2>/dev/null
-    fi
-    LOCK_HELD=0
 }
 acquire_install_lock \
     || err "timed out after ${LOCK_WAIT_SECONDS}s waiting for another rpi install (lock $LOCKFILE, owner $LOCK_OWNER); retry after it finishes"

@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, bail};
-use pi_coding::{Application, GoalActivationOutcome, GoalLifecycle, GoalState};
+use pi_coding::{Application, Goal, GoalActivationOutcome, GoalLifecycle, GoalPauseReason, GoalState};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InteractiveGoalCommand {
@@ -163,22 +163,42 @@ pub fn format_goal_pins(state: &GoalState) -> String {
         .join("\n")
 }
 
+/// Human-readable reason a goal is paused. The manual and resume-safety
+/// reasons stay recoverable with `/goal resume`; a budget-exhausted pause
+/// cannot be resumed and is never presented as resumable.
+#[must_use]
+pub fn format_pause_reason(reason: GoalPauseReason) -> &'static str {
+    match reason {
+        GoalPauseReason::Manual => "manually paused",
+        GoalPauseReason::BudgetExhausted => "budget exhausted; cannot resume",
+        GoalPauseReason::ResumeSafety => "session resumed; run /goal resume",
+    }
+}
+
+/// Lifecycle label for a goal. Paused goals carry their human-readable
+/// pause reason so the user never has to guess why work is suspended.
+fn lifecycle_label(goal: &Goal) -> String {
+    match goal.lifecycle {
+        GoalLifecycle::Active => "active".to_owned(),
+        GoalLifecycle::Paused => goal.pause_reason.map_or_else(
+            || "paused".to_owned(),
+            |reason| format!("paused ({})", format_pause_reason(reason)),
+        ),
+        GoalLifecycle::Completed => "completed".to_owned(),
+        GoalLifecycle::Dropped => "dropped".to_owned(),
+    }
+}
+
 #[must_use]
 pub fn format_goal_state(state: &GoalState) -> String {
     let Some(goal) = &state.current else {
         return "no goal".to_owned();
     };
-    let lifecycle = match goal.lifecycle {
-        GoalLifecycle::Active => "active",
-        GoalLifecycle::Paused => "paused",
-        GoalLifecycle::Completed => "completed",
-        GoalLifecycle::Dropped => "dropped",
-    };
     let budget = goal.token_budget.map_or_else(
         || format!("{} tokens used", goal.usage.tokens_used),
         |budget| format!("{}/{} tokens", goal.usage.tokens_used, budget),
     );
-    format!("{lifecycle} · {budget} · {}", goal.objective)
+    format!("{} · {budget} · {}", lifecycle_label(goal), goal.objective)
 }
 
 #[must_use]
@@ -186,19 +206,15 @@ pub fn format_goal_details(state: &GoalState) -> String {
     let Some(goal) = &state.current else {
         return "No goal is active. Choose Create goal to set an objective.".to_owned();
     };
-    let lifecycle = match goal.lifecycle {
-        GoalLifecycle::Active => "active",
-        GoalLifecycle::Paused => "paused",
-        GoalLifecycle::Completed => "completed",
-        GoalLifecycle::Dropped => "dropped",
-    };
     let tokens = goal.token_budget.map_or_else(
         || format!("{} (no budget)", goal.usage.tokens_used),
         |budget| format!("{} / {budget}", goal.usage.tokens_used),
     );
     let mut details = format!(
-        "Objective: {}\nStatus: {lifecycle}\nTokens: {tokens}\nTime spent: {}s",
-        goal.objective, goal.usage.active_time_seconds
+        "Objective: {}\nStatus: {}\nTokens: {tokens}\nTime spent: {}s",
+        goal.objective,
+        lifecycle_label(goal),
+        goal.usage.active_time_seconds
     );
     if !goal.pins.is_empty() {
         details.push_str("\nPins:");
@@ -315,5 +331,71 @@ mod tests {
     fn formats_empty_goal_details_for_overlay() {
         let details = format_goal_details(&GoalState::default());
         assert_eq!(details, "No goal is active. Choose Create goal to set an objective.");
+    }
+
+    #[test]
+    fn formats_paused_goal_with_human_readable_reason() {
+        let state = |reason: &str| -> GoalState {
+            serde_json::from_value(serde_json::json!({
+                "current": {
+                    "id": "goal-1",
+                    "objective": "ship safely",
+                    "tokenBudget": 10,
+                    "lifecycle": "paused",
+                    "pauseReason": reason,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "usage": { "tokensUsed": 4, "activeTimeSeconds": 12 }
+                },
+                "revision": 2
+            }))
+            .expect("goal state json")
+        };
+
+        // Manual pause: plainly recoverable, reason explained.
+        let manual = state("manual");
+        let manual_line = format_goal_state(&manual);
+        assert!(manual_line.contains("manually paused"), "{manual_line}");
+        assert!(!manual_line.contains("run /goal resume"), "{manual_line}");
+
+        // Resume-safety pause: the exact recovery command is spelled out.
+        let safety = state("resume_safety");
+        let safety_line = format_goal_state(&safety);
+        let safety_details = format_goal_details(&safety);
+        assert!(safety_line.contains("session resumed; run /goal resume"), "{safety_line}");
+        assert!(safety_details.contains("session resumed; run /goal resume"), "{safety_details}");
+
+        // Budget-exhausted pause: clearly exhausted and not resumable.
+        let exhausted = state("budget_exhausted");
+        let exhausted_line = format_goal_state(&exhausted);
+        let exhausted_details = format_goal_details(&exhausted);
+        assert!(exhausted_line.contains("budget exhausted; cannot resume"), "{exhausted_line}");
+        assert!(exhausted_details.contains("budget exhausted; cannot resume"), "{exhausted_details}");
+        assert!(!exhausted_line.contains("run /goal resume"), "{exhausted_line}");
+
+        // Active goals keep the plain lifecycle label.
+        let active: GoalState = serde_json::from_value(serde_json::json!({
+            "current": {
+                "id": "goal-1",
+                "objective": "ship safely",
+                "tokenBudget": 10,
+                "lifecycle": "active",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "usage": { "tokensUsed": 4, "activeTimeSeconds": 12 }
+            },
+            "revision": 1
+        }))
+        .expect("goal state json");
+        assert!(
+            format_goal_state(&active).starts_with("active · 4/10 tokens · ship safely"),
+            "{}",
+            format_goal_state(&active)
+        );
+        assert!(
+            format_goal_details(&active).contains("Status: active"),
+            "{}",
+            format_goal_details(&active)
+        );
     }
 }

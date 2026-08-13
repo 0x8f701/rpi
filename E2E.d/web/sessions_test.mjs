@@ -184,7 +184,24 @@ async function waitForEmptyView(page, id) {
   );
 }
 
+// Wait until the active session is user-visibly idle. Enter while a run is
+// still active is mapped to steer (App.tsx), so sequential NEW prompts must
+// only be issued after the stream badge clears.
+async function waitForIdle(page, id, timeoutMs = 30000) {
+  await waitFor(
+    page,
+    () => {
+      const badge = document.getElementById('stream-badge');
+      return !badge || badge.hidden === true;
+    },
+    id,
+    timeoutMs
+  );
+}
+
 async function promptAndWait(page, prompt, reply, id, timeoutMs = 30000) {
+  // Intended as a new prompt (not mid-stream steer): establish idle first.
+  await waitForIdle(page, `${id}: pre-send idle`, timeoutMs);
   await page.fill('#prompt-input', prompt);
   await page.press('#prompt-input', 'Enter');
   await waitFor(page, (r) => document.body.textContent.includes(r), id, timeoutMs, reply);
@@ -212,8 +229,8 @@ const FEATURE_BUTTON_IDS = [
   'goal-panel-btn',
   'workflow-toggle-btn',
   'sidechat-toggle-btn',
-  'maintenance-toggle-btn',
   'subagents-toggle-btn',
+  'personas-toggle-btn',
   'session-toggle-btn',
   'settings-toggle-btn',
 ];
@@ -234,6 +251,19 @@ async function assertNoHeaderFeatureButtons(page, id) {
   }, FEATURE_BUTTON_IDS);
   if (missing.length > 0) {
     fail(`${id}: sidebar nav missing feature buttons: ${missing.join(', ')}`);
+  }
+  const layout = await page.evaluate(() => {
+    const nav = document.querySelector('.session-sidebar__nav');
+    if (!nav) return null;
+    const style = getComputedStyle(nav);
+    return {
+      count: nav.querySelectorAll(':scope > .panel-toggle').length,
+      columns: style.gridTemplateColumns.split(' ').filter(Boolean).length,
+      maintainPresent: nav.textContent.includes('Maintain'),
+    };
+  });
+  if (!layout || layout.count !== 8 || layout.columns !== 2 || layout.maintainPresent) {
+    fail(`${id}: sidebar nav must be exactly 8 items in 2 columns with no Maintain (${JSON.stringify(layout)})`);
   }
   record(id);
 }
@@ -402,18 +432,20 @@ async function main() {
     await waitFor(page, () => document.getElementById('session-panel') !== null, 'T6.4: session panel never opened from Manage');
     await page.click('#session-close-btn');
     await waitFor(page, () => document.getElementById('session-panel') === null, 'T6.4: session panel never closed');
-    // T6.4 (open+close the session panel via Manage) collapses the desktop
-    // rail; re-open it before the T4 New actions. Wait on the exact
-    // control we are about to click (the New button, which lives in the
-    // sidebar header), not on the nav, so the next click is observable.
-    await page.click('#rail-reopen-btn');
+    // T6.4: Manage open/close must leave the desktop rail open so New stays
+    // visible for the T4 create loop (do not click a hidden rail reopen).
     await waitFor(
       page,
       () => {
+        const nav = document.querySelector('.session-sidebar__nav');
+        const sidebar = document.querySelector('.session-sidebar');
         const button = document.getElementById('sidebar-new-session-btn');
-        return button !== null && getComputedStyle(button).display !== 'none';
+        if (!nav || !sidebar || !button) return false;
+        if (getComputedStyle(nav).display === 'none') return false;
+        if (getComputedStyle(button).display === 'none') return false;
+        return sidebar.getBoundingClientRect().width >= 200;
       },
-      'T6.4: New session control never restored after the session panel close'
+      'T6.4: desktop rail/New control not visible after session panel close'
     );
 
     /* ---------------- T4: 8-session cap, no eviction ---------------- */

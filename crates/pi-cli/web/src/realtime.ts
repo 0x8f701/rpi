@@ -16,6 +16,8 @@
  * channel.
  */
 
+import { withResolvers } from './withResolvers';
+
 /** PCM input sample rate the V1 session expects (24 kHz mono). A JSON number,
  *  not a string, so it serializes as `24000`. */
 export const REALTIME_AUDIO_SAMPLE_RATE = 24000;
@@ -215,7 +217,7 @@ export async function waitForIceGatheringComplete(
   },
 ): Promise<void> {
   if (pc.iceGatheringState === 'complete') return;
-  const { promise, resolve } = Promise.withResolvers<void>();
+  const { promise, resolve } = withResolvers<void>();
   let done = false;
   const finish = () => {
     if (done) return;

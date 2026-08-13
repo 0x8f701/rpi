@@ -23,29 +23,22 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      # Regression guard for the embedded web client: crates/pi-cli/build.rs
-      # embeds crates/pi-cli/web/dist/index.html (vite-plugin-singlefile output)
-      # so cargo builds never require node. The artifact MUST be present and
-      # tracked in the checkout — a clean checkout missing it makes build.rs
-      # panic — and it must be the ONLY file versioned under web/dist.
-      - name: Verify embedded web client artifact is versioned
-        shell: bash
-        run: |
-          test -f crates/pi-cli/web/dist/index.html
-          test "$(git ls-files crates/pi-cli/web/dist)" = "crates/pi-cli/web/dist/index.html"
-
+      # The embedded web client: crates/pi-cli/build.rs embeds
+      # crates/pi-cli/web/dist (vite-plugin-singlefile output). dist/ is
+      # generated build output and not tracked by git, so a clean checkout
+      # must generate it BEFORE the first cargo command — build.rs fails fast
+      # when it is missing.
       - name: Set up Node for Web build
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
 
-      - name: Verify embedded Web bundle matches source
+      - name: Generate embedded Web bundle from clean checkout
         shell: bash
         run: |
           cd crates/pi-cli/web
           npm ci --no-audit --no-fund
           npm run build
-          git diff --exit-code -- dist/index.html
 
       - name: Install Rust 1.88.0
         shell: bash

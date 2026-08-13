@@ -6,8 +6,9 @@
 //   RPI_TOKEN           token file content (served via rpi-auth.<token> subprotocol)
 //   RPI_PHASE           "ok" | "error"
 //   RPI_PROXY_EVIDENCE  mock-persisted proxy evidence JSON ({callId,
-//                       openaiAlpha, authPresent}) written when the Rust
-//                       realtime_create_call proxy reached the mock
+//                       openaiAlpha, authPresent, sessionHasModel})
+//                       written when the Rust realtime_create_call proxy
+//                       reached the mock
 //   RPI_CHROME          executable path of the system Chrome (optional)
 //   RPI_EVIDENCE        evidence dir for screenshots
 //
@@ -18,7 +19,8 @@
 //   R1  #mic-btn is in realtime mode; clicking dispatches the real
 //       realtime_create_call frame on the WS
 //   R2  the Rust proxy reached the mock: the evidence file records
-//       OpenAI-Alpha quicksilver=v2 + a Bearer token
+//       OpenAI-Alpha quicksilver=v2 + a Bearer token, and the create-call
+//       session is model-free (sessionHasModel must be exactly false)
 //   R3  the live overlay renders (#realtime-transcript with the
 //       .realtime-transcript__label "realtime voice") and
 //       #realtime-conn-state exposes a non-empty state bucket
@@ -232,6 +234,18 @@ async function main() {
     }
     if (proxy.authPresent !== true) fail('R2: proxy request missing the Bearer token');
     if (!proxy.callId || !proxy.callId.startsWith('rtc_')) fail(`R2: unexpected callId (${proxy.callId})`);
+    // R2 also requires the create-call session to be model-free: the proxy
+    // selects the model server-side, so a request carrying session.model is
+    // the exact regression this lane guards. The mock rejects such requests
+    // with a 400 and records sessionHasModel=true; a successful call must
+    // record exactly false. Requiring `=== false` (not merely falsy) means a
+    // stale mock that never writes the field cannot silently pass.
+    if (proxy.sessionHasModel === true) {
+      fail('R2: proxy request carried session.model (create-call session must be model-free)');
+    }
+    if (proxy.sessionHasModel !== false) {
+      fail(`R2: proxy evidence missing sessionHasModel=false (got ${proxy.sessionHasModel}) — stale mock without the model guard`);
+    }
 
     // ---- R3: live overlay + connection-state bucket ----
     await waitFor(

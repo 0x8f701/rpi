@@ -2,34 +2,40 @@
 // Parent owns selection, collapse set, snapshot-derived identity, and the
 // per-file loaded diff + visible-line window (Load more / Load full).
 //
-// The pane renders the loaded line stream in hunk cards (existing class/
-// selector contract) sliced to the visible window: a hunk that straddles the
-// window boundary renders only its in-window lines, hunks entirely beyond
-// the window are omitted until the window grows, and backend-loaded lines
-// beyond the snapshot's hunks render as a flat "continued" block. Load
-// more / Load full controls sit below the hunks while content remains.
+// The pane renders the effective hunks — the merged per-file hunks once
+// loaded (authoritative), the snapshot hunks before that — in hunk cards
+// (existing class/selector contract) sliced to the visible window: a hunk
+// that straddles the window boundary renders only its in-window lines and
+// hunks entirely beyond the window are omitted until the window grows. A
+// hunk is comment-SELECTABLE only when it is complete AND fully merged
+// (`loadedHunkReady`); page-split or byte-capped hunks render but their
+// header is disabled until the complete per-file hunk arrives. There is no
+// flat "continued" block: every rendered line belongs to a structured hunk.
+// Load more / Load full controls sit below the hunks while content remains.
 //
 // Line bodies are syntax-highlighted in bounded batches (one hljs call per
-// hunk / continued run) when the selected path maps to a registered
-// highlight.js language; fragments are balanced per line, textContent stays
-// identical to the plain renderer, and hostile input stays literal (hljs
-// escapes, exactly like renderFence). Meta lines and unknown/binary files
-// render as plain text.
+// hunk) when the selected path maps to a registered highlight.js language;
+// fragments are balanced per line, textContent stays identical to the plain
+// renderer, and hostile input stays literal (hljs escapes, exactly like
+// renderFence). Meta lines and unknown/binary files render as plain text.
 
-import { useMemo, type ReactNode } from 'react';
+import { memo, useMemo, type ReactNode } from 'react';
 import { safeText } from '../redact';
 import {
   FILE_DIFF_MAX_UI_LINES,
   type DiffFile,
-  type HunkIdentity,
+  type DiffHunk,
   type LoadedDiff,
+  type LoadedHunk,
   type ReviewThread,
   countThreadComments,
   findThreadForHunk,
   hunkIdentityFor,
-  hunkKey,
+  hunkIsComplete,
   hunkKeyFor,
   isDiffPlaceholder,
+  loadedHunkReady,
+  threadIsStreaming,
 } from '../codeReview';
 import { diffPathLanguage, highlightDiffLineFragments } from '../markdown';
 
@@ -95,7 +101,6 @@ export interface CodeReviewDiffPaneProps {
   filesCount: number;
   snapshotId: string;
   threads: ReviewThread[];
-  activeHunk: HunkIdentity | null;
   selectedHunkKey: string | null;
   collapsedHunks: Set<string>;
   isHidden: boolean;
@@ -110,15 +115,22 @@ export interface CodeReviewDiffPaneProps {
   onLoadFull: () => void;
 }
 
+/** True when a hunk may be selected/commented right now. */
+function hunkSelectable(hunk: DiffHunk | LoadedHunk): boolean {
+  if ('totalLines' in hunk && 'complete' in hunk) {
+    return loadedHunkReady(hunk as LoadedHunk);
+  }
+  return hunkIsComplete(hunk);
+}
+
 /** Selected-file header + per-hunk diff lines with explicit selection. */
-export function CodeReviewDiffPane({
+export const CodeReviewDiffPane = memo(function CodeReviewDiffPane({
   selectedFile,
   loadedDiff,
   windowLimit,
   filesCount,
   snapshotId,
   threads,
-  activeHunk,
   selectedHunkKey,
   collapsedHunks,
   isHidden,
@@ -132,17 +144,24 @@ export function CodeReviewDiffPane({
   onLoadMore,
   onLoadFull,
 }: CodeReviewDiffPaneProps) {
-  // Hunk line ranges over the snapshot portion of the loaded line stream;
-  // the visible window slices each hunk to its in-window lines.
+  // Effective hunk source: the merged per-file hunks once loaded (they
+  // replace the snapshot's structure — catalog stats/identity stay with the
+  // snapshot file entry), the snapshot hunks before that.
+  const effectiveHunks = useMemo(() => {
+    if (loadedDiff && loadedDiff.hunks.length > 0) return loadedDiff.hunks;
+    return selectedFile ? selectedFile.hunks : [];
+  }, [loadedDiff, selectedFile]);
+
+  // Hunk line ranges over the effective hunks; the visible window slices
+  // each hunk to its in-window lines.
   const hunksWithRanges = useMemo(() => {
-    if (!selectedFile) return [];
     let offset = 0;
-    return selectedFile.hunks.map((hunk) => {
+    return effectiveHunks.map((hunk) => {
       const range = { start: offset, end: offset + hunk.lines.length };
       offset = range.end;
       return { hunk, range };
     });
-  }, [selectedFile]);
+  }, [effectiveHunks]);
 
   // Registered highlight.js language inferred from the selected path; null
   // means plain rendering (unknown/plain-text/binary files).
@@ -170,29 +189,16 @@ export function CodeReviewDiffPane({
     return out;
   }, [hunksWithRanges, windowLimit, collapsedHunks, diffLanguage, selectedFile]);
 
-  // Backend-loaded lines beyond the snapshot's hunks, within the window.
-  const extraVisible = useMemo(() => {
-    if (!loadedDiff) return 0;
-    return Math.max(
-      0,
-      Math.min(loadedDiff.lines.length, windowLimit) - loadedDiff.snapshotLineCount,
-    );
-  }, [loadedDiff, windowLimit]);
-
-  // One batch highlight for the visible continued lines (aligned 1:1).
-  const extraFragments = useMemo(() => {
-    if (!loadedDiff || extraVisible <= 0 || !diffLanguage) return null;
-    const slice = loadedDiff.lines.slice(
-      loadedDiff.snapshotLineCount,
-      loadedDiff.snapshotLineCount + extraVisible,
-    );
-    return highlightDiffLineFragments(diffLanguage, highlightableTexts(slice));
-  }, [loadedDiff, extraVisible, diffLanguage]);
-
   const isPlaceholder = selectedFile ? isDiffPlaceholder(selectedFile) : false;
-  const placeholderEmpty = isPlaceholder && (loadedDiff?.lines.length ?? 0) === 0;
+  const hunksEmpty = effectiveHunks.length === 0;
+  // Diff data is still being fetched when the backend hunk set is not yet
+  // complete and no error/byte cap stopped it.
+  const loadingDiff =
+    !!loadedDiff &&
+    !loadedDiff.hunksComplete &&
+    !loadedDiff.byteCapped &&
+    !loadError;
   const byteCapped = loadedDiff?.byteCapped ?? false;
-  const loadedLineCount = loadedDiff?.lines.length ?? 0;
 
   return (
     <div
@@ -233,17 +239,23 @@ export function CodeReviewDiffPane({
           {selectedFile.binary && (
             <div className="code-review__empty">Binary file — no text diff</div>
           )}
-          {!selectedFile.binary && selectedFile.hunks.length === 0 && placeholderEmpty && (
+          {!selectedFile.binary && hunksEmpty && loadingDiff && (
             <div className="code-review__empty code-review__empty--loading">
-              {isLoadingMore
-                ? 'Loading diff…'
-                : "This file's diff was not included in the snapshot — it loads on demand."}
+              Loading diff…
             </div>
           )}
           {!selectedFile.binary &&
-            selectedFile.hunks.length === 0 &&
-            !placeholderEmpty &&
-            loadedLineCount === 0 && <div className="code-review__empty">No hunks in this file</div>}
+            hunksEmpty &&
+            !loadingDiff &&
+            isPlaceholder && (
+              <div className="code-review__empty">
+                This file's diff was not included in the snapshot — it loads on demand.
+              </div>
+            )}
+          {!selectedFile.binary &&
+            hunksEmpty &&
+            !loadingDiff &&
+            !isPlaceholder && <div className="code-review__empty">No hunks in this file</div>}
           <div className="code-review__hunks">
             {hunksWithRanges.map(({ hunk, range }) => {
               const key = hunkKeyFor(selectedFile, hunk);
@@ -251,15 +263,14 @@ export function CodeReviewDiffPane({
               const thread = findThreadForHunk(threads, identity);
               const threadCount = countThreadComments(thread);
               const isSelected = key === selectedHunkKey;
-              const isStreaming = Boolean(
-                thread?.streamingText || (activeHunk && hunkKey(activeHunk) === key),
-              );
+              const isStreaming = threadIsStreaming(thread);
               const collapsed = collapsedHunks.has(key);
               const visibleCount = Math.max(
                 0,
                 Math.min(range.end, windowLimit) - range.start,
               );
               if (visibleCount <= 0) return null;
+              const selectable = hunkSelectable(hunk);
               const visibleLines = hunk.lines.slice(0, visibleCount);
               const fragments = hunkFragments[key] ?? null;
               return (
@@ -272,8 +283,13 @@ export function CodeReviewDiffPane({
                       type="button"
                       className="code-review__hunk-header"
                       onClick={() => onSelectHunk(key)}
+                      disabled={!selectable}
                       aria-pressed={isSelected}
-                      title="Select this hunk to comment"
+                      title={
+                        selectable
+                          ? 'Select this hunk to comment'
+                          : 'This hunk is not fully loaded yet — it cannot be commented'
+                      }
                     >
                       {safeText(
                         hunk.header ||
@@ -316,40 +332,15 @@ export function CodeReviewDiffPane({
                         `${key}:${idx}`,
                         line,
                         fragments ? (fragments[idx] ?? null) : null,
-                        () => onSelectHunk(key),
+                        selectable ? () => onSelectHunk(key) : undefined,
                       ),
                     )}
                   </pre>
                 </div>
               );
             })}
-            {extraVisible > 0 && loadedDiff && (
-              <div className="code-review__hunk code-review__hunk--continued">
-                <div className="code-review__hunk-header-row">
-                  <span className="code-review__hunk-header code-review__hunk-header--muted">
-                    {loadedDiff.snapshotLineCount === 0
-                      ? 'loaded diff lines'
-                      : '… continued lines from the loaded page'}
-                  </span>
-                </div>
-                <pre className="code-review__hunk-lines">
-                  {loadedDiff.lines
-                    .slice(
-                      loadedDiff.snapshotLineCount,
-                      loadedDiff.snapshotLineCount + extraVisible,
-                    )
-                    .map((line, idx) =>
-                      renderLine(
-                        `continued:${idx}`,
-                        line,
-                        extraFragments ? (extraFragments[idx] ?? null) : null,
-                      ),
-                    )}
-                </pre>
-              </div>
-            )}
           </div>
-          {(canLoadMore || hardCapped || byteCapped) && (
+          {(canLoadMore || hardCapped || byteCapped || loadError) && (
             <div className="code-review__window" role="status">
               <div className="code-review__window-meta code-review__page-status">
                 {hardCapped
@@ -401,4 +392,4 @@ export function CodeReviewDiffPane({
       )}
     </div>
   );
-}
+});

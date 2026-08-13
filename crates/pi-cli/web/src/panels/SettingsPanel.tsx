@@ -365,7 +365,7 @@ export function SettingsPanel({ sendCommand, refreshState, token, onTokenChange,
         <button id="settings-refresh-btn" type="button" onClick={() => loadCatalog().catch(() => {})} disabled={busy}>
           Refresh
         </button>
-        <button id="settings-close-btn" type="button" onClick={onClose} title="Close panel">
+        <button id="settings-close-btn" type="button" className="panel-close" onClick={onClose} title="Close panel" aria-label="Close settings panel">
           ✕
         </button>
       </header>

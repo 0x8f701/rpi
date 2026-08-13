@@ -590,6 +590,55 @@ class UserMockServer(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(bad)
                 return
+            # Regression guard (web realtime_rpc lane R2): Codex Live
+            # create-call sessions must NOT carry a model — the proxy selects
+            # the model server-side, and a stale client that still sends
+            # session.model is exactly the regression this lane exists to
+            # catch. Reject such requests with the exact reported 400 body so
+            # the lane fails on the wire. Evidence records ONLY the
+            # sessionHasModel boolean — never the model value or the auth key.
+            # This contract check deliberately precedes the
+            # MOCK_REALTIME_ERROR knob below, whose 500 behavior is unchanged
+            # for the model-free sessions every lane sends.
+            session_has_model = session_value.get("model") is not None
+            if session_has_model:
+                alpha = self.headers.get("OpenAI-Alpha", "")
+                auth = self.headers.get("Authorization", "")
+                content_type = self.headers.get("Content-Type", "")
+                print(
+                    f"user-mock scenario={type(self).scenario} "
+                    f"realtime_create_call_rejected session.model present",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                evidence_file = os.environ.get("MOCK_REALTIME_EVIDENCE", "")
+                if evidence_file:
+                    try:
+                        with open(evidence_file, "w", encoding="utf-8") as handle:
+                            json.dump(
+                                {
+                                    "callId": "rtc_e2e-rejected",
+                                    "openaiAlpha": alpha,
+                                    "authPresent": bool(auth),
+                                    "contentType": content_type,
+                                    "sessionHasModel": True,
+                                },
+                                handle,
+                            )
+                    except OSError as error:
+                        print(
+                            f"user-mock scenario={type(self).scenario} "
+                            f"realtime_evidence_write_error={type(error).__name__}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                bad = b"Field session.model is not allowed for this Codex realtime session"
+                self.send_response(400)
+                self.send_header("content-type", "text/plain")
+                self.send_header("content-length", str(len(bad)))
+                self.end_headers()
+                self.wfile.write(bad)
+                return
             # Error-path knob (web realtime_rpc lane): MOCK_REALTIME_ERROR=1
             # makes the create-call endpoint reject with 500 so the Web
             # client's realtime_create_call proxy fails and the page surfaces
@@ -608,7 +657,9 @@ class UserMockServer(BaseHTTPRequestHandler):
             # Record the proxy's required request headers for the E2E
             # assertion (the web realtime coverage driver asserts
             # OpenAI-Alpha: quicksilver=v2, the Bearer token, and the JSON
-            # Content-Type reached the backend). Persisted when
+            # Content-Type reached the backend) plus the sessionHasModel
+            # guard boolean (always false here — the guard above already
+            # rejected model-carrying sessions with a 400). Persisted when
             # MOCK_REALTIME_EVIDENCE is set.
             alpha = self.headers.get("OpenAI-Alpha", "")
             auth = self.headers.get("Authorization", "")
@@ -630,6 +681,7 @@ class UserMockServer(BaseHTTPRequestHandler):
                                 "openaiAlpha": alpha,
                                 "authPresent": bool(auth),
                                 "contentType": content_type,
+                                "sessionHasModel": session_has_model,
                             },
                             handle,
                         )
@@ -1113,36 +1165,52 @@ class UserMockServer(BaseHTTPRequestHandler):
                     ]
                 )
             # Subagents-panel e2e: the spawned child's prompt carries the
-            # marker text, so stream slowly (~16s) and the job stays running
-            # long enough to assert live status, message, view output, open
-            # the running-job detail modal (accessibility + task/status/
-            # activity + non-empty recent history + Refresh + Escape/Close),
-            # and cancel deterministically. The chunk content is unchanged;
-            # only the inter-chunk cadence widens the live window.
+            # marker text. The FIRST request makes the child really call the
+            # `read` tool on the fixture's seed.txt (the runtime executes it,
+            # so the child transcript carries a concrete `assistant · read
+            # seed.txt` action — never a generic-only history); once that tool
+            # result is in the conversation, stream slowly (~16s) so the job
+            # stays running long enough to assert live status, message, view
+            # output, open the running-job detail modal (accessibility +
+            # task/status/activity + recent history carrying the concrete read
+            # target + Refresh + Escape/Close), and cancel deterministically.
+            # The chunk content is unchanged; only the inter-chunk cadence
+            # widens the live window.
             if "web-e2e-subagent" in message_text(body):
-                chunks = ["subagent-", "progress ", "step ", "one ", "complete ",
-                          "auditing ", "release ", "notes ", "almost ", "done"]
-                payloads = []
-                for index, chunk in enumerate(chunks):
-                    payloads.append(
-                        {
-                            "id": f"user-mock-{request_number}-{index}",
-                            "model": "user-mock",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": chunk},
-                                    "finish_reason": None if index < len(chunks) - 1 else "stop",
-                                }
-                            ],
-                            "usage": {"prompt_tokens": 8, "completion_tokens": len(chunk), "total_tokens": 8 + len(chunk)},
-                        }
-                    )
-                self.send_response(200)
-                self.send_header("content-type", "text/event-stream")
-                self.end_headers()
-                slow_stream_response(self.wfile, payloads, delay=1.8)
-                return None
+                if completed_tool_results(body, "read"):
+                    chunks = ["subagent-", "progress ", "step ", "one ", "complete ",
+                              "auditing ", "release ", "notes ", "almost ", "done"]
+                    payloads = []
+                    for index, chunk in enumerate(chunks):
+                        payloads.append(
+                            {
+                                "id": f"user-mock-{request_number}-{index}",
+                                "model": "user-mock",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": chunk},
+                                        "finish_reason": None if index < len(chunks) - 1 else "stop",
+                                    }
+                                ],
+                                "usage": {"prompt_tokens": 8, "completion_tokens": len(chunk), "total_tokens": 8 + len(chunk)},
+                            }
+                        )
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream")
+                    self.end_headers()
+                    slow_stream_response(self.wfile, payloads, delay=1.8)
+                    return None
+                return stream_response(
+                    [
+                        tool_call_payload(
+                            f"user-mock-{request_number}",
+                            f"call-read-seed-{request_number}",
+                            "read",
+                            {"path": "seed.txt"},
+                        )
+                    ]
+                )
             # Long-Chinese Task card child: the spawned DeepSeek child's system
             # prompt carries the shared Chinese CONTEXT section and its user
             # message the long-Chinese assignment, so this marker keeps the

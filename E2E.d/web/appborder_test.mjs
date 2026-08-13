@@ -1,5 +1,5 @@
-// Web app-main panel border regression lane (playwright half of
-// E2E.d/web/appborder.sh).
+// Web app-main panel border + shared drawer resize + sidebar collapse lane
+// (playwright half of E2E.d/web/appborder.sh).
 //
 // Environment:
 //   RPI_URL          http://127.0.0.1:<port>/web
@@ -18,10 +18,15 @@
 //       edges resolve to the LIGHT --border-strong (rgb(143,149,158))
 //   B3  rail collapse via #sidebar-toggle-btn keeps the .app-main border-left
 //       edge (single strong line at x=230 open and x=44 collapsed)
+//   B5  ordinary panel shared desktop resizer: pointer drag + keyboard
+//       (ArrowUp/Down/Home/End) + bounds (25–90vh) + localStorage key
+//       `rpi-panel-drawer-size` survives reload; ARIA separator present
+//   B6  sidebar header collapse (#sidebar-collapse-btn) folds the desktop
+//       rail to the reopen strip; #rail-reopen-btn restores; header ☰ still
+//       toggles. Mobile: collapse closes the drawer.
 //   B4  mobile (390x844): .app-main border-left/right-style == none (flush
-//       edges, no squeeze) and documentElement.scrollWidth <= clientWidth
-//       (tolerance 0 — the transcript's own internal overflow is excluded by
-//       measuring documentElement, never #transcript)
+//       edges, no squeeze), documentElement.scrollWidth <= clientWidth,
+//       and #panel-drawer-resizer is not shown for open ordinary panels
 
 import { chromium } from 'playwright';
 
@@ -154,16 +159,214 @@ async function main() {
     await page.screenshot({ path: `${evidence}/appborder-rail-collapsed.png`, fullPage: true });
     await page.click('#sidebar-toggle-btn');
 
-    // ---- B4: mobile flush edges + zero horizontal overflow ----
+    // ---- B5: shared ordinary-panel height resizer (desktop) ----
+    await page.click('#todos-toggle-btn');
+    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'B5: todo panel did not open');
+    await waitFor(
+      page,
+      () => document.getElementById('panel-drawer-resizer') !== null,
+      'B5: shared panel-drawer-resizer never mounted'
+    );
+    const b5aria = await page.evaluate(() => {
+      const r = document.getElementById('panel-drawer-resizer');
+      if (!r) return null;
+      return {
+        role: r.getAttribute('role'),
+        orientation: r.getAttribute('aria-orientation'),
+        min: r.getAttribute('aria-valuemin'),
+        max: r.getAttribute('aria-valuemax'),
+        now: Number(r.getAttribute('aria-valuenow') || '0'),
+        tabIndex: r.tabIndex,
+      };
+    });
+    if (!b5aria) fail('B5: resizer missing after todo open');
+    if (b5aria.role !== 'separator') fail(`B5: resizer role must be separator (got "${b5aria.role}")`);
+    if (b5aria.orientation !== 'horizontal') fail(`B5: resizer aria-orientation must be horizontal (got "${b5aria.orientation}")`);
+    if (b5aria.min !== '25' || b5aria.max !== '90') {
+      fail(`B5: resizer bounds must be 25–90 (got min=${b5aria.min} max=${b5aria.max})`);
+    }
+    if (!(b5aria.now >= 25 && b5aria.now <= 90)) {
+      fail(`B5: aria-valuenow out of bounds (${b5aria.now})`);
+    }
+    if (b5aria.tabIndex < 0) fail('B5: resizer must be keyboard-focusable (tabIndex >= 0)');
+
+    await page.focus('#panel-drawer-resizer');
+    await page.keyboard.press('End');
+    const afterEnd = await page.evaluate(() => {
+      const raw = getComputedStyle(document.documentElement).getPropertyValue('--panel-drawer-height').trim();
+      const stored = window.localStorage.getItem('rpi-panel-drawer-size');
+      const now = document.getElementById('panel-drawer-resizer')?.getAttribute('aria-valuenow');
+      return { raw, stored, now };
+    });
+    if (afterEnd.raw !== '25vh') fail(`B5: End key must set --panel-drawer-height to 25vh (got "${afterEnd.raw}")`);
+    if (afterEnd.stored !== '25') fail(`B5: End key must persist rpi-panel-drawer-size=25 (got "${afterEnd.stored}")`);
+    if (afterEnd.now !== '25') fail(`B5: End key must set aria-valuenow=25 (got "${afterEnd.now}")`);
+
+    await page.keyboard.press('Home');
+    const afterHome = await page.evaluate(() => {
+      const raw = getComputedStyle(document.documentElement).getPropertyValue('--panel-drawer-height').trim();
+      const stored = window.localStorage.getItem('rpi-panel-drawer-size');
+      return { raw, stored };
+    });
+    if (afterHome.raw !== '90vh') fail(`B5: Home key must set --panel-drawer-height to 90vh (got "${afterHome.raw}")`);
+    if (afterHome.stored !== '90') fail(`B5: Home key must persist rpi-panel-drawer-size=90 (got "${afterHome.stored}")`);
+
+    await page.keyboard.press('End');
+    const resizerBox = await page.locator('#panel-drawer-resizer').boundingBox();
+    if (!resizerBox) fail('B5: resizer has no bounding box');
+    const startX = resizerBox.x + resizerBox.width / 2;
+    const startY = resizerBox.y + resizerBox.height / 2;
+    await page.mouse.move(startX, startY);
+    await page.mouse.down();
+    await page.mouse.move(startX, startY - 120, { steps: 8 });
+    await page.mouse.up();
+    const afterDrag = await page.evaluate(() => {
+      const raw = getComputedStyle(document.documentElement).getPropertyValue('--panel-drawer-height').trim();
+      const m = raw.match(/^([\d.]+)vh$/);
+      const vh = m ? Number(m[1]) : NaN;
+      const stored = window.localStorage.getItem('rpi-panel-drawer-size');
+      const panel = document.getElementById('todo-panel');
+      const h = panel ? panel.getBoundingClientRect().height : 0;
+      return { raw, vh, stored, h, viewH: window.innerHeight };
+    });
+    if (!(afterDrag.vh > 25 && afterDrag.vh <= 90)) {
+      fail(`B5: pointer drag must grow height above 25vh within bounds (got vh=${afterDrag.vh}, raw="${afterDrag.raw}")`);
+    }
+    {
+      const storedN = Number(afterDrag.stored);
+      if (!(Number.isFinite(storedN) && Math.abs(storedN - afterDrag.vh) < 0.6)) {
+        fail(`B5: drag must persist rpi-panel-drawer-size≈${afterDrag.vh} (got "${afterDrag.stored}")`);
+      }
+    }
+    const expectedH = (afterDrag.vh / 100) * afterDrag.viewH;
+    if (Math.abs(afterDrag.h - expectedH) > 4) {
+      fail(`B5: todo-panel height ${afterDrag.h}px must track --panel-drawer-height ${afterDrag.raw} (~${expectedH}px)`);
+    }
+    const persistedVh = afterDrag.vh;
+    await page.screenshot({ path: `${evidence}/appborder-panel-resize.png`, fullPage: true });
+
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
+    await waitFor(page, () => document.getElementById('conn-state') !== null, 'B5 reload: conn-state missing');
+    await waitFor(
+      page,
+      () => document.getElementById('conn-state').dataset.state === 'on',
+      'B5 reload: WS did not reach connected'
+    );
+    await page.click('#todos-toggle-btn');
+    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'B5 reload: todo panel did not reopen');
+    const afterReload = await page.evaluate((want) => {
+      const raw = getComputedStyle(document.documentElement).getPropertyValue('--panel-drawer-height').trim();
+      const stored = window.localStorage.getItem('rpi-panel-drawer-size');
+      const m = raw.match(/^([\d.]+)vh$/);
+      const vh = m ? Number(m[1]) : NaN;
+      return { raw, stored, vh, want };
+    }, persistedVh);
+    if (!(Number.isFinite(afterReload.vh) && Math.abs(afterReload.vh - persistedVh) < 0.6)) {
+      fail(`B5: reload must restore --panel-drawer-height≈${persistedVh}vh (got "${afterReload.raw}", stored="${afterReload.stored}")`);
+    }
+    await page.click('#todo-close-btn');
+    await waitFor(page, () => document.getElementById('todo-panel') === null, 'B5: todo panel did not close');
+    await waitFor(
+      page,
+      () => document.getElementById('panel-drawer-resizer') === null,
+      'B5: resizer must unmount when no ordinary panel is open'
+    );
+
+    // ---- B6: sidebar header collapse + reopen (desktop) ----
+    await waitFor(
+      page,
+      () => document.getElementById('sidebar-collapse-btn') !== null,
+      'B6: sidebar header collapse button missing'
+    );
+    const railOpen = await page.evaluate(() =>
+      document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true
+    );
+    if (!railOpen) {
+      await page.click('#sidebar-toggle-btn');
+      await waitFor(
+        page,
+        () => document.querySelector('.app-layout--drawer-open') !== null,
+        'B6: could not open the rail before collapse'
+      );
+    }
+    await page.click('#sidebar-collapse-btn');
+    await waitFor(
+      page,
+      () => {
+        const layout = document.querySelector('.app-layout');
+        const reopen = document.getElementById('rail-reopen-btn');
+        const sidebar = document.querySelector('.session-sidebar');
+        if (!layout || !reopen || !sidebar) return false;
+        if (layout.classList.contains('app-layout--drawer-open')) return false;
+        if (getComputedStyle(reopen).display === 'none') return false;
+        return sidebar.getBoundingClientRect().width <= 60;
+      },
+      'B6: #sidebar-collapse-btn did not collapse the desktop rail to the reopen strip'
+    );
+    await page.click('#rail-reopen-btn');
+    await waitFor(
+      page,
+      () => {
+        const nav = document.querySelector('.session-sidebar__nav');
+        const sidebar = document.querySelector('.session-sidebar');
+        if (!nav || !sidebar) return false;
+        return getComputedStyle(nav).display !== 'none' && sidebar.getBoundingClientRect().width >= 200;
+      },
+      'B6: #rail-reopen-btn did not restore the sidebar after header collapse'
+    );
+    await page.click('#sidebar-toggle-btn');
+    await waitFor(
+      page,
+      () => document.querySelector('.app-layout--drawer-open') === null,
+      'B6: header toggle no longer collapses the rail'
+    );
+    await page.click('#sidebar-toggle-btn');
+    await waitFor(
+      page,
+      () => document.querySelector('.app-layout--drawer-open') !== null,
+      'B6: header toggle no longer reopens the rail'
+    );
+    await page.screenshot({ path: `${evidence}/appborder-sidebar-collapse.png`, fullPage: true });
+
+    // ---- B4: mobile flush edges + zero horizontal overflow + no resizer ----
     await page.setViewportSize({ width: 390, height: 844 });
     await page.waitForTimeout(300);
+    // Desktop left the rail open; on mobile that class means the drawer is
+    // already open — only click the toggle when it is closed.
+    const mobileOpenAlready = await page.evaluate(() =>
+      document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true
+    );
+    if (!mobileOpenAlready) {
+      await page.click('#sidebar-toggle-btn');
+    }
+    await waitFor(
+      page,
+      () => document.querySelector('.app-layout--drawer-open') !== null,
+      'B4: mobile drawer did not open'
+    );
+    // Close any ordinary panel left open so the resizer path is re-exercised
+    // from a clean open (and the drawer nav stays reachable).
+    const todoOpen = await page.evaluate(() => document.getElementById('todo-panel') !== null);
+    if (todoOpen) {
+      await page.click('#todo-close-btn');
+      await waitFor(page, () => document.getElementById('todo-panel') === null, 'B4: could not close leftover todo panel');
+    }
+    await page.click('#todos-toggle-btn');
+    await waitFor(page, () => document.getElementById('todo-panel') !== null, 'B4: mobile todo panel did not open');
     const b4 = await page.evaluate(() => {
       const cs = getComputedStyle(document.querySelector('.app-main'));
+      const resizer = document.getElementById('panel-drawer-resizer');
+      const resizerDisplay = resizer ? getComputedStyle(resizer).display : 'none';
+      const panel = document.getElementById('todo-panel');
+      const panelH = panel ? panel.getBoundingClientRect().height : 0;
       return {
         borderLeft: cs.borderLeftWidth + ' ' + cs.borderLeftStyle,
         borderRight: cs.borderRightWidth + ' ' + cs.borderRightStyle,
         scrollWidth: document.documentElement.scrollWidth,
         clientWidth: document.documentElement.clientWidth,
+        resizerDisplay,
+        panelH,
+        viewH: window.innerHeight,
       };
     });
     if (b4.borderLeft !== '0px none') fail(`B4: mobile .app-main border-left must be none (got "${b4.borderLeft}")`);
@@ -171,9 +374,36 @@ async function main() {
     if (b4.scrollWidth > b4.clientWidth) {
       fail(`B4: mobile horizontal overflow (scrollWidth ${b4.scrollWidth} > clientWidth ${b4.clientWidth})`);
     }
+    if (b4.resizerDisplay !== 'none') {
+      fail(`B4: mobile must hide #panel-drawer-resizer (display="${b4.resizerDisplay}")`);
+    }
+    if (Math.abs(b4.panelH - b4.viewH) > 8) {
+      fail(`B4: mobile todo-panel height ${b4.panelH} must fill the viewport (~${b4.viewH})`);
+    }
+    // Mobile Todo overlays the sidebar drawer. Close it and wait for unmount
+    // before re-opening/collapsing sidebar controls.
+    await page.click('#todo-close-btn');
+    await waitFor(page, () => document.getElementById('todo-panel') === null, 'B4: mobile todo panel did not close');
+    const mobileDrawerOpen = await page.evaluate(() =>
+      document.querySelector('.app-layout')?.classList.contains('app-layout--drawer-open') === true
+    );
+    if (!mobileDrawerOpen) {
+      await page.click('#sidebar-toggle-btn');
+      await waitFor(
+        page,
+        () => document.querySelector('.app-layout--drawer-open') !== null,
+        'B4: could not re-open mobile drawer for collapse check'
+      );
+    }
+    await page.click('#sidebar-collapse-btn');
+    await waitFor(
+      page,
+      () => document.querySelector('.app-layout--drawer-open') === null,
+      'B4: mobile #sidebar-collapse-btn did not close the drawer'
+    );
     await page.screenshot({ path: `${evidence}/appborder-mobile.png`, fullPage: true });
 
-    console.log('web-appborder: PASSED (desktop dark+light .app-main 1px solid --border-strong edges, header/footer edges, no rail seam, stable transcript surface, rail-collapse edge, mobile flush edges + zero overflow)');
+    console.log('web-appborder: PASSED (desktop dark+light .app-main edges, rail-collapse edge, shared panel resizer pointer/keyboard/bounds/reload, sidebar header collapse/reopen, mobile flush edges + no resizer + zero overflow)');
   } finally {
     await browser.close().catch(() => {});
   }

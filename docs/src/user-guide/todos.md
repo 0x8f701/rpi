@@ -59,27 +59,45 @@ check/commit pair so DAG execution and planning cannot race
 
 ## `/todo` and the Todo DAG panel
 
-In the TUI and REPL:
+In the TUI, bare `/todo` (or `/todo list`) opens the Todo DAG panel. The
+panel's overview header uses the same count terms as the detail page
+(`✓ N completed · O open · A active · B blocked`) and wraps at the pane
+width, so a narrow terminal never cuts a term mid-word. Humans can also
+advance tasks directly from the command line without a model:
 
 ```text
-/todo            # open the Todo DAG panel (TUI) / print the plan (REPL)
-/todo list       # print the plan
-/todo markdown   # print the plan as Markdown checklists
+/todo                        # open the Todo DAG panel (TUI)
+/todo list                   # open the Todo DAG panel (TUI)
+/todo start <task>           # mark <task> in_progress (exact text, spaces allowed)
+/todo done <task>            # mark <task> completed
+/todo drop <task>            # mark <task> abandoned (slash op stays `drop`)
+/todo clear                  # remove every task
+/todo <markdown>             # replace the plan (markdown set, unchanged)
 ```
+
+`start`/`done`/`drop` resolve the task by exact content (or stable id) and go
+through the same application `TodoOp` path as the `todo` tool, so blocked
+`start`s are rejected by the dependency projection. `/todo block`/`unblock`
+are intentionally not accepted: the model has no manual `blocked` status —
+a task is blocked only while an unfinished `depends_on` dependency holds it,
+and dependency edges are managed via the `todo` tool/API. Unknown operations
+or a verb without a task print the full usage. The REPL keeps its own text
+path (bare `/todo` prints the plan; a markdown argument sets it).
 
 Source: `crates/pi-cli/src/interactive_commands.rs` (`/todo` builtin),
 `crates/pi-cli/src/todo_dag_panel.rs` and `crates/pi-cli/src/todo_dag_view.rs`
-(panel), `crates/pi-cli/src/todo_dag_panel.rs` (`TodoDagPanel`).
+(panel), `crates/pi-cli/src/tui.rs` (`dispatch_todo_command`).
 
 The Todo DAG panel (`TodoDagPanel` in `todo_dag_panel.rs`) shows every DAG in
 the session: the main session's DAG plus one DAG per active workflow. Each DAG
-header renders the execution label and counts (`✓ done · open · active ·
-blocked`); subagent rows under it show `• <name> (<agent>) · <status> ·
-<current task>` with the owning `todoTaskId`. Keys: `↑/↓`/`j`/`k` select a DAG
-or subagent row, `Enter` opens the detail page (task list with `depends_on`
-and `blocked_by`, plus linked jobs per task) or the subagent page (identity,
-type, status, owning DAG, linked todo task, current task summary, progress).
-`Esc` returns to the overview, `Esc`/`q` closes.
+header renders the execution label and counts (`✓ N completed · O open · A
+active · B blocked`, wrapping at the pane width); subagent rows under it show
+`• <name> (<agent>) · <status> · <current task>` with the owning
+`todoTaskId`. Keys: `↑/↓`/`j`/`k` select a DAG or subagent row, `Enter` opens
+the detail page (task list with `depends_on` and `blocked_by`, plus linked
+jobs per task) or the subagent page (identity, type, status, owning DAG,
+linked todo task, current task summary, progress). `Esc` returns to the
+overview, `Esc`/`q` closes.
 
 ## DAG execution
 

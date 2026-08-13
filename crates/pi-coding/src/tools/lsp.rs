@@ -91,10 +91,6 @@ const MAX_CODE_ACTIONS: usize = 50;
 static FAKE_LSP_RENAME_TARGETS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// Max directory depth walked for workspace diagnostics.
 const DIAGNOSTICS_MAX_DEPTH: usize = 6;
-/// Bounded best-effort wait for the server's analysis-ready signal
-/// (publishDiagnostics) before issuing hover/definition/references, so the
-/// first request does not race the initial project load.
-const DIAGNOSTICS_READINESS_WAIT: Duration = Duration::from_secs(5);
 
 /// One configured language server.
 struct ServerSpec {
@@ -603,16 +599,14 @@ async fn run_position_query(
         async move {
             open_file(client, &path, &lang).await?;
             let uri = path_to_uri(&path)?;
-            // Best-effort readiness wait: servers push publishDiagnostics once
-            // the document is analyzed. Issuing the query after that avoids
-            // racing the initial project load (rust-analyzer returns null or
-            // `ContentModified` -32801 otherwise). Bounded and non-fatal: the
-            // request goes out regardless.
-            let _ = tokio::time::timeout(
-                DIAGNOSTICS_READINESS_WAIT,
-                client.wait_for_diagnostics(uri.as_str()),
-            )
-            .await;
+            // Best-effort analysis readiness (shared helper): servers push
+            // publishDiagnostics once the document is analyzed; when the first
+            // push is empty (cold-start initial load) the helper settles and
+            // pumps a documentSymbol barrier so the query does not race the
+            // first analysis (rust-analyzer returns null or `ContentModified`
+            // -32801 otherwise). Bounded and non-fatal: the request goes out
+            // regardless.
+            let _ = client.wait_ready_diagnostics(uri.as_str()).await;
             let mut params = json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": line, "character": character },
@@ -708,7 +702,11 @@ async fn run_diagnostics(
             let mut reports = Vec::with_capacity(targets.len());
             for target in &targets {
                 let uri = path_to_uri(target)?;
-                let params = client.wait_for_diagnostics(uri.as_str()).await?;
+                // The readiness helper reports the LATEST push for the URI:
+                // a cold-start server's initial empty set is skipped via the
+                // documentSymbol analysis barrier, so a file with real errors
+                // is never reported as clean.
+                let params = client.wait_ready_diagnostics(uri.as_str()).await?;
                 reports.push(format_diagnostics(&params, "diagnostics"));
             }
             // Diagnostics the server pushed for documents we did not open
@@ -829,6 +827,13 @@ async fn rename_with_client(
 ) -> Result<AgentToolResult> {
     open_file(client, path, lang).await?;
     let uri = path_to_uri(path)?;
+    // Analysis readiness: rename must not be issued before the server has
+    // analyzed the document — a cold-start rust-analyzer refuses (or fails)
+    // renames that race the initial project load. The shared helper waits for
+    // the document's diagnostics, skipping a stale initial empty push via the
+    // documentSymbol analysis barrier, and is strict here: a rename is never
+    // fired against an unanalyzed document.
+    client.wait_ready_diagnostics(uri.as_str()).await?;
     let params = lsp_types::RenameParams {
         text_document_position: lsp_types::TextDocumentPositionParams {
             text_document: lsp_types::TextDocumentIdentifier { uri },
@@ -862,10 +867,12 @@ async fn run_code_actions(cwd: &str, args: &Value, abort: AbortSignal) -> Result
         async move {
             open_file(client, &path, &lang).await?;
             let uri = path_to_uri(&path)?;
-            // Seed the code-action context with the diagnostics the server has
-            // published for this document (many actions are diagnostic-driven).
+            // Seed the code-action context with the LATEST diagnostics the
+            // server has published for this document (many actions are
+            // diagnostic-driven): the shared readiness helper skips a stale
+            // initial empty push via the documentSymbol analysis barrier.
             let mut diagnostics = Vec::new();
-            let wait = client.wait_for_diagnostics(uri.as_str()).await;
+            let wait = client.wait_ready_diagnostics(uri.as_str()).await;
             if let Ok(params) = wait {
                 if let Some(list) = params.get("diagnostics").and_then(Value::as_array) {
                     diagnostics.clone_from(list);
@@ -2347,6 +2354,126 @@ mod tests {
         .to_string();
         assert!(err.contains("denied by path permission rule"), "{err}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn old() {}\n");
+    }
+
+    #[tokio::test]
+    async fn rename_end_to_end_waits_for_analysis_barrier_in_progressive_mode() {
+        // Cold-start stand-in: didOpen publishes an EMPTY diagnostics set and
+        // rename is refused (-32602) until a documentSymbol analysis barrier.
+        // The readiness-gated rename must pump the barrier first and then
+        // apply the workspace edit to every target — the old client, which
+        // renamed immediately after didOpen, was refused here.
+        let dir = tmpdir();
+        let a = dir.join("a.rs");
+        let b = dir.join("b.rs");
+        std::fs::write(&a, "fn old() {}\n").unwrap();
+        std::fs::write(&b, "fn old() {}\n").unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        let workspace = crate::WorkspaceRoots::for_tool_factory(&cwd);
+
+        let targets = format!(
+            "{};{}",
+            path_to_uri(&a.display().to_string()).unwrap().to_string(),
+            path_to_uri(&b.display().to_string()).unwrap().to_string()
+        );
+        let command = fake_lsp_server_command(&[
+            ("PI_FAKE_LSP_PROGRESSIVE", "1"),
+            ("PI_FAKE_LSP_RENAME_TARGETS", &targets),
+        ]);
+        let workspace_for_client = workspace.clone();
+        let a_path = a.display().to_string();
+        let result = with_server_command(command, "fake-lsp", &cwd, move |client| {
+            let workspace = workspace_for_client.clone();
+            let a_path = a_path.clone();
+            async move {
+                rename_with_client(
+                    client,
+                    &a_path,
+                    "rust",
+                    0,
+                    0,
+                    "renamed",
+                    &workspace,
+                    &[],
+                )
+                .await
+            }
+            .boxed()
+        })
+        .await
+        .expect("analysis-gated rename must succeed after the barrier");
+        let text = text_of(&result);
+        assert!(text.contains("rename: applied 2 text edit(s)"), "{text}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "NEWold() {}\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "NEWold() {}\n");
+    }
+
+    #[tokio::test]
+    async fn progressive_fake_refuses_rename_before_analysis_barrier() {
+        // The progressive fake's analysis gate is deterministic (request-
+        // driven, not sleep-based): a rename issued straight after didOpen,
+        // before any documentSymbol barrier, is refused with -32602 — exactly
+        // what the old client raced into on a cold-starting rust-analyzer.
+        let dir = tmpdir();
+        let path = dir.join("lib.rs");
+        std::fs::write(&path, "fn old() {}\n").unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        let command = fake_lsp_server_command(&[("PI_FAKE_LSP_PROGRESSIVE", "1")]);
+        let err = with_server_command(command, "fake-lsp", &cwd, move |client| {
+            let path = path.display().to_string();
+            async move {
+                open_file(client, &path, "rust").await?;
+                let uri = path_to_uri(&path)?;
+                let params = lsp_types::RenameParams {
+                    text_document_position: lsp_types::TextDocumentPositionParams {
+                        text_document: lsp_types::TextDocumentIdentifier { uri },
+                        position: Position { line: 0, character: 0 },
+                    },
+                    work_done_progress_params: Default::default(),
+                    new_name: "renamed".to_owned(),
+                };
+                client
+                    .request(
+                        lsp_types::request::Rename::METHOD,
+                        serde_json::to_value(params)?,
+                    )
+                    .await
+            }
+            .boxed()
+        })
+        .await
+        .expect_err("rename before the analysis barrier must be refused")
+        .to_string();
+        assert!(err.contains("-32602"), "{err}");
+        assert!(err.contains("refused before analysis barrier"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_skip_initial_empty_push_via_analysis_barrier() {
+        // Progressive fake: the didOpen push is EMPTY and the real diagnostic
+        // is published only behind the documentSymbol analysis barrier. The
+        // diagnostics path must return the real error, never the stale empty
+        // set (the false "no diagnostics" cold-start bug).
+        let dir = tmpdir();
+        let path = dir.join("lib.rs");
+        std::fs::write(&path, "fn main() { let x: u32 = \"oops\"; }\n").unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        let command = fake_lsp_server_command(&[("PI_FAKE_LSP_PROGRESSIVE", "1")]);
+        let path = path.display().to_string();
+        let params = with_server_command(command, "fake-lsp", &cwd, move |client| {
+            let path = path.clone();
+            async move {
+                open_file(client, &path, "rust").await?;
+                let uri = path_to_uri(&path)?;
+                client.wait_ready_diagnostics(uri.as_str()).await
+            }
+            .boxed()
+        })
+        .await
+        .expect("diagnostics readiness");
+        let text = format_diagnostics(&params, "diagnostics");
+        assert!(text.contains("progressive real diagnostic"), "{text}");
+        assert!(!text.contains("no diagnostics"), "{text}");
     }
 
     /// Production-factory path: [`crate::create_all_tools_with_rules`] builds

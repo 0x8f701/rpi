@@ -18,9 +18,11 @@ $ RPI_LISTEN=http://127.0.0.1:8765 npm run dev   # http://localhost:5173
 ```
 
 The dev server proxies `/ws` and `/rpc` to the listener. `npm run build`
-regenerates the committed `dist/index.html`; rebuilding the Rust binary
-embeds the new bundle. `RPI_WEB_DEV_DIR=<dir>` makes the listener serve a
-built page from disk instead, for iterating without recompiling Rust.
+regenerates `dist/index.html` (generated build output, not tracked by git);
+rebuilding the Rust binary embeds the new bundle. CI generates the bundle
+from a clean checkout before any cargo command. `RPI_WEB_DEV_DIR=<dir>` makes
+the listener serve a built page from disk instead, for iterating without
+recompiling Rust.
 
 ## Starting the listener
 
@@ -197,8 +199,8 @@ B).
   explicit `--session-dir` or `sessionDir` setting lists only that exact root.
   Web prompts use the normal session recorder and remain available after restart.
 - **Panels** — dedicated views for todo, goal, workflow, session tree,
-  settings, subagent jobs, side chat, maintenance, and code review, each driven
-  by the same JSONL RPC control plane.
+  settings, subagent jobs, side chat, and code review, each driven by the same
+  JSONL RPC control plane.
 - **Personas** — the Personas panel manages the same persistent persona
   definitions as the TUI `/persona` surface. A persona is a durable agent
   definition at `~/.pi/agent/personas/<name>/persona.md` (user scope) or
@@ -248,7 +250,8 @@ B).
 
 - Frontend type-check + build: `cd crates/pi-cli/web && npm run build`
   (type-check, focused transcript assertions, Vite bundle, and deterministic
-  trim); the committed `dist/index.html` is what the binary embeds.
+  trim); the generated `dist/index.html` (not tracked by git) is what the
+  binary embeds.
 - Rust: `cargo test -p pi-cli --lib` (subprotocol unit tests) and
   `cargo test -p pi-cli --test listen_control_plane` (GET /web route, positive
   and negative subprotocol auth, existing routes unchanged).

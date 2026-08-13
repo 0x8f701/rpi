@@ -364,7 +364,7 @@ export function SessionPanel({ sendCommand, waitForReady, refreshState, onLifecy
         <button id="session-refresh-btn" type="button" onClick={() => load().catch(() => {})} disabled={busy}>
           Refresh
         </button>
-        <button id="session-close-btn" type="button" onClick={onClose} title="Close panel">
+        <button id="session-close-btn" type="button" className="panel-close" onClick={onClose} title="Close panel" aria-label="Close session panel">
           ✕
         </button>
       </header>

@@ -12,6 +12,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::job_card_adapter::JobCardRows;
 use crate::theme::Theme;
 pub use crate::todo_dag_view::TodoDagCounts;
@@ -442,25 +444,18 @@ fn render_overview(frame: &mut ratatui::Frame<'_>, panel: &TodoDagPanel, area: R
     let rows = Rect { height: rows_height, ..area };
     let footer = Rect { y: area.y.saturating_add(rows_height), height: footer_height, ..area };
     let viewport = usize::from(rows.height).max(1);
+    let width = usize::from(area.width.max(1));
     let mut lines = Vec::new();
     let mut cursor_line = 0usize;
     for (index, dag) in panel.dags.iter().enumerate() {
         let selected = index == panel.selected;
-        let counts = dag.counts();
         let header_selected = selected && panel.selected_job.is_none();
-        let style = if header_selected {
-            Style::default().fg(theme.text).bg(theme.selected_bg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", if header_selected { '›' } else { ' ' }), style),
-            Span::styled(format!("{:<24}", truncate(&dag.label, 24)), style),
-            Span::styled(format!(" [{}] ", truncate(&dag.id, 18)), style.patch(Style::default().fg(theme.dim))),
-            Span::styled(format!("{} · ✓{} open {} active {} blocked {}", dag.execution.label(), counts.completed, counts.open, counts.active, counts.blocked), status_style(&dag.execution, theme)),
-        ]));
+        // The header wraps to the available width (word boundaries only) so a
+        // narrow pane never clips a count term mid-word.
+        let header_start = lines.len();
+        lines.extend(wrap_styled_line_words(overview_header_line(dag, theme, header_selected), width));
         if header_selected {
-            cursor_line = lines.len() - 1;
+            cursor_line = header_start;
         }
         for job_index in 0..dag.subagent_job_count() {
             let Some(job) = dag.subagent_job(job_index) else { continue };
@@ -476,6 +471,109 @@ fn render_overview(frame: &mut ratatui::Frame<'_>, panel: &TodoDagPanel, area: R
     let visible = lines.into_iter().skip(start).take(viewport).collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(visible), rows);
     frame.render_widget(Paragraph::new("↑/↓/j/k select subagent · Enter details · Esc/q close").style(Style::default().fg(theme.dim)), footer);
+}
+
+/// One DAG header line: selection marker, label, id, execution label, and the
+/// same `✓ N completed · O open · A active · B blocked` count terms as the
+/// detail page (the overview previously compressed these to `✓N open N
+/// active …`, which read differently from the detail line). The count span
+/// patches the header's selection style so the highlight survives wrapping.
+fn overview_header_line(dag: &TodoDagSnapshot, theme: Theme, selected: bool) -> Line<'static> {
+    let counts = dag.counts();
+    let style = if selected {
+        Style::default().fg(theme.text).bg(theme.selected_bg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    Line::from(vec![
+        Span::styled(format!(" {} ", if selected { '›' } else { ' ' }), style),
+        Span::styled(format!("{:<24}", truncate(&dag.label, 24)), style),
+        Span::styled(format!(" [{}] ", truncate(&dag.id, 18)), style.patch(Style::default().fg(theme.dim))),
+        Span::styled(format!("{} · ✓ {} completed · {} open · {} active · {} blocked", dag.execution.label(), counts.completed, counts.open, counts.active, counts.blocked), style.patch(status_style(&dag.execution, theme))),
+    ])
+}
+
+/// Word-boundary-aware wrap of a styled [`Line`] to `width` that preserves
+/// per-span styles. Rows break between words, so a narrow pane never cuts a
+/// word mid-word (the overview header previously clipped at the right edge);
+/// only a single word wider than `width` is hard-split, mirroring
+/// [`wrap_styled_line`]'s per-character fallback.
+fn wrap_styled_line_words(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if line.spans.is_empty() || width == 0 {
+        return vec![Line::default()];
+    }
+    // Flatten the spans into (word, style) pairs; whitespace is a separator.
+    let mut words = Vec::<(String, Style)>::new();
+    for span in line.spans {
+        let mut word = String::new();
+        for character in span.content.chars() {
+            if character.is_whitespace() {
+                if !word.is_empty() {
+                    words.push((std::mem::take(&mut word), span.style));
+                }
+            } else {
+                word.push(character);
+            }
+        }
+        if !word.is_empty() {
+            words.push((word, span.style));
+        }
+    }
+    let mut rows = Vec::<Vec<(String, Style)>>::new();
+    for (word, style) in words {
+        let word_width = UnicodeWidthStr::width(word.as_str());
+        if word_width > width {
+            // A single word wider than the pane: hard-split it across rows so
+            // no content is lost (only reachable with a pathological label).
+            let mut remaining = word.as_str();
+            while !remaining.is_empty() {
+                let mut columns = 0usize;
+                let mut split = 0usize;
+                for character in remaining.chars() {
+                    let character_width = character.width().unwrap_or(0);
+                    if columns.saturating_add(character_width) > width {
+                        break;
+                    }
+                    columns += character_width;
+                    split += character.len_utf8();
+                }
+                if split == 0 {
+                    split = remaining.chars().next().map_or(0, char::len_utf8);
+                }
+                rows.push(vec![(remaining[..split].to_owned(), style)]);
+                remaining = &remaining[split..];
+            }
+            continue;
+        }
+        let fits = rows.last().is_some_and(|row| {
+            let row_width = row
+                .iter()
+                .map(|(text, _)| UnicodeWidthStr::width(text.as_str()))
+                .sum::<usize>();
+            row_width
+                .saturating_add(row.len().saturating_sub(1))
+                .saturating_add(1)
+                .saturating_add(word_width)
+                <= width
+        });
+        if fits {
+            rows.last_mut().expect("row").push((word, style));
+        } else {
+            rows.push(vec![(word, style)]);
+        }
+    }
+    rows.into_iter()
+        .map(|row| {
+            Line::from(
+                row.into_iter()
+                    .enumerate()
+                    .map(|(index, (text, style))| {
+                        Span::styled(if index == 0 { text } else { format!(" {text}") }, style)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }
 
 /// Compact overview row per subagent job: `• <display_name> · <status> · <task>`.
@@ -790,6 +888,55 @@ mod tests {
         let overview = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(overview.contains("• Verifier (task) · running · Run focused verification"));
         assert!(overview.contains("• Alpha Worker · queued · Assemble the release"));
+    }
+
+    #[test]
+    fn overview_header_uses_detail_count_terms_and_keeps_selection_at_wide_width() {
+        let panel = TodoDagPanel::new(snapshot(), Vec::new());
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_todo_dag_panel(frame, &panel, crate::theme::DARK)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let wide = buffer.content.iter().map(|cell| cell.symbol()).collect::<String>();
+        // The overview must use the same count terms as the detail page
+        // (previously the ambiguous `✓N open N active …` compact form).
+        assert!(wide.contains("active · ✓ 1 completed · 2 open · 1 active · 1 blocked"), "wide header must carry the detail count terms\n{wide}");
+        assert!(!wide.contains("✓1 open"), "compact count form must be gone\n{wide}");
+        // The default selection is the main DAG header; the highlight marker
+        // must survive on the header line.
+        assert!(wide.contains("› Main session [main]"), "selected header must keep its marker\n{wide}");
+        let marked = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() == "›" && cell.style().bg == Some(crate::theme::DARK.selected_bg))
+            .count();
+        assert_eq!(marked, 1, "exactly the selected header carries the highlight marker");
+    }
+
+    #[test]
+    fn overview_header_wraps_at_60_columns_without_cutting_words() {
+        let panel = TodoDagPanel::new(snapshot(), Vec::new());
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_todo_dag_panel(frame, &panel, crate::theme::DARK)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let narrow = buffer.content.iter().map(|cell| cell.symbol()).collect::<String>();
+        // 60 columns forces the header (label + counts ≈ 80 chars) to wrap;
+        // every count word must still render in full — no mid-word clipping
+        // at the pane edge.
+        for word in ["completed", "open", "active", "blocked"] {
+            assert!(narrow.contains(word), "count word {word:?} must wrap in full at 60 columns\n{narrow}");
+        }
+        let header_rows = buffer
+            .content
+            .chunks(60)
+            .skip(1)
+            .take(2)
+            .flat_map(|row| row[1..59].iter())
+            .flat_map(|cell| cell.symbol().chars())
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(header_rows.contains("✓1completed·2open·1active·1blocked"), "all count terms must survive the wrap\n{narrow}");
     }
 
     #[test]

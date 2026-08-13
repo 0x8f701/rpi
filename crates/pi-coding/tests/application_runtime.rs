@@ -683,19 +683,40 @@ async fn foreground_bash_updates_and_end_forward_through_application_events() {
     let (session, registration) = session_with_responses(Vec::new());
     let application = Application::new(session).await;
     let mut events = application.subscribe();
-    let result = application.execute_bash("printf app".to_owned(), false).await.expect("application bash");
+    // Portable multi-write pattern (see tools.rs bash stream tests): first
+    // printf must be readable before exit so at least one BashExecutionUpdate
+    // is guaranteed before BashExecutionEnd, independent of scheduler timing.
+    // Chunks remain raw pipe reads — never assume a single delta equals the
+    // full output (session_facade documents the same contract).
+    let command = "printf 'a'; sleep 0.05; printf 'pp'";
+    let result = application
+        .execute_bash(command.to_owned(), false)
+        .await
+        .expect("application bash");
     assert_eq!(result.output, "app");
+    let mut streamed = String::new();
     let mut saw_update = false;
     let mut saw_end = false;
     while !saw_end {
-        let event = tokio::time::timeout(Duration::from_secs(2), events.recv()).await.expect("event timeout").expect("event channel");
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event channel");
         match event {
-            ApplicationEvent::Session(pi_coding::SessionEvent::BashExecutionUpdate { delta, .. }) if delta == "app" => saw_update = true,
+            ApplicationEvent::Session(pi_coding::SessionEvent::BashExecutionUpdate {
+                delta,
+                ..
+            }) if !delta.is_empty() => {
+                saw_update = true;
+                streamed.push_str(&delta);
+            }
             ApplicationEvent::Session(pi_coding::SessionEvent::BashExecutionEnd { message }) => {
-                assert_eq!(message.command, "printf app");
+                assert_eq!(message.command, command);
                 assert_eq!(message.output, "app");
                 let serialized = serde_json::to_value(ApplicationEvent::Session(
-                    pi_coding::SessionEvent::BashExecutionEnd { message: message.clone() },
+                    pi_coding::SessionEvent::BashExecutionEnd {
+                        message: message.clone(),
+                    },
                 ))
                 .expect("serialize bash end");
                 assert_eq!(serialized["type"], "bash_execution_end");
@@ -707,6 +728,7 @@ async fn foreground_bash_updates_and_end_forward_through_application_events() {
         }
     }
     assert!(saw_update);
+    assert_eq!(streamed, "app");
     registration.unregister();
 }
 

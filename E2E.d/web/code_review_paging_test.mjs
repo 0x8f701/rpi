@@ -31,6 +31,10 @@
 //       auto-loads its diff on selection — lines appear WITHOUT any
 //       Refresh/Load click, the pane never claims "No hunks in this file",
 //       and the unknown-language body stays plain (no hljs spans)
+//   T9  the loaded placeholder's hunk (which originates ENTIRELY beyond the
+//       global truncation) is selectable and commentable: clicking its
+//       header, typing a comment and pressing Enter resolves the loaded
+//       hunk identity and renders the accepted thread card
 //   T8  rust diff lines (src/other.rs) render hljs token spans with verbatim
 //       textContent, unchanged line numbers/prefix/kind backgrounds, and a
 //       hostile <script> diff line stays LITERAL text with no side effect
@@ -361,6 +365,55 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/code-review-placeholder-autoload.png`, fullPage: true });
 
+    // ---- T9: a hunk originating BEYOND the global truncation is selectable
+    // and commentable ----
+    // zz-later.txt's diff exists only in the loaded per-file data (the 2 MiB
+    // snapshot never carried it), so its hunk header appears only after the
+    // eager per-file fetch. Selecting it, typing a comment and pressing Enter
+    // must resolve the loaded hunk identity against the authoritative RPC
+    // cache and queue the thread (user comment card + hunk badge).
+    await waitFor(
+      page,
+      () => document.querySelector('.code-review__hunk-header:not(:disabled)') !== null,
+      'T9: loaded hunk header did not become commentable after the eager fetch',
+      20000
+    );
+    await page.click('.code-review__hunk-header:not(:disabled)');
+    await page.waitForTimeout(500);
+    const initialSelectionState = await page.evaluate(() => ({
+      enabledHeaders: Array.from(document.querySelectorAll('.code-review__hunk-header:not(:disabled)')).map((el) => ({
+        text: el.textContent || '',
+        pressed: el.getAttribute('aria-pressed'),
+      })),
+      selectedHunks: document.querySelectorAll('.code-review__hunk.is-selected').length,
+      composer: document.querySelector('.code-review__comment-input') !== null,
+      threadText: document.querySelector('.code-review__comments')?.textContent || '',
+    }));
+    if (!initialSelectionState.composer) {
+      fail(`T9: selection state ${JSON.stringify(initialSelectionState)}`);
+    }
+    const beyondText = 'comment on a hunk beyond global truncation';
+    await page.fill('.code-review__comment-input', beyondText);
+    await page.press('.code-review__comment-input', 'Enter');
+    await waitFor(
+      page,
+      (expectedText) =>
+        Array.from(document.querySelectorAll('.code-review__comment--user .code-review__comment-text')).some(
+          (el) => (el.textContent || '').includes(expectedText),
+        ),
+      'T9: the loaded-hunk comment never rendered as an accepted thread card',
+      25000,
+      beyondText
+    );
+    const beyondThread = await page.evaluate(() => ({
+      badge: document.querySelector('.code-review__hunk-badge')?.textContent || '',
+      userComments: Array.from(document.querySelectorAll('.code-review__comment--user')).length,
+    }));
+    if (beyondThread.badge !== '1' && beyondThread.userComments < 1) {
+      fail(`T9: loaded hunk thread missing (badge=${JSON.stringify(beyondThread)})`);
+    }
+    await page.screenshot({ path: `${evidence}/code-review-loaded-hunk-comment.png`, fullPage: true });
+
     // ---- T8: hljs token spans on rust diff lines, verbatim + hostile literal ----
     await clickFile(page, 'src/other.rs');
     await waitFor(
@@ -430,7 +483,7 @@ async function main() {
     const hostile = '<script>window.__crPwned=1</script><img src=x onerror=window.__crPwned=2>';
     const commentText = `review markdown matrix **user bold**\n- item one\n- item two\n\n\`\`\`rust\nfn user_rust() -> u32 { 1 }\n\`\`\`\n\n${hostile}`;
     await page.fill('.code-review__comment-input', commentText);
-    await page.press('.code-review__comment-input', 'Control+Enter');
+    await page.press('.code-review__comment-input', 'Enter');
 
     // The USER comment renders markdown + literal hostile HTML.
     await waitFor(
@@ -627,7 +680,7 @@ async function main() {
     );
     await page.screenshot({ path: `${evidence}/code-review-back-to-desktop.png`, fullPage: true });
 
-    console.log('web-code-review-paging: PASSED (nested tree collapse/expand; >4000-line Load more grows past the cap + changed-line-04001 appears + Load full; user + assistant comment markdown bold/list/rust fence with hostile HTML literal and no side effect; responsive resize across the 900px breakpoint surfaces the Files/Diff/Thread tab bar, tab clicks drive the single-pane narrow UI, Back-to-diff returns, resize back removes the tab bar)');
+    console.log('web-code-review-paging: PASSED (nested tree collapse/expand; >4000-line Load more grows past the cap + changed-line-04001 appears + Load full; empty globally-truncated placeholder auto-loads on selection; loaded placeholder hunk beyond global truncation is selectable + commentable with an accepted thread card; user + assistant comment markdown bold/list/rust fence with hostile HTML literal and no side effect; responsive resize across the 900px breakpoint surfaces the Files/Diff/Thread tab bar, tab clicks drive the single-pane narrow UI, Back-to-diff returns, resize back removes the tab bar)');
   } finally {
     await browser.close().catch(() => {});
   }

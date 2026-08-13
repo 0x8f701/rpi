@@ -1430,6 +1430,8 @@ pub fn workflow_task_ownership(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{JobSnapshot, TodoItem, TodoPhase, TodoStatus, TodoStorage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn contract(objective: &str) -> WorkflowSupervisorContract {
         WorkflowSupervisorContract {
@@ -1522,6 +1524,322 @@ mod tests {
                 prompt.contains(needle),
                 "replan prompt must guide DAG width: missing {needle:?}\n{prompt}"
             );
+        }
+    }
+
+    /// Execution-supervision contract backend: one canonical Todo task owned
+    /// by a delegated worker job, recording `TodoOp::Done` applications and
+    /// DAG reconciles so tests can assert what a settled worker job does to
+    /// the workflow.
+    #[derive(Clone)]
+    struct JobSettleBackend {
+        task: Arc<Mutex<TodoItem>>,
+        dag_status: Arc<Mutex<TodoDagExecutionStatus>>,
+        done_calls: Arc<AtomicUsize>,
+        reconcile_calls: Arc<AtomicUsize>,
+    }
+
+    impl JobSettleBackend {
+        fn with_open_task(task_id: &str) -> Self {
+            Self {
+                task: Arc::new(Mutex::new(TodoItem {
+                    id: task_id.to_owned(),
+                    content: "implement the worker step".to_owned(),
+                    status: TodoStatus::InProgress,
+                    depends_on: Vec::new(),
+                    ready: true,
+                    blocked_by: Vec::new(),
+                    agent: None,
+                })),
+                dag_status: Arc::new(Mutex::new(TodoDagExecutionStatus::Active)),
+                done_calls: Arc::new(AtomicUsize::new(0)),
+                reconcile_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn task(&self) -> TodoItem {
+            self.task.lock().clone()
+        }
+
+        fn task_open(&self, task_id: &str) -> bool {
+            let task = self.task.lock();
+            task.id == task_id
+                && matches!(
+                    task.status,
+                    TodoStatus::Pending | TodoStatus::InProgress
+                )
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowSupervisorBackend for JobSettleBackend {
+        fn todo_state(&self) -> TodoState {
+            TodoState {
+                phases: vec![TodoPhase {
+                    name: "phase".to_owned(),
+                    tasks: vec![self.task()],
+                }],
+                storage: TodoStorage::Session,
+            }
+        }
+
+        fn todo_dag_status(&self) -> TodoDagExecutionStatus {
+            *self.dag_status.lock()
+        }
+
+        fn workflow_jobs(
+            &self,
+            _workflow_id: &str,
+            _generation: u64,
+        ) -> Vec<crate::WorkflowJobSnapshot> {
+            Vec::new()
+        }
+
+        fn inbox(&self, _agent_id: &str, _peek: bool) -> Vec<crate::MailboxMessage> {
+            Vec::new()
+        }
+
+        fn active_workflow_job_ids(
+            &self,
+            _workflow_id: &str,
+            _generation: u64,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn configure_workflow_runtime(
+            &self,
+            _scope: WorkflowRuntimeScope,
+            _max_concurrency: usize,
+            _global_concurrency: OrchestrationConcurrencyGate,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn prompt_supervisor(&self, _prompt: String) -> Result<PlanningTurnOutcome> {
+            bail!("unexpected planning prompt in execution-supervision contract test")
+        }
+
+        async fn steer_supervisor(&self, _message: String) -> Result<()> {
+            Ok(())
+        }
+
+        fn execute_todo_dag(&self) -> Result<TodoDagExecutionOutcome> {
+            Ok(TodoDagExecutionOutcome {
+                status: *self.dag_status.lock(),
+                spawns: Vec::new(),
+            })
+        }
+
+        fn apply_todo(&self, op: TodoOp) -> Result<TodoApplyResult> {
+            let mut task = self.task.lock();
+            if let TodoOp::Done { task: Some(id), .. } = &op
+                && id == &task.id
+            {
+                self.done_calls.fetch_add(1, Ordering::SeqCst);
+                task.status = TodoStatus::Completed;
+                task.ready = false;
+            }
+            Ok(TodoApplyResult {
+                phases: vec![TodoPhase {
+                    name: "phase".to_owned(),
+                    tasks: vec![task.clone()],
+                }],
+                completed_tasks: Vec::new(),
+                summary: String::new(),
+            })
+        }
+
+        fn reconcile_todo_dag(&self) -> Result<TodoDagExecutionOutcome> {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(TodoDagExecutionOutcome {
+                status: *self.dag_status.lock(),
+                spawns: Vec::new(),
+            })
+        }
+
+        async fn pause(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn resume(&self) -> Result<TodoDagExecutionOutcome> {
+            Ok(TodoDagExecutionOutcome {
+                status: *self.dag_status.lock(),
+                spawns: Vec::new(),
+            })
+        }
+
+        async fn cancel_jobs(&self, ids: &[String]) -> Result<Vec<String>> {
+            Ok(ids.to_vec())
+        }
+    }
+
+    /// A workflow-scoped worker job snapshot for a delegated Todo task.
+    fn delegated_job(status: JobStatus) -> JobSnapshot {
+        JobSnapshot {
+            id: "job-1".to_owned(),
+            agent_id: "Worker".to_owned(),
+            agent: "task".to_owned(),
+            parent_id: "supervisor".to_owned(),
+            description: None,
+            todo_task_id: Some("task-1".to_owned()),
+            workflow_id: Some("wf-concise".to_owned()),
+            workflow_generation: Some(1),
+            status,
+            created_at: 1,
+            started_at: Some(2),
+            finished_at: Some(3),
+            result: None,
+            soft_budget_exhausted: false,
+        }
+    }
+
+    async fn observe_job(supervisor: &WorkflowSupervisor, job: JobSnapshot) -> Result<()> {
+        supervisor
+            .observe_application_event(
+                1,
+                ApplicationEvent::Orchestration(OrchestrationEvent::JobUpdated {
+                    group_id: "wf-concise".to_owned(),
+                    job,
+                }),
+            )
+            .await
+    }
+
+    /// The Grok fail-node regression: a worker whose final tool failed settles
+    /// its job `Failed`; the supervisor must never mark the delegated Todo
+    /// task Done for a failed job (Done is what lets the DAG settle complete
+    /// and auto-integrate), and it must re-evaluate the DAG with the task
+    /// still open.
+    #[tokio::test]
+    async fn failed_worker_job_keeps_todo_open_and_reconciles_without_done() {
+        let backend = Arc::new(JobSettleBackend::with_open_task("task-1"));
+        let supervisor = WorkflowSupervisor::spawn_restored(
+            contract("Ship the release"),
+            backend.clone(),
+            OrchestrationConcurrencyGate::new(1).expect("gate"),
+            WorkflowStatus::Running,
+        )
+        .expect("spawn supervisor");
+        observe_job(&supervisor, delegated_job(JobStatus::Failed))
+            .await
+            .expect("observe failed job");
+        assert_eq!(
+            backend.done_calls.load(Ordering::SeqCst),
+            0,
+            "a failed worker job must never mark the Todo task Done"
+        );
+        assert_eq!(
+            backend.reconcile_calls.load(Ordering::SeqCst),
+            1,
+            "a failed worker job must re-evaluate the DAG"
+        );
+        assert!(
+            backend.task_open("task-1"),
+            "the delegated task stays open after a failed worker job"
+        );
+        assert_eq!(
+            supervisor.projection().status,
+            WorkflowStatus::Running,
+            "with the task open the workflow stays Running (never Completed), so the \
+             Completed-only auto-integrate gate can never fire"
+        );
+    }
+
+    /// Contrast sanity check for the mock: a job that settles `Completed`
+    /// (no soft budget) IS the signal that marks the delegated Todo task
+    /// Done — proving the failed-job test above observes a real behavioral
+    /// difference, not a broken fixture.
+    #[tokio::test]
+    async fn completed_worker_job_marks_todo_done() {
+        let backend = Arc::new(JobSettleBackend::with_open_task("task-1"));
+        let supervisor = WorkflowSupervisor::spawn_restored(
+            contract("Ship the release"),
+            backend.clone(),
+            OrchestrationConcurrencyGate::new(1).expect("gate"),
+            WorkflowStatus::Running,
+        )
+        .expect("spawn supervisor");
+        observe_job(&supervisor, delegated_job(JobStatus::Completed))
+            .await
+            .expect("observe completed job");
+        assert_eq!(backend.done_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !backend.task_open("task-1"),
+            "a completed worker job marks the delegated task Done"
+        );
+        assert_eq!(backend.reconcile_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Status-mapping contract behind "no integrate": while a delegated task
+    /// is open the workflow status is never `Completed` — a settled DAG falls
+    /// to `Failed`, an active/dormant one stays `Running` — so a failed
+    /// worker can never push the workflow through the Completed-only
+    /// auto-integrate gate.
+    #[test]
+    fn open_task_never_maps_the_workflow_to_completed() {
+        let backend = Arc::new(JobSettleBackend::with_open_task("task-1"));
+        let contract = contract("Ship the release");
+        for dag_status in [
+            TodoDagExecutionStatus::Active,
+            TodoDagExecutionStatus::Settled,
+            TodoDagExecutionStatus::Dormant,
+            TodoDagExecutionStatus::Blocked,
+        ] {
+            *backend.dag_status.lock() = dag_status;
+            let actor = test_actor(&contract, backend.clone(), WorkflowStatus::Running);
+            let status = actor.status_from_backend();
+            assert_ne!(
+                status,
+                WorkflowStatus::Completed,
+                "{dag_status:?} with an open task must never map to Completed"
+            );
+            assert!(
+                !todo_is_exactly_complete(&backend.todo_state()),
+                "{dag_status:?}: an open task means the DAG is never exactly complete"
+            );
+            match dag_status {
+                TodoDagExecutionStatus::Active | TodoDagExecutionStatus::Dormant => {
+                    assert_eq!(status, WorkflowStatus::Running, "{dag_status:?}");
+                }
+                TodoDagExecutionStatus::Settled | TodoDagExecutionStatus::Blocked => {
+                    assert_eq!(status, WorkflowStatus::Failed, "{dag_status:?}");
+                }
+            }
+        }
+    }
+
+    fn test_actor(
+        contract: &WorkflowSupervisorContract,
+        backend: Arc<JobSettleBackend>,
+        status: WorkflowStatus,
+    ) -> SupervisorActor<JobSettleBackend> {
+        let (events, _) = broadcast::channel(SUPERVISOR_CHANNEL_CAPACITY);
+        SupervisorActor {
+            contract: contract.clone(),
+            projection: Arc::new(Mutex::new(project_backend(
+                contract,
+                backend.as_ref(),
+                status,
+                None,
+                &[],
+                None,
+            ))),
+            events,
+            backend,
+            status,
+            failure: None,
+            planning_in_flight: false,
+            plan_committed: false,
+            suppress_abort_failure: false,
+            planning_non_progress_tripped: false,
+            planning_non_progress_reason: None,
+            last_todo_state_hash: None,
+            last_failed_todo_fingerprint: None,
+            identical_failed_ops: 0,
+            corrections_without_progress: 0,
+            activity: Vec::new(),
+            planning_started_at_ms: None,
         }
     }
 }

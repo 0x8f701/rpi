@@ -156,16 +156,6 @@ pub struct ListenConfig {
     /// disables lifecycle opens with a clear error; tests inject a faux
     /// factory.
     pub session_factory: Option<std::sync::Arc<dyn SessionSpawner>>,
-    /// Test-only slow-writer seam (compiled only under `debug_assertions`,
-    /// absent from release binaries): when non-zero, every /ws connection's
-    /// outbound writer stalls its first send by this long (interruptible by
-    /// the close path) before delivering it, modeling a client that has
-    /// stopped reading so the bounded outbound queue fills and the
-    /// slow-client grace (1008 eviction) fires deterministically without
-    /// depending on kernel socket-buffer behavior. Production always passes
-    /// [`Duration::ZERO`].
-    #[cfg(debug_assertions)]
-    pub outbound_writer_delay: Duration,
 }
 
 pub struct ListenHandle {
@@ -257,9 +247,6 @@ struct ServerState {
     /// tokenless browsers are accepted only when same-origin against the
     /// request's own `Host` ([`authorized`]).
     base_url: Option<String>,
-    /// Test-only slow-writer seam, see [`ListenConfig::outbound_writer_delay`].
-    #[cfg(debug_assertions)]
-    outbound_writer_delay: Duration,
 }
 
 pub async fn start(
@@ -317,8 +304,6 @@ pub async fn start(
         collab: collab.clone(),
         token: token.map(Arc::from),
         base_url: advertised_base_url(address, config.advertised_origin.as_deref(), tls_active),
-        #[cfg(debug_assertions)]
-        outbound_writer_delay: config.outbound_writer_delay,
     };
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(run_listener(listener, tls, state, shutdown_rx));
@@ -1427,13 +1412,6 @@ where
     // grace window for one slot (see enqueue_message) so transient writer
     // stalls never drop events or close the connection.
     let slow_client_grace = timeouts.slow_client_grace;
-    // Test-only slow-writer seam: model a client that has stopped reading by
-    // stalling the first outbound send. The bounded queue then fills and the
-    // slow-client grace above fires deterministically without depending on
-    // kernel socket-buffer behavior. The close path stays responsive because
-    // the stall is selectable against `writer_control`.
-    #[cfg(debug_assertions)]
-    let outbound_writer_delay = state.outbound_writer_delay;
     // Non-inline commands run on a per-connection task set so a long command
     // never blocks the read/event select below. The set is bounded at
     // MAX_CONCURRENT_COMMANDS (mirroring the stdio RPC session); dropping it
@@ -1441,17 +1419,6 @@ where
     let mut commands = JoinSet::new();
     let (writer_control_tx, mut writer_control_rx) = mpsc::channel::<WriterControl>(1);
     let mut writer = AbortTask::new(tokio::spawn(async move {
-        // Test-only slow-writer seam (compiled only under `debug_assertions`,
-        // absent from release builds): stall this connection's first outbound
-        // send to model a client that has stopped reading, so the bounded
-        // queue fills and the slow-client grace (1008 eviction) fires
-        // deterministically without depending on kernel socket-buffer
-        // behavior. One-shot so a fresh connection's own response (queued
-        // behind any leftover broadcast events) is only delayed by one
-        // window. The close path preempts the stall; every build then shares
-        // the single send select below.
-        #[cfg(debug_assertions)]
-        let mut stalled = false;
         loop {
             let message = tokio::select! {
                 biased;
@@ -1470,24 +1437,6 @@ where
                     None => return Ok(()),
                 },
             };
-            #[cfg(debug_assertions)]
-            if !stalled {
-                stalled = true;
-                tokio::select! {
-                    biased;
-                    control = writer_control_rx.recv() => match control {
-                        Some(WriterControl::Close(frame)) => {
-                            let _ = tokio::time::timeout(
-                                WS_CLOSE_TIMEOUT,
-                                websocket_write.send(Message::Close(frame)),
-                            ).await;
-                            return Ok(());
-                        }
-                        None => return Ok(()),
-                    },
-                    _ = tokio::time::sleep(outbound_writer_delay) => {}
-                }
-            }
             tokio::select! {
                 biased;
                 control = writer_control_rx.recv() => match control {
@@ -1978,8 +1927,6 @@ mod tests {
             collab: CollabService::new(manager),
             token: None,
             base_url: None,
-            #[cfg(debug_assertions)]
-            outbound_writer_delay: Duration::ZERO,
         }
     }
 

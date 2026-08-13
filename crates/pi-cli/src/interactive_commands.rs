@@ -1643,8 +1643,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
 
     BuiltinCommand {
         name: "todo",
-        description: "Show or edit the task list",
-        argument_hint: Some("[list|markdown]"),
+        description: "Show the Todo DAG panel, set the plan with markdown, or start/done/drop/clear tasks by exact text",
+        argument_hint: Some("[list|start <task>|done <task>|drop <task>|clear|<markdown>]"),
         requires_arguments: false,
     },
     BuiltinCommand {
@@ -2338,7 +2338,10 @@ mod tests {
             usage(builtin("loop-cancel").expect("loop cancel command")),
             "/loop-cancel <id>"
         );
-        assert_eq!(usage(builtin("todo").expect("todo command")), "/todo [list|markdown]");
+        assert_eq!(
+            usage(builtin("todo").expect("todo command")),
+            "/todo [list|start <task>|done <task>|drop <task>|clear|<markdown>]"
+        );
         assert_eq!(
             usage(builtin("code-review").expect("code review command")),
             "/code-review [<from> <to>]"

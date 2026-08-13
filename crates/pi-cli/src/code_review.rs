@@ -113,6 +113,30 @@ impl DiffHunk {
         }
         diff
     }
+
+    /// True when the parsed hunk body matches its header counts. Git emits
+    /// exact counts (`old_count = deletions + context`,
+    /// `new_count = additions + context`), so a fully received hunk always
+    /// satisfies `content_lines == old_count + new_count - context_lines`
+    /// while a hunk cut mid-body by a byte cap never does. Meta lines
+    /// (`\ No newline at end of file`) are emitted after the body and are
+    /// not counted by git, so they neither help nor hurt the check.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        let mut content = 0usize;
+        let mut context = 0usize;
+        for line in &self.lines {
+            match line.kind {
+                DiffLineKind::Context => {
+                    content += 1;
+                    context += 1;
+                }
+                DiffLineKind::Addition | DiffLineKind::Deletion => content += 1,
+                DiffLineKind::Meta => {}
+            }
+        }
+        content == (self.old_count as usize + self.new_count as usize).saturating_sub(context)
+    }
 }
 
 /// One changed file in the review snapshot.
@@ -2236,19 +2260,56 @@ pub const MAX_FILE_PAGE_BYTES: usize = 1024 * 1024;
 /// the user knows content was elided.
 pub const MAX_DIFF_LINE_TEXT_BYTES: usize = 256 * 1024;
 
-/// Full parsed diff for a single file, ready to be sliced into pages.
+/// Full parsed diff for a single file, ready to be sliced into pages. The
+/// hunk structure is preserved (not flattened): every page carries complete
+/// hunk descriptors so the frontend can reconstruct exact hunks and content
+/// hashes even when a hunk's lines span page boundaries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDiff {
     pub path: String,
     pub previous_path: Option<String>,
     pub status: FileStatus,
     pub binary: bool,
-    /// All diff lines across hunks, in display order.
-    pub lines: Vec<DiffLine>,
+    /// Complete parsed hunks in display order. A byte-capped load may leave
+    /// the LAST hunk incomplete (see [`DiffHunk::is_complete`]); every other
+    /// hunk is complete by construction.
+    pub hunks: Vec<DiffHunk>,
     /// True when the per-file byte cap was hit — even more content exists
     /// beyond what was loaded. The frontend surfaces this as a hard cap.
     pub truncated: bool,
     pub error: Option<String>,
+}
+
+/// One hunk window inside a bounded page: the COMPLETE hunk's identity
+/// (header, ranges, content hash over the full hunk text — never over the
+/// page fragment) plus the subset of its lines that fall inside this page's
+/// line window. `line_start` is the hunk-local offset of the first carried
+/// line, so the frontend can deterministically merge page-split hunks and
+/// dedupe against snapshot-seeded prefixes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDiffPageHunk {
+    /// 0-based hunk index across the file's hunks.
+    pub index: usize,
+    pub header: String,
+    pub old_start: u32,
+    pub old_count: u32,
+    pub new_start: u32,
+    pub new_count: u32,
+    /// SHA-256 of the COMPLETE parsed hunk's unified diff (see
+    /// [`HunkIdentity::new`]) — identical on every page carrying this hunk,
+    /// so a page-split hunk keeps one stable identity.
+    pub content_hash: String,
+    /// Total lines of the complete hunk (meta lines included). The frontend
+    /// marks the hunk comment-ready only when its merged lines reach this
+    /// count.
+    pub total_lines: usize,
+    /// True when the parsed hunk body is complete (never cut by the per-file
+    /// byte cap). An incomplete hunk is never comment-ready.
+    pub complete: bool,
+    /// Hunk-local line offset where this page's subset starts.
+    pub line_start: usize,
+    /// The hunk's lines carried by this page, in display order.
+    pub lines: Vec<DiffLine>,
 }
 
 /// One bounded page of a single file's diff.
@@ -2259,7 +2320,9 @@ pub struct FileDiffPage {
     pub previous_path: Option<String>,
     pub status: FileStatus,
     pub binary: bool,
-    pub lines: Vec<DiffLine>,
+    /// Hunk windows overlapping `[cursor, next_cursor)`, in hunk order. The
+    /// union of their line subsets is exactly the page's line window.
+    pub hunks: Vec<FileDiffPageHunk>,
     /// Cursor of the first line in this page (0-based across the full file).
     pub cursor: usize,
     /// Cursor of the next page, or `None` when no more lines remain.
@@ -2267,6 +2330,10 @@ pub struct FileDiffPage {
     pub has_more: bool,
     /// Total lines in the full file diff (the page is a window over this).
     pub total_lines: usize,
+    /// Total hunks in the loaded file diff. The frontend knows the hunk
+    /// metadata set is complete once it holds this many hunk descriptors
+    /// (or the backend reports no more pages).
+    pub hunk_count: usize,
     /// Per-file byte cap was hit during load; even more content exists.
     pub truncated: bool,
 }
@@ -2457,23 +2524,29 @@ impl FileDiff {
                 previous_path: file.previous_path.clone(),
                 status: file.status,
                 binary: false,
-                lines: Vec::new(),
+                hunks: Vec::new(),
                 truncated: false,
                 error: Some("file diff is empty (the path may no longer differ in this comparison)".to_owned()),
             };
         };
-        let mut lines: Vec<DiffLine> = Vec::new();
-        for hunk in &entry.hunks {
-            for line in &hunk.lines {
-                lines.push(cap_line(line.clone()));
-            }
-        }
+        let hunks = entry
+            .hunks
+            .iter()
+            .map(|hunk| DiffHunk {
+                header: hunk.header.clone(),
+                old_start: hunk.old_start,
+                old_count: hunk.old_count,
+                new_start: hunk.new_start,
+                new_count: hunk.new_count,
+                lines: hunk.lines.iter().map(|line| cap_line(line.clone())).collect(),
+            })
+            .collect();
         Self {
             path: entry.path.clone(),
             previous_path: entry.previous_path.clone(),
             status: entry.status,
             binary: entry.binary,
-            lines,
+            hunks,
             truncated: output.truncated,
             error: None,
         }
@@ -2485,7 +2558,7 @@ impl FileDiff {
             previous_path,
             status: FileStatus::Unknown,
             binary: false,
-            lines: Vec::new(),
+            hunks: Vec::new(),
             truncated: false,
             error: Some(message),
         }
@@ -2496,6 +2569,13 @@ impl FileDiff {
     /// at [`MAX_FILE_PAGE_BYTES`] so a page of long lines never exceeds the WS
     /// frame budget. At least one line is always returned when the cursor is
     /// in range and the file is not binary/empty.
+    ///
+    /// The page carries hunk windows: every hunk overlapping `[cursor, next)`
+    /// is delivered as a [`FileDiffPageHunk`] with the COMPLETE hunk identity
+    /// (header/ranges/content hash over the full hunk) plus the in-window
+    /// subset of its lines and the subset's hunk-local offset. A hunk split
+    /// across pages therefore keeps one stable identity, and the frontend
+    /// merges the subsets deterministically by index.
     pub fn slice_page(
         &self,
         snapshot_id: &str,
@@ -2508,27 +2588,64 @@ impl FileDiff {
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
-        let total = self.lines.len();
+        // Cumulative line ranges per hunk (hunk i covers [start, end)).
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(self.hunks.len());
+        let mut offset = 0usize;
+        for hunk in &self.hunks {
+            let start = offset;
+            offset += hunk.lines.len();
+            ranges.push((start, offset));
+        }
+        let total = offset;
         if cursor > total {
             return Err(format!("cursor {cursor} out of range (total {total})"));
         }
         let cap = max_lines.clamp(1, MAX_FILE_PAGE_LINES);
-        let mut page: Vec<DiffLine> = Vec::new();
-        let mut bytes = 0usize;
+        let mut page_hunks: Vec<FileDiffPageHunk> = Vec::new();
+        let mut page_lines = 0usize;
+        let mut page_bytes = 0usize;
         let mut index = cursor;
-        while index < total {
-            if page.len() >= cap {
+        while index < total && page_lines < cap {
+            // The hunk containing `index` (ranges are contiguous and sorted).
+            let hunk_pos = ranges.partition_point(|&(_, end)| end <= index);
+            let (h_start, h_end) = ranges[hunk_pos];
+            let hunk = &self.hunks[hunk_pos];
+            let local = index - h_start;
+            let mut take = 0usize;
+            while take < h_end - index && page_lines + take < cap {
+                let line = &hunk.lines[local + take];
+                // 32 bytes covers line numbers + kind tag + JSON overhead.
+                let line_bytes = line.text.len() + 32;
+                if page_lines + take > 0 && page_bytes + line_bytes > MAX_FILE_PAGE_BYTES {
+                    break;
+                }
+                page_bytes += line_bytes;
+                take += 1;
+            }
+            if take == 0 {
+                // The hunk's first line does not fit the remaining page
+                // budget; no later line can either, so the page ends here.
                 break;
             }
-            let line = &self.lines[index];
-            // 32 bytes covers line numbers + kind tag + JSON overhead.
-            let line_bytes = line.text.len() + 32;
-            if !page.is_empty() && bytes + line_bytes > MAX_FILE_PAGE_BYTES {
-                break;
-            }
-            bytes += line_bytes;
-            page.push(line.clone());
-            index += 1;
+            let content_hash = HunkIdentity::new(snapshot_id, &self.path, hunk).content_hash;
+            page_hunks.push(FileDiffPageHunk {
+                index: hunk_pos,
+                header: hunk.header.clone(),
+                old_start: hunk.old_start,
+                old_count: hunk.old_count,
+                new_start: hunk.new_start,
+                new_count: hunk.new_count,
+                content_hash,
+                total_lines: hunk.lines.len(),
+                complete: hunk.is_complete(),
+                line_start: local,
+                lines: hunk.lines[local..local + take].to_vec(),
+            });
+            // Bounded descriptor overhead (header text + numbers + hash +
+            // JSON keys) so a page of many tiny hunks stays frame-safe.
+            page_bytes += 192;
+            page_lines += take;
+            index += take;
         }
         let next_cursor = index;
         let has_more = next_cursor < total;
@@ -2538,11 +2655,12 @@ impl FileDiff {
             previous_path: self.previous_path.clone(),
             status: self.status,
             binary: self.binary,
-            lines: page,
+            hunks: page_hunks,
             cursor,
             next_cursor: has_more.then_some(next_cursor),
             has_more,
             total_lines: total,
+            hunk_count: self.hunks.len(),
             truncated: self.truncated,
         })
     }
@@ -3172,10 +3290,17 @@ deleted file mode 100644
             previous_path: None,
             status: FileStatus::Modified,
             binary: false,
-            lines: vec![
-                DiffLine { kind: DiffLineKind::Context, old_no: Some(1), new_no: Some(1), text: "keep".into() },
-                DiffLine { kind: DiffLineKind::Addition, old_no: None, new_no: Some(2), text: "added".into() },
-            ],
+            hunks: vec![DiffHunk {
+                header: "@@ -1,2 +1,2 @@".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![
+                    DiffLine { kind: DiffLineKind::Context, old_no: Some(1), new_no: Some(1), text: "keep".into() },
+                    DiffLine { kind: DiffLineKind::Addition, old_no: None, new_no: Some(2), text: "added".into() },
+                ],
+            }],
             truncated: false,
             error: None,
         };
@@ -3183,10 +3308,11 @@ deleted file mode 100644
         assert!(diff.slice_page("snap", 3, 10).is_err(), "cursor past total rejected");
         // cursor == total is valid (returns an empty terminal page).
         let terminal = diff.slice_page("snap", 2, 10).expect("cursor == total ok");
-        assert!(terminal.lines.is_empty());
+        assert!(terminal.hunks.is_empty());
         assert!(!terminal.has_more);
         assert_eq!(terminal.next_cursor, None);
         assert_eq!(terminal.total_lines, 2);
+        assert_eq!(terminal.hunk_count, 1);
     }
 
     #[test]
@@ -3199,30 +3325,43 @@ deleted file mode 100644
             previous_path: None,
             status: FileStatus::Modified,
             binary: false,
-            lines,
+            hunks: vec![DiffHunk {
+                header: "@@ -0,0 +1,5 @@".into(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 5,
+                lines,
+            }],
             truncated: false,
             error: None,
         };
+        let page_lines = |page: &FileDiffPage| {
+            page.hunks
+                .iter()
+                .flat_map(|hunk| hunk.lines.iter().map(|l| l.text.clone()))
+                .collect::<Vec<_>>()
+        };
         let first = diff.slice_page("snap", 0, 2).expect("first page");
         assert_eq!(first.cursor, 0);
-        assert_eq!(first.lines.len(), 2);
-        assert_eq!(first.lines[0].text, "line0");
-        assert_eq!(first.lines[1].text, "line1");
+        assert_eq!(page_lines(&first), ["line0", "line1"]);
+        assert_eq!(first.hunks[0].line_start, 0);
         assert!(first.has_more);
         assert_eq!(first.next_cursor, Some(2));
         let second = diff.slice_page("snap", 2, 2).expect("second page");
         assert_eq!(second.cursor, 2);
-        assert_eq!(second.lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>(), ["line2", "line3"]);
+        assert_eq!(page_lines(&second), ["line2", "line3"]);
+        assert_eq!(second.hunks[0].line_start, 2);
         assert!(second.has_more);
         assert_eq!(second.next_cursor, Some(4));
         let third = diff.slice_page("snap", 4, 2).expect("third page");
-        assert_eq!(third.lines.len(), 1);
-        assert_eq!(third.lines[0].text, "line4");
+        assert_eq!(page_lines(&third), ["line4"]);
+        assert_eq!(third.hunks[0].line_start, 4);
         assert!(!third.has_more);
         assert_eq!(third.next_cursor, None);
         // max_lines=0 clamps to 1.
         let one = diff.slice_page("snap", 0, 0).expect("max_lines 0 -> 1");
-        assert_eq!(one.lines.len(), 1);
+        assert_eq!(page_lines(&one), ["line0"]);
     }
 
     #[test]
@@ -3232,7 +3371,7 @@ deleted file mode 100644
             previous_path: None,
             status: FileStatus::Unknown,
             binary: false,
-            lines: Vec::new(),
+            hunks: Vec::new(),
             truncated: false,
             error: Some("boom".into()),
         };
@@ -3242,14 +3381,216 @@ deleted file mode 100644
             previous_path: None,
             status: FileStatus::Binary,
             binary: true,
-            lines: Vec::new(),
+            hunks: Vec::new(),
             truncated: false,
             error: None,
         };
         let page = bin.slice_page("snap", 0, 10).expect("binary page");
         assert!(page.binary);
-        assert!(page.lines.is_empty());
+        assert!(page.hunks.is_empty());
         assert!(!page.has_more);
+        assert_eq!(page.hunk_count, 0);
+    }
+
+    #[test]
+    fn slice_page_hunk_windows_keep_complete_identity_across_page_splits() {
+        // A two-hunk file whose hunks split across pages: page 1 carries the
+        // tail of hunk 0, page 2 the rest. Every page's descriptor must carry
+        // the COMPLETE hunk's identity (hash over the full hunk text, not the
+        // page fragment) so the frontend can deterministically merge by index.
+        let hunk0_lines: Vec<DiffLine> = (0..6)
+            .map(|i| DiffLine { kind: DiffLineKind::Addition, old_no: None, new_no: Some(i + 1), text: format!("h0-{i}") })
+            .collect();
+        let hunk0 = DiffHunk {
+            header: "@@ -0,0 +1,6 @@".into(),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 6,
+            lines: hunk0_lines,
+        };
+        let hunk1_lines: Vec<DiffLine> = (7..12)
+            .map(|i| DiffLine { kind: DiffLineKind::Addition, old_no: None, new_no: Some(i + 1), text: format!("h1-{i}") })
+            .collect();
+        let hunk1 = DiffHunk {
+            header: "@@ -0,0 +7,5 @@".into(),
+            old_start: 0,
+            old_count: 0,
+            new_start: 7,
+            new_count: 5,
+            lines: hunk1_lines,
+        };
+        let diff = FileDiff {
+            path: "a.rs".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![hunk0, hunk1],
+            truncated: false,
+            error: None,
+        };
+        let full_hash = |index: usize| {
+            HunkIdentity::new("snap", "a.rs", &diff.hunks[index]).content_hash
+        };
+        // Explicit page-split scenario: page0 = hunk 0 head (cursor 0, max 4),
+        // page1 = hunk 0 tail (cursor 4, max 2), page2 = hunk 1 head
+        // (cursor 6, max 4), page3 = hunk 1 tail (cursor 10, max 4). A hunk
+        // whose lines span pages must keep ONE stable identity — the
+        // descriptor hash covers the COMPLETE hunk, never the page fragment.
+        let page0 = diff.slice_page("snap", 0, 4).expect("page 0");
+        assert_eq!(page0.cursor, 0);
+        assert_eq!(page0.next_cursor, Some(4));
+        assert!(page0.has_more);
+        assert_eq!(page0.hunks.len(), 1);
+        assert_eq!(page0.hunks[0].index, 0);
+        assert_eq!(page0.hunks[0].line_start, 0);
+        assert_eq!(
+            page0.hunks[0].lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            ["h0-0", "h0-1", "h0-2", "h0-3"]
+        );
+        assert_eq!(page0.hunks[0].total_lines, 6);
+        assert!(page0.hunks[0].complete);
+        assert_eq!(page0.hunks[0].content_hash, full_hash(0));
+        assert_eq!(page0.hunk_count, 2);
+
+        let page1 = diff.slice_page("snap", 4, 2).expect("page 1");
+        assert_eq!(page1.cursor, 4);
+        assert_eq!(page1.next_cursor, Some(6));
+        assert!(page1.has_more);
+        assert_eq!(page1.hunks.len(), 1);
+        assert_eq!(page1.hunks[0].index, 0);
+        assert_eq!(page1.hunks[0].line_start, 4);
+        assert_eq!(
+            page1.hunks[0].lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            ["h0-4", "h0-5"]
+        );
+        // Hunk 0 keeps one stable identity across its split pages.
+        assert_eq!(page1.hunks[0].content_hash, full_hash(0));
+        assert_eq!(page1.hunks[0].content_hash, page0.hunks[0].content_hash);
+
+        let page2 = diff.slice_page("snap", 6, 4).expect("page 2");
+        assert_eq!(page2.cursor, 6);
+        assert_eq!(page2.next_cursor, Some(10));
+        assert!(page2.has_more);
+        assert_eq!(page2.hunks.len(), 1);
+        assert_eq!(page2.hunks[0].index, 1);
+        assert_eq!(page2.hunks[0].line_start, 0);
+        assert_eq!(
+            page2.hunks[0].lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            ["h1-7", "h1-8", "h1-9", "h1-10"]
+        );
+        assert_eq!(page2.hunks[0].total_lines, 5);
+        assert_eq!(page2.hunks[0].content_hash, full_hash(1));
+        assert_eq!(page2.hunk_count, 2);
+
+        let page3 = diff.slice_page("snap", 10, 4).expect("page 3");
+        assert_eq!(page3.cursor, 10);
+        assert_eq!(page3.next_cursor, None);
+        assert!(!page3.has_more);
+        assert_eq!(page3.hunks.len(), 1);
+        assert_eq!(page3.hunks[0].index, 1);
+        assert_eq!(page3.hunks[0].line_start, 4);
+        assert_eq!(
+            page3.hunks[0].lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            ["h1-11"]
+        );
+        // The split hunk keeps one stable identity on every page carrying it.
+        assert_eq!(page3.hunks[0].content_hash, full_hash(1));
+        assert_eq!(page3.hunks[0].content_hash, page2.hunks[0].content_hash);
+        assert_eq!(page3.hunk_count, 2);
+        // Deterministic reconstruction: concat subsets by (index, line_start)
+        // reproduces the complete hunk lines byte-for-byte.
+        let mut merged0: Vec<String> = Vec::new();
+        merged0.extend(
+            page0
+                .hunks
+                .iter()
+                .filter(|h| h.index == 0)
+                .flat_map(|h| h.lines.iter().map(|l| l.text.clone())),
+        );
+        merged0.extend(
+            page1
+                .hunks
+                .iter()
+                .filter(|h| h.index == 0)
+                .flat_map(|h| h.lines.iter().map(|l| l.text.clone())),
+        );
+        let mut merged1: Vec<String> = Vec::new();
+        merged1.extend(
+            page2
+                .hunks
+                .iter()
+                .filter(|h| h.index == 1)
+                .flat_map(|h| h.lines.iter().map(|l| l.text.clone())),
+        );
+        merged1.extend(
+            page3
+                .hunks
+                .iter()
+                .filter(|h| h.index == 1)
+                .flat_map(|h| h.lines.iter().map(|l| l.text.clone())),
+        );
+        assert_eq!(
+            merged0,
+            diff.hunks[0].lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            merged1,
+            diff.hunks[1].lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn slice_page_marks_byte_capped_last_hunk_incomplete() {
+        // A per-file load cut by the 8 MiB byte cap mid-hunk: the parsed last
+        // hunk's body is shorter than its header counts. Its descriptor must
+        // be complete=false (never comment-ready) while earlier hunks stay
+        // complete=true.
+        let partial = DiffHunk {
+            header: "@@ -1,3 +1,3 @@".into(),
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                DiffLine { kind: DiffLineKind::Context, old_no: Some(1), new_no: Some(1), text: "a".into() },
+                DiffLine { kind: DiffLineKind::Deletion, old_no: Some(2), new_no: None, text: "b".into() },
+                // Cut before the remaining context lines arrived.
+            ],
+        };
+        assert!(!partial.is_complete());
+        // A complete `@@ -1,3 +1,3 @@` hunk: old_count = deletions + context
+        // (2+1), new_count = additions + context (2+1) → 5 content lines.
+        let full = DiffHunk {
+            header: "@@ -1,3 +1,3 @@".into(),
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                DiffLine { kind: DiffLineKind::Context, old_no: Some(1), new_no: Some(1), text: "a".into() },
+                DiffLine { kind: DiffLineKind::Deletion, old_no: Some(2), new_no: None, text: "b".into() },
+                DiffLine { kind: DiffLineKind::Deletion, old_no: Some(3), new_no: None, text: "b2".into() },
+                DiffLine { kind: DiffLineKind::Addition, old_no: None, new_no: Some(2), text: "c".into() },
+                DiffLine { kind: DiffLineKind::Addition, old_no: None, new_no: Some(3), text: "c2".into() },
+            ],
+        };
+        assert!(full.is_complete());
+        let diff = FileDiff {
+            path: "big.rs".into(),
+            previous_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            hunks: vec![full, partial],
+            truncated: true,
+            error: None,
+        };
+        let page = diff.slice_page("snap", 0, 100).expect("page");
+        assert_eq!(page.hunks.len(), 2);
+        assert!(page.hunks[0].complete);
+        assert!(!page.hunks[1].complete);
+        assert_eq!(page.hunks[1].total_lines, 2);
+        assert!(page.truncated);
     }
 
     #[test]
@@ -3274,9 +3615,18 @@ deleted file mode 100644
         let real = snapshot.files.iter().find(|f| f.path == "src/real.rs").expect("real file").clone();
         let diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &real);
         assert!(diff.error.is_none(), "{:?}", diff.error);
-        assert!(diff.lines.iter().any(|l| l.text == "edited"));
+        assert!(
+            diff.hunks.iter().flat_map(|h| h.lines.iter()).any(|l| l.text == "edited"),
+            "loaded diff lost the edit: {:?}",
+            diff
+        );
         let page = diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("page");
-        assert!(page.lines.iter().any(|l| l.text == "edited"));
+        assert!(
+            page.hunks.iter().flat_map(|h| h.lines.iter()).any(|l| l.text == "edited"),
+            "page lost the edit"
+        );
+        assert_eq!(page.hunk_count, diff.hunks.len());
+        assert!(page.hunks.iter().all(|h| h.complete));
     }
 
     #[test]
@@ -3291,7 +3641,7 @@ deleted file mode 100644
         // reads outside the work tree and git diff reports no such change.
         let evil = DiffFile { path: "../etc/passwd".into(), previous_path: None, status: FileStatus::Modified, binary: false, insertions: 0, deletions: 0, hunks: Vec::new(), truncated: false, message: None };
         let evil_diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &evil);
-        assert!(evil_diff.error.is_some() || evil_diff.lines.is_empty(), "traversal path did not fail closed: {:?}", evil_diff);
+        assert!(evil_diff.error.is_some() || evil_diff.hunks.is_empty(), "traversal path did not fail closed: {:?}", evil_diff);
         // The traversal must never create a file outside the repo.
         assert!(!repo.path().join("../etc/passwd").exists(), "traversal escaped the repo root");
     }
@@ -3318,20 +3668,38 @@ deleted file mode 100644
         let diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &big);
         assert!(diff.error.is_none(), "{:?}", diff.error);
         assert!(!diff.binary);
+        let total_lines: usize = diff.hunks.iter().map(|h| h.lines.len()).sum();
         assert!(
-            diff.lines.len() > MAX_FILE_RENDER_LINES,
+            total_lines > MAX_FILE_RENDER_LINES,
             "paging loader should recover the full file: got {} lines",
-            diff.lines.len()
+            total_lines
+        );
+        assert!(
+            diff.hunks.iter().all(|h| h.is_complete()),
+            "an uncapped per-file load must yield complete hunks"
         );
         // Page through the whole file; the paged line count must equal the
-        // full file and the final page has no next cursor.
+        // full file, every hunk descriptor must keep the complete identity,
+        // and the final page has no next cursor.
         let mut cursor = 0usize;
         let mut pages = 0usize;
         let mut seen = 0usize;
+        let mut seen_hunks: BTreeSet<usize> = BTreeSet::new();
         loop {
             let page = diff.slice_page(&snapshot.snapshot_id, cursor, MAX_FILE_PAGE_LINES).expect("page");
             assert_eq!(page.cursor, cursor);
-            seen += page.lines.len();
+            assert_eq!(page.hunk_count, diff.hunks.len());
+            seen += page.hunks.iter().map(|h| h.lines.len()).sum::<usize>();
+            for hunk in &page.hunks {
+                assert_eq!(hunk.total_lines, diff.hunks[hunk.index].lines.len());
+                assert!(hunk.complete);
+                assert_eq!(
+                    hunk.content_hash,
+                    HunkIdentity::new(&snapshot.snapshot_id, big_path, &diff.hunks[hunk.index]).content_hash,
+                    "page descriptor hash must cover the complete hunk"
+                );
+                seen_hunks.insert(hunk.index);
+            }
             pages += 1;
             match page.next_cursor {
                 Some(next) => cursor = next,
@@ -3341,7 +3709,8 @@ deleted file mode 100644
                 panic!("paging did not terminate");
             }
         }
-        assert_eq!(seen, diff.lines.len(), "paged lines must equal the full file");
+        assert_eq!(seen, total_lines, "paged lines must equal the full file");
+        assert_eq!(seen_hunks.len(), diff.hunks.len(), "every hunk must be delivered");
         assert!(pages > 1, "the big file must require more than one page");
     }
 
@@ -3367,7 +3736,11 @@ deleted file mode 100644
         assert_eq!(renamed.status, FileStatus::Renamed);
         let rename_diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &renamed);
         assert!(rename_diff.error.is_none(), "{:?}", rename_diff.error);
-        assert!(rename_diff.lines.iter().any(|l| l.text == "renamed"), "rename diff lost content: {:?}", rename_diff.lines);
+        assert!(
+            rename_diff.hunks.iter().flat_map(|h| h.lines.iter()).any(|l| l.text == "renamed"),
+            "rename diff lost content: {:?}",
+            rename_diff
+        );
         assert_eq!(rename_diff.previous_path.as_deref(), Some("old.txt"));
 
         let binary = snapshot.files.iter().find(|f| f.path == "img.png").expect("binary").clone();
@@ -3377,7 +3750,7 @@ deleted file mode 100644
         assert!(binary_diff.binary, "paging loader should preserve binary flag");
         let binary_page = binary_diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("binary page");
         assert!(binary_page.binary);
-        assert!(binary_page.lines.is_empty(), "binary file has no text lines");
+        assert!(binary_page.hunks.is_empty(), "binary file has no text hunks");
     }
 
     #[test]
@@ -3394,7 +3767,10 @@ deleted file mode 100644
         let diff = FileDiff::load(repo.path(), &scope, &file);
         assert!(diff.error.is_none(), "{:?}", diff.error);
         let page = diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("page");
-        assert!(page.lines.iter().any(|l| l.text == "base"));
+        assert!(
+            page.hunks.iter().flat_map(|h| h.lines.iter()).any(|l| l.text == "base"),
+            "revision diff lost the baseline line"
+        );
         assert!(!page.has_more);
     }
 
@@ -3622,14 +3998,15 @@ deleted file mode 100644
             assert!(diff.error.is_none(), "{}: {:?}", file.path, diff.error);
             let page = diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("page");
             assert_eq!(page.path, file.path, "page serves the requested file");
+            let loaded_lines: usize = diff.hunks.iter().map(|h| h.lines.len()).sum();
             if file.path.starts_with("big-") {
                 assert!(
-                    diff.lines.len() > MAX_FILE_RENDER_LINES,
+                    loaded_lines > MAX_FILE_RENDER_LINES,
                     "big placeholder must recover the full body: {} lines",
-                    diff.lines.len()
+                    loaded_lines
                 );
             } else {
-                assert!(!diff.lines.is_empty(), "small placeholder must load its lines");
+                assert!(!diff.hunks.is_empty(), "small placeholder must load its lines");
             }
         }
         assert_eq!(
@@ -3707,7 +4084,7 @@ deleted file mode 100644
             assert!(diff.error.is_none(), "{}: {:?}", file.path, diff.error);
             let page = diff.slice_page(&snapshot.snapshot_id, 0, 100).expect("page");
             assert_eq!(page.path, file.path);
-            assert!(!diff.lines.is_empty(), "placeholder must load its lines");
+            assert!(!diff.hunks.is_empty(), "placeholder must load its lines");
         }
     }
 

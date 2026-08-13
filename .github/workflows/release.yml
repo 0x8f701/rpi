@@ -1,11 +1,12 @@
 name: Release
 
-# On tag push v*, validate the release identity, build the `rpi` binary for
-# the five supported native targets, package per-target archives named
-# rpi-<version>-<target-triple>.{tar.gz|zip} (each containing a root rpi/rpi.exe
-# plus LICENSE), generate SHA256SUMS, and publish as a GitHub Release.
-# Tests run independently on master and pull requests; this workflow validates
-# the tag, builds native artifacts, verifies them, and publishes the release.
+# On tag push v*, validate the release identity, build the embedded web bundle
+# once, build the `rpi` binary for the five supported native targets, package
+# per-target archives named rpi-<version>-<target-triple>.{tar.gz|zip} (each
+# containing a root rpi/rpi.exe plus LICENSE), generate SHA256SUMS, and publish
+# as a GitHub Release. Tests run independently on master and pull requests;
+# this workflow validates the tag, builds native artifacts, verifies them, and
+# publishes the release.
 
 on:
   push:
@@ -32,19 +33,6 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      # Regression guard for the embedded web client: crates/pi-cli/build.rs
-      # embeds crates/pi-cli/web/dist/index.html (vite-plugin-singlefile output)
-      # so cargo builds never require node. The artifact MUST be present and
-      # tracked in the checkout — a clean checkout missing it makes build.rs
-      # panic — and it must be the ONLY file versioned under web/dist. This
-      # mirrors the test workflow guard: release builds only ever consume the
-      # committed artifact, never a rebuilt one.
-      - name: Verify embedded web client artifact is versioned
-        shell: bash
-        run: |
-          test -f crates/pi-cli/web/dist/index.html
-          test "$(git ls-files crates/pi-cli/web/dist)" = "crates/pi-cli/web/dist/index.html"
-
       - name: Validate semantic version tag and workspace version
         shell: bash
         run: |
@@ -60,9 +48,46 @@ jobs:
           fi
 
 
+  build-web:
+    name: build web client bundle
+    needs: [validate-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      # crates/pi-cli/build.rs embeds crates/pi-cli/web/dist (vite-plugin-singlefile
+      # output). dist/ is generated build output and not tracked by git, so the
+      # bundle is built ONCE here from the clean checkout and uploaded;
+      # build-linux and build-native download it into their workspaces before
+      # cargo build — every build job embeds the same deterministic bundle
+      # without repeating the npm install (and without setup-node inside the
+      # Ubuntu 20.04 container).
+      - name: Set up Node for Web build
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+
+      - name: Generate embedded Web bundle
+        shell: bash
+        run: |
+          cd crates/pi-cli/web
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Upload embedded Web bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist/index.html
+          if-no-files-found: error
+
+
   build-linux:
     name: build (${{ matrix.target }})
-    needs: [validate-release]
+    needs: [validate-release, build-web]
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -117,6 +142,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
+      # The embedded Web bundle is built once by build-web (dist/ is not
+      # tracked by git); download it into the workspace before cargo build.
+      - name: Download embedded Web bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist
 
       - name: Install Rust 1.88.0
         shell: bash
@@ -159,8 +191,13 @@ jobs:
         with:
           key: ubuntu-20.04-${{ matrix.target }}
 
+      # build-release.sh composes stable rustc --remap-path-prefix for the
+      # workspace, HOME, CARGO_HOME and RUSTUP_HOME roots (Cargo 1.88 rejects
+      # the unstable trim-paths profile key) and hands them to cargo via
+      # CARGO_ENCODED_RUSTFLAGS, preserving incoming RUSTFLAGS such as the
+      # Windows -C target-feature=+crt-static matrix flag.
       - name: Build rpi (release-dist)
-        run: cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
+        run: bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
 
       - name: Verify stripped release binary
         shell: bash
@@ -181,6 +218,20 @@ jobs:
             echo "Linux release binary still contains debug sections" >&2
             exit 1
           fi
+
+      # Fails on any count above zero; prints counts per category only, never
+      # the matching strings (the prefixes are builder paths).
+      - name: Verify no builder path leakage
+        shell: bash
+        run: |
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+          bash E2E.d/release/path-leak-check.sh \
+            "target/${{ matrix.target }}/release-dist/rpi" \
+            "HOME=$HOME" \
+            "WORKSPACE=$GITHUB_WORKSPACE" \
+            "CARGO_HOME=$cargo_home" \
+            "RUSTUP_HOME=$rustup_home"
 
       - name: Smoke-test on glibc 2.31 baseline
         shell: bash
@@ -226,12 +277,20 @@ jobs:
             expected_arch: AMD64
             rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.os }}
-    needs: [validate-release]
+    needs: [validate-release, build-web]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.sha }}
+
+      # The embedded Web bundle is built once by build-web (dist/ is not
+      # tracked by git); download it into the workspace before cargo build.
+      - name: Download embedded Web bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist
 
       - name: Verify native runner architecture
         shell: bash
@@ -269,10 +328,22 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build rpi (release-dist)
+      # build-release.sh/.ps1 compose stable rustc --remap-path-prefix for the
+      # workspace, HOME, CARGO_HOME and RUSTUP_HOME roots (Cargo 1.88 rejects
+      # the unstable trim-paths profile key) and hand them to cargo via
+      # CARGO_ENCODED_RUSTFLAGS, preserving the incoming matrix RUSTFLAGS
+      # (-C target-feature=+crt-static on Windows).
+      - name: Build rpi (release-dist, macOS)
+        if: runner.os != 'Windows'
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
+        run: bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
+
+      - name: Build rpi (release-dist, Windows)
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: ./E2E.d/release/build-release.ps1 +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked --target ${{ matrix.target }}
 
       - name: Verify stripped release binary
         shell: bash
@@ -288,6 +359,29 @@ jobs:
             echo "release binary exceeds the 64 MiB distribution limit" >&2
             exit 1
           fi
+
+      # Fails on any count above zero; prints counts per category only, never
+      # the matching strings (the prefixes are builder paths).
+      - name: Verify no builder path leakage (macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+          bash E2E.d/release/path-leak-check.sh \
+            "target/${{ matrix.target }}/release-dist/rpi" \
+            "HOME=$HOME" \
+            "WORKSPACE=$GITHUB_WORKSPACE" \
+            "CARGO_HOME=$cargo_home" \
+            "RUSTUP_HOME=$rustup_home"
+
+      - name: Verify no builder path leakage (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+          $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $HOME '.rustup' }
+          & ./E2E.d/release/path-leak-check.ps1 "target/${{ matrix.target }}/release-dist/rpi.exe" "HOME=$HOME" "WORKSPACE=$env:GITHUB_WORKSPACE" "CARGO_HOME=$cargoHome" "RUSTUP_HOME=$rustupHome"
 
       - name: Smoke-test the native binary (macOS)
         if: runner.os != 'Windows'
@@ -359,9 +453,14 @@ jobs:
       group: release-publication
       cancel-in-progress: false
     steps:
+      # Download the five platform archives only. `web-dist` (the embedded
+      # web bundle shared into the build jobs) must NOT land in the release
+      # staging dir — the exact-inventory check below requires exactly the
+      # five archives.
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: dist
+          pattern: rpi-*
           merge-multiple: true
 
       - name: Verify exact local inventory and generate SHA256SUMS

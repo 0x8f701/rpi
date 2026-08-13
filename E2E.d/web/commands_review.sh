@@ -4,7 +4,7 @@
 #
 # Spawns the real `rpi --listen` binary with a token file and the loopback
 # mock provider (--scenario steering), opens `/web` in a real browser, and
-# asserts the v0.2.10 Web composer command surface + the real code-review
+# asserts the v0.2.11 Web composer command surface + the real code-review
 # panel against a seeded TEMP git repo + a fixture project skill:
 #   - #command-btn sits LEFT of #prompt-input in the composer row
 #   - opening the command picker shows /compact, /skill, /code-review
@@ -15,7 +15,8 @@
 #     the HEAD→working-tree comparison label, the dirty file, and the
 #     changed diff lines; explicit hunk selection (never auto-selected),
 #     the file filter, keyboard file navigation, the truncated fixture
-#     banner, Ctrl+Enter comment submit + streaming/abort, the inline
+#     banner, Enter comment submit (Shift+Enter newline; a composing Enter
+#     never submits) + streaming/queued-comment/abort, the inline
 #     close-confirm guard, Escape close, mobile Files/Diff/Thread tab
 #     transitions, and closing the panel removes it from the DOM
 #   - the dirty file carries TWO separated diff hunks; a comment on the
@@ -108,7 +109,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-commands-review - composer command button left of textarea, command picker lists /compact /skill /code-review, /code-review draft + no auto-submit, Enter opens real review panel (HEAD→working tree + dirty file + changed lines), explicit hunk selection + file filter + keyboard nav + truncated banner + Ctrl+Enter comment/stream/abort + inline close confirm + Escape close + mobile Files/Diff/Thread tabs, TUI/Web parity (M/A compact glyphs, basename-only rows with full path/state in data/title/aria, no rail overflow desktop + mobile), two separated hunks with second-hunk thread ownership + per-hunk drafts A/B + file switch clears selection, hostile diff/comment stays literal (no dialog/script side effect), 1.5s snapshot polling observed and stops on close, session switch sends stamped code_review_close + no stale rev args, /skill <fixture> visible summary, /compact outgoing-WS dispatch (playwright, hard gate)'
+                'web-commands-review - composer command button left of textarea, command picker lists /compact /skill /code-review, /code-review draft + no auto-submit, Enter opens real review panel (HEAD→working tree + dirty file + changed lines), explicit hunk selection + file filter + keyboard nav + truncated banner + Enter comment/stream/queued-comment/abort (Shift+Enter newline, composing Enter never submits) + inline close confirm + Escape close + mobile Files/Diff/Thread tabs, TUI/Web parity (M/A compact glyphs, basename-only rows with full path/state in data/title/aria, no rail overflow desktop + mobile), two separated hunks with second-hunk thread ownership + per-hunk drafts A/B + file switch clears selection, hostile diff/comment stays literal (no dialog/script side effect), 1.5s snapshot polling observed and stops on close, session switch sends stamped code_review_close + no stale rev args, /skill <fixture> visible summary, /compact outgoing-WS dispatch (playwright, hard gate)'
             return 0
             ;;
         run|all) ;;

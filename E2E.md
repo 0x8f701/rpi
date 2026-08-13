@@ -1,6 +1,6 @@
 # rpi End-to-End Verification
 
-This handbook defines the release verification contract for `rpi` 0.2.7. It uses repository-relative paths and isolated temporary homes. Do not record local absolute paths, private endpoints, credential filenames, or credential values in committed evidence.
+This handbook defines the release verification contract for `rpi` 0.2.11. It uses repository-relative paths and isolated temporary homes. Do not record local absolute paths, private endpoints, credential filenames, or credential values in committed evidence.
 
 All prose, fixtures, agent definitions, skill bodies, and faux responses used by deterministic campaigns are English-only.
 
@@ -99,14 +99,22 @@ bash E2E.d/ci/workflow.sh release      # hard release gate: requires tmux; rpc +
 Build the release binary and exercise every archive shape:
 
 ```sh
-cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
+# build-release.sh applies stable rustc --remap-path-prefix (workspace, HOME,
+# CARGO_HOME, RUSTUP_HOME) via CARGO_ENCODED_RUSTFLAGS; Cargo 1.88 rejects the
+# unstable trim-paths profile key. The leak check then fails if the binary
+# still embeds any builder path prefix (counts per category only).
+bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
+bash E2E.d/release/path-leak-check.sh target/release-dist/rpi \
+  "HOME=$HOME" "WORKSPACE=$PWD" \
+  "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+  "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
 RPI_BIN=target/release-dist/rpi bash E2E.d/release/archive-fixture-smoke.sh run
 ```
 
 The archive gate verifies:
 
 - exactly five platform archives
-- exact `rpi-0.2.7-<target-triple>` names
+- exact `rpi-0.2.11-<target-triple>` names
 - a single root-level `rpi` or `rpi.exe`
 - a root-level `LICENSE`
 - a complete and valid `SHA256SUMS`
@@ -122,7 +130,7 @@ This lane starts a loopback release fixture and verifies download, checksum vali
 ### Headless Web listener release smoke
 
 ```sh
-cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
+bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
 RPI_BIN=target/release-dist/rpi bash E2E.d/release/listen-web-smoke.sh run
 ```
 
@@ -849,20 +857,20 @@ Any `timeout` kill is a hard failure. Evidence directories MUST remain for diagn
 
 ## Release checklist
 
-1. Workspace version and lockfile workspace packages are `0.2.7`.
-2. `cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked` succeeds.
-3. `target/release-dist/rpi --version` prints `rpi 0.2.7`.
+1. Workspace version and lockfile workspace packages are `0.2.11`.
+2. `bash E2E.d/release/build-release.sh +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked` succeeds.
+3. `target/release-dist/rpi --version` prints `rpi 0.2.11`.
 4. Complete library suites pass, including `cargo +1.88.0 test -p pi-ai --test codex_transport --locked` (Codex WS/SSE loopback contracts).
 5. `bash E2E.d/ci.sh` passes (includes orchestration umbrella after core campaigns).
 6. `bash E2E.d/ci/orchestration.sh run` passes on a tmux-capable host (or rpc+rust with explicit tmux skip log).
-7. `RPI_BIN=target/release-dist/rpi bash E2E.d/ci/workflow.sh release` passes on a tmux-capable host — the hard gate: tmux is required, and `workflow campaigns passed` is emitted only after `workflow.rpc`, `workflow.tmux`, and `workflow.goal-tmux` each record `execution_status=passed` under `$EVIDENCE_ROOT`; absence or failure of any lane fails the gate. A plain `workflow.sh run` dev run that skips tmux lanes is not release evidence.
-8. The release archive fixture passes.
-9. Installer and self-update fixtures pass.
-10. README installation commands match `install.sh`, `install.ps1`, and the published archive names.
+7. `bash E2E.d/ci/workflow.sh release` passes (hard gate; tmux required).
+8. `bash E2E.d/release.sh run` passes with the final release binary.
+9. `bash E2E.d/web/run.sh` passes with the final release binary.
+10. `bash E2E.d/web/coverage.sh` passes the Web coverage thresholds.
 11. The release commit contains no credentials, local paths, build artifacts, exported sessions, or generated diagrams.
-12. Tag `v0.2.7` points exactly at the verified release commit.
+12. Tag `v0.2.11` points exactly at the verified release commit.
     — Tagging is performed only after the release commit's hosted Test workflow passes.
-13. Push the release commit, wait for its hosted Test workflow, then push `v0.2.7` to the GitHub remote.
+13. Push the release commit, wait for its hosted Test workflow, then push `v0.2.11` to the GitHub remote.
 14. Confirm every hosted build and the GitHub Release publication job succeeds.
     — Depends on step 13, which is not performed locally.
 15. Confirm regression matrix rows 1–12 either passed or are explicitly listed under Known gaps for this tag.

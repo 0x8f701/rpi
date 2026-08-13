@@ -16,6 +16,8 @@
  * connection reason, never as a timeout.)
  */
 
+import { withResolvers } from './withResolvers';
+
 /** Unique sentinel thrown to abort a superseded socket's bootstrap
  *  continuation WITHOUT scheduling a reconnect (the newer, healthy socket
  *  owns the reconnect path). Distinct from a real error so the `.catch` can
@@ -135,7 +137,7 @@ export class ReadyGate {
    *  socket never registers a waiter. Resolves on the next `notifyOpen`, or
    *  rejects with `not connected` after `READY_GATE_TIMEOUT_MS`. */
   wait(): Promise<void> {
-    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    const { promise, resolve, reject } = withResolvers<void>();
     const entry = { resolve, reject, timer: null as ReadyGateTimer };
     entry.timer = this.scheduler.setTimeout(() => {
       this.waiters = this.waiters.filter((w) => w !== entry);

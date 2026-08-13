@@ -7,14 +7,13 @@
 //   RPI_CHROME       executable path of the system Chrome (optional)
 //   RPI_EVIDENCE     evidence dir for screenshots
 //
-// Asserts the v0.2.10 Web composer attachment intake — clipboard image paste,
+// Asserts the v0.2.11 Web composer attachment intake — clipboard image paste,
 // multi-file picker, multi-file drag/drop, Rust/TypeScript code upload, and
 // the outgoing RPC prompt frame content/order — against the REAL `rpi
 // --listen` binary + loopback mock provider in a real browser:
 //
 //   - Paste image via real ClipboardEvent/DataTransfer with a valid tiny PNG
-//     File — the paste dispatch is CANCELED (defaultPrevented) only when the
-//     clipboard carries files; a text-only ClipboardEvent is NOT canceled.
+//     File — file paste is canceled. Small plain text stays native.
 //   - Picker sets 2 code files together (.rs + .ts) via the hidden
 //     input[type=file] — 2 code chips appear with RS/TS badge labels.
 //   - Drop sends 2 code files together via synthetic DragEvent on the footer —
@@ -44,6 +43,13 @@
 //     collab guest view uses) — structural .md-* tags, hostile elements stay
 //     inert literal text, NO whole-message pre wrapper, images keep rendering
 //     BEFORE the caption, and a reload still renders the caption as Markdown.
+//   - 1 MiB plain-text paste: intercepted into one text attachment WITHOUT
+//     materializing the payload in the textarea (dispatch stays well under
+//     100 ms), the COMPLETE paste rides the existing prompt message wire,
+//     the sent chip clears on the fast command ACK (never waiting for the
+//     provider turn), and the user bubble renders a bounded/collapsed
+//     preview — no full 1 MiB user content ever reaches the DOM, including
+//     after the backend's user message_start reconciles the bubble.
 
 import { chromium } from 'playwright';
 
@@ -108,6 +114,7 @@ async function readChips(page) {
       name: chip.querySelector('.composer-attachment__name')?.textContent?.trim() || '',
       badge: chip.querySelector('.composer-attachment__badge')?.textContent?.trim() || '',
       isImage: chip.querySelector('.composer-attachment__thumb') !== null,
+      size: Number((chip.querySelector('.composer-attachment__size')?.textContent || '').match(/^\d+/)?.[0] || 0),
     }))
   );
 }
@@ -205,7 +212,8 @@ async function main() {
     }
     await page.screenshot({ path: `${evidence}/paste.png`, fullPage: true });
 
-    // Text-only paste: the handler must NOT call preventDefault (no files).
+    // Small text remains a native textarea paste. Large text is intercepted
+    // before the browser inserts/layouts it and becomes a bounded text chip.
     const textPasteResult = await page.evaluate(() => {
       const dt = new DataTransfer();
       dt.setData('text/plain', 'hello plain text');
@@ -214,18 +222,20 @@ async function main() {
         bubbles: true,
         cancelable: true,
       });
-      const target = document.getElementById('prompt-input');
-      target.dispatchEvent(event);
+      document.getElementById('prompt-input').dispatchEvent(event);
       return { defaultPrevented: event.defaultPrevented };
     });
     if (textPasteResult.defaultPrevented) {
-      fail('text-only paste: dispatch WAS canceled (defaultPrevented=true) — onPaste should not preventDefault for text-only clipboard data');
+      fail('small text paste was canceled — native textarea paste must remain available');
     }
-    // No new chip should have appeared from the text-only paste.
-    const afterTextChips = await readChips(page);
-    if (afterTextChips.length !== 1) {
-      fail(`text-only paste: chip count changed from 1 to ${afterTextChips.length} — text paste should not create a chip`);
+    if ((await readChips(page)).length !== 1) {
+      fail('small text paste changed the attachment list');
     }
+
+    // The 1 MiB large-text paste journey (dispatch latency, full wire
+    // payload, bounded DOM, ACK chip cleanup) runs as its own self-contained
+    // section AFTER the multi-image + markdown sends, so the queue-state and
+    // user-bubble count invariants below stay deterministic.
 
     // ------------------------------------------------------------------
     // Picker sets 2 code files together (.rs + .ts) via the hidden
@@ -997,6 +1007,136 @@ async function main() {
     await page.screenshot({ path: `${evidence}/user-markdown-restore.png`, fullPage: true });
 
     // ------------------------------------------------------------------
+    // Large plain-text paste: a 1 MiB paste becomes one text attachment
+    // chip without ever materializing the payload in the textarea, sends
+    // the COMPLETE content over the existing prompt message wire, renders
+    // a bounded/collapsed user preview, and the sent chip clears on the
+    // command ACK — the fast-ack contract (prompt responds before the
+    // provider turn; the turn is tokio::spawn'ed) — so this section never
+    // waits for the assistant reply to finish.
+    // ------------------------------------------------------------------
+    const largePaste = await page.evaluate(() => {
+      const input = document.getElementById('prompt-input');
+      const text = 'large-paste-line\n'.repeat(65536); // 1 MiB
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      const event = new ClipboardEvent('paste', {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true,
+      });
+      const start = performance.now();
+      input.dispatchEvent(event);
+      return {
+        defaultPrevented: event.defaultPrevented,
+        dispatchMs: performance.now() - start,
+        valueLength: input.value.length,
+        expectedLength: text.length,
+      };
+    });
+    if (!largePaste.defaultPrevented) {
+      fail('large text paste was not intercepted before native insertion');
+    }
+    if (largePaste.valueLength !== 0) {
+      fail(`large text paste reached textarea value (${largePaste.valueLength} chars)`);
+    }
+    if (largePaste.dispatchMs > 100) {
+      fail(`large text paste blocked dispatch for ${largePaste.dispatchMs.toFixed(1)}ms`);
+    }
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.composer-attachment').length === 1,
+      'large text paste did not create a text attachment chip'
+    );
+    const largeChip = (await readChips(page))[0];
+    if (!largeChip || largeChip.name !== 'pasted-text.txt' || largeChip.isImage) {
+      fail(`large text paste chip wrong: ${JSON.stringify(largeChip)}`);
+    }
+    if (!largeChip.size || largeChip.size !== largePaste.expectedLength) {
+      fail(`large text paste chip size wrong: ${JSON.stringify(largeChip)}`);
+    }
+
+    // Send: the complete paste rides the existing prompt message wire (the
+    // fenced text attachment shape), the textarea stays empty, and the chip
+    // clears on the ACK — not after the provider turn.
+    const largeSendBefore = sentFrames.length;
+    await page.press('#prompt-input', 'Enter');
+    let largeFrame = null;
+    const largeDeadline = Date.now() + 15000;
+    while (Date.now() < largeDeadline) {
+      for (let i = largeSendBefore; i < sentFrames.length; i++) {
+        let frame;
+        try {
+          frame = JSON.parse(sentFrames[i]);
+        } catch {
+          continue;
+        }
+        if (frame && frame.type === 'prompt') {
+          largeFrame = frame;
+          break;
+        }
+      }
+      if (largeFrame) break;
+      await page.waitForTimeout(50);
+    }
+    if (!largeFrame) fail('large text paste prompt RPC not observed');
+    const largeMessage = typeof largeFrame.message === 'string' ? largeFrame.message : '';
+    if (!largeMessage.startsWith('File: pasted-text.txt\n```text\nlarge-paste-line\n')) {
+      fail('large text paste did not use the bounded text attachment wire shape');
+    }
+    if (largeMessage.length < largePaste.expectedLength) {
+      fail(`large text paste was truncated on the prompt wire (${largeMessage.length} chars)`);
+    }
+    // The only queued chip was the pasted text, so exact sent-id cleanup
+    // empties the strip on ACK (the frame may still be mid-provider-turn).
+    await waitFor(
+      page,
+      () => document.getElementById('composer-attachments') === null,
+      'large text paste chip did not clear after send (ACK cleanup)'
+    );
+
+    // Bounded user bubble: the optimistic AND the persisted (message_start
+    // patched) bubble render the collapsed large-text preview. No full 1 MiB
+    // user content may ever reach the DOM — not before, and not after the
+    // backend's user message_start replaces the optimistic item.
+    await waitFor(
+      page,
+      () => {
+        const bubbles = document.querySelectorAll('.msg--user__large-text');
+        if (bubbles.length !== 1) return false;
+        // The bubble must have been reconciled with the persisted message
+        // (optimistic flag off) before the DOM-bound proof.
+        const bubble = bubbles[0].closest('.msg--user');
+        return bubble !== null && !bubble.classList.contains('optimistic');
+      },
+      'large paste: user bubble did not render the bounded preview (or never reconciled with the persisted message)'
+    );
+    const largeBubble = await page.evaluate(() => {
+      const details = document.querySelector('.msg--user__large-text');
+      const bubble = details ? details.closest('.msg--user') : null;
+      const pre = details ? details.querySelector('pre') : null;
+      return {
+        bubbleText: bubble ? bubble.textContent.length : -1,
+        previewChars: pre ? pre.textContent.length : -1,
+        summaryBytes: Number((details?.querySelector('summary')?.textContent || '').match(/(\d+) bytes/)?.[1] || -1),
+        hasOmission: pre ? pre.textContent.includes('characters omitted') : false,
+      };
+    });
+    if (largeBubble.previewChars < 0 || largeBubble.previewChars >= largePaste.expectedLength) {
+      fail(`large paste: user bubble DOM is not bounded (preview ${largeBubble.previewChars} chars, paste ${largePaste.expectedLength})`);
+    }
+    if (largeBubble.bubbleText >= largePaste.expectedLength) {
+      fail(`large paste: the full ${largePaste.expectedLength}-char payload reached the DOM (bubble textContent ${largeBubble.bubbleText} chars)`);
+    }
+    if (largeBubble.summaryBytes < largePaste.expectedLength) {
+      fail(`large paste: bubble summary understates the sent bytes (${largeBubble.summaryBytes} < ${largePaste.expectedLength})`);
+    }
+    if (!largeBubble.hasOmission) {
+      fail('large paste: bounded preview lacks the characters-omitted marker');
+    }
+    await page.screenshot({ path: `${evidence}/large-paste.png`, fullPage: true });
+
+    // ------------------------------------------------------------------
     // Branch matrix: codeLanguage switch cases (one file per extension —
     // each distinct extension takes a different switch branch in
     // attachments.ts codeLanguage), text-type fallbacks, TEXT_BASENAMES,
@@ -1158,6 +1298,197 @@ async function main() {
       'sanitize: chips did not clear after the final send'
     );
     await page.screenshot({ path: `${evidence}/sanitize-wire.png`, fullPage: true });
+
+    // ------------------------------------------------------------------
+    // Edge-case intake matrix (coverage journeys, disjoint block): empty
+    // 0-byte image (base64Length zero branch), type-less .jpg extension-MIME
+    // fallback, empty-type text file (mimeType 'text/plain' fallback), a
+    // 200-char filename (sanitize truncation to 128 in the File: header), an
+    // EMPTY filename (sanitize 'file' fallback), and an extension-less
+    // basename (extOf no-dot branch + language-less fence). All queue in ONE
+    // batch (6 chips: 2 images + 4 code), then a single send proves the wire
+    // (2 image blocks in paste order incl. the empty data + the jpeg MIME
+    // fallback; every code File: header incl. truncation/fallback shapes).
+    // The block starts by clearing any leftover chips and waits for the
+    // previous stream before dispatching, so it never assumes mid-flow chip
+    // counts from earlier sections.
+    // ------------------------------------------------------------------
+    const clearChips = async () => {
+      while (await page.locator('.composer-attachment').count()) {
+        await page.click('.composer-attachment:first-child .composer-attachment__remove');
+      }
+      await waitFor(
+        page,
+        () => document.getElementById('composer-attachments') === null,
+        'edge matrix: chip strip never cleared before the edge batch'
+      );
+    };
+    await clearChips();
+
+    const LONG_NAME = `${'x'.repeat(200)}.rs`;
+    await page.evaluate((longName) => {
+      const dt = new DataTransfer();
+      // 1. Empty 0-byte PNG (base64Length(0) classify branch).
+      dt.items.add(new File([], 'empty.png', { type: 'image/png' }));
+      // 2. Type-less .jpg (extension-based imageMimeType jpeg branch).
+      const canvas = document.createElement('canvas');
+      canvas.width = 1;
+      canvas.height = 1;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = 'rgb(0,255,255)';
+      ctx.fillRect(0, 0, 1, 1);
+      const jpegUrl = canvas.toDataURL('image/jpeg');
+      const jpegBin = atob(jpegUrl.split(',')[1]);
+      const jpegBytes = new Uint8Array(jpegBin.length);
+      for (let i = 0; i < jpegBin.length; i++) jpegBytes[i] = jpegBin.charCodeAt(i);
+      dt.items.add(new File([jpegBytes], 'shot.jpg', { type: '' }));
+      // 3. Empty-type text file (code mimeType 'text/plain' fallback).
+      dt.items.add(new File(['plain content'], 'note.txt', { type: '' }));
+      // 4. Over-long filename (sanitize truncation to MAX_FILENAME_LEN).
+      dt.items.add(new File(['long name body'], longName, { type: 'text/plain' }));
+      // 5. Empty filename (sanitize 'file' fallback).
+      dt.items.add(new File(['nameless body'], '', { type: 'text/plain' }));
+      // 6. Extension-less basename (extOf no-dot + language-less fence).
+      dt.items.add(new File(['LICENSE body'], 'LICENSE', { type: 'text/plain' }));
+      document.getElementById('prompt-input').dispatchEvent(
+        new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })
+      );
+    }, LONG_NAME);
+    await waitFor(
+      page,
+      () => document.querySelectorAll('.composer-attachment').length === 6,
+      'edge matrix: 6-chip edge batch never fully queued (2 images + 4 code)'
+    );
+    const edgeChips = await readChips(page);
+    const edgeNames = edgeChips.map((c) => c.name);
+    if (!edgeNames.includes('empty.png') || !edgeNames.includes('shot.jpg')) {
+      fail(`edge matrix: image chips missing (got ${JSON.stringify(edgeNames)})`);
+    }
+    const emptyPngChip = edgeChips.find((c) => c.name === 'empty.png');
+    if (!emptyPngChip || !emptyPngChip.isImage) {
+      fail('edge matrix: the 0-byte empty.png must queue as an image chip');
+    }
+    const jpgChip = edgeChips.find((c) => c.name === 'shot.jpg');
+    if (!jpgChip || !jpgChip.isImage) {
+      fail('edge matrix: the type-less shot.jpg must classify as an image via the extension fallback');
+    }
+    if (!edgeNames.includes('note.txt')) {
+      fail('edge matrix: the empty-type note.txt never queued (type-less text must stay accepted)');
+    }
+    const longChip = edgeChips.find((c) => c.name === LONG_NAME);
+    if (!longChip || longChip.badge !== 'RS') {
+      fail(`edge matrix: long-name chip missing or wrong badge (got ${JSON.stringify(edgeChips.find((c) => c.name === LONG_NAME))})`);
+    }
+    if (!edgeNames.includes('')) {
+      fail('edge matrix: the EMPTY-name file never queued (sanitize fallback must still accept it)');
+    }
+    const emptyNameChip = edgeChips.find((c) => c.name === '');
+    if (!emptyNameChip || emptyNameChip.badge !== 'TXT') {
+      fail(`edge matrix: empty-name chip must carry the TXT fallback badge (got ${JSON.stringify(emptyNameChip)})`);
+    }
+    const licenseChip = edgeChips.find((c) => c.name === 'LICENSE');
+    if (!licenseChip || licenseChip.badge !== 'TXT') {
+      fail(`edge matrix: extension-less LICENSE chip must carry the TXT badge (got ${JSON.stringify(licenseChip)})`);
+    }
+    await page.screenshot({ path: `${evidence}/edge-matrix-chips.png`, fullPage: true });
+
+    // Single send proves the wire shapes; wait for the previous stream first
+    // so Enter dispatches a NEW prompt (never a steer).
+    await waitFor(
+      page,
+      () => {
+        const badge = document.getElementById('stream-badge');
+        return !badge || badge.hidden === true;
+      },
+      'edge matrix: previous stream never cleared before the batch send',
+      30000
+    );
+    await page.fill('#prompt-input', 'edge cases batch');
+    const edgeSendBefore = sentFrames.length;
+    await page.press('#prompt-input', 'Enter');
+    let edgeFrame = null;
+    const edgeDeadline = Date.now() + 15000;
+    while (Date.now() < edgeDeadline) {
+      for (let i = edgeSendBefore; i < sentFrames.length; i++) {
+        let frame;
+        try {
+          frame = JSON.parse(sentFrames[i]);
+        } catch {
+          continue;
+        }
+        if (frame && frame.type === 'prompt') {
+          edgeFrame = frame;
+          break;
+        }
+      }
+      if (edgeFrame) break;
+      await page.waitForTimeout(200);
+    }
+    if (!edgeFrame) {
+      fail(`edge matrix: batch prompt RPC not observed (sent ${sentFrames.length - edgeSendBefore} frames after submit; last=${sentFrames.slice(-3).join(' | ') || 'none'})`);
+    }
+    if (!Array.isArray(edgeFrame.images) || edgeFrame.images.length !== 2) {
+      fail(`edge matrix: batch must carry exactly 2 image blocks (got ${JSON.stringify(edgeFrame.images)})`);
+    }
+    const edgeImg0 = edgeFrame.images[0];
+    if (edgeImg0.mimeType !== 'image/png' || edgeImg0.data !== '') {
+      fail(`edge matrix: empty.png must ride as an image/png block with EMPTY data (got ${JSON.stringify(edgeImg0)})`);
+    }
+    const edgeImg1 = edgeFrame.images[1];
+    if (edgeImg1.mimeType !== 'image/jpeg' || typeof edgeImg1.data !== 'string' || edgeImg1.data.length === 0) {
+      fail(`edge matrix: type-less shot.jpg must ride as image/jpeg via the extension fallback (got ${JSON.stringify({ mime: edgeImg1.mimeType, len: edgeImg1.data?.length })})`);
+    }
+    const edgeMsg = typeof edgeFrame.message === 'string' ? edgeFrame.message : '';
+    if (!edgeMsg.includes('File: note.txt\n```text\nplain content')) {
+      fail(`edge matrix: note.txt File: header missing from the wire (excerpt: ${edgeMsg.slice(0, 200)})`);
+    }
+    if (!edgeMsg.includes(`File: ${'x'.repeat(128)}\n`) || edgeMsg.includes(`File: ${'x'.repeat(200)}`)) {
+      fail('edge matrix: the 200-char filename must truncate to 128 chars in the File: header');
+    }
+    if (!edgeMsg.includes('File: file\n```\nnameless body')) {
+      fail('edge matrix: the EMPTY filename must sanitize to the "file" fallback on the wire');
+    }
+    if (!edgeMsg.includes('File: LICENSE\n```\nLICENSE body\n```')) {
+      fail('edge matrix: extension-less LICENSE must send a language-less fenced block (excerpt: ${edgeMsg.slice(0, 300)})');
+    }
+    if (!edgeMsg.includes('edge cases batch')) {
+      fail('edge matrix: the user caption is missing after the code segments');
+    }
+    // The batch must clear after dispatch like every other send.
+    await waitFor(
+      page,
+      () => document.getElementById('composer-attachments') === null,
+      'edge matrix: batch chips did not clear after the send'
+    );
+    await page.screenshot({ path: `${evidence}/edge-matrix-wire.png`, fullPage: true });
+
+    // Three PDFs in ONE batch: every rejection shares the 'unsupported'
+    // reason, so the grouped skip summary must use the 3+ sample form
+    // ("a.pdf, b.pdf +1 more") — never two separate toasts.
+    await page.setInputFiles('input[type=file]', [
+      { name: 'a.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 a\n') },
+      { name: 'b.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 b\n') },
+      { name: 'c.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 c\n') },
+    ]);
+    await waitFor(
+      page,
+      () => {
+        const toasts = Array.from(document.querySelectorAll('.toast--error'));
+        return toasts.some(
+          (t) =>
+            (t.textContent || '').includes('Skipped 3 file(s)') &&
+            (t.textContent || '').includes('3 unsupported') &&
+            (t.textContent || '').includes('a.pdf, b.pdf +1 more')
+        );
+      },
+      'edge matrix: 3-PDF batch never produced the grouped "+1 more" skip toast',
+      15000
+    );
+    const chipsAfterPdfs = await page.evaluate(() => document.querySelectorAll('.composer-attachment').length);
+    if (chipsAfterPdfs !== 0) {
+      fail(`edge matrix: 3-PDF batch created ${chipsAfterPdfs} chips (expected 0)`);
+    }
+    await page.screenshot({ path: `${evidence}/edge-matrix-pdf-group.png`, fullPage: true });
 
     console.log('web-attachments: PASSED (paste image canceled + chip; text-only paste not canceled; picker 2 code files RS/TS; drop 2 code files + drop-active highlight; chips preserve global intake order; PDF rejection toast + no chip; outgoing prompt frame: 1 image block + code files in order + no PDF; attachments cleared after dispatch; user bubble renders the image thumbnail inline with text — no "(image attached)"; image-only multi-image send renders 2 distinct thumbnails with no text; mobile viewport has no horizontal overflow with the multi-image grid; reload restores both user bubbles with their thumbnails; user-caption Markdown (heading/list/bold/inline code/fence/hostile) renders structurally with no pre wrapper and hostile HTML inert — images stay before the caption and reload still renders Markdown; rejection matrix (oversize/over-budget/too-many/invalid-UTF-8/remove/extension-fallback); codeLanguage switch matrix + basenames/app-type fallbacks; sanitizeFileName + safeFence wire contract)');
   } finally {

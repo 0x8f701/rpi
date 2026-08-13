@@ -72,6 +72,21 @@ async function lastAssistantText(page) {
   });
 }
 
+// Wait until the main session is user-visibly idle. Enter during an active
+// stream is mapped to steer (not a new prompt), so sequential NEW prompts must
+// only be issued after #stream-badge clears.
+async function waitForIdle(page, label, timeoutMs = 30000) {
+  await waitFor(
+    page,
+    () => {
+      const badge = document.getElementById('stream-badge');
+      return !badge || badge.hidden === true;
+    },
+    label,
+    timeoutMs
+  );
+}
+
 // Read a small JSON evidence file written by the mock/fixture (e.g. the
 // realtime create-call header record), returning null when absent/invalid.
 async function readJsonIfExists(file) {
@@ -339,10 +354,12 @@ async function main() {
     record('app.primary-action-send');
     record('prompt.slow-stream-full');
 
-    // Request 2 is instant.
+    // Request 2 is instant. Wait for user-visible idle before the next NEW
+    // prompt: Enter while streaming is mapped to steer, not a fresh request.
     await page.fill('#prompt-input', 'again');
     await page.press('#prompt-input', 'Enter');
     await waitFor(page, (reply) => document.body.textContent.includes(reply), 'fast reply never streamed into the DOM', 30000, fastReply);
+    await waitForIdle(page, 'session not idle after fast reply before abort stream');
     record('prompt.fast-roundtrip');
 
     // Request 3: slow stream, EARLY abort.
@@ -416,8 +433,15 @@ async function main() {
     );
     record('prompt.new-message-count');
 
+    // Recovery reply text can land while the run is still marked active;
+    // Phase C needs a NEW prompt (not steer), so establish the idle contract
+    // before any rich attempt. Each failed non-rich attempt also settles idle
+    // before the next retry.
+    await waitForIdle(page, 'session not idle after recovery before rich content');
+
     // ==================== Phase C: rich content ====================
     const richPromptAttempt = async () => {
+      await waitForIdle(page, 'session not idle before rich prompt attempt');
       const before = await page.evaluate(() => document.querySelectorAll('.msg--assistant .assistant-text').length);
       await page.fill('#prompt-input', 'render rich content');
       await page.press('#prompt-input', 'Enter');
@@ -1027,27 +1051,34 @@ async function main() {
     );
     record('todo.dep-unlink');
     // Detail-pane Complete button (covers the open-branch detail onClick).
-    const todoPanelDiag = await page.evaluate(() => ({
-      panelPresent: document.getElementById('todo-panel') !== null,
-      detailPresent: document.getElementById('todo-detail') !== null,
-      detailId: document.getElementById('todo-detail')?.dataset.taskId ?? '',
-      completeBtn: document.getElementById('todo-detail-complete') !== null,
-      reopenBtn: document.getElementById('todo-detail-reopen') !== null,
-      tasks: [...document.querySelectorAll('.todo-task')].map((r) => ({
-        text: r.textContent?.trim().slice(0, 40) || '',
-        status: r.querySelector('.todo-task__bullet')?.getAttribute('aria-label') || '',
-      })),
-    }));
-    console.error(`web-cov: TODO DIAG: ${JSON.stringify(todoPanelDiag)}`);
+    // Re-establish the open precondition explicitly: live Todo updates can
+    // settle between dependency mutations, but this branch must be exercised
+    // from an in-progress task rather than clicking an absent control.
+    if (await page.$('#todo-detail-reopen')) {
+      await page.click('#todo-detail-reopen');
+    }
+    await waitFor(
+      page,
+      () => {
+        const rows = [...document.querySelectorAll('.todo-task')];
+        const row = rows.find((r) => r.textContent.includes('web e2e task'));
+        const inProgress =
+          !!row && row.querySelector('.todo-task__bullet')?.getAttribute('aria-label') === 'in_progress';
+        return inProgress && document.getElementById('todo-detail-complete') !== null;
+      },
+      'detail task not in_progress with Complete visible before Complete coverage'
+    );
     await page.click('#todo-detail-complete');
     await waitFor(
       page,
       () => {
         const rows = [...document.querySelectorAll('.todo-task')];
         const row = rows.find((r) => r.textContent.includes('web e2e task'));
-        return !!row && row.querySelector('.todo-task__bullet')?.getAttribute('aria-label') === 'completed';
+        const completed =
+          !!row && row.querySelector('.todo-task__bullet')?.getAttribute('aria-label') === 'completed';
+        return completed && document.getElementById('todo-detail-reopen') !== null;
       },
-      'detail Complete never reached completed'
+      'detail Complete never reached completed with Reopen visible'
     );
     record('todo.detail-complete');
     // Detail-pane Reopen button (covers the completed-branch detail onClick).
@@ -1887,7 +1918,7 @@ async function main() {
     // fail if the canned mock child does not reply within the window.
     await page.waitForTimeout(2500);
 
-    // ============ Phase K: side chat + maintenance ============
+    // ============ Phase K: side chat ============
     await page.click('#subagents-close-btn');
     await waitFor(page, () => document.getElementById('subagents-panel') === null, 'subagents panel did not close');
     await page.click('#sidechat-toggle-btn');
@@ -1941,102 +1972,6 @@ async function main() {
     record('sidechat.prompt-reply');
     await page.click('.side-chat .panel-close');
     await waitFor(page, () => document.querySelector('.side-chat') === null, 'side chat panel did not close');
-    // Prime the active (post-switch) session with two user turns so snapcompact
-    // has something to archive: the steering fixture lowers
-    // compaction.snapKeepTurns to 1 (coverage.sh settings.json), so exactly two
-    // user turns let find_snap_cut_point land a cut (mirrors E2E.d/web/extras.sh).
-    // Mock parity is not relied on past request 4, so accept any non-empty reply.
-    for (let i = 0; i < 2; i += 1) {
-      // Wait until the main session is idle before prompting: a prompt sent
-      // while a run is in flight is rejected by the turn-gate (not queued), so
-      // each priming turn must only be issued once #stream-badge clears.
-      await waitFor(
-        page,
-        () => document.getElementById('stream-badge').hidden === true,
-        `main session still streaming before priming turn ${i + 1}`,
-        30000
-      );
-      const beforePrime = await page.evaluate(
-        () => document.querySelectorAll('.msg--assistant .assistant-text').length
-      );
-      await page.fill('#prompt-input', `prime turn ${i + 1}`);
-      await page.press('#prompt-input', 'Enter');
-      // Wait for a new assistant message AND for the turn to finish (streaming
-      // cleared) so the next priming prompt is accepted and snapcompact sees a
-      // complete user+assistant pair to archive.
-      await waitFor(
-        page,
-        (before) => {
-          const nodes = [...document.querySelectorAll('.msg--assistant .assistant-text')];
-          return (
-            nodes.length > before &&
-            (nodes[nodes.length - 1]?.textContent || '').trim() !== '' &&
-            document.getElementById('stream-badge').hidden === true
-          );
-        },
-        `priming turn ${i + 1} never completed before snapcompact`,
-        30000,
-        beforePrime
-      );
-    }
-    await page.click('#maintenance-toggle-btn');
-    await waitFor(page, () => document.querySelector('.maintenance') !== null, 'maintenance panel did not open');
-    const clickMaintenanceAction = async (label) => {
-      const clicked = await page.evaluate((want) => {
-        const btn = Array.from(document.querySelectorAll('.maintenance__action')).find((b) => b.textContent.includes(want));
-        if (!btn) return false;
-        btn.click();
-        return true;
-      }, label);
-      if (!clicked) fail(`maintenance action "${label}" not found`);
-    };
-    await clickMaintenanceAction('Snapcompact');
-    await waitFor(
-      page,
-      () =>
-        Array.from(document.querySelectorAll('.maintenance__result')).some((r) =>
-          r.textContent.includes('estimated tokens')
-        ),
-      'snapcompact never rendered the A→B token report'
-    );
-    const ab = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('.maintenance__result'))
-        .map((r) => r.textContent)
-        .join(' | ')
-    );
-    if (!ab.includes('→')) fail(`snapcompact report has no A→B arrow: ${ab}`);
-    record('maintenance.snapcompact-ab');
-    await clickMaintenanceAction('Rewind…');
-    await waitFor(
-      page,
-      () =>
-        document.querySelector('.maintenance__list') !== null ||
-        Array.from(document.querySelectorAll('.maintenance__result')).some((r) => r.textContent.includes('rewind')),
-      'rewind list never appeared'
-    );
-    record('maintenance.rewind-list');
-    await clickMaintenanceAction('Handoff');
-    await waitFor(page, () => document.querySelector('.maintenance__handoff') !== null, 'handoff envelope never rendered');
-    record('maintenance.handoff');
-    await clickMaintenanceAction('Queue…');
-    await waitFor(page, () => document.querySelector('.maintenance__queue') !== null, 'queue view never rendered');
-    await clickMaintenanceAction('Cancel queue');
-    await waitFor(
-      page,
-      () =>
-        Array.from(document.querySelectorAll('.maintenance__result')).some((r) => r.textContent.includes('Cancelled')),
-      'queue cancel never reported'
-    );
-    record('maintenance.queue-cancel');
-
-    // ---- App coverage: maintenance panel close (onClosePanel) ----
-    // Close the maintenance panel via its own close button (covers App's
-    // maintenance onClosePanel callback, distinct from a panel-toggle swap).
-    await page.click('.maintenance .panel-close');
-    await waitFor(page, () => document.querySelector('.maintenance') === null, 'maintenance panel did not close via its close button');
-    record('app.maintenance-close');
-    // Enter preserves the prompt/steer keyboard flow; the single composer
-    // button switches between Send and Stop as asserted above.
 
     // ==================== Phase M: mobile viewport ====================
     const mobile = await browser.newPage({ viewport: { width: 375, height: 667 } });

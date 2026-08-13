@@ -723,8 +723,8 @@ async fn goal_adapter_projects_active_goal_and_pauses_at_budget_boundary() {
         .await
         .expect("show goal");
     assert!(
-        show.starts_with("paused · 10/10 tokens · ship safely"),
-        "budget exhaustion must pause via adapter: {show}"
+        show.starts_with("paused (budget exhausted; cannot resume) · 10/10 tokens · ship safely"),
+        "budget exhaustion must pause with the cannot-resume reason: {show}"
     );
     let state = application.goal_state();
     let goal = state.current.expect("goal");
@@ -1092,7 +1092,7 @@ async fn goal_adapter_lifecycle_commands_are_coherent() {
     let paused = execute_interactive_goal_command(&application, InteractiveGoalCommand::Pause)
         .await
         .expect("pause");
-    assert_eq!(paused, "paused · 0/20 tokens · adapter goal");
+    assert_eq!(paused, "paused (manually paused) · 0/20 tokens · adapter goal");
     assert_eq!(
         application.goal_state().current.expect("goal").pause_reason,
         Some(GoalPauseReason::Manual)
@@ -1106,7 +1106,7 @@ async fn goal_adapter_lifecycle_commands_are_coherent() {
         execute_interactive_goal_command(&application, InteractiveGoalCommand::Show)
             .await
             .expect("show paused");
-    assert_eq!(still_paused, "paused · 4/20 tokens · adapter goal");
+    assert_eq!(still_paused, "paused (manually paused) · 4/20 tokens · adapter goal");
 
     let resumed = execute_interactive_goal_command(&application, InteractiveGoalCommand::Resume)
         .await

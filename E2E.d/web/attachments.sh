@@ -4,7 +4,7 @@
 # Spawns the real `rpi --listen` binary with a token file and the loopback
 # mock provider (--scenario steering; no prompts are sent, so the mock only
 # serves the model catalog), opens `/web` in a real browser, and asserts the
-# v0.2.10 Web composer attachment intake — clipboard image paste, multi-file
+# v0.2.11 Web composer attachment intake — clipboard image paste, multi-file
 # picker, multi-file drag/drop, Rust/TypeScript code upload, and the outgoing
 # RPC prompt frame content/order:
 #   - Paste image via real ClipboardEvent/DataTransfer with a valid tiny PNG

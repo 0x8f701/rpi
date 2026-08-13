@@ -335,6 +335,7 @@ export function PersonasPanel({ sendCommand, onClose }: PersonasPanelProps) {
           type="button"
           className="subagents-panel__close"
           title="Close personas panel"
+          aria-label="Close personas panel"
           onClick={onClose}
         >
           ×

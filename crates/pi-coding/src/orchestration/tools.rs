@@ -1283,7 +1283,15 @@ mod read_history_tests {
         }))
         .expect("tool message");
         let mut assistant = pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
-        assistant.content = vec![pi_ai::ContentBlock::text("let me check")];
+        assistant.content = vec![
+            pi_ai::ContentBlock::text("let me check"),
+            pi_ai::ContentBlock::ToolCall(pi_ai::ToolCall {
+                id: "call_2".to_owned(),
+                name: "read".to_owned(),
+                arguments: serde_json::json!({ "path": "seed.txt" }),
+                thought_signature: None,
+            }),
+        ];
         let assistant = serde_json::to_value(pi_ai::Message::Assistant(assistant))
             .expect("assistant message");
         let records = [
@@ -1351,6 +1359,11 @@ mod read_history_tests {
         assert!(text.contains("user: first ask with"), "{text}");
         assert!(text.contains("[tool: bash]"), "{text}");
         assert!(text.contains("assistant: let me check"), "{text}");
+        // The assistant tool call must project its concrete target — a
+        // generic-only history (`[tool: read]`/`[bash]` tags) is rejected.
+        assert!(text.contains("assistant · read seed.txt"), "concrete tool action missing: {text}");
+        // Tool results carry the reliably-known outcome, never the output.
+        assert!(text.contains("[tool: bash] · ok"), "{text}");
         // No raw JSONL leaks into the rendering.
         assert!(!text.contains("\"role\""), "no raw JSONL: {text}");
         assert!(!text.contains("toolCallId"), "no raw JSONL: {text}");
@@ -1367,6 +1380,13 @@ mod read_history_tests {
         let root = tempfile::tempdir().expect("root");
         let runtime = runtime(root.path());
         let history_path = root.path().join("Sibling-job.history.json");
+        let mut assistant = pi_ai::AssistantMessage::pending(&pi_ai::Model::default());
+        assistant.content = vec![pi_ai::ContentBlock::ToolCall(pi_ai::ToolCall {
+            id: "call_2".to_owned(),
+            name: "read".to_owned(),
+            arguments: serde_json::json!({ "path": "seed.txt" }),
+            thought_signature: None,
+        })];
         let messages = vec![
             pi_ai::Message::user_text("snapshot ask", 0),
             pi_ai::Message::ToolResult(pi_ai::ToolResultMessage {
@@ -1379,6 +1399,7 @@ mod read_history_tests {
                 is_error: false,
                 timestamp: 0,
             }),
+            pi_ai::Message::Assistant(assistant),
         ];
         fs::write(&history_path, serde_json::to_vec_pretty(&messages).expect("snapshot"))
             .expect("history file");
@@ -1393,6 +1414,7 @@ mod read_history_tests {
         let text = text_of(&result);
         assert!(text.contains("user: snapshot ask"), "{text}");
         assert!(text.contains("[tool: read]"), "{text}");
+        assert!(text.contains("assistant · read seed.txt"), "snapshot history must project the concrete read target: {text}");
     }
 
     #[tokio::test]

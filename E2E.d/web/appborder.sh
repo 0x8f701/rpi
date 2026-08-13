@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
-# Web app-main panel border regression lane (playwright-only hard gate).
+# Web app-main panel border + shared drawer resize + sidebar collapse lane
+# (playwright-only hard gate).
 #
 # Spawns the real `rpi --listen` binary with a token file and the loopback
-# mock provider, opens `/web` in a real browser, and asserts the desktop
-# dark/light panel-border contract + the mobile no-overflow contract:
+# mock provider, opens `/web` in a real browser, and asserts:
 #   - desktop (.app-main computed border-left/right: 1px solid the theme's
-#     --border-strong token; dark #3a4350, light #8f959e) — the single strong
-#     edge that visually separates the transcript column from the sidebar;
-#   - header border-bottom and .app-main > footer border-top are the same
-#     1px solid --border-strong edge;
-#   - .session-sidebar carries NO border-right on desktop (the edge is owned
-#     by .app-main's border-left — no doubled 2px seam);
+#     --border-strong token; dark #3a4350, light #8f959e);
+#   - header border-bottom and .app-main > footer border-top match;
+#   - .session-sidebar has NO border-right on desktop;
 #   - #transcript background resolves to --bg and scrollbar-gutter is stable;
-#   - collapsing the rail via #sidebar-toggle-btn keeps the .app-main edge;
-#   - mobile (390x844): .app-main drops BOTH edges (border-left/right-style
-#     none) and the document never overflows horizontally
-#     (documentElement.scrollWidth <= clientWidth, tolerance 0).
+#   - rail collapse via #sidebar-toggle-btn keeps the .app-main edge;
+#   - ordinary panels share ONE desktop height resizer (#panel-drawer-resizer):
+#     pointer + keyboard + 25–90vh bounds + localStorage `rpi-panel-drawer-size`;
+#   - SessionSidebar header #sidebar-collapse-btn folds desktop rail / closes
+#     mobile drawer; #rail-reopen-btn + header ☰ remain;
+#   - mobile (390x844): flush edges, zero horizontal overflow, resizer hidden.
 #
 # The color assertion resolves the --border-strong token through a probe
 # element (never a hardcoded hex), so the lane tracks the theme tokens.
@@ -42,7 +41,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-appborder - desktop dark/light .app-main computed border (1px solid --border-strong both edges, header/footer edges, no rail seam, stable transcript surface) + mobile (390x844) flush edges with zero horizontal overflow (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-appborder - desktop dark/light .app-main edges + shared panel resizer (pointer/keyboard/bounds/reload) + sidebar header collapse/reopen + mobile flush edges / no resizer / zero overflow (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;
