@@ -49,7 +49,7 @@ if [ -n "${RUSTFLAGS:-}" ]; then
     read -r -a incoming_flags <<< "$RUSTFLAGS"
 fi
 
-all_flags=("${incoming_flags[@]}" "${remap_flags[@]}")
+all_flags=(${incoming_flags[@]+"${incoming_flags[@]}"} ${remap_flags[@]+"${remap_flags[@]}"})
 encoded=""
 for flag in "${all_flags[@]}"; do
     if [ -n "$encoded" ]; then
@@ -69,7 +69,9 @@ incoming_cxxflags=()
 if [ -n "${CXXFLAGS:-}" ]; then
     read -r -a incoming_cxxflags <<< "$CXXFLAGS"
 fi
-export CFLAGS="${incoming_cflags[*]}${incoming_cflags[*]:+ }${compiler_remap_flags[*]}"
-export CXXFLAGS="${incoming_cxxflags[*]}${incoming_cxxflags[*]:+ }${compiler_remap_flags[*]}"
+all_cflags=(${incoming_cflags[@]+"${incoming_cflags[@]}"} ${compiler_remap_flags[@]+"${compiler_remap_flags[@]}"})
+export CFLAGS="${all_cflags[*]}"
+all_cxxflags=(${incoming_cxxflags[@]+"${incoming_cxxflags[@]}"} ${compiler_remap_flags[@]+"${compiler_remap_flags[@]}"})
+export CXXFLAGS="${all_cxxflags[*]}"
 
 exec cargo "$@"

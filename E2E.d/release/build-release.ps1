@@ -68,10 +68,10 @@ if ($isMsvc) {
     if ($rustupHomeRoot) { $compilerRemapFlags += "/pathmap:$rustupHomeRoot=/pi-rustup-home" }
     if ($homeRoot) { $compilerRemapFlags += "/pathmap:$homeRoot=/pi-home" }
 } else {
-    if ($repoRoot) { $compilerRemapFlags += "-ffile-prefix-map=$repoRoot=/pi-src" "-fmacro-prefix-map=$repoRoot=/pi-src" }
-    if ($cargoHomeRoot) { $compilerRemapFlags += "-ffile-prefix-map=$cargoHomeRoot=/pi-cargo-home" "-fmacro-prefix-map=$cargoHomeRoot=/pi-cargo-home" }
-    if ($rustupHomeRoot) { $compilerRemapFlags += "-ffile-prefix-map=$rustupHomeRoot=/pi-rustup-home" "-fmacro-prefix-map=$rustupHomeRoot=/pi-rustup-home" }
-    if ($homeRoot) { $compilerRemapFlags += "-ffile-prefix-map=$homeRoot=/pi-home" "-fmacro-prefix-map=$homeRoot=/pi-home" }
+    if ($repoRoot) { $compilerRemapFlags += "-ffile-prefix-map=$repoRoot=/pi-src", "-fmacro-prefix-map=$repoRoot=/pi-src" }
+    if ($cargoHomeRoot) { $compilerRemapFlags += "-ffile-prefix-map=$cargoHomeRoot=/pi-cargo-home", "-fmacro-prefix-map=$cargoHomeRoot=/pi-cargo-home" }
+    if ($rustupHomeRoot) { $compilerRemapFlags += "-ffile-prefix-map=$rustupHomeRoot=/pi-rustup-home", "-fmacro-prefix-map=$rustupHomeRoot=/pi-rustup-home" }
+    if ($homeRoot) { $compilerRemapFlags += "-ffile-prefix-map=$homeRoot=/pi-home", "-fmacro-prefix-map=$homeRoot=/pi-home" }
 }
 
 # RUSTFLAGS is space-separated by definition (cargo splits on whitespace);
