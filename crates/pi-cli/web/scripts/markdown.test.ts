@@ -27,6 +27,10 @@ import {
   highlightDiffLineFragments,
 } from '../src/markdown.ts';
 import { safeText } from '../src/redact.ts';
+// The mermaid module is aliased to scripts/__mocks__/mermaid.ts by the build
+// command; its fakeDocument/tempWrappers let the leak regression observe the
+// wrapper lifecycle the real mermaid 11.16.1 render reproduces.
+import mermaidMock, { fakeDocument, tempWrappers } from 'mermaid';
 
 const failures: string[] = [];
 let ran = 0;
@@ -423,6 +427,71 @@ function fakeRoot(hosts: FakeHost[]): HTMLElement {
   check('hydrate: per-host callback for each mutation', calls.length === 2, `calls=${calls.length}`);
   check('hydrate: first host rendered', a.innerHTML.includes('<svg'), a.innerHTML);
   check('hydrate: second host errored', b.innerHTML.includes('md-mermaid-error'), b.innerHTML);
+}
+
+{
+  // Repeated invalid renders must not leak mermaid's parser-error DOM.
+  // mermaid 11.16.1 appends a temporary wrapper (`#d<renderId>` holding the
+  // `<svg id="<renderId>">` it draws into) to document.body and removes it
+  // on success, but on a parse error it THROWS before the removal — the
+  // parser-error SVG ("Syntax error in text", "mermaid version …") would
+  // accumulate below the composer, one wrapper per failed render. The stub
+  // reproduces that lifecycle against a fake document; hydrateMermaid must
+  // remove exactly each render id's wrapper on both paths while the in-host
+  // `.md-mermaid-host--error` fallback survives.
+  const prevDoc = Reflect.get(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', {
+    value: fakeDocument,
+    configurable: true,
+    writable: true,
+  });
+  try {
+    // 1) prove the stub reproduces the leak: a failed render leaves its
+    //    wrapper (with the parser/version text) in the registry.
+    let threw = false;
+    try {
+      await mermaidMock.render('mmd-probe', 'BROKEN probe');
+    } catch {
+      threw = true;
+    }
+    const probe = tempWrappers.find((n) => n.id === 'dmmd-probe');
+    check('hydrate-leak: stub reproduces the wrapper leak on failure',
+      threw && probe !== null && probe.textContent.includes('Syntax error in text'),
+      `threw=${threw} probe=${probe?.id ?? 'missing'}`);
+    probe?.remove();
+    check('hydrate-leak: probe wrapper removed', !tempWrappers.some((n) => n.id === 'dmmd-probe'));
+
+    // 2) repeated invalid renders through hydrateMermaid: every leaked
+    //    wrapper is cleaned, the in-host error fallback remains, and the
+    //    post-mutation callback still fires once per failed host.
+    const calls: string[] = [];
+    const a = fakeHost('BROKEN first');
+    const b = fakeHost('BROKEN second');
+    await hydrateMermaid(fakeRoot([a, b]), () => calls.push('mutated'));
+    check('hydrate-leak: no wrapper left after repeated failures',
+      tempWrappers.length === 0,
+      `leftovers: ${tempWrappers.map((n) => n.id).join(',') || 'none'}`);
+    check('hydrate-leak: no parser/version text remains in the fake body',
+      !tempWrappers.some(
+        (n) => n.textContent.includes('Syntax error in text') || n.textContent.includes('mermaid version')
+      ));
+    check('hydrate-leak: first host keeps its error fallback',
+      a.innerHTML.includes('md-mermaid-error') && a.classes.has('md-mermaid-host--error'), a.innerHTML);
+    check('hydrate-leak: second host keeps its error fallback',
+      b.innerHTML.includes('md-mermaid-error') && b.classes.has('md-mermaid-host--error'), b.innerHTML);
+    check('hydrate-leak: callback fired once per failed mutation',
+      calls.length === 2, `calls=${calls.length}`);
+  } finally {
+    if (prevDoc === undefined) {
+      Reflect.deleteProperty(globalThis, 'document');
+    } else {
+      Object.defineProperty(globalThis, 'document', {
+        value: prevDoc,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
 }
 
 // ---- hub wait card body: markdown renders structurally ----

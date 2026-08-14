@@ -68,6 +68,7 @@ export const MATRIX = [
       'md.extra-fence-langs',
       'md.extra-mermaid-empty',
       'md.extra-mermaid-error',
+      'md.extra-mermaid-no-residue',
       'md.extra-currency',
       'md.extra-image-relative',
       'md.extra-url-policy',

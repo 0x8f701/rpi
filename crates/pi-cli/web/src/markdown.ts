@@ -606,6 +606,29 @@ function initMermaid(): void {
 }
 
 /**
+ * Remove mermaid's temporary render wrapper for one render id.
+ *
+ * mermaidAPI.render() (v11) appends `<div id="d<id>"><svg id="<id>">…</svg></div>`
+ * to `document.body` and removes it via its own `removeTempElements()` on
+ * SUCCESS. On a parse error it draws the parser-error diagram ("Syntax error
+ * in text", "mermaid version …") into that wrapper and THROWS before the
+ * removal runs — the wrapper then stays in the page below the
+ * composer/footer, one leaked div per failed render. This mirrors mermaid's
+ * own removal, scoped to the exact render id we generated, and verifies the
+ * wrapper is mermaid's (it contains the svg with the render id) so nothing
+ * else is touched. We run securityLevel 'strict' (never sandbox), so the
+ * `d<id>` div is the only artifact to remove. No-op when there is no DOM
+ * (unit-test environment) or no wrapper.
+ */
+function removeMermaidTempDom(renderId: string): void {
+  if (typeof document === 'undefined') return;
+  // The wrapper div holds the `<svg id="<renderId>">` mermaid drew into;
+  // remove exactly that pair.
+  const div = document.getElementById(`d${renderId}`);
+  if (div?.querySelector(`#${renderId}`)) div.remove();
+}
+
+/**
  * Replace `.md-mermaid-host` elements inside `root` with rendered SVG.
  * Never throws: parse failures (and initialization failures) degrade to a
  * styled block showing the raw source. Safe to call repeatedly.
@@ -635,8 +658,9 @@ export async function hydrateMermaid(root: HTMLElement, onMutated?: () => void):
       onMutated?.();
       continue;
     }
+    const renderId = `mmd-${mermaidSeq++}`;
     try {
-      const { svg } = await mermaid.render(`mmd-${mermaidSeq++}`, source);
+      const { svg } = await mermaid.render(renderId, source);
       host.innerHTML = svg;
       host.classList.add('md-mermaid-host--rendered');
     } catch {
@@ -646,6 +670,11 @@ export async function hydrateMermaid(root: HTMLElement, onMutated?: () => void):
         `<pre class="md-mermaid-error__source">${escapeHtml(source)}</pre>` +
         '</div>';
       host.classList.add('md-mermaid-host--error');
+    } finally {
+      // mermaid removes the wrapper itself on success; on a parse error it
+      // throws before the removal, so the parser-error SVG would leak below
+      // the composer. Clean up exactly this render id's wrapper both ways.
+      removeMermaidTempDom(renderId);
     }
     onMutated?.();
   }

@@ -592,6 +592,46 @@ async function main() {
       fail(`md.extra: mermaid error source missing: ${mermaidErrorSource.slice(0, 120)}`);
     }
     record('md.extra-mermaid-error');
+    // mermaid 11.16.1's render() appends a temporary wrapper
+    // (`<div id="d<id>"><svg id="<id>">…</svg></div>`) to document.body and
+    // removes it on success, but on a PARSE error it THROWS before the
+    // removal — the parser-error SVG ("Syntax error in text", "mermaid
+    // version …") would leak below the composer/footer, one wrapper per
+    // failed render. Exercise the failure REPEATEDLY (each retry renders a
+    // fresh invalid diagram under a new render id) and prove the page holds
+    // no residue while the in-host error fallback keeps rendering.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await page.fill('#prompt-input', 'render markdown extra branches');
+      await page.press('#prompt-input', 'Enter');
+      await waitFor(
+        page,
+        (n) => document.querySelectorAll('#transcript .md-mermaid-host--error').length >= n,
+        `md.extra: repeated invalid mermaid render ${attempt + 2} never errored`,
+        30000,
+        attempt + 2
+      );
+    }
+    const mermaidResidue = await page.evaluate(() => {
+      const bodyText = document.body.textContent || '';
+      return {
+        syntaxError: bodyText.includes('Syntax error in text'),
+        version: bodyText.includes('mermaid version'),
+      };
+    });
+    if (mermaidResidue.syntaxError || mermaidResidue.version) {
+      fail(
+        `md.extra: mermaid parser error leaked below the composer ` +
+        `(Syntax error in text=${mermaidResidue.syntaxError}, mermaid version=${mermaidResidue.version})`
+      );
+    }
+    // The in-host degradation UI survives the cleanup for every attempt.
+    const errorHostSources = await page.evaluate(
+      () => [...document.querySelectorAll('#transcript .md-mermaid-host--error .md-mermaid-error__source')].map((n) => n.textContent || '')
+    );
+    if (errorHostSources.length < 3 || !errorHostSources.every((s) => s.includes('bad token here'))) {
+      fail(`md.extra: in-host mermaid error fallback lost after cleanup: ${JSON.stringify(errorHostSources)}`);
+    }
+    record('md.extra-mermaid-no-residue');
     const extraRichText = await lastAssistantText(page);
     if (!extraRichText.includes('5$/unit')) fail('md.extra: currency amount not preserved as literal text');
     record('md.extra-currency');
