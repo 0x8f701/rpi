@@ -281,9 +281,9 @@ mod tests {
         let retained = slot.runtime().session();
         let epoch = slot.next_epoch();
 
-        slot.replace(
+        slot.replace_arc(Arc::new(
             ApplicationRuntimeCandidate::new(session(target.path(), "target")).activate(epoch),
-        );
+        ));
 
         assert_eq!(clone.runtime().epoch(), epoch);
         assert_eq!(clone.runtime().session().cwd(), target.path());
