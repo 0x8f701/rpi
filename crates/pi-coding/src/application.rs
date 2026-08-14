@@ -4417,9 +4417,12 @@ mod tests {
         let orchestration = crate::OrchestrationRuntime::new(config, factory).expect("orchestration");
 
         current_thread_runtime().block_on(async {
-            let application =
-                Application::new_with_orchestration(session, orchestration).await;
-            let runtime = application.orchestration_runtime().expect("orchestration attached");
+            session.start_new_recording().expect("start test recording");
+            let application = Application::new(session).await;
+            orchestration
+                .bind_and_recover(&application.session())
+                .expect("bind orchestration");
+            let runtime = orchestration;
             let spawn = runtime
                 .spawn_tasks(
                     "Main",
@@ -4460,6 +4463,7 @@ mod tests {
                 message.contains(&job_id),
                 "the error must list the unsettled job id: {message}"
             );
+            runtime.shutdown().await;
         });
     }
 
