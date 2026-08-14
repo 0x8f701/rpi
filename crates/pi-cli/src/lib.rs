@@ -54,6 +54,7 @@ pub mod terminal_images;
 pub mod tool_card_adapter;
 pub mod theme;
 pub(crate) mod tree_panel;
+pub(crate) mod video_extract;
 pub mod todo_dag_panel;
 mod todo_dag_view;
 pub mod tui;

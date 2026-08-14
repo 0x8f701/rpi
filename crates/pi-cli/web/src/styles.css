@@ -1507,6 +1507,27 @@ footer {
 }
 .composer-attachment__remove:hover { color: var(--error); border-color: var(--error); }
 
+/* Video attachment chip: explicit VIDEO badge while uploading/processing or
+ * failed (a ready video shows the first extracted frame as the thumbnail),
+ * a status line for the in-flight/error lifecycle, and a red border on
+ * failure so a rejected upload is visible at a glance. */
+.composer-attachment__badge--video {
+  border-color: var(--accent);
+  color: var(--accent);
+  letter-spacing: 0.06em;
+}
+.composer-attachment__status {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.composer-attachment__status[data-state="uploading"] { color: var(--accent-dim); }
+.composer-attachment__status[data-state="error"] { color: var(--error); }
+.composer-attachment--error { border-color: var(--error); }
+
 /* Drop target: while a file drag is over the composer, the footer becomes a
  * drop zone with an accent border + a centered overlay hint. The overlay is
  * absolutely positioned over the footer (footer gains position: relative while

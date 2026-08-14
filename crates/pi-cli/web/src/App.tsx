@@ -917,18 +917,33 @@ export function ToastList({ toasts, dismiss }: { toasts: Array<{ id: string; mes
 // intake paths — paste, drag/drop, file picker — and unit-tested there).
 import {
   type ComposerAttachment,
+  type IntakeContext,
   type ReadResult,
+  type VideoUploadOutcome,
+  MAX_COMMAND_ID,
+  MAX_PROMPT_FRAME_BYTES,
+  MAX_TOTAL_WIRE_BYTES,
+  aggregateWire,
   attachmentAccept,
   attachmentsToImageBlocks,
   buildCodeMessage,
+  buildVideoMessage,
   classifyAttachments,
   codeBadgeLabel,
+  commandFrameBytes,
   formatSkipSummary,
-  wireFootprint,
+  IntakeBudgetTracker,
+  intakeReservation,
+  isStaleIntake,
+  mergeIntakeResults,
+  placeholderFor,
+  uploadVideoFile,
+  videoMetaLabel,
   readAccepted,
   readAttachmentsInOrder,
   reconcileIntakeBudget,
   removeSentAttachments,
+  settleVideoOutcome,
 } from './attachments';
 import { PASTED_TEXT_ATTACHMENT_NAME, largeTextDisplay, planLargeTextPaste } from './composerPaste';
 
@@ -1553,10 +1568,25 @@ export function App() {
   const promptInputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
-  // Authoritative concurrent attachment budget (queued + in-flight reserved).
-  // See onFilesChosen's CONCURRENCY INVARIANT. Reconciled from `attachments`
-  // inside every setAttachments updater that touches attachments.
-  const intakeBudgetRef = useRef({ count: 0, wire: 0 });
+  // Authoritative concurrent attachment budget (queued exact + every
+  // outstanding intake reservation). See onFilesChosen's CONCURRENCY
+  // INVARIANT. The queued exact is recomputed from `attachments` inside every
+  // setAttachments updater; each in-flight intake reserves and later releases
+  // ONLY its own key, so overlapping intakes never drop each other's
+  // reservations (which would let a third intake bypass the front-end caps).
+  const intakeBudgetTrackerRef = useRef(new IntakeBudgetTracker());
+  // Live ids of video attachments whose upload is still in flight. The
+  // synchronous staleness gate for settleVideo: an upload outcome for an id
+  // that was removed/reset while the request was in flight must be SILENT
+  // (no mutation, no toast). Kept in sync at queue, remove, reset, and
+  // settle points — never derived from the closure-snapshot `attachments`.
+  const pendingUploadIdsRef = useRef(new Set<string>());
+  // Intake generation: bumped on every full composer reset (host switch via
+  // resetAllState). An intake captures the generation + authority + session
+  // at SELECTION time; if the context changes while its reads/upload are in
+  // flight, the intake is discarded silently (see isStaleIntake) so files
+  // selected on host A can never migrate into B's composer or upload to B.
+  const intakeGenRef = useRef(0);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaChunksRef = useRef<Blob[]>([]);
@@ -2104,7 +2134,11 @@ export function App() {
     setAttachments([]);
     setDropActive(false);
     dragDepthRef.current = 0;
-    intakeBudgetRef.current = { count: 0, wire: 0 };
+    intakeBudgetTrackerRef.current.reset();
+    pendingUploadIdsRef.current.clear();
+    // Invalidate every in-flight intake: files selected before the switch
+    // must be discarded by the settle gate (never pushed/uploaded to B).
+    intakeGenRef.current += 1;
   }, []);
 
   /* ---------------- connection ---------------- */
@@ -2978,24 +3012,64 @@ export function App() {
     const input = promptInputRef.current;
     if (!input) return;
     const text = input.value.trim();
-    // Attached images -> prompt `images` ContentBlocks; attached UTF-8 code
-    // files -> filename + fenced-code blocks prepended to the prompt `message`
-    // (reuses the existing text wire). Both mappings live in ./attachments.
+    // Attached images + extracted video frames -> prompt `images`
+    // ContentBlocks; attached UTF-8 code files -> filename + fenced-code
+    // blocks prepended to the prompt `message`; attached videos -> the
+    // backend's bounded chronological-frame instruction prepended to the
+    // `message` (marker) with the frames riding `images`. All mappings live
+    // in ./attachments.
     const codeMessage = buildCodeMessage(attachments);
+    const videoMarker = buildVideoMessage(attachments);
     const images = attachmentsToImageBlocks(attachments);
-    if (!text && codeMessage === '' && images.length === 0) return;
+    // A video that has not reached `ready` must never send: an uploading chip
+    // has no frames yet and an error-state video would silently drop the
+    // video the user expects in the prompt. Block with an actionable toast
+    // and preserve the draft + chips.
+    const unreadyVideo = attachments.find((a) => a.kind === 'video' && a.videoState !== 'ready');
+    if (unreadyVideo) {
+      if (unreadyVideo.videoState === 'error') {
+        toast(
+          `video ${unreadyVideo.name} failed to process${unreadyVideo.videoError ? `: ${unreadyVideo.videoError}` : ''} — remove it and try again`,
+          true,
+        );
+      } else {
+        toast(`video ${unreadyVideo.name} is still processing — wait for it to finish`, true);
+      }
+      return;
+    }
+    if (!text && codeMessage === '' && videoMarker === '' && images.length === 0) return;
 
-    // Intercept Web-supported slash commands when there are no attachments.
-    // Command selection only drafts; this path is the real dispatch. Unknown
-    // slashes (parseSupportedCommand → null) fall through as normal prompts.
-    // Intercepted commands NEVER get an optimistic user bubble.
-    if (kind === 'prompt' && text && attachments.length === 0) {
+    // Intercept Web-supported slash commands when there are no attachments,
+    // for BOTH submit kinds (prompt and steer — while a turn streams, Enter
+    // dispatches a steer, and a typed slash command must still route to the
+    // command surface instead of the model; the /loop streaming guard then
+    // rejects create/update exactly like the TUI). Command selection only
+    // drafts; this path is the real dispatch. Unknown slashes
+    // (parseSupportedCommand → null) fall through as normal prompts/steers —
+    // EXCEPT the TUI loop aliases (loops/loop-update/loop-delete/loop-cancel),
+    // which are intercepted with an actionable error and NEVER reach the
+    // model. Intercepted commands NEVER get an optimistic user bubble.
+    // TUI parity for the composer: rejections (usage errors, the /loop
+    // streaming guard, aliases) PRESERVE the draft so the user can correct
+    // it — only accepted dispatch/panel actions clear the composer.
+    if (text && attachments.length === 0) {
       const parsed = parseSupportedCommand(text);
-      if (parsed) {
-        const action = resolveSlashAction(parsed.name, parsed.args);
-        const sid = sessionIdRef.current;
+      const sid = sessionIdRef.current;
+      const acceptCommand = () => {
         input.value = '';
         flushComposerResize(input);
+      };
+
+      if (!parsed) {
+        const alias = unsupportedAliasMessage(text);
+        if (alias) {
+          toast(alias, true);
+          return;
+        }
+        // Otherwise fall through to the normal prompt path below (which
+        // consumes the text and clears the composer itself).
+      } else {
+        const action = resolveSlashAction(parsed.name, parsed.args);
 
         if (action.type === 'error') {
           toast(action.message, true);
@@ -3267,7 +3341,7 @@ export function App() {
         if (sentIds) {
           setAttachments((prev) => {
             const next = removeSentAttachments(prev, sentIds);
-            intakeBudgetRef.current = reconcileIntakeBudget(next);
+            intakeBudgetTrackerRef.current.setQueued(reconcileIntakeBudget(next));
             return next;
           });
         }
@@ -3290,56 +3364,165 @@ export function App() {
   /* ---------------- composer: file attachments ---------------- */
 
   // Unified attachment intake for all three paths (paste / drop / file
-  // picker): classify against per-file/aggregate/count limits, read the
-  // accepted files in intake order (Promise.all preserves order regardless of
-  // async completion), then queue the built attachments and toast every skip —
-  // both the synchronous classification rejects and the late read rejects
-  // (invalid UTF-8 / unreadable).
+  // picker): classify against per-file/aggregate/count limits, then queue the
+  // accepted files IN INTAKE ORDER in ONE state push. READY INVARIANT:
+  // image/code files are read to completion BEFORE that push (they enter the
+  // queue fully built), while videos enter as uploading placeholders and
+  // settle in place via the backend POST /upload/video endpoint (raw bytes
+  // never ride the prompt frame; the returned chronological JPEG frames +
+  // bounded instruction do). Late rejects (invalid UTF-8 / unreadable) are
+  // collected into the skip toast, never built; a failed video upload KEEPS
+  // its chip in an actionable error state (draft preserved), never a silent
+  // drop.
   //
   // CONCURRENCY INVARIANT: `attachments` state is a closure snapshot, so two
   // intakes firing before a re-render (e.g. paste while a drop's reads are in
-  // flight) would both classify against the same stale budget and could bypass
-  // the front-end caps. `intakeBudgetRef` is the authoritative concurrent
-  // budget: it is read for classification, the accepted files' wire footprints
-  // are RESERVED into it synchronously BEFORE the await, and it is reconciled
-  // from the actual `attachments` state inside each setAttachments updater
-  // (so remove/send/reset keep it consistent and late skips are released). The
-  // backend PAYLOAD_TOO_LARGE frame limit remains the hard backstop.
+  // flight) would both classify against the same stale queued state and could
+  // bypass the front-end caps. `intakeBudgetTrackerRef` is authoritative:
+  // admission = queued exact + the SUM of every outstanding intake reservation.
+  // Each intake registers its own key synchronously BEFORE its await (or before
+  // a paste's setAttachments call), then its updater recomputes queued state and
+  // releases ONLY that key. One intake settling can therefore never drop another
+  // in-flight reservation; remove/send/reset keep queued state exact and late
+  // skips/stale intakes release only their own reservation.
+  // When a video's frames land, the aggregate wire is re-checked against
+  // MAX_TOTAL_WIRE_BYTES and an over-budget video flips to an actionable
+  // error state. The backend PAYLOAD_TOO_LARGE frame limit remains the hard
+  // backstop.
   const onFilesChosen = useCallback(
     async (fileList: FileList | null) => {
       if (!fileList || fileList.length === 0) return;
-      const budget = intakeBudgetRef.current;
+      // Capture the intake context SYNCHRONOUSLY, before any await: a host
+      // switch (bumps intakeGenRef via resetAllState) or a session/authority
+      // change during the read/upload round-trips must discard this intake
+      // silently — files selected on A never migrate into B's composer or
+      // upload to B's listener. Video uploads use the CAPTURED host/token.
+      const intakeContext: IntakeContext = {
+        gen: intakeGenRef.current,
+        host: hostRef.current,
+        token: tokenRef.current,
+        session: sessionIdRef.current,
+      };
+      const budget = intakeBudgetTrackerRef.current.admission();
       const plan = classifyAttachments(Array.from(fileList), {
         currentCount: budget.count,
         currentWire: budget.wire,
       });
-      // Reserve synchronously so a concurrent intake sees the updated budget.
-      for (const a of plan.accepted) {
-        budget.wire += wireFootprint(a.kind, a.file.size);
-        budget.count += 1;
+      // Reserve THIS intake's footprint in the tracker BEFORE any await so a
+      // concurrent intake's admission sees it. Released ONLY on this intake's
+      // settle (inside the push updater) or stale discard — never by another
+      // intake's reconcile.
+      const intakeId = nextId('intake');
+      if (plan.accepted.length > 0) {
+        intakeBudgetTrackerRef.current.reserve(intakeId, intakeReservation(plan.accepted));
       }
       const skips = [...plan.skipped];
       if (plan.accepted.length > 0) {
+        // One id per accepted file; the same id keys the video placeholder
+        // chip and its settle patch, so queue order is preserved across all
+        // async completions. READY INVARIANT: image/code files are read to
+        // COMPLETION before any state change — a chip only ever enters the
+        // queue as a fully-built image/code attachment or an uploading VIDEO
+        // placeholder. submit()'s guards therefore see every in-queue
+        // image/code with its payload present, and the only in-flight kind is
+        // a video with an explicit `videoState` — a half-read image can never
+        // be submitted as a silently-dropped phantom.
+        const tasks = plan.accepted.map((entry) => ({ entry, id: nextId('a') }));
+        // Register in-flight video upload ids for the settle staleness gate.
+        for (const t of tasks) {
+          if (t.entry.kind === 'video') pendingUploadIdsRef.current.add(t.id);
+        }
+        const settleVideo = (id: string, name: string, outcome: VideoUploadOutcome) => {
+          // Fast-path staleness gate: the chip was removed or the composer
+          // was reset while the upload was in flight — skip the settle
+          // entirely (no mutation, no toast). The AUTHORITATIVE toast gate is
+          // the pure outcome's `surface` below, which also covers a removal
+          // that lands between this gate and the state flush.
+          if (!pendingUploadIdsRef.current.has(id)) return;
+          pendingUploadIdsRef.current.delete(id);
+          // `surface` is written by the settle updater (per-settle closure,
+          // so concurrent video settles never cross-talk) and read by the
+          // deferred toast AFTER React flushes the state update. Defaults to
+          // the failure state so a live failure is never missed even if the
+          // flush is delayed; a mid-flight removal makes the updater compute
+          // surface=false, so a phantom failure toast is impossible.
+          let surface = !outcome.ok;
+          setAttachments((prev) => {
+            const settled = settleVideoOutcome(prev, id, outcome);
+            surface = settled.surface;
+            intakeBudgetTrackerRef.current.setQueued(reconcileIntakeBudget(settled.next));
+            return settled.next;
+          });
+          window.setTimeout(() => {
+            if (surface && !outcome.ok) toast(`video ${name} failed: ${outcome.message}`, true);
+          }, 0);
+        };
         let built: ComposerAttachment[] = [];
         try {
-          const results = await readAttachmentsInOrder(plan.accepted, readAccepted);
-          for (const r of results as ReadResult[]) {
-            if (r.attachment) built.push(r.attachment);
-            else if (r.skip) skips.push(r.skip);
-          }
+          const reads = tasks.filter((t) => t.entry.kind !== 'video');
+          const results = await readAttachmentsInOrder(
+            reads.map((t) => t.entry),
+            readAccepted,
+          );
+          const readById = new Map<string, ReadResult>();
+          results.forEach((r, i) => readById.set(reads[i]!.id, r as ReadResult));
+          // Merge built reads + video placeholders back into INTAKE order and
+          // collect late skips (invalid UTF-8 / unreadable) — the pure
+          // ready-invariant merge.
+          const merged = mergeIntakeResults(tasks, readById);
+          built = merged.built;
+          skips.push(...merged.skips);
         } catch {
+          // A reader threw unexpectedly: no read chips exist yet (reads never
+          // touched state). Videos still queue — their upload is independent
+          // of the FileReader.
           toast('failed to read one or more attachments', true);
+          for (const t of tasks) {
+            if (t.entry.kind === 'video') built.push(placeholderFor(t.entry, t.id));
+          }
         }
-        // Always reconcile from the actual state — releases late-skip and
-        // read-failure reservations so a fully-invalid batch never leaves a
-        // sticky reserved budget. Returning the same `prev` reference when no
-        // files built lets React bail out of the re-render while still fixing
-        // the authoritative concurrent budget.
+        // STALE INTAKE GATE: the composer context (host/session/authority)
+        // changed while the reads were in flight. Discard SILENTLY — nothing
+        // was queued yet, so the synchronous budget reservations made above
+        // must be RELEASED here (no state push means the updater reconcile
+        // never runs, and a leaked reservation would block follow-on intake),
+        // and the pending upload registrations are dropped so uploads never
+        // start.
+        if (
+          isStaleIntake(intakeContext, {
+            gen: intakeGenRef.current,
+            host: hostRef.current,
+            token: tokenRef.current,
+            session: sessionIdRef.current,
+          })
+        ) {
+          for (const t of tasks) pendingUploadIdsRef.current.delete(t.id);
+          intakeBudgetTrackerRef.current.release(intakeId);
+          return;
+        }
+        // Single push in intake order; reconcile releases any late-skip
+        // reservations so a fully-invalid batch never leaves a sticky budget.
         setAttachments((prev) => {
           const next = built.length > 0 ? [...prev, ...built] : prev;
-          intakeBudgetRef.current = reconcileIntakeBudget(next);
+          intakeBudgetTrackerRef.current.setQueued(reconcileIntakeBudget(next));
+          intakeBudgetTrackerRef.current.release(intakeId);
           return next;
         });
+        // Video uploads run against the CAPTURED listener authority + token
+        // (same token scope as /rpc) — never the post-await current values.
+        // They settle in parallel; the in-place patch by id preserves intake
+        // order.
+        const uploadOpts = {
+          hostAuthority: intakeContext.host,
+          token: intakeContext.token,
+          pageProtocol: location.protocol,
+        };
+        const videoSettles = tasks
+          .filter((t) => t.entry.kind === 'video')
+          .map((t) => uploadVideoFile(t.entry.file, uploadOpts).then((outcome) => settleVideo(t.id, t.entry.file.name, outcome)));
+        // Wait for the settles so the final skip summary includes every late
+        // reject (video failures toast on their own settle).
+        await Promise.all(videoSettles);
       }
       const summary = formatSkipSummary(skips);
       if (summary) toast(summary, true);
@@ -3364,7 +3547,7 @@ export function App() {
         return;
       }
 
-      const budget = intakeBudgetRef.current;
+      const budget = intakeBudgetTrackerRef.current.admission();
       const classified = classifyAttachments(
         [{ type: plan.attachment.mimeType, name: plan.attachment.name, size: plan.attachment.size }],
         { currentCount: budget.count, currentWire: budget.wire },
@@ -3374,10 +3557,13 @@ export function App() {
         toast(summary ?? 'pasted text could not be attached', true);
         return;
       }
+      const pasteIntakeId = nextId('intake');
+      intakeBudgetTrackerRef.current.reserve(pasteIntakeId, intakeReservation(classified.accepted));
 
       setAttachments((prev) => {
         const next = [...prev, plan.attachment];
-        intakeBudgetRef.current = reconcileIntakeBudget(next);
+        intakeBudgetTrackerRef.current.setQueued(reconcileIntakeBudget(next));
+        intakeBudgetTrackerRef.current.release(pasteIntakeId);
         return next;
       });
       toast(`large paste attached as ${PASTED_TEXT_ATTACHMENT_NAME}`);
@@ -3387,9 +3573,12 @@ export function App() {
 
 
   const removeAttachment = useCallback((id: string) => {
+    // A removed chip's in-flight upload outcome becomes STALE: the settle
+    // gate must not resurrect the chip or toast a phantom failure.
+    pendingUploadIdsRef.current.delete(id);
     setAttachments((prev) => {
       const next = prev.filter((attachment) => attachment.id !== id);
-      intakeBudgetRef.current = reconcileIntakeBudget(next);
+      intakeBudgetTrackerRef.current.setQueued(reconcileIntakeBudget(next));
       return next;
     });
   }, []);
@@ -4447,36 +4636,65 @@ export function App() {
       >
         {dropActive && (
           <div className="composer-drop" aria-hidden="true">
-            <span className="composer-drop__hint">Drop images or code files to attach</span>
+            <span className="composer-drop__hint">Drop images, videos, or code files to attach</span>
           </div>
         )}
         <div id="composer-main">
           {attachments.length > 0 && (
             <div id="composer-attachments" aria-label="Attached files">
-              {attachments.map((attachment) => (
-                <span key={attachment.id} className="composer-attachment" title={attachment.name}>
-                  {attachment.kind === 'image' && attachment.previewUrl ? (
-                    <img className="composer-attachment__thumb" src={attachment.previewUrl} alt="" />
-                  ) : (
-                    <span className="composer-attachment__badge">
-                      {codeBadgeLabel(attachment.name)}
-                    </span>
-                  )}
-                  <span className="composer-attachment__meta">
-                    <span className="composer-attachment__name">{safeText(attachment.name)}</span>
-                    <span className="composer-attachment__size">{attachment.size} bytes</span>
-                  </span>
-                  <button
-                    type="button"
-                    className="composer-attachment__remove"
-                    title="Remove attachment"
-                    aria-label={`Remove ${attachment.name}`}
-                    onClick={() => removeAttachment(attachment.id)}
+              {attachments.map((attachment) => {
+                const isVideo = attachment.kind === 'video';
+                const videoFailed = isVideo && attachment.videoState === 'error';
+                return (
+                  <span
+                    key={attachment.id}
+                    className={`composer-attachment${videoFailed ? ' composer-attachment--error' : ''}`}
+                    title={attachment.name}
                   >
-                    ✕
-                  </button>
-                </span>
-              ))}
+                    {isVideo && attachment.previewUrl ? (
+                      // Ready video: first extracted frame as the thumbnail.
+                      <img className="composer-attachment__thumb" src={attachment.previewUrl} alt="" />
+                    ) : isVideo ? (
+                      // Uploading / processing / failed: explicit VIDEO badge.
+                      <span className="composer-attachment__badge composer-attachment__badge--video">VIDEO</span>
+                    ) : attachment.kind === 'image' && attachment.previewUrl ? (
+                      <img className="composer-attachment__thumb" src={attachment.previewUrl} alt="" />
+                    ) : (
+                      <span className="composer-attachment__badge">
+                        {codeBadgeLabel(attachment.name)}
+                      </span>
+                    )}
+                    <span className="composer-attachment__meta">
+                      <span className="composer-attachment__name">{safeText(attachment.name)}</span>
+                      {isVideo && attachment.videoState !== 'ready' ? (
+                        <span
+                          className="composer-attachment__status"
+                          data-state={attachment.videoState === 'error' ? 'error' : 'uploading'}
+                          role="status"
+                          aria-live="polite"
+                        >
+                          {attachment.videoState === 'error'
+                            ? (attachment.videoError ?? 'processing failed')
+                            : 'uploading & processing…'}
+                        </span>
+                      ) : isVideo ? (
+                        <span className="composer-attachment__size">{videoMetaLabel(attachment)}</span>
+                      ) : (
+                        <span className="composer-attachment__size">{attachment.size} bytes</span>
+                      )}
+                    </span>
+                    <button
+                      type="button"
+                      className="composer-attachment__remove"
+                      title="Remove attachment"
+                      aria-label={`Remove ${attachment.name}`}
+                      onClick={() => removeAttachment(attachment.id)}
+                    >
+                      ✕
+                    </button>
+                  </span>
+                );
+              })}
             </div>
           )}
           {isRealtimeMode && realtimeActive && (
@@ -4550,7 +4768,7 @@ export function App() {
           <button
             id="attach-btn"
             type="button"
-            title="Attach images or code/text files"
+            title="Attach images, videos, or code/text files"
             onClick={() => fileInputRef.current?.click()}
           >
             📎

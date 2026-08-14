@@ -2735,6 +2735,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "cap-fs-ext",
+ "cap-std",
  "clap",
  "clap_complete",
  "crossterm 0.29.0",

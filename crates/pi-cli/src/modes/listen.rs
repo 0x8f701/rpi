@@ -70,8 +70,8 @@ const REMOTE_EXTENSION_UI_ERROR: &str = "remote interactive extension UI is disa
 // `MAX_CONNECTION_TASKS` stays publicly reachable through this module.
 pub use super::ws_auth::MAX_CONNECTION_TASKS;
 use super::ws_auth::{
-    ListenAddressPolicy, authorized, constant_work_eq, load_auth_token, read_token_file,
-    websocket_subprotocol,
+    ListenAddressPolicy, authorized, constant_work_eq, load_auth_token, normalize_origin,
+    read_token_file, websocket_subprotocol,
 };
 
 /// Bounds for authenticated WebSocket handshakes and idle collaboration
@@ -247,7 +247,15 @@ struct ServerState {
     /// tokenless browsers are accepted only when same-origin against the
     /// request's own `Host` ([`authorized`]).
     base_url: Option<String>,
+    /// Fail-fast concurrency bound for video uploads: each in-flight
+    /// preprocessing run holds up to 64 MiB of upload bytes plus an ffmpeg
+    /// subprocess, so a burst of uploads must not stack unboundedly. A full
+    /// semaphore answers new uploads with 429 before any body is read.
+    video_upload_permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
+
+/// Maximum concurrent `POST /upload/video` preprocessing runs.
+const MAX_CONCURRENT_VIDEO_UPLOADS: usize = 4;
 
 pub async fn start(
     application: Application,
@@ -304,6 +312,9 @@ pub async fn start(
         collab: collab.clone(),
         token: token.map(Arc::from),
         base_url: advertised_base_url(address, config.advertised_origin.as_deref(), tls_active),
+        video_upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_VIDEO_UPLOADS,
+        )),
     };
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(run_listener(listener, tls, state, shutdown_rx));
@@ -774,6 +785,13 @@ where
         return write_response(&mut stream, StatusCode::OK, mime, bytes).await;
     }
 
+    if raw.method == Method::OPTIONS && raw.path == "/upload/video" {
+        return handle_video_upload_preflight(&mut stream, raw, &state).await;
+    }
+    if raw.method == Method::POST && raw.path == "/upload/video" {
+        return handle_video_upload(&mut stream, raw, &state).await;
+    }
+
     if raw.method != Method::POST || raw.path != "/rpc" {
         write_plain_response(&mut stream, StatusCode::NOT_FOUND, "not found").await?;
         return Ok(());
@@ -890,6 +908,340 @@ async fn dispatch_http_command(
         }
         command => state.manager.dispatch(command, session_id).await,
     }
+}
+
+/// `X-Video-Name` header carrying the user-visible file name for
+/// `POST /upload/video` (the request body is the raw video bytes).
+const VIDEO_NAME_HEADER: &str = "x-video-name";
+
+/// Byte cap for the percent-DECODED `X-Video-Name` value. The raw header is
+/// already bounded by [`MAX_HEADER_BYTES`]; the decode cap keeps a hostile
+/// expansion bounded before sanitization.
+const MAX_VIDEO_NAME_DECODED_BYTES: usize = 1024;
+
+/// Percent-decode an `encodeURIComponent`-style header value (the Web client
+/// always sends the video name percent-encoded so raw Unicode never hits the
+/// ByteString header limit). Decoded bytes are interpreted as UTF-8 (lossy);
+/// invalid percent sequences are kept literal; output is capped at `cap`
+/// bytes.
+fn percent_decode_video_name(value: &str, cap: usize) -> String {
+    let input = value.as_bytes();
+    let mut bytes = Vec::with_capacity(input.len().min(cap));
+    let mut index = 0;
+    while index < input.len() && bytes.len() < cap {
+        let byte = input[index];
+        if byte == b'%' && index + 2 < input.len() {
+            let hi = (input[index + 1] as char).to_digit(16);
+            let lo = (input[index + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                bytes.push((hi * 16 + lo) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        bytes.push(byte);
+        index += 1;
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Authenticated, bounded video upload endpoint for the Web client.
+///
+/// The request body is the raw video; the `X-Video-Name` header carries the
+/// user-visible file name. The response is a bounded JSON attachment —
+/// `attachmentId`, sanitized name/container/duration, the extracted
+/// chronological JPEG frames, and a ready-made instruction string — that the
+/// Web client renders as a video-attachment marker and feeds into
+/// `prompt`/`steer` through the existing image `ContentBlock` path. Raw
+/// video bytes never ride the prompt WebSocket JSON, and nothing is stored
+/// server-side: the frames exist only in this response and the temporary
+/// work directory is removed before the handler returns.
+///
+/// Auth mirrors `/rpc` exactly ([`authorized`] with the same tokenless
+/// same-origin browser policy). Failures map to bounded JSON
+/// `{"error": "..."}` bodies; the ffmpeg-missing case is an actionable 503.
+async fn handle_video_upload<S>(
+    stream: &mut S,
+    raw: RawRequest,
+    state: &ServerState,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // The actual upload is gated by the normal bearer/same-origin auth; a
+    // refused request gets no CORS headers (the browser blocks reading it).
+    if !authorized(&raw.headers, state.token.as_deref(), true) {
+        return write_video_plain_response_bounded(
+            stream,
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            None,
+            VIDEO_RESPONSE_WRITE_TIMEOUT,
+        )
+        .await;
+    }
+    // CORS: reflect a validated browser Origin on every post-auth response
+    // so a cross-authority Web UI (e.g. loaded from 127.0.0.1, talking to
+    // the LAN address) can read the result. Malformed/null/file origins are
+    // never reflected; native clients without an Origin get no CORS headers.
+    let cors = raw
+        .headers
+        .get(http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(validated_cors_origin);
+    let cors = cors.as_deref();
+    let write_timeout = VIDEO_RESPONSE_WRITE_TIMEOUT;
+    let Some(name_value) = raw.headers.get(VIDEO_NAME_HEADER) else {
+        return write_video_json_response_bounded(
+            stream,
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": "missing X-Video-Name header"}),
+            cors,
+            write_timeout,
+        )
+        .await;
+    };
+    // The Web client sends the name `encodeURIComponent`-encoded (raw
+    // Unicode would exceed the ByteString header limit); decode it bounded
+    // before sanitizing. Invalid percent sequences stay literal.
+    let raw_name = percent_decode_video_name(
+        &String::from_utf8_lossy(name_value.as_bytes()),
+        MAX_VIDEO_NAME_DECODED_BYTES,
+    );
+    // Reject an unsupported name before reading a single body byte. The
+    // message is generic: the raw name may carry a client-side local path
+    // and must never be echoed.
+    if crate::video_extract::sanitize_video_name(&raw_name).is_none() {
+        return write_video_json_response_bounded(
+            stream,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            &serde_json::json!({"error": format!(
+                "unsupported video file — supported containers: mkv, mp4, webm, mov, avi, ogg"
+            )}),
+            cors,
+            write_timeout,
+        )
+        .await;
+    }
+    let Some(length) = content_length(&raw.headers) else {
+        return write_video_json_response_bounded(
+            stream,
+            StatusCode::LENGTH_REQUIRED,
+            &serde_json::json!({"error": "content-length is required"}),
+            cors,
+            write_timeout,
+        )
+        .await;
+    };
+    if length > crate::video_extract::MAX_VIDEO_UPLOAD_BYTES {
+        return write_video_json_response_bounded(
+            stream,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &serde_json::json!({"error": format!(
+                "upload exceeds the {} MiB video limit",
+                crate::video_extract::MAX_VIDEO_UPLOAD_BYTES / 1024 / 1024
+            )}),
+            cors,
+            write_timeout,
+        )
+        .await;
+    }
+    // Fail-fast concurrency bound: each in-flight upload holds up to 64 MiB
+    // plus an ffmpeg subprocess, so a burst must not stack. The permit is
+    // held for the whole handler and released on return.
+    let _permit = match state.video_upload_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return write_video_json_response_bounded(
+                stream,
+                StatusCode::TOO_MANY_REQUESTS,
+                &serde_json::json!({"error": "too many concurrent video uploads — try again shortly"}),
+                cors,
+                write_timeout,
+            )
+            .await;
+        }
+    };
+    let body = match tokio::time::timeout(READ_TIMEOUT, read_body(stream, raw.remainder, length))
+        .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) => {
+            write_video_plain_response_bounded(stream, error.status, error.message, cors, write_timeout)
+                .await?;
+            return Ok(());
+        }
+        Err(_) => {
+            write_video_plain_response_bounded(
+                stream,
+                StatusCode::REQUEST_TIMEOUT,
+                "request timed out",
+                cors,
+                write_timeout,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    // Resolve the program on this task (test overrides are lock-free here),
+    // then run the bounded ffmpeg pipeline on the blocking pool.
+    let program = crate::video_extract::ffmpeg_program();
+    let limits = crate::video_extract::VideoLimits::default();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::video_extract::extract_video(&program, limits, body, &raw_name)
+    })
+    .await
+    .context("video preprocessing task panicked")?;
+    match result {
+        Ok(video) => {
+            let response = serde_json::json!({
+                "attachmentId": uuid::Uuid::new_v4().to_string(),
+                "name": video.name,
+                "container": video.container,
+                "mimeType": video.mime_type,
+                "sizeBytes": video.size_bytes,
+                "durationSeconds": video.duration_seconds,
+                "frameCount": video.frames.len(),
+                "framesBase64Bytes": video.frames_base64_bytes(),
+                "frames": video.frames,
+                "instruction": video.instruction,
+            });
+            write_video_json_response_bounded(stream, StatusCode::OK, &response, cors, write_timeout)
+                .await
+        }
+        Err(error) => {
+            write_video_json_response_bounded(
+                stream,
+                error.status(),
+                &serde_json::json!({"error": error.message}),
+                cors,
+                write_timeout,
+            )
+            .await
+        }
+    }
+}
+
+/// Headers the upload preflight allows the actual request to carry.
+const VIDEO_PREFLIGHT_ALLOWED_HEADERS: &[&str] =
+    &["authorization", "x-video-name", "content-type"];
+
+/// CORS preflight for `POST /upload/video`.
+///
+/// Browsers do NOT attach the bearer token to the preflight — they only
+/// DECLARE it in `Access-Control-Request-Headers` — so the preflight is
+/// authorized by origin policy alone: the `Origin` must be a valid
+/// `http(s)://host[:port]` (no credentials, path, query, fragment, null,
+/// file, or wildcard), the requested method must be `POST`, and every
+/// requested header must be on the allowlist. The validated origin is then
+/// reflected; the actual POST is still gated by the normal bearer /
+/// same-origin auth.
+async fn handle_video_upload_preflight<S>(
+    stream: &mut S,
+    raw: RawRequest,
+    state: &ServerState,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(origin_value) = raw.headers.get(http::header::ORIGIN) else {
+        return write_plain_response(stream, StatusCode::BAD_REQUEST, "origin required").await;
+    };
+    let Ok(origin_text) = origin_value.to_str() else {
+        return write_plain_response(stream, StatusCode::BAD_REQUEST, "malformed origin").await;
+    };
+    let Some(origin) = validated_cors_origin(origin_text) else {
+        // Never reflect a malformed/null/file/wildcard origin.
+        return write_plain_response(stream, StatusCode::BAD_REQUEST, "malformed origin").await;
+    };
+    // Preflights cannot carry the bearer token (browsers only DECLARE it in
+    // Access-Control-Request-Headers), so the gate is the same policy as
+    // `authorized()` minus the token: with a token configured any valid
+    // origin passes (the real POST is bearer-gated); tokenless listeners
+    // reflect only the same-origin browser (Origin authority == Host).
+    if state.token.is_none() && !authorized(&raw.headers, None, true) {
+        return write_plain_response(stream, StatusCode::UNAUTHORIZED, "unauthorized").await;
+    }
+    if !matches!(
+        raw.headers
+            .get("access-control-request-method")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    ) {
+        return write_plain_response(
+            stream,
+            StatusCode::BAD_REQUEST,
+            "access-control-request-method must be POST",
+        )
+        .await;
+    }
+    // Every header the actual request intends to send must be allowlisted.
+    if let Some(requested) = raw.headers.get("access-control-request-headers") {
+        let requested = requested.to_str().unwrap_or("");
+        let requested = requested
+            .split(',')
+            .map(str::trim)
+            .filter(|header| !header.is_empty())
+            .collect::<Vec<_>>();
+        if requested
+            .iter()
+            .any(|header| !VIDEO_PREFLIGHT_ALLOWED_HEADERS.contains(header))
+        {
+            return write_plain_response(
+                stream,
+                StatusCode::BAD_REQUEST,
+                "requested headers are not allowed",
+            )
+            .await;
+        }
+    }
+    let header = format!(
+        "HTTP/1.1 204 No Content\r\naccess-control-allow-origin: {origin}\r\n\
+         access-control-allow-methods: POST, OPTIONS\r\n\
+         access-control-allow-headers: authorization, x-video-name, content-type\r\n\
+         access-control-max-age: 600\r\n\
+         vary: origin, access-control-request-method, access-control-request-headers\r\n\
+         connection: close\r\n\r\n"
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// Validate a CORS `Origin` for reflection: exactly `http(s)://host[:port]`
+/// with a non-empty host, no credentials/path/query/fragment/whitespace, and
+/// a numeric port when one is present. Returns the canonical lowercased
+/// form. `null` (opaque/sandboxed), `file:`, and wildcard origins never
+/// pass — there is nothing safe to reflect.
+fn validated_cors_origin(value: &str) -> Option<String> {
+    let origin = normalize_origin(value)?;
+    let authority = origin.split_once("://")?.1;
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6: `[::1]` or `[::1]:8765`.
+        let (host, after) = rest.split_once(']')?;
+        match after {
+            "" => (host, None),
+            port if port.starts_with(':') => (host, Some(&port[1..])),
+            _ => return None,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    if let Some(port) = port {
+        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(origin)
 }
 
 fn collab_room_id(path: &str) -> Option<&str> {
@@ -1753,8 +2105,85 @@ async fn write_json_response<T: Serialize, S>(
 where
     S: AsyncWrite + Unpin,
 {
+    write_json_response_cors(stream, status, value, None).await
+}
+
+/// Like [`write_json_response`] with an optional reflected CORS origin.
+async fn write_json_response_cors<T: Serialize, S>(
+    stream: &mut S,
+    status: StatusCode,
+    value: &T,
+    allow_origin: Option<&str>,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let body = serde_json::to_vec(value).context("serializing HTTP RPC response")?;
-    write_response(stream, status, CONTENT_TYPE_JSON, &body).await
+    write_response_with_cors(stream, status, CONTENT_TYPE_JSON, &body, allow_origin).await
+}
+
+/// Like [`write_plain_response`] with an optional reflected CORS origin.
+async fn write_plain_response_cors<S>(
+    stream: &mut S,
+    status: StatusCode,
+    message: &str,
+    allow_origin: Option<&str>,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    write_response_with_cors(
+        stream,
+        status,
+        "text/plain; charset=utf-8",
+        message.as_bytes(),
+        allow_origin,
+    )
+    .await
+}
+
+/// Deadline for a video-upload response write: a client that stops reading
+/// must not pin the connection task while the (multi-MiB) frame payload is
+/// written. Reuses the request read bound.
+const VIDEO_RESPONSE_WRITE_TIMEOUT: Duration = READ_TIMEOUT;
+
+/// Write a video-upload JSON response under a bounded deadline (slow-reader
+/// protection). The timeout is a parameter so tests can shrink it.
+async fn write_video_json_response_bounded<T: Serialize, S>(
+    stream: &mut S,
+    status: StatusCode,
+    value: &T,
+    allow_origin: Option<&str>,
+    timeout: Duration,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, write_json_response_cors(stream, status, value, allow_origin))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => bail!("timed out writing the video upload response"),
+    }
+}
+
+/// Write a video-upload plain response under a bounded deadline.
+async fn write_video_plain_response_bounded<S>(
+    stream: &mut S,
+    status: StatusCode,
+    message: &str,
+    allow_origin: Option<&str>,
+    timeout: Duration,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, write_plain_response_cors(stream, status, message, allow_origin))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => bail!("timed out writing the video upload response"),
+    }
 }
 
 async fn write_response<S>(
@@ -1766,14 +2195,36 @@ async fn write_response<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    write_response_with_cors(stream, status, content_type, body, None).await
+}
+
+/// Like [`write_response`] with an optional `access-control-allow-origin`
+/// header (plus `vary: origin`) for the video upload endpoint. The origin is
+/// always a validated, reflected requester origin — never `*`.
+async fn write_response_with_cors<S>(
+    stream: &mut S,
+    status: StatusCode,
+    content_type: &str,
+    body: &[u8],
+    allow_origin: Option<&str>,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let reason = status.canonical_reason().unwrap_or("Error");
-    let header = format!(
-        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+    let mut header = format!(
+        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\n",
         status.as_u16(),
         reason,
         content_type,
         body.len()
     );
+    if let Some(origin) = allow_origin {
+        header.push_str("access-control-allow-origin: ");
+        header.push_str(origin);
+        header.push_str("\r\nvary: origin\r\n");
+    }
+    header.push_str("connection: close\r\n\r\n");
     stream.write_all(header.as_bytes()).await?;
     stream.write_all(body).await?;
     stream.shutdown().await?;
@@ -1927,6 +2378,9 @@ mod tests {
             collab: CollabService::new(manager),
             token: None,
             base_url: None,
+            video_upload_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_VIDEO_UPLOADS,
+            )),
         }
     }
 
@@ -2972,5 +3426,511 @@ mod tests {
             .expect("slow-client eviction is a clean server exit");
         drainer.await.ok();
         manager.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // POST /upload/video — authenticated bounded upload + frame extraction.
+    // ---------------------------------------------------------------------
+
+    /// Build a parsed `POST /upload/video` request with the raw video bytes
+    /// as the body and an `X-Video-Name` header. Extra headers are appended
+    /// verbatim; a caller-supplied `host` replaces the default.
+    fn video_request(body: &[u8], name: &str, extra_headers: &[(&str, &str)]) -> RawRequest {
+        let has_host = extra_headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("host"));
+        let mut head = format!(
+            "POST /upload/video HTTP/1.1\r\n{}content-length: {}\r\nx-video-name: {}\r\n",
+            if has_host { "" } else { "host: x\r\n" },
+            body.len(),
+            name
+        );
+        for (key, value) in extra_headers {
+            head.push_str(&format!("{key}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        let mut bytes = head.into_bytes();
+        bytes.extend_from_slice(body);
+        headers(&bytes).expect("parse upload request")
+    }
+
+    /// Run `handle_video_upload` against a duplex pair and return the raw
+    /// HTTP response text.
+    async fn run_video_upload(raw: RawRequest, state: &ServerState) -> String {
+        let (mut client, mut server) = tokio::io::duplex(1024 * 1024);
+        handle_video_upload(&mut server, raw, state)
+            .await
+            .expect("upload handler runs");
+        drop(server);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read response");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    async fn video_upload_state() -> ServerState {
+        let mut state = ws_server_state().await;
+        state.token = Some(Arc::from(b"video-secret".as_slice()));
+        state
+    }
+
+    fn response_json(response: &str) -> Value {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or(response);
+        serde_json::from_str(body).expect("response body is JSON")
+    }
+
+    #[tokio::test]
+    async fn video_upload_success_returns_jpeg_frames_and_metadata() {
+        use crate::video_extract::test_support::{fake_ffmpeg, video_bytes};
+        use crate::video_extract::with_ffmpeg_program_async;
+
+        let (_dir, script) = fake_ffmpeg();
+        let body = video_bytes("VALID 00:00:12.34 1280x720");
+        let raw = video_request(&body, "clip.mkv", &[]);
+        let state = ws_server_state().await;
+        let response = with_ffmpeg_program_async(script, async {
+            run_video_upload(raw, &state).await
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let parsed = response_json(&response);
+        assert!(parsed["attachmentId"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(parsed["name"], "clip.mkv");
+        assert_eq!(parsed["container"], "mkv");
+        assert_eq!(parsed["mimeType"], "video/x-matroska");
+        assert_eq!(parsed["sizeBytes"].as_u64().unwrap() as usize, body.len());
+        assert!((parsed["durationSeconds"].as_f64().unwrap() - 12.34).abs() < 1e-9);
+        assert_eq!(parsed["frameCount"], 6);
+        assert!(parsed["framesBase64Bytes"].as_u64().unwrap() > 0);
+        let frames = parsed["frames"].as_array().expect("frames array");
+        assert_eq!(frames.len(), 6);
+        let mut previous_ts = -1.0;
+        for (index, frame) in frames.iter().enumerate() {
+            assert_eq!(frame["index"], index);
+            assert_eq!(frame["mimeType"], "image/jpeg", "frame {index}");
+            assert_eq!(frame["width"], 1);
+            assert_eq!(frame["height"], 1);
+            let data = frame["data"].as_str().expect("base64 data");
+            assert!(!data.is_empty());
+            let ts = frame["timestampSeconds"].as_f64().unwrap();
+            assert!(ts > previous_ts, "frames must be chronological");
+            previous_ts = ts;
+        }
+        let instruction = parsed["instruction"].as_str().expect("instruction");
+        assert!(instruction.contains("clip.mkv"));
+        assert!(instruction.contains("0.00s"));
+        assert!(instruction.contains("2.06s"));
+        assert!(
+            !response.contains("pi-video-"),
+            "response must not leak the work directory"
+        );
+        // Raw video never enters a content block: every frame is a JPEG.
+        assert!(
+            frames.iter().all(|frame| frame["mimeType"] == "image/jpeg"),
+            "no video MIME may appear in the frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_upload_requires_bearer_auth() {
+        use crate::video_extract::test_support::video_bytes;
+        use crate::video_extract::with_ffmpeg_program_async;
+
+        let body = video_bytes("VALID 00:00:01.00 320x240");
+        let state = video_upload_state().await;
+        // No Authorization header while a token is configured.
+        let raw = video_request(&body, "clip.mkv", &[]);
+        let response = run_video_upload(raw, &state).await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+
+        // Wrong token.
+        let raw = video_request(
+            &body,
+            "clip.mkv",
+            &[("authorization", "Bearer not-the-token")],
+        );
+        let response = run_video_upload(raw, &state).await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+
+        // Correct bearer token passes auth; with ffmpeg overridden to a
+        // missing binary the pipeline then fails with the actionable 503 —
+        // proving auth was not the blocker (host-independent).
+        let raw = video_request(
+            &body,
+            "clip.mkv",
+            &[("authorization", "Bearer video-secret")],
+        );
+        let missing = std::env::temp_dir().join(format!("pi-no-ffmpeg-{}", uuid::Uuid::new_v4()));
+        let response = with_ffmpeg_program_async(missing, async {
+            run_video_upload(raw, &state).await
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn video_upload_validates_name_length_and_container_before_processing() {
+        use crate::video_extract::test_support::video_bytes;
+
+        let state = ws_server_state().await;
+        let body = video_bytes("VALID 00:00:01.00 320x240");
+
+        // Unsupported extension -> 415 before any body read. The raw name
+        // may carry a client-side path and must never be echoed.
+        let raw = video_request(&body, "../private/clip.txt", &[]);
+        let response = run_video_upload(raw, &state).await;
+        assert!(response.starts_with("HTTP/1.1 415"), "{response}");
+        let parsed = response_json(&response);
+        let error = parsed["error"].as_str().expect("error");
+        assert!(error.contains("supported containers"), "{error}");
+        assert!(
+            !error.contains("private") && !error.contains("clip.txt"),
+            "raw name must not be echoed: {error}"
+        );
+
+        // Missing content-length -> 411.
+        let head = "POST /upload/video HTTP/1.1\r\nhost: x\r\nx-video-name: clip.mkv\r\n\r\n";
+        let raw = headers(head.as_bytes()).expect("parse");
+        let response = run_video_upload(raw, &state).await;
+        assert!(response.starts_with("HTTP/1.1 411"), "{response}");
+
+        // Oversized content-length -> 413 before reading the body.
+        let head = format!(
+            "POST /upload/video HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\nx-video-name: clip.mkv\r\n\r\n",
+            crate::video_extract::MAX_VIDEO_UPLOAD_BYTES + 1
+        );
+        let raw = headers(head.as_bytes()).expect("parse");
+        let response = run_video_upload(raw, &state).await;
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+
+        // Right extension, wrong container bytes -> 415 (no ffmpeg needed).
+        let raw = video_request(b"definitely not a video", "clip.mkv", &[]);
+        let response = run_video_upload(raw, &state).await;
+        assert!(response.starts_with("HTTP/1.1 415"), "{response}");
+
+        // Missing name header -> 400.
+        let head = format!(
+            "POST /upload/video HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        let raw = headers(head.as_bytes()).expect("parse");
+        let response = run_video_upload(raw, &state).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn video_upload_missing_ffmpeg_returns_actionable_503() {
+        use crate::video_extract::test_support::video_bytes;
+        use crate::video_extract::with_ffmpeg_program_async;
+
+        let state = ws_server_state().await;
+        let body = video_bytes("VALID 00:00:01.00 320x240");
+        let raw = video_request(&body, "clip.mkv", &[]);
+        let missing = std::env::temp_dir().join(format!("pi-no-ffmpeg-{}", uuid::Uuid::new_v4()));
+        let response = with_ffmpeg_program_async(missing, async {
+            run_video_upload(raw, &state).await
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        let parsed = response_json(&response);
+        let error = parsed["error"].as_str().expect("error");
+        assert!(error.contains("ffmpeg"), "{error}");
+        assert!(error.contains("install"), "actionable: {error}");
+    }
+
+    #[tokio::test]
+    async fn video_upload_rejects_invalid_media_with_bounded_error() {
+        use crate::video_extract::test_support::{fake_ffmpeg, video_bytes};
+        use crate::video_extract::with_ffmpeg_program_async;
+
+        let (_dir, script) = fake_ffmpeg();
+        let state = ws_server_state().await;
+        let body = video_bytes("CORRUPT");
+        let raw = video_request(&body, "clip.mkv", &[]);
+        let response = with_ffmpeg_program_async(script, async {
+            run_video_upload(raw, &state).await
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        let parsed = response_json(&response);
+        let error = parsed["error"].as_str().expect("error");
+        assert!(error.contains("not a decodable video"), "{error}");
+        assert!(
+            !error.contains("pi-video-"),
+            "error must not leak the work directory: {error}"
+        );
+    }
+
+    /// Run the CORS preflight handler for a raw OPTIONS request head.
+    async fn run_video_preflight(head: &str, state: &ServerState) -> String {
+        let raw = headers(head.as_bytes()).expect("parse preflight");
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        handle_video_upload_preflight(&mut server, raw, state)
+            .await
+            .expect("preflight handler runs");
+        drop(server);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read response");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[test]
+    fn cors_origin_validation_accepts_http_hosts_and_rejects_junk() {
+        assert_eq!(
+            validated_cors_origin("http://127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765".to_owned())
+        );
+        assert_eq!(
+            validated_cors_origin("https://LAN-IP.example"),
+            Some("https://lan-ip.example".to_owned())
+        );
+        assert_eq!(
+            validated_cors_origin("http://[::1]:8765"),
+            Some("http://[::1]:8765".to_owned())
+        );
+        for bad in [
+            "null",
+            "file:///etc/passwd",
+            "https://",
+            "*",
+            "http://host:abc",
+            "http://user@host",
+            "http://host/path",
+            "http://host?query",
+            "javascript:alert(1)",
+            "http://",
+        ] {
+            assert!(validated_cors_origin(bad).is_none(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn video_upload_preflight_allows_valid_cross_origin_without_bearer() {
+        // Cross-origin preflights carry no bearer (browsers only declare it),
+        // so a token-configured listener must allow any valid origin here;
+        // the actual POST is what enforces the token.
+        let state = video_upload_state().await;
+        let head = "OPTIONS /upload/video HTTP/1.1\r\nhost: x\r\norigin: http://127.0.0.1:5173\r\n\
+                    access-control-request-method: POST\r\n\
+                    access-control-request-headers: authorization, x-video-name, content-type\r\n\r\n";
+        let response = run_video_preflight(head, &state).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+        assert!(
+            response.contains("access-control-allow-origin: http://127.0.0.1:5173"),
+            "{response}"
+        );
+        assert!(response.contains("access-control-allow-methods: POST, OPTIONS"), "{response}");
+        assert!(
+            response.contains("access-control-allow-headers: authorization, x-video-name, content-type"),
+            "{response}"
+        );
+        assert!(response.contains("access-control-max-age: 600"), "{response}");
+        assert!(response.contains("vary: origin"), "{response}");
+
+        // Tokenless listener reflects only the same-origin browser.
+        let state = ws_server_state().await;
+        let head = "OPTIONS /upload/video HTTP/1.1\r\nhost: 127.0.0.1:8765\r\n\
+                    origin: http://127.0.0.1:8765\r\naccess-control-request-method: POST\r\n\r\n";
+        let response = run_video_preflight(head, &state).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+        assert!(
+            response.contains("access-control-allow-origin: http://127.0.0.1:8765"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_upload_preflight_rejects_malformed_origins_and_headers() {
+        // Tokened listener: malformed origins/headers are still rejected
+        // before any reflection, independent of the token.
+        let state = video_upload_state().await;
+        for origin in ["null", "file:///etc/passwd", "https://", "*", "not-an-origin", "http://host:abc"] {
+            let head = format!(
+                "OPTIONS /upload/video HTTP/1.1\r\nhost: x\r\norigin: {origin}\r\n\
+                 access-control-request-method: POST\r\n\r\n"
+            );
+            let response = run_video_preflight(&head, &state).await;
+            assert!(response.starts_with("HTTP/1.1 400"), "{origin}: {response}");
+            assert!(
+                !response.to_lowercase().contains("access-control-allow-origin"),
+                "{origin}: must never reflect"
+            );
+        }
+        // Missing origin.
+        let response = run_video_preflight(
+            "OPTIONS /upload/video HTTP/1.1\r\nhost: x\r\naccess-control-request-method: POST\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        // Wrong requested method.
+        let response = run_video_preflight(
+            "OPTIONS /upload/video HTTP/1.1\r\nhost: x\r\norigin: http://ok.example\r\n\
+             access-control-request-method: GET\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        // Disallowed requested header.
+        let response = run_video_preflight(
+            "OPTIONS /upload/video HTTP/1.1\r\nhost: x\r\norigin: http://ok.example\r\n\
+             access-control-request-method: POST\r\naccess-control-request-headers: x-evil\r\n\r\n",
+            &state,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(
+            !response.to_lowercase().contains("access-control-allow-headers"),
+            "disallowed headers must not be advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_upload_post_reflects_validated_origin_only() {
+        use crate::video_extract::test_support::video_bytes;
+        use crate::video_extract::with_ffmpeg_program_async;
+
+        let body = video_bytes("VALID 00:00:01.00 320x240");
+        let missing = std::env::temp_dir().join(format!("pi-no-ffmpeg-{}", uuid::Uuid::new_v4()));
+
+        // Cross-authority POST with a validated Origin AND the bearer token
+        // is readable by that origin (the 503 proves the pipeline ran; CORS
+        // headers present). Without the token the same request is refused.
+        let state = video_upload_state().await;
+        let raw = video_request(
+            &body,
+            "clip.mkv",
+            &[
+                ("origin", "http://other.example:9999"),
+                ("authorization", "Bearer video-secret"),
+            ],
+        );
+        let response = with_ffmpeg_program_async(missing.clone(), async {
+            run_video_upload(raw, &state).await
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("access-control-allow-origin: http://other.example:9999"),
+            "{response}"
+        );
+        assert!(response.contains("vary: origin"), "{response}");
+
+        let raw = video_request(
+            &body,
+            "clip.mkv",
+            &[
+                ("host", "127.0.0.1:8765"),
+                ("origin", "https://evil.example"),
+            ],
+        );
+        let response = run_video_upload(raw, &state).await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(
+            !response.to_lowercase().contains("access-control-allow-origin"),
+            "unauthenticated cross-origin must not be reflected: {response}"
+        );
+
+        // Tokenless same-origin browser keeps working and gets ACAO.
+        let state = ws_server_state().await;
+        let raw = video_request(
+            &body,
+            "clip.mkv",
+            &[("host", "127.0.0.1:8765"), ("origin", "http://127.0.0.1:8765")],
+        );
+        let response = with_ffmpeg_program_async(missing, async {
+            run_video_upload(raw, &state).await
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("access-control-allow-origin: http://127.0.0.1:8765"),
+            "{response}"
+        );
+
+        // Native client without an Origin gets no CORS headers at all.
+        let raw = video_request(&body, "clip.mkv", &[]);
+        let response = run_video_upload(raw, &state).await;
+        assert!(
+            !response.to_lowercase().contains("access-control-allow-origin"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn video_name_percent_decode_is_bounded_and_literal() {
+        assert_eq!(percent_decode_video_name("clip.mkv", 1024), "clip.mkv");
+        assert_eq!(percent_decode_video_name("clip%2Emkv", 1024), "clip.mkv");
+        assert_eq!(percent_decode_video_name("%E6%BC%94%E7%A4%BA.mkv", 1024), "演示.mkv");
+        // Invalid percent sequences stay literal.
+        assert_eq!(percent_decode_video_name("bad%zz.mkv", 1024), "bad%zz.mkv");
+        assert_eq!(percent_decode_video_name("%", 1024), "%");
+        // Decode output is capped.
+        let long = format!("{}.mkv", "a".repeat(500));
+        assert!(percent_decode_video_name(&long, 64).len() <= 64);
+    }
+
+    #[tokio::test]
+    async fn video_upload_accepts_percent_encoded_name() {
+        use crate::video_extract::test_support::{fake_ffmpeg, video_bytes};
+        use crate::video_extract::with_ffmpeg_program_async;
+
+        let (_dir, script) = fake_ffmpeg();
+        let body = video_bytes("VALID 00:00:01.00 320x240");
+        // The Web client sends encodeURIComponent(name); "clip%2Emkv"
+        // decodes back to "clip.mkv" and must pass the container check.
+        let raw = video_request(&body, "clip%2Emkv", &[]);
+        let state = ws_server_state().await;
+        let response = with_ffmpeg_program_async(script, async {
+            run_video_upload(raw, &state).await
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(response_json(&response)["name"], "clip.mkv");
+    }
+
+    #[tokio::test]
+    async fn video_upload_rejects_when_concurrency_limit_reached() {
+        use crate::video_extract::test_support::video_bytes;
+
+        let mut state = ws_server_state().await;
+        state.video_upload_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = state
+            .video_upload_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("hold the only permit");
+        let body = video_bytes("VALID 00:00:01.00 320x240");
+        let raw = video_request(&body, "clip.mkv", &[]);
+        let response = run_video_upload(raw, &state).await;
+        assert!(response.starts_with("HTTP/1.1 429"), "{response}");
+        let parsed = response_json(&response);
+        let error = parsed["error"].as_str().expect("error");
+        assert!(error.contains("too many concurrent video uploads"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn video_upload_response_write_is_bounded_for_slow_readers() {
+        // A client that never drains the socket must not pin the connection
+        // task: the (multi-MiB) frame response write times out.
+        let (mut client, mut server) = tokio::io::duplex(16);
+        let start = std::time::Instant::now();
+        let result = write_video_json_response_bounded(
+            &mut server,
+            StatusCode::OK,
+            &json!({"payload": "x".repeat(8192)}),
+            None,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(result.is_err(), "a stalled reader must time out the write");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "write timeout fired after {}ms",
+            start.elapsed().as_millis()
+        );
+        drop(client);
     }
 }
