@@ -25385,6 +25385,7 @@ mod tests {
         // Live child → Main activity for the running child.
         state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::MessageDelivered {
             group_id: "group".to_owned(),
+            waiter_claimed: false,
             message: pi_coding::MailboxMessage {
                 id: "m-live".to_owned(),
                 from: "Alpha".to_owned(),
@@ -25449,6 +25450,7 @@ mod tests {
         }));
         state.apply(ApplicationEvent::Orchestration(pi_coding::OrchestrationEvent::MessageDelivered {
             group_id: "group".to_owned(),
+            waiter_claimed: false,
             message: pi_coding::MailboxMessage {
                 id: "m-1".to_owned(),
                 from: "Alpha".to_owned(),
@@ -25795,6 +25797,7 @@ mod tests {
         });
         adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
             group_id: "group".to_owned(),
+            waiter_claimed: false,
             message: pi_coding::MailboxMessage {
                 id: "m-a".to_owned(),
                 from: "Alpha".to_owned(),
@@ -25812,6 +25815,7 @@ mod tests {
         });
         adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
             group_id: "group".to_owned(),
+            waiter_claimed: false,
             message: pi_coding::MailboxMessage {
                 id: "m-b".to_owned(),
                 from: "Beta".to_owned(),
@@ -25848,6 +25852,7 @@ mod tests {
         });
         adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
             group_id: "group".to_owned(),
+            waiter_claimed: false,
             message: pi_coding::MailboxMessage {
                 id: "m-1".to_owned(),
                 from: "Alpha".to_owned(),
@@ -25888,6 +25893,7 @@ mod tests {
         {
             adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
                 group_id: "group".to_owned(),
+                waiter_claimed: false,
                 message: pi_coding::MailboxMessage {
                     id: format!("m-{index}"),
                     from: from.to_owned(),
@@ -25937,6 +25943,7 @@ mod tests {
             });
             adapter.apply_orchestration_event(&pi_coding::OrchestrationEvent::MessageDelivered {
                 group_id: "group".to_owned(),
+                waiter_claimed: false,
                 message: pi_coding::MailboxMessage {
                     id: format!("m-{id}"),
                     from: agent_id.to_owned(),
@@ -26572,6 +26579,7 @@ mod tests {
         state.apply(ApplicationEvent::Orchestration(
             pi_coding::OrchestrationEvent::MessageDelivered {
                 group_id: "group".to_owned(),
+                waiter_claimed: false,
                 message: message.clone(),
             },
         ));
@@ -33105,6 +33113,7 @@ mod tests {
         state.apply(ApplicationEvent::Orchestration(
             pi_coding::OrchestrationEvent::MessageDelivered {
                 group_id: "group".to_owned(),
+                waiter_claimed: false,
                 message: pi_coding::MailboxMessage {
                     id: "m-1".to_owned(),
                     from: "job-b".to_owned(),
@@ -33581,6 +33590,7 @@ mod tests {
         state.apply(ApplicationEvent::Orchestration(
             pi_coding::OrchestrationEvent::MessageDelivered {
                 group_id: "group".to_owned(),
+                waiter_claimed: false,
                 message: pi_coding::MailboxMessage {
                     id: "m-1".to_owned(),
                     from: "job-a".to_owned(),

@@ -455,6 +455,178 @@ async fn parked_send_returns_revived() {
     runtime.shutdown().await;
 }
 
+/// An Idle durable child revives immediately on a committed message: the
+/// idle→park TTL is not a forced delivery boundary, the receipt is a truthful
+/// Revived (not a fake Woken), and the mailbox message reaches the revived
+/// run's model context as the typed orchestration custom message.
+#[tokio::test]
+async fn idle_send_revives_durable_child_with_message_in_context() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let parent_session_dir = tempfile::tempdir().expect("parent sessions");
+
+    let parent_recorder = session_store::start_session_in(
+        artifacts.path(),
+        Some(&test_model()),
+        None,
+        Some(parent_session_dir.path()),
+        None,
+        None,
+    )
+    .expect("parent recorder");
+
+    let parent = Session::new(SessionOptions {
+        model: test_model(),
+        cwd: artifacts.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+    })
+    .expect("parent session");
+    parent.record(parent_recorder).expect("record");
+
+    let contexts = Arc::new(std::sync::Mutex::new(Vec::<pi_ai::Context>::new()));
+    let stream_contexts = contexts.clone();
+    let factory: ChildSessionFactory = Arc::new(move |request| {
+        let stream_contexts = stream_contexts.clone();
+        Box::pin(async move {
+            let stream_fn: pi_agent::StreamFn = Arc::new(move |model, context, _opts| {
+                let stream_contexts = stream_contexts.clone();
+                Box::pin(async move {
+                    stream_contexts.lock().expect("context lock").push(context);
+                    let stream = pi_ai::new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    tokio::spawn(async move {
+                        let mut message = pi_ai::AssistantMessage::pending(&model);
+                        message.content.push(pi_ai::ContentBlock::text("done"));
+                        message.stop_reason = StopReason::Stop;
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            });
+            Session::new(SessionOptions {
+                model: request.model,
+                cwd: std::env::current_dir().expect("cwd"),
+                system_prompt: request.system_prompt,
+                thinking_level: ThinkingLevel::Off,
+                api_key: String::new(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(request.orchestration_tools),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: Some(stream_fn),
+                auth_resolver: None,
+            })
+        })
+    });
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![definition()]),
+        artifacts.path(),
+    );
+    config.parent_model = test_model();
+    config.idle_ttl = None;
+    let runtime = OrchestrationRuntime::new(config, factory).expect("runtime");
+    runtime.bind_and_recover(&parent).expect("bind and initialize");
+
+    // Spawn a child; it settles Idle (idle_ttl is None, so it never parks on
+    // its own).
+    let tools = runtime.agent_tools("Main", 0);
+    let task = tool(&tools, "task");
+    let spawn_result = (task.execute)(context(
+        "spawn-worker",
+        json!({
+            "context": "Idle revival exercise: complete the assignment, then remain available.",
+            "tasks": [{ "name": "Worker", "task": "do work" }]
+        }),
+    ))
+    .await
+    .expect("spawn");
+    let spawns: Vec<TaskSpawn> = serde_json::from_value(spawn_result.details).expect("spawns");
+    runtime
+        .wait_jobs(&[spawns[0].job_id.clone()], Some(Duration::from_secs(5)), None)
+        .await
+        .expect("wait for child");
+    let idle = runtime
+        .list("Main")
+        .into_iter()
+        .find(|peer| peer.id == "Worker")
+        .expect("worker listed");
+    assert_eq!(idle.status, AgentStatus::Idle, "child settles Idle");
+
+    // The first message to the settled child revives it immediately and
+    // truthfully instead of lying with a Woken receipt.
+    let receipts = runtime.send("Main", "Worker", "wake up now", None);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0].outcome,
+        DeliveryOutcome::Revived,
+        "idle durable child must revive on a committed message"
+    );
+    assert!(receipts[0].error.is_none(), "{:?}", receipts[0].error);
+
+    // The revived job settles, drains the mailbox, and the message reaches
+    // the revived run's model context exactly once.
+    let jobs = runtime.jobs(None);
+    let revived_job = jobs
+        .iter()
+        .find(|j| j.agent_id == "Worker" && j.status == JobStatus::Running)
+        .or_else(|| jobs.iter().find(|j| j.agent_id == "Worker" && !j.status.is_settled()))
+        .expect("revived job exists");
+    runtime
+        .wait_jobs(&[revived_job.id.clone()], Some(Duration::from_secs(5)), None)
+        .await
+        .expect("wait for revived job");
+    assert!(
+        runtime.inbox("Worker", true).is_empty(),
+        "mailbox must be drained by the revived run"
+    );
+    let contains_message = |context: &pi_ai::Context| {
+        context.messages.iter().any(|message| {
+            let text = match message {
+                pi_ai::Message::Custom(custom) => custom
+                    .content
+                    .to_blocks()
+                    .iter()
+                    .filter_map(|block| match block {
+                        pi_ai::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                pi_ai::Message::User(user) => user
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        pi_ai::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                _ => String::new(),
+            };
+            text.contains("wake up now")
+        })
+    };
+    let captured = contexts.lock().expect("contexts lock");
+    assert_eq!(captured.len(), 2, "initial run + revived run");
+    assert!(
+        !contains_message(&captured[0]),
+        "the initial run must not see the later message"
+    );
+    assert!(
+        captured.iter().skip(1).any(contains_message),
+        "the mailbox message must reach the revived run's model context"
+    );
+
+    runtime.shutdown().await;
+}
+
 /// Interrupted job is cancelled on recovery.
 #[test]
 fn interrupted_job_cancelled_on_recovery() {
@@ -504,4 +676,136 @@ fn recovery_status_truthful() {
         pi_coding::recovery_status(AgentStatus::Parked),
         AgentStatus::Parked
     );
+}
+
+/// A waiter aborted after the atomic handoff restores the message to the
+/// mailbox, and the committed message survives a restart: the handoff removal
+/// is only persisted when the wait actually returns the message, so the
+/// durable sidecar never records a consumption that did not happen.
+#[tokio::test]
+async fn aborted_waiter_handoff_restores_and_survives_restart() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let parent_session_dir = tempfile::tempdir().expect("parent sessions");
+
+    let parent_recorder = session_store::start_session_in(
+        artifacts.path(),
+        Some(&test_model()),
+        None,
+        Some(parent_session_dir.path()),
+        None,
+        None,
+    )
+    .expect("parent recorder");
+    let parent = Session::new(SessionOptions {
+        model: test_model(),
+        cwd: artifacts.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: None,
+        auth_resolver: None,
+    })
+    .expect("parent session");
+    parent.record(parent_recorder).expect("record");
+
+    let factory: ChildSessionFactory = Arc::new(|request| {
+        Box::pin(async {
+            let stream_fn: pi_agent::StreamFn = Arc::new(|model, _ctx, _opts| {
+                Box::pin(async move {
+                    let stream = pi_ai::new_assistant_message_event_stream();
+                    let producer = stream.clone();
+                    tokio::spawn(async move {
+                        let mut message = pi_ai::AssistantMessage::pending(&model);
+                        message.content.push(pi_ai::ContentBlock::text("done"));
+                        message.stop_reason = StopReason::Stop;
+                        producer.end(Some(message)).await;
+                    });
+                    stream
+                })
+            });
+            Session::new(SessionOptions {
+                model: test_model(),
+                cwd: std::env::current_dir().expect("cwd"),
+                system_prompt: request.system_prompt,
+                thinking_level: ThinkingLevel::Off,
+                api_key: String::new(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(request.orchestration_tools),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: Some(stream_fn),
+                auth_resolver: None,
+            })
+        })
+    });
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![definition()]),
+        artifacts.path(),
+    );
+    config.parent_model = test_model();
+    config.idle_ttl = None;
+    let runtime = OrchestrationRuntime::new(config.clone(), factory.clone()).expect("runtime");
+    runtime.bind_and_recover(&parent).expect("bind and initialize");
+
+    // Spawn a child so "Worker" is a registered durable agent, then settle it.
+    let tools = runtime.agent_tools("Main", 0);
+    let task = tool(&tools, "task");
+    let spawn_result = (task.execute)(context(
+        "spawn-worker",
+        json!({
+            "context": "Durable handoff exercise: complete the assignment, then remain available.",
+            "tasks": [{ "name": "Worker", "task": "do work" }]
+        }),
+    ))
+    .await
+    .expect("spawn");
+    let spawns: Vec<TaskSpawn> = serde_json::from_value(spawn_result.details).expect("spawns");
+    runtime
+        .wait_jobs(&[spawns[0].job_id.clone()], Some(Duration::from_secs(5)), None)
+        .await
+        .expect("wait for child");
+
+    // Worker waits for Main; the send is atomically handed off, then the wait
+    // task is dropped before it can return the message.
+    let waiter = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .wait_message("Worker", Some("Main"), Some(Duration::from_secs(30)), None)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    let receipts = runtime.send("Main", "Worker", "durable handoff", None);
+    assert_eq!(receipts[0].outcome, DeliveryOutcome::Woken, "atomic handoff");
+    waiter.abort();
+    assert!(waiter.await.is_err(), "aborted waiter join");
+    assert_eq!(
+        runtime.inbox("Worker", true).len(),
+        1,
+        "the aborted waiter must restore the handed-off message"
+    );
+
+    // Restart from the same parent: the committed message must still be in
+    // the recovered mailbox (the removal was never persisted).
+    runtime.shutdown().await;
+    let restarted = OrchestrationRuntime::new(config, Arc::new(|_request| {
+        Box::pin(async { anyhow::bail!("no child session expected after restart") })
+    }))
+    .expect("restarted runtime");
+    restarted.bind_and_recover(&parent).expect("bind and recover existing state");
+    let inbox = restarted.inbox("Worker", true);
+    assert_eq!(
+        inbox.len(),
+        1,
+        "the handed-off message must survive the restart"
+    );
+    assert_eq!(inbox[0].body, "durable handoff");
+    restarted.shutdown().await;
 }

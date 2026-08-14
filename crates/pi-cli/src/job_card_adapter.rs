@@ -872,6 +872,7 @@ mod tests {
         // A child → Main IRC progress message becomes the live activity.
         adapter.apply_orchestration_event(&OrchestrationEvent::MessageDelivered {
             group_id: "group".to_owned(),
+            waiter_claimed: false,
             message: MailboxMessage {
                 id: "m-1".to_owned(),
                 from: "Child".to_owned(),
@@ -950,6 +951,7 @@ mod tests {
         adapter.apply_orchestration_event(&OrchestrationEvent::JobUpdated { group_id: "group".to_owned(), job: snapshot });
         adapter.apply_orchestration_event(&OrchestrationEvent::MessageDelivered {
             group_id: "group".to_owned(),
+            waiter_claimed: false,
             message: MailboxMessage {
                 id: "m-secret".to_owned(),
                 from: "Child".to_owned(),

@@ -451,6 +451,41 @@ impl ApplicationInner {
     fn runtime(&self) -> Arc<runtime::ApplicationRuntime> {
         self.runtime.runtime()
     }
+
+    /// Deliver an unsolicited child → Main mailbox message into the live main
+    /// session's steering queue, so the parent model receives the reply at
+    /// its next safe turn boundary (running) or the next run's initial
+    /// steering drain (idle). Messages already claimed by an active `hub
+    /// wait` are skipped: the wait tool returns the body as its own tool
+    /// result, so steering it again would duplicate it in the model context.
+    /// `MessageDelivered` presentation events still publish for every message
+    /// (TUI/Web rendering is unchanged). A failed steer does not drain the
+    /// mailbox, so the committed reply is never lost — callers must surface
+    /// the failure (bounded structured diagnostic) rather than swallow it.
+    async fn steer_main_delivered_message(&self, event: &crate::OrchestrationEvent) -> Result<()> {
+        let crate::OrchestrationEvent::MessageDelivered {
+            message,
+            waiter_claimed: false,
+            ..
+        } = event
+        else {
+            return Ok(());
+        };
+        let session = self.runtime().session();
+        session
+            .steer(crate::orchestration::mailbox_message_as_custom(message))
+            .await
+    }
+
+    /// Bounded structured diagnostic for a failed main-session steer: one
+    /// stderr line identifying the message (never the raw body).
+    fn report_steer_main_delivery_failure(&self, event: &crate::OrchestrationEvent, error: &anyhow::Error) {
+        let id = match event {
+            crate::OrchestrationEvent::MessageDelivered { message, .. } => message.id.as_str(),
+            _ => "?",
+        };
+        eprintln!("orchestration: steering delivered message {id} into the main session failed: {error:#}");
+    }
 }
 
 impl Application {
@@ -844,6 +879,7 @@ impl Application {
                     match events.recv().await {
                         Ok(event) => {
                             let Some(inner) = orchestration_inner.upgrade() else { break; };
+                            inner.steer_main_delivered_message(&event).await;
                             let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1010,6 +1046,7 @@ impl Application {
                         if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                             inner.todo_dag_failed(&error);
                         }
+                        inner.steer_main_delivered_message(&event).await;
                         let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                         inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                     }
@@ -1025,6 +1062,10 @@ impl Application {
                             if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                                 inner.todo_dag_failed(&error);
                             }
+                            // `presentation_events` is a UI snapshot (jobs and
+                            // agents), never an unconsumed context queue:
+                            // historical `MessageDelivered` must NOT be steered
+                            // into the main session here.
                             let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                             inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                         }
@@ -2760,6 +2801,7 @@ impl Application {
                                 if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                                     inner.todo_dag_failed(&error);
                                 }
+                                inner.steer_main_delivered_message(&event).await;
                                 let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                                 inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                             }
@@ -2772,6 +2814,11 @@ impl Application {
                                     if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                                         inner.todo_dag_failed(&error);
                                     }
+                                    // `presentation_events` is a UI snapshot
+                                    // (jobs and agents), never an unconsumed
+                                    // context queue: historical
+                                    // `MessageDelivered` must NOT be steered
+                                    // into the main session here.
                                     let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                                     inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                                 }

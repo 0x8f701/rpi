@@ -257,9 +257,23 @@ async fn run_loop(
             Vec::new()
         };
         if follow_ups.is_empty() {
-            break;
+            // The final-turn window: a message steered while the last turn was
+            // in flight (e.g. IRC handed to an active orchestration bridge)
+            // arrives during the follow-up check, after the turn-boundary
+            // drain already returned empty. Drain steering once more and
+            // process anything that landed so the run never settles with an
+            // acknowledged-but-unprocessed message.
+            pending = if let Some(get) = &config.get_steering_messages {
+                get().await
+            } else {
+                Vec::new()
+            };
+            if pending.is_empty() {
+                break;
+            }
+        } else {
+            pending = follow_ups;
         }
-        pending = follow_ups;
     }
 
     emit(AgentEvent::AgentEnd {

@@ -944,9 +944,12 @@ async fn batch_results_are_correlated_and_artifacts_resolve() {
         read_result.content.first(),
         Some(pi_ai::ContentBlock::Text { text, .. }) if text.contains("first")
     ));
+    // Second has settled Idle with no bridge and no waiter: the peer message
+    // is truthfully Queued and retained in its mailbox (asserted below) — the
+    // previous Woken receipt was the fake-wake lie, not a delivery.
     assert_eq!(
         runtime.send("First", "Second", "peer result", None)[0].outcome,
-        pi_coding::DeliveryOutcome::Woken
+        pi_coding::DeliveryOutcome::Queued
     );
     let sibling_inbox = runtime.inbox("Second", false);
     assert_eq!(sibling_inbox.len(), 1);
@@ -1091,8 +1094,13 @@ async fn mailbox_cap_wait_and_peer_roster_are_enforced() {
         .await
         .expect("child");
 
-    assert_eq!(runtime.send("Main", "Worker", "one", None)[0].outcome, pi_coding::DeliveryOutcome::Woken);
-    assert_eq!(runtime.send("Main", "Worker", "two", None)[0].outcome, pi_coding::DeliveryOutcome::Woken);
+    // Worker has settled Idle with no bridge and no waiter: delivery is
+    // truthfully Queued and retained in the mailbox (asserted below) — the
+    // previous Woken receipt was the fake-wake lie, not a delivery. (The
+    // active-running Woken contract is covered by
+    // `running_target_reports_woken_while_bridge_active`.)
+    assert_eq!(runtime.send("Main", "Worker", "one", None)[0].outcome, pi_coding::DeliveryOutcome::Queued);
+    assert_eq!(runtime.send("Main", "Worker", "two", None)[0].outcome, pi_coding::DeliveryOutcome::Queued);
     assert_eq!(runtime.send("Main", "Worker", "three", None)[0].outcome, pi_coding::DeliveryOutcome::Failed);
     let inbox = runtime.inbox("Worker", true);
     assert_eq!(inbox.len(), 2);
@@ -1656,6 +1664,126 @@ async fn cancellation_race_does_not_report_or_deliver_fake_wake() {
     runtime.shutdown().await;
 }
 
+/// A send landing in the run-end window must never be lost or duplicated:
+/// the bridge accepts it while the child is mid-turn (Woken), and the child's
+/// release races `run` completion against the delivery channel. Either the
+/// run processes the steered message exactly once (mailbox drained), or the
+/// unprocessed message stays in the mailbox for the next run — never-acked
+/// traffic simply remains queued, and steered-but-unprocessed traffic is
+/// restored by the settle path.
+#[tokio::test]
+async fn concurrent_send_run_end_race_retains_message_exactly_once() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release_first = tokio_util::sync::CancellationToken::new();
+    let contexts = Arc::new(Mutex::new(Vec::<pi_ai::Context>::new()));
+    let stream_started = started.clone();
+    let stream_release = release_first.clone();
+    let stream_contexts = contexts.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream_calls = calls.clone();
+    let stream_fn: pi_agent::StreamFn = Arc::new(move |model, context, options| {
+        let started = stream_started.clone();
+        let release = stream_release.clone();
+        let contexts = stream_contexts.clone();
+        let calls = stream_calls.clone();
+        Box::pin(async move {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            contexts.lock().push(context);
+            let stream = pi_ai::new_assistant_message_event_stream();
+            let producer = stream.clone();
+            tokio::spawn(async move {
+                if call == 0 {
+                    started.notify_waiters();
+                    let abort = options.stream.abort_signal;
+                    tokio::select! {
+                        () = release.cancelled() => {}
+                        () = async {
+                            match abort {
+                                Some(signal) => signal.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => {}
+                    }
+                }
+                let mut message = pi_ai::AssistantMessage::pending(&model);
+                message.content.push(ContentBlock::text("done"));
+                message.stop_reason = StopReason::Stop;
+                producer.end(Some(message)).await;
+            });
+            stream
+        })
+    });
+    let factory: ChildSessionFactory = Arc::new(move |request| {
+        let stream_fn = stream_fn.clone();
+        Box::pin(async move {
+            Session::new(SessionOptions {
+                model: Model::default(),
+                cwd: std::env::current_dir().expect("cwd"),
+                system_prompt: request.system_prompt,
+                thinking_level: ThinkingLevel::Off,
+                api_key: String::new(),
+                compaction: None,
+                stream_options: Default::default(),
+                tools: Some(request.orchestration_tools),
+                before_tool_call: None,
+                after_tool_call: None,
+                stream_fn: Some(stream_fn),
+                auth_resolver: None,
+            })
+        })
+    });
+    let runtime = OrchestrationRuntime::new(config_with_ttl(artifacts.path(), None), factory)
+        .expect("runtime");
+    let runner = runtime.clone();
+    let run = tokio::spawn(async move {
+        let (_, abort) = AbortController::new();
+        runner
+            .run_tasks(
+                "Main",
+                0,
+                vec![TaskItem {
+                    index: 0,
+                    id: "Race".to_owned(),
+                    agent: "task".to_owned(),
+                    assignment: "remain active".to_owned(),
+                    todo_task_id: None,
+                    ..Default::default()
+                }],
+                abort,
+            )
+            .await
+    });
+    started.notified().await;
+    // The child is mid-turn with a live bridge, so the bridge accepts the
+    // message and the receipt is a truthful Woken.
+    let receipt = runtime.send("Main", "Race", "raced at run end", None)[0].clone();
+    assert_eq!(receipt.outcome, pi_coding::DeliveryOutcome::Woken);
+    // Release the run immediately so completion races the delivery channel.
+    release_first.cancel();
+    let results = run.await.expect("race join").expect("race result");
+    assert_eq!(results[0].status, AgentStatus::Idle);
+    let captured = contexts.lock();
+    let processed = captured.iter().any(|context| {
+        context_user_texts(context)
+            .into_iter()
+            .any(|text| text.contains("raced at run end"))
+    });
+    let inbox_len = runtime.inbox("Race", true).len();
+    match inbox_len {
+        0 => assert!(
+            processed,
+            "message must not be lost when the mailbox is empty"
+        ),
+        1 => assert!(
+            !processed,
+            "message must not be both processed by the run and retained in the mailbox"
+        ),
+        other => panic!("mailbox must hold at most one copy, got {other}"),
+    }
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn delivery_outcomes_queued_woken_parked_failed() {
     let artifacts = tempfile::tempdir().expect("artifacts");
@@ -1698,11 +1826,14 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
     let results = run.await.expect("run join").expect("results");
     assert_eq!(results[0].status, AgentStatus::Idle);
 
-    // Woken: target is now Idle.
+    // Queued: an Idle target without durable binding cannot be woken. The
+    // message is retained in the mailbox (truthful receipt) instead of a
+    // fake Woken that would strand it forever.
     assert_eq!(
         runtime.send("Main", "Runner", "after completion", None)[0].outcome,
-        pi_coding::DeliveryOutcome::Woken,
+        pi_coding::DeliveryOutcome::Queued,
     );
+    assert_eq!(runtime.inbox("Runner", true).len(), 1);
 
     // A parked registry entry has no live execution to revive. Delivery is
     // retained for a future explicit resume and the status remains truthful.
@@ -1756,6 +1887,50 @@ async fn delivery_outcomes_queued_woken_parked_failed() {
         pi_coding::DeliveryOutcome::Failed,
     );
     runtime2.shutdown().await;
+    runtime.shutdown().await;
+}
+
+/// A `hub wait` is one-shot: a synchronous burst of sends hands exactly ONE
+/// message to the waiter (atomically removing it from the mailbox and
+/// unregistering the claim); the rest stay in the bounded mailbox — they are
+/// never flooded into the waiter's channel nor lost on its drop.
+#[tokio::test]
+async fn waiter_is_one_shot_and_mailbox_stays_bounded() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = OrchestrationRuntime::new(
+        config_with_ttl(artifacts.path(), None),
+        Arc::new(|_request| Box::pin(async { unreachable!("no child session expected") })),
+    )
+    .expect("runtime");
+    let waiter_runtime = runtime.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_runtime
+            .wait_message("Main", Some("Worker"), Some(std::time::Duration::from_secs(5)), None)
+            .await
+            .expect("wait")
+            .expect("one message claimed")
+    });
+    tokio::task::yield_now().await;
+    let mut receipts = Vec::new();
+    for index in 0..3 {
+        receipts.push(runtime.send("Worker", "Main", &format!("burst-{index}"), None)[0].clone());
+    }
+    assert_eq!(receipts[0].outcome, pi_coding::DeliveryOutcome::Woken);
+    assert_eq!(receipts[1].outcome, pi_coding::DeliveryOutcome::Queued);
+    assert_eq!(receipts[2].outcome, pi_coding::DeliveryOutcome::Queued);
+    let claimed = waiter.await.expect("waiter join");
+    assert!(claimed.body.starts_with("burst-"), "{}", claimed.body);
+    let inbox = runtime.inbox("Main", true);
+    assert_eq!(
+        inbox.len(),
+        2,
+        "the one-shot waiter must leave the remaining messages mailbox-bounded"
+    );
+    let mut bodies = inbox.iter().map(|message| message.body.clone()).collect::<Vec<_>>();
+    bodies.push(claimed.body);
+    bodies.sort();
+    bodies.dedup();
+    assert_eq!(bodies.len(), 3, "each message must be delivered exactly once");
     runtime.shutdown().await;
 }
 

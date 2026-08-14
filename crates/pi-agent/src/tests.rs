@@ -1,6 +1,8 @@
 use crate::{
-    Agent, AgentEvent, AgentEventType, AgentLoopTurnUpdate, AgentOptions, AgentState, AgentTool,
-    AgentToolResult, BeforeToolCallResult, QueueMode, StreamFn, ToolExecutionMode,
+    AbortController, Agent, AgentContext, AgentEvent, AgentEventType, AgentLoopConfig,
+    AgentLoopTurnUpdate, AgentMessage, AgentOptions, AgentState, AgentTool, AgentToolResult,
+    BeforeToolCallResult, EventSink, MessageQueueFn, QueueMode, StreamFn, ThinkingLevel,
+    ToolExecutionMode,
 };
 use anyhow::anyhow;
 use parking_lot::Mutex;
@@ -424,6 +426,123 @@ async fn steering_and_follow_up_are_injected() {
     assert_eq!(contexts.len(), 2);
     assert!(contexts[0].contains(&"steer".into()));
     assert!(contexts[1].contains(&"follow".into()));
+}
+
+#[tokio::test]
+async fn steering_landing_in_final_turn_window_is_processed_before_run_returns() {
+    // The turn-boundary steering drain runs before the follow-up check; a
+    // message that lands during that final window (e.g. IRC handed to an
+    // active orchestration bridge) must still be processed before the run
+    // settles, or it would be acknowledged by the bridge and lost with the
+    // dropped session.
+    let contexts = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let seen = contexts.clone();
+    let messages = Arc::new(Mutex::new(VecDeque::from(vec![
+        assistant(vec![ContentBlock::text("one")], StopReason::Stop),
+        assistant(vec![ContentBlock::text("two")], StopReason::Stop),
+    ])));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream_calls = calls.clone();
+    let stream: StreamFn = Arc::new(move |_model, context, _options| {
+        let seen = seen.clone();
+        let messages = messages.clone();
+        let stream_calls = stream_calls.clone();
+        Box::pin(async move {
+            stream_calls.fetch_add(1, Ordering::SeqCst);
+            seen.lock().push(
+                context
+                    .messages
+                    .iter()
+                    .filter_map(|message| {
+                        if let Message::User(user) = message {
+                            user.content.first().and_then(|block| {
+                                if let ContentBlock::Text { text, .. } = block {
+                                    Some(text.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            );
+            let message = messages.lock().pop_front().unwrap();
+            let stream = new_assistant_message_event_stream();
+            stream
+                .push(AssistantMessageEvent::Done {
+                    reason: message.stop_reason,
+                    message: message.clone(),
+                })
+                .await;
+            stream.end(Some(message)).await;
+            stream
+        })
+    });
+    let steering = Arc::new(Mutex::new(VecDeque::<AgentMessage>::new()));
+    let injected = Arc::new(AtomicBool::new(false));
+    let get_steering_queue = steering.clone();
+    let get_steering: MessageQueueFn = Arc::new(move || {
+        let queue = get_steering_queue.clone();
+        Box::pin(async move { queue.lock().drain(..).collect() })
+    });
+    // The follow-up check enqueues the steering message as a side effect on
+    // its first poll: that is exactly the final-turn window between the last
+    // turn-boundary drain and the settle drain.
+    let follow_up_queue = steering.clone();
+    let follow_up_injected = injected.clone();
+    let follow_ups: MessageQueueFn = Arc::new(move || {
+        let queue = follow_up_queue.clone();
+        let injected = follow_up_injected.clone();
+        Box::pin(async move {
+            if !injected.swap(true, Ordering::SeqCst) {
+                queue.lock().push_back(Message::user_text("final-window", pi_ai::now_millis()));
+            }
+            Vec::new()
+        })
+    });
+    let config = AgentLoopConfig {
+        model: model(),
+        reasoning: ThinkingLevel::Off,
+        stream_options: SimpleStreamOptions::default(),
+        tool_execution: ToolExecutionMode::default(),
+        skip_initial_steering: false,
+        get_steering_messages: Some(get_steering),
+        get_follow_up_messages: Some(follow_ups),
+        ..AgentLoopConfig::default()
+    };
+    let (_, abort) = AbortController::new();
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
+    let emit: EventSink = Arc::new(|_event| Box::pin(async { Ok(()) }));
+    crate::loop_runtime::run_agent_loop(
+        vec![Message::user_text("prompt", pi_ai::now_millis())],
+        context,
+        config,
+        emit,
+        stream,
+        abort,
+    )
+    .await
+    .expect("run");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the final-window steering must run as a second turn before the run settles"
+    );
+    let contexts = contexts.lock();
+    assert!(
+        !contexts[0].contains(&"final-window".to_owned()),
+        "turn 1 must not see the later message"
+    );
+    assert!(
+        contexts[1].contains(&"final-window".to_owned()),
+        "the final-window message must reach the second turn's context"
+    );
 }
 
 #[tokio::test]

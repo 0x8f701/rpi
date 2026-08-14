@@ -5,18 +5,19 @@ use std::{
     time::Duration,
 };
 
-use pi_agent::{AbortController, AgentEvent, QueueMode, ToolCallContext};
+use pi_agent::{AbortController, AgentEvent, QueueMode, ThinkingLevel, ToolCallContext};
 use pi_ai::providers::{
     FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
 };
 use pi_ai::{ContentBlock, Model, StopReason};
 use pi_coding::{
-    AgentRuntimeSettings, Application, ApplicationEvent, ApplicationRuntimeCandidate,
-    ApplicationRuntimeFactory, ApplicationRuntimeFuture, ExtensionCapability, ExtensionMode,
-    ExtensionOrigin, ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeOptions,
-    ExtensionSpec, ExtensionSpecRuntime, JobStatus, OrchestrationSettings, ResourceManager,
-    ResourceManagerOptions, Session, SessionOptions, StreamingBehavior, TaskItem, ToolSelection,
-    WorkspaceRoots,
+    AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentRuntimeSettings, Application,
+    ApplicationEvent, ApplicationRuntimeCandidate, ApplicationRuntimeFactory,
+    ApplicationRuntimeFuture, DeliveryOutcome, ExtensionCapability, ExtensionMode, ExtensionOrigin,
+    ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeOptions, ExtensionSpec,
+    ExtensionSpecRuntime, JobStatus, OrchestrationConfig, OrchestrationRuntime,
+    OrchestrationSettings, ResourceManager, ResourceManagerOptions, Session, SessionOptions,
+    StreamingBehavior, TaskItem, ToolSelection, WorkspaceRoots,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -1847,5 +1848,556 @@ async fn abort_during_loop_turn_settles_as_cancelled_not_failed() {
     );
 
     application.wait_for_idle().await;
+    registration.unregister();
+}
+
+// ---------------------------------------------------------------------------
+// Unsolicited child → Main reply delivery into the live main session model
+// context (typed orchestration custom message), with hub-wait deduplication.
+// ---------------------------------------------------------------------------
+
+fn irc_task_definition() -> AgentDefinition {
+    AgentDefinition {
+        name: "task".to_owned(),
+        description: "execute an orchestration task".to_owned(),
+        system_prompt: "complete the assigned task".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+    }
+}
+
+fn irc_runtime(artifact_dir: &Path) -> OrchestrationRuntime {
+    let config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![irc_task_definition()]),
+        artifact_dir,
+    );
+    OrchestrationRuntime::new(
+        config,
+        Arc::new(|_request| {
+            Box::pin(async { anyhow::bail!("no child session expected in this test") })
+        }),
+    )
+    .expect("orchestration runtime")
+}
+
+/// Extract the model-facing text of every message that can carry a steered
+/// orchestration delivery from a captured provider context. The session
+/// projects the typed custom message into a user message before the provider
+/// (`pi_ai::transform::project_session_messages`), so both kinds are scanned;
+/// the raw body never leaks anywhere else.
+fn irc_custom_texts(context: &pi_ai::Context) -> Vec<String> {
+    context
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            pi_ai::Message::Custom(custom) => Some(
+                custom
+                    .content
+                    .to_blocks()
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            pi_ai::Message::User(user) => Some(
+                user.content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn wait_for_steered_message(application: &Application, needle: &str) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (steering, _) = application.queued_messages().await;
+            if steering.iter().any(|message| match message {
+                pi_ai::Message::Custom(custom) => custom
+                    .content
+                    .to_blocks()
+                    .iter()
+                    .any(|block| {
+                        matches!(block, ContentBlock::Text { text, .. } if text.contains(needle))
+                    }),
+                _ => false,
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("steered message never queued");
+}
+
+/// An unsolicited child → Main reply lands in the main session's steering
+/// queue while Main is idle and reaches the model context on the next run's
+/// initial steering drain.
+#[tokio::test]
+async fn idle_main_receives_unsolicited_child_reply_on_next_run() {
+    let contexts = Arc::new(parking_lot::Mutex::new(Vec::<pi_ai::Context>::new()));
+    let (session, registration) = session_with_recorded_contexts(
+        vec![FauxResponse::text("main turn done")],
+        contexts.clone(),
+    );
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = irc_runtime(artifacts.path());
+    let application = Application::new_with_orchestration(session, runtime.clone()).await;
+
+    // Unsolicited child → Main reply while Main is idle: truthfully queued
+    // (no fake Woken) and steered into the live main session.
+    let receipt = runtime.send("Worker", "Main", "async progress from child", None)[0].clone();
+    assert_eq!(receipt.outcome, DeliveryOutcome::Queued);
+    wait_for_steered_message(&application, "async progress from child").await;
+
+    application
+        .prompt("hello".to_owned(), Vec::new(), None)
+        .await
+        .expect("prompt");
+    application.wait_for_idle().await;
+
+    let captured = contexts.lock();
+    assert_eq!(captured.len(), 1, "one main turn");
+    assert!(
+        irc_custom_texts(&captured[0])
+            .into_iter()
+            .any(|text| text.contains("async progress from child")),
+        "the reply must reach the idle main model context on the next run"
+    );
+    runtime.shutdown().await;
+    registration.unregister();
+}
+
+/// A reply steered while Main is mid-turn reaches the model at its next safe
+/// turn boundary (the per-turn steering drain), never the in-flight turn.
+#[tokio::test]
+async fn running_main_receives_unsolicited_child_reply_at_next_turn_boundary() {
+    let started = Arc::new(Notify::new());
+    let release = CancellationToken::new();
+    let contexts = Arc::new(parking_lot::Mutex::new(Vec::<pi_ai::Context>::new()));
+    let stream_started = started.clone();
+    let stream_release = release.clone();
+    let stream_contexts = contexts.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream_calls = calls.clone();
+    let stream_fn: pi_agent::StreamFn = Arc::new(move |model, context, options| {
+        let started = stream_started.clone();
+        let release = stream_release.clone();
+        let contexts = stream_contexts.clone();
+        let calls = stream_calls.clone();
+        Box::pin(async move {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            contexts.lock().push(context);
+            let stream = pi_ai::new_assistant_message_event_stream();
+            let producer = stream.clone();
+            tokio::spawn(async move {
+                if call == 0 {
+                    started.notify_waiters();
+                    let abort = options.stream.abort_signal;
+                    tokio::select! {
+                        () = release.cancelled() => {}
+                        () = async {
+                            match abort {
+                                Some(signal) => signal.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => {}
+                    }
+                }
+                let mut message = pi_ai::AssistantMessage::pending(&model);
+                message.content.push(ContentBlock::text(if call == 0 {
+                    "first turn"
+                } else {
+                    "second turn"
+                }));
+                message.stop_reason = StopReason::Stop;
+                producer.end(Some(message)).await;
+            });
+            stream
+        })
+    });
+    let session = Session::new(SessionOptions {
+        model: Model::default(),
+        cwd: std::env::current_dir().expect("current directory"),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: Some(stream_fn),
+        auth_resolver: None,
+    })
+    .expect("build session");
+    session.set_session_dir(test_sessions_root());
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = irc_runtime(artifacts.path());
+    let application = Application::new_with_orchestration(session, runtime.clone()).await;
+
+    let prompt_application = application.clone();
+    let prompt_task = tokio::spawn(async move {
+        prompt_application
+            .prompt("start working".to_owned(), Vec::new(), None)
+            .await
+            .expect("prompt");
+        prompt_application.wait_for_idle().await;
+    });
+    started.notified().await;
+    let receipt = runtime.send("Worker", "Main", "urgent progress from child", None)[0].clone();
+    assert_eq!(receipt.outcome, DeliveryOutcome::Queued);
+    wait_for_steered_message(&application, "urgent progress from child").await;
+    release.cancel();
+    prompt_task.await.expect("prompt task");
+
+    let captured = contexts.lock();
+    assert!(captured.len() >= 2, "first turn + steering turn");
+    assert!(
+        !irc_custom_texts(&captured[0])
+            .into_iter()
+            .any(|text| text.contains("urgent progress from child")),
+        "the in-flight turn must not see the later reply"
+    );
+    assert!(
+        irc_custom_texts(&captured[1])
+            .into_iter()
+            .any(|text| text.contains("urgent progress from child")),
+        "the reply must reach the running main at its next turn boundary"
+    );
+    runtime.shutdown().await;
+}
+
+/// A child reply claimed by an active `hub wait` is delivered through the
+/// waiter and NOT also steered into the main session (no duplication), while
+/// the `MessageDelivered` presentation event still publishes.
+#[tokio::test]
+async fn waiter_claimed_child_reply_is_not_duplicated_into_main_context() {
+    let contexts = Arc::new(parking_lot::Mutex::new(Vec::<pi_ai::Context>::new()));
+    let (session, registration) = session_with_recorded_contexts(
+        vec![FauxResponse::text("main turn done")],
+        contexts.clone(),
+    );
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = irc_runtime(artifacts.path());
+    let application = Application::new_with_orchestration(session, runtime.clone()).await;
+    let mut events = application.subscribe();
+
+    // Main blocks in `hub wait from=Worker` (the waiter owns the mailbox).
+    let waiter = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .wait_message("Main", Some("Worker"), Some(Duration::from_secs(3)), None)
+                .await
+        }
+    });
+    // On the single-threaded test runtime the spawned waiter runs to its
+    // first await, which happens after the claim guard is registered.
+    tokio::task::yield_now().await;
+
+    let receipt = runtime.send("Worker", "Main", "dedup me", None)[0].clone();
+    assert_eq!(
+        receipt.outcome,
+        DeliveryOutcome::Woken,
+        "an active hub wait claims the message"
+    );
+    let claimed = waiter.await.expect("waiter join").expect("wait succeeds");
+    assert_eq!(
+        claimed.as_ref().map(|message| message.body.as_str()),
+        Some("dedup me")
+    );
+
+    // The app event loop must publish the delivery as waiter-claimed and skip
+    // steering it into the main session.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await {
+                Ok(ApplicationEvent::Orchestration(
+                    pi_coding::OrchestrationEvent::MessageDelivered {
+                        waiter_claimed: true,
+                        message,
+                        ..
+                    },
+                )) if message.body == "dedup me" => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    })
+    .await
+    .expect("waiter-claimed MessageDelivered event");
+
+    // A subsequent main turn never sees the body as a steered custom message
+    // (the waiter already returned it as its own result).
+    application
+        .prompt("follow up".to_owned(), Vec::new(), None)
+        .await
+        .expect("prompt");
+    application.wait_for_idle().await;
+    let captured = contexts.lock();
+    for context in captured.iter() {
+        assert!(
+            !irc_custom_texts(context)
+                .into_iter()
+                .any(|text| text.contains("dedup me")),
+            "waiter-claimed reply must not be duplicated into the main context"
+        );
+    }
+    assert!(
+        runtime.inbox("Main", true).is_empty(),
+        "the waiter must have drained the mailbox"
+    );
+    runtime.shutdown().await;
+    registration.unregister();
+}
+
+/// The atomic waiter claim wins over an imminent timeout: a message sent
+/// while a `hub wait` is registered is handed to the waiter (removed from the
+/// mailbox, receipt Woken), not left stranded under a stale pre-check.
+#[tokio::test]
+async fn waiter_claim_wins_over_imminent_timeout() {
+    let contexts = Arc::new(parking_lot::Mutex::new(Vec::<pi_ai::Context>::new()));
+    let (session, registration) = session_with_recorded_contexts(
+        vec![FauxResponse::text("main turn done")],
+        contexts.clone(),
+    );
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = irc_runtime(artifacts.path());
+    let application = Application::new_with_orchestration(session, runtime.clone()).await;
+
+    let waiter = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .wait_message("Main", Some("Worker"), Some(Duration::from_millis(100)), None)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    let receipt = runtime.send("Worker", "Main", "claimed before timeout", None)[0].clone();
+    assert_eq!(
+        receipt.outcome,
+        DeliveryOutcome::Woken,
+        "the atomic claim must hand the message to the waiter"
+    );
+    let claimed = waiter.await.expect("waiter join").expect("wait succeeds");
+    assert_eq!(
+        claimed.as_ref().map(|message| message.body.as_str()),
+        Some("claimed before timeout"),
+        "the waiter must receive the claimed message even under an imminent timeout"
+    );
+    assert!(
+        runtime.inbox("Main", true).is_empty(),
+        "the claimed message must leave the mailbox"
+    );
+    runtime.shutdown().await;
+    registration.unregister();
+}
+
+/// A waiter that times out before the send leaves no stale claim: the message
+/// is truthfully Queued, the delivery event is NOT claimed-flagged, and the
+/// application steers it into the main session (nothing stranded).
+#[tokio::test]
+async fn timed_out_waiter_does_not_strand_reply() {
+    let contexts = Arc::new(parking_lot::Mutex::new(Vec::<pi_ai::Context>::new()));
+    let (session, registration) = session_with_recorded_contexts(
+        vec![FauxResponse::text("main turn done")],
+        contexts.clone(),
+    );
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = irc_runtime(artifacts.path());
+    let application = Application::new_with_orchestration(session, runtime.clone()).await;
+
+    let waiter = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .wait_message("Main", Some("Worker"), Some(Duration::from_millis(50)), None)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    // The waiter times out and fully unregisters before the send happens.
+    let timed_out = tokio::time::timeout(Duration::from_secs(3), waiter)
+        .await
+        .expect("waiter settles")
+        .expect("wait join")
+        .expect("wait returns Ok(None) on timeout");
+    assert!(timed_out.is_none(), "the short wait must time out");
+
+    let receipt = runtime.send("Worker", "Main", "after the wait ended", None)[0].clone();
+    assert_eq!(
+        receipt.outcome,
+        DeliveryOutcome::Queued,
+        "no waiter means a truthful Queued (retained) outcome"
+    );
+    wait_for_steered_message(&application, "after the wait ended").await;
+    application
+        .prompt("next turn".to_owned(), Vec::new(), None)
+        .await
+        .expect("prompt");
+    application.wait_for_idle().await;
+    let captured = contexts.lock();
+    assert!(
+        captured.iter().any(|context| irc_custom_texts(context)
+            .into_iter()
+            .any(|text| text.contains("after the wait ended"))),
+        "the reply must reach the main context after a timed-out waiter"
+    );
+    runtime.shutdown().await;
+    registration.unregister();
+}
+
+/// A waiter task dropped after the atomic handoff (before returning the
+/// message) restores it to the mailbox and republishes the delivery, so the
+/// application still steers it into the main session — the message is never
+/// stranded under a claim that never consumed it.
+#[tokio::test]
+async fn dropped_waiter_restores_handed_off_message() {
+    let contexts = Arc::new(parking_lot::Mutex::new(Vec::<pi_ai::Context>::new()));
+    let (session, registration) = session_with_recorded_contexts(
+        vec![FauxResponse::text("main turn done")],
+        contexts.clone(),
+    );
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime = irc_runtime(artifacts.path());
+    let application = Application::new_with_orchestration(session, runtime.clone()).await;
+
+    let waiter = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .wait_message("Main", Some("Worker"), Some(Duration::from_secs(30)), None)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    let receipt = runtime.send("Worker", "Main", "handed then dropped", None)[0].clone();
+    assert_eq!(
+        receipt.outcome,
+        DeliveryOutcome::Woken,
+        "the atomic claim hands the message to the waiter"
+    );
+    // Kill the waiter task before it can receive: the guard's drop must
+    // restore the message to the mailbox and republish the delivery.
+    waiter.abort();
+    assert!(waiter.await.is_err(), "aborted waiter join");
+
+    // The message is back in the mailbox (never lost) and the republished
+    // delivery steers it into the main session.
+    assert_eq!(runtime.inbox("Main", true).len(), 1, "restored to the mailbox");
+    wait_for_steered_message(&application, "handed then dropped").await;
+    application
+        .prompt("recover turn".to_owned(), Vec::new(), None)
+        .await
+        .expect("prompt");
+    application.wait_for_idle().await;
+    let captured = contexts.lock();
+    assert!(
+        captured.iter().any(|context| irc_custom_texts(context)
+            .into_iter()
+            .any(|text| text.contains("handed then dropped"))),
+        "the restored reply must still reach the main context"
+    );
+    runtime.shutdown().await;
+    registration.unregister();
+}
+
+/// A lagged orchestration event stream replays a UI snapshot
+/// (`presentation_events`), never an unconsumed context queue: historical
+/// `MessageDelivered` must not be steered into the main session.
+#[tokio::test]
+async fn lagged_replay_does_not_steer_historical_deliveries() {
+    let contexts = Arc::new(parking_lot::Mutex::new(Vec::<pi_ai::Context>::new()));
+    let (session, registration) = session_with_recorded_contexts(
+        vec![FauxResponse::text("main turn done")],
+        contexts.clone(),
+    );
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let mut config = OrchestrationConfig::new(
+        AgentCatalog::from_agents(vec![irc_task_definition()]),
+        artifacts.path(),
+    );
+    config.mailbox_capacity = 300;
+    let runtime = OrchestrationRuntime::new(
+        config,
+        Arc::new(|_request| {
+            Box::pin(async { anyhow::bail!("no child session expected in this test") })
+        }),
+    )
+    .expect("orchestration runtime");
+    let application = Application::new_with_orchestration(session, runtime.clone()).await;
+
+    // Burst enough deliveries to overflow the app's event buffer (256) before
+    // its loop can consume any: the receiver lags and the presentation-log
+    // replay runs. The retained events are still live deliveries (steered
+    // once each); the replayed UI snapshot must never steer or duplicate.
+    for index in 0..300 {
+        runtime.send("Worker", "Main", &format!("replay-me-{index}"), None);
+    }
+    // Let the event loop drain the retained events; the queue then holds each
+    // exactly once (any historical replay would duplicate entries).
+    let bodies = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (steering, _) = application.queued_messages().await;
+            let count = steering.len();
+            if count >= 256 {
+                break steering;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retained deliveries settle")
+    .into_iter()
+    .filter_map(|message| match message {
+        pi_ai::Message::Custom(custom) => {
+            let text = custom
+                .content
+                .to_blocks()
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            text.find("replay-me-")
+                .map(|index| text[index..].lines().next().unwrap_or_default().to_owned())
+        }
+        _ => None,
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(
+        bodies.len(),
+        bodies.iter().collect::<std::collections::HashSet<_>>().len(),
+        "each retained delivery must be steered exactly once (no replay duplication)"
+    );
+    assert!(
+        bodies.iter().all(|body| body != "replay-me-0"),
+        "the dropped prefix must never be replayed from the presentation snapshot"
+    );
+    runtime.shutdown().await;
     registration.unregister();
 }

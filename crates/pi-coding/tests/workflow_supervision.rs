@@ -1081,6 +1081,7 @@ async fn activity_feed_tracks_thinking_tool_and_irc_and_is_generation_gated() {
             4,
             ApplicationEvent::Orchestration(OrchestrationEvent::MessageDelivered {
                 group_id: "g".to_owned(),
+                waiter_claimed: false,
                 message,
             }),
         )

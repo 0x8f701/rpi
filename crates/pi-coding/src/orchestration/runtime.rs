@@ -69,21 +69,29 @@ impl ChildSession {
     }
 
     async fn steer(&self, message: &MailboxMessage) -> Result<()> {
-        self.session
-            .steer(pi_ai::Message::Custom(pi_ai::CustomMessage {
-                custom_type: ORCHESTRATION_MESSAGE_TYPE.to_owned(),
-                content: format_orchestration_message(message).into(),
-                display: true,
-                details: Some(serde_json::json!({
-                    "id": message.id,
-                    "from": message.from,
-                    "to": message.to,
-                    "body": message.body,
-                    "replyTo": message.reply_to,
-                })),
-                timestamp: i64::try_from(message.timestamp).unwrap_or(i64::MAX),
-            }))
-            .await
+        self.session.steer(mailbox_message_as_custom(message)).await
+    }
+
+    /// Drain any orchestration mailbox messages that were steered into the
+    /// session's steering queue but never processed by the run. The active
+    /// delivery bridge acknowledges a message the moment it is steered; if the
+    /// run completes before the agent loop drains the queue (the final-turn
+    /// race), the message would otherwise be lost with the dropped session.
+    /// The caller restores them to the mailbox so the next run/revival
+    /// delivers them exactly once.
+    async fn drain_unprocessed_orchestration_steering(&self) -> Vec<MailboxMessage> {
+        let (steering, _) = self.session.drain_queued_messages().await;
+        steering
+            .into_iter()
+            .filter_map(|message| match message {
+                pi_ai::Message::Custom(custom)
+                    if custom.custom_type == ORCHESTRATION_MESSAGE_TYPE =>
+                {
+                    mailbox_message_from_custom(&custom)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     async fn run(&self, assignment: &str) -> Result<crate::RunResult> {
@@ -649,6 +657,12 @@ pub enum OrchestrationEvent {
     MessageDelivered {
         group_id: String,
         message: MailboxMessage,
+        /// True when an active `hub wait` claimed the message at delivery
+        /// time: the waiter returns the body as its own tool result, so the
+        /// application skips steering it into the parent session to avoid
+        /// duplicating it in the model context.
+        #[serde(default)]
+        waiter_claimed: bool,
     },
 }
 
@@ -670,6 +684,18 @@ pub enum DeliveryOutcome {
     Woken,
     Revived,
     Failed,
+}
+
+/// What `deliver_committed` actually did with a committed mailbox message, so
+/// `send` can report a truthful receipt instead of a fake `Woken`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommittedDelivery {
+    /// Handed to an active steering bridge; the run processes it.
+    Delivered,
+    /// Claimed by an active `hub wait`, which drains the mailbox itself.
+    WaiterClaimed,
+    /// No active bridge and no waiter; the message stays in the mailbox.
+    Retained,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -986,27 +1012,55 @@ struct GlobalRegistry {
 
 /// A registered `hub wait` interest tied to an agent's mailbox lifetime.
 ///
-/// While at least one `MessageWaiter` is registered for an `AgentEntry`,
-/// `deliver_committed` skips active steering for matching messages so the
-/// waiting task can durably drain them via `wait_message` instead of racing
-/// the active delivery bridge. `from == None` is a wildcard claim. The guard
-/// is RAII: dropping it removes the registration on every return path
-/// (return/cancel/timeout/drop), so a stale claim can never strand a message.
+/// While at least one `MessageWaiter` is registered for an `AgentEntry`, a
+/// matching send is atomically handed to the waiter: the message leaves the
+/// mailbox and arrives on `delivery`, so the claim is the actual consumption
+/// — a stale pre-check can never strand a message under a claim that never
+/// drains it. `from == None` is a wildcard claim. The guard is RAII: dropping
+/// it removes the registration on every return path (return/cancel/timeout/
+/// drop) and restores any handed-off message that this wait ended without
+/// returning, so the message is never lost.
 struct MessageWaiter {
     token: u64,
     from: Option<String>,
+    delivery: tokio::sync::mpsc::UnboundedSender<MailboxMessage>,
 }
 
 struct MessageWaiterGuard {
     entry: Arc<AgentEntry>,
     token: u64,
+    delivery_rx: tokio::sync::mpsc::UnboundedReceiver<MailboxMessage>,
+    /// Called when this wait ends without returning an atomically handed-off
+    /// message (timeout/abort/drop): the message is back in the mailbox, and
+    /// Main-target deliveries are republished (flag false) so the application
+    /// still steers them into the main session instead of leaving the reply
+    /// stranded under the earlier claimed-flag.
+    republish: Option<Arc<dyn Fn(MailboxMessage) + Send + Sync>>,
 }
 
 impl Drop for MessageWaiterGuard {
     fn drop(&mut self) {
-        let mut waiters = self.entry.waiters.lock();
-        if let Some(index) = waiters.iter().position(|waiter| waiter.token == self.token) {
-            waiters.remove(index);
+        {
+            let mut waiters = self.entry.waiters.lock();
+            if let Some(index) = waiters.iter().position(|waiter| waiter.token == self.token) {
+                waiters.remove(index);
+            }
+        }
+        // A message handed off by the atomic one-shot claim but never returned
+        // by this wait goes back to the mailbox (it was durably committed
+        // before the handoff, so it must not be lost). The restore is forced:
+        // it reverses the handoff removal, so the bound never rejects it, and
+        // duplicates of the same id are replaced, never doubled.
+        if let Ok(message) = self.delivery_rx.try_recv() {
+            {
+                let mut mailbox = self.entry.mailbox.lock();
+                mailbox.retain(|queued| queued.id != message.id);
+                mailbox.push_front(message.clone());
+            }
+            self.entry.message_ready.notify_waiters();
+            if let Some(republish) = &self.republish {
+                republish(message);
+            }
         }
     }
 }
@@ -1642,9 +1696,12 @@ soft_budget: None,
  agents
  }
 
-    /// Attempt to revive a parked durable child. The caller holds
-    /// `durable_mutation`, making the Parked→Queued claim and persistence one
-    /// serialized transaction against sends and rebind commit.
+    /// Attempt to revive a parked or idle durable child. The caller holds
+    /// `durable_mutation`, making the {Parked,Idle}→Queued claim and
+    /// persistence one serialized transaction against sends and rebind
+    /// commit. Idle children are revived immediately on a committed message
+    /// (the idle→park TTL is no longer a forced delivery boundary); Main is
+    /// never claimed because its registry entry carries no `durable_info`.
     fn maybe_revive(&self, target: &str) -> Result<Option<DeliveryOutcome>> {
         if !self.inner.durable_bound.load(Ordering::Acquire) {
             return Ok(None);
@@ -1663,9 +1720,10 @@ soft_budget: None,
             None => return Ok(None),
         };
         let snapshot = entry.snapshot.lock().clone();
-        if snapshot.status != AgentStatus::Parked {
+        if !matches!(snapshot.status, AgentStatus::Parked | AgentStatus::Idle) {
             return Ok(None);
         }
+        let previous_status = snapshot.status;
         let info = match entry.durable_info.lock().clone() {
             Some(info) => info,
             None => return Ok(None),
@@ -1750,11 +1808,14 @@ soft_budget: None,
         if !REGISTRY.compare_status(
             &self.inner.group_id,
             target,
-            AgentStatus::Parked,
+            previous_status,
             AgentStatus::Queued,
         )? {
             return Ok(None);
         }
+        // The claim owns the lifecycle now: disarm the idle→park timer so it
+        // cannot race the revival start.
+        self.cancel_park_timer(target);
 
         let job_id = Uuid::now_v7().to_string();
         let cancel = CancellationToken::new();
@@ -1780,7 +1841,7 @@ soft_budget: None,
                 &self.inner.group_id,
                 target,
                 AgentStatus::Queued,
-                AgentStatus::Parked,
+                previous_status,
             );
             return Err(error);
         }
@@ -1792,7 +1853,7 @@ soft_budget: None,
                 &self.inner.group_id,
                 target,
                 AgentStatus::Queued,
-                AgentStatus::Parked,
+                previous_status,
             );
             if let Err(restore_error) = self.persist_state() {
                 return Err(anyhow!(
@@ -2159,6 +2220,20 @@ soft_budget: None,
             let _durable_mutation = self.inner.durable_mutation.lock();
             REGISTRY.unregister_active_delivery(&self.inner.group_id, &agent_id);
         }
+        // A message steered in the final-turn window may still sit in the
+        // session's steering queue (the bridge acknowledged it at steer time,
+        // before the run settled). Return it to the mailbox so the next run
+        // or revival delivers it exactly once. A failed persist of the
+        // restore must surface on the run result, never be swallowed.
+        let mut restore_errors = Vec::new();
+        for message in child.drain_unprocessed_orchestration_steering().await {
+            if let Err(error) = self.restore_unprocessed_delivery(&agent_id, message.clone()) {
+                restore_errors.push(format!(
+                    "restoring unprocessed delivery {}: {error:#}",
+                    message.id
+                ));
+            }
+        }
         drop(local_permit);
 
         let status = if cancel.is_cancelled() {
@@ -2202,6 +2277,12 @@ soft_budget: None,
             }),
             None => error,
         };
+        for restore_error in restore_errors {
+            final_error = Some(match final_error {
+                Some(error) => format!("{error}; {restore_error}"),
+                None => restore_error,
+            });
+        }
         if let (Some(root), Some(source)) = (
             persona_root.as_deref(),
             canonical_session_path.as_deref(),
@@ -2506,10 +2587,11 @@ soft_budget: None,
         });
     }
 
-    fn publish_message_delivered(&self, message: MailboxMessage) {
+    fn publish_message_delivered(&self, message: MailboxMessage, waiter_claimed: bool) {
         let _ = self.inner.events.send(OrchestrationEvent::MessageDelivered {
             group_id: self.inner.group_id.clone(),
             message,
+            waiter_claimed,
         });
     }
 
@@ -2656,8 +2738,34 @@ soft_budget: None,
                         });
                     }
                     Ok(()) => {
+                        let mut outcome = outcome;
+                        let mut waiter_claimed = false;
                         if matches!(outcome, DeliveryOutcome::Woken) {
-                            REGISTRY.deliver_committed(&group_id, &target, &message.id);
+                            match REGISTRY.deliver_committed(&group_id, &target, &message.id) {
+                                CommittedDelivery::Delivered => {}
+                                CommittedDelivery::WaiterClaimed => waiter_claimed = true,
+                                // No active bridge (e.g. the run settled
+                                // between enqueue and this call): the message
+                                // stays in the mailbox for the next run or
+                                // revival. Report the truthful Queued outcome
+                                // instead of a fake Woken.
+                                CommittedDelivery::Retained => {
+                                    outcome = DeliveryOutcome::Queued;
+                                }
+                            }
+                        } else if REGISTRY.hand_to_waiter(&group_id, &target, &message) {
+                            // An active `hub wait` atomically claimed the
+                            // message: it left the mailbox and the waiter
+                            // returns it as its own result, so no revival is
+                            // needed and the application must not steer a
+                            // duplicate. The removal is NOT persisted here:
+                            // consumption is durably recorded only when
+                            // `wait_message` actually returns the message, so
+                            // an aborted/timed-out waiter's restore keeps the
+                            // durable mailbox consistent with memory (the
+                            // committed message survives a restart).
+                            waiter_claimed = true;
+                            outcome = DeliveryOutcome::Woken;
                         }
                         match if matches!(outcome, DeliveryOutcome::Queued) {
                             self.maybe_revive(&target)
@@ -2672,7 +2780,7 @@ soft_budget: None,
                                 // or not the recipient has consumed it yet.
                                 self.record_delivered_message(message.clone());
                                 if target == main_id {
-                                    self.publish_message_delivered(message);
+                                    self.publish_message_delivered(message, waiter_claimed);
                                 }
                                 receipts.push(DeliveryReceipt {
                                     to: target,
@@ -2740,6 +2848,41 @@ soft_budget: None,
         }
     }
 
+    /// Return a steered-but-unprocessed mailbox message to the recipient's
+    /// mailbox, reversing the bridge's acknowledgement. Called when a run
+    /// settles while the agent loop still holds the message in its steering
+    /// queue (final-turn race), so the next run/revival delivers it exactly
+    /// once instead of losing it with the dropped session. The in-memory
+    /// restore always stands; a persistence failure is returned so the caller
+    /// can surface it (the message was durably committed before the bridge
+    /// acknowledged it, so a crash must not lose it silently).
+    fn restore_unprocessed_delivery(&self, agent_id: &str, message: MailboxMessage) -> Result<()> {
+        let _durable_mutation = self.inner.durable_mutation.lock();
+        if self.inner.rebind_reserved.load(Ordering::Acquire) {
+            bail!("durable orchestration rebind is in progress; restored delivery persisted by the rebind");
+        }
+        // Forced restore (dedup + front, never cap-rejected): the message was
+        // durably committed and acknowledged away, and the in-flight capacity
+        // it occupied is being returned.
+        REGISTRY.restore_mailbox_message(&self.inner.group_id, agent_id, message);
+        self.persist_state()
+            .context("persisting restored unprocessed delivery")
+    }
+
+    /// Restore a waited/handed-off message whose consumption could not be
+    /// persisted, using the forced id-dedup restore (the message was durably
+    /// committed before the handoff). Main-target messages are republished
+    /// with `waiter_claimed: false`: the original delivery event was
+    /// claimed-flagged, so the application skipped steering, and without a
+    /// fresh non-claimed event the restored reply would never reach the main
+    /// session's model context.
+    fn restore_waited_message(&self, agent_id: &str, message: MailboxMessage) {
+        REGISTRY.restore_mailbox_message(&self.inner.group_id, agent_id, message.clone());
+        if message.to == self.main_agent_id() {
+            self.publish_message_delivered(message, false);
+        }
+    }
+
     #[must_use]
     pub fn inbox(&self, agent_id: &str, peek: bool) -> Vec<MailboxMessage> {
         self.inbox_result(agent_id, peek).unwrap_or_default()
@@ -2766,16 +2909,37 @@ soft_budget: None,
             .get(&self.inner.group_id, agent_id)
             .ok_or_else(|| anyhow!("unknown orchestration agent {agent_id:?}"))?;
         // Register an explicit waiter before the loop checks the mailbox so a
-        // concurrent `deliver_committed` defers matching (and wildcard) sends
+        // concurrent send atomically hands matching (and wildcard) deliveries
         // to this waiter instead of the active steering bridge. The guard is
         // RAII: it unregisters on every return path — return, timeout, abort,
-        // shutdown, or task drop — so no stale claim can strand a message.
-        let _waiter_guard = REGISTRY
-            .register_message_waiter(&self.inner.group_id, agent_id, from.map(str::to_owned))
+        // shutdown, or task drop — and restores any handed-off message this
+        // wait did not return, so no stale claim can strand a message.
+        let republish: Option<Arc<dyn Fn(MailboxMessage) + Send + Sync>> = Some(Arc::new({
+            let runtime = self.clone();
+            move |message: MailboxMessage| {
+                // The wait ended (timeout/abort/drop) after an atomic handoff
+                // restored the message to the mailbox. Re-surface Main-target
+                // deliveries with a fresh non-claimed event so the application
+                // still steers them into the main session; presentation
+                // surfaces dedupe the duplicate render by message id.
+                if message.to == runtime.main_agent_id() {
+                    runtime.publish_message_delivered(message, false);
+                }
+            }
+        }));
+        let mut _waiter_guard = REGISTRY
+            .register_message_waiter(
+                &self.inner.group_id,
+                agent_id,
+                from.map(str::to_owned),
+                republish,
+            )
             .ok_or_else(|| anyhow!("unknown orchestration agent {agent_id:?}"))?;
         let wait = async {
             loop {
-                let notified = entry.message_ready.notified();
+                // Pre-existing matching mail (sent before this waiter
+                // registered, or restored by an earlier timed-out wait) is
+                // drained from the mailbox first.
                 let message = {
                     let _durable_mutation = self.inner.durable_mutation.lock();
                     if self.inner.rebind_reserved.load(Ordering::Acquire) {
@@ -2787,11 +2951,7 @@ soft_budget: None,
                                 .persist_state()
                                 .context("persisting waited orchestration message")
                             {
-                                REGISTRY.restore_mailbox(
-                                    &self.inner.group_id,
-                                    agent_id,
-                                    vec![message],
-                                );
+                                self.restore_waited_message(agent_id, message);
                                 return Err(error);
                             }
                             Some(message)
@@ -2802,7 +2962,30 @@ soft_budget: None,
                 if message.is_some() {
                     return Ok(message);
                 }
-                notified.await;
+                // Otherwise wait for an atomic handoff (the sender removed the
+                // message from the mailbox and delivered it to this waiter's
+                // channel) or a mailbox wake that warrants re-checking.
+                tokio::select! {
+                    message = _waiter_guard.delivery_rx.recv() => {
+                        match message {
+                            Some(message) => {
+                                if let Err(error) = self
+                                    .persist_state()
+                                    .context("persisting handed-off orchestration message")
+                                {
+                                    self.restore_waited_message(agent_id, message);
+                                    return Err(error);
+                                }
+                                return Ok(Some(message));
+                            }
+                            None => {
+                                let notified = entry.message_ready.notified();
+                                notified.await;
+                            }
+                        }
+                    }
+                    notified = entry.message_ready.notified() => {}
+                }
             }
         };
         match (timeout, abort) {
@@ -3761,6 +3944,20 @@ soft_budget: None,
             let _durable_mutation = self.inner.durable_mutation.lock();
             REGISTRY.unregister_active_delivery(&self.inner.group_id, &item.id);
         }
+        // A message steered in the final-turn window may still sit in the
+        // session's steering queue (the bridge acknowledged it at steer time,
+        // before the run settled). Return it to the mailbox so the next run
+        // or revival delivers it exactly once. A failed persist of the
+        // restore must surface on the run result, never be swallowed.
+        let mut restore_errors = Vec::new();
+        for message in child.drain_unprocessed_orchestration_steering().await {
+            if let Err(error) = self.restore_unprocessed_delivery(&item.id, message.clone()) {
+                restore_errors.push(format!(
+                    "restoring unprocessed delivery {}: {error:#}",
+                    message.id
+                ));
+            }
+        }
         drop(global_permit);
         drop(local_permit);
         let status = if cancel.is_cancelled() {
@@ -3804,6 +4001,12 @@ soft_budget: None,
             }),
             None => error,
         };
+        for restore_error in restore_errors {
+            final_error = Some(match final_error {
+                Some(error) => format!("{error}; {restore_error}"),
+                None => restore_error,
+            });
+        }
         if let (Some(root), Some(source)) = (persona_root.as_deref(), canonical_session_path.as_deref())
             && let Err(archive_error) = archive_persona_session(root, &item.id, source, false)
         {
@@ -5106,21 +5309,13 @@ impl GlobalRegistry {
                     mailbox.push_back(message);
                     DeliveryOutcome::Woken
                 }
-                AgentStatus::Queued | AgentStatus::Parked => {
+                AgentStatus::Queued | AgentStatus::Parked | AgentStatus::Idle => {
                     let mut mailbox = entry.mailbox.lock();
                     if mailbox.len() >= entry.mailbox_capacity {
                         bail!("orchestration mailbox for {target:?} is full");
                     }
                     mailbox.push_back(message);
                     DeliveryOutcome::Queued
-                }
-                AgentStatus::Idle => {
-                    let mut mailbox = entry.mailbox.lock();
-                    if mailbox.len() >= entry.mailbox_capacity {
-                        bail!("orchestration mailbox for {target:?} is full");
-                    }
-                    mailbox.push_back(message);
-                    DeliveryOutcome::Woken
                 }
                 AgentStatus::Aborted => DeliveryOutcome::Failed,
             }
@@ -5134,9 +5329,63 @@ impl GlobalRegistry {
         Ok(outcome)
     }
 
-    fn deliver_committed(&self, group: &str, target: &str, message_id: &str) -> bool {
+    /// Atomically claim a committed mailbox message for the first matching
+    /// active `hub wait`: the message leaves the mailbox and is handed to the
+    /// waiter's delivery channel, so the claim is the actual consumption — a
+    /// pre-check could never guarantee the waiter drains it. The waiter is
+    /// one-shot: it is removed from the registry in the same critical section
+    /// as the handoff, so a burst of sends hands exactly one message to the
+    /// waiter and later sends stay in the bounded mailbox. Returns true only
+    /// when a waiter actually received the message.
+    fn hand_to_waiter(&self, group: &str, target: &str, message: &MailboxMessage) -> bool {
         let Some(entry) = self.get(group, target) else {
             return false;
+        };
+        self.hand_to_waiter_entry(&entry, message)
+    }
+
+    fn hand_to_waiter_entry(&self, entry: &AgentEntry, message: &MailboxMessage) -> bool {
+        // Lock order: waiters → mailbox (matches the waiter-guard Drop).
+        let mut waiters = entry.waiters.lock();
+        let Some(index) = waiters
+            .iter()
+            .position(|waiter| waiter.from.is_none() || waiter.from.as_deref() == Some(&message.from))
+        else {
+            return false;
+        };
+        let mut mailbox = entry.mailbox.lock();
+        let Some(mail_index) = mailbox.iter().position(|queued| queued.id == message.id) else {
+            return false;
+        };
+        let message = mailbox.remove(mail_index).expect("position checked");
+        drop(mailbox);
+        // One-shot claim: remove the waiter so a send burst cannot flood its
+        // unbounded channel (later sends remain mailbox-bounded) and no
+        // second handoff can race the guard's restore.
+        let waiter = waiters.remove(index);
+        drop(waiters);
+        if waiter.delivery.send(message.clone()).is_err() {
+            // The waiter's task ended between the lookup and the send: put the
+            // message back so it is never lost.
+            let mut mailbox = entry.mailbox.lock();
+            mailbox.retain(|queued| queued.id != message.id);
+            mailbox.push_front(message);
+            entry.message_ready.notify_waiters();
+            return false;
+        }
+        true
+    }
+
+    /// Deliver a committed mailbox message to an active recipient, reporting
+    /// exactly what happened so `send` can return a truthful receipt.
+    fn deliver_committed(
+        &self,
+        group: &str,
+        target: &str,
+        message_id: &str,
+    ) -> CommittedDelivery {
+        let Some(entry) = self.get(group, target) else {
+            return CommittedDelivery::Retained;
         };
         let message = entry
             .mailbox
@@ -5145,25 +5394,21 @@ impl GlobalRegistry {
             .find(|message| message.id == message_id)
             .cloned();
         let Some(message) = message else {
-            return false;
+            return CommittedDelivery::Retained;
         };
-        // An explicit `hub wait` registered for this message takes precedence
-        // over the active steering bridge: skip delivery so `wait_message` can
-        // drain the mailbox item itself. A wildcard waiter (`from == None`)
-        // claims every message; otherwise the sender must match exactly.
-        let claimed = entry
-            .waiters
-            .lock()
-            .iter()
-            .any(|waiter| waiter.from.is_none() || waiter.from.as_deref() == Some(&message.from));
-        if claimed {
-            return false;
+        // An explicit `hub wait` takes precedence over the active steering
+        // bridge: atomically hand the message to the waiter (removing it from
+        // the mailbox) so `wait_message` returns it as its own result.
+        if self.hand_to_waiter_entry(&entry, &message) {
+            return CommittedDelivery::WaiterClaimed;
         }
-        entry
-            .active_delivery
-            .lock()
-            .as_ref()
-            .is_some_and(|sender| sender.send(message).is_ok())
+        match entry.active_delivery.lock().as_ref() {
+            Some(sender) if sender.send(message).is_ok() => CommittedDelivery::Delivered,
+            // No active bridge (e.g. the run settled between the enqueue and
+            // this call): the message stays in the mailbox and the next
+            // run/revival delivers it.
+            _ => CommittedDelivery::Retained,
+        }
     }
 
     fn register_active_delivery(
@@ -5199,16 +5444,32 @@ impl GlobalRegistry {
     /// message after its `wait_message` returns, times out, is cancelled, or
     /// the owning task is dropped. `from == None` registers a wildcard claim
     /// (matches every sender); otherwise only that exact sender is claimed.
+    /// Matching sends are atomically handed to the waiter's delivery channel
+    /// (removed from the mailbox). `republish` fires only when this wait ends
+    /// without returning an already-handed-off message (the message is
+    /// restored to the mailbox), letting the caller re-surface Main-target
+    /// deliveries so the application still steers them into the main session.
     fn register_message_waiter(
         &self,
         group: &str,
         id: &str,
         from: Option<String>,
+        republish: Option<Arc<dyn Fn(MailboxMessage) + Send + Sync>>,
     ) -> Option<MessageWaiterGuard> {
         let entry = self.get(group, id)?;
         let token = entry.waiter_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        entry.waiters.lock().push(MessageWaiter { token, from });
-        Some(MessageWaiterGuard { entry, token })
+        let (delivery, delivery_rx) = tokio::sync::mpsc::unbounded_channel();
+        entry.waiters.lock().push(MessageWaiter {
+            token,
+            from,
+            delivery,
+        });
+        Some(MessageWaiterGuard {
+            entry,
+            token,
+            delivery_rx,
+            republish,
+        })
     }
 
     fn park_if_idle(&self, group: &str, id: &str, main_id: &str) -> Option<AgentSnapshot> {
@@ -5258,6 +5519,24 @@ impl GlobalRegistry {
         let mut mailbox = entry.mailbox.lock();
         let index = mailbox.iter().position(|message| message.id == message_id)?;
         mailbox.remove(index)
+    }
+
+    /// Re-insert a previously committed mailbox message. The restore reverses
+    /// an earlier removal (bridge ack or waiter handoff), so it is never
+    /// rejected by the mailbox bound — the slot the in-flight message occupied
+    /// is being returned, even if other sends refilled it meanwhile. A
+    /// duplicate of the same message id is replaced (never doubled), and the
+    /// restored message returns to the front of the queue so the next
+    /// run/revival/waiter sees it first.
+    fn restore_mailbox_message(&self, group: &str, id: &str, message: MailboxMessage) -> bool {
+        let Some(entry) = self.get(group, id) else {
+            return false;
+        };
+        let mut mailbox = entry.mailbox.lock();
+        mailbox.retain(|queued| queued.id != message.id);
+        mailbox.push_front(message);
+        entry.message_ready.notify_waiters();
+        true
     }
 
     fn set_status(&self, group: &str, id: &str, status: AgentStatus) -> Result<()> {
@@ -5406,6 +5685,49 @@ fn format_orchestration_message(message: &MailboxMessage) -> String {
         message.body,
         reply,
     )
+}
+
+/// Build the typed custom message used to deliver a mailbox message into a
+/// session's steering queue (children via the active-delivery bridge, Main
+/// via the application event loop). The typed `details` carry the full
+/// mailbox record so the body can be reconstructed if the run settles before
+/// processing it.
+pub(crate) fn mailbox_message_as_custom(message: &MailboxMessage) -> pi_ai::Message {
+    pi_ai::Message::Custom(pi_ai::CustomMessage {
+        custom_type: ORCHESTRATION_MESSAGE_TYPE.to_owned(),
+        content: format_orchestration_message(message).into(),
+        display: true,
+        details: Some(serde_json::json!({
+            "id": message.id,
+            "from": message.from,
+            "to": message.to,
+            "body": message.body,
+            "replyTo": message.reply_to,
+            "timestamp": message.timestamp,
+        })),
+        timestamp: i64::try_from(message.timestamp).unwrap_or(i64::MAX),
+    })
+}
+
+/// Reverse of [`mailbox_message_as_custom`]: reconstruct the mailbox record
+/// from a steered custom message (used when a run settles before processing
+/// it, so the message returns to the mailbox instead of being lost).
+fn mailbox_message_from_custom(custom: &pi_ai::CustomMessage) -> Option<MailboxMessage> {
+    let details = custom.details.as_ref()?;
+    Some(MailboxMessage {
+        id: details.get("id")?.as_str()?.to_owned(),
+        from: details.get("from")?.as_str()?.to_owned(),
+        to: details.get("to")?.as_str()?.to_owned(),
+        body: details.get("body")?.as_str()?.to_owned(),
+        timestamp: details
+            .get("timestamp")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_else(now_millis),
+        reply_to: details
+            .get("replyTo")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+    })
 }
 
 
@@ -7659,6 +7981,219 @@ mod prompt_size_tests {
         assert_eq!(runtime.inbox("WorkerB", true).len(), 0);
         assert_eq!(runtime.delivered_messages().len(), 3, "consumption must not erase the log");
         assert!(runtime.delivered_messages().iter().any(|message| message.body == "results ready"));
+    }
+
+    #[test]
+    fn mailbox_restore_is_forced_and_dedupes_across_full_mailbox() {
+        // A run-end restore reverses an earlier removal (bridge ack or waiter
+        // handoff): it must never be rejected by the mailbox bound — the
+        // in-flight capacity the message occupied is being returned — and a
+        // duplicate of the same id is replaced, never doubled.
+        let root = tempfile::tempdir().expect("root");
+        let runtime = prompt_runtime(root.path());
+        register_peer(&runtime, "Cap", "task", Some("Main"), AgentStatus::Idle);
+        let capacity = runtime.inner.config.mailbox_capacity;
+        for index in 0..capacity {
+            runtime.send("Main", "Cap", &format!("fill-{index}"), None);
+        }
+        assert_eq!(runtime.inbox("Cap", true).len(), capacity, "mailbox at capacity");
+        assert_eq!(
+            runtime.send("Main", "Cap", "overflow", None)[0].outcome,
+            DeliveryOutcome::Failed,
+            "ordinary sends still respect the bound"
+        );
+        let restored = MailboxMessage {
+            id: "restored-1".to_owned(),
+            from: "Main".to_owned(),
+            to: "Cap".to_owned(),
+            body: "in flight".to_owned(),
+            timestamp: now_millis(),
+            reply_to: None,
+        };
+        assert!(
+            REGISTRY.restore_mailbox_message(&runtime.inner.group_id, "Cap", restored.clone()),
+            "restore must succeed even at capacity"
+        );
+        let inbox = runtime.inbox("Cap", true);
+        assert_eq!(inbox.len(), capacity + 1, "restore returns the in-flight slot");
+        assert_eq!(inbox[0].id, "restored-1", "restored message returns to the front");
+        // Restoring the same committed message again replaces it, never doubles.
+        assert!(
+            REGISTRY.restore_mailbox_message(&runtime.inner.group_id, "Cap", restored.clone())
+        );
+        let inbox = runtime.inbox("Cap", true);
+        assert_eq!(inbox.len(), capacity + 1, "id-dedup restore");
+        assert_eq!(
+            inbox.iter().filter(|message| message.id == "restored-1").count(),
+            1,
+            "exactly one copy of the restored message"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_persistence_failure_surfaces_while_memory_restore_stands() {
+        // A run-end restore of a durably committed message must never swallow
+        // a persistence failure: the error surfaces (the run records it) while
+        // the in-memory restore keeps the message deliverable.
+        let root = tempfile::tempdir().expect("root");
+        let parent_dir = tempfile::tempdir().expect("parent sessions");
+        let recorder = crate::session_store::start_session_in(
+            root.path(),
+            Some(&pi_ai::Model::default()),
+            None,
+            Some(parent_dir.path()),
+            None,
+            None,
+        )
+        .expect("recorder");
+        let parent = Session::new(crate::SessionOptions {
+            model: pi_ai::Model::default(),
+            cwd: root.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("parent");
+        parent.record(recorder).expect("record");
+        let runtime = prompt_runtime(root.path());
+        runtime.bind_and_recover(&parent).expect("bind durable");
+        assert!(runtime.is_durable(), "runtime must be durable-bound");
+        // Main is pre-registered and excluded from the durable state, so the
+        // enqueue persists cleanly.
+        runtime.send("Worker", "Main", "committed", None);
+        assert_eq!(runtime.inbox("Main", true).len(), 1);
+        // Simulate the bridge acknowledgement (durable removal), then break
+        // the sidecar so the restore persist must fail.
+        let message = runtime.inbox("Main", false).remove(0);
+        let sidecar = runtime
+            .inner
+            .durable
+            .lock()
+            .as_ref()
+            .expect("durable binding")
+            .sidecar_path()
+            .to_path_buf();
+        std::fs::remove_file(&sidecar).expect("remove sidecar");
+        std::fs::create_dir(&sidecar).expect("sidecar path becomes directory");
+        let error = runtime
+            .restore_unprocessed_delivery("Main", message.clone())
+            .expect_err("persistence failure must surface, never be swallowed");
+        assert!(
+            error.to_string().to_lowercase().contains("persist")
+                || error.to_string().to_lowercase().contains("restor"),
+            "{error:#}"
+        );
+        let inbox = runtime.inbox("Main", true);
+        assert_eq!(inbox.len(), 1, "the in-memory restore must stand");
+        assert_eq!(inbox[0].id, message.id);
+    }
+
+    #[tokio::test]
+    async fn handed_off_wait_persist_failure_restores_and_republishes() {
+        // When the waiter's consumption persist fails after an atomic
+        // handoff, the message is force-restored to the mailbox (exactly one
+        // copy) and Main-target deliveries are republished non-claimed so the
+        // application still steers them (the original claimed event skipped
+        // steering, so without the republish the reply would be stranded).
+        let root = tempfile::tempdir().expect("root");
+        let parent_dir = tempfile::tempdir().expect("parent sessions");
+        let recorder = crate::session_store::start_session_in(
+            root.path(),
+            Some(&pi_ai::Model::default()),
+            None,
+            Some(parent_dir.path()),
+            None,
+            None,
+        )
+        .expect("recorder");
+        let parent = Session::new(crate::SessionOptions {
+            model: pi_ai::Model::default(),
+            cwd: root.path().to_path_buf(),
+            system_prompt: String::new(),
+            thinking_level: ThinkingLevel::Off,
+            api_key: String::new(),
+            compaction: None,
+            stream_options: Default::default(),
+            tools: Some(Vec::new()),
+            before_tool_call: None,
+            after_tool_call: None,
+            stream_fn: None,
+            auth_resolver: None,
+        })
+        .expect("parent");
+        parent.record(recorder).expect("record");
+        let runtime = prompt_runtime(root.path());
+        runtime.bind_and_recover(&parent).expect("bind durable");
+        let mut events = runtime.subscribe();
+        let waiter_runtime = runtime.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_runtime
+                .wait_message("Main", Some("Worker"), Some(Duration::from_secs(30)), None)
+                .await
+        });
+        tokio::task::yield_now().await;
+        // The enqueue persists while the sidecar is intact; the atomic
+        // handoff happens synchronously inside send.
+        let receipt = runtime.send("Worker", "Main", "handoff-persist-fail", None);
+        assert_eq!(receipt[0].outcome, DeliveryOutcome::Woken);
+        // Break the sidecar so the waiter's consumption persist must fail.
+        let sidecar = runtime
+            .inner
+            .durable
+            .lock()
+            .as_ref()
+            .expect("durable binding")
+            .sidecar_path()
+            .to_path_buf();
+        std::fs::remove_file(&sidecar).expect("remove sidecar");
+        std::fs::create_dir(&sidecar).expect("sidecar path becomes directory");
+        let wait_result = waiter.await.expect("waiter join");
+        assert!(
+            wait_result.is_err(),
+            "consumption persist failure must surface: {wait_result:?}"
+        );
+        assert_eq!(
+            runtime.inbox("Main", true).len(),
+            1,
+            "exactly one restored copy of the handed-off message"
+        );
+        // The original claimed event AND the republished non-claimed event
+        // both arrive (the latter drives the application steer).
+        let mut saw_claimed = false;
+        let mut saw_republished = false;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match events.recv().await {
+                    Ok(OrchestrationEvent::MessageDelivered {
+                        message,
+                        waiter_claimed,
+                        ..
+                    }) if message.body == "handoff-persist-fail" => {
+                        if waiter_claimed {
+                            saw_claimed = true;
+                        } else {
+                            saw_republished = true;
+                        }
+                        if saw_claimed && saw_republished {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("claimed and republished events");
+        assert!(saw_claimed, "original claimed event must publish");
+        assert!(saw_republished, "republished non-claimed event must publish");
     }
 
     #[test]
