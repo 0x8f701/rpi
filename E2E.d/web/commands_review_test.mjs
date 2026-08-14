@@ -2130,8 +2130,9 @@ async function main() {
     );
     await page.screenshot({ path: `${evidence}/skill-first-token.png`, fullPage: true });
 
-    // /skill bare: a client-side usage error toast, the composer clears, and
-    // NO skill RPC ever goes out.
+    // /skill bare: a client-side usage error toast, NO skill RPC ever goes
+    // out, and the draft is PRESERVED (TUI parity: usage errors keep the
+    // composer so the user can correct the command).
     const skillRpcBefore = sentFrames.filter((p) => { try { return JSON.parse(p).type === 'skill'; } catch { return false; } }).length;
     await page.fill('#prompt-input', '/skill');
     await page.press('#prompt-input', 'Enter');
@@ -2144,11 +2145,11 @@ async function main() {
     await page.waitForTimeout(1200); // window long enough for a wrongly-dispatched skill RPC to appear
     const skillRpcAfter = sentFrames.filter((p) => { try { return JSON.parse(p).type === 'skill'; } catch { return false; } }).length;
     if (skillRpcAfter !== skillRpcBefore) {
-      fail(`/skill bare must not dispatch a skill RPC (frames before=${skillRpcBefore} after=${skillRpcAfter})`);
+      fail(`/skill bare must not dispatch a skill RPC (frames ${skillRpcBefore} -> ${skillRpcAfter})`);
     }
     const skillBareValue = await page.evaluate(() => document.getElementById('prompt-input')?.value || '');
-    if (skillBareValue !== '') {
-      fail(`/skill bare must clear the composer after the usage error (value=${JSON.stringify(skillBareValue)})`);
+    if (skillBareValue !== '/skill') {
+      fail(`/skill bare must preserve the draft after the usage error (value=${JSON.stringify(skillBareValue)})`);
     }
     await page.screenshot({ path: `${evidence}/skill-bare-error.png`, fullPage: true });
 
@@ -2323,8 +2324,8 @@ async function main() {
     const panelAfterArity = await page.evaluate(() => document.getElementById('code-review-panel') !== null);
     if (panelAfterArity) fail('/code-review a b c opened the panel — the arity guard must reject before any RPC');
     const arityValue = await page.evaluate(() => document.getElementById('prompt-input')?.value || '');
-    if (arityValue !== '') {
-      fail(`/code-review a b c must clear the composer after the usage error (value=${JSON.stringify(arityValue)})`);
+    if (arityValue !== '/code-review a b c') {
+      fail(`/code-review a b c must preserve the draft after the usage error (value=${JSON.stringify(arityValue)})`);
     }
     await page.screenshot({ path: `${evidence}/code-review-arity-error.png`, fullPage: true });
 

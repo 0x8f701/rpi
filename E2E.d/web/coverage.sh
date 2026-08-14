@@ -461,7 +461,8 @@ EOF
         --evidence "$EVIDENCE_ROOT/web-scroll/coverage-assertions.json" \
         --evidence "$EVIDENCE_ROOT/web-projects/coverage-assertions.json" \
         --evidence "$EVIDENCE_ROOT/web-external_sessions/coverage-assertions.json" \
-        --evidence "$EVIDENCE_ROOT/web-presentation/coverage-assertions.json"
+        --evidence "$EVIDENCE_ROOT/web-presentation/coverage-assertions.json" \
+        --evidence "$EVIDENCE_ROOT/web-loop_goal/coverage-assertions.json"
 
     # persist payloads next to the report for later inspection
     mkdir -p "$EVIDENCE_DIR/payloads"

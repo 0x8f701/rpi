@@ -11,7 +11,8 @@
  * (d) compose the draft text for a selection (trailing space iff the backend
  * marks `requiresArguments`), and (e) parse a submitted input line back into a
  * supported command + argument tail for Main's dispatch wiring. No second
- * command catalog is hardcoded — only the 3-name Web-execution surface.
+ * command catalog is hardcoded — only the 6-name Web-execution surface
+ * (compact/skill/code-review/loop/goal/ps).
  */
 
 /** One normalized command from the `get_commands` wire response. The backend
@@ -33,11 +34,14 @@ export interface CommandEntry {
 
 /** The only slash commands the Web composer can execute. The picker filters
  *  the backend catalog to this surface so every shown item is dispatchable
- *  (Main wires real dispatch for these three). Static literal → Record. */
+ *  (Main wires real dispatch for these six). Static literal → Record. */
 export const WEB_SUPPORTED_COMMANDS: Record<string, true> = {
   compact: true,
   skill: true,
   'code-review': true,
+  loop: true,
+  goal: true,
+  ps: true,
 };
 
 /** Coerce an `unknown` field to `string` — non-strings become `''` so a
@@ -89,7 +93,7 @@ export function normalizeCommands(data: unknown): CommandEntry[] {
 
 /** Filter a normalized catalog to the Web-executable surface, preserving
  *  backend order. The picker shows the WEB_SUPPORTED_COMMANDS builtins
- *  (compact/skill/code-review) PLUS loaded skill candidates
+ *  (compact/skill/code-review/loop/goal/ps) PLUS loaded skill candidates
  *  (`source === "skill"`) so `/skill` can drill into the real loaded skills.
  *  Prompt and extension dynamic commands stay executable on the backend but
  *  never enter the Web picker surface (their dispatch is not wired here). */
@@ -113,9 +117,10 @@ export function skillCandidates(commands: CommandEntry[]): CommandEntry[] {
   return commands.filter(isSkillCandidate);
 }
 
-/** The primary Web-executable builtins (compact/skill/code-review) from a
- *  normalized+filtered catalog, in backend order. The picker shows this list
- *  first; selecting the `/skill` parent switches to [`skillCandidates`]. */
+/** The primary Web-executable builtins (compact/skill/code-review/loop/goal/
+ *  ps) from a normalized+filtered catalog, in backend order. The picker shows
+ *  this list first; selecting the `/skill` parent switches to
+ *  [`skillCandidates`]. */
 export function primaryCommands(commands: CommandEntry[]): CommandEntry[] {
   return commands.filter((command) => !isSkillCandidate(command));
 }

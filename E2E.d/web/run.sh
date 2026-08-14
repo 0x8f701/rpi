@@ -78,6 +78,20 @@
 #                                         changed lines) + close, /skill
 #                                         <fixture> visible summary, /compact
 #                                         outgoing-WS dispatch
+#   loop_goal loop_goal.sh               composer picker lists /loop + /goal
+#                                         + /ps (get_commands authority),
+#                                         draft-no-auto-submit, Enter
+#                                         dispatches loop create/list/update/
+#                                         delete/cancel + goal create/show/
+#                                         pin/pins/pause/resume/complete/drop
+#                                         + bare /ps (empty process list)
+#                                         against the real listener (goal
+#                                         create/resume activate work, TUI
+#                                         parity), /loop create/update
+#                                         streaming guard, local usage errors
+#                                         with no RPC (/ps extra included),
+#                                         no user bubbles, sessionId-stamped
+#                                         frames
 #   slowclient slowclient.sh              slow-client contract: delta-burst
 #                                         calibration, heavy-transcript burst
 #                                         amplification bound, controlled
@@ -210,7 +224,7 @@ E2E_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)"
 export E2E_RUN_ID EVIDENCE_ROOT WORK_ROOT RPI_BIN
 
 # Every lane script in the suite (core.sh = the shared core lane).
-LANES="core goal xss abort scroll reconnect readygate switch mobile auth auth_tokenless extras sessions session_restore projects commands_review attachments slowclient external_sessions presentation realtime_webrtc readygate_spawn code_review_paging skill_completion realtime_rpc appborder personas stt_rpc"
+LANES="core goal xss abort scroll reconnect readygate switch mobile auth auth_tokenless extras sessions session_restore projects commands_review loop_goal attachments slowclient external_sessions presentation realtime_webrtc readygate_spawn code_review_paging skill_completion realtime_rpc appborder personas stt_rpc"
 
 list_lanes() {
     local lane

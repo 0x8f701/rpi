@@ -51,10 +51,15 @@ fn usage_session(usage: Usage) -> Session {
     .expect("session")
 }
 
+/// Fake provider session whose `block_call`-th model call blocks until the
+/// given token is cancelled, so a specific turn's completion (and its usage
+/// charge) can be held at a deterministic point. Every reply carries a fixed
+/// 3-token usage so completed turns always commit a usage update.
 fn controlled_usage_session(
     calls: Arc<AtomicUsize>,
     started: Arc<Notify>,
-    release_second: CancellationToken,
+    release: CancellationToken,
+    block_call: usize,
 ) -> Session {
     let suffix = uuid::Uuid::now_v7();
     let model = Model {
@@ -67,17 +72,23 @@ fn controlled_usage_session(
     let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
         let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
         let started = started.clone();
-        let release_second = release_second.clone();
+        let release = release.clone();
         Box::pin(async move {
             let stream = pi_ai::new_assistant_message_event_stream();
             let producer = stream.clone();
             tokio::spawn(async move {
                 started.notify_waiters();
-                if call == 2 {
-                    release_second.cancelled().await;
+                if call == block_call {
+                    release.cancelled().await;
                 }
                 let mut message = pi_ai::AssistantMessage::pending(&model);
                 message.content.push(ContentBlock::text("done"));
+                message.usage = Usage {
+                    input: 2,
+                    output: 1,
+                    total_tokens: 3,
+                    ..Usage::default()
+                };
                 message.stop_reason = StopReason::Stop;
                 producer.end(Some(message)).await;
             });
@@ -177,6 +188,7 @@ async fn goal_resume_starts_exactly_once_and_pause_cancels_queued_work() {
         calls.clone(),
         started.clone(),
         release_second.clone(),
+        2,
     ))
     .await;
     application.goal_create("resume exactly once", Some(100)).expect("create metadata");
@@ -207,6 +219,256 @@ async fn goal_resume_starts_exactly_once_and_pause_cancels_queued_work() {
     release_second.cancel();
     application.wait_for_idle().await;
     assert_eq!(calls.load(Ordering::SeqCst), 2, "queued paused work must not start a second provider call");
+}
+
+#[tokio::test]
+async fn goal_resume_survives_prior_turn_usage_charge_race() {
+    // Regression for the backend /goal resume race (Web loop_goal E2E): the
+    // activate-created work turn is still in flight when the user pauses and
+    // resumes. The resume commits `Resumed` (revision R, Active) and its
+    // continuation is queued behind the in-flight turn. When that prior turn
+    // finally completes it charges usage, advancing the revision to R+1
+    // WITHOUT touching the lifecycle. The queued continuation must still run
+    // exactly once (usage-only revision bumps must not cancel it), and the
+    // usage charge must land on the resumed active lifecycle — never on a
+    // stale paused/active snapshot. Before the fix the continuation was
+    // cancelled by the revision-mismatch stale check, so the second provider
+    // call never happened.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let release_first = CancellationToken::new();
+    let application = Application::new(controlled_usage_session(
+        calls.clone(),
+        started.clone(),
+        release_first.clone(),
+        1,
+    ))
+    .await;
+
+    assert_eq!(
+        application.activate_goal("race the resume", Some(100)).await.expect("activate"),
+        GoalActivationOutcome::Started
+    );
+    wait_for_calls(&calls, &started, 1).await;
+    application.goal_pause().expect("pause");
+
+    // The resume commits Active and queues exactly one continuation behind
+    // the in-flight prior turn. It must succeed — never fail with
+    // "goal is not active" — because the schedule is keyed to the revision
+    // the resume itself committed.
+    assert_eq!(
+        application.resume_goal_work().await.expect("resume must succeed"),
+        GoalActivationOutcome::Queued
+    );
+
+    // Prior turn completes and charges usage: revision advances, lifecycle
+    // stays active. The queued continuation must run exactly once.
+    release_first.cancel();
+    application.wait_for_idle().await;
+
+    let goal = application.goal_state().current.expect("goal");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "resume must schedule exactly one continuation"
+    );
+    assert_eq!(goal.lifecycle, GoalLifecycle::Active);
+    assert_eq!(goal.pause_reason, None);
+    assert_eq!(
+        goal.usage.tokens_used, 6,
+        "both turns' usage charged against the resumed active goal"
+    );
+}
+
+/// Regression (reviewer P2): a queued activation/resume continuation must not
+/// survive a pause followed by a MUTATION-ONLY resume (GoalPanel / RPC
+/// `activate:false`). Any lifecycle-revision-changing command invalidates the
+/// older activation — the mutation-only resume returning the goal to Active
+/// must not resurrect it. Deterministic: the busy prompt holds the turn gate,
+/// the resume queues behind it, and the pause + mutation-only resume land
+/// before the gate frees, so the queued continuation's wake check sees the
+/// newer lifecycle epoch and cancels itself.
+#[tokio::test]
+async fn pause_then_mutation_only_resume_does_not_resurrect_queued_activation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let release_prompt = CancellationToken::new();
+    let application = Application::new(controlled_usage_session(
+        calls.clone(),
+        started.clone(),
+        release_prompt.clone(),
+        1,
+    ))
+    .await;
+    application.goal_create("panel goal", Some(100)).expect("create metadata");
+    application.goal_pause().expect("pause");
+
+    // The busy prompt holds the turn gate so the resume queues behind it.
+    application
+        .prompt("busy turn".to_owned(), Vec::new(), None)
+        .await
+        .expect("busy prompt");
+    wait_for_calls(&calls, &started, 1).await;
+    assert_eq!(
+        application.resume_goal_work().await.expect("queued resume"),
+        GoalActivationOutcome::Queued
+    );
+    // Pause invalidates the queued reservation…
+    application.goal_pause().expect("pause invalidates queued work");
+    // …and the mutation-only resume (GoalPanel / RPC activate:false) returns
+    // the goal to Active WITHOUT scheduling; it must not resurrect the
+    // invalidated reservation.
+    application.goal_resume().expect("mutation-only resume");
+
+    release_prompt.cancel();
+    application.wait_for_idle().await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "mutation-only resume must not resurrect the paused queued activation"
+    );
+    let goal = application.goal_state().current.expect("goal");
+    assert_eq!(goal.lifecycle, GoalLifecycle::Active);
+}
+
+/// A newer resume supersedes an older queued continuation: the older
+/// run_goal_work cancels itself on wake and only the newest revision's
+/// continuation runs exactly one model call. Deterministic via the release
+/// token + turn-gate ordering, no sleeps.
+#[tokio::test]
+async fn newer_resume_supersedes_queued_continuation_and_only_newest_runs() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let release_first = CancellationToken::new();
+    let session = controlled_usage_session(
+        calls.clone(),
+        started.clone(),
+        release_first.clone(),
+        1,
+    );
+    let application = Application::new(session.clone()).await;
+
+    assert_eq!(
+        application.activate_goal("supersede me", Some(100)).await.expect("activate"),
+        GoalActivationOutcome::Started
+    );
+    wait_for_calls(&calls, &started, 1).await;
+    application.goal_pause().expect("pause");
+
+    // First resume queues a continuation behind the in-flight activate turn.
+    assert_eq!(
+        application.resume_goal_work().await.expect("first resume"),
+        GoalActivationOutcome::Queued
+    );
+    // Pause then resume again: the second continuation supersedes the first.
+    application.goal_pause().expect("pause again");
+    assert_eq!(
+        application.resume_goal_work().await.expect("newer resume"),
+        GoalActivationOutcome::Queued
+    );
+
+    release_first.cancel();
+    application.wait_for_idle().await;
+
+    let goal = application.goal_state().current.expect("goal");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "activate turn plus exactly one newest continuation must run"
+    );
+    assert_eq!(goal.lifecycle, GoalLifecycle::Active);
+    // The continuation that ran is keyed to the newest resume revision; the
+    // superseded first-resume continuation never delivered a message.
+    let continuations: Vec<u64> = session
+        .history()
+        .iter()
+        .filter_map(|message| match message {
+            Message::Custom(message) if message.custom_type == "pi.goal.continue" => {
+                message.details.as_ref()?.get("revision")?.as_u64()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        continuations.len(),
+        2,
+        "exactly the activate turn plus the newest continuation deliver messages: {continuations:?}"
+    );
+    assert_eq!(
+        *continuations.iter().min().expect("activate revision"),
+        1,
+        "activate message keys the create revision: {continuations:?}"
+    );
+    assert!(
+        *continuations.iter().max().expect("newest revision") > 1,
+        "the delivered continuation must be keyed to the newest resume revision, got {continuations:?}"
+    );
+}
+
+/// Inverse stale-start interleaving: the older continuation's wake check
+/// passes and its model call starts before a newer pause/resume lands. The
+/// in-flight call cannot be cancelled, but the newest continuation must still
+/// run exactly once afterwards. Deterministic via the release token +
+/// turn-gate ordering, no sleeps.
+#[tokio::test]
+async fn stale_continuation_already_started_then_superseded_still_runs_newest_once() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
+    let release_old = CancellationToken::new();
+    let session = controlled_usage_session(
+        calls.clone(),
+        started.clone(),
+        release_old.clone(),
+        2,
+    );
+    let application = Application::new(session.clone()).await;
+
+    assert_eq!(
+        application.activate_goal("stale start", Some(100)).await.expect("activate"),
+        GoalActivationOutcome::Started
+    );
+    application.wait_for_idle().await;
+    application.goal_pause().expect("pause");
+
+    // The resume starts immediately (gate free) and blocks at call 2: the
+    // older continuation is now stale-starting.
+    assert_eq!(
+        application.resume_goal_work().await.expect("resume"),
+        GoalActivationOutcome::Started
+    );
+    wait_for_calls(&calls, &started, 2).await;
+
+    // While the stale continuation is in flight, pause + newer resume.
+    application.goal_pause().expect("pause while stale turn runs");
+    assert_eq!(
+        application.resume_goal_work().await.expect("newer resume"),
+        GoalActivationOutcome::Queued
+    );
+
+    release_old.cancel();
+    application.wait_for_idle().await;
+
+    let goal = application.goal_state().current.expect("goal");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "the already-started stale continuation plus exactly one newest continuation must run"
+    );
+    assert_eq!(goal.lifecycle, GoalLifecycle::Active);
+    let continuations: Vec<u64> = session
+        .history()
+        .iter()
+        .filter_map(|message| match message {
+            Message::Custom(message) if message.custom_type == "pi.goal.continue" => {
+                message.details.as_ref()?.get("revision")?.as_u64()
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        *continuations.iter().max().expect("newest revision") >= 3,
+        "the newest continuation must be keyed to a resume revision, got {continuations:?}"
+    );
 }
 
 fn capturing_session(

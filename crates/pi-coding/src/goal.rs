@@ -114,6 +114,14 @@ pub struct GoalState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<Goal>,
     pub revision: u64,
+    /// Revision of the last event that changed the goal's lifecycle or
+    /// identity. Activation reservations capture this value, so any
+    /// lifecycle-revision-changing command — pause, complete, drop,
+    /// budget-exhaustion usage, fork clone, or a new goal — invalidates an
+    /// older activation at run time, while usage-only and pin updates
+    /// preserve it. Derived from the journal on replay; never set directly.
+    #[serde(default)]
+    pub lifecycle_revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +324,41 @@ impl GoalRuntime {
         objective: impl Into<String>,
         token_budget: Option<u64>,
     ) -> Result<Goal, GoalError> {
+        let mut state = self.state.lock();
+        self.create_locked(&mut state, objective, token_budget)
+    }
+
+    /// Creates the goal and runs `reserve` with the resulting [`GoalState`]
+    /// snapshot (goal plus committed revision) inside the same critical
+    /// section as the journal commit.
+    ///
+    /// Callers that schedule goal work against the created goal MUST reserve
+    /// through this method instead of committing and re-reading with a second
+    /// [`GoalRuntime::get`]: the reservation is linearized with every
+    /// lifecycle transition, so a concurrent pause/complete/drop or a newer
+    /// create/resume can only invalidate or supersede this reservation after
+    /// its own commit — the commit→reservation ordering can never invert.
+    ///
+    /// `reserve` runs with the goal state mutex held: it must be non-blocking
+    /// and MUST NOT call back into this runtime or start async work.
+    pub fn create_and_reserve<T>(
+        &self,
+        objective: impl Into<String>,
+        token_budget: Option<u64>,
+        reserve: impl FnOnce(&GoalState) -> T,
+    ) -> Result<(GoalState, T), GoalError> {
+        let mut state = self.state.lock();
+        self.create_locked(&mut state, objective, token_budget)?;
+        let reserved = reserve(&state);
+        Ok((state.clone(), reserved))
+    }
+
+    fn create_locked(
+        &self,
+        state: &mut GoalState,
+        objective: impl Into<String>,
+        token_budget: Option<u64>,
+    ) -> Result<Goal, GoalError> {
         let objective = objective.into();
         let objective = objective.trim();
         if objective.is_empty() {
@@ -330,7 +373,6 @@ impl GoalRuntime {
             return Err(GoalError::InvalidTokenBudget);
         }
 
-        let mut state = self.state.lock();
         if state.current.is_some() {
             return Err(GoalError::GoalAlreadyExists);
         }
@@ -347,7 +389,7 @@ impl GoalRuntime {
             updated_at: timestamp,
             usage: GoalUsage::default(),
         };
-        self.commit(&mut state, GoalEventKind::Created, goal)
+        self.commit(state, GoalEventKind::Created, goal)
     }
 
     /// Creates the goal owned by a forked session from a source snapshot.
@@ -442,7 +484,37 @@ impl GoalRuntime {
     /// resumed, and repeating an active transition is idempotent.
     pub fn resume(&self) -> Result<Goal, GoalError> {
         let mut state = self.state.lock();
-        let current = current_goal(&state)?;
+        self.resume_locked(&mut state)
+    }
+
+    /// Resumes a paused goal (or confirms an already-active one) and runs
+    /// `reserve` with the resulting [`GoalState`] snapshot (goal plus
+    /// committed revision) inside the same critical section as the journal
+    /// commit. The reservation runs whether or not a transition was committed
+    /// (an idempotent resume of an already-active goal still observes the
+    /// current snapshot, so callers can report their already-active outcome).
+    ///
+    /// Callers that schedule goal work against the resumed goal MUST reserve
+    /// through this method instead of committing and re-reading with a second
+    /// [`GoalRuntime::get`]: the reservation is linearized with every
+    /// lifecycle transition, so a concurrent pause/complete/drop or a newer
+    /// create/resume can only invalidate or supersede this reservation after
+    /// its own commit — the commit→reservation ordering can never invert.
+    ///
+    /// `reserve` runs with the goal state mutex held: it must be non-blocking
+    /// and MUST NOT call back into this runtime or start async work.
+    pub fn resume_and_reserve<T>(
+        &self,
+        reserve: impl FnOnce(&GoalState) -> T,
+    ) -> Result<(GoalState, T), GoalError> {
+        let mut state = self.state.lock();
+        self.resume_locked(&mut state)?;
+        let reserved = reserve(&state);
+        Ok((state.clone(), reserved))
+    }
+
+    fn resume_locked(&self, state: &mut GoalState) -> Result<Goal, GoalError> {
+        let current = current_goal(state)?;
         match current.lifecycle {
             GoalLifecycle::Active => Ok(current.clone()),
             GoalLifecycle::Paused
@@ -455,7 +527,7 @@ impl GoalRuntime {
                 goal.lifecycle = GoalLifecycle::Active;
                 goal.pause_reason = None;
                 goal.updated_at = self.next_timestamp(goal.updated_at);
-                self.commit(&mut state, GoalEventKind::Resumed, goal)
+                self.commit(state, GoalEventKind::Resumed, goal)
             }
             lifecycle => Err(GoalError::InvalidTransition {
                 operation: "resume",
@@ -665,11 +737,14 @@ impl GoalRuntime {
         let event = GoalEvent {
             revision,
             timestamp: goal.updated_at,
-            kind,
+            kind: kind.clone(),
             goal: goal.clone(),
         };
         (self.persist)(&event)?;
         state.revision = revision;
+        if event_changes_lifecycle_or_identity(&kind, state.current.as_ref(), &goal) {
+            state.lifecycle_revision = revision;
+        }
         state.current = Some(goal.clone());
         Ok(goal)
     }
@@ -758,6 +833,9 @@ fn replay_event(state: &mut GoalState, event: &GoalEvent) -> Result<(), GoalErro
     }
 
     state.revision = event.revision;
+    if event_changes_lifecycle_or_identity(&event.kind, state.current.as_ref(), &event.goal) {
+        state.lifecycle_revision = event.revision;
+    }
     state.current = Some(event.goal.clone());
     Ok(())
 }
@@ -996,4 +1074,28 @@ fn validate_replayed_transition(
 
 fn invalid_event(event: &GoalEvent, reason: &str) -> GoalError {
     GoalError::InvalidJournal(format!("revision {}: {reason}", event.revision))
+}
+
+/// Whether the event changes the goal's lifecycle or identity, and therefore
+/// invalidates any activation reservation made against an earlier snapshot.
+/// Usage-only charges and pin updates preserve the reservation; everything
+/// else (create, fork, pause, resume, complete, drop, and a usage charge that
+/// crosses the budget) invalidates it.
+fn event_changes_lifecycle_or_identity(
+    kind: &GoalEventKind,
+    previous: Option<&Goal>,
+    goal: &Goal,
+) -> bool {
+    match kind {
+        GoalEventKind::PinsUpdated { .. } => false,
+        GoalEventKind::UsageUpdated { .. } => previous.is_none_or(|prev| {
+            prev.id != goal.id || prev.lifecycle != goal.lifecycle
+        }),
+        GoalEventKind::Created
+        | GoalEventKind::ForkCloned { .. }
+        | GoalEventKind::Paused { .. }
+        | GoalEventKind::Resumed
+        | GoalEventKind::Completed
+        | GoalEventKind::Dropped => true,
+    }
 }

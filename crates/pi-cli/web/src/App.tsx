@@ -109,8 +109,16 @@ import {
 } from './commands';
 import {
   formatCompactReport,
+  formatGoalResult,
+  formatLoopResult,
+  formatProcessList,
   formatSkillResult,
+  goalWire,
+  loopRequiresIdle,
+  loopWire,
+  psWire,
   resolveSlashAction,
+  unsupportedAliasMessage,
 } from './slashDispatch';
 
 const RPI_AUTH_PREFIX = 'rpi-auth.';
@@ -975,7 +983,8 @@ async function blobToWav(blob: Blob): Promise<Blob | null> {
  *  confirms and Main dispatches.
  *
  *  Two modes share one popover:
- *   - `commands` lists the Web-executable builtins (compact/skill/code-review).
+ *   - `commands` lists the Web-executable builtins
+ *     (compact/skill/code-review/loop/goal/ps).
  *     Selecting the `/skill` parent (or opening the picker while the composer
  *     already holds a `/skill` prefix) drills into `skills` mode.
  *   - `skills` lists every loaded skill candidate (`source === "skill"`) with
@@ -1034,9 +1043,9 @@ function CommandPicker({
     sendCommand({ type: 'get_commands' })
       .then((data) => {
         // Backend get_commands is authoritative; narrow to the Web-executable
-        // surface (compact/skill/code-review builtins + loaded skill
-        // candidates) so every shown item is dispatchable or drills into a
-        // dispatchable candidate list.
+        // surface (compact/skill/code-review/loop/goal/ps builtins + loaded
+        // skill candidates) so every shown item is dispatchable or drills
+        // into a dispatchable candidate list.
         setCommands(filterSupportedCommands(normalizeCommands(data)));
         setActiveIndex(0);
         setLoading(false);
@@ -2999,6 +3008,7 @@ export function App() {
             openArgs.from = action.from;
             openArgs.to = action.to;
           }
+          acceptCommand();
           setCodeReviewOpenArgs(openArgs);
           openPanel('code-review', { force: true });
           return;
@@ -3016,6 +3026,7 @@ export function App() {
               };
           if (sid) command.sessionId = sid;
           const label = isSnap ? 'Snapcompact' : 'Compact';
+          acceptCommand();
           sendCommand(command)
             .then((data) => {
               pushItemFor(sid, {
@@ -3043,6 +3054,7 @@ export function App() {
         if (action.type === 'skill') {
           const command: Record<string, unknown> = { type: 'skill', name: action.name };
           if (sid) command.sessionId = sid;
+          acceptCommand();
           sendCommand(command)
             .then((data) => {
               pushItemFor(sid, {
@@ -3064,17 +3076,168 @@ export function App() {
             });
           return;
         }
+
+        // /loop and /goal share ONE success/error summary path: dispatch the
+        // typed RPC on the ACTIVE session (explicit sessionId, same as the
+        // compact/skill paths), then render the formatted result — or the
+        // actionable error, including the TUI-equivalent "no active loop with
+        // id" case where the backend resolves `false` instead of failing —
+        // as a visible summary bubble. Intercepted commands NEVER get an
+        // optimistic user bubble. The wire mapping + text live in the pure
+        // helpers in ./slashDispatch (mirrors the TUI parsers exactly).
+        if (action.type === 'loop' || action.type === 'goal') {
+          // TUI parity guard: /loop create|update are unavailable while
+          // another turn is running (the TUI loop dispatch rejects exactly
+          // these two ops while streaming). Rejected locally — no RPC leaves
+          // the client and the draft stays in the composer, matching the TUI
+          // status message verbatim.
+          if (
+            action.type === 'loop' &&
+            loopRequiresIdle(action.action) &&
+            (sid ? streamingBySessionIdRef.current[sid] : false)
+          ) {
+            toast('/loop is unavailable while another turn is running', true);
+            return;
+          }
+          // TUI parity: BARE `/goal` opens the Goal panel (the TUI maps a
+          // bare /goal to its goal panel); explicit show/get/inspect
+          // dispatch the goal_get RPC below.
+          if (action.type === 'goal' && action.action.op === 'show' && !action.action.explicit) {
+            acceptCommand();
+            refreshGoal(sid);
+            openPanel('goal', { force: true });
+            return;
+          }
+          acceptCommand();
+          const wire = action.type === 'loop' ? loopWire(action.action) : goalWire(action.action);
+          if (sid) wire.sessionId = sid;
+          const label = action.type === 'loop' ? 'loop' : 'goal';
+          // /goal create|resume dispatch with `activate: true` (TUI parity:
+          // they start/queue goal work and resolve with the activation
+          // outcome), so the summary path chains a goal_get for the state
+          // line. All other commands format their own response directly.
+          const activateWork =
+            action.type === 'goal' &&
+            (action.action.op === 'create' || action.action.op === 'resume');
+          const run = activateWork
+            ? sendCommand(wire).then((outcome) => {
+                const stateWire = goalWire({ op: 'show' });
+                if (sid) stateWire.sessionId = sid;
+                return sendCommand(stateWire).then((state) => ({ data: outcome, state }));
+              })
+            : sendCommand(wire).then((data) => ({ data, state: undefined }));
+          run.then(({ data, state }) => {
+              const result =
+                action.type === 'loop'
+                  ? formatLoopResult(action.action, data)
+                  : formatGoalResult(action.action, data, state);
+              if (result.ok) {
+                pushItemFor(sid, {
+                  kind: 'summary',
+                  id: nextId('s'),
+                  label,
+                  text: result.text,
+                });
+              } else {
+                pushItemFor(sid, {
+                  kind: 'summary',
+                  id: nextId('s'),
+                  label,
+                  text: result.message,
+                });
+                toast(`${label} failed: ${result.message}`, true);
+              }
+            })
+            .catch((err: Error & { rpc?: boolean }) => {
+              const message = err.message || String(err);
+              pushItemFor(sid, {
+                kind: 'summary',
+                id: nextId('s'),
+                label,
+                text: message,
+              });
+              toast(`${label} failed: ${message}`, true);
+            });
+          return;
+        }
+
+        // /ps reuses the accepted-command summary pattern: dispatch the
+        // process_list RPC on the ACTIVE session (explicit sessionId, same
+        // as the compact/skill/loop/goal paths), then render the bounded
+        // TUI-parity process listing — or the actionable RPC error — as a
+        // visible summary bubble. Intercepted commands NEVER get an
+        // optimistic user bubble; only accepted dispatch clears the composer
+        // (a `/ps extra` usage error preserves the draft and sends no RPC,
+        // handled above by resolveSlashAction).
+        if (action.type === 'ps') {
+          const wire = psWire();
+          if (sid) wire.sessionId = sid;
+          acceptCommand();
+          sendCommand(wire)
+            .then((data) => {
+              pushItemFor(sid, {
+                kind: 'summary',
+                id: nextId('s'),
+                label: 'ps',
+                text: formatProcessList(data),
+              });
+            })
+            .catch((err: Error & { rpc?: boolean }) => {
+              const message = err.message || String(err);
+              pushItemFor(sid, {
+                kind: 'summary',
+                id: nextId('s'),
+                label: 'ps',
+                text: message,
+              });
+              toast(`ps failed: ${message}`, true);
+            });
+          return;
+        }
       }
     }
 
-    // Code-file fences prepend the user's typed text; image-only sends render
-    // the thumbnails themselves (no placeholder text). The bubble carries the
-    // same image payloads as the prompt frame (minus the wire-only `type`
-    // tag), so the optimistic bubble and the backend's persisted user message
-    // render identically and reconcile without flicker.
-    const message = [codeMessage, text].filter(Boolean).join('\n\n');
-    const bubbleId = nextId('u');
+    // Hard front-end cap: the whole prompt frame (message + every image
+    // base64) must fit under MAX_TOTAL_WIRE_BYTES. Intake + the video-settle
+    // check keep this invariant, but re-check at submit so an edge case can
+    // never overrun the 4 MiB RPC frame (the backend PAYLOAD_TOO_LARGE stays
+    // the hard backstop).
+    if (aggregateWire(attachments) > MAX_TOTAL_WIRE_BYTES) {
+      toast('attachments exceed the total send size limit — remove some attachments', true);
+      return;
+    }
+
+    // Code-file fences + video markers prepend the user's typed text; image/
+    // frame-only sends render the thumbnails themselves (no placeholder
+    // text). The bubble carries the same image payloads as the prompt frame
+    // (minus the wire-only `type` tag), so the optimistic bubble and the
+    // backend's persisted user message render identically and reconcile
+    // without flicker.
+    const message = [codeMessage, videoMarker, text].filter(Boolean).join('\n\n');
+    // Build the EXACT wire command before any UI mutation: the frame-byte
+    // gate below must reject with the draft + chips fully intact. Images are
+    // the same shape the backend persists (minus the wire-only `type` tag
+    // carried by `command.images`).
+    const command: Record<string, unknown> =
+      kind === 'steer' ? { type: 'steer', message } : { type: 'prompt', message };
+    if (images.length > 0) command.images = images;
     const sid = sessionIdRef.current;
+    // EXACT pre-dispatch frame-byte check against the backend's 4 MiB RPC
+    // frame cap (MAX_RPC_MESSAGE_BYTES — the backend rejects a frame at
+    // exactly the cap, LF not counted): the FULL serialized command — typed
+    // text + code fences + video markers + every image/frame base64 + the
+    // envelope — counted with the same JSON escaping and UTF-8 bytes the
+    // transport uses. `MAX_COMMAND_ID` is a fixed max-length id stand-in, so
+    // the check is a conservative UPPER BOUND that never depends on
+    // predicting sendCommand's counter. An over-cap frame is refused HERE,
+    // before the optimistic bubble or the composer clear, so the draft is
+    // preserved for editing (the backend PAYLOAD_TOO_LARGE stays the hard
+    // backstop for any path this gate cannot see).
+    if (commandFrameBytes(command, MAX_COMMAND_ID, sid) >= MAX_PROMPT_FRAME_BYTES) {
+      toast('message and attachments exceed the 4 MiB send limit — shorten the message or remove some attachments', true);
+      return;
+    }
+    const bubbleId = nextId('u');
     pushItemFor(sid, {
       kind: 'user',
       id: bubbleId,
@@ -3097,9 +3260,6 @@ export function App() {
     // Enter resolves to the active run's prompt/steer verb. The primary
     // button is intentionally different while streaming: it becomes Stop,
     // while Enter keeps the typed steering-message shortcut.
-    const command: Record<string, unknown> =
-      kind === 'steer' ? { type: 'steer', message } : { type: 'prompt', message };
-    if (images.length > 0) command.images = images;
     sendCommand(command, bubbleId)
       .then(() => {
         // ACK received: clear only the sent snapshot by id, preserving any
@@ -3116,7 +3276,7 @@ export function App() {
         // Failed transport: retain the chips and budget for retry.
         if (!err.rpc) toast(`send failed: ${err.message}`, true);
       });
-  }, [attachments, flushComposerResize, openPanel, pushItemFor, sendCommand, toast]);
+  }, [attachments, flushComposerResize, openPanel, pushItemFor, refreshGoal, sendCommand, toast]);
 
   const abortActiveRun = useCallback(() => {
     const sid = sessionIdRef.current;

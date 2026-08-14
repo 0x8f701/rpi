@@ -7,8 +7,11 @@
 import { parseSupportedCommand } from '../src/commands.ts';
 import {
   formatCompactReport,
+  formatProcessList,
+  formatProcessRow,
   formatSkillResult,
   isSnapCompactArgs,
+  psWire,
   resolveSlashAction,
 } from '../src/slashDispatch.ts';
 
@@ -49,7 +52,27 @@ function check(name, cond, detail) {
     const p = parseSupportedCommand('/code-review main feature');
     return p && p.name === 'code-review' && p.args === 'main feature';
   })());
-  check('unknown slash -> null (stays normal prompt)', parseSupportedCommand('/goal ship') === null);
+  check('loop with args', (() => {
+    const p = parseSupportedCommand('/loop 5m check deploy');
+    return p && p.name === 'loop' && p.args === '5m check deploy';
+  })());
+  check('goal bare still parses (dispatch shows state)', (() => {
+    const p = parseSupportedCommand('/goal');
+    return p && p.name === 'goal' && p.args === '';
+  })());
+  check('goal with objective', (() => {
+    const p = parseSupportedCommand('/goal ship safely');
+    return p && p.name === 'goal' && p.args === 'ship safely';
+  })());
+  check('ps bare', (() => {
+    const p = parseSupportedCommand('/ps');
+    return p && p.name === 'ps' && p.args === '';
+  })());
+  check('ps with tail still parses (rejected later)', (() => {
+    const p = parseSupportedCommand('/ps extra');
+    return p && p.name === 'ps' && p.args === 'extra';
+  })());
+  check('unknown slash -> null (stays normal prompt)', parseSupportedCommand('/workflow ship') === null);
   check('no slash -> null', parseSupportedCommand('hello') === null);
   check('leading spaces trimmed', (() => {
     const p = parseSupportedCommand('  /compact  --snap  ');
@@ -130,8 +153,27 @@ function check(name, cond, detail) {
   const crThree = resolveSlashAction('code-review', 'a b c');
   check('code-review three revs -> error', crThree.type === 'error');
 
-  const unknown = resolveSlashAction('goal', 'x');
+  const unknown = resolveSlashAction('workflow', 'x');
   check('unknown name -> error', unknown.type === 'error');
+
+  // /loop + /goal resolve to typed actions (their full decision table lives
+  // in scripts/loopGoal.test.ts).
+  const loopSmoke = resolveSlashAction('loop', '5m check deploy');
+  check('loop smoke -> typed loop action', loopSmoke.type === 'loop' && loopSmoke.action.op === 'create');
+  const loopBare = resolveSlashAction('loop', '');
+  check('bare /loop -> usage error', loopBare.type === 'error' && /usage: \/loop/.test(loopBare.message));
+  const goalSmoke = resolveSlashAction('goal', 'show');
+  check('goal smoke -> typed goal action', goalSmoke.type === 'goal' && goalSmoke.action.op === 'show');
+  const goalBare = resolveSlashAction('goal', '');
+  check('bare /goal -> show (panel, not explicit)', goalBare.type === 'goal' && goalBare.action.op === 'show');
+  // /ps is a bare-only surface: the bare command dispatches process_list;
+  // any argument tail is a LOCAL usage error (no RPC, draft preserved).
+  const psBare = resolveSlashAction('ps', '');
+  check('bare /ps -> typed ps action', psBare.type === 'ps');
+  const psArgs = resolveSlashAction('ps', 'extra');
+  check('/ps extra -> usage error', psArgs.type === 'error' && psArgs.message === 'usage: /ps');
+  const psArgsTrimmed = resolveSlashAction('ps', '   extra   ');
+  check('/ps whitespace-padded tail -> usage error', psArgsTrimmed.type === 'error' && psArgsTrimmed.message === 'usage: /ps');
 }
 
 // ---- format helpers (visible bubble text) ----
@@ -165,6 +207,64 @@ function check(name, cond, detail) {
     'skill result bare string',
     formatSkillResult('plain summary', 'x') === 'plain summary',
   );
+}
+
+// ---- /ps wire mapping + bounded TUI-parity process formatter ----
+{
+  check('ps wire -> process_list', JSON.stringify(psWire()) === JSON.stringify({ type: 'process_list' }));
+
+  const running = {
+    id: 'proc-1',
+    ownerId: 'owner-1',
+    label: 'deploy probe',
+    state: 'running',
+    pid: 4242,
+    tty: false,
+    startedAtMs: 1750000000000,
+    outputStartCursor: 0,
+    outputCursor: 128,
+  };
+  check('running row mirrors TUI line', formatProcessRow(running) ===
+    'proc-1\tRunning\tdeploy probe\tcursor 0..128');
+  check('row without label -> (unlabeled)', formatProcessRow({ ...running, label: null }).includes('\t(unlabeled)\t'));
+  check('row without label field -> (unlabeled)', formatProcessRow({ ...running, label: undefined }).includes('\t(unlabeled)\t'));
+  check('non-string label -> (unlabeled)', formatProcessRow({ ...running, label: 42 }).includes('\t(unlabeled)\t'));
+
+  // State mapping: wire snake_case -> Rust Debug variant name (TUI parity).
+  const states = {
+    starting: 'Starting', running: 'Running', stopping: 'Stopping', exited: 'Exited',
+    timed_out: 'TimedOut', expired: 'Expired', failed: 'Failed',
+  };
+  for (const [wire, label] of Object.entries(states)) {
+    check(`state ${wire} -> ${label}`, formatProcessRow({ ...running, state: wire }).includes(`\t${label}\t`));
+  }
+  check('unknown state falls back to wire string', formatProcessRow({ ...running, state: 'suspending' }).includes('\tsuspending\t'));
+  check('non-string state -> ?', formatProcessRow({ ...running, state: 7 }).includes('\t?\t'));
+  check('missing id -> ?', formatProcessRow({ id: null, state: 'running' }).startsWith('?\tRunning\t'));
+
+  // Sanitized labels: control characters (row/column injection) are stripped,
+  // length is bounded.
+  check('label newline stripped', formatProcessRow({ ...running, label: 'a\nb' }).includes('\tab\t'));
+  check('label tab stripped', formatProcessRow({ ...running, label: 'a\tb' }) === 'proc-1\tRunning\tab\tcursor 0..128');
+  check('label carriage return stripped', formatProcessRow({ ...running, label: 'a\rb' }).includes('\tab\t'));
+  check('long label truncated with ellipsis', formatProcessRow({ ...running, label: 'x'.repeat(200) }).includes(`\t${'x'.repeat(64)}…\t`));
+  check('label truncation respects bound', formatProcessRow({ ...running, label: 'y'.repeat(200) }).includes(`\t${'y'.repeat(64)}…\t`));
+  check('malformed row never throws', typeof formatProcessRow(null) === 'string' && typeof formatProcessRow('junk') === 'string');
+  check('cursor fields default to 0', formatProcessRow({ ...running, outputStartCursor: null, outputCursor: 'x' }).endsWith('cursor 0..0'));
+
+  // Empty list -> TUI marker.
+  check('empty list -> No supervised processes', formatProcessList([]) === 'No supervised processes');
+  check('non-array list -> No supervised processes', formatProcessList(null) === 'No supervised processes');
+  check('non-array object -> No supervised processes', formatProcessList({ processes: [] }) === 'No supervised processes');
+  // List joins rows.
+  const listText = formatProcessList([running, { ...running, id: 'proc-2', state: 'exited', label: null }]);
+  check('list joins rows', listText.split('\n').length === 2, listText);
+  check('list row shape', listText === 'proc-1\tRunning\tdeploy probe\tcursor 0..128\nproc-2\tExited\t(unlabeled)\tcursor 0..128');
+  // Bounded: 20 processes render 16 rows + an overflow marker (backend cap).
+  const many = Array.from({ length: 20 }, (_, i) => ({ ...running, id: `proc-${i}` }));
+  const manyText = formatProcessList(many);
+  check('list bounded to 16 rows', manyText.split('\n').length === 17, manyText);
+  check('list overflow marker', manyText.endsWith('… and 4 more'));
 }
 
 console.log(`\nslashParse.test: ${ran} assertions, ${failures.length} failure(s)`);

@@ -331,6 +331,13 @@ pub enum RpcCommand {
         objective: String,
         #[serde(default, rename = "tokenBudget")]
         token_budget: Option<u64>,
+        /// TUI parity switch: when true, mirrors `/goal create` in
+        /// goal_commands.rs — create the goal AND start (or queue) its first
+        /// work turn (`activate_goal`), resolving with the activation outcome
+        /// instead of the goal. Default false keeps the mutation-only
+        /// contract the Web Goal panel's form uses (it never starts work).
+        #[serde(default)]
+        activate: bool,
     },
     GoalGet {
         #[serde(default)]
@@ -343,6 +350,13 @@ pub enum RpcCommand {
     GoalResume {
         #[serde(default)]
         id: Option<String>,
+        /// TUI parity switch: when true, mirrors `/goal resume` in
+        /// goal_commands.rs — resume the paused goal AND schedule exactly one
+        /// continuation turn (`resume_goal_work`), resolving with the
+        /// activation outcome instead of the goal. Default false keeps the
+        /// mutation-only contract the Web Goal panel's Resume button uses.
+        #[serde(default)]
+        activate: bool,
     },
     GoalComplete {
         #[serde(default)]
@@ -957,7 +971,7 @@ impl RpcCommand {
             | Self::GoalCreate { id, .. }
             | Self::GoalGet { id }
             | Self::GoalPause { id }
-            | Self::GoalResume { id }
+            | Self::GoalResume { id, .. }
             | Self::GoalComplete { id }
             | Self::GoalDrop { id }
             | Self::GoalUpdateUsage { id, .. }
@@ -3073,13 +3087,35 @@ async fn handle_command_inner(
         RpcCommand::GoalCreate {
             objective,
             token_budget,
+            activate,
             ..
-        } => Ok(Some(serde_json::to_value(
-            app.goal_create(objective, token_budget)?,
-        )?)),
+        } => {
+            // TUI parity: with `activate` the create mirrors `/goal create`
+            // (goal_commands.rs `execute_interactive_goal_command`) — create
+            // AND start/queue the first work turn, resolving with the
+            // activation outcome; without it the mutation-only contract the
+            // Web Goal panel uses is preserved, resolving with the goal.
+            let value = if activate {
+                serde_json::to_value(app.activate_goal(objective, token_budget).await?)?
+            } else {
+                serde_json::to_value(app.goal_create(objective, token_budget)?)?
+            };
+            Ok(Some(value))
+        }
         RpcCommand::GoalGet { .. } => Ok(Some(serde_json::to_value(app.goal_state())?)),
         RpcCommand::GoalPause { .. } => Ok(Some(serde_json::to_value(app.goal_pause()?)?)),
-        RpcCommand::GoalResume { .. } => Ok(Some(serde_json::to_value(app.goal_resume()?)?)),
+        RpcCommand::GoalResume { activate, .. } => {
+            // TUI parity: with `activate` the resume mirrors `/goal resume` —
+            // resume AND schedule exactly one continuation turn
+            // (`resume_goal_work`), resolving with the activation outcome;
+            // without it the mutation-only contract is preserved.
+            let value = if activate {
+                serde_json::to_value(app.resume_goal_work().await?)?
+            } else {
+                serde_json::to_value(app.goal_resume()?)?
+            };
+            Ok(Some(value))
+        }
         RpcCommand::GoalComplete { .. } => Ok(Some(serde_json::to_value(app.goal_complete()?)?)),
         RpcCommand::GoalDrop { .. } => Ok(Some(serde_json::to_value(app.goal_drop()?)?)),
         RpcCommand::GoalUpdateUsage {
@@ -5716,6 +5752,7 @@ mod tests {
                 id: Some("create".into()),
                 objective: "ship safely".into(),
                 token_budget: Some(10),
+                activate: false,
             },
         )
         .await;
@@ -5764,6 +5801,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_activate_flag_mirrors_tui_create_and_resume_while_default_stays_mutation_only() {
+        let settings = settings_state();
+
+        // Wire-level parse: `activate` is an OPTIONAL field; absent (the Web
+        // Goal panel contract) and present (the composer /goal create parity)
+        // frames both parse.
+        let command = match parse_input(br#"{"type":"goal_create","objective":"ship with work","tokenBudget":10,"activate":true}"#)
+            .expect("activate:true goal_create frame must parse")
+        {
+            RpcInput::Command { command, .. } => command,
+            RpcInput::ExtensionUiResponse(_) => panic!("expected goal_create command"),
+        };
+        assert!(matches!(command, RpcCommand::GoalCreate { activate: true, .. }));
+
+        // Default (activate absent/false) keeps the mutation-only contract:
+        // the response is the GOAL wire, not an outcome.
+        let app = build_todo_app("faux-rpc-goal-plain", "faux-rpc-goal-plain-api").await;
+        let plain = handle_command(
+                &app,
+                &settings,
+                &workflows_state(),
+            RpcCommand::GoalCreate {
+                id: Some("plain".into()),
+                objective: "mutation only".into(),
+                token_budget: None,
+                activate: false,
+            },
+        )
+        .await;
+        assert!(plain.success, "{plain:?}");
+        let goal = plain.data.expect("goal");
+        assert_eq!(goal["objective"], "mutation only");
+        assert!(goal.get("id").is_some(), "mutation-only create resolves with the Goal wire");
+        app.cleanup().await;
+
+        // activate:true mirrors TUI /goal create — create + start work.
+        let app = build_todo_app("faux-rpc-goal-activate", "faux-rpc-goal-activate-api").await;
+        let created = handle_command(&app, &settings, &workflows_state(), command).await;
+        assert!(created.success, "{created:?}");
+        let outcome = created.data.expect("activation outcome");
+        assert!(
+            outcome == "started" || outcome == "queued",
+            "unexpected activation outcome: {outcome:?}"
+        );
+        let state = handle_command(
+                &app,
+                &settings,
+                &workflows_state(),
+            RpcCommand::GoalGet {
+                id: Some("get".into()),
+            },
+        )
+        .await;
+        let data = state.data.expect("goal state");
+        assert_eq!(data["current"]["objective"], "ship with work");
+        assert_eq!(data["current"]["tokenBudget"], 10);
+        assert_eq!(data["current"]["lifecycle"], "active");
+
+        // activate:true resume mirrors TUI /goal resume — resume + one turn.
+        assert!(handle_command(
+                &app,
+                &settings,
+                &workflows_state(),
+            RpcCommand::GoalPause {
+                id: Some("pause".into()),
+            },
+        )
+        .await
+        .success);
+        let resumed = handle_command(
+                &app,
+                &settings,
+                &workflows_state(),
+            RpcCommand::GoalResume {
+                id: Some("resume".into()),
+                activate: true,
+            },
+        )
+        .await;
+        assert!(resumed.success, "{resumed:?}");
+        let outcome = resumed.data.expect("activation outcome");
+        assert!(
+            outcome == "started" || outcome == "queued",
+            "unexpected activation outcome: {outcome:?}"
+        );
+        app.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn goal_pin_unpin_and_journal_rpc_replay_recorder_backed_session() {
         let cwd = tempfile::tempdir().expect("goal journal cwd");
         let session = pi_coding::Session::new(pi_coding::SessionOptions {
@@ -5803,6 +5929,7 @@ mod tests {
                 id: Some("create".into()),
                 objective: "ship cleanly".into(),
                 token_budget: Some(20),
+                activate: false,
             },
         )
         .await;

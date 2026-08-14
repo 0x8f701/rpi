@@ -49,6 +49,48 @@ export const MATRIX = [
     ],
   },
   {
+    // The real loop_goal lane (E2E.d/web/loop_goal.sh -> loop_goal_test.mjs):
+    // composer picker /loop + /goal, draft-no-auto-submit, real-listener RPC
+    // execution (loop create/list/update/delete/cancel, goal
+    // create/show/pin/pins/pause/resume/complete/drop with activate-work TUI
+    // parity), the /loop streaming guard, local usage errors with no RPC, no
+    // user bubbles, and sessionId-stamped routing. Its evidence file is
+    // written by the lane itself at
+    // $EVIDENCE_ROOT/web-loop_goal/coverage-assertions.json; the gate fails
+    // if any of these lg.* contracts did not execute.
+    feature: 'loop + goal composer',
+    ids: [
+      'lg.picker-lists-loop-goal',
+      'lg.loop-draft-no-submit',
+      'lg.goal-draft-no-submit',
+      'lg.goal-panel-open',
+      'lg.ps-picker-listed',
+      'lg.ps-draft-no-submit',
+      'lg.ps-empty-list',
+      'lg.ps-args-local-reject',
+      'lg.ps-session-routed',
+      'lg.loop-create',
+      'lg.loop-streaming-guard',
+      'lg.loop-list',
+      'lg.loop-update',
+      'lg.loop-delete',
+      'lg.loop-cancel-error',
+      'lg.goal-create-activate',
+      'lg.goal-show',
+      'lg.goal-pin',
+      'lg.goal-pins',
+      'lg.goal-pause',
+      'lg.goal-resume-activate',
+      'lg.goal-complete',
+      'lg.goal-drop-error',
+      'lg.usage-error-no-rpc',
+      'lg.draft-preserved-on-error',
+      'lg.alias-no-prompt',
+      'lg.no-user-bubbles',
+      'lg.session-routed',
+    ],
+  },
+  {
     feature: 'markdown',
     ids: [
       'md.table-rendered',
@@ -204,7 +246,9 @@ export const MATRIX = [
   {
     // The real external_sessions lane (E2E.d/web/external_sessions.sh ->
     // external_sessions_test.mjs): Web-only default OMP/Codex/Grok discovery
-    // + source grouping, foreign click imports a native rpi copy, foreign
+    // + source grouping, foreign click imports a native rpi copy, OMP
+    // rotation chain (parentSession early/middle/final history) renders fully
+    // and once with task/subagent child sessions excluded, foreign
     // bytes/mtime immutable, lineage reuse, no duplicate rows, and explicit
     // sessionImportSources:[] native-only. Evidence at
     // $EVIDENCE_ROOT/web-external_sessions/coverage-assertions.json.
@@ -216,6 +260,8 @@ export const MATRIX = [
       'X3.1', 'X3.2',
       'X4.1', 'X4.2',
       'X5.1', 'X5.2',
+      'X7.1', 'X7.2', 'X7.3', 'X7.4',
+      'X8.1',
       'X6.1', 'X6.2',
     ],
   },

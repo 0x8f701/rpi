@@ -409,7 +409,11 @@ fn serialized_goal_state_has_a_narrow_secret_free_schema() {
     let object = value.as_object().expect("state object");
     assert_eq!(
         object.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["current", "revision"]
+        vec!["current", "lifecycleRevision", "revision"]
+    );
+    assert_eq!(
+        object["lifecycleRevision"], json!(1),
+        "the created goal's lifecycle epoch must be the create revision"
     );
     let goal = object["current"].as_object().expect("goal object");
     assert_eq!(
@@ -515,6 +519,114 @@ fn concurrent_create_allows_exactly_one_goal() {
         WORKERS - 1
     );
     assert_eq!(runtime.get().revision, 1);
+}
+
+/// Regression for the confirmed goal transition → activation reservation
+/// race: the reservation of a create/resume transition runs inside the same
+/// critical section as the journal commit, so a newer pause/resume can never
+/// interleave between an older commit and its reservation, and only the
+/// newest reservation survives.
+///
+/// The older resume commits rev 3 and its reservation callback blocks at a
+/// barrier while still holding the ordering boundary. The newer pause/resume
+/// must block behind it; after the older reservation completes, the newer
+/// reservation lands on rev 5 and supersedes rev 3. If a refactor moved the
+/// reservation outside the commit lock, the newer pause/resume would run to
+/// completion while the older reservation is still held back, and the older
+/// key could overwrite the newer one — the inversion this test pins closed.
+#[test]
+fn reservation_commit_ordering_blocks_older_inversion() {
+    let runtime = GoalRuntime::memory();
+    runtime.create("ordered reservation", Some(100)).expect("create");
+    runtime.pause().expect("pause");
+
+    let older_committed = Arc::new(Barrier::new(2));
+    let release_older = Arc::new(Barrier::new(2));
+    let reservations = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let newer_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Older resume: commits rev 3 (Active), then its reservation callback
+    // blocks at the barrier while still inside the commit's critical section.
+    let older = {
+        let runtime = runtime.clone();
+        let older_committed = older_committed.clone();
+        let release_older = release_older.clone();
+        let reservations = reservations.clone();
+        thread::spawn(move || {
+            let (state, _) = runtime
+                .resume_and_reserve(|state| {
+                    reservations
+                        .lock()
+                        .expect("reservations")
+                        .push(state.revision);
+                    older_committed.wait();
+                    release_older.wait();
+                })
+                .expect("older resume must commit");
+            assert_eq!(state.revision, 3);
+        })
+    };
+
+    // Wait until the older resume has committed rev 3 and is paused inside
+    // its reservation, holding the ordering boundary open.
+    older_committed.wait();
+
+    // Newer pause + resume on another thread: both commit under the same
+    // boundary, so they MUST block until the older reservation completes.
+    let newer = {
+        let runtime = runtime.clone();
+        let reservations = reservations.clone();
+        let newer_finished = newer_finished.clone();
+        thread::spawn(move || {
+            runtime.pause().expect("newer pause");
+            let (state, _) = runtime
+                .resume_and_reserve(|state| {
+                    reservations
+                        .lock()
+                        .expect("reservations")
+                        .push(state.revision);
+                })
+                .expect("newer resume");
+            assert_eq!(state.revision, 5);
+            newer_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+
+    // The newer pause/resume cannot interleave between the older commit and
+    // its reservation: give it a moment to try, then verify it is still
+    // blocked and the newer reservation has not started.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !newer_finished.load(std::sync::atomic::Ordering::SeqCst),
+        "newer pause/resume must not interleave between the older commit and its reservation"
+    );
+    assert_eq!(
+        reservations.lock().expect("reservations").len(),
+        1,
+        "only the older reservation may have started while the boundary is held"
+    );
+
+    // Release the older reservation; both threads complete in commit order
+    // and the reservation order is strictly older-then-newer, so the newest
+    // (rev 5) supersedes the older (rev 3) and only the newest continuation
+    // would be authorized to run.
+    release_older.wait();
+    older.join().expect("join older resume");
+    newer.join().expect("join newer pause/resume");
+
+    let reservations = reservations.lock().expect("reservations");
+    assert_eq!(
+        *reservations,
+        vec![3, 5],
+        "reservations must be linearized in commit order; the newer key (5) supersedes the older (3)"
+    );
+    let state = runtime.get();
+    assert_eq!(state.revision, 5);
+    assert_eq!(state.current.expect("goal").lifecycle, GoalLifecycle::Active);
+    assert_eq!(
+        state.lifecycle_revision, 5,
+        "pause+resume advance the lifecycle epoch, invalidating the rev-3 reservation"
+    );
 }
 
 #[test]

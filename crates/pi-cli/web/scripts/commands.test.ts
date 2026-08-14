@@ -9,7 +9,8 @@
 //
 // Assertions exercise BEHAVIOR (what the helpers return), not source strings.
 // The backend get_commands catalog stays authoritative; the only hardcoded
-// surface is the 3-name Web-execution allowlist (compact/skill/code-review).
+// surface is the 6-name Web-execution allowlist (compact/skill/code-review/
+// loop/goal/ps).
 import {
   normalizeCommands,
   filterSupportedCommands,
@@ -115,26 +116,32 @@ function check(name, cond, detail) {
   check('entry still kept', out.length === 1);
 }
 
-// ---- Web-executable surface filter: only compact/skill/code-review ----
+// ---- Web-executable surface filter: compact/skill/code-review/loop/goal/ps ----
 {
-  check('allowlist has exactly compact + skill + code-review',
-    Object.keys(WEB_SUPPORTED_COMMANDS).sort().join(',') === 'code-review,compact,skill');
+  check('allowlist has exactly compact + skill + code-review + loop + goal + ps',
+    Object.keys(WEB_SUPPORTED_COMMANDS).sort().join(',') === 'code-review,compact,goal,loop,ps,skill');
   const cmds = normalizeCommands({ commands: [
     { name: 'compact', source: 'builtin', requiresArguments: false },
     { name: 'goal', source: 'builtin' },
     { name: 'skill', source: 'builtin', requiresArguments: true },
     { name: 'code-review', source: 'builtin', requiresArguments: false },
+    { name: 'loop', source: 'builtin', requiresArguments: true },
+    { name: 'ps', source: 'builtin', requiresArguments: false },
     { name: 'workflow', source: 'builtin' },
     { name: 'btw', source: 'builtin' },
   ] });
   const supported = filterSupportedCommands(cmds);
-  check('supported filter keeps only the 3', supported.map((c) => c.name).join(',') === 'compact,skill,code-review', JSON.stringify(supported.map((c) => c.name)));
-  check('supported filter preserves backend order', supported[0].name === 'compact' && supported[1].name === 'skill' && supported[2].name === 'code-review');
-  check('goal filtered out', !supported.some((c) => c.name === 'goal'));
+  check('supported filter keeps the 6', supported.map((c) => c.name).join(',') === 'compact,goal,skill,code-review,loop,ps', JSON.stringify(supported.map((c) => c.name)));
+  check('supported filter preserves backend order', supported[0].name === 'compact' && supported[1].name === 'goal' && supported[2].name === 'skill' && supported[3].name === 'code-review' && supported[4].name === 'loop' && supported[5].name === 'ps');
+  check('goal kept (dispatch wired)', supported.some((c) => c.name === 'goal'));
+  check('loop kept (dispatch wired)', supported.some((c) => c.name === 'loop'));
+  check('ps kept (dispatch wired)', supported.some((c) => c.name === 'ps'));
   check('workflow filtered out', !supported.some((c) => c.name === 'workflow'));
   check('supported filter on empty -> []', filterSupportedCommands([]).length === 0);
   // requiresArguments survives the filter (needed for compose below).
   check('skill still requiresArguments after filter', supported.find((c) => c.name === 'skill').requiresArguments === true);
+  check('loop still requiresArguments after filter', supported.find((c) => c.name === 'loop').requiresArguments === true);
+  check('ps still requiresArguments false after filter', supported.find((c) => c.name === 'ps').requiresArguments === false);
 }
 
 // ---- search: empty query returns everything (post-filter) ----
@@ -198,6 +205,8 @@ function check(name, cond, detail) {
   // Goal/workflow (not supported, but the rule is generic) -> bare.
   check('/goal (requiresArguments=false) -> bare', composeCommandText('goal', false) === '/goal');
   check('/loop (requiresArguments=true) -> trailing space', composeCommandText('loop', true) === '/loop ');
+  // ps: no args -> bare (the picker drafts exactly `/ps`).
+  check('/ps (requiresArguments=false) -> bare', composeCommandText('ps', false) === '/ps');
   // Already-slashed name is not double-slashed; requiresArguments still applies.
   check('already-slashed compact not double-slashed', composeCommandText('/compact', false) === '/compact');
   check('already-slashed skill keeps trailing space', composeCommandText('/skill', true) === '/skill ');
@@ -213,8 +222,20 @@ function check(name, cond, detail) {
   check('/code-review HEAD~1 HEAD -> args', JSON.stringify(parseSupportedCommand('/code-review HEAD~1 HEAD')) === JSON.stringify({ name: 'code-review', args: 'HEAD~1 HEAD' }));
   check('leading/trailing whitespace trimmed', JSON.stringify(parseSupportedCommand('  /compact  ')) === JSON.stringify({ name: 'compact', args: '' }));
   check('extra spaces between name and args collapsed', parseSupportedCommand('/skill    foo').args === 'foo');
-  // Non-supported commands -> null (Main wires dispatch only for the 3).
-  check('/goal -> null (not supported)', parseSupportedCommand('/goal') === null);
+  // The 5-name Web surface: loop/goal parse like any other supported command;
+  // their argument VALIDATION lives in resolveSlashAction (parseSupportedCommand
+  // performs no RPC mapping), so a bare /goal still parses.
+  check('/loop bare -> parse (dispatch errors on usage)', JSON.stringify(parseSupportedCommand('/loop')) === JSON.stringify({ name: 'loop', args: '' }));
+  check('/loop args -> tail preserved', JSON.stringify(parseSupportedCommand('/loop 5m check deploy')) === JSON.stringify({ name: 'loop', args: '5m check deploy' }));
+  check('/goal bare -> parse', JSON.stringify(parseSupportedCommand('/goal')) === JSON.stringify({ name: 'goal', args: '' }));
+  check('/goal show -> args', JSON.stringify(parseSupportedCommand('/goal show')) === JSON.stringify({ name: 'goal', args: 'show' }));
+  check('/goal ship -> args', JSON.stringify(parseSupportedCommand('/goal ship')) === JSON.stringify({ name: 'goal', args: 'ship' }));
+  // /ps parses like any other supported command; argument VALIDATION (bare
+  // only) lives in resolveSlashAction — parseSupportedCommand performs no
+  // RPC mapping, so `/ps extra` still parses with the tail preserved.
+  check('/ps bare -> parse', JSON.stringify(parseSupportedCommand('/ps')) === JSON.stringify({ name: 'ps', args: '' }));
+  check('/ps extra -> tail preserved (rejected later by resolveSlashAction)', JSON.stringify(parseSupportedCommand('/ps extra')) === JSON.stringify({ name: 'ps', args: 'extra' }));
+  // Non-supported commands -> null (Main wires dispatch only for the 6).
   check('/workflow -> null', parseSupportedCommand('/workflow') === null);
   check('plain text -> null', parseSupportedCommand('hello there') === null);
   check('empty -> null', parseSupportedCommand('') === null);
@@ -245,12 +266,14 @@ function check(name, cond, detail) {
       { name: 'compact', description: 'Manually compact session context', source: 'builtin', argumentHint: '[--snap] [instructions]', requiresArguments: false },
       { name: 'skill', description: "Show a loaded skill's frontmatter summary", source: 'builtin', argumentHint: '<name>', requiresArguments: true },
       { name: 'code-review', description: 'Browse a working-tree or two-revision Git diff in a fullscreen panel', source: 'builtin', argumentHint: '[<from> <to>]', requiresArguments: false },
+      { name: 'loop', description: 'Run a prompt on a recurring interval', source: 'builtin', argumentHint: '[list|...|<interval> <prompt>]', requiresArguments: true },
       { name: 'goal', description: 'Create, inspect, pin, or drop the session goal', source: 'builtin', argumentHint: '[show|create ...]', requiresArguments: false },
+      { name: 'ps', description: 'List supervised processes', source: 'builtin', argumentHint: null, requiresArguments: false },
     ],
   };
   const cmds = filterSupportedCommands(normalizeCommands(payload));
-  // Only the 3 Web-executable commands reach the menu, in backend order.
-  check('round-trip: only supported reach menu', cmds.map((c) => c.name).join(',') === 'compact,skill,code-review');
+  // Only the 6 Web-executable commands reach the menu, in backend order.
+  check('round-trip: only supported reach menu', cmds.map((c) => c.name).join(',') === 'compact,skill,code-review,loop,goal,ps');
   // Search for "review" lands on code-review alone.
   check('round-trip: search review -> code-review', filterCommands(cmds, 'review').map((c) => c.name).join(',') === 'code-review');
   // Selecting each composes the contract-correct draft text.
@@ -258,16 +281,35 @@ function check(name, cond, detail) {
   check('round-trip: draft compact', composeCommandText(byName.compact.name, byName.compact.requiresArguments) === '/compact');
   check('round-trip: draft skill (trailing space)', composeCommandText(byName.skill.name, byName.skill.requiresArguments) === '/skill ');
   check('round-trip: draft code-review (bare, optional args)', composeCommandText(byName['code-review'].name, byName['code-review'].requiresArguments) === '/code-review');
+  // requiresArguments drives the trailing space from the backend field: loop
+  // (cannot run bare) drafts with a trailing space, goal (bare = show) drafts bare.
+  check('round-trip: draft loop (trailing space)', composeCommandText(byName.loop.name, byName.loop.requiresArguments) === '/loop ');
+  check('round-trip: draft goal (bare)', composeCommandText(byName.goal.name, byName.goal.requiresArguments) === '/goal');
+  // ps (no args) drafts bare — the picker inserts exactly `/ps`.
+  check('round-trip: draft ps (bare)', composeCommandText(byName.ps.name, byName.ps.requiresArguments) === '/ps');
   // Submit parse round-trips the drafted text back to a dispatchable command.
   check('round-trip: parse /compact', JSON.stringify(parseSupportedCommand('/compact')) === JSON.stringify({ name: 'compact', args: '' }));
   check('round-trip: parse /skill foo', JSON.stringify(parseSupportedCommand('/skill foo')) === JSON.stringify({ name: 'skill', args: 'foo' }));
   check('round-trip: parse /code-review', JSON.stringify(parseSupportedCommand('/code-review')) === JSON.stringify({ name: 'code-review', args: '' }));
+  check('round-trip: parse /loop 5m probe', JSON.stringify(parseSupportedCommand('/loop 5m probe')) === JSON.stringify({ name: 'loop', args: '5m probe' }));
+  check('round-trip: parse /goal', JSON.stringify(parseSupportedCommand('/goal')) === JSON.stringify({ name: 'goal', args: '' }));
+  check('round-trip: parse /ps', JSON.stringify(parseSupportedCommand('/ps')) === JSON.stringify({ name: 'ps', args: '' }));
   // Acceptance flow: the selected draft lands in an EMPTY composer as the
   // bare '/code-review' the E2E lane asserts, and still parses back to the
   // dispatchable command (selection never auto-submits).
   const e2eDraft = composeCommandText(byName['code-review'].name, byName['code-review'].requiresArguments);
   check('round-trip: code-review draft into empty composer', appendDraft('', e2eDraft) === '/code-review');
   check('round-trip: inserted draft still parses', JSON.stringify(parseSupportedCommand(appendDraft('', e2eDraft))) === JSON.stringify({ name: 'code-review', args: '' }));
+  // Same contract for the loop/goal drafts: selection only drafts, the typed
+  // draft still parses back to the dispatchable command.
+  check('round-trip: loop draft into empty composer', appendDraft('', composeCommandText(byName.loop.name, byName.loop.requiresArguments)) === '/loop ');
+  check('round-trip: goal draft into empty composer', appendDraft('', composeCommandText(byName.goal.name, byName.goal.requiresArguments)) === '/goal');
+  check('round-trip: loop draft parses back', JSON.stringify(parseSupportedCommand('/loop ')) === JSON.stringify({ name: 'loop', args: '' }));
+  check('round-trip: goal draft parses back', JSON.stringify(parseSupportedCommand('/goal')) === JSON.stringify({ name: 'goal', args: '' }));
+  // Same contract for the ps draft: selection only drafts, the bare `/ps`
+  // still parses back to the dispatchable command.
+  check('round-trip: ps draft into empty composer', appendDraft('', composeCommandText(byName.ps.name, byName.ps.requiresArguments)) === '/ps');
+  check('round-trip: ps draft parses back', JSON.stringify(parseSupportedCommand('/ps')) === JSON.stringify({ name: 'ps', args: '' }));
 }
 
 // ---- skill candidates: get_commands projects loaded skills with skillName ----

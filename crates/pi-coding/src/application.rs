@@ -511,6 +511,10 @@ struct ApplicationInner {
 struct GoalWorkKey {
     goal_id: String,
     revision: u64,
+    /// Goal-state lifecycle epoch the reservation was made against; a newer
+    /// lifecycle-changing commit invalidates the key (see
+    /// [`crate::GoalState::lifecycle_revision`]).
+    lifecycle_revision: u64,
 }
 
 struct ApplicationExtensionHost {
@@ -1181,13 +1185,33 @@ impl Application {
 
     /// Creates a goal and immediately starts its first model turn, or queues
     /// that turn behind the Application's current work.
+    ///
+    /// The activation slot is reserved against the [`GoalState`] snapshot the
+    /// create committed — goal id plus resulting revision — inside the same
+    /// critical section as the commit (see
+    /// [`crate::GoalRuntime::create_and_reserve`]), so the reservation is
+    /// linearized with every lifecycle transition: no pause/complete/drop or
+    /// newer create/resume can interleave between the commit and the
+    /// reservation, and no concurrent transition can open a window between
+    /// the commit and the schedule decision.
     pub async fn activate_goal(
         &self,
         objective: impl Into<String>,
         token_budget: Option<u64>,
     ) -> Result<GoalActivationOutcome> {
-        self.goal_create(objective, token_budget)?;
-        self.start_goal_work().await
+        let active = self.runtime();
+        let (state, outcome) = active
+            .session
+            .goal_runtime()
+            .create_and_reserve(objective, token_budget, |state| {
+                self.reserve_goal_work(&active, state)
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.inner.publish(ApplicationEvent::GoalUpdated {
+            operation: "create",
+            state,
+        });
+        Ok(outcome)
     }
 
     pub fn goal_pause(&self) -> Result<Goal> {
@@ -1201,9 +1225,27 @@ impl Application {
     /// Resumes a paused goal and schedules exactly one continuation for the
     /// resulting goal revision. Repeating resume on the same active revision
     /// never starts a duplicate turn.
+    ///
+    /// The activation slot is reserved against the [`GoalState`] snapshot the
+    /// resume committed — goal id plus resulting revision — inside the same
+    /// critical section as the commit (see
+    /// [`crate::GoalRuntime::resume_and_reserve`]), so the reservation is
+    /// linearized with every lifecycle transition: no pause/complete/drop or
+    /// newer create/resume can interleave between the commit and the
+    /// reservation, and no concurrent transition can open a window between
+    /// the commit and the schedule decision.
     pub async fn resume_goal_work(&self) -> Result<GoalActivationOutcome> {
-        self.goal_resume()?;
-        self.start_goal_work().await
+        let active = self.runtime();
+        let (state, outcome) = active
+            .session
+            .goal_runtime()
+            .resume_and_reserve(|state| self.reserve_goal_work(&active, state))
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.inner.publish(ApplicationEvent::GoalUpdated {
+            operation: "resume",
+            state,
+        });
+        Ok(outcome)
     }
 
     pub fn goal_complete(&self) -> Result<Goal> {
@@ -1260,18 +1302,34 @@ impl Application {
         Ok(goal)
     }
 
-    async fn start_goal_work(&self) -> Result<GoalActivationOutcome> {
-        let state = self.goal_state();
+    /// Reserves the single activation slot for the given committed state
+    /// snapshot and spawns the continuation turn.
+    ///
+    /// The snapshot MUST be the result of the create/resume transition this
+    /// reservation belongs to, delivered through
+    /// [`crate::GoalRuntime::create_and_reserve`] /
+    /// [`crate::GoalRuntime::resume_and_reserve`] inside the same lock hold
+    /// as the commit, so the reservation is linearized with every lifecycle
+    /// transition: pause/complete/drop/budget exhaustion/fork can only
+    /// invalidate this reservation after its commit, and a newer create or
+    /// resume can only supersede it after its own commit — the ordering can
+    /// never invert. Repeating the reservation for the same goal revision
+    /// returns [`GoalActivationOutcome::AlreadyActive`].
+    fn reserve_goal_work(
+        &self,
+        active: &Arc<runtime::ApplicationRuntime>,
+        state: &GoalState,
+    ) -> GoalActivationOutcome {
         let goal = state
             .current
             .as_ref()
             .filter(|goal| goal.lifecycle == crate::GoalLifecycle::Active)
-            .ok_or_else(|| anyhow!("goal is not active"))?;
+            .expect("create/resume commits always yield an active goal");
         let key = GoalWorkKey {
             goal_id: goal.id.clone(),
             revision: state.revision,
+            lifecycle_revision: state.lifecycle_revision,
         };
-        let active = self.runtime();
         let turn_guard = active.turn_gate.clone().try_lock_owned().ok();
         let outcome = if turn_guard.is_some() {
             GoalActivationOutcome::Started
@@ -1281,14 +1339,14 @@ impl Application {
         {
             let mut activation = active.goal_work_activation.lock();
             if activation.as_ref() == Some(&key) {
-                return Ok(GoalActivationOutcome::AlreadyActive);
+                return GoalActivationOutcome::AlreadyActive;
             }
             *activation = Some(key.clone());
         }
         active.goal_work_pending.fetch_add(1, Ordering::AcqRel);
         let inner = Arc::downgrade(&self.inner);
         tokio::spawn(run_goal_work(inner, key, turn_guard));
-        Ok(outcome)
+        outcome
     }
 
     pub fn prepare_resumed_goal(&self, forked: bool) -> Result<()> {
@@ -1676,17 +1734,6 @@ impl Application {
                     }
                 }
             }
-        }
-        // Exact trusted agent mention + delegation verb spawns through the
-        // normal orchestration path (AgentUpdated/JobUpdated). Generic skill
-        // or semantic text stays a selection recommendation only.
-        if allow_natural_language_spawn
-            && let Some(runtime) = self.runtime().orchestration_runtime()
-            && runtime
-                .spawn_from_natural_language(runtime.main_agent_id(), 0, &message)?
-                .is_some()
-        {
-            active.todo_cycle_pending.store(true, Ordering::Release);
         }
         inner.publish(ApplicationEvent::Selection(selection));
         if session.todo_reminder_pending() {
@@ -3813,10 +3860,25 @@ async fn run_goal_work(
     }
     let active = inner.runtime();
     let state = active.session.goal_runtime().get();
-    if state.revision != key.revision
+    // A usage charge from a completed prior turn may advance the revision
+    // without touching the goal's identity or lifecycle; that must not cancel
+    // this scheduled continuation. The activation slot is the authority: this
+    // turn runs only while it is still the scheduled work for the same active
+    // goal. A lifecycle/id change (pause, complete, drop, fork, new goal,
+    // budget exhaustion) advances `lifecycle_revision` and invalidates the
+    // key — even across a mutation-only resume that returns the goal to
+    // Active — while a usage-only revision bump keeps the key valid. A
+    // superseding schedule for a newer revision replaces the slot and
+    // cancels this turn.
+    let scheduled = {
+        let activation = active.goal_work_activation.lock();
+        activation.as_ref() == Some(&key)
+    };
+    if !scheduled
         || !state.current.as_ref().is_some_and(|goal| {
             goal.id == key.goal_id && goal.lifecycle == crate::GoalLifecycle::Active
         })
+        || state.lifecycle_revision != key.lifecycle_revision
     {
         clear_goal_work_activation(&inner, &key);
         return;
