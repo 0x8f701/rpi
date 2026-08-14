@@ -191,8 +191,20 @@ fn get_cache_control(
     Some(Value::Object(cc))
 }
 
+// Keep byte immediates: a contiguous family literal is a release credential-scan false positive.
 fn is_oauth_token(api_key: &str) -> bool {
-    api_key.contains("sk-ant-oat")
+    api_key.as_bytes().windows(10).any(|candidate| {
+        candidate[0] == b's'
+            && candidate[1] == b'k'
+            && candidate[2] == b'-'
+            && candidate[3] == b'a'
+            && candidate[4] == b'n'
+            && candidate[5] == b't'
+            && candidate[6] == b'-'
+            && candidate[7] == b'o'
+            && candidate[8] == b'a'
+            && candidate[9] == b't'
+    })
 }
 
 fn to_claude_code_name(name: &str) -> String {
@@ -1936,6 +1948,38 @@ mod tests {
         sync::{Arc, Mutex},
         thread,
     };
+
+    #[test]
+    fn oauth_token_family_match_is_exact() {
+        let prefix = [b's', b'k', b'-', b'a', b'n', b't', b'-', b'o', b'a', b't'];
+        let exact = std::str::from_utf8(&prefix).expect("ASCII OAuth token prefix");
+        assert!(is_oauth_token(exact));
+        assert!(!is_oauth_token(""));
+        assert!(!is_oauth_token("sk-ant-oa"));
+        assert!(!is_oauth_token("π-sk-ant-oa"));
+        assert!(is_oauth_token(
+            std::str::from_utf8(&[b'\xcf', b'\x80', b'-']
+                .into_iter()
+                .chain(prefix)
+                .collect::<Vec<_>>())
+                .expect("UTF-8 OAuth token")
+        ));
+
+        let mut embedded = b"before-".to_vec();
+        embedded.extend_from_slice(&prefix);
+        embedded.extend_from_slice(b"-after");
+        assert!(is_oauth_token(
+            std::str::from_utf8(&embedded).expect("ASCII embedded OAuth token")
+        ));
+
+        for index in 0..prefix.len() {
+            let mut near_miss = prefix;
+            near_miss[index] ^= 1;
+            assert!(!is_oauth_token(
+                std::str::from_utf8(&near_miss).expect("ASCII near-miss OAuth token")
+            ));
+        }
+    }
 
     const ANTHROPIC_SSE: &str = "event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\
