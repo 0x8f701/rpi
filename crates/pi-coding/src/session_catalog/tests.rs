@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use super::*;
-use crate::import::{source_root_for, SourceSessionFormat};
+use crate::import::{parse_omp_chain_public, source_root_for, SourceSessionFormat};
 
 
 struct Fixture {
@@ -1907,6 +1907,740 @@ fn native_pi_excludes_children_subtree_from_default_tree_discovery() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].session_id, "native-parent");
     assert_eq!(rows[0].path, top);
+}
+
+
+/// Write an OMP rotation chain: `count` files where every file after the
+/// first carries a `parentSession` header pointing at the previous file's
+/// absolute path (OMP `newSession({ parentSession })` rotation), plus a
+/// handoff-style custom message on the leaf. Each file contributes one
+/// user/assistant turn whose text embeds the file index.
+fn write_omp_chain(catalog: &SessionCatalog, dir: &str, count: usize) -> Vec<PathBuf> {
+    let directory = catalog
+        .root_for(SessionSourceKind::Omp)
+        .path
+        .join(dir);
+    fs::create_dir_all(&directory).expect("omp chain dir");
+    let mut files = Vec::new();
+    for index in 0..count {
+        let id = format!("omp-chain-{index}");
+        let path = directory.join(format!("{id}.jsonl"));
+        let parent = files
+            .last()
+            .map(|previous: &PathBuf| format!(r#","parentSession":"{}""#, previous.display()))
+            .unwrap_or_default();
+        let mut records = vec![format!(
+            r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-01-01T00:0{index}:00Z","cwd":"<workspace>/chain"{parent}}}"#
+        )];
+        if index + 1 == count {
+            records.push(
+                r#"{"type":"custom_message","customType":"handoff","content":"handoff summary","display":true,"attribution":"agent","id":"handoff-1","parentId":null,"timestamp":"2026-01-01T00:05:00Z"}"#
+                    .to_owned(),
+            );
+        }
+        records.push(format!(
+            r#"{{"type":"message","id":"u{index}","parentId":null,"timestamp":"2026-01-01T00:0{index}:01Z","message":{{"role":"user","content":"chain prompt {index}"}}}}"#
+        ));
+        records.push(format!(
+            r#"{{"type":"message","id":"a{index}","parentId":"u{index}","timestamp":"2026-01-01T00:0{index}:02Z","message":{{"role":"assistant","content":"chain reply {index}"}}}}"#
+        ));
+        fs::write(&path, records.join("\n") + "\n").expect("omp chain file");
+        files.push(path);
+    }
+    files
+}
+
+/// OMP rotates an oversized logical conversation into a new file whose
+/// `session` header records the prior file in `parentSession`. Loading the
+/// leaf must concatenate the complete chain (root → leaf) in order; today the
+/// leaf alone would only carry the final messages.
+#[test]
+fn omp_import_concatenates_rotated_parent_session_chain_in_order() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let chain = write_omp_chain(&catalog, "--chain--", 3);
+    let [root, mid, leaf] = chain.as_slice() else {
+        panic!("expected 3 files");
+    };
+    let before = [
+        fs::read(root).expect("root bytes"),
+        fs::read(mid).expect("mid bytes"),
+    ];
+
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("chained import");
+    assert!(!resolved.reused_existing);
+    assert_eq!(resolved.source_session_id.as_deref(), Some("omp-chain-2"));
+    let texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        [
+            "chain prompt 0",
+            "chain reply 0",
+            "chain prompt 1",
+            "chain reply 1",
+            "chain prompt 2",
+            "chain reply 2",
+        ],
+        "rotation chain must concatenate every file's messages in order"
+    );
+
+    // The emitted native session carries the full history.
+    let native_body = fs::read_to_string(&resolved.path).expect("native body");
+    for text in [
+        "chain prompt 0",
+        "chain reply 1",
+        "chain prompt 2",
+        "chain reply 2",
+    ] {
+        assert!(native_body.contains(text), "native import missing {text:?}");
+    }
+    // Handoff summaries are custom messages, never rendered as turns.
+    assert!(!native_body.contains("handoff summary"));
+
+    // Exactly one native import for the logical session.
+    let native_dir = catalog.root_for(SessionSourceKind::NativePi).path;
+    let native_files = WalkDir::new(&native_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension() == Some(OsStr::new("jsonl")))
+        .count();
+    assert_eq!(native_files, 1);
+
+    // Source files are read-only during the chain load.
+    assert_eq!(fs::read(root).expect("root bytes"), before[0]);
+    assert_eq!(fs::read(mid).expect("mid bytes"), before[1]);
+
+    // Idempotent re-select returns the same native copy with the full chain.
+    let again = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("reuse");
+    assert!(again.reused_existing);
+    assert_eq!(again.path, resolved.path);
+    assert_eq!(again.id, resolved.id);
+    assert_eq!(
+        again.messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        texts
+    );
+}
+
+/// `createBranchedSession` copies active-path entries (original ids) into the
+/// new file while also stamping `parentSession`; chain loading must keep such
+/// overlap exactly once.
+#[test]
+fn omp_chain_deduplicates_overlapping_branch_copies() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let root = write_omp_chain(&catalog, "--branch--", 1).remove(0);
+    let directory = catalog
+        .root_for(SessionSourceKind::Omp)
+        .path
+        .join("--branch--");
+    let leaf = directory.join("omp-branch-leaf.jsonl");
+    // Leaf copies the root turn verbatim (same ids) and adds a new turn.
+    let copied = fs::read_to_string(&root).expect("root body");
+    let records = copied
+        .lines()
+        .chain([
+            r#"{"type":"message","id":"u1","parentId":"a0","timestamp":"2026-01-01T00:01:01Z","message":{"role":"user","content":"chain prompt 1"}}"#,
+            r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-01-01T00:01:02Z","message":{"role":"assistant","content":"chain reply 1"}}"#,
+        ])
+        .map(|line| {
+            if line.contains(r#""type":"session""#) {
+                format!(
+                    r#"{{"type":"session","version":3,"id":"omp-branch-leaf","timestamp":"2026-01-01T00:01:00Z","cwd":"<workspace>/chain","parentSession":"{}"}}"#,
+                    root.display()
+                )
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&leaf, records + "\n").expect("branch leaf");
+
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, &leaf, None)
+        .expect("branch import");
+    let texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        ["chain prompt 0", "chain reply 0", "chain prompt 1", "chain reply 1"],
+        "copied entries must appear once, in first-file order"
+    );
+}
+
+/// Malformed, missing, cyclic, escaping, and bare-id `parentSession`
+/// references fail closed: the load keeps the safe prefix and never follows
+/// the reference.
+#[test]
+fn omp_chain_fails_closed_on_bad_references() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let omp_root = catalog.root_for(SessionSourceKind::Omp).path;
+    let directory = omp_root.join("--closed--");
+    fs::create_dir_all(&directory).expect("dir");
+
+    let write = |name: &str, parent: Option<&str>| {
+        let path = directory.join(format!("{name}.jsonl"));
+        let parent = parent
+            .map(|value| format!(r#","parentSession":"{value}""#))
+            .unwrap_or_default();
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    r#"{{"type":"session","version":3,"id":"{name}","timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>/closed"{parent}}}"#,
+                    "\n",
+                    r#"{{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":"{name} prompt"}}}}"#,
+                    "\n"
+                ),
+                name = name,
+                parent = parent
+            ),
+        )
+        .expect("write");
+        path
+    };
+
+    // Self-reference cycle.
+    let self_ref = write("omp-self", Some(&directory.join("omp-self.jsonl").display().to_string()));
+    let chain = catalog.omp_chain_paths(&self_ref);
+    assert_eq!(chain, vec![self_ref.clone()], "self-reference must not loop");
+
+    // Two-file cycle back to the leaf.
+    let cycle_a = write("omp-cycle-a", None);
+    let cycle_b = write("omp-cycle-b", Some(&cycle_a.display().to_string()));
+    let cycle_a = write("omp-cycle-a", Some(&cycle_b.display().to_string()));
+    let chain = catalog.omp_chain_paths(&cycle_b);
+    assert_eq!(chain, vec![cycle_a, cycle_b], "cycle must stop after one pass");
+
+    // Missing target under the root.
+    let missing = write(
+        "omp-missing",
+        Some(&directory.join("omp-gone.jsonl").display().to_string()),
+    );
+    assert_eq!(
+        catalog.omp_chain_paths(&missing),
+        vec![missing.clone()],
+        "missing parent must fail closed"
+    );
+
+    // Escape target outside the OMP root.
+    let outside = fixture.write("outside-evil.jsonl", "{\"type\":\"session\",\"id\":\"evil\"}\n");
+    let escaped = write("omp-escape", Some(&outside.display().to_string()));
+    assert_eq!(
+        catalog.omp_chain_paths(&escaped),
+        vec![escaped.clone()],
+        "out-of-root parent must never chain"
+    );
+
+    // Bare session id (fork lineage) is not a path reference.
+    let fork = write("omp-fork", Some("019f1234-5678-7000-0000-000000000000"));
+    assert_eq!(
+        catalog.omp_chain_paths(&fork),
+        vec![fork.clone()],
+        "bare id parentSession (fork) must not chain"
+    );
+
+    // Non-JSONL suffix.
+    let odd = write("omp-odd", Some(&omp_root.join("odd.txt").display().to_string()));
+    assert_eq!(
+        catalog.omp_chain_paths(&odd),
+        vec![odd.clone()],
+        "non-jsonl parent must fail closed"
+    );
+
+    // Every failed-closed leaf still imports its own messages.
+    for leaf in [self_ref, missing, escaped, fork, odd] {
+        let resolved = catalog
+            .import_or_resume(SessionSourceKind::Omp, &leaf, None)
+            .expect("leaf import");
+        assert_eq!(resolved.messages.len(), 1);
+    }
+}
+
+/// Task/subagent child trees live at depth 3+ under the parent session stem
+/// and must never be pulled into a rotation chain, even when referenced.
+#[test]
+fn omp_chain_excludes_child_subagent_sessions() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let omp_root = catalog.root_for(SessionSourceKind::Omp).path;
+    let directory = omp_root.join("--work--");
+    let leaf = directory.join("omp-parent.jsonl");
+    fs::create_dir_all(&directory).expect("dir");
+    fs::write(
+        &leaf,
+        format!(
+            concat!(
+                r#"{{"type":"session","version":3,"id":"omp-parent","timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>/work"}}"#,
+                "\n",
+                r#"{{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":"parent prompt"}}}}"#,
+                "\n"
+            ),
+        ),
+    )
+    .expect("leaf");
+    // Depth-3 child under the session stem (OMP `<dir>/<name>/<AgentId>.jsonl`).
+    let child = directory.join("omp-parent").join("child-agent.jsonl");
+    fs::create_dir_all(child.parent().expect("parent")).expect("child dir");
+    fs::write(
+        &child,
+        concat!(
+            r#"{"type":"session","version":3,"id":"omp-child","timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>/work"}"#,
+            "\n",
+            r#"{"type":"message","id":"u","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"child prompt"}}"#,
+            "\n"
+        ),
+    )
+    .expect("child");
+    // Repoint the leaf's parentSession at the depth-3 child.
+    let body = fs::read_to_string(&leaf).expect("leaf body");
+    let body = body.replace(
+        r#""timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>/work""#,
+        &format!(
+            r#""timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>/work","parentSession":"{}""#,
+            child.display()
+        ),
+    );
+    fs::write(&leaf, body).expect("leaf rewrite");
+
+    assert!(
+        !catalog.is_safe_session_path(SessionSourceKind::Omp, &child),
+        "depth-3 child must stay structurally ineligible"
+    );
+    let chain = catalog.omp_chain_paths(&leaf);
+    assert_eq!(chain, vec![leaf.clone()], "child tree must never chain");
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, &leaf, None)
+        .expect("leaf import");
+    let texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(texts, ["parent prompt"], "child messages must stay excluded");
+}
+
+/// The chain walk honors count and byte bounds and keeps the safe prefix.
+#[test]
+fn omp_chain_bounds_limit_count_and_bytes() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let chain = write_omp_chain(&catalog, "--bounded--", 10);
+    let leaf = chain.last().expect("leaf");
+
+    // Count bound: the leaf-anchored walk keeps at most 8 files — the newest
+    // 8, since the oldest ancestors drop when the budget runs out.
+    let (bounded, bounded_fingerprint) = catalog.omp_chain_probe_bounded(leaf, 8, u64::MAX);
+    assert_eq!(bounded.len(), 8);
+    assert_eq!(&bounded[..3], &chain[2..5], "newest files first in root order");
+    assert_eq!(bounded.last(), Some(leaf));
+    assert_eq!(bounded_fingerprint.split('\n').count(), 8, "fingerprint covers every walked member");
+
+    // Import of an over-long chain truncates at the bound but still works.
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("bounded import");
+    let texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(texts.len(), 16, "8 files x one user/assistant turn");
+    assert!(texts.contains(&"chain prompt 2"), "oldest retained message present");
+    assert!(!texts.contains(&"chain prompt 1"), "over-budget file excluded");
+    assert!(texts.contains(&"chain prompt 9"), "leaf always included");
+    // The walk fingerprint and the parse fingerprint agree on the same chain.
+    let omp_root = catalog.root_for(SessionSourceKind::Omp).path;
+    let (_, parse_fingerprint) = parse_omp_chain_public(&omp_root, &bounded, u64::MAX)
+        .expect("parse of walked chain");
+    assert_eq!(
+        parse_fingerprint, bounded_fingerprint,
+        "walk and parse chain fingerprints must agree"
+    );
+
+    // Byte bound: budget covering leaf + its direct parent excludes the next
+    // ancestor.
+    let [root, mid] = [&chain[0], &chain[8]];
+    let mid_size = fs::metadata(mid).expect("mid meta").len();
+    let leaf_size = fs::metadata(leaf).expect("leaf meta").len();
+    let tight = catalog.omp_chain_probe_bounded(leaf, 8, mid_size + leaf_size).0;
+    assert_eq!(tight, vec![mid.clone(), leaf.clone()], "earlier ancestor excluded by byte budget");
+    let leaf_only = catalog.omp_chain_probe_bounded(leaf, 8, leaf_size).0;
+    assert_eq!(leaf_only, vec![leaf.clone()], "only the leaf fits the budget");
+    assert_eq!(catalog.omp_chain_probe_bounded(root, 8, u64::MAX).0, vec![root.clone()]);
+}
+
+/// The OMP lineage fingerprint covers every chain member: mutating an
+/// ancestor's content + mtime while the leaf stays unchanged must yield a
+/// fresh import with the updated transcript, never a reused stale native copy.
+#[test]
+fn omp_chain_reimports_when_ancestor_content_changes() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let chain = write_omp_chain(&catalog, "--refinger--", 3);
+    let leaf = chain[2].clone();
+    let mid = &chain[1];
+
+    let first = catalog
+        .import_or_resume(SessionSourceKind::Omp, &leaf, None)
+        .expect("first chained import");
+    assert!(!first.reused_existing);
+    let first_texts = first
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(first_texts.len(), 6, "full chain on first import");
+    let first_body = fs::read_to_string(&first.path).expect("first body");
+    assert!(first_body.contains("chain reply 1"));
+
+    // Mutate ONLY the middle ancestor (content + mtime); leaf untouched.
+    fs::write(
+        mid,
+        fs::read_to_string(mid)
+            .expect("mid body")
+            .replace("chain prompt 1", "chain prompt MUTATED")
+            .replace("chain reply 1", "chain reply MUTATED"),
+    )
+    .expect("mutate mid");
+    set_modified(mid, 42_000);
+
+    // Catalog/UI path: after the ancestor mutation the leaf row's chain
+    // fingerprint no longer matches the stored import, so the row must NOT be
+    // marked AlreadyImported (selection re-enters import_or_resume instead of
+    // short-circuiting to the stale native copy).
+    let rows_before = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        ..CatalogListOptions::default()
+    });
+    let row_before = rows_before
+        .iter()
+        .find(|row| row.session_id == "omp-chain-2")
+        .expect("leaf row");
+    assert!(
+        matches!(row_before.status, CatalogRowStatus::Foreign),
+        "mutated ancestor must mark the leaf row Foreign, got {:?}",
+        row_before.status
+    );
+
+    let second = catalog
+        .import_or_resume(SessionSourceKind::Omp, &leaf, None)
+        .expect("reimport after ancestor mutation");
+    assert!(
+        !second.reused_existing,
+        "ancestor change must not reuse the stale native copy"
+    );
+    assert_ne!(second.path, first.path, "fresh native import expected");
+    assert_ne!(second.id, first.id, "chain fingerprint must change the import id");
+    let second_body = fs::read_to_string(&second.path).expect("second body");
+    assert!(
+        second_body.contains("chain prompt MUTATED"),
+        "updated ancestor transcript must be in the new import"
+    );
+    assert!(second_body.contains("chain prompt 0"), "full chain retained");
+    assert!(second_body.contains("chain prompt 2"), "leaf retained");
+    // The stale copy is never deleted, but is no longer the selection.
+    assert!(first.path.exists(), "stale import file is left in place");
+
+    // Scan now marks the row AlreadyImported pointing at the FRESH import
+    // (exact chain-fingerprint match among the same-identity natives).
+    let rows_after = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        ..CatalogListOptions::default()
+    });
+    let row_after = rows_after
+        .iter()
+        .find(|row| row.session_id == "omp-chain-2")
+        .expect("leaf row after reimport");
+    match &row_after.status {
+        CatalogRowStatus::AlreadyImported { native_path, .. } => {
+            assert_eq!(native_path, &second.path, "row must point at the fresh import");
+        }
+        other => panic!("expected AlreadyImported after reimport, got {other:?}"),
+    }
+
+    // Unchanged leaf + ancestors after the new import reuse the newest copy.
+    let third = catalog
+        .import_or_resume(SessionSourceKind::Omp, &leaf, None)
+        .expect("settled reuse");
+    assert!(third.reused_existing);
+    assert_eq!(third.path, second.path);
+}
+
+/// The aggregate byte bound is revalidated authoritatively at parse time from
+/// the securely opened descriptors (newest prefix retained, leaf
+/// unconditional), and the chain fingerprint reflects the retained members.
+#[test]
+fn omp_chain_aggregate_byte_bound_revalidated_at_parse() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let chain = write_omp_chain(&catalog, "--parsebound--", 3);
+    let root = catalog.root_for(SessionSourceKind::Omp).path;
+
+    let (full, full_fingerprint) = parse_omp_chain_public(&root, &chain, u64::MAX)
+        .expect("full chain parse");
+    assert_eq!(full.messages.len(), 6);
+    assert!(full.messages.iter().any(|m| m.text == "chain prompt 0"));
+
+    // Budget covering leaf + mid excludes the root at parse time.
+    let mid_size = fs::metadata(&chain[1]).expect("mid meta").len();
+    let leaf_size = fs::metadata(&chain[2]).expect("leaf meta").len();
+    let (truncated, truncated_fingerprint) =
+        parse_omp_chain_public(&root, &chain, mid_size + leaf_size).expect("bounded parse");
+    let texts = truncated
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        ["chain prompt 1", "chain reply 1", "chain prompt 2", "chain reply 2"],
+        "parse-time retention keeps the newest prefix and always the leaf"
+    );
+    assert_ne!(
+        truncated_fingerprint, full_fingerprint,
+        "fingerprint must cover exactly the retained members"
+    );
+    // Leaf-only budget still yields the leaf (unconditional).
+    let (leaf_only, _) = parse_omp_chain_public(&root, &chain, leaf_size).expect("leaf parse");
+    let leaf_texts = leaf_only
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(leaf_texts, ["chain prompt 2", "chain reply 2"]);
+}
+
+/// Linkage is revalidated against the parsed content: a member whose parsed
+/// `parentSession` no longer references its predecessor fails closed at parse
+/// time instead of stitching unrelated files together.
+#[test]
+fn omp_chain_parse_revalidates_linkage_and_fails_closed() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let chain = write_omp_chain(&catalog, "--linkage--", 3);
+    let root = catalog.root_for(SessionSourceKind::Omp).path;
+    let leaf_path = &chain[2];
+
+    let (full, full_fingerprint) =
+        parse_omp_chain_public(&root, &chain, u64::MAX).expect("consistent chain");
+    assert_eq!(full.messages.len(), 6);
+    let (again, again_fingerprint) =
+        parse_omp_chain_public(&root, &chain, u64::MAX).expect("consistent chain again");
+    assert_eq!(again_fingerprint, full_fingerprint, "digest is deterministic");
+    assert_eq!(again.messages.len(), 6);
+
+    // Break the middle member's parentSession: it no longer references the
+    // root, so the root must be dropped (fail closed) while the leaf→middle
+    // link still holds. The bogus reference is a fixture-derived path that is
+    // not part of the chain.
+    let bogus_root = chain[0].with_file_name("not-the-root.jsonl");
+    let mid_body = fs::read_to_string(&chain[1]).expect("mid body");
+    fs::write(
+        &chain[1],
+        mid_body.replace(
+            &format!(r#","parentSession":"{}""#, chain[0].display()),
+            &format!(r#","parentSession":"{}""#, bogus_root.display()),
+        ),
+    )
+    .expect("rewrite mid linkage");
+    let (drifted, drifted_fingerprint) =
+        parse_omp_chain_public(&root, &chain, u64::MAX).expect("drifted chain");
+    let texts = drifted
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        ["chain prompt 1", "chain reply 1", "chain prompt 2", "chain reply 2"],
+        "broken root link must drop the root, keep the consistent newest prefix"
+    );
+    assert_ne!(drifted_fingerprint, full_fingerprint);
+
+    // Break the leaf's parentSession too: the chain collapses to the leaf.
+    let bogus_mid = chain[1].with_file_name("not-the-mid.jsonl");
+    let leaf_body = fs::read_to_string(leaf_path).expect("leaf body");
+    fs::write(
+        leaf_path,
+        leaf_body.replace(
+            &format!(r#","parentSession":"{}""#, chain[1].display()),
+            &format!(r#","parentSession":"{}""#, bogus_mid.display()),
+        ),
+    )
+    .expect("rewrite leaf linkage");
+    let (collapsed, _) =
+        parse_omp_chain_public(&root, &chain, u64::MAX).expect("collapsed chain");
+    let collapsed_texts = collapsed
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        collapsed_texts,
+        ["chain prompt 2", "chain reply 2"],
+        "broken leaf link must collapse to the leaf alone"
+    );
+
+    // The catalog import path applies the same fail-closed behavior.
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf_path, None)
+        .expect("import after drift");
+    let resolved_texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(resolved_texts, collapsed_texts);
+}
+
+/// Two fingerprint-scoped imports share one leaf identity; the lineage index
+/// must NOT collapse to the last path sorted. Exact chain-fingerprint
+/// matching must resolve the fresh import even when the stale file sorts
+/// last lexically, and a fresh scan must point at the matching native copy.
+#[test]
+fn omp_lineage_index_resolves_matching_fingerprint_across_same_identity() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let chain = write_omp_chain(&catalog, "--multimap--", 3);
+    let leaf = &chain[2];
+
+    let first = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("first import");
+    let stale_path = first.path.clone();
+
+    // Mutate the middle ancestor and re-import: same leaf identity, different
+    // chain fingerprint -> a second native import.
+    fs::write(
+        &chain[1],
+        fs::read_to_string(&chain[1])
+            .expect("mid body")
+            .replace("chain prompt 1", "chain prompt MUTATED"),
+    )
+    .expect("mutate mid");
+    set_modified(&chain[1], 43_000);
+    let second = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("second import");
+    assert_ne!(second.path, stale_path);
+    let fresh_path = second.path.clone();
+
+    // Plant the OPPOSITE path sort: the stale import sorts LAST lexically.
+    let fresh_renamed = fresh_path
+        .parent()
+        .expect("native parent")
+        .join("import_aaa_fresh.jsonl");
+    let stale_renamed = stale_path
+        .parent()
+        .expect("native parent")
+        .join("import_zzz_stale.jsonl");
+    fs::rename(&fresh_path, &fresh_renamed).expect("rename fresh");
+    fs::rename(&stale_path, &stale_renamed).expect("rename stale");
+
+    // The index keeps BOTH same-identity imports with their stored lineage.
+    let index = catalog.build_lineage_index();
+    let entries = index
+        .get(&(SessionSourceKind::Omp, "id:omp-chain-2".to_owned()))
+        .expect("identity entries");
+    assert_eq!(entries.len(), 2, "both imports must share the identity slot");
+
+    // Scan resolves the fresh import by exact chain fingerprint (not the
+    // last-sorted stale file).
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        ..CatalogListOptions::default()
+    });
+    let row = rows
+        .iter()
+        .find(|row| row.session_id == "omp-chain-2")
+        .expect("leaf row");
+    match &row.status {
+        CatalogRowStatus::AlreadyImported { native_path, .. } => {
+            assert_eq!(
+                native_path, &fresh_renamed,
+                "scan must point at the fingerprint-matching import, not the last-sorted file"
+            );
+        }
+        other => panic!("expected AlreadyImported, got {other:?}"),
+    }
+
+    // A third selection resolves the matching fingerprint, not the stale one.
+    let third = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("third selection");
+    assert!(third.reused_existing);
+    assert_eq!(third.path, fresh_renamed);
+}
+
+/// Non-OMP kinds never chain: a Codex file carrying an OMP-style
+/// `parentSession` header reference loads exactly its own file.
+#[test]
+fn non_omp_sources_never_follow_parent_session_references() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    // A second session that would be chained if the reference were followed.
+    let parent = write_codex(
+        &catalog,
+        "rollout-parent-target.jsonl",
+        "codex-parent",
+        "<workspace>/plain",
+        "parent prompt",
+    );
+    let source = write_codex(
+        &catalog,
+        "rollout-parent-ref.jsonl",
+        "codex-plain",
+        "<workspace>/plain",
+        "plain prompt",
+    );
+    // Inject an OMP-style absolute parentSession into the Codex session_meta
+    // record; non-OMP sources must ignore it entirely.
+    let body = fs::read_to_string(&source).expect("codex body");
+    let body = body.replace(
+        r#""payload":{"id":"codex-plain","cwd":"<workspace>/plain"}"#,
+        &format!(
+            r#""payload":{{"id":"codex-plain","cwd":"<workspace>/plain","parentSession":"{parent}"}}"#,
+            parent = parent.display()
+        ),
+    );
+    fs::write(&source, body).expect("rewrite codex");
+
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Codex, &source, None)
+        .expect("codex import");
+    let texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts, ["plain prompt", "ok"],
+        "parentSession reference must never chain a non-OMP source"
+    );
+    assert_eq!(resolved.source_session_id.as_deref(), Some("codex-plain"));
+    assert!(
+        !texts.iter().any(|text| text.contains("parent prompt")),
+        "the referenced file's messages must stay out"
+    );
 }
 
 

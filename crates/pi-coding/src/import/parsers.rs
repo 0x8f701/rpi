@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -126,7 +126,42 @@ fn parse_native(
     path: &Path,
     file: fs::File,
 ) -> Result<ParsedSession, ImportSessionError> {
+    let native = read_native_turns(source, path, file)?;
+    let (messages, meaningful_count) = project_turns(&native.turns);
+    Ok(ParsedSession {
+        source_session_id: native.source_session_id,
+        cwd: native.cwd,
+        started_at: native.started_at,
+        messages,
+        meaningful_count,
+    })
+}
+
+/// Active-path turns of one native/OMP file, retaining the node identity and
+/// meaningfulness needed by rotation-chain merging.
+struct NativeTurns {
+    source_session_id: Option<String>,
+    cwd: PathBuf,
+    started_at: Option<String>,
+    /// Raw `parentSession` header value (the prior rotated file reference).
+    parent_session: Option<String>,
+    turns: Vec<ActiveTurn>,
+}
+
+fn read_native_turns(
+    source: SourceSessionFormat,
+    path: &Path,
+    file: fs::File,
+) -> Result<NativeTurns, ImportSessionError> {
     let contents = read_bounded_text_from(file, path, MAX_SOURCE_BYTES)?;
+    read_native_turns_from_contents(source, path, &contents)
+}
+
+fn read_native_turns_from_contents(
+    source: SourceSessionFormat,
+    path: &Path,
+    contents: &str,
+) -> Result<NativeTurns, ImportSessionError> {
     if contents.trim().is_empty() {
         return Err(ImportSessionError::NoConvertibleMessages {
             format: source,
@@ -168,18 +203,266 @@ fn parse_native(
         .get("timestamp")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let parent_session = header
+        .get("parentSession")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let nodes = values[header_index + 1..]
         .iter()
         .filter_map(native_node)
         .collect::<Vec<_>>();
-    let (messages, meaningful_count) = active_messages(&nodes);
-    Ok(ParsedSession {
+    Ok(NativeTurns {
         source_session_id,
         cwd,
         started_at,
-        messages,
-        meaningful_count,
+        parent_session,
+        turns: active_turns(&nodes),
     })
+}
+
+/// One ordered active-path turn of a native/OMP file.
+#[derive(Debug, Clone)]
+struct ActiveTurn {
+    /// Record `id`, used to deduplicate entries copied across rotated files.
+    id: String,
+    meaningful: bool,
+    message: Option<ImportedMessage>,
+}
+
+/// One parsed chain member with the identity and linkage needed for
+/// adjacency revalidation.
+struct ParsedChainMember {
+    path: PathBuf,
+    parent_session: Option<String>,
+    fingerprint: String,
+    native: NativeTurns,
+}
+
+/// Parse a rotation chain of OMP session files (root → leaf order) into one
+/// logical session. The leaf's header identity and cwd anchor the result; the
+/// root file anchors the start time. Message entries duplicated across files
+/// (e.g. `createBranchedSession` copies entries with their original ids) are
+/// kept once, from their earliest file.
+///
+/// Every candidate member is opened through the configured root capability
+/// ONCE and parsed from that same descriptor — no ambient reopens. The opened
+/// descriptors provide the authoritative aggregate byte budget (the newest
+/// chain prefix that fits `max_bytes` is retained; the leaf always stays).
+/// An ancestor that cannot be opened or parsed is excluded, and the adjacency
+/// revalidation below then drops it and everything older, retaining the safe
+/// newest prefix instead of failing the leaf import. Linkage is revalidated
+/// against the parsed content itself: a member is kept only when the
+/// next-newer member's `parentSession` equals its path, so a header swap
+/// between traversal and parse fails closed instead of stitching unrelated
+/// files together. The returned fingerprint joins one metadata fingerprint
+/// (`{mtime_secs}:{size}`, from the same opened descriptor) per accepted
+/// member, so any ancestor or leaf change yields a different chain identity.
+pub(super) fn parse_omp_chain(
+    root: &Path,
+    paths: &[PathBuf],
+    max_bytes: u64,
+) -> Result<(ParsedSession, String), ImportSessionError> {
+    if paths.is_empty() {
+        return Err(ImportSessionError::InvalidNativeHeader {
+            format: SourceSessionFormat::Omp,
+            path: PathBuf::from("<empty chain>"),
+        });
+    }
+    let mut opened = Vec::with_capacity(paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        let is_leaf = index + 1 == paths.len();
+        match super::open_source_under_root(SourceSessionFormat::Omp, root, path) {
+            Ok(member) => opened.push(Some(member)),
+            // An unreadable ancestor cannot be trusted; exclude it and let the
+            // adjacency pass retain the safe newest prefix.
+            Err(_) if !is_leaf => opened.push(None),
+            Err(error) => return Err(error),
+        }
+    }
+    // Keep the newest chain prefix that fits the aggregate budget, measured
+    // from the opened descriptors (authoritative revalidation; the catalog's
+    // traversal-side check only bounds the walk). The leaf is unconditional.
+    let mut retained = Vec::new();
+    let mut total_bytes = 0_u64;
+    for (index, member) in opened.into_iter().enumerate().rev() {
+        let Some(member) = member else {
+            continue;
+        };
+        let size = member.metadata().len();
+        let is_leaf = index + 1 == paths.len();
+        if !is_leaf && total_bytes.saturating_add(size) > max_bytes {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(size);
+        let fingerprint = super::metadata_fingerprint(member.metadata());
+        retained.push((member, fingerprint));
+    }
+    retained.reverse();
+
+    // Parse every retained member from its own opened descriptor; an ancestor
+    // parse failure excludes the member (the adjacency pass drops it and
+    // everything older), while a leaf failure is fatal.
+    let retained_len = retained.len();
+    let mut members = Vec::with_capacity(retained_len);
+    for (index, (member, fingerprint)) in retained.into_iter().enumerate() {
+        let is_leaf = index + 1 == retained_len;
+        let OpenedSourceParts { path, primary, .. } = member.into_parts();
+        let parsed = (|| -> Result<ParsedChainMember, ImportSessionError> {
+            let contents = read_bounded_text_from(primary, &path, MAX_SOURCE_BYTES)?;
+            let native = read_native_turns_from_contents(SourceSessionFormat::Omp, &path, &contents)?;
+            Ok(ParsedChainMember {
+                path,
+                parent_session: native.parent_session.clone(),
+                fingerprint,
+                native,
+            })
+        })();
+        match parsed {
+            Ok(member) => members.push(member),
+            Err(_) if !is_leaf => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    // Fail closed on linkage drift: keep the newest prefix where every
+    // retained member is referenced by the next-newer member's parsed
+    // `parentSession` (same descriptor/content that is being imported). The
+    // leaf is unconditional; a broken link (or an excluded failed member)
+    // drops that member and everything older instead of stitching unrelated
+    // files together.
+    let mut accepted = vec![&members[members.len() - 1]];
+    let mut cursor = members.len() - 1;
+    while cursor > 0 {
+        let newer = &members[cursor];
+        let predecessor = &members[cursor - 1];
+        let linked = newer
+            .parent_session
+            .as_deref()
+            .is_some_and(|parent| parent == predecessor.path.to_str().unwrap_or_default());
+        if !linked {
+            break;
+        }
+        accepted.push(predecessor);
+        cursor -= 1;
+    }
+    accepted.reverse();
+
+    let accepted_len = accepted.len();
+    let mut turns = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut source_session_id = None;
+    let mut cwd = PathBuf::new();
+    let mut started_at = None;
+    let mut fingerprints = Vec::with_capacity(accepted_len);
+    for (index, member) in accepted.into_iter().enumerate() {
+        if index + 1 == accepted_len {
+            source_session_id = member.native.source_session_id.clone();
+            cwd = member.native.cwd.clone();
+        }
+        if index == 0 {
+            started_at = member.native.started_at.clone();
+        }
+        fingerprints.push(member.fingerprint.clone());
+        for turn in &member.native.turns {
+            if seen_ids.insert(turn.id.clone()) {
+                turns.push(turn.clone());
+            }
+        }
+    }
+    let (messages, meaningful_count) = project_turns(&turns);
+    let fingerprint = fingerprints.join("\n");
+    Ok((
+        ParsedSession {
+            source_session_id,
+            cwd,
+            started_at,
+            messages,
+            meaningful_count,
+        },
+        fingerprint,
+    ))
+}
+
+/// Read the OMP `parentSession` header reference (absolute path of the prior
+/// rotated session file) from an already-secured handle. Non-OMP sources and
+/// files without the field return `None`; malformed headers fail closed.
+pub(super) fn source_parent_session_opened(
+    source: SourceSessionFormat,
+    opened: &OpenedSource,
+) -> Result<Option<String>, ImportSessionError> {
+    if source != SourceSessionFormat::Omp {
+        return Ok(None);
+    }
+    read_omp_parent_session(opened.primary_ref(), opened.path())
+}
+
+/// Bounded header read: the OMP session record is line 1, or line 2 behind the
+/// title slot, so only the first two records are parsed.
+fn read_omp_parent_session(
+    file: &fs::File,
+    path: &Path,
+) -> Result<Option<String>, ImportSessionError> {
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(0)).map_err(|source| ImportSessionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut values = Vec::new();
+    let mut buffer = Vec::new();
+    while values.len() < 2 {
+        buffer.clear();
+        let read = reader
+            .by_ref()
+            .take(MAX_LINE_BYTES.saturating_add(3) as u64)
+            .read_until(b'\n', &mut buffer)
+            .map_err(|source| ImportSessionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        let mut frame_bytes = buffer.len();
+        if buffer.get(frame_bytes.wrapping_sub(1)) == Some(&b'\n') {
+            frame_bytes -= 1;
+            if buffer.get(frame_bytes.wrapping_sub(1)) == Some(&b'\r') {
+                frame_bytes -= 1;
+            }
+        }
+        if frame_bytes > MAX_LINE_BYTES {
+            return Err(resource_limit(
+                path,
+                format!("JSONL line exceeds {MAX_LINE_BYTES} bytes"),
+            ));
+        }
+        let line = std::str::from_utf8(&buffer[..frame_bytes])
+            .map_err(|_| resource_limit(path, "source is not valid UTF-8".to_owned()))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) if value.is_object() => values.push(value),
+            Ok(_) => {}
+            Err(source) => {
+                return Err(ImportSessionError::Json {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    let header = values
+        .into_iter()
+        .find(|value| value.get("type").and_then(Value::as_str) == Some("session"));
+    Ok(header.and_then(|value| {
+        value
+            .get("parentSession")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }))
 }
 
 fn valid_omp_title_slot(value: &Value) -> bool {
@@ -233,13 +516,30 @@ fn native_node(value: &Value) -> Option<TreeNode> {
 }
 
 fn active_messages(nodes: &[TreeNode]) -> (Vec<ImportedMessage>, usize) {
+    project_turns(&active_turns(nodes))
+}
+
+/// Project ordered active-path turns into the lossy message list and the
+/// meaningful-turn count.
+fn project_turns(turns: &[ActiveTurn]) -> (Vec<ImportedMessage>, usize) {
+    let meaningful_count = turns.iter().filter(|turn| turn.meaningful).count();
+    let messages = turns
+        .iter()
+        .filter_map(|turn| turn.message.clone())
+        .collect::<Vec<_>>();
+    (messages, meaningful_count)
+}
+
+/// Ordered active-path turns (root → leaf) of one native/OMP file, retaining
+/// node identity and meaningfulness for rotation-chain merging.
+fn active_turns(nodes: &[TreeNode]) -> Vec<ActiveTurn> {
     let by_id = nodes
         .iter()
         .enumerate()
         .map(|(index, node)| (node.id.as_str(), index))
         .collect::<HashMap<_, _>>();
     let Some(mut cursor) = nodes.len().checked_sub(1) else {
-        return (Vec::new(), 0);
+        return Vec::new();
     };
     let mut path = Vec::new();
     let mut visited = HashSet::new();
@@ -274,22 +574,25 @@ fn active_messages(nodes: &[TreeNode]) -> (Vec<ImportedMessage>, usize) {
                 })
                 .unwrap_or(position)
         });
-    let mut messages = Vec::new();
-    let mut meaningful_count = 0usize;
-    for index in &path[start..] {
-        let node = &nodes[*index];
-        if node.meaningful {
-            meaningful_count += 1;
-        }
-        if let (Some(role), Some(text)) = (node.role, node.text.clone()) {
-            messages.push(ImportedMessage {
-                role,
-                text,
-                timestamp: node.timestamp.clone(),
-            });
-        }
-    }
-    (messages, meaningful_count)
+    path[start..]
+        .iter()
+        .map(|index| {
+            let node = &nodes[*index];
+            let message = match (node.role, node.text.clone()) {
+                (Some(role), Some(text)) => Some(ImportedMessage {
+                    role,
+                    text,
+                    timestamp: node.timestamp.clone(),
+                }),
+                _ => None,
+            };
+            ActiveTurn {
+                id: node.id.clone(),
+                meaningful: node.meaningful,
+                message,
+            }
+        })
+        .collect()
 }
 
 /// Whether message content carries a meaningful user/assistant turn: non-empty

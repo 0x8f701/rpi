@@ -25,6 +25,15 @@
 //   X5  X5.1 leave the imported session then re-select the native copy
 //       X5.2 re-select reuses the same native session file (lineage reuse;
 //            import_*.jsonl count still 1)
+//   X7  X7.1 click the rotated OMP leaf row -> distinct native import copy
+//       X7.2 imported transcript renders the full parentSession chain
+//            (early + middle + final user/assistant turns, ordered once)
+//       X7.3 exactly one import_*.jsonl carrying the whole chain; no handoff
+//            custom-message text, no child-session text
+//       X7.4 task/subagent child session row absent and child text never
+//            rendered
+//   X8  X8.1 all four OMP source files (early/mid/final/child) byte+mtime
+//            immutable after chain import
 //   X6  X6.1 sessionImportSources:[] — foreign OMP/Codex/Grok rows absent
 //       X6.2 native seed still listed under native-only policy
 //
@@ -59,6 +68,8 @@ const PHASE_IDS = {
     'X3.1', 'X3.2',
     'X4.1', 'X4.2',
     'X5.1', 'X5.2',
+    'X7.1', 'X7.2', 'X7.3', 'X7.4',
+    'X8.1',
   ],
   native_only: [
     'X6.1', 'X6.2',
@@ -556,6 +567,130 @@ async function runDefaultPhase(page, meta) {
   record('X5.2');
   await page.screenshot({ path: `${evidence}/external-x5-reuse.png`, fullPage: true });
 
+  /* ---------------- X7: OMP rotation chain loads fully, ordered once ------- */
+  // The seeded OMP logical conversation is rotated across three
+  // `parentSession`-linked files (early -> middle -> final). Clicking the leaf
+  // must transparently import ONE native copy whose transcript renders every
+  // file's user/assistant turns in order, exactly once each — while the
+  // depth-3 task/subagent child session stays excluded.
+  for (const p of [meta.ompEarlyPath, meta.ompMidPath, meta.ompFinalPath, meta.ompChildPath]) {
+    if (!fs.existsSync(p)) fail(`X7 precondition: OMP fixture missing at ${p}`);
+  }
+  const ompBefore = {};
+  for (const [label, p] of [['early', meta.ompEarlyPath], ['mid', meta.ompMidPath],
+    ['final', meta.ompFinalPath], ['child', meta.ompChildPath]]) {
+    ompBefore[label] = fileFingerprint(p);
+  }
+  const ompImportsBefore = listImportFiles(nativeSessionsRoot);
+
+  await clickSidebarSession(page, meta.ompId);
+
+  await waitFor(
+    page,
+    (ids) => {
+      const active = document.querySelector('.session-sidebar__row--active .session-sidebar__switch');
+      if (!active) return false;
+      const sid = active.dataset.sessionId || '';
+      const source = active.dataset.sessionSource || '';
+      const isNative = source === 'pi' || source === 'native' || source === 'primary';
+      return isNative && !ids.includes(sid);
+    },
+    'X7.1: OMP leaf click never activated a distinct native copy',
+    30000,
+    [meta.ompId, meta.ompEarlyId, meta.ompMidId, meta.ompChildId, importedNativeId, activeSid]
+  );
+  record('X7.1');
+
+  // Full chain transcript: early, middle, AND final user/assistant turns all
+  // render, in chronological order, each exactly once.
+  await waitFor(
+    page,
+    (needles) => {
+      const text = document.getElementById('transcript')?.textContent || '';
+      return needles.every((needle) => text.includes(needle));
+    },
+    'X7.2: imported transcript never restored the full OMP rotation chain',
+    30000,
+    ['OMP early prompt', 'OMP early reply', 'OMP middle prompt', 'OMP middle reply',
+      'OMP final prompt', 'OMP final reply']
+  );
+  const chainTranscript = await activeTranscript(page);
+  const chainNeedles = [
+    ['OMP early prompt', 'OMP early reply'],
+    ['OMP middle prompt', 'OMP middle reply'],
+    ['OMP final prompt', 'OMP final reply'],
+  ];
+  for (const [prompt, reply] of chainNeedles) {
+    const promptAt = chainTranscript.indexOf(prompt);
+    const replyAt = chainTranscript.indexOf(reply);
+    if (promptAt === -1 || replyAt === -1) fail(`X7.2: chain turn missing (${prompt})`);
+    if (promptAt >= replyAt) fail(`X7.2: chain turn out of order (${prompt} before ${reply})`);
+  }
+  const earlyAt = chainTranscript.indexOf('OMP early prompt');
+  const middleAt = chainTranscript.indexOf('OMP middle prompt');
+  const finalAt = chainTranscript.indexOf('OMP final prompt');
+  if (!(earlyAt < middleAt && middleAt < finalAt)) {
+    fail(`X7.2: chain order not chronological (early=${earlyAt} middle=${middleAt} final=${finalAt})`);
+  }
+  for (const needle of ['OMP early prompt', 'OMP early reply', 'OMP middle prompt',
+    'OMP middle reply', 'OMP final prompt', 'OMP final reply']) {
+    const occurrences = chainTranscript.split(needle).length - 1;
+    if (occurrences !== 1) fail(`X7.2: chain text "${needle}" rendered ${occurrences} times (expected 1)`);
+  }
+  record('X7.2');
+
+  // Exactly one new import containing the whole chain; handoff custom
+  // messages and child-session content never reach the native file.
+  const ompDeadline = Date.now() + 15000;
+  let ompImportsAfter = listImportFiles(nativeSessionsRoot);
+  while (ompImportsAfter.length <= ompImportsBefore.length && Date.now() < ompDeadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    ompImportsAfter = listImportFiles(nativeSessionsRoot);
+  }
+  const ompNewImports = ompImportsAfter.filter((p) => !ompImportsBefore.includes(p));
+  if (ompNewImports.length !== 1) {
+    fail(`X7.3: expected exactly one OMP chain import (new=${ompNewImports.join(', ')})`);
+  }
+  const ompImportBody = fs.readFileSync(ompNewImports[0], 'utf8');
+  for (const needle of ['OMP early prompt', 'OMP early reply', 'OMP middle prompt',
+    'OMP middle reply', 'OMP final prompt', 'OMP final reply']) {
+    if (!ompImportBody.includes(needle)) fail(`X7.3: chained import missing ${needle}`);
+  }
+  if (ompImportBody.includes('handoff context')) {
+    fail('X7.3: handoff custom-message text leaked into the chained import');
+  }
+  if (ompImportBody.includes('OMP child prompt')) {
+    fail('X7.3: task/subagent child content leaked into the chained import');
+  }
+  record('X7.3');
+
+  // Child session: never a sidebar row, never a rendered message.
+  const snap7 = await sidebarSnapshot(page);
+  if (snap7.rows.some((r) => r.sessionId === meta.ompChildId)) {
+    fail(`X7.4: child session ${meta.ompChildId} listed in the sidebar`);
+  }
+  if (chainTranscript.includes('OMP child prompt')) {
+    fail('X7.4: child session text rendered in the transcript');
+  }
+  record('X7.4');
+  await page.screenshot({ path: `${evidence}/external-x7-omp-chain.png`, fullPage: true });
+
+  /* ---------------- X8: OMP sources immutable after chain import ----------- */
+  for (const [label, p] of [['early', meta.ompEarlyPath], ['mid', meta.ompMidPath],
+    ['final', meta.ompFinalPath], ['child', meta.ompChildPath]]) {
+    const after = fileFingerprint(p);
+    if (after.sha256 !== ompBefore[label].sha256 || after.size !== ompBefore[label].size) {
+      fail(`X8.1: OMP ${label} source bytes changed after chain import`);
+    }
+    if (!after.bytes.equals(ompBefore[label].bytes)) {
+      fail(`X8.1: OMP ${label} source byte content changed after chain import`);
+    }
+    if (after.mtimeMs !== ompBefore[label].mtimeMs) {
+      fail(`X8.1: OMP ${label} source mtime changed (${ompBefore[label].mtimeMs} -> ${after.mtimeMs})`);
+    }
+  }
+  record('X8.1');
+
   // Persist the imported native id for operators inspecting evidence.
   fs.writeFileSync(
     path.join(evidence, 'import-result.json'),
@@ -564,6 +699,7 @@ async function runDefaultPhase(page, meta) {
       importedNativeId,
       sessionFileAfterImport: sessionFile,
       sessionFileAfterReuse: sessionFile2,
+      ompChainImportPath: ompNewImports[0],
       foreignCodexSha256: beforeForeign.sha256,
       foreignCodexMtimeMs: beforeForeign.mtimeMs,
     }, null, 2),

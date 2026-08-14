@@ -41,7 +41,7 @@ main() {
     case "${1:-run}" in
         list|--list|--dry-run)
             printf '%s\n' \
-                'web-external-sessions - external sessions: Web default OMP/Codex/Grok discovery+provider grouping (rpi/OMP/Codex/Grok), foreign click imports native copy, foreign bytes/mtime immutable, lineage reuse, no duplicate rows, sessionImportSources:[] native-only (PLAYWRIGHT-ONLY, hard-fail)'
+                'web-external-sessions - external sessions: Web default OMP/Codex/Grok discovery+provider grouping (rpi/OMP/Codex/Grok), foreign click imports native copy, OMP rotation chain (early/middle/final parentSession history) renders fully and once with task/subagent child sessions excluded, foreign bytes/mtime immutable, lineage reuse, no duplicate rows, sessionImportSources:[] native-only (PLAYWRIGHT-ONLY, hard-fail)'
             return 0
             ;;
         run|all) ;;
@@ -130,17 +130,85 @@ native_file.write_text(
 )
 
 # OMP (pi-compatible v3 under ~/.omp/agent/sessions/--work--/).
-omp_id = "omp-ext-e2e"
-omp_file = home / ".omp" / "agent" / "sessions" / "--work--" / f"{omp_id}.jsonl"
+# OMP rotates an oversized logical conversation into a fresh session file
+# whose `session` header records the prior file's absolute path in
+# `parentSession`; the leaf only holds the post-rotation turns plus a handoff
+# custom message. Loading the leaf must concatenate the complete bounded
+# chain (early -> middle -> final) as one ordered session.
+omp_root = home / ".omp" / "agent" / "sessions" / "--work--"
+# The leaf keeps the historical ompId ("omp-ext-e2e"); early/middle are its
+# parentSession ancestors.
+omp_ids = ["omp-ext-early", "omp-ext-mid", "omp-ext-e2e"]
+omp_labels = ["early", "middle", "final"]
+omp_paths = []
+for index, (omp_name, label) in enumerate(zip(omp_ids, omp_labels)):
+    parent = None if index == 0 else omp_paths[index - 1]
+    records = []
+    header = {
+        "type": "session",
+        "version": 3,
+        "id": omp_name,
+        "timestamp": f"2026-01-01T00:0{index}:00Z",
+        "cwd": cwd,
+    }
+    if parent is not None:
+        header["parentSession"] = str(parent)
+    records.append(header)
+    if index > 0:
+        # OMP handoff custom message: never rendered as a user/assistant turn.
+        records.append(
+            {
+                "type": "custom_message",
+                "customType": "handoff",
+                "content": f"handoff context summarizing {label} history",
+                "display": True,
+                "attribution": "agent",
+                "id": f"handoff-{index}",
+                "parentId": None,
+                "timestamp": f"2026-01-01T00:0{index}:00.500Z",
+            }
+        )
+    records.append(
+        {
+            "type": "message",
+            "id": f"u{index}",
+            "parentId": None if index == 0 else f"handoff-{index}",
+            "timestamp": f"2026-01-01T00:0{index}:01Z",
+            "message": {"role": "user", "content": f"OMP {label} prompt"},
+        }
+    )
+    records.append(
+        {
+            "type": "message",
+            "id": f"a{index}",
+            "parentId": f"u{index}",
+            "timestamp": f"2026-01-01T00:0{index}:02Z",
+            "message": {"role": "assistant", "content": f"OMP {label} reply"},
+        }
+    )
+    path = omp_root / f"{omp_name}.jsonl"
+    write_text(
+        path,
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+    )
+    omp_paths.append(path)
+
+omp_id = omp_ids[2]
+omp_file = omp_paths[2]  # leaf is the selectable logical session
+
+# Task/subagent child session at depth 3 under the parent session stem
+# (`<dir>/<name>/<AgentId>.jsonl`): never listed, never chained.
+omp_child_id = "omp-child-hidden"
+omp_child_path = omp_root / "omp-ext-e2e" / f"{omp_child_id}.jsonl"
 write_text(
-    omp_file,
+    omp_child_path,
     (
         json.dumps(
             {
                 "type": "session",
                 "version": 3,
-                "id": omp_id,
-                "timestamp": "2026-01-01T00:00:00Z",
+                "id": omp_child_id,
+                "timestamp": "2026-01-01T00:06:00Z",
                 "cwd": cwd,
             },
             separators=(",", ":"),
@@ -149,10 +217,10 @@ write_text(
         + json.dumps(
             {
                 "type": "message",
-                "id": "u",
+                "id": "cu",
                 "parentId": None,
-                "timestamp": "2026-01-01T00:00:01Z",
-                "message": {"role": "user", "content": "OMP external prompt"},
+                "timestamp": "2026-01-01T00:06:01Z",
+                "message": {"role": "user", "content": "OMP child prompt"},
             },
             separators=(",", ":"),
         )
@@ -240,11 +308,15 @@ write_text(
 )
 
 # Pin mtimes deterministically so boot restore prefers the native seed when
-# the catalog is sorted newest-first (native newest).
+# the catalog is sorted newest-first (native newest). The depth-3 child is
+# pinned newest of all to prove mtime never makes a child tree eligible.
 base = native_file.stat().st_mtime
 os.utime(native_file, (base + 3, base + 3))
 os.utime(omp_file, (base + 2, base + 2))
+os.utime(omp_paths[1], (base + 1.5, base + 1.5))
 os.utime(codex_file, (base + 1, base + 1))
+os.utime(omp_paths[0], (base + 0.5, base + 0.5))
+os.utime(omp_child_path, (base + 4, base + 4))
 os.utime(grok_dir / "summary.json", (base, base))
 
 meta = {
@@ -255,6 +327,14 @@ meta = {
     "nativePath": str(native_file),
     "ompId": omp_id,
     "ompPath": str(omp_file),
+    "ompEarlyPath": str(omp_paths[0]),
+    "ompEarlyId": omp_ids[0],
+    "ompMidPath": str(omp_paths[1]),
+    "ompMidId": omp_ids[1],
+    "ompFinalPath": str(omp_paths[2]),
+    "ompFinalId": omp_ids[2],
+    "ompChildId": omp_child_id,
+    "ompChildPath": str(omp_child_path),
     "codexId": codex_id,
     "codexPath": str(codex_file),
     "grokId": grok_id,

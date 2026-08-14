@@ -233,6 +233,12 @@ impl OpenedSource {
         self.primary
     }
 
+    /// Borrowed primary handle for bounded header reads that must not consume
+    /// the descriptor (e.g. OMP `parentSession` chain resolution).
+    pub(super) fn primary_ref(&self) -> &fs::File {
+        &self.primary
+    }
+
     /// Aggregate persisted size of the opened session and its companions, read
     /// from the already securely-opened descriptors (no ambient reopen, no
     /// symlink escape). For multi-file sources such as Grok this is the sum of
@@ -582,22 +588,71 @@ pub fn parse_source_public(
     parse_source(source, path).map(ParsedSessionPublic::from)
 }
 
-/// Parse a catalog source through its configured root capability.
-pub(crate) fn parse_source_under_root_public(
-    source: SourceSessionFormat,
-    root: &Path,
-    path: &Path,
-) -> Result<ParsedSessionPublic, ImportSessionError> {
-    let opened = open_source_under_root(source, root, path)?;
-    parsers::parse_opened_source(source, opened).map(ParsedSessionPublic::from)
-}
-
 /// Parse an already secured source handle without reopening its path.
 pub(crate) fn parse_opened_source_public(
     source: SourceSessionFormat,
     opened: OpenedSource,
 ) -> Result<ParsedSessionPublic, ImportSessionError> {
     parsers::parse_opened_source(source, opened).map(ParsedSessionPublic::from)
+}
+
+/// Content-fingerprint convention shared by the catalog and the OMP chain
+/// parser: `{mtime_secs}:{size}` from a metadata handle. The chain fingerprint
+/// joins one of these per member, so any member change (content or mtime)
+/// yields a different chain identity.
+pub(crate) fn metadata_fingerprint(metadata: &fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    format!("{}:{}", modified, metadata.len())
+}
+
+/// One chain member's linkage + identity, read through the configured root
+/// capability from a single securely opened descriptor.
+pub(crate) struct OmpChainMemberProbe {
+    /// Raw `parentSession` header value (the prior rotated file reference).
+    pub parent_session: Option<String>,
+    /// Metadata fingerprint of this member from the same opened descriptor.
+    pub fingerprint: String,
+    /// Size of this member from the same opened descriptor.
+    pub size: u64,
+}
+
+/// Probe one OMP chain member: read its `parentSession` header reference and
+/// metadata fingerprint through the configured root capability. Non-OMP
+/// sources and files without the field return `None` parent; malformed
+/// references fail closed with the source error.
+pub(crate) fn omp_chain_member_probe_under_root_public(
+    source: SourceSessionFormat,
+    root: &Path,
+    path: &Path,
+) -> Result<OmpChainMemberProbe, ImportSessionError> {
+    let opened = open_source_under_root(source, root, path)?;
+    let parent_session = parsers::source_parent_session_opened(source, &opened)?;
+    Ok(OmpChainMemberProbe {
+        parent_session,
+        fingerprint: metadata_fingerprint(opened.metadata()),
+        size: opened.metadata().len(),
+    })
+}
+
+/// Parse a complete OMP rotation chain (root → leaf order) into one logical
+/// session. Every candidate file is opened through the configured root
+/// capability once; the aggregate byte budget is revalidated against those
+/// descriptors (newest prefix retained, leaf unconditional) and every file
+/// stays subject to per-file size/line/record limits. Entries duplicated
+/// across files are kept once. Returns the parsed session plus a SHA-256 chain
+/// content fingerprint (retained members' raw bytes) used for lineage reuse.
+pub(crate) fn parse_omp_chain_public(
+    root: &Path,
+    paths: &[PathBuf],
+    max_bytes: u64,
+) -> Result<(ParsedSessionPublic, String), ImportSessionError> {
+    parsers::parse_omp_chain(root, paths, max_bytes)
+        .map(|(parsed, fingerprint)| (ParsedSessionPublic::from(parsed), fingerprint))
 }
 
 /// Lossy parse result shared with the session catalog (no private parser types).

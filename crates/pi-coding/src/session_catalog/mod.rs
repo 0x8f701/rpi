@@ -13,7 +13,7 @@ mod lineage;
 mod tests;
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
@@ -25,10 +25,10 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::import::{
-    emit_parsed_session_at_with_lineage, open_source_direct, open_source_under_root,
-    parse_opened_source_public, parse_source_under_root_public, source_id_under_root_public,
-    ImportedMessage, ImportedSession, ImportLineage, ImportSessionError, ParsedSessionPublic,
-    SourceSessionFormat,
+    emit_parsed_session_at_with_lineage, omp_chain_member_probe_under_root_public,
+    open_source_direct, open_source_under_root, parse_omp_chain_public,
+    parse_opened_source_public, source_id_under_root_public, ImportedMessage, ImportedSession,
+    ImportLineage, ImportSessionError, ParsedSessionPublic, SourceSessionFormat,
 };
 use crate::default_session_dir;
 use crate::PreparedSessionResume;
@@ -53,6 +53,12 @@ pub const SESSION_CATALOG_WALK_ENTRY_LIMIT: usize = 4_096;
 pub const SESSION_CATALOG_CANDIDATE_LIMIT: usize = 512;
 /// Maximum rows in the shared catalog universe returned by scan/list/search.
 pub const SESSION_CATALOG_ROW_LIMIT: usize = 512;
+/// Maximum OMP session files joined into one logical rotation chain
+/// (root → leaf). Mirrors OMP's own bounded session lineage walks.
+pub const SESSION_CATALOG_OMP_CHAIN_LIMIT: usize = 8;
+/// Aggregate byte budget for one OMP rotation chain. The selected leaf is
+/// always included; ancestors are pulled only while the budget still fits.
+pub const SESSION_CATALOG_OMP_CHAIN_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 struct DiscoveredCandidate {
@@ -837,11 +843,107 @@ impl SessionCatalog {
         }
     }
 
+    /// Resolve the OMP rotation chain for `leaf` in root → leaf order: the
+    /// leaf plus every ancestor reachable through `parentSession` header
+    /// references. OMP rotates an oversized logical conversation into a fresh
+    /// session file whose `session` header records the prior file's absolute
+    /// path; the leaf only holds the turns after the rotation.
+    ///
+    /// The walk fails closed and bounded:
+    /// - references must be absolute `.jsonl` paths, lexically under the OMP
+    ///   root, and individually safe session files (depth-2 native-tree shape,
+    ///   regular, non-symlink) — task/subagent child trees never chain;
+    /// - malformed headers, bare id references (fork lineage), missing files,
+    ///   and cycles stop the walk at the last valid link;
+    /// - at most [`SESSION_CATALOG_OMP_CHAIN_LIMIT`] files and
+    ///   [`SESSION_CATALOG_OMP_CHAIN_MAX_BYTES`] aggregate bytes are joined,
+    ///   with per-member sizes read from the same capability-opened
+    ///   descriptors as the header probes.
+    #[must_use]
+    fn omp_chain_paths(&self, leaf: &Path) -> Vec<PathBuf> {
+        self.omp_chain_probe_bounded(
+            leaf,
+            SESSION_CATALOG_OMP_CHAIN_LIMIT,
+            SESSION_CATALOG_OMP_CHAIN_MAX_BYTES,
+        )
+        .0
+    }
+
+    /// Chain content fingerprint for a leaf: one metadata fingerprint per
+    /// walked member, joined root → leaf. Computed from the same
+    /// capability-opened descriptors as the walk probes.
+    #[must_use]
+    fn omp_chain_fingerprint(&self, leaf: &Path) -> String {
+        self.omp_chain_probe_bounded(
+            leaf,
+            SESSION_CATALOG_OMP_CHAIN_LIMIT,
+            SESSION_CATALOG_OMP_CHAIN_MAX_BYTES,
+        )
+        .1
+    }
+
+    /// Bounded `parentSession` chain walk with explicit limits (tests),
+    /// returning the root → leaf paths and their joined metadata fingerprint.
+    fn omp_chain_probe_bounded(
+        &self,
+        leaf: &Path,
+        limit: usize,
+        max_bytes: u64,
+    ) -> (Vec<PathBuf>, String) {
+        let root = self.root_for(SessionSourceKind::Omp).path;
+        let format = SourceSessionFormat::Omp;
+        let mut chain = Vec::new();
+        let mut fingerprints = Vec::new();
+        let mut visited = HashSet::new();
+        let mut cursor = make_absolute(leaf.to_path_buf());
+        let mut total_bytes = 0_u64;
+        loop {
+            if chain.len() == limit {
+                break;
+            }
+            if !visited.insert(cursor.clone()) {
+                break;
+            }
+            let Ok(probe) = omp_chain_member_probe_under_root_public(format, &root, &cursor)
+            else {
+                // Unreadable member: keep it (the leaf is unconditional; an
+                // ancestor was already validated on the way in) but stop
+                // extending the chain.
+                chain.push(cursor);
+                break;
+            };
+            if !chain.is_empty() && total_bytes.saturating_add(probe.size) > max_bytes {
+                break;
+            }
+            total_bytes = total_bytes.saturating_add(probe.size);
+            chain.push(cursor.clone());
+            fingerprints.push(probe.fingerprint);
+            let Some(parent) = probe.parent_session else {
+                break;
+            };
+            let parent_path = PathBuf::from(parent);
+            let followable = parent_path.is_absolute()
+                && parent_path.extension() == Some(OsStr::new("jsonl"))
+                && self.is_safe_session_path(SessionSourceKind::Omp, &parent_path);
+            if !followable {
+                break;
+            }
+            cursor = parent_path;
+        }
+        chain.reverse();
+        fingerprints.reverse();
+        (chain, fingerprints.join("\n"))
+    }
+
     /// Native resume or idempotent foreign import.
     ///
     /// - Native Pi paths return the existing file (no copy).
     /// - Foreign sources reuse a prior conversion when lineage matches.
     /// - Otherwise a new Pi v3 session is emitted with durable lineage.
+    ///
+    /// OMP selections load the complete `parentSession` rotation chain
+    /// (root → leaf) as one ordered logical session; the emitted native file
+    /// carries the full history.
     pub fn import_or_resume(
         &self,
         kind: SessionSourceKind,
@@ -856,9 +958,21 @@ impl SessionCatalog {
             .to_import_format()
             .expect("foreign kind maps to import format");
         let root = self.root_for(kind).path;
-        let opened = open_source_under_root(format, &root, &source_path)?;
-        let metadata = opened.metadata().clone();
-        let parsed = parse_opened_source_public(format, opened)?;
+        let (parsed, content_fingerprint_value) = if kind == SessionSourceKind::Omp {
+            // OMP rotation: the selected leaf continues a logical conversation
+            // split across `parentSession`-linked files. Load the complete
+            // bounded chain (root → leaf) as one ordered session; the chain
+            // parser owns every member open. The returned fingerprint covers
+            // every chain member, so an ancestor change re-imports instead of
+            // reusing a stale native copy.
+            let chain = self.omp_chain_paths(&source_path);
+            parse_omp_chain_public(&root, &chain, SESSION_CATALOG_OMP_CHAIN_MAX_BYTES)?
+        } else {
+            let opened = open_source_under_root(format, &root, &source_path)?;
+            let fingerprint = content_fingerprint(opened.metadata());
+            let parsed = parse_opened_source_public(format, opened)?;
+            (parsed, fingerprint)
+        };
         let source_session_id = parsed
             .source_session_id
             .clone()
@@ -870,7 +984,7 @@ impl SessionCatalog {
             source_path_fingerprint: make_absolute(source_path.clone())
                 .to_string_lossy()
                 .into_owned(),
-            content_fingerprint: Some(content_fingerprint(&metadata)),
+            content_fingerprint: Some(content_fingerprint_value),
         };
         if let Some((native_id, native_path)) = self.find_existing_import(&lineage) {
             return Ok(existing_import_result(
@@ -982,10 +1096,19 @@ impl SessionCatalog {
         self.import_or_resume(kind, path, preferred_cwd)
     }
 
-    /// Build lineage index from native Pi sessions already on disk.
+    /// Build a lineage multimap from native Pi sessions already on disk: one
+    /// identity key may map to SEVERAL imports (an OMP chain change re-imports
+    /// under the same leaf identity but a different chain fingerprint), each
+    /// retaining its stored lineage so callers can exact-match the current
+    /// chain fingerprint instead of collapsing to the last path sorted.
     #[must_use]
-    pub fn build_lineage_index(&self) -> HashMap<(SessionSourceKind, String), (String, PathBuf)> {
-        let mut index = HashMap::new();
+    pub fn build_lineage_index(
+        &self,
+    ) -> HashMap<(SessionSourceKind, String), Vec<(String, PathBuf, ImportLineageKey)>> {
+        let mut index: HashMap<
+            (SessionSourceKind, String),
+            Vec<(String, PathBuf, ImportLineageKey)>,
+        > = HashMap::new();
         let root = self.root_for(SessionSourceKind::NativePi).path;
         for path in self.discover(SessionSourceKind::NativePi) {
             let Ok(opened) = open_source_under_root(SourceSessionFormat::Pi, &root, &path) else {
@@ -994,7 +1117,10 @@ impl SessionCatalog {
             if let Some((lineage, native_id)) =
                 read_native_lineage(opened.into_primary(), &path)
             {
-                index.insert(lineage.identity_key(), (native_id, path));
+                index
+                    .entry(lineage.identity_key())
+                    .or_default()
+                    .push((native_id, path, lineage));
             }
         }
         index
@@ -1002,30 +1128,24 @@ impl SessionCatalog {
 
     fn find_existing_import(&self, lineage: &ImportLineageKey) -> Option<(String, PathBuf)> {
         let index = self.build_lineage_index();
-        if let Some(hit) = index.get(&lineage.identity_key()) {
-            return Some(hit.clone());
+        if let Some(entries) = index.get(&lineage.identity_key()) {
+            // Scan EVERY same-identity native and return the first whose
+            // stored lineage matches the current chain fingerprint; a stale
+            // sibling (different fingerprint) never shadows the matching one.
+            return entries.iter().find_map(|(native_id, native_path, stored)| {
+                omp_fingerprint_matches(lineage, stored)
+                    .then(|| (native_id.clone(), native_path.clone()))
+            });
         }
         // Fallback: same source path fingerprint under any id key.
-        index.into_iter().find_map(|((source, _), value)| {
-            if source != lineage.source {
+        index.values().flatten().find_map(|(native_id, native_path, stored)| {
+            if stored.source != lineage.source
+                || stored.source_path_fingerprint != lineage.source_path_fingerprint
+                || !omp_fingerprint_matches(lineage, stored)
+            {
                 return None;
             }
-            let path = &value.1;
-            let Ok(opened) = open_source_under_root(
-                SourceSessionFormat::Pi,
-                &self.root_for(SessionSourceKind::NativePi).path,
-                path,
-            ) else {
-                return None;
-            };
-            let Some((existing, _)) = read_native_lineage(opened.into_primary(), path) else {
-                return None;
-            };
-            if existing.source_path_fingerprint == lineage.source_path_fingerprint {
-                Some(value)
-            } else {
-                None
-            }
+            Some((native_id.clone(), native_path.clone()))
         })
     }
 
@@ -1147,7 +1267,10 @@ impl SessionCatalog {
         &self,
         kind: SessionSourceKind,
         path: &Path,
-        lineage_index: &HashMap<(SessionSourceKind, String), (String, PathBuf)>,
+        lineage_index: &HashMap<
+            (SessionSourceKind, String),
+            Vec<(String, PathBuf, ImportLineageKey)>,
+        >,
     ) -> Result<Option<CatalogRow>, CatalogError> {
         let metadata = fs::symlink_metadata(path).map_err(|source| CatalogError::Io {
             path: path.to_path_buf(),
@@ -1253,14 +1376,26 @@ impl SessionCatalog {
             source: kind,
             source_session_id: session_id.clone(),
             source_path_fingerprint: canonical_fingerprint(path),
-            content_fingerprint: Some(content_fingerprint(&metadata)),
+            // For OMP the fingerprint covers the whole rotation chain (leaf
+            // + `parentSession` ancestors), not this file alone; it is
+            // computed from the same capability-opened walk descriptors the
+            // import uses, so a changed ancestor changes the row fingerprint.
+            content_fingerprint: if kind == SessionSourceKind::Omp {
+                Some(self.omp_chain_fingerprint(path))
+            } else {
+                Some(content_fingerprint(&metadata))
+            },
         };
         let status = lineage_index
             .get(&lineage.identity_key())
-            .cloned()
-            .map(|(native_id, native_path)| CatalogRowStatus::AlreadyImported {
-                native_id,
-                native_path,
+            .and_then(|entries| {
+                entries.iter().find(|(_, _, stored)| {
+                    omp_fingerprint_matches(&lineage, stored)
+                })
+            })
+            .map(|(native_id, native_path, _)| CatalogRowStatus::AlreadyImported {
+                native_id: native_id.clone(),
+                native_path: native_path.clone(),
             })
             .unwrap_or(CatalogRowStatus::Foreign);
         let message_blob = parsed
@@ -1341,12 +1476,32 @@ fn deterministic_import_id(lineage: &ImportLineageKey) -> String {
     digest.update(source.as_str().as_bytes());
     digest.update(b"\0");
     digest.update(identity.as_bytes());
+    if lineage.source == SessionSourceKind::Omp {
+        // The OMP chain fingerprint participates in the id so a changed
+        // ancestor produces a distinct native import instead of colliding
+        // with (and reusing) the stale copy at the old deterministic path.
+        digest.update(b"\0chain:");
+        digest.update(lineage.content_fingerprint.as_deref().unwrap_or_default().as_bytes());
+    }
     let bytes = digest.finalize();
     let mut uuid_bytes = [0_u8; 16];
     uuid_bytes.copy_from_slice(&bytes[..16]);
     uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x50;
     uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80;
     uuid::Uuid::from_bytes(uuid_bytes).to_string()
+}
+
+/// Whether the stored native lineage matches the current selection's content
+/// fingerprint. Non-OMP sources always match (identity-based reuse policy);
+/// OMP requires the stored chain fingerprint to equal the current chain
+/// fingerprint so a changed ancestor re-imports instead of reusing a stale
+/// native copy.
+fn omp_fingerprint_matches(selection: &ImportLineageKey, stored: &ImportLineageKey) -> bool {
+    if selection.source != SessionSourceKind::Omp {
+        return true;
+    }
+    stored.content_fingerprint.is_some()
+        && stored.content_fingerprint == selection.content_fingerprint
 }
 
 fn existing_import_result(

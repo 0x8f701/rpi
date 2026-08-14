@@ -307,6 +307,19 @@ pub fn resolve_resume_selection(
             }),
             CatalogRowStatus::AlreadyImported { native_path, .. } => {
                 ensure_source_enabled(target.source, &sources, &target.source_path)?;
+                if target.source == SessionSourceKind::Omp {
+                    // OMP chain freshness is fingerprint-gated inside
+                    // import_or_resume; the row's identity-only AlreadyImported
+                    // status can be stale between list and click (an ancestor
+                    // mutated after the last scan). Re-enter import_or_resume:
+                    // it reuses the existing native copy when the current chain
+                    // fingerprint matches and re-imports otherwise.
+                    return imported_result(catalog.import_or_resume(
+                        target.source,
+                        &target.source_path,
+                        preferred_cwd,
+                    )?);
+                }
                 Ok(ResumeSelectionResult {
                     source: target.source,
                     path: native_path.clone(),
@@ -519,6 +532,43 @@ mod tests {
         )
         .expect("omp fixture");
         path
+    }
+
+    /// Write an OMP rotation chain (root → leaf) where every file after the
+    /// first carries a `parentSession` header pointing at the previous file.
+    fn write_omp_chain(catalog: &SessionCatalog, count: usize) -> Vec<PathBuf> {
+        let directory = catalog.root_for(SessionSourceKind::Omp).path.join("--chain--");
+        fs::create_dir_all(&directory).expect("omp chain dir");
+        let mut files = Vec::new();
+        for index in 0..count {
+            let id = format!("rc-chain-{index}");
+            let path = directory.join(format!("{id}.jsonl"));
+            let parent = files
+                .last()
+                .map(|previous: &PathBuf| {
+                    format!(r#","parentSession":"{}""#, previous.display())
+                })
+                .unwrap_or_default();
+            fs::write(
+                &path,
+                format!(
+                    concat!(
+                        r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-01-01T00:00:00Z","cwd":"<workspace>/work"{parent}}}"#,
+                        "\n",
+                        r#"{{"type":"message","id":"u{index}","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":"{id} prompt"}}}}"#,
+                        "\n",
+                        r#"{{"type":"message","id":"a{index}","parentId":"u{index}","timestamp":"2026-01-01T00:00:02Z","message":{{"role":"assistant","content":"{id} reply"}}}}"#,
+                        "\n"
+                    ),
+                    index = index,
+                    id = id,
+                    parent = parent
+                ),
+            )
+            .expect("omp chain file");
+            files.push(path);
+        }
+        files
     }
 
     #[test]
@@ -1120,6 +1170,91 @@ mod tests {
         assert_eq!(second.path, first.path);
         assert!(!second.imported);
         assert!(second.reused_existing);
+    }
+
+    /// An OMP `AlreadyImported` row must NEVER short-circuit to the stored
+    /// native path: the identity-only status can be stale between list and
+    /// click (an ancestor mutated after the last scan), so selection re-enters
+    /// `import_or_resume`, which reuses when the current chain fingerprint
+    /// matches and emits a fresh full-history import otherwise.
+    #[test]
+    fn omp_already_imported_target_reenters_import_or_resume() {
+        let home = tempfile::tempdir().expect("home");
+        let catalog = SessionCatalog::new(home.path());
+        let chain = write_omp_chain(&catalog, 3);
+        let leaf = chain[2].clone();
+        let sources = [SessionSourceKind::NativePi, SessionSourceKind::Omp];
+
+        let first = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Input(leaf.to_string_lossy().into_owned()),
+            None,
+            &sources,
+        )
+        .expect("first chain import");
+        assert!(first.imported);
+        let stale_path = first.path.clone();
+
+        // Mutate the middle ancestor (content + mtime); the stored native copy
+        // is now stale while the leaf row identity is unchanged.
+        fs::write(
+            &chain[1],
+            fs::read_to_string(&chain[1])
+                .expect("mid body")
+                .replace("rc-chain-1 prompt", "rc-chain-1 prompt MUTATED"),
+        )
+        .expect("mutate mid");
+
+        // A stale AlreadyImported target captured before the mutation must not
+        // short-circuit to the old native copy.
+        let fresh = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Target(ResumeSelectorTarget {
+                source: SessionSourceKind::Omp,
+                source_path: leaf.clone(),
+                status: CatalogRowStatus::AlreadyImported {
+                    native_id: "stale".to_owned(),
+                    native_path: stale_path.clone(),
+                },
+            }),
+            None,
+            &sources,
+        )
+        .expect("stale target must re-enter import");
+        assert_ne!(fresh.path, stale_path, "stale native copy must not be selected");
+        assert!(fresh.imported, "ancestor mutation must produce a fresh import");
+        assert!(fresh.path.is_file());
+        let fresh_body = fs::read_to_string(&fresh.path).expect("fresh body");
+        assert!(
+            fresh_body.contains("rc-chain-1 prompt MUTATED"),
+            "updated ancestor transcript required in the fresh import"
+        );
+        assert!(fresh_body.contains("rc-chain-0 prompt"), "full chain retained");
+
+        // A fresh scan row (exact fingerprint match) resolves to the same
+        // fresh import without a duplicate.
+        let rows = load_resume_catalog(
+            &catalog,
+            &ResumeCatalogRequest {
+                sources: sources.to_vec(),
+                ..ResumeCatalogRequest::default()
+            },
+        )
+        .expect("reloaded catalog")
+        .rows;
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == "rc-chain-2")
+            .expect("omp leaf row");
+        let direct = resolve_resume_selection(
+            &catalog,
+            &ResumeSelectionRequest::Target(ResumeSelectorTarget::from(row)),
+            None,
+            &sources,
+        )
+        .expect("fresh row selection");
+        assert_eq!(direct.path, fresh.path, "fresh row resolves the matching import");
+        assert!(direct.reused_existing);
     }
 
     #[test]

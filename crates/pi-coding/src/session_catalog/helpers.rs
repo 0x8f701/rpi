@@ -112,13 +112,7 @@ pub(super) fn canonical_fingerprint(path: &Path) -> String {
 }
 
 pub(super) fn content_fingerprint(metadata: &Metadata) -> String {
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_secs())
-        .unwrap_or(0);
-    format!("{}:{}", modified, metadata.len())
+    crate::import::metadata_fingerprint(metadata)
 }
 
 #[cfg(unix)]
