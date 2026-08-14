@@ -82,6 +82,7 @@ import {
   type VideoUploadOutcome,
   type VideoUploadResponseLike,
 } from '../src/attachments.ts';
+import { withResolvers } from '../src/withResolvers.ts';
 
 const failures: string[] = [];
 let ran = 0;
@@ -750,7 +751,7 @@ check('codeBadgeLabel empty -> TXT', codeBadgeLabel('') === 'TXT');
     token: '',
     timeoutMs: 5,
     fetchImpl: (_url, init) => {
-      const { promise, reject } = Promise.withResolvers<VideoUploadResponseLike>();
+      const { promise, reject } = withResolvers<VideoUploadResponseLike>();
       init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       return promise;
     },
