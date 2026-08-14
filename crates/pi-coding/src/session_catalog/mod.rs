@@ -709,7 +709,7 @@ impl SessionCatalog {
                 (row.kind, normalize_cwd(&row.cwd), normalized_summary)
             };
             if let Some((_, existing)) = best.iter_mut().find(|(existing, _)| *existing == key) {
-                if compare_rows_newest(row, existing).is_lt() {
+                if Self::dedupe_prefers(row, existing) {
                     *existing = row.clone();
                 }
                 continue;
@@ -731,6 +731,35 @@ impl SessionCatalog {
         let mut result = best.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
         sort_rows_newest(&mut result);
         result
+    }
+
+    /// Whether `candidate` should replace `existing` for the same dedupe key.
+    fn dedupe_prefers(candidate: &CatalogRow, existing: &CatalogRow) -> bool {
+        if candidate.kind == SessionSourceKind::Omp && existing.kind == SessionSourceKind::Omp {
+            // OMP rotation rows share the chain-opener summary and cwd, so the
+            // generic newest-mtime tie-break would collapse a rotation to an
+            // arbitrary ancestor. Prefer the row whose accepted chain is
+            // longest (greatest message count — the leaf includes every
+            // ancestor), then an exact AlreadyImported row over a Foreign
+            // ancestor, and only then the newest comparator.
+            match candidate
+                .message_count
+                .unwrap_or(0)
+                .cmp(&existing.message_count.unwrap_or(0))
+            {
+                Ordering::Greater => return true,
+                Ordering::Less => return false,
+                Ordering::Equal => {}
+            }
+            let candidate_imported =
+                matches!(candidate.status, CatalogRowStatus::AlreadyImported { .. });
+            let existing_imported =
+                matches!(existing.status, CatalogRowStatus::AlreadyImported { .. });
+            if candidate_imported != existing_imported {
+                return candidate_imported;
+            }
+        }
+        compare_rows_newest(candidate, existing).is_lt()
     }
 
     /// Resolve a path or unambiguous id/prefix to `(kind, path)`.
@@ -855,6 +884,10 @@ impl SessionCatalog {
     ///   regular, non-symlink) — task/subagent child trees never chain;
     /// - malformed headers, bare id references (fork lineage), missing files,
     ///   and cycles stop the walk at the last valid link;
+    /// - members whose descriptor exceeds the per-file source cap are rejected
+    ///   before their header is scanned, and header probes are themselves
+    ///   byte/record bounded, so noise-padded files stop the walk instead of
+    ///   reading to EOF;
     /// - at most [`SESSION_CATALOG_OMP_CHAIN_LIMIT`] files and
     ///   [`SESSION_CATALOG_OMP_CHAIN_MAX_BYTES`] aggregate bytes are joined,
     ///   with per-member sizes read from the same capability-opened
@@ -866,34 +899,23 @@ impl SessionCatalog {
             SESSION_CATALOG_OMP_CHAIN_LIMIT,
             SESSION_CATALOG_OMP_CHAIN_MAX_BYTES,
         )
-        .0
-    }
-
-    /// Chain content fingerprint for a leaf: one metadata fingerprint per
-    /// walked member, joined root → leaf. Computed from the same
-    /// capability-opened descriptors as the walk probes.
-    #[must_use]
-    fn omp_chain_fingerprint(&self, leaf: &Path) -> String {
-        self.omp_chain_probe_bounded(
-            leaf,
-            SESSION_CATALOG_OMP_CHAIN_LIMIT,
-            SESSION_CATALOG_OMP_CHAIN_MAX_BYTES,
-        )
-        .1
     }
 
     /// Bounded `parentSession` chain walk with explicit limits (tests),
-    /// returning the root → leaf paths and their joined metadata fingerprint.
+    /// returning the root → leaf paths. The walk only establishes WHICH
+    /// members are candidates; the authoritative accepted chain, parsed
+    /// session, and content fingerprint come from [`parse_omp_chain_public`],
+    /// shared by both import and row status so malformed or adjacency-rejected
+    /// ancestors are excluded identically on both sides.
     fn omp_chain_probe_bounded(
         &self,
         leaf: &Path,
         limit: usize,
         max_bytes: u64,
-    ) -> (Vec<PathBuf>, String) {
+    ) -> Vec<PathBuf> {
         let root = self.root_for(SessionSourceKind::Omp).path;
         let format = SourceSessionFormat::Omp;
         let mut chain = Vec::new();
-        let mut fingerprints = Vec::new();
         let mut visited = HashSet::new();
         let mut cursor = make_absolute(leaf.to_path_buf());
         let mut total_bytes = 0_u64;
@@ -906,9 +928,9 @@ impl SessionCatalog {
             }
             let Ok(probe) = omp_chain_member_probe_under_root_public(format, &root, &cursor)
             else {
-                // Unreadable member: keep it (the leaf is unconditional; an
-                // ancestor was already validated on the way in) but stop
-                // extending the chain.
+                // Unreadable/oversize/noise-padded member: keep it (the leaf
+                // is unconditional; an ancestor was already validated on the
+                // way in) but stop extending the chain.
                 chain.push(cursor);
                 break;
             };
@@ -917,7 +939,6 @@ impl SessionCatalog {
             }
             total_bytes = total_bytes.saturating_add(probe.size);
             chain.push(cursor.clone());
-            fingerprints.push(probe.fingerprint);
             let Some(parent) = probe.parent_session else {
                 break;
             };
@@ -931,8 +952,7 @@ impl SessionCatalog {
             cursor = parent_path;
         }
         chain.reverse();
-        fingerprints.reverse();
-        (chain, fingerprints.join("\n"))
+        chain
     }
 
     /// Native resume or idempotent foreign import.
@@ -1343,14 +1363,34 @@ impl SessionCatalog {
         // secured descriptors for both aggregate size and parsing. This avoids
         // ambient reopen and confines companion reads (e.g. Grok chat_history)
         // to the already-validated no-follow capability handles.
-        let opened = match open_source_under_root(format, &root, path) {
-            Ok(opened) => opened,
-            Err(_) => return Ok(None),
-        };
-        let aggregate_size = opened.aggregate_size();
-        let parsed = match parse_opened_source_public(format, opened) {
-            Ok(parsed) => parsed,
-            Err(_) => return Ok(None),
+        let (parsed, content_fingerprint_value, size) = if kind == SessionSourceKind::Omp {
+            // Authoritative accepted-chain parse, shared with import: walk the
+            // bounded rotation chain and parse it through the same function
+            // `import_or_resume` uses. The row's session content AND content
+            // fingerprint therefore match exactly what an import would emit —
+            // malformed, oversize, budget-excluded, or adjacency-rejected
+            // ancestors are dropped identically on both sides, so an imported
+            // leaf never reads as permanently Foreign.
+            let chain = self.omp_chain_paths(path);
+            match parse_omp_chain_public(&root, &chain, SESSION_CATALOG_OMP_CHAIN_MAX_BYTES) {
+                Ok((parsed, fingerprint)) => {
+                    let size = open_source_under_root(format, &root, path)
+                        .map(|opened| opened.aggregate_size())
+                        .unwrap_or(0);
+                    (parsed, Some(fingerprint), size)
+                }
+                Err(_) => return Ok(None),
+            }
+        } else {
+            let opened = match open_source_under_root(format, &root, path) {
+                Ok(opened) => opened,
+                Err(_) => return Ok(None),
+            };
+            let size = opened.aggregate_size();
+            match parse_opened_source_public(format, opened) {
+                Ok(parsed) => (parsed, Some(content_fingerprint(&metadata)), size),
+                Err(_) => return Ok(None),
+            }
         };
         let session_id = parsed
             .source_session_id
@@ -1376,15 +1416,11 @@ impl SessionCatalog {
             source: kind,
             source_session_id: session_id.clone(),
             source_path_fingerprint: canonical_fingerprint(path),
-            // For OMP the fingerprint covers the whole rotation chain (leaf
-            // + `parentSession` ancestors), not this file alone; it is
-            // computed from the same capability-opened walk descriptors the
-            // import uses, so a changed ancestor changes the row fingerprint.
-            content_fingerprint: if kind == SessionSourceKind::Omp {
-                Some(self.omp_chain_fingerprint(path))
-            } else {
-                Some(content_fingerprint(&metadata))
-            },
+            // The content fingerprint covers the whole accepted rotation chain
+            // (leaf + every retained `parentSession` ancestor) and is the SAME
+            // authoritative parse-side digest the import stores, so row status
+            // and import reuse agree exactly.
+            content_fingerprint: content_fingerprint_value,
         };
         let status = lineage_index
             .get(&lineage.identity_key())
@@ -1417,7 +1453,7 @@ impl SessionCatalog {
             kind,
             session_id,
             summary,
-            size: aggregate_size,
+            size,
             message_count: Some(parsed.meaningful_count),
             cwd: parsed.cwd,
             modified_epoch,

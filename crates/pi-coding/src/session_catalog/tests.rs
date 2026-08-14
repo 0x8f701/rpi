@@ -7,7 +7,10 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use super::*;
-use crate::import::{parse_omp_chain_public, source_root_for, SourceSessionFormat};
+use crate::import::{
+    parse_omp_chain_public, source_root_for, ImportSessionError, SourceSessionFormat,
+    MAX_HEADER_SCAN_BYTES, MAX_HEADER_SCAN_RECORDS, MAX_SOURCE_BYTES,
+};
 
 
 struct Fixture {
@@ -2245,11 +2248,10 @@ fn omp_chain_bounds_limit_count_and_bytes() {
 
     // Count bound: the leaf-anchored walk keeps at most 8 files — the newest
     // 8, since the oldest ancestors drop when the budget runs out.
-    let (bounded, bounded_fingerprint) = catalog.omp_chain_probe_bounded(leaf, 8, u64::MAX);
+    let bounded = catalog.omp_chain_probe_bounded(leaf, 8, u64::MAX);
     assert_eq!(bounded.len(), 8);
     assert_eq!(&bounded[..3], &chain[2..5], "newest files first in root order");
     assert_eq!(bounded.last(), Some(leaf));
-    assert_eq!(bounded_fingerprint.split('\n').count(), 8, "fingerprint covers every walked member");
 
     // Import of an over-long chain truncates at the bound but still works.
     let resolved = catalog
@@ -2264,13 +2266,17 @@ fn omp_chain_bounds_limit_count_and_bytes() {
     assert!(texts.contains(&"chain prompt 2"), "oldest retained message present");
     assert!(!texts.contains(&"chain prompt 1"), "over-budget file excluded");
     assert!(texts.contains(&"chain prompt 9"), "leaf always included");
-    // The walk fingerprint and the parse fingerprint agree on the same chain.
+    // The authoritative parse fingerprint is one content digest covering
+    // exactly the accepted members, so it differs from the leaf-only digest.
     let omp_root = catalog.root_for(SessionSourceKind::Omp).path;
     let (_, parse_fingerprint) = parse_omp_chain_public(&omp_root, &bounded, u64::MAX)
         .expect("parse of walked chain");
-    assert_eq!(
-        parse_fingerprint, bounded_fingerprint,
-        "walk and parse chain fingerprints must agree"
+    let (_, leaf_only_fingerprint) =
+        parse_omp_chain_public(&omp_root, &[leaf.clone()], u64::MAX).expect("parse of leaf");
+    assert_eq!(parse_fingerprint.len(), 64, "SHA-256 hex digest");
+    assert_ne!(
+        parse_fingerprint, leaf_only_fingerprint,
+        "chain fingerprint covers every accepted member"
     );
 
     // Byte bound: budget covering leaf + its direct parent excludes the next
@@ -2278,11 +2284,399 @@ fn omp_chain_bounds_limit_count_and_bytes() {
     let [root, mid] = [&chain[0], &chain[8]];
     let mid_size = fs::metadata(mid).expect("mid meta").len();
     let leaf_size = fs::metadata(leaf).expect("leaf meta").len();
-    let tight = catalog.omp_chain_probe_bounded(leaf, 8, mid_size + leaf_size).0;
+    let tight = catalog.omp_chain_probe_bounded(leaf, 8, mid_size + leaf_size);
     assert_eq!(tight, vec![mid.clone(), leaf.clone()], "earlier ancestor excluded by byte budget");
-    let leaf_only = catalog.omp_chain_probe_bounded(leaf, 8, leaf_size).0;
+    let leaf_only = catalog.omp_chain_probe_bounded(leaf, 8, leaf_size);
     assert_eq!(leaf_only, vec![leaf.clone()], "only the leaf fits the budget");
-    assert_eq!(catalog.omp_chain_probe_bounded(root, 8, u64::MAX).0, vec![root.clone()]);
+    assert_eq!(catalog.omp_chain_probe_bounded(root, 8, u64::MAX), vec![root.clone()]);
+}
+
+/// The OMP parent-session header probe is bounded by both a physical-record
+/// budget and a cumulative byte budget: ancestors padded with non-object JSON
+/// records fail closed instead of reading to EOF, the walk stops at that
+/// member, and import still emits the safe newest prefix whose row then reads
+/// AlreadyImported (row and import share the accepted-chain fingerprint).
+#[test]
+fn omp_header_probe_fails_closed_on_noise_padded_ancestors() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let omp_root = catalog.root_for(SessionSourceKind::Omp).path;
+
+    // Physical-record budget: a valid header followed by more non-object
+    // records than the header scan allows must fail the probe.
+    let chain = write_omp_chain(&catalog, "--noisy-records--", 3);
+    let mid = &chain[1];
+    let leaf = &chain[2];
+    let header = fs::read_to_string(mid)
+        .expect("mid body")
+        .lines()
+        .next()
+        .expect("header line")
+        .to_owned();
+    let mut noisy = header;
+    noisy.push('\n');
+    noisy.push_str(&"null\n".repeat(MAX_HEADER_SCAN_RECORDS + 1));
+    fs::write(mid, &noisy).expect("noisy mid");
+
+    assert!(
+        matches!(
+            omp_chain_member_probe_under_root_public(SourceSessionFormat::Omp, &omp_root, mid),
+            Err(ImportSessionError::ResourceLimit { .. })
+        ),
+        "record-padded header must fail closed instead of scanning to EOF"
+    );
+    assert_eq!(
+        catalog.omp_chain_paths(leaf),
+        vec![mid.clone(), leaf.clone()],
+        "walk must stop at the record-padded member"
+    );
+
+    // Import still works with the safe newest prefix (the padded ancestor is
+    // excluded from the parse too) and the row then reads AlreadyImported.
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("record-padded chain import");
+    let texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        ["chain prompt 2", "chain reply 2"],
+        "record-padded ancestor excluded, newest prefix retained"
+    );
+
+    // Byte budget: records large enough to exceed the cumulative byte bound
+    // before the record bound.
+    let chain = write_omp_chain(&catalog, "--noisy-bytes--", 3);
+    let mid = &chain[1];
+    let leaf = &chain[2];
+    let header = fs::read_to_string(mid)
+        .expect("mid body")
+        .lines()
+        .next()
+        .expect("header line")
+        .to_owned();
+    let pad = format!("{}\n", serde_json::to_string(&"x".repeat(96)).expect("pad json"));
+    let bytes = pad.len() as u64;
+    let needed = (MAX_HEADER_SCAN_BYTES / bytes + 1) as usize;
+    assert!(
+        needed < MAX_HEADER_SCAN_RECORDS,
+        "fixture must trip the byte bound before the record bound"
+    );
+    let mut noisy = header;
+    noisy.push('\n');
+    noisy.push_str(&pad.repeat(needed));
+    fs::write(mid, &noisy).expect("byte-padded mid");
+
+    assert!(
+        matches!(
+            omp_chain_member_probe_under_root_public(SourceSessionFormat::Omp, &omp_root, mid),
+            Err(ImportSessionError::ResourceLimit { .. })
+        ),
+        "byte-padded header must fail closed"
+    );
+    assert_eq!(
+        catalog.omp_chain_paths(leaf),
+        vec![mid.clone(), leaf.clone()],
+        "walk must stop at the byte-padded member"
+    );
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("byte-padded chain import");
+    assert!(
+        resolved.messages.iter().any(|m| m.text == "chain prompt 2"),
+        "newest prefix retained for byte-padded chain"
+    );
+
+    // Both noisy-chain leaves read AlreadyImported after import — never
+    // permanently Foreign.
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        ..Default::default()
+    });
+    let leaf_rows = rows
+        .iter()
+        .filter(|row| row.session_id == "omp-chain-2")
+        .collect::<Vec<_>>();
+    assert_eq!(leaf_rows.len(), 2, "one row per noisy chain leaf");
+    for row in leaf_rows {
+        assert!(
+            matches!(row.status, CatalogRowStatus::AlreadyImported { .. }),
+            "imported noisy-chain leaf must not read as permanently Foreign, got {:?}",
+            row.status
+        );
+    }
+}
+
+/// An OMP ancestor whose descriptor exceeds the per-file source cap is
+/// rejected before its header is probed; the walk stops there and import
+/// keeps the safe newest prefix, with the row reading AlreadyImported after.
+#[test]
+fn omp_chain_probe_rejects_oversize_ancestor() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let chain = write_omp_chain(&catalog, "--oversize--", 3);
+    let mid = &chain[1];
+    let leaf = &chain[2];
+    let omp_root = catalog.root_for(SessionSourceKind::Omp).path;
+
+    // Sparse-extend the middle ancestor beyond the per-file source cap so the
+    // descriptor-length check trips without writing 64 MiB.
+    let file = File::options().write(true).open(mid).expect("open mid");
+    file.set_len(MAX_SOURCE_BYTES + 1).expect("extend mid");
+
+    assert!(
+        matches!(
+            omp_chain_member_probe_under_root_public(SourceSessionFormat::Omp, &omp_root, mid),
+            Err(ImportSessionError::ResourceLimit { .. })
+        ),
+        "oversize ancestor must be rejected before header probing"
+    );
+    assert_eq!(
+        catalog.omp_chain_paths(leaf),
+        vec![mid.clone(), leaf.clone()],
+        "walk must stop at the oversize member"
+    );
+
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("import with oversize ancestor");
+    let texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        ["chain prompt 2", "chain reply 2"],
+        "oversize ancestor excluded, newest prefix retained"
+    );
+
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        ..Default::default()
+    });
+    let row = rows
+        .iter()
+        .find(|row| row.session_id == "omp-chain-2")
+        .expect("leaf row");
+    assert!(
+        matches!(row.status, CatalogRowStatus::AlreadyImported { .. }),
+        "oversize ancestor must not leave the imported row Foreign, got {:?}",
+        row.status
+    );
+}
+
+/// The OMP chain fingerprint is content-based: a same-length rewrite with the
+/// mtime restored must still change the fingerprint and re-import instead of
+/// reusing the stale native copy.
+#[test]
+fn omp_chain_fingerprint_tracks_content_not_mtime() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let chain = write_omp_chain(&catalog, "--content-fp--", 3);
+    let mid = &chain[1];
+    let leaf = &chain[2];
+    let omp_root = catalog.root_for(SessionSourceKind::Omp).path;
+
+    // Freeze the mtime that will later be "restored" to the same value.
+    set_modified(mid, 42_000);
+    let original = fs::read_to_string(mid).expect("mid body");
+    let original_len = original.len();
+    let original_mtime = fs::metadata(mid).expect("mid meta").modified().expect("mtime");
+
+    let first = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("first chained import");
+    assert!(!first.reused_existing);
+    let chain_paths = catalog.omp_chain_paths(leaf);
+    let (_, fingerprint_before) =
+        parse_omp_chain_public(&omp_root, &chain_paths, SESSION_CATALOG_OMP_CHAIN_MAX_BYTES)
+            .expect("parse before rewrite");
+
+    // Same-length rewrite with the mtime restored: identical size and mtime,
+    // different bytes. The old {mtime_secs}:{size} fingerprint would miss
+    // this; the content digest must not.
+    let rewritten = original
+        .replace("chain prompt 1", "chain prompT 1")
+        .replace("chain reply 1", "chain repLy 1");
+    assert_eq!(rewritten.len(), original_len, "fixture rewrite must be same-length");
+    fs::write(mid, &rewritten).expect("rewrite mid");
+    set_modified(mid, 42_000); // restore the frozen mtime
+    let meta = fs::metadata(mid).expect("mid meta");
+    assert_eq!(meta.len(), original_len as u64, "size restored");
+    assert_eq!(meta.modified().expect("mtime"), original_mtime, "mtime restored");
+
+    let (_, fingerprint_after) =
+        parse_omp_chain_public(&omp_root, &chain_paths, SESSION_CATALOG_OMP_CHAIN_MAX_BYTES)
+            .expect("parse after rewrite");
+    assert_ne!(
+        fingerprint_after, fingerprint_before,
+        "same-length rewrite with restored mtime must change the content fingerprint"
+    );
+
+    // The stale native copy is not reused: a fresh import with a new id/path
+    // carries the rewritten ancestor transcript.
+    let second = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("re-import after content rewrite");
+    assert!(!second.reused_existing);
+    assert_ne!(second.path, first.path, "content change must emit a fresh import");
+    let body = fs::read_to_string(&second.path).expect("second body");
+    assert!(
+        body.contains("chain prompT 1"),
+        "rewritten ancestor transcript must be in the fresh import"
+    );
+}
+
+/// Malformed or adjacency-rejected ancestors must not leave imported rows
+/// permanently Foreign: the row's fingerprint comes from the same
+/// authoritative accepted-chain parse as the import, so after import the row
+/// reads AlreadyImported even when an ancestor was excluded.
+#[test]
+fn omp_row_status_matches_import_when_ancestors_excluded() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+
+    // Malformed ancestor: valid header, broken JSON body after it.
+    let chain = write_omp_chain(&catalog, "--malformed-mid--", 3);
+    let mid = &chain[1];
+    let leaf = &chain[2];
+    let header = fs::read_to_string(mid)
+        .expect("mid body")
+        .lines()
+        .next()
+        .expect("header line")
+        .to_owned();
+    fs::write(mid, format!("{header}\n{{not json\n")).expect("malformed mid");
+
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("import with malformed ancestor");
+    assert!(!resolved.reused_existing);
+    let texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        ["chain prompt 2", "chain reply 2"],
+        "malformed ancestor excluded, newest prefix retained"
+    );
+
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        ..Default::default()
+    });
+    let row = rows
+        .iter()
+        .find(|row| row.session_id == "omp-chain-2")
+        .expect("leaf row");
+    assert!(
+        matches!(row.status, CatalogRowStatus::AlreadyImported { .. }),
+        "malformed ancestor must not leave the imported row permanently Foreign, got {:?}",
+        row.status
+    );
+
+    // Adjacency-rejected ancestor: mid no longer references root, so the
+    // parse drops root (and anything older) while keeping mid + leaf.
+    let chain = write_omp_chain(&catalog, "--adjacency-mid--", 3);
+    let mid = &chain[1];
+    let leaf = &chain[2];
+    let bogus = chain[0].with_file_name("not-the-root.jsonl");
+    let mid_body = fs::read_to_string(mid).expect("mid body");
+    fs::write(
+        mid,
+        mid_body.replace(
+            &format!(r#","parentSession":"{}""#, chain[0].display()),
+            &format!(r#","parentSession":"{}""#, bogus.display()),
+        ),
+    )
+    .expect("rewrite mid linkage");
+
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("import with adjacency-rejected ancestor");
+    let texts = resolved
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        [
+            "chain prompt 1",
+            "chain reply 1",
+            "chain prompt 2",
+            "chain reply 2"
+        ],
+        "root dropped by adjacency, mid + leaf retained"
+    );
+
+    let rows = catalog.list(&CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        ..Default::default()
+    });
+    let row = rows
+        .iter()
+        .find(|row| row.session_id == "omp-chain-2")
+        .expect("leaf row");
+    assert!(
+        matches!(row.status, CatalogRowStatus::AlreadyImported { .. }),
+        "adjacency-rejected ancestor must not leave the imported row permanently Foreign, got {:?}",
+        row.status
+    );
+}
+
+/// OMP rotation rows share the chain-opener summary and cwd, so dedupe must
+/// prefer the leaf row (longest accepted chain / exact AlreadyImported match)
+/// over its rotation ancestors — both before and after import.
+#[test]
+fn omp_dedupe_keeps_leaf_row_for_rotation_chain() {
+    let fixture = Fixture::new();
+    let catalog = fixture.catalog();
+    let chain = write_omp_chain(&catalog, "--dedupe-leaf--", 3);
+    let leaf = &chain[2];
+
+    let options = CatalogListOptions {
+        sources: vec![SessionSourceKind::Omp],
+        include_foreign: true,
+        dedupe: true,
+        ..Default::default()
+    };
+
+    // Before import: the three rotation rows collapse to the leaf.
+    let rows = catalog.list(&options);
+    assert_eq!(rows.len(), 1, "rotation chain collapses to one deduped row");
+    assert_eq!(rows[0].session_id, "omp-chain-2", "the leaf row wins dedupe");
+    assert!(matches!(rows[0].status, CatalogRowStatus::Foreign));
+    assert_eq!(
+        rows[0].message_count,
+        Some(6),
+        "leaf row carries the full accepted-chain message count"
+    );
+
+    // After import: the same deduped leaf row reads AlreadyImported.
+    let resolved = catalog
+        .import_or_resume(SessionSourceKind::Omp, leaf, None)
+        .expect("chain import");
+    assert!(!resolved.reused_existing);
+    let rows = catalog.list(&options);
+    assert_eq!(rows.len(), 1, "one leaf row after import");
+    assert_eq!(rows[0].session_id, "omp-chain-2");
+    match &rows[0].status {
+        CatalogRowStatus::AlreadyImported { native_path, .. } => {
+            assert_eq!(native_path, &resolved.path, "leaf row points at its import");
+        }
+        other => panic!("expected AlreadyImported leaf row, got {other:?}"),
+    }
 }
 
 /// The OMP lineage fingerprint covers every chain member: mutating an

@@ -4,16 +4,32 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use super::{
     ImportSessionError, ImportedMessage, ImportedMessageRole, OpenedSource, OpenedSourceParts,
     SourceSessionFormat,
 };
 
-const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+/// Per-file source cap applied to every member of a parsed source, including
+/// OMP rotation chain members. Exposed crate-wide so the catalog's OMP chain
+/// probe rejects oversize members before scanning their headers.
+pub(crate) const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECORDS: usize = 250_000;
 const MAX_CWD_SIDECAR_BYTES: u64 = 16 * 1024;
+
+/// Maximum total bytes the OMP parent-session header probe scans before
+/// failing closed: two full-size JSONL records (optional title slot + session
+/// record) plus their trailing newlines. A file that cannot yield its session
+/// record within this budget is treated as malformed instead of being read to
+/// EOF.
+pub(crate) const MAX_HEADER_SCAN_BYTES: u64 = 2 * MAX_LINE_BYTES as u64 + 2;
+/// Maximum physical JSONL records the OMP parent-session header probe scans
+/// before failing closed (same convention as the full-file record bound), so
+/// files padded with empty/non-object JSON records cannot drive the probe
+/// unboundedly.
+pub(crate) const MAX_HEADER_SCAN_RECORDS: usize = MAX_RECORDS;
 
 #[derive(Debug)]
 pub(super) struct ParsedSession {
@@ -235,8 +251,45 @@ struct ActiveTurn {
 struct ParsedChainMember {
     path: PathBuf,
     parent_session: Option<String>,
-    fingerprint: String,
+    /// SHA-256 of this member's exact bytes, read from its capability-opened
+    /// descriptor (domain-separated; see [`member_content_digest`]).
+    digest: [u8; 32],
     native: NativeTurns,
+}
+
+/// SHA-256 of one chain member's exact bytes, domain-separated so member
+/// digests are unambiguous regardless of where one file's bytes end and the
+/// next begins.
+fn member_content_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pi-rs-omp-chain-member-v1\0");
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// Chain content fingerprint: SHA-256 over the count-prefixed, root → leaf
+/// ordered member digests. The explicit count plus fixed-size digests make the
+/// framing unambiguous, so any accepted-member byte change (including
+/// same-length rewrites with restored mtimes) or accepted-set change yields a
+/// different fingerprint.
+fn chain_fingerprint(digests: &[[u8; 32]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pi-rs-omp-chain-v1\0");
+    hasher.update((digests.len() as u64).to_le_bytes());
+    for digest in digests {
+        hasher.update(digest);
+    }
+    hex_encode(&hasher.finalize())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Parse a rotation chain of OMP session files (root → leaf order) into one
@@ -255,9 +308,11 @@ struct ParsedChainMember {
 /// against the parsed content itself: a member is kept only when the
 /// next-newer member's `parentSession` equals its path, so a header swap
 /// between traversal and parse fails closed instead of stitching unrelated
-/// files together. The returned fingerprint joins one metadata fingerprint
-/// (`{mtime_secs}:{size}`, from the same opened descriptor) per accepted
-/// member, so any ancestor or leaf change yields a different chain identity.
+/// files together. The returned fingerprint is a SHA-256 over the accepted
+/// members' exact bytes (read from the same capability-opened descriptors,
+/// count-prefixed and root → leaf ordered), so any accepted-member byte
+/// change — including a same-length rewrite with a restored mtime — yields a
+/// different chain identity.
 pub(super) fn parse_omp_chain(
     root: &Path,
     paths: &[PathBuf],
@@ -295,26 +350,29 @@ pub(super) fn parse_omp_chain(
             break;
         }
         total_bytes = total_bytes.saturating_add(size);
-        let fingerprint = super::metadata_fingerprint(member.metadata());
-        retained.push((member, fingerprint));
+        retained.push(member);
     }
     retained.reverse();
 
     // Parse every retained member from its own opened descriptor; an ancestor
     // parse failure excludes the member (the adjacency pass drops it and
-    // everything older), while a leaf failure is fatal.
+    // everything older), while a leaf failure is fatal. The exact bytes read
+    // for parsing are also hashed (no reopen), producing the per-member
+    // content digest used by the chain fingerprint.
     let retained_len = retained.len();
     let mut members = Vec::with_capacity(retained_len);
-    for (index, (member, fingerprint)) in retained.into_iter().enumerate() {
+    for (index, member) in retained.into_iter().enumerate() {
         let is_leaf = index + 1 == retained_len;
         let OpenedSourceParts { path, primary, .. } = member.into_parts();
         let parsed = (|| -> Result<ParsedChainMember, ImportSessionError> {
-            let contents = read_bounded_text_from(primary, &path, MAX_SOURCE_BYTES)?;
-            let native = read_native_turns_from_contents(SourceSessionFormat::Omp, &path, &contents)?;
+            let bytes = read_bounded_bytes_from(primary, &path, MAX_SOURCE_BYTES)?;
+            let contents = std::str::from_utf8(&bytes)
+                .map_err(|_| resource_limit(&path, "source is not valid UTF-8".to_owned()))?;
+            let native = read_native_turns_from_contents(SourceSessionFormat::Omp, &path, contents)?;
             Ok(ParsedChainMember {
                 path,
                 parent_session: native.parent_session.clone(),
-                fingerprint,
+                digest: member_content_digest(&bytes),
                 native,
             })
         })();
@@ -354,7 +412,7 @@ pub(super) fn parse_omp_chain(
     let mut source_session_id = None;
     let mut cwd = PathBuf::new();
     let mut started_at = None;
-    let mut fingerprints = Vec::with_capacity(accepted_len);
+    let mut digests = Vec::with_capacity(accepted_len);
     for (index, member) in accepted.into_iter().enumerate() {
         if index + 1 == accepted_len {
             source_session_id = member.native.source_session_id.clone();
@@ -363,7 +421,7 @@ pub(super) fn parse_omp_chain(
         if index == 0 {
             started_at = member.native.started_at.clone();
         }
-        fingerprints.push(member.fingerprint.clone());
+        digests.push(member.digest);
         for turn in &member.native.turns {
             if seen_ids.insert(turn.id.clone()) {
                 turns.push(turn.clone());
@@ -371,7 +429,7 @@ pub(super) fn parse_omp_chain(
         }
     }
     let (messages, meaningful_count) = project_turns(&turns);
-    let fingerprint = fingerprints.join("\n");
+    let fingerprint = chain_fingerprint(&digests);
     Ok((
         ParsedSession {
             source_session_id,
@@ -398,7 +456,10 @@ pub(super) fn source_parent_session_opened(
 }
 
 /// Bounded header read: the OMP session record is line 1, or line 2 behind the
-/// title slot, so only the first two records are parsed.
+/// title slot, so only the first two records are parsed. The scan is capped by
+/// both a cumulative byte budget and a physical-record budget so files padded
+/// with empty/non-object JSON records fail closed instead of being read to
+/// EOF.
 fn read_omp_parent_session(
     file: &fs::File,
     path: &Path,
@@ -410,6 +471,8 @@ fn read_omp_parent_session(
     })?;
     let mut values = Vec::new();
     let mut buffer = Vec::new();
+    let mut bytes_read = 0_u64;
+    let mut records = 0_usize;
     while values.len() < 2 {
         buffer.clear();
         let read = reader
@@ -422,6 +485,13 @@ fn read_omp_parent_session(
             })?;
         if read == 0 {
             break;
+        }
+        bytes_read = bytes_read.saturating_add(read as u64);
+        if bytes_read > MAX_HEADER_SCAN_BYTES {
+            return Err(resource_limit(
+                path,
+                format!("header scan exceeds {MAX_HEADER_SCAN_BYTES} bytes"),
+            ));
         }
         let mut frame_bytes = buffer.len();
         if buffer.get(frame_bytes.wrapping_sub(1)) == Some(&b'\n') {
@@ -442,6 +512,13 @@ fn read_omp_parent_session(
         if line.is_empty() {
             continue;
         }
+        if records == MAX_HEADER_SCAN_RECORDS {
+            return Err(resource_limit(
+                path,
+                format!("header scan exceeds {MAX_HEADER_SCAN_RECORDS} JSON records"),
+            ));
+        }
+        records += 1;
         match serde_json::from_str::<Value>(line) {
             Ok(value) if value.is_object() => values.push(value),
             Ok(_) => {}

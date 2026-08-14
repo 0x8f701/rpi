@@ -25,6 +25,12 @@ use walkdir::WalkDir;
 use self::parsers::{ParsedSession, parse_source, source_id};
 use crate::default_session_dir;
 
+/// Per-file OMP source cap, re-exported so the catalog's chain probe rejects
+/// oversize members before scanning their headers and tests can size fixtures.
+pub(crate) use parsers::MAX_SOURCE_BYTES;
+/// OMP header-probe budgets, re-exported for the catalog and regressions.
+pub(crate) use parsers::{MAX_HEADER_SCAN_BYTES, MAX_HEADER_SCAN_RECORDS};
+
 /// [`import_session_to`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -596,10 +602,11 @@ pub(crate) fn parse_opened_source_public(
     parsers::parse_opened_source(source, opened).map(ParsedSessionPublic::from)
 }
 
-/// Content-fingerprint convention shared by the catalog and the OMP chain
-/// parser: `{mtime_secs}:{size}` from a metadata handle. The chain fingerprint
-/// joins one of these per member, so any member change (content or mtime)
-/// yields a different chain identity.
+/// Single-file content-fingerprint convention for non-chain sources:
+/// `{mtime_secs}:{size}` from a metadata handle. OMP rotation chains do NOT
+/// use this — their freshness comes from the authoritative SHA-256 content
+/// digest over accepted members' exact bytes computed by
+/// [`parse_omp_chain_public`], so chain identity is content-based.
 pub(crate) fn metadata_fingerprint(metadata: &fs::Metadata) -> String {
     let modified = metadata
         .modified()
@@ -610,33 +617,35 @@ pub(crate) fn metadata_fingerprint(metadata: &fs::Metadata) -> String {
     format!("{}:{}", modified, metadata.len())
 }
 
-/// One chain member's linkage + identity, read through the configured root
+/// One chain member's linkage + size, read through the configured root
 /// capability from a single securely opened descriptor.
 pub(crate) struct OmpChainMemberProbe {
     /// Raw `parentSession` header value (the prior rotated file reference).
     pub parent_session: Option<String>,
-    /// Metadata fingerprint of this member from the same opened descriptor.
-    pub fingerprint: String,
     /// Size of this member from the same opened descriptor.
     pub size: u64,
 }
 
-/// Probe one OMP chain member: read its `parentSession` header reference and
-/// metadata fingerprint through the configured root capability. Non-OMP
-/// sources and files without the field return `None` parent; malformed
-/// references fail closed with the source error.
+/// Probe one OMP chain member: reject descriptors beyond the per-file source
+/// cap before any header read, then read its `parentSession` header reference
+/// through the configured root capability. Non-OMP sources and files without
+/// the field return `None` parent; malformed references and oversize or
+/// noise-padded files fail closed with the source error.
 pub(crate) fn omp_chain_member_probe_under_root_public(
     source: SourceSessionFormat,
     root: &Path,
     path: &Path,
 ) -> Result<OmpChainMemberProbe, ImportSessionError> {
     let opened = open_source_under_root(source, root, path)?;
+    let size = opened.metadata().len();
+    if size > MAX_SOURCE_BYTES {
+        return Err(ImportSessionError::ResourceLimit {
+            path: path.to_path_buf(),
+            reason: format!("file is {size} bytes; maximum is {MAX_SOURCE_BYTES}"),
+        });
+    }
     let parent_session = parsers::source_parent_session_opened(source, &opened)?;
-    Ok(OmpChainMemberProbe {
-        parent_session,
-        fingerprint: metadata_fingerprint(opened.metadata()),
-        size: opened.metadata().len(),
-    })
+    Ok(OmpChainMemberProbe { parent_session, size })
 }
 
 /// Parse a complete OMP rotation chain (root → leaf order) into one logical
@@ -644,8 +653,10 @@ pub(crate) fn omp_chain_member_probe_under_root_public(
 /// capability once; the aggregate byte budget is revalidated against those
 /// descriptors (newest prefix retained, leaf unconditional) and every file
 /// stays subject to per-file size/line/record limits. Entries duplicated
-/// across files are kept once. Returns the parsed session plus a SHA-256 chain
-/// content fingerprint (retained members' raw bytes) used for lineage reuse.
+/// across files are kept once. Returns the parsed session plus the SHA-256
+/// chain content fingerprint over the accepted members' exact bytes (count-
+/// prefixed, root → leaf), used for lineage reuse — the same authoritative
+/// result the catalog row status relies on.
 pub(crate) fn parse_omp_chain_public(
     root: &Path,
     paths: &[PathBuf],

@@ -309,11 +309,11 @@ pub fn resolve_resume_selection(
                 ensure_source_enabled(target.source, &sources, &target.source_path)?;
                 if target.source == SessionSourceKind::Omp {
                     // OMP chain freshness is fingerprint-gated inside
-                    // import_or_resume; the row's identity-only AlreadyImported
-                    // status can be stale between list and click (an ancestor
-                    // mutated after the last scan). Re-enter import_or_resume:
-                    // it reuses the existing native copy when the current chain
-                    // fingerprint matches and re-imports otherwise.
+                    // import_or_resume. A row is exact when listed, but its
+                    // accepted chain can change before the click (for example,
+                    // when an ancestor is rewritten). Re-enter import_or_resume:
+                    // it reuses the native copy when the current chain
+                    // fingerprint still matches and re-imports otherwise.
                     return imported_result(catalog.import_or_resume(
                         target.source,
                         &target.source_path,
