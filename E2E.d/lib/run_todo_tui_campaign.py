@@ -216,8 +216,8 @@ def main() -> None:
         if "Main session" not in overview or "[main]" not in overview:
             raise AssertionError(f"overview missing main DAG row:\n{overview}")
         checks.append("todo-overview-main-row")
-        # Overview counts row: "{exec} \u00b7 \u27130 open 21 active 7 blocked 0".
-        if "open 21 active 7 blocked 0" not in overview:
+        # Overview row uses middle-dot separators between bounded counters.
+        if "21 open" not in overview or "7 active" not in overview or "0 blocked" not in overview:
             raise AssertionError(f"overview counts not projected:\n{overview}")
         checks.append("todo-overview-counts")
 

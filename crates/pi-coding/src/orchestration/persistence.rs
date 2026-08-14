@@ -43,6 +43,11 @@ pub struct DurableState {
     pub parent_session_id: String,
     pub parent_session_path: String,
     pub agents: Vec<PersistedAgent>,
+    /// Mailbox for the configured orchestration root agent. The root is not a
+    /// child and therefore is not represented in `agents`, but child replies
+    /// committed before the parent session can consume them must survive restart.
+    #[serde(default)]
+    pub main_mailbox: Vec<MailboxMessage>,
     #[serde(default)]
     pub jobs: Vec<JobSnapshot>,
 }
@@ -143,6 +148,7 @@ pub struct DurableRuntime {
 
 struct DurableRuntimeInner {
     parent_session_id: String,
+    main_agent_id: String,
     parent_session_path: PathBuf,
     child_root: PathBuf,
     sidecar_path: PathBuf,
@@ -157,8 +163,23 @@ impl DurableRuntime {
         parent_session_path: PathBuf,
         child_root: PathBuf,
     ) -> Result<Self> {
+        Self::new_with_main_agent_id(
+            parent_session_id,
+            parent_session_path,
+            child_root,
+            "Main".to_owned(),
+        )
+    }
+
+    pub fn new_with_main_agent_id(
+        parent_session_id: String,
+        parent_session_path: PathBuf,
+        child_root: PathBuf,
+        main_agent_id: String,
+    ) -> Result<Self> {
         crate::session_store::validate_session_id(&parent_session_id)
             .context("invalid parent session id")?;
+        validate_agent_id(&main_agent_id).context("invalid orchestration main agent id")?;
         let requested_parent = absolute_lexical(&parent_session_path)?;
         let requested_parent_dir = requested_parent
             .parent()
@@ -230,6 +251,7 @@ impl DurableRuntime {
         Ok(Self {
             inner: Arc::new(DurableRuntimeInner {
                 parent_session_id,
+                main_agent_id,
                 parent_session_path,
                 child_root,
                 sidecar_path,
@@ -286,6 +308,7 @@ impl DurableRuntime {
             &self.inner.parent_session_id,
             &self.inner.parent_session_path,
             &self.inner.child_root,
+            &self.inner.main_agent_id,
         )?;
         write_state_atomic(&self.inner.sidecar_path, &state)?;
         Ok(result)
@@ -310,6 +333,7 @@ impl DurableRuntime {
             &self.inner.parent_session_id,
             &self.inner.parent_session_path,
             &self.inner.child_root,
+            &self.inner.main_agent_id,
         )
         .map(Some)
     }
@@ -427,6 +451,7 @@ fn validate_state(
     expected_parent_id: &str,
     expected_parent_path: &Path,
     child_root: &Path,
+    main_agent_id: &str,
 ) -> Result<()> {
     if state.version != DURABLE_STATE_VERSION {
         bail!(
@@ -452,15 +477,35 @@ fn validate_state(
     if state.jobs.len() > MAX_JOBS {
         bail!("durable state jobs exceed maximum of {MAX_JOBS}");
     }
+    if state.main_mailbox.len() > MAX_MAILBOX_PER_AGENT {
+        bail!(
+            "durable state mailbox for main agent {:?} exceeds maximum of {MAX_MAILBOX_PER_AGENT}",
+            main_agent_id
+        );
+    }
     let mut seen_ids = BTreeSet::new();
     let mut agent_relationships = std::collections::BTreeMap::new();
     let mut seen_message_ids = BTreeSet::new();
+    for message in &state.main_mailbox {
+        validate_agent_id(&message.id)?;
+        validate_agent_id(&message.from)?;
+        validate_agent_id(&message.to)?;
+        if message.to != main_agent_id {
+            bail!("durable main mailbox message recipient does not match main agent");
+        }
+        if !seen_message_ids.insert(message.id.as_str()) {
+            bail!("durable mailbox message id {:?} appears more than once", message.id);
+        }
+        if message.body.len() > MAX_BODY_LEN {
+            bail!("durable main mailbox message body exceeds maximum length");
+        }
+    }
     for agent in &state.agents {
         validate_agent_id(&agent.snapshot.id)?;
         if !seen_ids.insert(agent.snapshot.id.as_str()) {
             bail!("durable state agent id {:?} appears more than once", agent.snapshot.id);
         }
-        if agent.snapshot.id == "Main" {
+        if agent.snapshot.id == main_agent_id {
             bail!("durable state cannot contain the orchestration main agent");
         }
         if agent.request.child_id != agent.snapshot.id {
@@ -509,7 +554,7 @@ fn validate_state(
         }
     }
     for (agent_id, (_, parent_id)) in &agent_relationships {
-        if *parent_id != "Main" && !seen_ids.contains(parent_id) {
+        if *parent_id != main_agent_id && !seen_ids.contains(parent_id) {
             bail!("durable child agent {agent_id:?} references unknown parent {parent_id:?}");
         }
     }
@@ -545,6 +590,7 @@ fn load_and_validate_state(
     expected_parent_id: &str,
     expected_parent_path: &Path,
     child_root: &Path,
+    main_agent_id: &str,
 ) -> Result<DurableState> {
     let sidecar_path = canonicalize_child_path(child_root, sidecar_path)
         .context("validating durable state sidecar containment")?;
@@ -557,7 +603,13 @@ fn load_and_validate_state(
         .with_context(|| format!("reading durable state sidecar {}", sidecar_path.display()))?;
     let state: DurableState = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing durable state sidecar {}", sidecar_path.display()))?;
-    validate_state(&state, expected_parent_id, expected_parent_path, child_root)?;
+    validate_state(
+        &state,
+        expected_parent_id,
+        expected_parent_path,
+        child_root,
+        main_agent_id,
+    )?;
     Ok(state)
 }
 
@@ -766,6 +818,7 @@ pub fn persist_request(request: &ChildSessionRequest) -> PersistedRequest {
 pub fn build_state(
     parent_session_id: &str,
     parent_session_path: &Path,
+    main_mailbox: Vec<MailboxMessage>,
     agents: Vec<PersistedAgent>,
     jobs: Vec<JobSnapshot>,
 ) -> DurableState {
@@ -773,6 +826,7 @@ pub fn build_state(
         version: DURABLE_STATE_VERSION,
         parent_session_id: parent_session_id.to_owned(),
         parent_session_path: parent_session_path.to_string_lossy().into_owned(),
+        main_mailbox,
         agents,
         jobs,
     }
@@ -792,6 +846,7 @@ mod tests {
             version: DURABLE_STATE_VERSION,
             parent_session_id: parent_id(),
             parent_session_path: parent_path.to_string_lossy().into_owned(),
+            main_mailbox: Vec::new(),
             agents,
             jobs: Vec::new(),
         }
@@ -848,6 +903,109 @@ mod tests {
             session_path: None,
             mailbox: Vec::new(),
         }
+    }
+
+    #[test]
+    fn configured_main_identity_round_trips_root_relationships_and_mailbox() {
+        let root = tempdir().expect("root");
+        let parent_path = root.path().join("parent.jsonl");
+        fs::write(&parent_path, b"{}\n").expect("parent");
+        let runtime = DurableRuntime::new_with_main_agent_id(
+            parent_id(),
+            parent_path.clone(),
+            root.path().join("children").join(parent_id()),
+            "Coordinator".to_owned(),
+        )
+        .expect("configured-main durable runtime");
+        let mut agent = persisted_agent("Alpha");
+        agent.snapshot.parent_id = Some("Coordinator".to_owned());
+        agent.request.parent_id = "Coordinator".to_owned();
+        let mut state = state_with_agents(&parent_path, vec![agent]);
+        state.main_mailbox.push(MailboxMessage {
+            id: "message-1".to_owned(),
+            from: "Alpha".to_owned(),
+            to: "Coordinator".to_owned(),
+            body: "durable reply".to_owned(),
+            timestamp: 1,
+            reply_to: None,
+        });
+
+        runtime.persist(&state).expect("persist configured-main state");
+        assert_eq!(runtime.load().expect("load configured-main state"), state);
+    }
+
+    #[test]
+    fn configured_main_identity_rejects_wrong_mailbox_recipient() {
+        let root = tempdir().expect("root");
+        let parent_path = root.path().join("parent.jsonl");
+        fs::write(&parent_path, b"{}\n").expect("parent");
+        let runtime = DurableRuntime::new_with_main_agent_id(
+            parent_id(),
+            parent_path.clone(),
+            root.path().join("children").join(parent_id()),
+            "Coordinator".to_owned(),
+        )
+        .expect("configured-main durable runtime");
+        let mut state = state_with_agents(&parent_path, Vec::new());
+        state.main_mailbox.push(MailboxMessage {
+            id: "message-1".to_owned(),
+            from: "Alpha".to_owned(),
+            to: "Main".to_owned(),
+            body: "misrouted reply".to_owned(),
+            timestamp: 1,
+            reply_to: None,
+        });
+
+        let error = runtime
+            .persist(&state)
+            .expect_err("wrong main mailbox recipient must fail closed");
+        assert!(error.to_string().contains("recipient"), "{error:#}");
+    }
+
+    #[test]
+    fn configured_main_identity_rejects_root_as_child() {
+        let root = tempdir().expect("root");
+        let parent_path = root.path().join("parent.jsonl");
+        fs::write(&parent_path, b"{}\n").expect("parent");
+        let runtime = DurableRuntime::new_with_main_agent_id(
+            parent_id(),
+            parent_path.clone(),
+            root.path().join("children").join(parent_id()),
+            "Coordinator".to_owned(),
+        )
+        .expect("configured-main durable runtime");
+        let mut root_agent = persisted_agent("Coordinator");
+        root_agent.snapshot.parent_id = Some("Coordinator".to_owned());
+        root_agent.request.parent_id = "Coordinator".to_owned();
+        let state = state_with_agents(&parent_path, vec![root_agent]);
+
+        let error = runtime
+            .persist(&state)
+            .expect_err("configured main identity cannot be persisted as a child");
+        assert!(error.to_string().contains("main agent"), "{error:#}");
+    }
+
+    #[test]
+    fn configured_main_identity_rejects_unknown_parent() {
+        let root = tempdir().expect("root");
+        let parent_path = root.path().join("parent.jsonl");
+        fs::write(&parent_path, b"{}\n").expect("parent");
+        let runtime = DurableRuntime::new_with_main_agent_id(
+            parent_id(),
+            parent_path.clone(),
+            root.path().join("children").join(parent_id()),
+            "Coordinator".to_owned(),
+        )
+        .expect("configured-main durable runtime");
+        let mut orphan = persisted_agent("Alpha");
+        orphan.snapshot.parent_id = Some("Missing".to_owned());
+        orphan.request.parent_id = "Missing".to_owned();
+        let state = state_with_agents(&parent_path, vec![orphan]);
+
+        let error = runtime
+            .persist(&state)
+            .expect_err("unknown non-root parent must fail closed");
+        assert!(error.to_string().contains("unknown parent"), "{error:#}");
     }
 
     fn runtime(root: &Path) -> (DurableRuntime, PathBuf) {

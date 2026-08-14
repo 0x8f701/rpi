@@ -149,10 +149,10 @@ impl ApplicationRuntimeSlot {
         self.next_epoch.fetch_add(1, Ordering::AcqRel)
     }
 
-    pub(super) fn replace(&self, runtime: ApplicationRuntime) -> Arc<ApplicationRuntime> {
+    pub(super) fn replace_arc(&self, runtime: Arc<ApplicationRuntime>) -> Arc<ApplicationRuntime> {
         let epoch = runtime.epoch();
         let mut active = self.active.write();
-        let previous = std::mem::replace(&mut *active, Arc::new(runtime));
+        let previous = std::mem::replace(&mut *active, runtime);
         let sent = self.events.send(ApplicationEvent::RuntimeChanged { epoch });
         drop(active);
         let _ = sent;

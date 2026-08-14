@@ -278,7 +278,7 @@ TERM=xterm-256color \
         --evidence "$evidence/hub-tui" \
         >"$evidence/hub-tui-result.json"
     assert_file_contains "$evidence/hub-tui/tui.txt" \
-        'IRC · Beta → Main' 'beta-to-main-tmux' \
+        'IRC ⟵ Beta' 'beta-to-main-tmux' \
         'Alpha (Alpha) · completed' 'Beta (Beta) · completed'
     assert_file_lacks "$evidence/hub-tui/tui.txt" '<orchestration-message'
     assert_file_contains "$evidence/hub-tui/assertions.json" \

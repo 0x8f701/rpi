@@ -269,7 +269,7 @@ def main() -> None:
         time.sleep(1.5)
         run_tmux("send-keys", "-t", f"{session}:0", "-l", "Run the authoritative child-owned hub campaign.")
         run_tmux("send-keys", "-t", f"{session}:0", "Enter")
-        pane = wait_for(session, ["hub tool campaign complete", "IRC · Beta → Main", BETA_TO_MAIN], 35)
+        pane = wait_for(session, ["hub tool campaign complete", "IRC ⟵ Beta", BETA_TO_MAIN], 35)
         pane = wait_for(session, ["Alpha (Alpha) · completed", "Beta (Beta) · completed"], 10)
         if HubTuiHandler.request_error is not None:
             raise HubTuiHandler.request_error

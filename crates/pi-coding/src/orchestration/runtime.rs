@@ -652,8 +652,8 @@ pub enum OrchestrationEvent {
         group_id: String,
         agent: AgentSnapshot,
     },
-    /// Live projection of a message successfully delivered to Main.
-    /// Does not drain the mailbox; presentation-only for parent TUI/human UI.
+    /// Live projection of a successfully delivered message.
+    /// Unclaimed root-agent messages remain durable until the Application consumes them.
     MessageDelivered {
         group_id: String,
         message: MailboxMessage,
@@ -1093,6 +1093,7 @@ struct DurableAgentInfo {
 
 struct PreparedRecoveredState {
     group_entries: HashMap<String, Arc<AgentEntry>>,
+    main_mailbox: Vec<MailboxMessage>,
     agents: Vec<super::persistence::PersistedAgent>,
     jobs: PreparedJobRecords,
 }
@@ -1448,10 +1449,11 @@ impl OrchestrationRuntime {
                 .ok_or_else(|| anyhow!("parent session path has no parent"))?
                 .join("children")
                 .join(&session_id);
-            let durable = super::persistence::DurableRuntime::new(
+            let durable = super::persistence::DurableRuntime::new_with_main_agent_id(
                 session_id,
                 session_path,
                 child_root,
+                self.main_agent_id().to_owned(),
             )?;
             let same_parent = self
                 .inner
@@ -1499,9 +1501,11 @@ impl OrchestrationRuntime {
                 prepared.durable.parent_session_path(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             ))?;
             prepared.recovered = Some(PreparedRecoveredState {
                 group_entries: self.prepared_group_entries(HashMap::new()),
+                main_mailbox: Vec::new(),
                 agents: Vec::new(),
                 jobs: self.inner.jobs.prepare_replacement(Vec::new()),
             });
@@ -1619,10 +1623,18 @@ impl OrchestrationRuntime {
             Ok(super::persistence::build_state(
                 durable.parent_session_id(),
                 durable.parent_session_path(),
+                self.collect_main_mailbox(),
                 self.collect_persisted_agents(),
                 self.inner.jobs.snapshots(None),
             ))
         })
+    }
+
+    fn collect_main_mailbox(&self) -> Vec<MailboxMessage> {
+        REGISTRY
+            .get(&self.inner.group_id, self.main_agent_id())
+            .map(|entry| entry.mailbox.lock().iter().cloned().collect())
+            .unwrap_or_default()
     }
 
  /// Collect all non-main agents with their persisted definition, request,
@@ -2397,6 +2409,7 @@ soft_budget: None,
     ) -> Result<PreparedRecoveredState> {
         let now = now_millis();
         let mut entries = HashMap::with_capacity(state.agents.len());
+        let main_mailbox = state.main_mailbox;
         let mut agents = Vec::with_capacity(state.agents.len());
         for agent in state.agents {
             let session_path = agent
@@ -2468,12 +2481,16 @@ soft_budget: None,
             .collect::<Vec<_>>();
         let jobs = self.inner.jobs.prepare_replacement(job_snapshots);
         Ok(PreparedRecoveredState {
+            main_mailbox,
             group_entries: self.prepared_group_entries(entries),
             agents,
             jobs,
         })
     }
-    fn install_prepared_state(&self, state: PreparedRecoveredState) {
+    fn install_prepared_state(&self, mut state: PreparedRecoveredState) {
+        if let Some(main) = state.group_entries.get(self.main_agent_id()) {
+            *main.mailbox.lock() = std::mem::take(&mut state.main_mailbox).into();
+        }
         REGISTRY.install_prepared_group(&self.inner.group_id, state.group_entries);
         self.inner.jobs.install_replacement(state.jobs);
     }
@@ -2501,6 +2518,7 @@ soft_budget: None,
         durable.persist(&super::persistence::build_state(
             durable.parent_session_id(),
             durable.parent_session_path(),
+            recovered.main_mailbox.clone(),
             recovered.agents.clone(),
             recovered.jobs.snapshots().to_vec(),
         ))?;
@@ -2846,6 +2864,23 @@ soft_budget: None,
         if self.persist_state().is_err() {
             REGISTRY.restore_mailbox(&self.inner.group_id, agent_id, vec![message]);
         }
+    }
+
+    pub(crate) fn acknowledge_main_delivery(&self, message_id: &str) -> Result<()> {
+        let _durable_mutation = self.inner.durable_mutation.lock();
+        let main_id = self.main_agent_id();
+        let Some(message) = REGISTRY.remove_message_value(
+            &self.inner.group_id,
+            main_id,
+            message_id,
+        ) else {
+            return Ok(());
+        };
+        if let Err(error) = self.persist_state().context("persisting delivered Main message") {
+            REGISTRY.restore_mailbox_message(&self.inner.group_id, main_id, message);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Return a steered-but-unprocessed mailbox message to the recipient's
@@ -4979,6 +5014,7 @@ soft_budget: None,
             durable.persist(&super::persistence::build_state(
                 durable.parent_session_id(),
                 durable.parent_session_path(),
+                self.collect_main_mailbox(),
                 self.collect_persisted_agents(),
                 jobs,
             ))?;
@@ -5712,7 +5748,7 @@ pub(crate) fn mailbox_message_as_custom(message: &MailboxMessage) -> pi_ai::Mess
 /// Reverse of [`mailbox_message_as_custom`]: reconstruct the mailbox record
 /// from a steered custom message (used when a run settles before processing
 /// it, so the message returns to the mailbox instead of being lost).
-fn mailbox_message_from_custom(custom: &pi_ai::CustomMessage) -> Option<MailboxMessage> {
+pub(crate) fn mailbox_message_from_custom(custom: &pi_ai::CustomMessage) -> Option<MailboxMessage> {
     let details = custom.details.as_ref()?;
     Some(MailboxMessage {
         id: details.get("id")?.as_str()?.to_owned(),

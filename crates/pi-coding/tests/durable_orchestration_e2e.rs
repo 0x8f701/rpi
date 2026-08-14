@@ -40,37 +40,49 @@ use tokio::sync::{Barrier, Notify};
 use tokio_util::sync::CancellationToken;
 
 fn task_definition() -> AgentDefinition {
-    AgentDefinition { name: "task".to_owned(),
-    description: "background task".to_owned(),
-    system_prompt: "complete the assignment thoroughly".to_owned(),
-    tools: Some(Vec::new()),
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: "task".to_owned(),
+        description: "background task".to_owned(),
+        system_prompt: "complete the assignment thoroughly".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+    }
 }
 
 fn reviewer_definition() -> AgentDefinition {
-    AgentDefinition { name: "reviewer".to_owned(),
-    description: "code reviewer".to_owned(),
-    system_prompt: "review carefully".to_owned(),
-    tools: Some(Vec::new()),
-    autoload_skills: Vec::new(),
-    model: None,
-    thinking_level: Some(ThinkingLevel::Off),
-    max_turns: None,
-    max_tool_calls: None,
-    timeout_secs: None,
-    disallowed_tools: Vec::new(),
-    capability_ceiling: None,
-    source: AgentDefinitionSource::Bundled,
-    path: None, trusted: true, kind: pi_coding::AgentDefinitionKind::Agent, personality: None, soft_budget: None }
+    AgentDefinition {
+        name: "reviewer".to_owned(),
+        description: "code reviewer".to_owned(),
+        system_prompt: "review carefully".to_owned(),
+        tools: Some(Vec::new()),
+        autoload_skills: Vec::new(),
+        model: None,
+        thinking_level: Some(ThinkingLevel::Off),
+        max_turns: None,
+        max_tool_calls: None,
+        timeout_secs: None,
+        disallowed_tools: Vec::new(),
+        capability_ceiling: None,
+        source: AgentDefinitionSource::Bundled,
+        path: None,
+        trusted: true,
+        kind: pi_coding::AgentDefinitionKind::Agent,
+        personality: None,
+        soft_budget: None,
+    }
 }
 
 fn test_model() -> Model {
@@ -497,6 +509,7 @@ fn plant_sidecar(
             .parent_session_path()
             .to_string_lossy()
             .into_owned(),
+        main_mailbox: Vec::new(),
         agents,
         jobs,
     };
@@ -1079,6 +1092,68 @@ async fn hub_inbox_drain_failure_restores_mailbox() {
     runtime.shutdown().await;
 }
 
+/// A child reply committed to the root mailbox survives runtime reconstruction
+/// until the parent Application records and acknowledges it.
+#[tokio::test]
+async fn main_mailbox_survives_runtime_reconstruction() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let (parent, _, _) = parent_session(artifacts.path(), sessions.path());
+    let runtime_a = OrchestrationRuntime::new(
+        config(artifacts.path(), vec![task_definition()]),
+        quick_factory("unused"),
+    )
+    .expect("runtime A");
+    bind_fresh_parent(&runtime_a, &parent);
+    let receipts = runtime_a.send("Worker", "Main", "durable Main reply", None);
+    assert!(receipts[0].error.is_none(), "{receipts:?}");
+    runtime_a.shutdown().await;
+
+    let runtime_b = OrchestrationRuntime::new(
+        config(artifacts.path(), vec![task_definition()]),
+        quick_factory("unused"),
+    )
+    .expect("runtime B");
+    bind_then_recover_existing(&runtime_b, &parent);
+    assert!(
+        runtime_b
+            .inbox("Main", true)
+            .iter()
+            .any(|message| message.body == "durable Main reply"),
+        "runtime B recovers the unconsumed root mailbox"
+    );
+    runtime_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn configured_main_identity_recovers_root_mailbox() {
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let sessions = tempfile::tempdir().expect("sessions");
+    let (parent, _, _) = parent_session(artifacts.path(), sessions.path());
+    let mut config_a = config(artifacts.path(), vec![task_definition()]);
+    config_a.main_agent_id = "Coordinator".to_owned();
+    let runtime_a = OrchestrationRuntime::new(config_a, quick_factory("unused"))
+        .expect("runtime A");
+    bind_fresh_parent(&runtime_a, &parent);
+    let receipts = runtime_a.send("Worker", "Coordinator", "configured root reply", None);
+    assert!(receipts[0].error.is_none(), "{receipts:?}");
+    runtime_a.shutdown().await;
+
+    let mut config_b = config(artifacts.path(), vec![task_definition()]);
+    config_b.main_agent_id = "Coordinator".to_owned();
+    let runtime_b = OrchestrationRuntime::new(config_b, quick_factory("unused"))
+        .expect("runtime B");
+    bind_then_recover_existing(&runtime_b, &parent);
+    assert!(
+        runtime_b
+            .inbox("Coordinator", true)
+            .iter()
+            .any(|message| message.body == "configured root reply"),
+        "configured root mailbox survives reconstruction"
+    );
+    runtime_b.shutdown().await;
+}
+
 /// After runtime/session replacement, bind targets the current recorder — children
 /// and sidecar live under the new parent root, never the old one.
 #[tokio::test]
@@ -1543,6 +1618,7 @@ async fn corrupt_sidecar_fails_closed_without_registry_mutation() {
         version: DURABLE_STATE_VERSION,
         parent_session_id: "foreign-parent".to_owned(),
         parent_session_path: parent_path.to_string_lossy().into_owned(),
+        main_mailbox: Vec::new(),
         agents: vec![persisted_worker(
             "Intruder",
             AgentStatus::Parked,
@@ -1560,6 +1636,7 @@ async fn corrupt_sidecar_fails_closed_without_registry_mutation() {
             version: DURABLE_STATE_VERSION,
             parent_session_id: parent_id.clone(),
             parent_session_path: parent_path.to_string_lossy().into_owned(),
+            main_mailbox: Vec::new(),
             agents: vec![],
             jobs: vec![],
         })
@@ -1608,6 +1685,7 @@ async fn fresh_non_explicit_application_attach_binds_before_parent_jsonl_exists(
 
     application
         .attach_orchestration_with_override(runtime.clone(), false)
+        .await
         .expect("fresh non-explicit application attachment");
 
     assert!(runtime.is_durable(), "attachment binds durable orchestration");
@@ -1873,6 +1951,7 @@ async fn corrupt_new_parent_rebind_preserves_old_live_binding_and_state() {
         version: DURABLE_STATE_VERSION,
         parent_session_id: new_id,
         parent_session_path: new_path.to_string_lossy().into_owned(),
+        main_mailbox: Vec::new(),
         agents: vec![mismatched],
         jobs: Vec::new(),
     };
@@ -2059,6 +2138,7 @@ fn oversize_serialized_write_is_rejected_before_replacement() {
         version: DURABLE_STATE_VERSION,
         parent_session_id: parent_id.to_owned(),
         parent_session_path: parent_path.to_string_lossy().into_owned(),
+        main_mailbox: Vec::new(),
         agents: vec![persisted_worker(
             "Worker",
             AgentStatus::Parked,
@@ -2087,10 +2167,9 @@ fn oversize_serialized_write_is_rejected_before_replacement() {
     );
     assert_eq!(durable.load().expect("baseline remains loadable"), baseline);
 }
-
 /// Two-runtime recovery is proven from state produced only through public live
-/// runtime operations: bind, spawn, message persistence, shutdown, and recover.
-/// The recovered child keeps its mailbox and continues the same real JSONL.
+/// runtime operations: bind, spawn, shutdown, recover, and revival. The
+/// recovered child continues the same real JSONL transcript.
 #[tokio::test]
 async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity() {
     let artifacts = tempfile::tempdir().expect("artifacts");
@@ -2126,10 +2205,6 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
         )
         .await
         .expect("initial public job");
-    let queued = runtime_a.send("Main", "Worker", "mail retained across restart", None);
-    assert_eq!(queued.len(), 1, "{queued:?}");
-    assert_eq!(queued[0].outcome, DeliveryOutcome::Woken, "{queued:?}");
-    assert!(queued[0].error.is_none(), "{queued:?}");
 
     let reader = DurableRuntime::new(
         parent_id.clone(),
@@ -2143,13 +2218,6 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
         .iter()
         .find(|agent| agent.snapshot.id == "Worker")
         .expect("runtime A persisted Worker");
-    assert!(
-        live_worker
-            .mailbox
-            .iter()
-            .any(|message| message.body == "mail retained across restart"),
-        "runtime A publicly persisted mailbox: {live_worker:?}"
-    );
     let child_path = PathBuf::from(
         live_worker
             .session_path
@@ -2173,13 +2241,7 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
         .find(|agent| agent.id == "Worker")
         .expect("runtime B recovered Worker");
     assert_eq!(worker.status, AgentStatus::Parked, "{worker:?}");
-    assert!(
-        runtime_b
-            .inbox("Worker", true)
-            .iter()
-            .any(|message| message.body == "mail retained across restart"),
-        "runtime B recovered runtime A mailbox"
-    );
+    assert!(runtime_b.inbox("Worker", true).is_empty(), "runtime B starts without queued mail");
 
     let receipts = runtime_b.send("Main", "Worker", "continue after public restart", None);
     assert_eq!(receipts.len(), 1, "{receipts:?}");
@@ -2200,9 +2262,8 @@ async fn public_live_persist_restart_recovers_mailbox_and_transcript_continuity(
     let after_restart = std::fs::read_to_string(&child_path).expect("continued child transcript");
     assert!(after_restart.contains("initial public durable turn"), "{after_restart}");
     assert!(
-        after_restart.contains("mail retained across restart")
-            && after_restart.contains("continue after public restart"),
-        "recovered mailbox and new wake append to the same transcript: {after_restart}"
+        after_restart.contains("continue after public restart"),
+        "the restart wake appends to the same transcript: {after_restart}"
     );
     assert!(
         after_restart.matches("public restart assistant").count() >= 2,
@@ -2229,6 +2290,7 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
     let application = Application::new(old_parent).await;
     application
         .attach_orchestration(runtime.clone())
+        .await
         .expect("attach old application orchestration");
     let legacy = runtime
         .spawn_tasks(
@@ -2281,6 +2343,7 @@ async fn application_switch_rebind_is_transactional_and_uses_new_child_root() {
         version: DURABLE_STATE_VERSION,
         parent_session_id: new_id.to_owned(),
         parent_session_path: new_path.to_string_lossy().into_owned(),
+        main_mailbox: Vec::new(),
         agents: vec![invalid_agent],
         jobs: Vec::new(),
     };

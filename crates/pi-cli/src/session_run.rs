@@ -1158,7 +1158,7 @@ pub async fn build_session(cli: &Cli) -> Result<RunSession> {
         application.attach_goal_tool(binding)?;
     }
     if let Some(orchestration) = orchestration {
-        if let Err(error) = application.attach_orchestration(orchestration) {
+        if let Err(error) = application.attach_orchestration(orchestration).await {
             application.cleanup().await;
             return Err(error);
         }

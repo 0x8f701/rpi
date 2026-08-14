@@ -9,15 +9,15 @@ use pi_agent::{AbortController, AgentEvent, QueueMode, ThinkingLevel, ToolCallCo
 use pi_ai::providers::{
     FauxProviderOptions, FauxProviderRegistration, FauxResponse, register_faux_provider,
 };
-use pi_ai::{ContentBlock, Model, StopReason};
+use pi_ai::{ContentBlock, Model, StopReason, Usage};
 use pi_coding::{
     AgentCatalog, AgentDefinition, AgentDefinitionSource, AgentRuntimeSettings, Application,
     ApplicationEvent, ApplicationRuntimeCandidate, ApplicationRuntimeFactory,
     ApplicationRuntimeFuture, DeliveryOutcome, ExtensionCapability, ExtensionMode, ExtensionOrigin,
     ExtensionPermissionSet, ExtensionRuntime, ExtensionRuntimeOptions, ExtensionSpec,
-    ExtensionSpecRuntime, JobStatus, OrchestrationConfig, OrchestrationRuntime,
-    OrchestrationSettings, ResourceManager, ResourceManagerOptions, Session, SessionOptions,
-    StreamingBehavior, TaskItem, ToolSelection, WorkspaceRoots,
+    ExtensionSpecRuntime, GoalActivationOutcome, JobStatus, OrchestrationConfig,
+    OrchestrationRuntime, OrchestrationSettings, ResourceManager, ResourceManagerOptions, Session,
+    SessionOptions, StreamingBehavior, TaskItem, ToolSelection, WorkspaceRoots,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -364,6 +364,106 @@ async fn cross_cwd_switch_replaces_generation_and_preserves_old_session_lease() 
     std::mem::forget(retained);
     std::mem::forget(clone);
     std::mem::forget(application);
+}
+
+#[tokio::test]
+async fn cross_cwd_switch_drains_queued_goal_work_from_old_generation() {
+    let source = tempfile::tempdir().expect("source cwd");
+    let target = tempfile::tempdir().expect("target cwd");
+    let source_file = source.path().join("source.jsonl");
+    let target_file = target.path().join("target.jsonl");
+    write_session(&source_file, source.path(), "source-goal", "source message");
+    write_session(&target_file, target.path(), "target-goal", "target message");
+    let extension_dir = target.path().join(".pi/extensions");
+    std::fs::create_dir_all(&extension_dir).expect("target extension directory");
+    std::fs::write(
+        extension_dir.join("target-probe.mjs"),
+        r#"export default function (pi) {
+  pi.registerCommand("target-probe", { handler: () => "target-extension" });
+}"#,
+    )
+    .expect("target extension");
+
+    let first_started = Arc::new(Notify::new());
+    let release_first = CancellationToken::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream_started = first_started.clone();
+    let stream_release = release_first.clone();
+    let stream_calls = calls.clone();
+    let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, options| {
+        let started = stream_started.clone();
+        let release = stream_release.clone();
+        let calls = stream_calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let stream = pi_ai::new_assistant_message_event_stream();
+            let producer = stream.clone();
+            tokio::spawn(async move {
+                started.notify_waiters();
+                let abort = options.stream.abort_signal;
+                tokio::select! {
+                    () = release.cancelled() => {}
+                    () = async {
+                        match abort {
+                            Some(signal) => signal.cancelled().await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {}
+                }
+                let mut message = pi_ai::AssistantMessage::pending(&model);
+                message.content.push(ContentBlock::text("source turn finished"));
+                message.usage = Usage::default();
+                message.stop_reason = StopReason::Stop;
+                producer.end(Some(message)).await;
+            });
+            stream
+        })
+    });
+    let session = Session::new(SessionOptions {
+        model: Model::default(),
+        cwd: source.path().to_path_buf(),
+        system_prompt: String::new(),
+        thinking_level: ThinkingLevel::Off,
+        api_key: String::new(),
+        compaction: None,
+        stream_options: Default::default(),
+        tools: Some(Vec::new()),
+        before_tool_call: None,
+        after_tool_call: None,
+        stream_fn: Some(stream_fn),
+        auth_resolver: None,
+    })
+    .expect("source session");
+    session.switch_session(&source_file).await.expect("source resume");
+    let application = Application::new(session).await;
+    application
+        .attach_runtime_factory(Arc::new(TestRuntimeFactory))
+        .expect("factory");
+    application.goal_create("generation-safe goal", Some(100)).expect("goal metadata");
+
+    application
+        .prompt("hold source turn".to_owned(), Vec::new(), None)
+        .await
+        .expect("source prompt");
+    first_started.notified().await;
+    assert_eq!(
+        application.resume_goal_work().await.expect("queue goal work"),
+        GoalActivationOutcome::Queued
+    );
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        application.switch_session(&target_file),
+    )
+    .await
+    .expect("cross-cwd switch must not hang")
+    .expect("cross-cwd switch");
+    assert!(!outcome.cancelled);
+    assert_eq!(application.session().cwd(), target.path());
+    assert!(!application.is_streaming(), "new generation must not inherit old goal pending work");
+    application.wait_for_idle().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "queued old-generation goal work must not start");
+    release_first.cancel();
 }
 
 #[tokio::test]
@@ -1986,6 +2086,47 @@ async fn idle_main_receives_unsolicited_child_reply_on_next_run() {
         "the reply must reach the idle main model context on the next run"
     );
     runtime.shutdown().await;
+    registration.unregister();
+}
+
+/// A child reply committed before application construction is recovered from
+/// the durable Main mailbox and reaches the next model turn exactly once.
+#[tokio::test]
+async fn recovered_main_reply_reaches_next_model_turn_once() {
+    let contexts = Arc::new(parking_lot::Mutex::new(Vec::<pi_ai::Context>::new()));
+    let (session, registration) = session_with_recorded_contexts(
+        vec![FauxResponse::text("main turn done")],
+        contexts.clone(),
+    );
+    session.start_new_recording().expect("start durable recording");
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let runtime_a = irc_runtime(artifacts.path());
+    runtime_a.bind_and_recover(&session).expect("bind runtime A");
+    let receipts = runtime_a.send("Worker", "Main", "recovered async progress", None);
+    assert!(receipts[0].error.is_none(), "{receipts:?}");
+    runtime_a.shutdown().await;
+
+    let runtime_b = irc_runtime(artifacts.path());
+    let application = Application::new_with_orchestration(session, runtime_b.clone()).await;
+    wait_for_steered_message(&application, "recovered async progress").await;
+    application
+        .prompt("hello".to_owned(), Vec::new(), None)
+        .await
+        .expect("prompt");
+    application.wait_for_idle().await;
+
+    let captured = contexts.lock();
+    assert_eq!(captured.len(), 1, "one main turn");
+    let deliveries = irc_custom_texts(&captured[0])
+        .into_iter()
+        .filter(|text| text.contains("recovered async progress"))
+        .count();
+    assert_eq!(deliveries, 1, "recovered reply reaches model exactly once");
+    assert!(
+        runtime_b.inbox("Main", true).is_empty(),
+        "consumed recovered Main mail is durably acknowledged"
+    );
+    runtime_b.shutdown().await;
     registration.unregister();
 }
 

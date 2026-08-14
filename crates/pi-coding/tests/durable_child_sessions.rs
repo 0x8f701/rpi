@@ -158,6 +158,7 @@ fn durable_state_round_trip() {
         version: pi_coding::DURABLE_STATE_VERSION,
         parent_session_id: "parent-id".to_owned(),
         parent_session_path: dir.path().join("parent.jsonl").to_string_lossy().into_owned(),
+        main_mailbox: Vec::new(),
         agents: Vec::new(),
         jobs: Vec::new(),
     };
@@ -181,6 +182,7 @@ fn durable_state_wrong_parent_rejected() {
         version: pi_coding::DURABLE_STATE_VERSION,
         parent_session_id: "parent-id".to_owned(),
         parent_session_path: dir.path().join("parent.jsonl").to_string_lossy().into_owned(),
+        main_mailbox: Vec::new(),
         agents: Vec::new(),
         jobs: Vec::new(),
     };
@@ -211,6 +213,7 @@ fn corrupt_sidecar_fails_closed() {
         version: pi_coding::DURABLE_STATE_VERSION,
         parent_session_id: "parent-id".to_owned(),
         parent_session_path: dir.path().join("parent.jsonl").to_string_lossy().into_owned(),
+        main_mailbox: Vec::new(),
         agents: Vec::new(),
         jobs: Vec::new(),
     };

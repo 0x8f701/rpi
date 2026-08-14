@@ -711,7 +711,7 @@ impl AcpServer {
             return Ok(internal_error_response(id, "attaching the goal tool", &error));
         }
         if let Some(orchestration) = orchestration
-            && let Err(error) = application.attach_orchestration(orchestration)
+            && let Err(error) = application.attach_orchestration(orchestration).await
         {
             application.cleanup().await;
             return Ok(internal_error_response(id, "attaching orchestration", &error));

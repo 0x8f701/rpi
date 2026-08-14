@@ -462,7 +462,11 @@ impl ApplicationInner {
     /// (TUI/Web rendering is unchanged). A failed steer does not drain the
     /// mailbox, so the committed reply is never lost — callers must surface
     /// the failure (bounded structured diagnostic) rather than swallow it.
-    async fn steer_main_delivered_message(&self, event: &crate::OrchestrationEvent) -> Result<()> {
+    async fn steer_main_delivered_message(
+        &self,
+        active: &runtime::ApplicationRuntime,
+        event: &crate::OrchestrationEvent,
+    ) -> Result<()> {
         let crate::OrchestrationEvent::MessageDelivered {
             message,
             waiter_claimed: false,
@@ -471,10 +475,38 @@ impl ApplicationInner {
         else {
             return Ok(());
         };
-        let session = self.runtime().session();
-        session
+        {
+            let mut steered = self.steered_main_message_ids.lock();
+            if !steered.insert(message.id.clone()) {
+                return Ok(());
+            }
+        }
+        let session = active.session.clone();
+        if let Err(error) = session
             .steer(crate::orchestration::mailbox_message_as_custom(message))
             .await
+        {
+            self.steered_main_message_ids.lock().remove(&message.id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn replay_main_mailbox(
+        &self,
+        active: &runtime::ApplicationRuntime,
+        orchestration: &crate::OrchestrationRuntime,
+    ) {
+        for message in orchestration.inbox(orchestration.main_agent_id(), true) {
+            let event = crate::OrchestrationEvent::MessageDelivered {
+                group_id: orchestration.group_id().to_owned(),
+                message,
+                waiter_claimed: false,
+            };
+            if let Err(error) = self.steer_main_delivered_message(active, &event).await {
+                self.report_steer_main_delivery_failure(&event, &error);
+            }
+        }
     }
 
     /// Bounded structured diagnostic for a failed main-session steer: one
@@ -485,6 +517,12 @@ impl ApplicationInner {
             _ => "?",
         };
         eprintln!("orchestration: steering delivered message {id} into the main session failed: {error:#}");
+    }
+
+    fn report_main_delivery_ack_failure(&self, message_id: &str, error: &anyhow::Error) {
+        eprintln!(
+            "orchestration: acknowledging recorded Main delivery {message_id} failed: {error:#}"
+        );
     }
 }
 
@@ -498,6 +536,7 @@ struct ApplicationInner {
     events: broadcast::Sender<ApplicationEvent>,
     runtime_factory: Mutex<Option<Arc<dyn ApplicationRuntimeFactory>>>,
     runtime: runtime::ApplicationRuntimeSlot,
+    steered_main_message_ids: Mutex<std::collections::BTreeSet<String>>,
     workflow_manager: Mutex<Option<crate::WorkflowManager>>,
     workflow_runtime_factory: Mutex<Option<Weak<workflows::ApplicationWorkflowRuntimeFactory>>>,
     workflow_events: Mutex<Option<JoinHandle<()>>>,
@@ -562,7 +601,7 @@ impl Application {
         } = candidate;
         let application = Self::build(session, extension_runtime).await;
         if let Some(runtime) = orchestration_runtime {
-            application.attach_orchestration(runtime)?;
+            application.attach_orchestration(runtime).await?;
         }
         if let Some(binding) = goal_tool_binding {
             application.attach_goal_tool(binding)?;
@@ -577,6 +616,7 @@ impl Application {
         let application = Self::build(session, None).await;
         application
             .attach_orchestration(orchestration)
+            .await
             .expect("fresh application accepts orchestration");
         application
     }
@@ -597,6 +637,7 @@ impl Application {
             runtime: runtime::ApplicationRuntimeSlot::new(initial_runtime, events.clone()),
             runtime_factory: Mutex::new(None),
             events,
+            steered_main_message_ids: Mutex::new(std::collections::BTreeSet::new()),
             workflow_manager: Mutex::new(None),
             workflow_runtime_factory: Mutex::new(None),
             workflow_events: Mutex::new(None),
@@ -608,7 +649,7 @@ impl Application {
         let application = Self { inner };
         let generation = application.runtime();
         application
-            .bind_runtime_generation(&generation)
+            .bind_runtime_generation(generation.clone())
             .await
             .expect("fresh runtime generation must bind");
         // Hook-wire the initial trust decision: resolve it through the
@@ -638,7 +679,7 @@ impl Application {
 
     async fn bind_runtime_generation(
         &self,
-        generation: &runtime::ApplicationRuntime,
+        generation: Arc<runtime::ApplicationRuntime>,
     ) -> Result<()> {
         let epoch = generation.epoch();
         let session = generation.session();
@@ -850,6 +891,20 @@ impl Application {
                 {
                     let _ = runtime.emit(extension_event).await;
                 }
+                if let SessionEvent::EntryAppended { entry } = &event
+                    && entry.custom_type.as_deref()
+                        == Some(crate::orchestration::ORCHESTRATION_MESSAGE_TYPE)
+                    && let Some(details) = entry.details.as_ref()
+                    && let Some(message_id) = details.get("id").and_then(Value::as_str)
+                    && let Some(orchestration) = inner.runtime().orchestration_runtime()
+                {
+                    if let Err(error) = orchestration.acknowledge_main_delivery(message_id) {
+                        inner.steered_main_message_ids.lock().remove(message_id);
+                        inner.report_main_delivery_ack_failure(message_id, &error);
+                    } else {
+                        inner.steered_main_message_ids.lock().remove(message_id);
+                    }
+                }
                 let _ = inner.runtime.publish(epoch, ApplicationEvent::Session(event));
             }
         }));
@@ -877,13 +932,21 @@ impl Application {
         }
         if let Some(orchestration) = generation.orchestration_runtime() {
             let mut events = orchestration.subscribe();
+            self.inner.replay_main_mailbox(&generation, &orchestration).await;
+            let event_runtime = orchestration.clone();
             let orchestration_inner = Arc::downgrade(&self.inner);
+            let event_generation = generation.clone();
             *generation.orchestration_events.lock() = Some(tokio::spawn(async move {
                 loop {
                     match events.recv().await {
                         Ok(event) => {
                             let Some(inner) = orchestration_inner.upgrade() else { break; };
-                            inner.steer_main_delivered_message(&event).await;
+                            if let Err(error) = inner
+                                .steer_main_delivered_message(&event_generation, &event)
+                                .await
+                            {
+                                inner.report_steer_main_delivery_failure(&event, &error);
+                            }
                             let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1013,11 +1076,11 @@ impl Application {
     }
 
 
-    pub fn attach_orchestration(&self, runtime: crate::OrchestrationRuntime) -> Result<()> {
-        self.attach_orchestration_with_override(runtime, true)
+    pub async fn attach_orchestration(&self, runtime: crate::OrchestrationRuntime) -> Result<()> {
+        self.attach_orchestration_with_override(runtime, true).await
     }
 
-    pub fn attach_orchestration_with_override(
+    pub async fn attach_orchestration_with_override(
         &self,
         runtime: crate::OrchestrationRuntime,
         explicit: bool,
@@ -1028,11 +1091,15 @@ impl Application {
                 .bind_and_recover(&active.session)
                 .context("binding orchestration to application session")?;
         }
-        let mut current = active.orchestration_runtime.lock();
-        if current.is_some() {
-            return Err(anyhow!("application orchestration is already configured"));
+        {
+            let mut current = active.orchestration_runtime.lock();
+            if current.is_some() {
+                return Err(anyhow!("application orchestration is already configured"));
+            }
+            *current = Some(runtime.clone());
         }
         let mut events = runtime.subscribe();
+        self.inner.replay_main_mailbox(&active, &runtime).await;
         let event_runtime = runtime.clone();
         let event_inner = Arc::downgrade(&self.inner);
         let epoch = active.epoch();
@@ -1050,7 +1117,8 @@ impl Application {
                         if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                             inner.todo_dag_failed(&error);
                         }
-                        inner.steer_main_delivered_message(&event).await;
+                        inner.steer_main_delivered_message(&active, &event).await
+                            .unwrap_or_else(|error| inner.report_steer_main_delivery_failure(&event, &error));
                         let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                         inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                     }
@@ -1078,10 +1146,8 @@ impl Application {
                 }
             }
         });
-        *current = Some(runtime);
         *active.orchestration_events.lock() = Some(event_task);
         active.orchestration_explicit.store(explicit, Ordering::Release);
-        drop(current);
         self.inner.arm_todo_dag_after_mutation()?;
         Ok(())
     }
@@ -1345,7 +1411,7 @@ impl Application {
         }
         active.goal_work_pending.fetch_add(1, Ordering::AcqRel);
         let inner = Arc::downgrade(&self.inner);
-        tokio::spawn(run_goal_work(inner, key, turn_guard));
+        tokio::spawn(run_goal_work(inner, active.clone(), key, turn_guard));
         outcome
     }
 
@@ -2210,14 +2276,25 @@ impl Application {
         candidate.session.set_session_dir(active.session.session_dir());
 
         let _operation = self.inner.operation_gate.lock().await;
+        active.goal_work_activation.lock().take();
+        active.session.abort().await;
+        let active_run = { active.active_run.lock().take() };
+        if let Some(run) = active_run {
+            let _ = run.await;
+        } else {
+            active.session.wait_for_idle().await;
+        }
+        while active.goal_work_pending.load(Ordering::Acquire) != 0 {
+            active.goal_work_changed.notified().await;
+        }
         let loops = self.loop_handle()?;
         let epoch = self.inner.runtime.next_epoch();
-        let next = candidate.activate(epoch);
-        self.bind_runtime_generation(&next).await?;
+        let next = Arc::new(candidate.activate(epoch));
+        self.bind_runtime_generation(next.clone()).await?;
         loops
             .commit_session_switch(prepared_loops, crate::LoopRemovalReason::SessionChanged)
             .await?;
-        let old = self.inner.runtime.replace(next);
+        let old = self.inner.runtime.replace_arc(next);
 
         old.process_manager.shutdown_owner(&old.process_owner_id).await;
         let orchestration_task = old.orchestration_events.lock().take();
@@ -2829,11 +2906,13 @@ impl Application {
             }
         };
         if runtime_changed {
+            self.inner.steered_main_message_ids.lock().clear();
             if let Some(task) = active.orchestration_events.lock().take() {
                 task.abort();
             }
             if let Some(runtime) = &next_runtime {
                 let mut events = runtime.subscribe();
+                self.inner.replay_main_mailbox(&active, runtime).await;
                 let event_runtime = runtime.clone();
                 let event_inner = Arc::downgrade(&self.inner);
                 let epoch = active.epoch();
@@ -2848,7 +2927,8 @@ impl Application {
                                 if let Err(error) = inner.observe_orchestration_event(&event_runtime, &event, allow_spawn) {
                                     inner.todo_dag_failed(&error);
                                 }
-                                inner.steer_main_delivered_message(&event).await;
+                                inner.steer_main_delivered_message(&active, &event).await
+                                    .unwrap_or_else(|error| inner.report_steer_main_delivery_failure(&event, &error));
                                 let _ = inner.runtime.publish(epoch, ApplicationEvent::Orchestration(event));
                                 inner.finish_todo_cycle_if_idle(Some(&event_runtime), false);
                             }
@@ -3676,6 +3756,16 @@ impl ApplicationInner {
         goal_was_active: bool,
     ) {
         let active = self.runtime();
+        self.finish_goal_turn_for_runtime(&active, parent_usage, started, goal_was_active);
+    }
+
+    fn finish_goal_turn_for_runtime(
+        &self,
+        active: &runtime::ApplicationRuntime,
+        parent_usage: pi_ai::Usage,
+        started: Instant,
+        goal_was_active: bool,
+    ) {
         if active.session.goal_runtime().get().current.is_none() {
             return;
         }
@@ -3821,44 +3911,40 @@ impl Drop for ApplicationInner {
 
 
 struct GoalWorkPendingGuard {
-    inner: Weak<ApplicationInner>,
+    active: Arc<runtime::ApplicationRuntime>,
 }
 
 impl Drop for GoalWorkPendingGuard {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.upgrade() {
-            let active = inner.runtime();
-            active.goal_work_pending.fetch_sub(1, Ordering::AcqRel);
-            active.goal_work_changed.notify_waiters();
-        }
+        self.active.goal_work_pending.fetch_sub(1, Ordering::AcqRel);
+        self.active.goal_work_changed.notify_waiters();
     }
 }
 
 async fn run_goal_work(
     inner: Weak<ApplicationInner>,
+    active: Arc<runtime::ApplicationRuntime>,
     key: GoalWorkKey,
     turn_guard: Option<OwnedMutexGuard<()>>,
 ) {
     let _pending = GoalWorkPendingGuard {
-        inner: inner.clone(),
+        active: active.clone(),
     };
     let turn_guard = match turn_guard {
         Some(turn_guard) => turn_guard,
-        None => {
-            let Some(application) = inner.upgrade() else {
-                return;
-            };
-            application.runtime().turn_gate.clone().lock_owned().await
-        }
+        None => active.turn_gate.clone().lock_owned().await,
     };
     let Some(inner) = inner.upgrade() else {
         return;
     };
     if inner.cleaned.load(Ordering::Acquire) {
-        clear_goal_work_activation(&inner, &key);
+        clear_goal_work_activation(&active, &key);
         return;
     }
-    let active = inner.runtime();
+    if !Arc::ptr_eq(&inner.runtime(), &active) {
+        clear_goal_work_activation(&active, &key);
+        return;
+    }
     let state = active.session.goal_runtime().get();
     // A usage charge from a completed prior turn may advance the revision
     // without touching the goal's identity or lifecycle; that must not cancel
@@ -3880,7 +3966,7 @@ async fn run_goal_work(
         })
         || state.lifecycle_revision != key.lifecycle_revision
     {
-        clear_goal_work_activation(&inner, &key);
+        clear_goal_work_activation(&active, &key);
         return;
     }
 
@@ -3899,21 +3985,25 @@ async fn run_goal_work(
     });
     let started = Instant::now();
     match active.session.run_messages(vec![message]).await {
-        Ok(result) => inner.finish_goal_turn(result.usage, started, true),
+        Ok(result) => inner.finish_goal_turn_for_runtime(&active, result.usage, started, true),
         Err(error) => {
-            clear_goal_work_activation(&inner, &key);
+            clear_goal_work_activation(&active, &key);
             inner.publish(ApplicationEvent::RunFailed {
                 message: error.to_string(),
             });
-            inner.finish_goal_turn(pi_ai::Usage::default(), started, true);
+            inner.finish_goal_turn_for_runtime(
+                &active,
+                pi_ai::Usage::default(),
+                started,
+                true,
+            );
         }
     }
     inner.finish_parent_turn();
     drop(turn_guard);
 }
 
-fn clear_goal_work_activation(inner: &ApplicationInner, key: &GoalWorkKey) {
-    let active = inner.runtime();
+fn clear_goal_work_activation(active: &runtime::ApplicationRuntime, key: &GoalWorkKey) {
     let mut activation = active.goal_work_activation.lock();
     if activation.as_ref() == Some(key) {
         *activation = None;

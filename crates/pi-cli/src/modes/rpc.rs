@@ -9348,6 +9348,7 @@ mod tests {
         let runtime = OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
         application
             .attach_orchestration(runtime)
+            .await
             .expect("attach orchestration");
         (root, application, registration, persona_root)
     }

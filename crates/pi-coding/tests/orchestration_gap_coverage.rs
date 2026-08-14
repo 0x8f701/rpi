@@ -752,6 +752,7 @@ async fn cross_cwd_session_switch_cancels_orchestration_children() {
     let application = Application::new(parent).await;
     application
         .attach_orchestration(runtime.clone())
+        .await
         .expect("attach orchestration to the application");
     application
         .attach_runtime_factory(Arc::new(NoOpRuntimeFactory))
@@ -945,6 +946,7 @@ async fn real_application_task_tool_end_to_end_smoke() {
     let application = Application::new(parent).await;
     application
         .attach_orchestration(runtime.clone())
+        .await
         .expect("attach orchestration");
 
     // Drive the real `task` tool. The Application is attached (real parent
