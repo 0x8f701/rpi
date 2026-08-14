@@ -89,8 +89,8 @@ TERM=xterm-256color \
     send_cmd '/todo'
     wait_for 'Todo DAGs' 20
     wait_for '[main]' 20
-    wait_for 'open 4' 20
-    wait_for 'blocked 0' 20
+    wait_for '4 open' 20
+    wait_for '0 blocked' 20
 
     # --- Enter opens the detail page ---
     tmux send-keys -t "$session":0 Enter

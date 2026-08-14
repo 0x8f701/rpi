@@ -1993,6 +1993,40 @@ fn irc_runtime(artifact_dir: &Path) -> OrchestrationRuntime {
     .expect("orchestration runtime")
 }
 
+#[tokio::test]
+async fn application_owns_attached_orchestration_after_source_drop() {
+    let (session, registration) = session_with_responses(Vec::new());
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let application = {
+        let runtime = irc_runtime(artifacts.path());
+        Application::new_with_orchestration(session, runtime).await
+    };
+
+    let runtime = application
+        .orchestration_runtime()
+        .expect("attached orchestration runtime");
+    let waited = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .wait_message("Main", Some("Worker"), Some(Duration::from_secs(1)), None)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    let receipt = runtime.send("Worker", "Main", "owner transfer", None)[0].clone();
+    assert!(receipt.error.is_none(), "{receipt:?}");
+    let message = waited
+        .await
+        .expect("join wait")
+        .expect("live orchestration wait")
+        .expect("delivered message");
+    assert_eq!(message.body, "owner transfer");
+
+    application.cleanup().await;
+    registration.unregister();
+}
+
 /// Extract the model-facing text of every message that can carry a steered
 /// orchestration delivery from a captured provider context. The session
 /// projects the typed custom message into a user message before the provider

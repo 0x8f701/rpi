@@ -771,12 +771,13 @@ fn detail_lines(workflow: &WorkflowPanelSnapshot, expanded: &BTreeSet<String>, t
             Span::styled(format!(" · {}", branch), Style::default().fg(theme.dim)),
         ]));
     }
-    if let Some(supervisor) = &workflow.supervisor {
-        lines.push(Line::from(vec![
+    match &workflow.supervisor {
+        Some(supervisor) => lines.push(Line::from(vec![
             Span::styled("Supervisor ", Style::default().fg(theme.dim)),
             Span::styled(sanitize(&supervisor.name), Style::default().fg(theme.text)),
             Span::styled(format!(" · {}", sanitize(&supervisor.status)), Style::default().fg(theme.dim)),
-        ]));
+        ])),
+        None => lines.push(field_line("Supervisor", "Not started", theme)),
     }
     if workflow.status == WorkflowStatus::Planning {
         // Live planning progress: the supervisor turn is in flight, so the
@@ -789,7 +790,7 @@ fn detail_lines(workflow: &WorkflowPanelSnapshot, expanded: &BTreeSet<String>, t
         // supervisor turn — so planning never reads as a static spinner nor
         // dumps unbounded reasoning into the page.
         push_section(&mut lines, "Planning", theme);
-        let supervisor_state = workflow.supervisor.as_ref().map_or("running", |supervisor| supervisor.status.as_str());
+        let supervisor_state = workflow.supervisor.as_ref().map_or("not started", |supervisor| supervisor.status.as_str());
         let started_at = workflow.planning_started_at_ms;
         let last_activity_at = workflow.planning_activity.last().map(|entry| entry.at_ms).or(started_at);
         let elapsed_ms = started_at.and_then(|started| now.checked_sub(started));
@@ -1638,6 +1639,7 @@ mod tests {
         let mut panel = WorkflowPanel::new(vec![item]);
         panel.handle_key(key(KeyCode::Enter));
         let text = render(&panel, 110, 38).join("\n");
+        assert!(text.contains("Supervisor") && text.contains("Not started"), "empty supervisor state missing\n{text}");
         assert!(text.contains("No agents yet"), "empty agents state missing\n{text}");
         assert!(text.contains("No recent messages"), "empty IRC state missing\n{text}");
     }
@@ -1668,6 +1670,17 @@ mod tests {
         // while a live activity exists (the Todo DAG's own "drafting the
         // plan" line for an empty DAG is separate and legitimate).
         assert!(!text.contains("◉ planning · drafting the plan"), "live activity must drive the progress line\n{text}");
+        assert!(text.contains("supervisor running"), "present supervisor state missing\n{text}");
+        item.supervisor = None;
+        let without_supervisor = detail_lines(&item, &BTreeSet::new(), crate::theme::DARK, 1_012_000)
+            .0
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(without_supervisor.contains("Supervisor  Not started"), "missing planning supervisor empty state\n{without_supervisor}");
+        assert!(without_supervisor.contains("supervisor not started"), "planning progress contradicts empty supervisor state\n{without_supervisor}");
+        assert!(!without_supervisor.contains("supervisor running"), "absent supervisor must not render running\n{without_supervisor}");
 
         // Color contract: thinking uses the thinking color, tool activity the
         // job-card running accent, and the workflow name stays accent.

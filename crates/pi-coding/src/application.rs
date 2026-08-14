@@ -1091,16 +1091,16 @@ impl Application {
                 .bind_and_recover(&active.session)
                 .context("binding orchestration to application session")?;
         }
+        let mut events = runtime.subscribe();
+        let event_runtime = runtime.clone();
         {
             let mut current = active.orchestration_runtime.lock();
             if current.is_some() {
                 return Err(anyhow!("application orchestration is already configured"));
             }
-            *current = Some(runtime.clone());
+            *current = Some(runtime);
         }
-        let mut events = runtime.subscribe();
-        self.inner.replay_main_mailbox(&active, &runtime).await;
-        let event_runtime = runtime.clone();
+        self.inner.replay_main_mailbox(&active, &event_runtime).await;
         let event_inner = Arc::downgrade(&self.inner);
         let epoch = active.epoch();
         let event_task = tokio::spawn(async move {
