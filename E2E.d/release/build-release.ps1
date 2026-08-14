@@ -54,12 +54,12 @@ if ($homeRoot) { $remapFlags += "--remap-path-prefix=$homeRoot=/pi-home" }
 # /pathmap:from=to; GCC/Clang take -ffile-prefix-map/-fmacro-prefix-map
 # (file-prefix-map already implies macro-prefix-map on GCC 8+/Clang 10+;
 # both are emitted explicitly for older toolchains).
-$isWindows = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+$isWindowsHost = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
 $isMsvc = $false
 if ($env:CC) {
     $isMsvc = ($env:CC -match 'cl(\.exe)?$' -or $env:CC -match 'clang-cl')
 } else {
-    $isMsvc = $isWindows
+    $isMsvc = $isWindowsHost
 }
 $compilerRemapFlags = @()
 if ($isMsvc) {
