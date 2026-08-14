@@ -2370,13 +2370,38 @@ mod tests {
                 let (mut socket, _) = listener.accept().expect("accept request");
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
+                let mut expected_len = None;
                 loop {
                     let count = socket.read(&mut buffer).expect("read request");
                     if count == 0 {
                         break;
                     }
                     request.extend_from_slice(&buffer[..count]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    if expected_len.is_none()
+                        && let Some(headers_end) = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map(|index| index + 4)
+                    {
+                        let headers = String::from_utf8_lossy(&request[..headers_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.split_once(':').and_then(|(name, value)| {
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then_some(value.trim())
+                                })
+                            })
+                            .expect("request Content-Length header")
+                            .parse::<usize>()
+                            .expect("valid request Content-Length");
+                        expected_len = Some(
+                            headers_end
+                                .checked_add(content_length)
+                                .expect("request length overflow"),
+                        );
+                    }
+                    if expected_len.is_some_and(|expected| request.len() >= expected) {
                         break;
                     }
                 }
@@ -2402,7 +2427,10 @@ mod tests {
         native.stream.max_retries = 1;
         let stream = stream_bedrock(
             model(format!("http://{address}")),
-            Context::default(),
+            Context {
+                system_prompt: "x".repeat(64 * 1024),
+                ..Context::default()
+            },
             native,
         )
         .await;
@@ -2410,6 +2438,8 @@ mod tests {
         assert_eq!(output.stop_reason, StopReason::ToolUse);
         let first_request = requests_rx.recv().expect("first request");
         let second_request = requests_rx.recv().expect("second request");
+        assert!(first_request.len() > 64 * 1024);
+        assert_eq!(first_request.len(), second_request.len());
         let first = String::from_utf8_lossy(&first_request);
         let second = String::from_utf8_lossy(&second_request);
         assert!(first.to_ascii_lowercase().contains("authorization: aws4-hmac-sha256"));
