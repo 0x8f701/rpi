@@ -146,7 +146,7 @@ TERM=xterm-256color \
     # --- Todo DAG: all 10 tasks completed ---
     send_cmd '/todo'
     wait_for 'Todo DAGs' 20
-    wait_for '✓10 open 0 active 0 blocked 0' 20
+    wait_for '✓ 10 completed · 0 open · 0 active · 0 blocked' 20
     tmux send-keys -t "$session":0 Escape
     sleep 0.5
 
