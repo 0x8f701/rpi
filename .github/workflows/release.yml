@@ -66,7 +66,7 @@ jobs:
       # without repeating the npm install (and without setup-node inside the
       # Ubuntu 20.04 container).
       - name: Set up Node for Web build
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
 
@@ -187,7 +187,7 @@ jobs:
               ;;
           esac
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ubuntu-20.04-${{ matrix.target }}
 
@@ -324,7 +324,7 @@ jobs:
               ;;
           esac
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
 

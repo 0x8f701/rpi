@@ -1,11 +1,45 @@
 name: Test
 
+# Parallel DAG replacing the former single 90-minute monolithic job (run
+# 31765008106 hit the job timeout while still inside the coding/todo
+# lifecycle step, skipping every later gate). Each bounded job runs in
+# parallel, so no single runaway step can suppress the other gates:
+#
+#   build-web ──┬─► workspace-core-units   (check --workspace + core lib units)
+#               ├─► integration-contracts  (contracts, process/session and
+#               │                           structured-output contracts, CLI/
+#               │                           control-plane/TUI/durable/extension
+#               │                           integration E2E)
+#               ├─► coding-todo-lifecycles (coding_tools_lifecycle +
+#               │                           todo_dag_lifecycle, isolated with a
+#               │                           generous bound because the Aug 14 run
+#               │                           spent 80+ min inside this step)
+#               └─► build-release-binary ──┬─► product-e2e   (E2E.d/ci.sh run;
+#                                           │   also installs Rust + web-dist:
+#                                           │   orchestration.rust lanes compile
+#                                           │   pi-cli/pi-coding with cargo)
+#                                           ├─► workflow-e2e (E2E.d/ci/workflow.sh run)
+#                                           └─► web-e2e      (playwright web suite)
+#
+#   installer (static install.sh/install.ps1 checks) runs independently.
+#
+# Every command from the old single job is covered exactly once below; each
+# cargo job uses its own rust-cache key so job caches never collide.
+
 on:
   push:
     branches: [master]
   pull_request:
     branches: [master]
   workflow_dispatch:
+
+# Cancel superseded Test runs only: per-PR and per-branch groups. Release
+# runs are a different workflow (release.yml) and are never in this group;
+# release.yml additionally serializes publication with its own
+# cancel-in-progress: false concurrency.
+concurrency:
+  group: test-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -14,10 +48,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: workspace and product contracts
+  build-web:
+    name: build web client bundle
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -27,9 +61,10 @@ jobs:
       # crates/pi-cli/web/dist (vite-plugin-singlefile output). dist/ is
       # generated build output and not tracked by git, so a clean checkout
       # must generate it BEFORE the first cargo command — build.rs fails fast
-      # when it is missing.
+      # when it is missing. It is built ONCE here and shared with every cargo
+      # job via the web-dist artifact.
       - name: Set up Node for Web build
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
 
@@ -39,6 +74,29 @@ jobs:
           cd crates/pi-cli/web
           npm ci --no-audit --no-fund
           npm run build
+
+      - name: Upload embedded Web bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist/index.html
+          if-no-files-found: error
+
+  workspace-core-units:
+    name: workspace check and core library units
+    needs: [build-web]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download embedded Web bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist
 
       - name: Install Rust 1.88.0
         shell: bash
@@ -67,9 +125,9 @@ jobs:
               ;;
           esac
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: test
+          key: workspace-core-units
 
       - name: Check workspace
         run: cargo +1.88.0 check --workspace --all-targets --locked
@@ -81,6 +139,53 @@ jobs:
           cargo +1.88.0 test --locked -p pi-coding --lib -- --test-threads=1
           cargo +1.88.0 test --locked -p pi-cli --lib -- --test-threads=1
 
+  integration-contracts:
+    name: integration contracts
+    needs: [build-web]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download embedded Web bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup_init="$RUNNER_TEMP/rustup-init"
+          rustup_sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init" \
+            --output "$rustup_init"
+          actual_sha256="$(sha256sum "$rustup_init" | cut -d ' ' -f 1)"
+          [ "$actual_sha256" = "$rustup_sha256" ] || {
+            echo "rustup-init SHA-256 mismatch" >&2
+            exit 1
+          }
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *)
+              echo "Expected rustc 1.88.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: integration-contracts
+
       - name: Test workspace contracts
         shell: bash
         run: |
@@ -91,12 +196,6 @@ jobs:
           # stay on the release gate (ProviderGapScout G1).
           cargo +1.88.0 test --package pi-ai --test codex_transport --locked -- --test-threads=1
           cargo +1.88.0 test --package pi-agent --test loop_runtime_continue --locked
-      - name: Test coding tool and todo lifecycles
-        shell: bash
-        run: |
-          cargo +1.88.0 test --package pi-coding --test coding_tools_lifecycle --locked -- --nocapture
-          cargo +1.88.0 test --package pi-coding --test todo_dag_lifecycle --locked -- --nocapture
-
       - name: Test process and session lifecycles
         shell: bash
         run: |
@@ -141,12 +240,146 @@ jobs:
           cargo +1.88.0 test --package pi-cli --test extension_run_chain_tui --locked
           cargo +1.88.0 test --package pi-cli --test extension_ui_tui --locked
 
+  coding-todo-lifecycles:
+    name: coding tool and todo lifecycles
+    needs: [build-web]
+    runs-on: ubuntu-24.04
+    # Isolated in its own job because run 31765008106 spent 80+ minutes
+    # inside this step (54s when healthy on Aug 11) and exhausted the old
+    # monolithic job's 90-minute budget. The 100-minute bound lets a slow
+    # but finite regression complete while every other gate runs in
+    # parallel; a hard hang still fails only this job, never the rest.
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download embedded Web bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup_init="$RUNNER_TEMP/rustup-init"
+          rustup_sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init" \
+            --output "$rustup_init"
+          actual_sha256="$(sha256sum "$rustup_init" | cut -d ' ' -f 1)"
+          [ "$actual_sha256" = "$rustup_sha256" ] || {
+            echo "rustup-init SHA-256 mismatch" >&2
+            exit 1
+          }
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *)
+              echo "Expected rustc 1.88.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: coding-todo-lifecycles
+
+      - name: Test coding tool and todo lifecycles
+        shell: bash
+        run: |
+          cargo +1.88.0 test --package pi-coding --test coding_tools_lifecycle --locked -- --nocapture
+          cargo +1.88.0 test --package pi-coding --test todo_dag_lifecycle --locked -- --nocapture
+
+  build-release-binary:
+    name: build release-dist Linux binary
+    needs: [build-web]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download embedded Web bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist
+
+      - name: Install Rust 1.88.0
+        shell: bash
+        run: |
+          rustup_init="$RUNNER_TEMP/rustup-init"
+          rustup_sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init" \
+            --output "$rustup_init"
+          actual_sha256="$(sha256sum "$rustup_init" | cut -d ' ' -f 1)"
+          [ "$actual_sha256" = "$rustup_sha256" ] || {
+            echo "rustup-init SHA-256 mismatch" >&2
+            exit 1
+          }
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *)
+              echo "Expected rustc 1.88.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: build-release-binary
+
+      - name: Build and smoke-test release binary
+        shell: bash
+        run: |
+          cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
+          target/release-dist/rpi --version
+
+      - name: Smoke-test Web-only listener lifecycle
+        shell: bash
+        env:
+          RPI_BIN: target/release-dist/rpi
+        run: E2E.d/release.sh listen-web
+
+      - name: Upload release-dist Linux rpi binary
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rpi-linux
+          path: target/release-dist/rpi
+          if-no-files-found: error
+
+  installer:
+    name: installer checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      # The checked-in installer regression suite (tests/install-sh-static.sh)
+      # runs inside E2E.d/ci.sh run (product-e2e job) — exactly once.
       - name: Check installers
         shell: bash
         run: |
           sh -n install.sh
           sh install.sh --help >/dev/null
-          sh tests/install-sh-static.sh
 
       - name: Check PowerShell installer
         shell: pwsh
@@ -162,27 +395,148 @@ jobs:
             exit 1
           }
 
-      - name: Build and smoke-test release binary
+  product-e2e:
+    name: deterministic product E2E
+    needs: [build-release-binary]
+    runs-on: ubuntu-24.04
+    # Includes the orchestration.rust cargo +1.88.0 compiles of pi-cli/pi-coding
+    # test binaries (240-360s run_with_timeout lanes) plus the binary campaigns;
+    # on a cold hosted runner that is not a 45-minute gate.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      # ci.sh -> campaigns.sh run -> orchestration.sh run compiles pi-cli and
+      # pi-coding integration tests with cargo +1.88.0 (orchestration.rust
+      # lanes) and the user project-authoring lane spawns `cargo` from the
+      # agent PATH, so this job needs the same Rust toolchain and embedded
+      # Web bundle as the other cargo jobs — plus the rpi-linux artifact for
+      # the binary lanes.
+      - name: Download embedded Web bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: web-dist
+          path: crates/pi-cli/web/dist
+
+      - name: Install Rust 1.88.0
         shell: bash
         run: |
-          cargo +1.88.0 build --package pi-cli --bin rpi --profile release-dist --locked
-          target/release-dist/rpi --version
+          rustup_init="$RUNNER_TEMP/rustup-init"
+          rustup_sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            "https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init" \
+            --output "$rustup_init"
+          actual_sha256="$(sha256sum "$rustup_init" | cut -d ' ' -f 1)"
+          [ "$actual_sha256" = "$rustup_sha256" ] || {
+            echo "rustup-init SHA-256 mismatch" >&2
+            exit 1
+          }
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Smoke-test Web-only listener lifecycle
+          rustc_version="$("$HOME/.cargo/bin/rustc" +1.88.0 --version)"
+          echo "$rustc_version"
+          case "$rustc_version" in
+            "rustc 1.88.0 "*) ;;
+            *)
+              echo "Expected rustc 1.88.0" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: product-e2e
+
+      - name: Download release-dist rpi binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: rpi-linux
+          path: target/release-dist
+
+      - name: Make rpi binary executable
         shell: bash
-        env:
-          RPI_BIN: target/release-dist/rpi
-        run: E2E.d/release.sh listen-web
+        run: |
+          chmod 0755 target/release-dist/rpi
+          [ -x target/release-dist/rpi ] || {
+            echo "rpi binary missing or not executable" >&2
+            exit 1
+          }
 
+      # Covers the deterministic product campaigns (E2E.d/ci/campaigns.sh)
+      # plus the checked-in installer regression suite
+      # (tests/install-sh-static.sh).
       - name: Run deterministic product E2E
         env:
           RPI_BIN: target/release-dist/rpi
         run: E2E.d/ci.sh run
 
+  workflow-e2e:
+    name: multi-workflow product E2E
+    needs: [build-release-binary]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download release-dist rpi binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: rpi-linux
+          path: target/release-dist
+
+      - name: Make rpi binary executable
+        shell: bash
+        run: |
+          chmod 0755 target/release-dist/rpi
+          [ -x target/release-dist/rpi ] || {
+            echo "rpi binary missing or not executable" >&2
+            exit 1
+          }
+
       - name: Run multi-workflow product E2E
         env:
           RPI_BIN: target/release-dist/rpi
         run: E2E.d/ci/workflow.sh run
+
+  web-e2e:
+    name: web client E2E suite
+    needs: [build-release-binary]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download release-dist rpi binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: rpi-linux
+          path: target/release-dist
+
+      - name: Make rpi binary executable
+        shell: bash
+        run: |
+          chmod 0755 target/release-dist/rpi
+          [ -x target/release-dist/rpi ] || {
+            echo "rpi binary missing or not executable" >&2
+            exit 1
+          }
+
+      # The web suite keeps the old Node 20 contract: the monolithic job ran
+      # these lanes under setup-node's Node 20, so the playwright/ws install
+      # and every lane's ephemeral npm install must not drift onto the
+      # runner's mutable default Node.
+      - name: Set up Node for Web E2E
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
 
       # Web client regression suite (E2E.d/web/run.sh). Lanes are
       # playwright-only release gates: a lane without a usable playwright
