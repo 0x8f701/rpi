@@ -249,6 +249,7 @@ impl ReviewSnapshot {
             error.as_bytes(),
             false,
             None,
+            None,
         );
         Self {
             root,
@@ -327,14 +328,19 @@ impl HunkIdentity {
 /// (`git diff --name-status -z` output); hashing it keeps the stale guard
 /// sensitive to files beyond a truncated patch's cut point — otherwise adding
 /// or renaming a file past the 2 MiB window would reuse an old snapshot id
-/// even though the placeholder set changed. `None` is used only for error and
-/// empty snapshots that never acquired a catalog.
+/// even though the placeholder set changed. `index_fingerprint` is the raw
+/// `git ls-files -s -z` output for the review paths (mode + blob oid per
+/// entry): the name-status catalog records WHICH paths changed, but a content
+/// change to a tracked staged addition beyond the truncation cut would
+/// otherwise reuse the old id even though the reviewed content changed.
+/// `None` is used only for error, empty, and two-revision snapshots.
 fn review_snapshot_identity(
     root: &Path,
     comparison: &[u8],
     diff: &[u8],
     truncated: bool,
     catalog: Option<&[u8]>,
+    index_fingerprint: Option<&[u8]>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(root.to_string_lossy().as_bytes());
@@ -348,6 +354,13 @@ fn review_snapshot_identity(
             hasher.update(bytes);
         }
         None => hasher.update([0]),
+    }
+    match index_fingerprint {
+        Some(bytes) => {
+            hasher.update([2]);
+            hasher.update(bytes);
+        }
+        None => {}
     }
     hasher.update([u8::from(truncated)]);
     format!("{:x}", hasher.finalize())
@@ -710,7 +723,7 @@ fn load_revision_snapshot(
         Ok(output) => output,
         Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
     };
-    snapshot_from_diff_output(root, scope, comparison.as_bytes(), output, Some(&catalog_output))
+    snapshot_from_diff_output(root, scope, comparison.as_bytes(), output, Some(&catalog_output), None)
 }
 
 fn resolve_review_commit(root: &Path, revision: &str, label: &str) -> Result<String, String> {
@@ -770,60 +783,16 @@ fn load_working_tree_snapshot(root: PathBuf, sandbox: GitSandbox) -> ReviewSnaps
         }
         Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
     };
-    let mut reviewable_paths = index_path_set(&changed_output.stdout);
-    let mut review_path_args = nul_path_args(&changed_output.stdout)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-
-    // Stage the full working tree in the disposable index so Git can discover
-    // working-tree renames. The final patch remains path-limited below.
-    let add_args = ["add", "-A", "--", "."];
-    match run_git_bounded(&root, &add_args, MAX_GIT_METADATA_BYTES, Some(isolated)) {
-        Ok(output) if output.error.is_none() && !output.truncated => {}
-        Ok(output) => {
-            let error = output
-                .error
-                .unwrap_or_else(|| "git add output exceeded the metadata limit".to_owned());
-            return ReviewSnapshot::empty_for_scope_error(root, scope, error);
-        }
-        Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
-    }
-
-    // Rename-aware changed-file catalog: the same `--name-status -z` output
-    // both extends the review pathspecs with rename destinations and backfills
-    // files a truncated combined patch could not carry. The diff options
-    // mirror the final patch so rename pairing is identical between the
-    // catalog and the parsed diff. A catalog past its bound fails closed
-    // instead of silently omitting files.
-    let rename_args = [
-        "diff",
-        "--cached",
-        "--name-status",
-        "-z",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-color",
-        "--default-prefix",
-        "--no-relative",
-        "--find-renames",
-        "--histogram",
-        head.as_str(),
-        "--",
-    ];
-    let rename_output = match run_git_bounded(&root, &rename_args, MAX_CATALOG_BYTES, Some(isolated)) {
-        Ok(output) if output.error.is_none() && !output.truncated => output,
-        Ok(output) => {
-            let error = output
-                .error
-                .unwrap_or_else(|| "changed file catalog exceeded the size limit".to_owned());
-            return ReviewSnapshot::empty_for_scope_error(root, scope, error);
-        }
-        Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
-    };
-    let catalog = name_status_catalog(&rename_output.stdout);
-    for destination in rename_destination_paths(&rename_output.stdout) {
-        reviewable_paths.insert(normalize_repo_path(&encode_path_bytes(&destination)));
-        review_path_args.insert(os_string_from_git_path(destination));
+    let mut reviewable_paths: BTreeSet<String> = BTreeSet::new();
+    let mut review_path_args: BTreeSet<OsString> = BTreeSet::new();
+    for entry in changed_output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let arg = os_string_from_git_path(entry.to_vec());
+        reviewable_paths.insert(normalize_repo_path(&encode_path_bytes(entry)));
+        review_path_args.insert(arg);
     }
 
     let comparison = format!("working-tree\0{head}");
@@ -831,11 +800,146 @@ fn load_working_tree_snapshot(root: PathBuf, sandbox: GitSandbox) -> ReviewSnaps
         return ReviewSnapshot {
             root: root.clone(),
             scope,
-            snapshot_id: review_snapshot_identity(&root, comparison.as_bytes(), &[], false, None),
+            snapshot_id: review_snapshot_identity(&root, comparison.as_bytes(), &[], false, None, None),
             files: Vec::new(),
             truncated: false,
             error: None,
         };
+    }
+
+    // The copied real index already reflects the staged state, so a changed
+    // path ABSENT from it — a staged rename source, a `git rm`'d path, or a
+    // `git rm --cached` path whose worktree replacement is untracked — is
+    // already in its correct review state: deleted from the tracked set.
+    // Such paths are never reset or re-added: re-adding one would erase the
+    // staged deletion (a `git rm --cached` path would even restage its
+    // untracked worktree replacement), silently losing the review.
+    let mut ls_args: Vec<OsString> = vec![
+        "--literal-pathspecs".into(),
+        "ls-files".into(),
+        "-z".into(),
+        "--".into(),
+    ];
+    ls_args.extend(review_path_args.iter().cloned());
+    let index_output = match run_git_bounded_os(&root, &ls_args, MAX_DIFF_BYTES, Some(isolated)) {
+        Ok(output) if output.error.is_none() && !output.truncated => output,
+        Ok(output) => {
+            let error = output
+                .error
+                .unwrap_or_else(|| "tracked path list exceeded the size limit".to_owned());
+            return ReviewSnapshot::empty_for_scope_error(root, scope, error);
+        }
+        Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
+    };
+    let mut index_members: Vec<OsString> = Vec::new();
+    for entry in index_output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        index_members.push(os_string_from_git_path(entry.to_vec()));
+    }
+
+    // Scoped tracked-only staging: `git add -u` updates and removes exactly
+    // the index entries named by the changed pathspecs (modifications, staged
+    // additions, unstaged/staged deletions, submodule bumps, type changes,
+    // file→directory replacements) and NEVER adds new files — so unrelated
+    // untracked files/directories (build output, node_modules, ...) are never
+    // scanned, hashed, or staged, and the capture cost scales with the review
+    // instead of the repository. Only paths the copied real index still
+    // tracks are passed, so every pathspec matches (no "did not match any
+    // files" failure) and index-absent deletions stay deleted. `git add -u`
+    // with zero pathspecs would update the WHOLE index, so the call is
+    // skipped when no changed path is currently tracked; `--literal-pathspecs`
+    // keeps every entry an exact path (glob characters in real filenames stay
+    // literal).
+    if !index_members.is_empty() {
+        let mut add_args: Vec<OsString> = vec![
+            "--literal-pathspecs".into(),
+            "add".into(),
+            "-u".into(),
+            "--".into(),
+        ];
+        add_args.extend(index_members.iter().cloned());
+        match run_git_bounded_os(&root, &add_args, MAX_GIT_METADATA_BYTES, Some(isolated)) {
+            Ok(output) if output.error.is_none() && !output.truncated => {}
+            Ok(output) => {
+                let error = output
+                    .error
+                    .unwrap_or_else(|| "git add output exceeded the metadata limit".to_owned());
+                return ReviewSnapshot::empty_for_scope_error(root, scope, error);
+            }
+            Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
+        }
+    }
+
+    // Content fingerprint of the disposable index AFTER staging: `-s -z`
+    // records are `MODE OID STAGE\0PATH\0` (raw bytes, never C-quoted, so
+    // non-UTF-8 and backslash/tab paths round-trip exactly). Hashing these
+    // mode+blob oids into the snapshot identity makes it sensitive to review
+    // content the name-status catalog (WHICH paths changed) and a truncated
+    // patch (content before the 2 MiB cut) cannot carry — e.g. a staged
+    // addition whose content changes beyond the cut, staged or unstaged.
+    let mut fingerprint_args: Vec<OsString> = vec![
+        "--literal-pathspecs".into(),
+        "ls-files".into(),
+        "-s".into(),
+        "-z".into(),
+        "--".into(),
+    ];
+    fingerprint_args.extend(review_path_args.iter().cloned());
+    let fingerprint_output =
+        match run_git_bounded_os(&root, &fingerprint_args, MAX_DIFF_BYTES, Some(isolated)) {
+            Ok(output) if output.error.is_none() && !output.truncated => output,
+            Ok(output) => {
+                let error = output
+                    .error
+                    .unwrap_or_else(|| "tracked path list exceeded the size limit".to_owned());
+                return ReviewSnapshot::empty_for_scope_error(root, scope, error);
+            }
+            Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
+        };
+
+    // Rename-aware changed-file catalog, scoped to the review pathspecs so a
+    // stale real-index entry (a staged addition later deleted from the
+    // worktree, or an index entry manually reverted to HEAD content) can never
+    // pair with a review-path deletion and sneak an untracked path into the
+    // snapshot. The same `--name-status -z` output both extends the review
+    // pathspecs with rename destinations and backfills files a truncated
+    // combined patch could not carry. The diff options mirror the final patch
+    // so rename pairing is identical between the catalog and the parsed diff.
+    // A catalog past its bound fails closed instead of silently omitting files.
+    let mut rename_args: Vec<OsString> = vec![
+        "--literal-pathspecs".into(),
+        "diff".into(),
+        "--cached".into(),
+        "--name-status".into(),
+        "-z".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+        "--no-color".into(),
+        "--default-prefix".into(),
+        "--no-relative".into(),
+        "--find-renames".into(),
+        "--histogram".into(),
+        head.clone().into(),
+        "--".into(),
+    ];
+    rename_args.extend(review_path_args.iter().cloned());
+    let rename_output =
+        match run_git_bounded_os(&root, &rename_args, MAX_CATALOG_BYTES, Some(isolated)) {
+            Ok(output) if output.error.is_none() && !output.truncated => output,
+            Ok(output) => {
+                let error = output
+                    .error
+                    .unwrap_or_else(|| "changed file catalog exceeded the size limit".to_owned());
+                return ReviewSnapshot::empty_for_scope_error(root, scope, error);
+            }
+            Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
+        };
+    for destination in rename_destination_paths(&rename_output.stdout) {
+        reviewable_paths.insert(normalize_repo_path(&encode_path_bytes(&destination)));
+        review_path_args.insert(os_string_from_git_path(destination));
     }
 
     // Object-to-object diff only: no worktree conversion filters are consulted.
@@ -864,11 +968,18 @@ fn load_working_tree_snapshot(root: PathBuf, sandbox: GitSandbox) -> ReviewSnaps
         Err(error) => return ReviewSnapshot::empty_for_scope_error(root, scope, error),
     };
 
-    let mut snapshot =
-        snapshot_from_diff_output(root, scope, comparison.as_bytes(), output, Some(&rename_output));
-    // Synthetic untracked additions staged only for rename discovery never
-    // enter the path-limited patch, so their placeholder entries (added only
-    // when the patch truncated) are dropped here alongside any parsed ghosts.
+    let mut snapshot = snapshot_from_diff_output(
+        root,
+        scope,
+        comparison.as_bytes(),
+        output,
+        Some(&rename_output),
+        Some(&fingerprint_output.stdout),
+    );
+    // The catalog is scoped to review paths and every rename destination is a
+    // review path, so parsed files and placeholders always belong to the
+    // review; the filter stays as defense in depth against any catalog entry a
+    // future change lets slip past the pathspecs.
     snapshot.files.retain(|file| {
         file.status == FileStatus::Renamed || reviewable_paths.contains(&file.path)
     });
@@ -881,6 +992,7 @@ fn snapshot_from_diff_output(
     comparison: &[u8],
     output: GitOutput,
     catalog_output: Option<&GitOutput>,
+    index_fingerprint: Option<&[u8]>,
 ) -> ReviewSnapshot {
     if let Some(error) = output.error {
         return ReviewSnapshot::empty_for_scope_error(root, scope, error);
@@ -888,8 +1000,14 @@ fn snapshot_from_diff_output(
 
     let catalog = catalog_output.map(|output| name_status_catalog(&output.stdout));
     let catalog_bytes = catalog_output.map(|output| output.stdout.as_slice());
-    let snapshot_id =
-        review_snapshot_identity(&root, comparison, &output.stdout, output.truncated, catalog_bytes);
+    let snapshot_id = review_snapshot_identity(
+        &root,
+        comparison,
+        &output.stdout,
+        output.truncated,
+        catalog_bytes,
+        index_fingerprint,
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut files = parse_unified_diff(&stdout);
     if output.truncated {
@@ -914,14 +1032,6 @@ fn snapshot_from_diff_output(
         truncated: output.truncated,
         error: None,
     }
-}
-
-fn nul_path_args(stdout: &[u8]) -> Vec<OsString> {
-    stdout
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| os_string_from_git_path(entry.to_vec()))
-        .collect()
 }
 
 fn rename_destination_paths(stdout: &[u8]) -> Vec<Vec<u8>> {
@@ -1062,20 +1172,6 @@ fn os_string_from_git_path(path: Vec<u8>) -> OsString {
     {
         OsString::from(String::from_utf8_lossy(&path).into_owned())
     }
-}
-
-/// Parse `git ls-files -z` output (raw NUL-separated repo-relative paths) into a
-/// normalized set. `ls-files -z` never C-quotes, so backslash/tab/newline path
-/// components round-trip as raw bytes. Each entry is run through the same
-/// `encode_path_bytes` + `normalize_repo_path` pipeline the parser applies to
-/// decoded diff paths, so non-UTF-8 paths (escaped as `\ooo`) and paths with
-/// backslash/tab components compare byte-for-byte against the snapshot.
-fn index_path_set(stdout: &[u8]) -> BTreeSet<String> {
-    stdout
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| normalize_repo_path(&encode_path_bytes(entry)))
-        .collect()
 }
 
 fn repository_attributes_are_safe(repository: &RepositoryLayout) -> Result<(), String> {
@@ -2421,41 +2517,49 @@ impl FileDiff {
                 Err(error) => return Err(error),
             }
         }
-        // Re-base only the target paths on HEAD in the disposable index: a
-        // copied real index may already have staged a rename's source
-        // deletion, in which case `git add -- <source>` fails ("did not match
-        // any files") because the path exists in neither the index nor the
-        // worktree. Resetting the path entries to HEAD keeps every pathspec
-        // addressable so rename detection pairs both sides exactly like the
-        // snapshot; other index entries stay untouched. `git reset` tolerates
-        // unmatched pathspecs silently, so a stale or malicious path still
-        // fails closed at the `git add` step below.
-        let mut reset_args: Vec<OsString> = vec![
+        // Mirror the snapshot loader: the copied index already carries staged
+        // deletions. Only target paths that remain index members may be
+        // updated from the worktree; index-absent paths must stay deleted, and
+        // `add -u` must never receive an empty path set (that updates all).
+        let mut ls_args: Vec<OsString> = vec![
             "--literal-pathspecs".into(),
-            "reset".into(),
-            "-q".into(),
-            "HEAD".into(),
+            "ls-files".into(),
+            "-z".into(),
             "--".into(),
         ];
-        reset_args.extend(pathspecs.iter().cloned());
-        match run_git_bounded_os(root, &reset_args, MAX_GIT_METADATA_BYTES, Some(isolated)) {
-            Ok(output) if output.error.is_none() && !output.truncated => {}
+        ls_args.extend(pathspecs.iter().cloned());
+        let index_output = match run_git_bounded_os(root, &ls_args, MAX_DIFF_BYTES, Some(isolated)) {
+            Ok(output) if output.error.is_none() && !output.truncated => output,
             Ok(output) => {
-                return Err(output.error.unwrap_or_else(|| "git reset output exceeded the metadata limit".to_owned()));
+                return Err(output
+                    .error
+                    .unwrap_or_else(|| "tracked path list exceeded the size limit".to_owned()));
             }
             Err(error) => return Err(error),
-        }
-        // Stage only the target paths in the disposable sandbox index so the
-        // HEAD-vs-working-tree content for these paths is reviewable exactly
-        // like the snapshot, without staging the whole tree.
-        let mut add_args: Vec<OsString> = vec!["--literal-pathspecs".into(), "add".into(), "--".into()];
-        add_args.extend(pathspecs.iter().cloned());
-        match run_git_bounded_os(root, &add_args, MAX_GIT_METADATA_BYTES, Some(isolated)) {
-            Ok(output) if output.error.is_none() && !output.truncated => {}
-            Ok(output) => {
-                return Err(output.error.unwrap_or_else(|| "git add output exceeded the metadata limit".to_owned()));
+        };
+        let index_members = index_output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| os_string_from_git_path(entry.to_vec()))
+            .collect::<Vec<_>>();
+        if !index_members.is_empty() {
+            let mut add_args: Vec<OsString> = vec![
+                "--literal-pathspecs".into(),
+                "add".into(),
+                "-u".into(),
+                "--".into(),
+            ];
+            add_args.extend(index_members);
+            match run_git_bounded_os(root, &add_args, MAX_GIT_METADATA_BYTES, Some(isolated)) {
+                Ok(output) if output.error.is_none() && !output.truncated => {}
+                Ok(output) => {
+                    return Err(output
+                        .error
+                        .unwrap_or_else(|| "git add output exceeded the metadata limit".to_owned()));
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
         let mut args: Vec<OsString> = vec![
             "--literal-pathspecs".into(),
@@ -3107,7 +3211,10 @@ deleted file mode 100644
         write(repo.path().join(old).as_path(), "same\n");
         git(repo.path(), &["add", old]);
         git(repo.path(), &["commit", "-m", "add unusual path"]);
-        fs::rename(repo.path().join(old), repo.path().join(new)).expect("rename unusual path");
+        // Stage the rename (git mv) so both sides are tracked changed paths;
+        // the backslash/tab bytes must round-trip through the path-limited
+        // staging and rename discovery.
+        git(repo.path(), &["mv", old, new]);
         let snapshot = load_review_snapshot(repo.path());
         let renamed = snapshot.files.iter().find(|file| file.path == new).expect("renamed path");
         assert_eq!(renamed.previous_path.as_deref(), Some(old));
@@ -3121,11 +3228,13 @@ deleted file mode 100644
         write(repo.path().join("old.txt").as_path(), "payload\n");
         git(repo.path(), &["add", "notes.md", "old.txt"]);
         git(repo.path(), &["commit", "-m", "add tracked files"]);
-        // Unstaged edit to a tracked file, a bare working-tree rename of a
-        // tracked file, and an unrelated untracked file left alone.
+        // An unstaged edit to a tracked file, a staged rename of a tracked
+        // file (`git mv`, whose destination is a tracked changed path), and an
+        // unrelated untracked file left alone. A bare filesystem rename whose
+        // destination stays untracked is out of the tracked-only review
+        // contract and reads as a deletion, never as a rename.
         write(repo.path().join("notes.md").as_path(), "base\nedited\n");
-        fs::rename(repo.path().join("old.txt"), repo.path().join("new.txt"))
-            .expect("rename tracked file");
+        git(repo.path(), &["mv", "old.txt", "new.txt"]);
         write(repo.path().join("stray.txt").as_path(), "ignored by review\n");
         let index = repo.path().join(".git/index");
         let index_before = fs::read(&index).expect("index before");
@@ -3155,6 +3264,236 @@ deleted file mode 100644
     }
 
     #[test]
+    fn load_review_snapshot_keeps_staged_and_unstaged_tracked_deletions() {
+        let repo = init_repo();
+        write(repo.path().join("unstaged-gone.txt").as_path(), "base\n");
+        write(repo.path().join("staged-gone.txt").as_path(), "base\n");
+        git(repo.path(), &["add", "unstaged-gone.txt", "staged-gone.txt"]);
+        git(repo.path(), &["commit", "-m", "add deletable files"]);
+        // Unstaged deletion (tracked path absent from the worktree only: the
+        // copied real index entry is removed by the scoped `git add -u`) and
+        // staged deletion (`git rm`: absent from BOTH the real index and the
+        // worktree, so the loader never resets or re-adds it — the copied
+        // real index already carries the deletion).
+        fs::remove_file(repo.path().join("unstaged-gone.txt")).expect("remove unstaged");
+        git(repo.path(), &["rm", "-q", "staged-gone.txt"]);
+        let index = repo.path().join(".git/index");
+        let index_before = fs::read(&index).expect("index before");
+
+        let snapshot = load_review_snapshot(repo.path());
+
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        let paths = snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"unstaged-gone.txt"), "{paths:?}");
+        assert!(paths.contains(&"staged-gone.txt"), "{paths:?}");
+        for file in &snapshot.files {
+            assert_eq!(
+                file.status,
+                FileStatus::Deleted,
+                "tracked deletion must read as Deleted: {}",
+                file.path
+            );
+        }
+        assert_eq!(fs::read(&index).expect("index after"), index_before);
+    }
+
+    #[test]
+    fn load_review_snapshot_keeps_git_rm_cached_deletions_with_worktree_replacement() {
+        // `git rm --cached` stages a deletion while the worktree file stays
+        // untracked. The review must keep showing the tracked deletion —
+        // never an empty snapshot, never a Modified entry — whether the
+        // replacement file is unchanged or edited, because re-staging the
+        // replacement would silently erase the deletion.
+        let repo = init_repo();
+        write(repo.path().join("unchanged.txt").as_path(), "base\n");
+        write(repo.path().join("edited.txt").as_path(), "base\n");
+        git(repo.path(), &["add", "unchanged.txt", "edited.txt"]);
+        git(repo.path(), &["commit", "-m", "add deletable files"]);
+        git(repo.path(), &["rm", "-q", "--cached", "unchanged.txt"]);
+        git(repo.path(), &["rm", "-q", "--cached", "edited.txt"]);
+        write(repo.path().join("edited.txt").as_path(), "base\nedited replacement\n");
+        let index = repo.path().join(".git/index");
+        let index_before = fs::read(&index).expect("index before");
+
+        let snapshot = load_review_snapshot(repo.path());
+
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert!(
+            !snapshot.files.is_empty(),
+            "git rm --cached deletions must not vanish: {:?}",
+            snapshot.files
+        );
+        let paths = snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"unchanged.txt"), "{paths:?}");
+        assert!(paths.contains(&"edited.txt"), "{paths:?}");
+        for file in &snapshot.files {
+            assert_eq!(
+                file.status,
+                FileStatus::Deleted,
+                "git rm --cached must read as Deleted: {}",
+                file.path
+            );
+        }
+        assert_eq!(fs::read(&index).expect("index after"), index_before);
+    }
+
+    #[test]
+    fn load_review_snapshot_reports_file_replaced_by_directory_as_deletion() {
+        let repo = init_repo();
+        write(repo.path().join("swap.txt").as_path(), "tracked file\n");
+        git(repo.path(), &["add", "swap.txt"]);
+        git(repo.path(), &["commit", "-m", "add swap file"]);
+        // The tracked file path becomes an untracked directory full of files.
+        // The review must show the tracked file as deleted and must NOT stage,
+        // scan, or list the replacement directory's contents.
+        fs::remove_file(repo.path().join("swap.txt")).expect("remove tracked file");
+        write(repo.path().join("swap.txt/bundle.bin").as_path(), "0000000000\n");
+        write(repo.path().join("swap.txt/nested/more.bin").as_path(), "more\n");
+        let index = repo.path().join(".git/index");
+        let index_before = fs::read(&index).expect("index before");
+
+        let snapshot = load_review_snapshot(repo.path());
+
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        let swap = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "swap.txt")
+            .expect("swap entry");
+        assert_eq!(swap.status, FileStatus::Deleted);
+        assert!(
+            !snapshot
+                .files
+                .iter()
+                .any(|file| file.path.starts_with("swap.txt/")),
+            "replacement directory contents must not be reviewed: {:?}",
+            snapshot
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(fs::read(&index).expect("index after"), index_before);
+    }
+
+    #[test]
+    fn load_review_snapshot_keeps_submodule_bumps_as_modifications() {
+        // A bumped submodule is a tracked gitlink change. The path-limited
+        // staging must keep it as a modification and never force-remove the
+        // entry as a "file replaced by directory".
+        let parent = init_repo();
+        let sub_dir = TempDir::new().expect("submodule tempdir");
+        git(sub_dir.path(), &["init"]);
+        write(sub_dir.path().join("lib.txt").as_path(), "base\n");
+        git(sub_dir.path(), &["add", "lib.txt"]);
+        git(sub_dir.path(), &["commit", "-m", "submodule initial"]);
+        let sub_path = sub_dir.path().canonicalize().expect("canonical submodule");
+        git(
+            parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub_path.to_str().expect("utf8 submodule path"),
+                "ext",
+            ],
+        );
+        git(parent.path(), &["commit", "-qm", "add submodule"]);
+        // Commit inside the submodule checkout (parent/.git/modules/ext), the
+        // clone the parent's gitlink points at.
+        git(&parent.path().join("ext"), &["commit", "--allow-empty", "-qm", "submodule bump"]);
+        let index = parent.path().join(".git/index");
+        let index_before = fs::read(&index).expect("index before");
+
+        let snapshot = load_review_snapshot(parent.path());
+
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        let ext = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "ext")
+            .expect("submodule entry");
+        assert_eq!(
+            ext.status,
+            FileStatus::Modified,
+            "submodule bump must read as Modified: {:?}",
+            snapshot
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(fs::read(&index).expect("index after"), index_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_review_snapshot_never_inspects_large_untracked_build_trees() {
+        // Regression: the previous loader staged the whole working tree with
+        // `git add -A -- .`, hashing every unrelated untracked file, which
+        // timed out on repositories with large build/output trees. The
+        // tracked-only loader must never open, scan, or stage the untracked
+        // tree. The canaries make the OLD full-tree behavior fail
+        // deterministically (no wall-clock comparison): `git add` errors out
+        // on the unreadable file, and hashing the 1 TiB sparse file cannot
+        // finish inside the 15s git timeout.
+        let repo = init_repo();
+        write(repo.path().join("README.md").as_path(), "base\nchanged\n");
+        let build = repo.path().join("build");
+        fs::create_dir(&build).expect("mkdir build");
+        let secret = build.join("secret.txt");
+        fs::write(&secret, "never read\n").expect("write canary");
+        let mut permissions = fs::metadata(&secret).expect("canary metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o000);
+        fs::set_permissions(&secret, permissions).expect("chmod canary");
+        let big = build.join("big.bin");
+        let big_file = fs::File::create(&big).expect("create sparse canary");
+        big_file.set_len(1_u64 << 40).expect("sparse canary size");
+        let index = repo.path().join(".git/index");
+        let index_before = fs::read(&index).expect("index before");
+
+        let snapshot = load_review_snapshot(repo.path());
+
+        assert!(
+            snapshot.error.is_none(),
+            "loader touched the untracked tree: {:?}",
+            snapshot.error
+        );
+        assert!(
+            snapshot.files.iter().any(|file| file.path == "README.md"),
+            "tracked change missing: {:?}",
+            snapshot
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !snapshot
+                .files
+                .iter()
+                .any(|file| file.path.starts_with("build/")),
+            "untracked build tree leaked into the review"
+        );
+        assert_eq!(fs::read(&index).expect("index after"), index_before);
+        assert_eq!(
+            fs::metadata(&big).expect("canary metadata").len(),
+            1_u64 << 40,
+            "sparse canary was modified"
+        );
+    }
+
+    #[test]
     fn snapshot_fails_closed_on_nonzero_git_with_partial_patch() {
         let output = GitOutput {
             stdout: b"diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n".to_vec(),
@@ -3166,6 +3505,7 @@ deleted file mode 100644
             ReviewScope::WorkingTree,
             b"working-tree",
             output,
+            None,
             None,
         );
         assert!(snapshot.files.is_empty());
@@ -3630,6 +3970,61 @@ deleted file mode 100644
     }
 
     #[test]
+    fn load_file_diff_keeps_git_rm_cached_replacement_as_deletion() {
+        let repo = init_repo();
+        write(repo.path().join("tracked.txt").as_path(), "tracked\n");
+        git(repo.path(), &["add", "tracked.txt"]);
+        git(repo.path(), &["commit", "-m", "track file"]);
+        git(repo.path(), &["rm", "--cached", "tracked.txt"]);
+        write(repo.path().join("tracked.txt").as_path(), "untracked replacement\n");
+
+        let snapshot = load_review_snapshot(repo.path());
+        let file = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "tracked.txt")
+            .expect("tracked deletion")
+            .clone();
+        assert_eq!(file.status, FileStatus::Deleted);
+        let diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &file);
+        assert!(diff.error.is_none(), "{:?}", diff.error);
+        assert!(diff.hunks.iter().flat_map(|hunk| &hunk.lines).any(|line| {
+            line.kind == DiffLineKind::Deletion && line.text == "tracked"
+        }));
+        assert!(!diff.hunks.iter().flat_map(|hunk| &hunk.lines).any(|line| {
+            line.kind == DiffLineKind::Addition && line.text == "untracked replacement"
+        }));
+    }
+
+    #[test]
+    fn load_file_diff_keeps_file_to_directory_replacement_as_deletion() {
+        let repo = init_repo();
+        write(repo.path().join("swap.txt").as_path(), "tracked file\n");
+        git(repo.path(), &["add", "swap.txt"]);
+        git(repo.path(), &["commit", "-m", "track file"]);
+        std::fs::remove_file(repo.path().join("swap.txt")).expect("remove tracked file");
+        std::fs::create_dir(repo.path().join("swap.txt")).expect("replacement directory");
+        write(repo.path().join("swap.txt/child.bin").as_path(), "untracked child\n");
+
+        let snapshot = load_review_snapshot(repo.path());
+        let file = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "swap.txt")
+            .expect("tracked deletion")
+            .clone();
+        assert_eq!(file.status, FileStatus::Deleted);
+        let diff = FileDiff::load(repo.path(), &ReviewScope::WorkingTree, &file);
+        assert!(diff.error.is_none(), "{:?}", diff.error);
+        assert!(diff.hunks.iter().flat_map(|hunk| &hunk.lines).any(|line| {
+            line.kind == DiffLineKind::Deletion && line.text == "tracked file"
+        }));
+        assert!(!diff.hunks.iter().flat_map(|hunk| &hunk.lines).any(|line| {
+            line.kind == DiffLineKind::Addition && line.text == "untracked child"
+        }));
+    }
+
+    #[test]
     fn load_file_diff_rejects_traversal_path_fail_closed() {
         let repo = init_repo();
         write(repo.path().join("real.txt").as_path(), "base\n");
@@ -3724,7 +4119,10 @@ deleted file mode 100644
         write(repo.path().join("old.txt").as_path(), baseline);
         git(repo.path(), &["add", "old.txt"]);
         git(repo.path(), &["commit", "-m", "add old"]);
-        fs::rename(repo.path().join("old.txt"), repo.path().join("new.txt")).expect("rename");
+        // Stage the rename so both sides are tracked changed paths (a bare
+        // filesystem rename with an untracked destination is out of the
+        // tracked-only review contract).
+        git(repo.path(), &["mv", "old.txt", "new.txt"]);
         write(repo.path().join("new.txt").as_path(), &format!("{baseline}renamed\n"));
         // A binary file (fake PNG header) added in the working tree.
         let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR\x00\x00\x00\x00";
@@ -3814,6 +4212,7 @@ deleted file mode 100644
             b"working-tree",
             output,
             Some(&catalog),
+            None,
         );
         assert!(snapshot.truncated);
         let paths = snapshot
@@ -3883,6 +4282,7 @@ deleted file mode 100644
             b"working-tree",
             patch(),
             Some(&catalog_a),
+            None,
         );
         let snapshot_b = snapshot_from_diff_output(
             PathBuf::from("repo"),
@@ -3890,6 +4290,7 @@ deleted file mode 100644
             b"working-tree",
             patch(),
             Some(&catalog_b),
+            None,
         );
         let snapshot_a_again = snapshot_from_diff_output(
             PathBuf::from("repo"),
@@ -3897,6 +4298,7 @@ deleted file mode 100644
             b"working-tree",
             patch(),
             Some(&catalog_a),
+            None,
         );
         assert_ne!(
             snapshot_a.snapshot_id, snapshot_b.snapshot_id,
@@ -3906,6 +4308,46 @@ deleted file mode 100644
             snapshot_a.snapshot_id, snapshot_a_again.snapshot_id,
             "identical diff and catalog stay idempotent"
         );
+    }
+
+    #[test]
+    fn truncated_working_tree_identity_tracks_review_path_content() {
+        // A staged addition whose diff lies ENTIRELY beyond the combined
+        // patch's 2 MiB cut: the name-status catalog (which paths changed)
+        // and the truncated patch bytes (identical cut point) are the same
+        // across content variants, so only the post-staging index fingerprint
+        // can tell the snapshot ids apart.
+        let repo = init_repo();
+        let mut first = vec![b'a'; 3 * 1024 * 1024];
+        let mut second = first.clone();
+        second[3 * 1024 * 1024 - 9] = b'b'; // differs only beyond the 2 MiB cut
+        fs::write(repo.path().join("zz-late.bin"), &first).expect("write staged addition");
+        git(repo.path(), &["add", "zz-late.bin"]);
+        let snapshot_a = load_review_snapshot(repo.path());
+        assert!(snapshot_a.error.is_none(), "{:?}", snapshot_a.error);
+        assert!(snapshot_a.truncated, "3 MiB addition must exceed the snapshot cap");
+        // A pure UNSTAGED worktree edit beyond the cut (staged blob unchanged):
+        // the review shows the worktree content, so the id must flip.
+        fs::write(repo.path().join("zz-late.bin"), &second).expect("write worktree edit");
+        let snapshot_b = load_review_snapshot(repo.path());
+        assert!(snapshot_b.error.is_none(), "{:?}", snapshot_b.error);
+        assert_ne!(
+            snapshot_a.snapshot_id,
+            snapshot_b.snapshot_id,
+            "worktree content beyond the truncation cut must flip the identity"
+        );
+        // Re-staging the SAME content does not change the review: idempotent.
+        git(repo.path(), &["add", "zz-late.bin"]);
+        let snapshot_c = load_review_snapshot(repo.path());
+        assert!(snapshot_c.error.is_none(), "{:?}", snapshot_c.error);
+        assert_eq!(
+            snapshot_b.snapshot_id,
+            snapshot_c.snapshot_id,
+            "identical review content must keep the identical identity"
+        );
+        // Determinism: identical state reproduces the identical identity.
+        let snapshot_c_again = load_review_snapshot(repo.path());
+        assert_eq!(snapshot_c.snapshot_id, snapshot_c_again.snapshot_id);
     }
 
     /// Repo whose combined HEAD→working-tree diff exceeds the 2 MiB snapshot
@@ -3928,8 +4370,10 @@ deleted file mode 100644
         let changed = "changed-line\n".repeat(200_000);
         write(repo.path().join("big-a.txt").as_path(), &changed);
         write(repo.path().join("big-b.txt").as_path(), &changed);
-        fs::rename(repo.path().join("rename-old.txt"), repo.path().join("rename-new.txt"))
-            .expect("rename");
+        // The rename is staged (`git mv`) so both sides are tracked changed
+        // paths; a bare filesystem rename whose destination stays untracked
+        // is out of the tracked-only review contract.
+        git(repo.path(), &["mv", "rename-old.txt", "rename-new.txt"]);
         // A small content edit keeps the rename paired (above the 50%
         // similarity threshold) while giving the loaded diff hunk lines.
         write(
