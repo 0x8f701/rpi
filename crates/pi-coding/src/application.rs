@@ -1495,6 +1495,102 @@ impl Application {
         let session = active.session.clone();
         let inner = self.inner.clone();
         let selection = session.select_for_request(&message).await;
+        // Explicit trusted-agent delegation spawns run FIRST: a named
+        // delegation must not also trigger the auto-todo classifier, which
+        // would duplicate/ambiguously orchestrate the same prompt. An
+        // explicit but NEGATED delegation (`别让glm…`, `Do not have glm…`)
+        // suppresses auto-todo outright — the user said NOT to run it — and
+        // never reaches the hook or the spawn. A positive delegation passes
+        // through the task authorization boundary — the composed
+        // before_tool_call pipeline (settings pre_tool_call hooks + host
+        // approval mode + extension hooks) runs against a synthetic `task`
+        // call. A block (or rewritten arguments) suppresses the auto-spawn
+        // AND the auto-todo classifier, so nothing bypasses the gate through
+        // the todo path; the delegation stays a plain parent turn and the
+        // model can still call `task` through the same gate. The pipeline is
+        // always composed, so its presence cannot be the gate; its OUTCOME
+        // is.
+        let mut delegated_prompt = false;
+        if let Some(runtime) = self.runtime().orchestration_runtime() {
+            // Mixed polarity: a negated clause (`Don't have glm…`) suppresses
+            // auto-todo, while a positive clause in the same prompt
+            // (`; have grok review it`) still authorizes and spawns its own
+            // mentions. The two signals are independent.
+            delegated_prompt = runtime.has_explicit_negated_delegation(&message);
+            if allow_natural_language_spawn
+                && !runtime.delegated_mentions_in(&message).is_empty()
+            {
+                let authorized = match session.before_tool_call() {
+                Some(hook) => {
+                    // The synthetic call matches the REAL `task` tool
+                    // boundary: the parent toolset's task definition carries
+                    // the exact capability into the hook context, and its
+                    // prepare_arguments fills the canonical null-shaped
+                    // arguments (`{task, name, agent, todoTaskId, context,
+                    // tasks, outputSchema, schemaMode}`) that a real task
+                    // call presents to the pipeline.
+                    let task_tool = runtime
+                        .agent_tools(runtime.main_agent_id(), 0)
+                        .into_iter()
+                        .find(|tool| tool.name == "task");
+                    match task_tool {
+                        None => true,
+                        Some(task_tool) => {
+                            let raw = serde_json::json!({ "task": message.as_str() });
+                            let arguments = match task_tool.prepare_arguments.as_ref() {
+                                Some(prepare) => prepare(raw)?,
+                                None => raw,
+                            };
+                            let context = pi_agent::BeforeToolCallContext {
+                                assistant_message: pi_ai::AssistantMessage::pending(&pi_ai::Model::default()),
+                                tool_call: pi_ai::ToolCall {
+                                    id: "natural-language-spawn".to_owned(),
+                                    name: "task".to_owned(),
+                                    arguments: arguments.clone(),
+                                    thought_signature: None,
+                                },
+                                arguments: arguments.clone(),
+                                context: pi_agent::AgentContext {
+                                    system_prompt: String::new(),
+                                    messages: Vec::new(),
+                                    tools: vec![task_tool],
+                                },
+                            };
+                            let result = hook(context).await?;
+                            if result.block {
+                                false
+                            } else {
+                                // A pre-hook may rewrite the task arguments:
+                                // the auto-spawn proceeds only when they are
+                                // untouched (`None` = unchanged) or
+                                // semantically equal to the synthetic call.
+                                // A rewritten call is left to the normal
+                                // model/tool path so the modification is
+                                // honored exactly once, there.
+                                result
+                                    .arguments
+                                    .as_ref()
+                                    .is_none_or(|rewritten| rewritten == &arguments)
+                            }
+                        }
+                    }
+                }
+                None => true,
+            };
+            if authorized {
+                delegated_prompt = runtime
+                    .spawn_from_natural_language(runtime.main_agent_id(), 0, &message)?
+                    .is_some();
+                if delegated_prompt {
+                    active.todo_cycle_pending.store(true, Ordering::Release);
+                }
+            } else {
+                // The hook blocked or rewrote the task call: the delegation
+                // is not auto-spawned, and auto-todo must not orchestrate it.
+                delegated_prompt = true;
+            }
+            }
+        }
         // Deterministic auto-mode classifier (`selector.autoMode`):
         // - off: nothing.
         // - suggest: publish a status hint when a code task / goal is detected.
@@ -1510,7 +1606,7 @@ impl Application {
             .runtime()
             .orchestration_runtime()
             .is_some_and(|runtime| runtime.workflow_scope().is_some());
-        if !workflow_owned && auto_mode.is_enabled() {
+        if !workflow_owned && auto_mode.is_enabled() && !delegated_prompt {
             let mode = crate::selector::classify_prompt(&message);
             if let Some(hint) = crate::selector::mode_hint(mode) {
                 inner.publish(ApplicationEvent::ModeDetected {

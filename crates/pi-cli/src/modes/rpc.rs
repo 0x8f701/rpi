@@ -9618,6 +9618,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plural_natural_language_prompt_fans_out_to_every_named_agent_in_job_list() {
+        // RpcCommand::Prompt funnels into the same prompt_inner spawn path as
+        // the TUI composer and the Web /rpc dispatch: a plural CJK delegation
+        // must spawn BOTH named agents, and job_list must prove it.
+        use pi_coding::{AgentCatalog, AgentDefinition, AgentDefinitionSource, OrchestrationConfig};
+        let root = tempfile::tempdir().expect("tempdir");
+        let agent = |name: &str, description: &str| AgentDefinition {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            system_prompt: "prompt".to_owned(),
+            tools: Some(Vec::new()),
+            autoload_skills: Vec::new(),
+            model: None,
+            thinking_level: Some(ThinkingLevel::Off),
+            max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            disallowed_tools: Vec::new(),
+            capability_ceiling: None,
+            source: AgentDefinitionSource::Bundled,
+            path: None,
+            trusted: true,
+            kind: pi_coding::AgentDefinitionKind::Agent,
+            personality: None,
+            soft_budget: None,
+        };
+        let factory: pi_coding::ChildSessionFactory = Arc::new(move |request| {
+            let stream_fn: pi_agent::StreamFn = Arc::new(move |model, _context, _options| {
+                use pi_ai::{AssistantMessage, AssistantMessageEvent, StopReason};
+                async move {
+                    let events = pi_ai::new_assistant_message_event_stream();
+                    let writer = events.clone();
+                    tokio::spawn(async move {
+                        let mut message = AssistantMessage::pending(&model);
+                        message.stop_reason = StopReason::Stop;
+                        writer
+                            .push(AssistantMessageEvent::Done {
+                                reason: StopReason::Stop,
+                                message: message.clone(),
+                            })
+                            .await;
+                        writer.end(Some(message)).await;
+                    });
+                    events
+                }
+                .boxed()
+            });
+            Box::pin(async move {
+                pi_coding::Session::new(pi_coding::SessionOptions {
+                    model: request.model,
+                    cwd: std::env::current_dir().expect("cwd"),
+                    system_prompt: request.system_prompt,
+                    thinking_level: request.thinking_level.unwrap_or(ThinkingLevel::Off),
+                    api_key: "subagents-child".to_owned(),
+                    compaction: None,
+                    stream_options: Default::default(),
+                    tools: Some(request.orchestration_tools),
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    stream_fn: Some(stream_fn),
+                    auth_resolver: None,
+                })
+            })
+        });
+        let mut config = OrchestrationConfig::new(
+            AgentCatalog::from_agents(vec![
+                agent("glm", "General language model agent"),
+                agent("grok", "Research assistant agent"),
+            ]),
+            root.path(),
+        );
+        config.default_agent = "glm".to_owned();
+        config.parent_model = Model::default();
+        let runtime =
+            pi_coding::OrchestrationRuntime::new(config, factory).expect("orchestration runtime");
+        let application = Application::new_with_orchestration(subagents_session(), runtime).await;
+
+        let prompted = subagents_handle(
+            &application,
+            RpcCommand::Prompt {
+                id: None,
+                message: "你让glm和grok一起调研这个仓库".to_owned(),
+                images: Vec::new(),
+                streaming_behavior: None,
+            },
+        )
+        .await;
+        assert!(prompted.success, "{prompted:?}");
+
+        let listed = subagents_handle(&application, RpcCommand::JobList { id: None }).await;
+        assert!(listed.success, "{listed:?}");
+        let jobs = listed.data.expect("job list")["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .clone();
+        let mut names = jobs
+            .iter()
+            .filter_map(|job| job.get("agent").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["glm".to_owned(), "grok".to_owned()], "{jobs:?}");
+        for job in &jobs {
+            assert!(
+                job.get("agentId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty()),
+                "each spawn must carry a stable agent id: {job:?}"
+            );
+        }
+        application.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn persona_rpc_failure_errors_never_embed_absolute_paths() {
         let (root, app, _registration, persona_root) = persona_rpc_app(false).await;
 

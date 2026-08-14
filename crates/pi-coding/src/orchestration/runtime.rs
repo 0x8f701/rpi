@@ -4192,73 +4192,108 @@ soft_budget: None,
         }
     }
 
-    /// Spawn a child when the request carries a delegation construction and a
-    /// unique exact trusted agent name. Delegation intent is Unicode-aware:
-    /// either a recognized English delegation verb token anywhere in the
-    /// request (`Have researcher study this`) or a conservative CJK
-    /// construction where a Chinese delegation token abuts the agent name and
-    /// an action clause follows it (`你让researcher仔细调研pi-coding-agent`).
+    /// Spawn children when the request carries a delegation construction
+    /// naming one or more exact trusted agents. Delegation intent is
+    /// Unicode-aware: a conservative CJK construction where a Chinese
+    /// delegation token abuts the FIRST mentioned name and an action clause
+    /// follows the whole conjunction chain (`你让glm和grok一起调研这个仓库`),
+    /// or an English delegation verb whose raw-text list includes the
+    /// mentions (`Have glm and grok study this`; object mentions like
+    /// `Have glm review grok's output` are not delegated). Every explicitly
+    /// delegated name is spawned in one batch, in mention order, each with
+    /// the full request as assignment.
     /// Informational mentions (`researcher 是做什么的？`,
-    /// `我在文档里看到researcher`) and generic skill/semantic text return
+    /// `glm和grok哪个好？`) and generic skill/semantic text return
     /// `Ok(None)` so the caller can keep selection recommendations without
-    /// spawning.
+    /// spawning. Distinct names that normalize identically (e.g.
+    /// `Research-Agent` vs `research-agent`) stay ambiguous and fail
+    /// actionably instead of fanning out.
     pub fn spawn_from_natural_language(
         &self,
         parent_id: &str,
         parent_depth: usize,
         request: &str,
     ) -> Result<Option<Vec<TaskSpawn>>> {
-        match self.exact_agent_mention_in_catalog(request) {
-            crate::selector::ExactAgentMention::None => Ok(None),
-            crate::selector::ExactAgentMention::Ambiguous(names) => {
-                // Only explicit delegation intent escalates an ambiguous
-                // mention into an error: an English delegation verb anywhere
-                // or a CJK construction aimed at one of the candidates. A
-                // plain informational mention ("researcher和writer哪个好")
-                // stays a recommendation.
-                let cjk_hit = names
-                    .iter()
-                    .any(|name| cjk_delegation_construction(request, name));
-                if !request_has_delegation_verb(request) && !cjk_hit {
-                    return Ok(None);
-                }
+        let mentions = self.exact_agent_mentions_in_catalog(request);
+        if mentions.is_empty() {
+            return Ok(None);
+        }
+        let delegated_runs = self.delegated_runs_in(request, &mentions);
+        // Normalized-name collisions (e.g. `Research-Agent` vs
+        // `research-agent`) stay ambiguous ONLY when the colliding phrase
+        // participates in the explicit delegation clause — an informational
+        // mention (`Tell me whether Research Agent is available`) or a
+        // non-delegating verb list (`Have me compare Research Agent
+        // descriptions`) never errors and never spawns.
+        if let Some(colliding) = crate::selector::exact_agent_mention_collisions(&mentions)
+            && colliding
+                .iter()
+                .any(|name| delegated_phrase_participates(&delegated_runs, name))
+        {
+            let names = colliding
+                .iter()
+                .map(|name| format!("{name:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "exact agent mention is ambiguous between {names}; pass the intended name in \
+                 task.agent or rename agents so their normalized names are unique"
+            );
+        }
+        let delegated_mentions = mentions
+            .iter()
+            .filter(|name| {
+                let lowered = normalized_lower(name);
+                delegated_runs.iter().any(|member| member == &lowered)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if delegated_mentions.is_empty() {
+            return Ok(None);
+        }
+        // Delegation intent gates the fan-out: only mentions inside an
+        // explicit delegation clause spawn. CJK: every mention carrying a
+        // delegation construction delegates its own conjunction chain
+        // (`你让glm和grok调研` -> both; `让glm调研；grok是做什么` -> glm only;
+        // `glm是做什么？让grok调研` -> grok only; `不要让glm调研` -> nothing).
+        // English: the verb's raw-text list — `Have glm and grok study this`
+        // spawns both, `Have glm review grok's output` spawns only glm (grok
+        // is the review's object), `Tell me whether glm or grok is better`
+        // spawns nothing, and a negated verb (`Do not have glm study this`)
+        // spawns nothing.
+        let delegated_mentions = self.delegated_mentions_in(request);
+        if delegated_mentions.is_empty() {
+            return Ok(None);
+        }
+        // Validate every named agent up front so a single absent/disabled
+        // name fails actionably before any job is created.
+        for name in &delegated_mentions {
+            self.ensure_agent_enabled(name)?;
+            if !self
+                .enabled_agents()
+                .iter()
+                .any(|agent| agent.name == *name)
+            {
                 bail!(
-                    "{}",
-                    self.exact_agent_ambiguity(request).unwrap_or_else(|| {
-                        "exact agent mention is ambiguous".to_owned()
-                    })
+                    "exact agent mention {:?} is not available for spawning",
+                    name
                 );
             }
-            crate::selector::ExactAgentMention::Unique(name) => {
-                if !delegation_intent(request, &name) {
-                    return Ok(None);
-                }
-                self.ensure_agent_enabled(&name)?;
-                if !self
-                    .enabled_agents()
-                    .iter()
-                    .any(|agent| agent.name == name)
-                {
-                    bail!(
-                        "exact agent mention {:?} is not available for spawning",
-                        name
-                    );
-                }
-                let spawns = self.spawn_tasks(
-                    parent_id,
-                    parent_depth,
-                    vec![TaskItem {
-                        index: 0,
-                        id: name.clone(),
-                        agent: name,
-                        assignment: request.to_owned(),
-                        todo_task_id: None,
-                        ..Default::default()
-                    }],
-                )?;
-                Ok(Some(spawns))
-            }
         }
+        let items = delegated_mentions
+            .iter()
+            .enumerate()
+            .map(|(index, name)| TaskItem {
+                index,
+                id: name.clone(),
+                agent: name.clone(),
+                assignment: request.to_owned(),
+                todo_task_id: None,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let spawns = self.spawn_tasks(parent_id, parent_depth, items)?;
+        Ok(Some(spawns))
     }
 
     /// P0-C catalog diagnostics: fail actionably when `request` (a workflow
@@ -4414,6 +4449,78 @@ soft_budget: None,
             .cloned()
             .collect::<Vec<_>>();
         crate::selector::exact_agent_mention(assignment, &trusted)
+    }
+
+    /// Ordered exact trusted agent names mentioned in `request` (raw-text
+    /// scan with CJK-conjunction support), for multi-target delegation.
+    fn exact_agent_mentions_in_catalog(&self, request: &str) -> Vec<String> {
+        let trusted = self
+            .inner
+            .config
+            .catalog
+            .agents()
+            .iter()
+            .filter(|agent| agent.trusted)
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::selector::exact_agent_mentions(request, &trusted)
+    }
+
+    /// Exact trusted agent mentions that form an explicit delegation clause
+    /// in `request` — the same scan [`spawn_from_natural_language`] fans out
+    /// — without spawning anything. Callers use this to gate the spawn
+    /// through the task authorization boundary before any job is created.
+    #[must_use]
+    pub(crate) fn delegated_mentions_in(&self, request: &str) -> Vec<String> {
+        let mentions = self.exact_agent_mentions_in_catalog(request);
+        let runs = self.delegated_runs_in(request, &mentions);
+        mentions
+            .iter()
+            .filter(|name| {
+                let lowered = normalized_lower(name);
+                runs.iter().any(|member| member == &lowered)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Raw lowercase runs that form explicit delegation clauses in `request`
+    /// (English verb lists plus per-mention CJK conjunction chains).
+    fn delegated_runs_in(&self, request: &str, mentions: &[String]) -> Vec<String> {
+        let mut delegated = Vec::new();
+        if request_has_delegation_verb(request) {
+            delegated.extend(english_delegation_list(request));
+        }
+        for mention in mentions {
+            if let Some(chain) = cjk_delegation_chain(request, mention) {
+                delegated.extend(chain);
+            }
+        }
+        delegated
+    }
+
+    /// True when `request` carries an explicit delegation clause that is
+    /// NEGATED (`别让glm调研`, `Do not have glm study this`): the user said
+    /// NOT to delegate the named agents, so nothing may spawn and nothing
+    /// may be orchestrated through an alternate owner (the auto-todo DAG).
+    /// Shares the exact parser with the positive scan — never an ad hoc app
+    /// string check.
+    #[must_use]
+    pub(crate) fn has_explicit_negated_delegation(&self, request: &str) -> bool {
+        let mentions = self.exact_agent_mentions_in_catalog(request);
+        if mentions.is_empty() {
+            return false;
+        }
+        if request_has_delegation_verb(request)
+            && mentions.iter().any(|name| {
+                delegated_phrase_participates(&english_delegation_list_negated(request), name)
+            })
+        {
+            return true;
+        }
+        mentions
+            .iter()
+            .any(|mention| cjk_delegation_chain_negated(request, mention).is_some())
     }
 
     pub(crate) fn exact_agent_ambiguity(&self, assignment: &str) -> Option<String> {
@@ -6237,6 +6344,7 @@ const CJK_DELEGATION_TOKENS: &[&str] = &["让", "请", "叫", "派", "安排", "
 /// space) and a non-trivial action clause follows it. Informational mentions
 /// ("researcher 是做什么的？", "我在文档里看到researcher") return false even
 /// when they name the agent exactly.
+#[cfg(test)]
 #[must_use]
 fn delegation_intent(request: &str, agent_name: &str) -> bool {
     request_has_delegation_verb(request) || cjk_delegation_construction(request, agent_name)
@@ -6302,30 +6410,84 @@ fn agent_name_span(request: &str, agent_name: &str) -> Option<(usize, usize)> {
 /// Conservative CJK delegation construction: a Chinese delegation token
 /// (`让`/`请`/`叫`/`派`/`安排`/`委托`/`交给`) directly abuts the agent name
 /// (`你让researcher…`) or precedes it with exactly one ASCII space
-/// (`让 mentor 审查…`), and a non-trivial action clause follows the name.
-/// This is deliberately stricter than the English token path: `请 review the
-/// security patch` is not a delegation to an agent named `review`, and
-/// `请使用research技能` names a skill, not an agent.
+/// (`让 mentor 审查…`), and a non-trivial action clause follows the WHOLE
+/// conjunction chain (`你让glm和grok调研…` — `你让glm和grok` with no action is
+/// not a delegation). Negated delegations (`不要让glm调研`, `别让grok调研`)
+/// are not delegations. This is deliberately stricter than the English token
+/// path: `请 review the security patch` is not a delegation to an agent named
+/// `review`, and `请使用research技能` names a skill, not an agent. Returns
+/// the lowercase raw names of the delegation clause (the matched name plus
+/// every name joined to it by CJK conjunctions), or `None`. NFKC+lowercase
+/// parity with the selector scan: `让ｇｌｍ调研` matches `glm` exactly like
+/// `让glm调研`.
 #[must_use]
-fn cjk_delegation_construction(request: &str, agent_name: &str) -> bool {
-    let Some((span_start, span_end)) = agent_name_span(request, agent_name) else {
-        return false;
-    };
-    let before = &request[..span_start];
+fn cjk_delegation_chain(request: &str, agent_name: &str) -> Option<Vec<String>> {
+    cjk_delegation_matching(request, agent_name, false)
+}
+
+/// Negated projection of [`cjk_delegation_matching`]: the conjunction chain
+/// of an explicitly NEGATED CJK delegation (`别让glm调研`), used by the
+/// negated-intent probe. The action-clause gate does not apply — the
+/// negation itself is the signal.
+#[must_use]
+fn cjk_delegation_chain_negated(request: &str, agent_name: &str) -> Option<Vec<String>> {
+    cjk_delegation_matching(request, agent_name, true)
+}
+
+/// Shared CJK delegation parser. The positive projection (false) yields the
+/// chain when a delegation token abuts the name and an action clause follows
+/// the WHOLE conjunction chain, without negation; the negated projection
+/// (true) yields the chain when the construction is explicitly negated. Both
+/// run on the NFKC-lowercased request so fullwidth forms match identically.
+#[must_use]
+fn cjk_delegation_matching(
+    request: &str,
+    agent_name: &str,
+    expected_negated: bool,
+) -> Option<Vec<String>> {
+    let normalized = normalized_lower(request);
+    let (span_start, span_end) = agent_name_span(&normalized, &normalized_lower(agent_name))?;
+    let before = &normalized[..span_start];
     // The token must directly abut the name (`你让researcher…`) or precede it
-    // with exactly one ASCII space (`让 mentor 审查这次修改`). The single-space
-    // form is the natural spaced typing of `让 <name> <action>`; two or more
+    // with exactly one ASCII space (`让 mentor 审查这次修改`); two or more
     // spaces stay non-delegations (conservative).
-    let token_hit = CJK_DELEGATION_TOKENS.iter().any(|token| {
-        before.ends_with(token)
-            || before
-                .strip_suffix(' ')
-                .is_some_and(|prefix| prefix.ends_with(token) && !prefix.ends_with("  "))
-    });
-    if !token_hit {
-        return false;
+    if !cjk_delegation_token_hit(before) {
+        return None;
     }
-    let after = &request[span_end..];
+    // Negation in the trailing clause before the name (`不要让glm调研`,
+    // `别让grok调研`).
+    let negated = cjk_clause_is_negated(trailing_cjk_clause(before));
+    if negated != expected_negated {
+        return None;
+    }
+    // Walk the CJK conjunction chain so the action clause is required AFTER
+    // the LAST joined name: `你让glm和grok` names the pair but delegates no
+    // work, while `你让glm和grok调研` delegates both.
+    let runs = ascii_identifier_runs(&normalized);
+    let (index, (head_run, _)) = runs
+        .iter()
+        .enumerate()
+        .find(|(_, (_, start))| *start == span_start)?;
+    let mut chain = vec![head_run.to_ascii_lowercase()];
+    let mut chain_end = span_end;
+    for (next_run, next_start) in runs.iter().skip(index + 1) {
+        let gap = &normalized[chain_end..*next_start];
+        let joined = !gap.is_empty()
+            && gap
+                .chars()
+                .all(|character| is_cjk_agent_conjunction(character) || character.is_whitespace())
+            && gap.chars().any(is_cjk_agent_conjunction)
+            && looks_like_agent_name(next_run);
+        if !joined {
+            break;
+        }
+        chain.push(next_run.to_ascii_lowercase());
+        chain_end = next_start + next_run.len();
+    }
+    if expected_negated {
+        return Some(chain);
+    }
+    let after = &normalized[chain_end..];
     // If the clause opens with a determiner/preposition (English), the name is
     // the clause's object ("请review the security patch"), not a delegated
     // agent — reject it like the English candidate scan does.
@@ -6343,7 +6505,7 @@ fn cjk_delegation_construction(request: &str, agent_name: &str) -> bool {
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
         .collect::<String>();
     if !clause_open.is_empty() && follows_without_action(&clause_open.to_ascii_lowercase()) {
-        return false;
+        return None;
     }
     // An action clause must follow: at least two characters that are neither
     // whitespace nor punctuation (e.g. 仔细调研 in the literal prompt). A bare
@@ -6365,10 +6527,96 @@ fn cjk_delegation_construction(request: &str, agent_name: &str) -> bool {
         }
         clause_chars += 1;
         if clause_chars >= 2 {
-            return true;
+            return Some(chain);
         }
     }
-    false
+    None
+}
+
+/// The CJK delegation token directly abuts the name (`你让researcher…`) or
+/// precedes it with exactly one ASCII space (`让 mentor 审查这次修改`).
+#[must_use]
+fn cjk_delegation_token_hit(before: &str) -> bool {
+    CJK_DELEGATION_TOKENS.iter().any(|token| {
+        before.ends_with(token)
+            || before
+                .strip_suffix(' ')
+                .is_some_and(|prefix| prefix.ends_with(token) && !prefix.ends_with("  "))
+    })
+}
+
+/// The trailing clause of the text before a name, used for the negation
+/// check. Splits on CJK AND ASCII sentence punctuation — the parser runs on
+/// the NFKC-normalized request, where fullwidth `；` becomes ASCII `;`.
+#[must_use]
+fn trailing_cjk_clause(before: &str) -> &str {
+    before
+        .rsplit(|c: char| {
+            matches!(
+                c,
+                '。' | '；' | '，' | '、' | '！' | '？' | '…' | '.' | ';' | ',' | '!' | '?'
+            )
+        })
+        .next()
+        .unwrap_or(before)
+}
+
+/// True when a conservative CJK delegation construction targets `agent_name`
+/// (see [`cjk_delegation_chain`]).
+#[must_use]
+fn cjk_delegation_construction(request: &str, agent_name: &str) -> bool {
+    cjk_delegation_chain(request, agent_name).is_some()
+}
+
+/// CJK negation markers that make a delegation construction an instruction
+/// NOT to delegate (`不要让glm调研`, `别让grok调研`).
+const CJK_DELEGATION_NEGATIONS: &[&str] = &["不要", "不用", "不必", "勿", "莫"];
+
+/// True when the trailing clause before a CJK delegation token negates the
+/// delegation. The multi-character markers match anywhere. A trailing `别`
+/// is also a negation unless it belongs to a known non-negating compound:
+/// `你别让…` and `请别让…` are denied, while `特别让…`, `分别让…`, and
+/// `个别让…` retain their ordinary meanings.
+#[must_use]
+fn cjk_clause_is_negated(clause: &str) -> bool {
+    if CJK_DELEGATION_NEGATIONS
+        .iter()
+        .any(|marker| clause.contains(marker))
+    {
+        return true;
+    }
+    clause.char_indices().any(|(index, character)| {
+        if character != '别' {
+            return false;
+        }
+        !matches!(
+            clause[..index].chars().next_back(),
+            Some('特' | '分' | '个')
+        )
+    })
+}
+
+/// NFKC-lowercased form used for cross-space name comparison (the same
+/// normalization the selector applies to requests).
+#[must_use]
+fn normalized_lower(value: &str) -> String {
+    value.nfkc().flat_map(char::to_lowercase).collect()
+}
+
+/// True when the colliding name's normalized phrase participates in an
+/// explicit delegation clause: the phrase as a single run (hyphenated form,
+/// e.g. `research-agent`) or any of its split runs (`research` for
+/// `Research Agent`) appears in the delegated run set.
+#[must_use]
+fn delegated_phrase_participates(delegated_runs: &[String], name: &str) -> bool {
+    let lowered = normalized_lower(name);
+    if delegated_runs.iter().any(|member| member == &lowered) {
+        return true;
+    }
+    lowered
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .any(|token| delegated_runs.iter().any(|member| member == token))
 }
 
 /// ASCII identifier-like tokens that could name an agent: `[A-Za-z][A-Za-z0-9_-]*`
@@ -6434,46 +6682,300 @@ fn ascii_identifier_runs(request: &str) -> Vec<(String, usize)> {
 /// Deterministic candidate agent names referenced with explicit delegation
 /// intent in `request`: CJK constructions (a Chinese delegation token abuts
 /// the name and an action clause follows) and the noun directly after an
-/// English delegation verb. Function words and the verbs themselves are never
-/// candidates, so `Have researcher study this` yields `researcher` while
-/// `please review the security patch` and `请使用research技能` yield nothing.
+/// English delegation verb. Names joined to a candidate by a conjunction
+/// (`你让missing1和missing2一起调研`, `Have missing1 and missing2 study this`)
+/// are candidates too, so validation reports EVERY named agent, never just
+/// the first. Function words and the verbs themselves are never candidates,
+/// so `Have researcher study this` yields `researcher` while `please review
+/// the security patch` and `请使用research技能` yield nothing.
 fn delegation_candidates(request: &str) -> Vec<String> {
     let mut candidates = std::collections::BTreeSet::new();
-    // English: the token right after a delegation verb.
-    let tokens = request
+    // English: the token right after a delegation verb, plus names chained
+    // to it by list conjunctions (`and`/`or`) or separators (`,`/`，`/`&`):
+    // `Have ghost-one and ghost-two study this` names BOTH agents, so
+    // validation reports every named agent, not just the first. The chain
+    // stops at the first token that is neither a conjunction nor a candidate
+    // name — the action clause — so `Have writer check this` chains nothing
+    // after `writer`.
+    let normalized = request
         .nfkc()
         .flat_map(char::to_lowercase)
-        .collect::<String>()
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
-        .filter(|token| !token.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
+        .collect::<String>();
+    let tokens = delegation_scan_tokens(&normalized);
+    for (index, (token, _)) in tokens.iter().enumerate() {
         if !ENGLISH_DELEGATION_VERBS.contains(&token.as_str()) {
             continue;
         }
-        let Some(next) = tokens.get(index + 1) else {
+        let Some((next, next_start)) = tokens.get(index + 1) else {
             continue;
         };
-        if looks_like_agent_name(next) && !is_english_function_word(next) {
-            // The token after the candidate must not be a determiner /
-            // pronoun / preposition that turns the candidate into the
-            // clause's object ("please review the patch", "ask me to …").
-            let action_follows = tokens.get(index + 2).is_none_or(|after| {
-                !follows_without_action(after)
-            });
-            if action_follows {
-                candidates.insert(next.clone());
+        if !looks_like_agent_name(next)
+            || is_english_function_word(next)
+            || is_english_agent_conjunction(next)
+        {
+            continue;
+        }
+        // The token after the candidate must not be a determiner / pronoun /
+        // preposition that turns the candidate into the clause's object
+        // ("please review the patch", "ask me to …"). A list continuation
+        // (conjunction or separator) after the name keeps it a candidate.
+        let noun_end = next_start + next.len();
+        let after = tokens.get(index + 2);
+        let list_continues = after.is_some_and(|(after_token, after_start)| {
+            is_english_agent_conjunction(after_token)
+                || gap_has_english_list_separator(&normalized, noun_end, *after_start)
+        });
+        let action_follows = list_continues
+            || after.is_none_or(|(after_token, _)| !follows_without_action(after_token));
+        if !action_follows {
+            continue;
+        }
+        candidates.insert(next.clone());
+        // Chain the rest of the list: a name following a conjunction or a
+        // separator is also delegated; the first token that is neither ends
+        // the list (the action clause).
+        let mut cursor = index + 2;
+        let mut previous_end = noun_end;
+        loop {
+            let (candidate, candidate_start) = match tokens.get(cursor) {
+                Some(tuple) => tuple,
+                None => break,
+            };
+            let separated =
+                gap_has_english_list_separator(&normalized, previous_end, *candidate_start);
+            let conjunction = is_english_agent_conjunction(candidate);
+            if !separated && !conjunction {
+                break; // the action clause follows the list
             }
+            if conjunction {
+                cursor += 1; // `and`/`or` joins the next name
+            }
+            let Some((chained, chained_start)) = tokens.get(cursor) else {
+                break;
+            };
+            if !looks_like_agent_name(chained)
+                || is_english_function_word(chained)
+                || is_english_agent_conjunction(chained)
+            {
+                break;
+            }
+            candidates.insert(chained.clone());
+            previous_end = chained_start + chained.len();
+            cursor += 1;
         }
     }
-    // CJK: names abutted by a Chinese delegation token with an action clause.
-    for (run, _) in ascii_identifier_runs(request) {
-        if looks_like_agent_name(&run) && cjk_delegation_construction(request, &run) {
-            candidates.insert(run);
+    // CJK: names abutted by a Chinese delegation token with an action clause,
+    // plus names joined to them by CJK conjunctions (`和`/`跟`/`与`/`、`/`，`
+    // or commas): `你让missing1和missing2一起调研` names BOTH agents, so
+    // validation must report every named agent, not just the first. A
+    // conjunction-free gap (an action clause, or a bare space) breaks the
+    // chain, mirroring the conservative single-space CJK token rule.
+    let runs = ascii_identifier_runs(request);
+    let mut chained = false;
+    for (index, (run, start)) in runs.iter().enumerate() {
+        if !looks_like_agent_name(run) {
+            chained = false;
+            continue;
+        }
+        let direct = cjk_delegation_construction(request, run);
+        let joined = chained
+            && {
+                let (previous, previous_start) = &runs[index - 1];
+                let gap = &request[previous_start + previous.len()..*start];
+                !gap.is_empty()
+                    && gap
+                        .chars()
+                        .any(|character| is_cjk_agent_conjunction(character))
+                    && gap.chars().all(|character| {
+                        is_cjk_agent_conjunction(character) || character.is_whitespace()
+                    })
+            };
+        if direct || joined {
+            candidates.insert(run.clone());
+            chained = true;
+        } else {
+            chained = false;
         }
     }
     candidates.into_iter().collect()
+}
+
+/// CJK conjunctions that join two delegated agent names in one clause
+/// (`你让glm和grok一起调研`): the next name follows through one of these
+/// without an intervening action clause.
+fn is_cjk_agent_conjunction(character: char) -> bool {
+    matches!(character, '和' | '跟' | '与' | '、' | '，' | ',')
+}
+
+/// NFKC-lowercased token scan for the English delegation branch: runs of
+/// alphanumerics, `-` and `_` with byte offsets into `normalized` (used to
+/// inspect raw separators such as commas between tokens).
+fn delegation_scan_tokens(normalized: &str) -> Vec<(String, usize)> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut start = 0;
+    for (index, character) in normalized.char_indices() {
+        if character.is_alphanumeric() || character == '-' || character == '_' {
+            if current.is_empty() {
+                start = index;
+            }
+            current.push(character);
+        } else if !current.is_empty() {
+            tokens.push((std::mem::take(&mut current), start));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push((current, start));
+    }
+    tokens
+}
+
+/// English list conjunctions that join delegated agent names
+/// (`Have glm and grok study this`).
+fn is_english_agent_conjunction(token: &str) -> bool {
+    matches!(token, "and" | "or")
+}
+
+/// True when the raw gap between two tokens contains an English list
+/// separator (comma or ampersand), so `Have glm, grok study this` chains
+/// even though tokenization drops the comma.
+fn gap_has_english_list_separator(
+    normalized: &str,
+    previous_end: usize,
+    next_start: usize,
+) -> bool {
+    normalized[previous_end..next_start]
+        .chars()
+        .any(|character| matches!(character, ',' | '，' | '&'))
+}
+
+/// Raw-text list of names delegated by the English delegation verbs in
+/// `request` (lowercase runs, unioned across every verb occurrence): the
+/// head of each verb's list is the first non-function-word run after the
+/// verb, and every later run whose gap to the previous member contains a
+/// list separator (`,`/`，`/`&`) or that follows a `and`/`or` run is also a
+/// member. The walk stops at the first non-member run — the action clause.
+/// `Have glm review grok's output` yields only `glm` (grok is the review's
+/// object), and `Tell me whether glm or grok is better` yields nothing
+/// (`whether` is not a function word, so it becomes the head and is never a
+/// catalog mention).
+fn english_delegation_list(request: &str) -> Vec<String> {
+    english_delegation_list_by(request, false)
+}
+
+/// Negated projection of [`english_delegation_list_by`]: the lists of the
+/// NEGATED verbs (`Do not have glm study this` yields `glm`), used by the
+/// negated-intent probe.
+#[must_use]
+fn english_delegation_list_negated(request: &str) -> Vec<String> {
+    english_delegation_list_by(request, true)
+}
+
+/// Shared English delegation list parser: the verb-list runs under
+/// `expected_negated` — with `false` the non-negated verb lists (the names
+/// actually delegated), with `true` the lists of negated verbs (the names
+/// the user forbade). NFKC+lowercase parity with the selector scan:
+/// `Have ｇｌｍ study this` == `Have glm study this`. All offsets are in the
+/// normalized space.
+fn english_delegation_list_by(request: &str, expected_negated: bool) -> Vec<String> {
+    let normalized = normalized_lower(request);
+    let runs = ascii_identifier_runs(&normalized);
+    let mut members = std::collections::BTreeSet::new();
+    for (verb_index, (run, verb_start)) in runs.iter().enumerate() {
+        if !ENGLISH_DELEGATION_VERBS
+            .iter()
+            .any(|verb| run.eq_ignore_ascii_case(verb))
+        {
+            continue;
+        }
+        // A negated verb (`Do not have glm study this`, `Don't ask glm to
+        // review this`) is an instruction NOT to delegate.
+        let negated = english_verb_is_negated(&normalized, *verb_start);
+        if negated != expected_negated {
+            continue;
+        }
+        // Head: the first run after the verb that is not a function word.
+        let mut cursor = verb_index + 1;
+        let mut previous_end = 0usize;
+        let mut head = None;
+        while let Some((candidate, start)) = runs.get(cursor) {
+            if is_english_function_word(candidate) {
+                cursor += 1;
+                continue;
+            }
+            head = Some(candidate.to_ascii_lowercase());
+            previous_end = start + candidate.len();
+            cursor += 1;
+            break;
+        }
+        let Some(head) = head else {
+            continue;
+        };
+        members.insert(head);
+        // Chain: a `and`/`or` run or a separator-joined run continues the
+        // list; the first token that is neither ends it (the action clause).
+        loop {
+            let Some((candidate, start)) = runs.get(cursor) else {
+                break;
+            };
+            let conjunction = candidate.eq_ignore_ascii_case("and")
+                || candidate.eq_ignore_ascii_case("or");
+            let separated = !conjunction
+                && gap_has_english_list_separator(&normalized, previous_end, *start);
+            if !conjunction && !separated {
+                break;
+            }
+            if conjunction {
+                cursor += 1;
+                let Some((chained, chained_start)) = runs.get(cursor) else {
+                    break;
+                };
+                if is_english_function_word(chained) || !looks_like_agent_name(chained) {
+                    break;
+                }
+                members.insert(chained.to_ascii_lowercase());
+                previous_end = chained_start + chained.len();
+                cursor += 1;
+                continue;
+            }
+            if is_english_function_word(candidate) || !looks_like_agent_name(candidate) {
+                break;
+            }
+            members.insert(candidate.to_ascii_lowercase());
+            previous_end = start + candidate.len();
+            cursor += 1;
+        }
+    }
+    members.into_iter().collect()
+}
+
+/// True when the delegation verb starting at `verb_start` is negated in its
+/// clause (`Do not have glm study this`, `Don't ask glm to review this`): an
+/// instruction NOT to delegate. Checks the trailing clause before the verb
+/// for negation tokens (`not`/`never`/`dont`/`doesnt`/`didnt`/`cannot`/
+/// `cant`/`wont`) or a contracted `n't`.
+fn english_verb_is_negated(request: &str, verb_start: usize) -> bool {
+    let before = &request[..verb_start];
+    let clause = before
+        .rsplit(|c: char| {
+            matches!(
+                c,
+                '.' | ';' | '!' | '?' | ',' | '。' | '；' | '！' | '？' | '、' | '，'
+            )
+        })
+        .next()
+        .unwrap_or(before)
+        .to_ascii_lowercase();
+    let negated_token = clause
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            matches!(
+                token,
+                "not" | "never" | "dont" | "doesnt" | "didnt" | "cannot" | "cant" | "wont"
+            )
+        });
+    negated_token || clause.contains("n't")
 }
 
 fn one_line(value: &str) -> String {
@@ -8002,6 +8504,12 @@ mod delegation_intent_tests {
             ("让 mentor 审查这次修改", "mentor"),
             ("请 researcher 去调查", "researcher"),
             ("叫 writer 检查这段代码", "writer"),
+            // The action clause must follow the WHOLE conjunction chain:
+            // `你让glm和grok调研` delegates both names.
+            ("你让glm和grok调研这个仓库", "glm"),
+            // `别` inside a word (`特别让…` = "especially let …") is not a
+            // negation marker.
+            ("特别让researcher仔细调研", "researcher"),
         ] {
             assert!(
                 cjk_delegation_construction(prompt, agent),
@@ -8009,8 +8517,10 @@ mod delegation_intent_tests {
             );
         }
         // Negatives: informational mentions, questions, possessive markers,
-        // whitespace-separated English after a CJK token, and double spaces
-        // after the token (only a single space is accepted).
+        // whitespace-separated English after a CJK token, double spaces
+        // after the token (only a single space is accepted), a conjunction
+        // chain WITHOUT a following action clause (`你让glm和grok` names the
+        // pair but delegates no work), and negations (`不要让…`, `别让…`).
         for (prompt, agent) in [
             ("researcher 是做什么的？", "researcher"),
             ("我在文档里看到researcher", "researcher"),
@@ -8019,6 +8529,11 @@ mod delegation_intent_tests {
             ("请使用research技能", "research"),
             ("让  mentor 审查这次修改", "mentor"),
             ("请  researcher 去调查", "researcher"),
+            ("你让glm和grok", "glm"),
+            ("不要让glm调研这个仓库", "glm"),
+            ("别让missing1调研", "missing1"),
+            ("你别让missing1调研", "missing1"),
+            ("请别让missing1调研", "missing1"),
         ] {
             assert!(
                 !cjk_delegation_construction(prompt, agent),
@@ -8117,6 +8632,76 @@ mod delegation_intent_tests {
         );
         assert!(delegation_candidates("请使用research技能").is_empty());
         assert!(delegation_candidates("researcher 是做什么的？").is_empty());
+    }
+
+    #[test]
+    fn delegation_candidates_chain_cjk_conjunction_joined_names() {
+        // Every name in a CJK conjunction chain is a candidate, so validation
+        // reports ALL named agents, never just the first.
+        assert_eq!(
+            delegation_candidates("你让missing1和missing2一起调研"),
+            vec!["missing1".to_owned(), "missing2".to_owned()]
+        );
+        assert_eq!(
+            delegation_candidates("你让missing1、missing2、missing3一起调研"),
+            vec![
+                "missing1".to_owned(),
+                "missing2".to_owned(),
+                "missing3".to_owned()
+            ]
+        );
+        assert_eq!(
+            delegation_candidates("你让missing1，missing2一起调研"),
+            vec!["missing1".to_owned(), "missing2".to_owned()]
+        );
+        // An action clause between names breaks the chain.
+        assert_eq!(
+            delegation_candidates("你让missing1仔细调研missing2"),
+            vec!["missing1".to_owned()]
+        );
+        // A bare space is not a conjunction (conservative, mirroring the
+        // single-space CJK token rule): nothing chains.
+        assert_eq!(
+            delegation_candidates("你让missing1 missing2一起调研"),
+            vec!["missing1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn delegation_candidates_chain_english_list_joined_names() {
+        // Every name in an English list after a delegation verb is a
+        // candidate, so validation reports ALL named agents.
+        assert_eq!(
+            delegation_candidates("Have missing1 and missing2 study this"),
+            vec!["missing1".to_owned(), "missing2".to_owned()]
+        );
+        assert_eq!(
+            delegation_candidates("Have missing1, missing2 and missing3 study this"),
+            vec![
+                "missing1".to_owned(),
+                "missing2".to_owned(),
+                "missing3".to_owned()
+            ]
+        );
+        // `or` chains like `and`.
+        assert_eq!(
+            delegation_candidates("Have missing1 or missing2 study this"),
+            vec!["missing1".to_owned(), "missing2".to_owned()]
+        );
+        // The chain stops at the action clause: a plain verb after the name
+        // is not a delegated agent.
+        assert_eq!(
+            delegation_candidates("Have writer check this"),
+            vec!["writer".to_owned()]
+        );
+        // Function words end the list ("the team" is not an agent list).
+        assert_eq!(
+            delegation_candidates("Have missing1 and the team study this"),
+            vec!["missing1".to_owned()]
+        );
+        // The first-noun clause-object rejection still applies.
+        assert!(delegation_candidates("please review the security patch").is_empty());
+        assert!(delegation_candidates("ask me to review").is_empty());
     }
 }
 

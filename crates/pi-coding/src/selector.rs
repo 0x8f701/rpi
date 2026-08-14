@@ -416,6 +416,104 @@ fn exact_agent_mention_for_phrase(
     }
 }
 
+/// Ordered, deduplicated exact trusted agent names mentioned in `request`.
+///
+/// Unlike [`exact_agent_mention`] — which scans the normalized token stream
+/// and is the single-target contract for task-tool/default selection — this
+/// scan ALSO matches the raw request text with char-boundary semantics, so
+/// CJK conjunctions without whitespace (`你让glm和grok一起调研这个仓库`)
+/// keep ASCII names as separate runs instead of being glued into one token.
+/// Names are returned in first-occurrence order, deduplicated, trusted-only.
+#[must_use]
+pub(crate) fn exact_agent_mentions(request: &str, agents: &[AgentDefinition]) -> Vec<String> {
+    let raw_request = request
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let token_request = normalized_tokens(request).join(" ");
+    let mut found = Vec::new();
+    for agent in agents.iter().filter(|agent| agent.trusted) {
+        let name_phrase = normalized_tokens(&agent.name).join(" ");
+        if name_phrase.is_empty() {
+            continue;
+        }
+        // Raw-text position wins (the CJK-conjunction fix). The exact
+        // original name is tried FIRST (NFKC-lowercased like the request, so
+        // fullwidth forms normalize identically, and hyphens preserved) so
+        // hyphenated forms like `research-agent` anchor at their true text
+        // position instead of falling to the token stream and sorting after
+        // every raw match. Token-stream-only matches (stopword-dropped forms
+        // like `research the agent`) sort after all raw matches.
+        let exact_name = agent
+            .name
+            .nfkc()
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        let raw_exact = phrase_first_pos(&raw_request, &exact_name)
+            .map(|position| (exact_name.len(), position));
+        let raw_phrase = phrase_first_pos(&raw_request, &name_phrase)
+            .map(|position| (name_phrase.len(), position));
+        let token_phrase = phrase_first_pos(&token_request, &name_phrase)
+            .map(|position| (name_phrase.len(), position));
+        let Some((space, position, span)) = raw_exact
+            .or(raw_phrase)
+            .map(|(span, position)| (0usize, position, span))
+            .or_else(|| token_phrase.map(|(span, position)| (1usize, position, span)))
+        else {
+            continue;
+        };
+        found.push((space, position, span, agent.name.clone()));
+    }
+    // One token may match several catalog names (`grok` inside `grok-agent`):
+    // the longest exact raw occurrence wins, so a single mention never fans
+    // out to prefix-colliding definitions. Identical spans (distinct names
+    // matching the same phrase, e.g. `Research-Agent` vs `research-agent`)
+    // are kept — the caller reports them as ambiguous.
+    let mut resolved = Vec::new();
+    for entry in &found {
+        let contained = found.iter().any(|other| {
+            other.0 == entry.0
+                && (other.1, other.1 + other.2) != (entry.1, entry.1 + entry.2)
+                && other.1 <= entry.1
+                && other.1 + other.2 >= entry.1 + entry.2
+        });
+        if !contained {
+            resolved.push(entry.clone());
+        }
+    }
+    // Position within each anchor space, with the name as a deterministic
+    // tie-break (never catalog order).
+    resolved.sort_by(|left, right| (left.0, left.1, &left.3).cmp(&(right.0, right.1, &right.3)));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut mentions = Vec::new();
+    for (_, _, _, name) in resolved {
+        if seen.insert(name.clone()) {
+            mentions.push(name);
+        }
+    }
+    mentions
+}
+
+/// When two or more distinct catalog definitions in `mentions` normalize to
+/// the same name phrase (e.g. `Research-Agent` vs `research-agent`), a single
+/// textual mention cannot be attributed to one of them, so multi-target
+/// fan-out is unsafe and the single-target ambiguity contract applies.
+/// Returns the names of the first colliding normalized group, if any.
+#[must_use]
+pub(crate) fn exact_agent_mention_collisions(mentions: &[String]) -> Option<Vec<String>> {
+    let mut by_phrase: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for name in mentions {
+        by_phrase
+            .entry(normalized_tokens(name).join(" "))
+            .or_default()
+            .push(name.clone());
+    }
+    by_phrase
+        .into_iter()
+        .find(|(_, names)| names.len() >= 2)
+        .map(|(_, names)| names)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExactSkillMention {
     None,
@@ -1129,6 +1227,51 @@ fn contains_embedded_ascii_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// Byte position of the first word-boundary occurrence of `needle` in
+/// `haystack`, mirroring [`contains_phrase`]'s match set: whole-phrase,
+/// space-delimited, or an ASCII word embedded in a non-whitespace script
+/// (CJK). `None` when there is no word-boundary occurrence.
+fn phrase_first_pos(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    if haystack == needle {
+        return Some(0);
+    }
+    let mut best: Option<usize> = None;
+    let mut consider = |position: usize| {
+        best = Some(best.map_or(position, |current| current.min(position)));
+    };
+    if haystack.starts_with(&format!("{needle} ")) {
+        consider(0);
+    }
+    if let Some(prefix) = haystack.strip_suffix(&format!(" {needle}")) {
+        consider(prefix.len() + 1);
+    }
+    if let Some(relative) = haystack.find(&format!(" {needle} ")) {
+        consider(relative + 1);
+    }
+    // ASCII word embedded in a script without whitespace (CJK): scan every
+    // occurrence and keep the first with non-ASCII-alphanumeric neighbors,
+    // so `researcher` never matches inside `researchers`.
+    if needle.is_ascii() {
+        let mut search_from = 0;
+        while let Some(relative) = haystack[search_from..].find(needle) {
+            let at = search_from + relative;
+            let before = haystack[..at].chars().next_back();
+            let after = haystack[at + needle.len()..].chars().next();
+            let boundary_before = before.is_none_or(|character| !character.is_ascii_alphanumeric());
+            let boundary_after = after.is_none_or(|character| !character.is_ascii_alphanumeric());
+            if boundary_before && boundary_after {
+                consider(at);
+                break;
+            }
+            search_from = at + needle.len();
+        }
+    }
+    best
+}
+
 fn unique_overlap(request: &BTreeSet<&str>, candidate: &[String]) -> Vec<String> {
     candidate
         .iter()
@@ -1547,6 +1690,139 @@ mod tests {
                 "expected no agent mention in {request:?}"
             );
         }
+    }
+
+    #[test]
+    fn exact_agent_mentions_finds_plural_cjk_and_english_names_in_mention_order() {
+        let glm = agent("glm", "General language model agent");
+        let grok = agent("grok", "Research assistant agent");
+        let agents = [glm, grok.clone()];
+        // CJK conjunctions without whitespace keep ASCII names as separate
+        // runs; the single-target tokenizer would glue them into one token.
+        assert_eq!(
+            exact_agent_mentions("你让glm和grok一起调研这个仓库", &agents),
+            vec!["glm".to_owned(), "grok".to_owned()]
+        );
+        // Spaced and fullwidth-conjunction variants and English lists.
+        for request in [
+            "你让glm 和 grok一起调研这个仓库",
+            "你让glm、grok一起调研这个仓库",
+            "Have glm and grok study this",
+        ] {
+            assert_eq!(
+                exact_agent_mentions(request, &agents),
+                vec!["glm".to_owned(), "grok".to_owned()],
+                "{request}"
+            );
+        }
+        // Mention order follows the request, not the catalog.
+        assert_eq!(
+            exact_agent_mentions("Have grok and glm study this", &agents),
+            vec!["grok".to_owned(), "glm".to_owned()]
+        );
+        // Repeated mentions dedupe to one entry per agent.
+        assert_eq!(
+            exact_agent_mentions("Have glm, grok and glm study this", &agents),
+            vec!["glm".to_owned(), "grok".to_owned()]
+        );
+        // Single-name control.
+        assert_eq!(
+            exact_agent_mentions("你让grok调研这个仓库", &agents),
+            vec!["grok".to_owned()]
+        );
+        // Partial-word negatives and name-free prompts match nothing.
+        assert!(
+            exact_agent_mentions("你让glmx和grokx一起调研这个仓库", &agents).is_empty(),
+            "partial words must not match"
+        );
+        assert!(exact_agent_mentions("请研究一下这个项目", &agents).is_empty());
+        // A hyphenated name mentioned BEFORE a raw name keeps its text order:
+        // the exact-name raw scan anchors `research-agent` at its true
+        // position instead of demoting it to the token stream.
+        let research_agent = agent("research-agent", "Hyphenated researcher");
+        assert_eq!(
+            exact_agent_mentions(
+                "Have research-agent and grok study this",
+                &[research_agent, grok],
+            ),
+            vec!["research-agent".to_owned(), "grok".to_owned()]
+        );
+    }
+
+    #[test]
+    fn exact_agent_mentions_resolve_prefix_collisions_to_longest_name() {
+        let grok = agent("grok", "Research assistant agent");
+        let grok_agent = agent("grok-agent", "Specialized researcher");
+        let agents = [grok.clone(), grok_agent.clone()];
+        // One token naming the longer agent never fans out to its prefix
+        // (`grok` inside `grok-agent` is a substring of an identifier, not a
+        // separate mention).
+        assert_eq!(
+            exact_agent_mentions("Have grok-agent study this", &agents),
+            vec!["grok-agent".to_owned()]
+        );
+        assert_eq!(
+            exact_agent_mentions("Have grok study this", &agents),
+            vec!["grok".to_owned()]
+        );
+        // Both explicitly named: both mention, in text order.
+        assert_eq!(
+            exact_agent_mentions("Have grok and grok-agent study this", &agents),
+            vec!["grok".to_owned(), "grok-agent".to_owned()]
+        );
+    }
+
+    #[test]
+    fn exact_agent_mentions_normalize_fullwidth_forms() {
+        // NFKC parity: a fullwidth agent name matches a fullwidth request,
+        // and a fullwidth request matches an ASCII name.
+        let fullwidth = agent("ｇｌｍ", "Fullwidth general language model agent");
+        assert_eq!(
+            exact_agent_mentions("让ｇｌｍ调研这个仓库", &[fullwidth.clone()]),
+            vec!["ｇｌｍ".to_owned()]
+        );
+        let glm = agent("glm", "General language model agent");
+        assert_eq!(
+            exact_agent_mentions("让ｇｌｍ调研这个仓库", &[glm]),
+            vec!["glm".to_owned()]
+        );
+    }
+
+    #[test]
+    fn exact_agent_mention_keeps_single_target_contract() {
+        let glm = agent("glm", "General language model agent");
+        let grok = agent("grok", "Research assistant agent");
+        // The single-target scan keeps its normalized-token contract: the
+        // task tool still sees one name (Unique) or several (Ambiguous) and
+        // never multi-selects.
+        assert!(matches!(
+            exact_agent_mention("Have glm study this", &[glm.clone(), grok.clone()]),
+            ExactAgentMention::Unique(name) if name == "glm"
+        ));
+        assert!(matches!(
+            exact_agent_mention("Have glm and grok study this", &[glm, grok]),
+            ExactAgentMention::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn exact_agent_mention_collisions_flag_normalized_duplicates_only() {
+        let upper = agent("Research-Agent", "First researcher");
+        let lower = agent("research-agent", "Second researcher");
+        let agents = [upper.clone(), lower.clone()];
+        // The hyphen-split mention matches BOTH definitions after
+        // normalization, so a single textual mention stays ambiguous.
+        let mentions = exact_agent_mentions("你让Research-Agent调研这个", &agents);
+        assert_eq!(mentions.len(), 2, "{mentions:?}");
+        let colliding = exact_agent_mention_collisions(&mentions).expect("collision");
+        assert!(colliding.contains(&"Research-Agent".to_owned()), "{colliding:?}");
+        assert!(colliding.contains(&"research-agent".to_owned()), "{colliding:?}");
+        // Distinct names never collide: multi-target fan-out is safe.
+        let glm = agent("glm", "General language model agent");
+        let grok = agent("grok", "Research assistant agent");
+        let mentions = exact_agent_mentions("Have glm and grok study this", &[glm, grok]);
+        assert_eq!(mentions, vec!["glm".to_owned(), "grok".to_owned()]);
+        assert!(exact_agent_mention_collisions(&mentions).is_none());
     }
 
     #[test]
