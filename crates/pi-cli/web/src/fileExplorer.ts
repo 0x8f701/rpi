@@ -2632,10 +2632,13 @@ export function fileExplorerContentSurface(
 ): FileExplorerContentSurface {
   if (fileKind !== 'file') return 'source';
   const stored = view.surfaceByPath?.[path];
-  if (stored === 'ask' || stored === 'map') return stored;
+  // Map used to replace the file. It is a header dialog now, so a stored
+  // map surface falls through to Source or Preview.
+  if (stored === 'ask') return stored;
   // Explicit Ask attach wins for ANY file (previewable or not).
   if (fileExplorerPreviewKind(path) == null) return 'source';
-  return stored ?? 'preview';
+  if (stored == null || stored === 'map') return 'preview';
+  return stored;
 }
 
 export function fileExplorerWithPathSurface(

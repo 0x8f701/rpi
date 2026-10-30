@@ -7859,6 +7859,79 @@ body:has(#subagents-panel) .file-explorer-resizer {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+.file-explorer__map-btn {
+  appearance: none;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.file-explorer__map-btn:hover:not(:disabled),
+.file-explorer__map-btn.is-active {
+  color: var(--fg);
+  border-color: var(--border);
+}
+.file-explorer__map-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.file-explorer__map-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.file-explorer__map-dialog {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  padding: 12px;
+  background: color-mix(in srgb, var(--bg) 28%, transparent);
+}
+.file-explorer__map-dialog-card {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.file-explorer__map-dialog-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 32px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.file-explorer__map-dialog-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  color: var(--muted);
+}
+.file-explorer__map-dialog-close {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
 .file-explorer__refresh-btn {
   appearance: none;
   flex: none;

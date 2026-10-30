@@ -89,6 +89,7 @@ function headerSlice(html: string): string {
   const html = renderExplorer();
   const head = headerSlice(html);
   check('a11y: Files title is static text outside the controls', head.includes('>Files<') && !html.includes('file-explorer-hide-btn') && !html.includes('file-explorer__title-button') && !head.includes(FILE_EXPLORER_TREE_TOGGLE_ID) && !head.includes('File surface'));
+  check('a11y: Map is a header action', head.includes('data-testid="file-explorer-map-toggle"') && head.includes('Map') && head.includes('aria-label="Dependency map"') && !head.includes('File surface'));
   check('a11y: Refresh keeps its accessible name and has no text label', head.includes(`id="${FILE_EXPLORER_REFRESH_BTN_ID}"`) && head.includes('aria-label="Refresh"') && head.includes('title="Refresh"') && head.includes('aria-hidden="true"') && !head.includes('file-explorer__refresh-label') && !head.includes('Refreshing'));
   check('a11y: close button names Close file explorer', head.includes(`id="${FILE_EXPLORER_CLOSE_BTN_ID}"`) && head.includes('aria-label="Close file explorer"') && head.includes('title="Close file explorer"'));
   check('a11y: fullscreen is absent without onToggleExpanded', !head.includes('expand-btn'));
@@ -2187,7 +2188,7 @@ await withDelayHarness(async (doc, root) => {
           { name: 'nested', path: 'src/nested', kind: 'dir' },
           { name: 'widget.rs', path: 'src/nested/widget.rs', kind: 'file' },
         ],
-        truncated: true,
+        truncated: false,
       });
     }
     if (command.type === 'file_explorer_list') {
@@ -2247,7 +2248,7 @@ await withDelayHarness(async (doc, root) => {
     labels.includes('src/nested') && labels.includes('src/nested/widget.rs'),
     labels.join('|'),
   );
-  check('search says it stopped early', (doc.body.textContent ?? '').includes('Search stopped early'));
+  check('search does not stop after a match cap', !(doc.body.textContent ?? '').includes('Search stopped early'));
   const file = [...doc.body.querySelectorAll('.file-explorer__row')]
     .find((node) => (node.textContent ?? '').includes('widget.rs'));
   await act(async () => { file?.click(); });

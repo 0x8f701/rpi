@@ -33,10 +33,6 @@ pub(crate) const DEFAULT_PAGE_LINES: usize = 400;
 pub(crate) const MAX_PAGE_LINES: usize = 2_000;
 pub(crate) const MAX_PAGE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_LIST_ENTRIES: usize = 5_000;
-/// Matches returned by one workspace search. Further matches set `truncated`.
-pub(crate) const MAX_SEARCH_MATCHES: usize = 200;
-/// Directories and files examined by one search. Hitting this stops the walk.
-const MAX_SEARCH_VISITED: usize = 20_000;
 pub(crate) const MAX_CHANGED_FILES: usize = 5_000;
 const MAX_GIT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -411,8 +407,9 @@ fn split_completion_input(input: &str) -> (&str, &str) {
 /// ran. This walk uses the same ignore and no-follow rules as [`list`] and
 /// returns both files and directories. A directory the captured policy
 /// rejects is omitted and not walked, so a denied or secret subtree cannot
-/// leak through a match. `truncated` is set when the match cap or the visit
-/// cap stops the walk before the tree is exhausted.
+/// leak through a match. Ignored names and symlinks are skipped. The walk
+/// does not stop after a match count or a visit count; every other file and
+/// directory under the workspace is examined. `truncated` stays false.
 pub(crate) fn search(app: &Application, query: &str) -> Result<SearchResponse> {
     if query.contains('\0') {
         bail!("path is outside the workspace");
@@ -430,9 +427,7 @@ pub(crate) fn search(app: &Application, query: &str) -> Result<SearchResponse> {
     let root_dir = open_workspace_root(&workspace_root)?;
     let mut queue = VecDeque::from([String::new()]);
     let mut matches = Vec::new();
-    let mut visited = 0usize;
-    let mut truncated = false;
-    'walk: while let Some(relative) = queue.pop_front() {
+    while let Some(relative) = queue.pop_front() {
         let relative_path = PathBuf::from(&relative);
         let ignore = build_ignore_stack(&root_dir, &relative_path)?;
         let directory = match open_relative_directory(
@@ -449,11 +444,6 @@ pub(crate) fn search(app: &Application, query: &str) -> Result<SearchResponse> {
             .entries()
             .map_err(|_| anyhow!("directory is unavailable"))?
         {
-            if visited >= MAX_SEARCH_VISITED || matches.len() >= MAX_SEARCH_MATCHES {
-                truncated = true;
-                break 'walk;
-            }
-            visited = visited.saturating_add(1);
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => continue,
@@ -511,7 +501,7 @@ pub(crate) fn search(app: &Application, query: &str) -> Result<SearchResponse> {
     });
     Ok(SearchResponse {
         entries: matches,
-        truncated,
+        truncated: false,
     })
 }
 
@@ -3977,15 +3967,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_reports_truncation_past_the_match_cap() {
+    async fn search_returns_every_match_past_the_old_cap() {
         let cwd = tempfile::tempdir().expect("cwd");
-        for index in 0..(MAX_SEARCH_MATCHES + 5) {
+        let count = 205;
+        for index in 0..count {
             std::fs::write(cwd.path().join(format!("hit-{index:03}.txt")), "x").expect("hit");
         }
         let app = completion_application(cwd.path(), &[]).await;
         let found = search(&app, "hit-").expect("search");
-        assert_eq!(found.entries.len(), MAX_SEARCH_MATCHES);
-        assert!(found.truncated);
+        assert_eq!(found.entries.len(), count);
+        assert!(!found.truncated);
         assert!(found.entries.iter().all(|entry| entry.kind == "file"));
     }
 

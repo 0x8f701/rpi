@@ -27,9 +27,12 @@ All notable changes to `rpi` are documented in this file.
   workspace root, not only rows the file tree has already loaded. Matching
   is case-insensitive on the relative path and uses the same ignore and
   no-follow rules as listing. A policy-denied directory is omitted and not
-  walked. The walk stops at 200 matches or 20,000 visited entries and says
-  so. Choosing a file opens it; choosing a directory expands its parents
-  and returns to the tree.
+  walked. The walk covers the rest of the workspace instead of stopping
+  after a fixed number of matches. Choosing a file opens it; choosing a
+  directory expands its parents and returns to the tree.
+- The file dependency map is a Files header action, in the same place as
+  Code review's Auto Review. It opens over the explorer and leaves
+  Source, Preview, and Ask on the file.
 - Code-review gap expand on Web and TUI: unchanged context bands above,
   between, and below hunks load from the snapshot's pinned blobs in
   bounded 20-line windows (serialized on Web, selection-driven in the TUI),

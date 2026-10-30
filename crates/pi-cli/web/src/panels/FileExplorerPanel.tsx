@@ -10,10 +10,12 @@
 // App sidebar Files toggle, the header ×, and Escape (which restores
 // focus to the Files toggle).
 //
-// Layout: static Files header (title, icon-only Refresh, ⛶, × last).
-// Search and the tree collapse control sit in the tree column, under
-// that header and above the listing. Source | Preview | Ask | Map is a
-// content-local toolbar above the open file. Phone ≤720 shows the tree
+// Layout: static Files header (title, Map, icon-only Refresh, ⛶, × last).
+// Map matches Code review's Auto Review: a header action that opens a
+// dialog over the explorer. Search and the tree collapse control sit in
+// the tree column, under that header and above the listing. Source |
+// Preview | Ask is a content-local toolbar above the open file. Phone
+// ≤720 shows the tree
 // OR the selected file, never a stacked half-and-half split; desktop
 // ≥721 keeps the side-by-side tree/content split. A collapsed desktop
 // tree stays a slim rail so the toggle remains reachable.
@@ -22,7 +24,7 @@
 //
 // File contents: previewable .md/.markdown/.html/.htm/.svg default to Preview
 // (MarkdownBody, sandboxed HTML iframe, SVG img). Source is the existing
-// line-numbered view. Source | Preview | Ask | Map lives above the file content.
+// line-numbered view. Source | Preview | Ask lives above the file content.
 // Unknown files stay React text after safeText(). Paging is infinite-scroll;
 // there is no Load more button.
 
@@ -1415,13 +1417,9 @@ export function FileExplorerPanel({
   }, [blameScope]);
   const [mapResult, setMapResult] = useState<FileExplorerMapResult | null>(null);
   const [mapPending, setMapPending] = useState(false);
+  const [mapOpen, setMapOpen] = useState(false);
   const mapRequestRef = useRef(0);
   const mapScope = `${viewOwnerKey}\0${activePath ?? ''}\0${activeView}`;
-  useEffect(() => {
-    mapRequestRef.current += 1;
-    setMapPending(false);
-    setMapResult(null);
-  }, [mapScope]);
   const requestMap = useCallback(() => {
     if (!sessionId || !activePath || activeView !== 'file') return;
     const generation = nextFileExplorerRequestGeneration();
@@ -1454,6 +1452,16 @@ export function FileExplorerPanel({
         if (mapRequestRef.current === generation) setMapPending(false);
       });
   }, [activePath, activeView, currentSession, onConversationError, sendCommand, sessionId, viewOwnerKey]);
+  useEffect(() => {
+    if (!mapOpen || activePath == null || activeView !== 'file') {
+      mapRequestRef.current += 1;
+      setMapPending(false);
+      setMapResult(null);
+      if (activePath == null || activeView !== 'file') setMapOpen(false);
+      return;
+    }
+    requestMap();
+  }, [activePath, activeView, mapOpen, mapScope, requestMap]);
   const dismissSelection = useCallback(() => {
     // Escape triage: report whether a selection/blame existed so the document
     // keydown consumes Escape only for a real dismissal and never closes the
@@ -1755,6 +1763,16 @@ export function FileExplorerPanel({
       // Focus owner: the toggle is looked up from the panel root by the
       // host's toggle id (Chat passes a distinct one); a null root
       // (SSR/tests) keeps the document fallback.
+      if (event.key === 'Escape' && mapOpen) {
+        const target = event.target as { tagName?: string; isContentEditable?: boolean } | null;
+        const tag = typeof target?.tagName === 'string' ? target.tagName.toUpperCase() : '';
+        if (target?.isContentEditable === true || tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT') {
+          return;
+        }
+        event.preventDefault();
+        setMapOpen(false);
+        return;
+      }
       const toggle = fileExplorerKeydownScope(rootRef.current)
         ?.querySelector<HTMLElement>(`#${toggleId}`)
         ?? fileExplorerToggleButton(toggleId);
@@ -1762,7 +1780,7 @@ export function FileExplorerPanel({
     };
     document.addEventListener('keydown', onDocKeyDown);
     return () => document.removeEventListener('keydown', onDocKeyDown);
-  }, [dismissSelection, onClose, toggleId]);
+  }, [dismissSelection, mapOpen, onClose, toggleId]);
   const root = dirs[''] ?? fileExplorerEmptyDirState();
   const treeLoadingIdentity = fileExplorerTreeLoadingIdentity(
     sessionId,
@@ -1848,7 +1866,7 @@ export function FileExplorerPanel({
   // reflows the source. Recomputed on scroll (measureSelectionRef) and on
   // resize (ResizeObserver, disconnected on cleanup); hidden — never
   // cleared — when the selected lines are not painted in the visible source.
-  const selectionFloatRange = contentSurface !== 'map' && showLines && !showPreview && !diffHunks ? paintedSelection : null;
+  const selectionFloatRange = showLines && !showPreview && !diffHunks ? paintedSelection : null;
   const [selectionAnchor, setSelectionAnchor] = useState<FileExplorerSelectionAnchor>(
     () => ({ visible: false, top: 0, left: 0, placement: 'below' }),
   );
@@ -2097,6 +2115,20 @@ export function FileExplorerPanel({
         <div className="file-explorer__actions">
           <button
             type="button"
+            id={fileExplorerControlId(toggleId, 'map-btn')}
+            className={`file-explorer__map-btn${mapOpen ? ' is-active' : ''}`}
+            data-testid="file-explorer-map-toggle"
+            title={activePath != null && activeView === 'file' ? 'Dependency map for this file' : 'Open a file to see its dependency map'}
+            aria-label="Dependency map"
+            aria-expanded={mapOpen}
+            disabled={activePath == null || activeView !== 'file'}
+            onClick={() => setMapOpen((open) => !open)}
+          >
+            <span className="file-explorer__action-glyph" aria-hidden="true">◇</span>
+            Map
+          </button>
+          <button
+            type="button"
             id={fileExplorerControlId(toggleId, 'refresh-btn')}
             className={`file-explorer__refresh-btn${refreshBusy ? ' is-refreshing' : ''}`}
             title="Refresh"
@@ -2275,22 +2307,6 @@ export function FileExplorerPanel({
               >
                 Ask
               </button>
-              <button
-                type="button"
-                id={fileExplorerControlId(toggleId, 'map-toggle')}
-                className={`file-explorer__surface-btn${contentSurface === 'map' ? ' is-active' : ''}`}
-                role="radio"
-                aria-checked={contentSurface === 'map'}
-                data-testid="file-explorer-map-toggle"
-                title="Dependency map for this file"
-                aria-label="Dependency map for this file"
-                onClick={() => {
-                  setContentSurface('map');
-                  requestMap();
-                }}
-              >
-                Map
-              </button>
             </div>
             )}
           </div>
@@ -2326,17 +2342,6 @@ export function FileExplorerPanel({
                 cwd={workspaceCwd ?? null}
                 selection={askSelectionRange}
               />
-            </div>
-          ) : contentSurface === 'map' && activePath != null && activeView === 'file' ? (
-            <div className="file-explorer__map-pane" data-testid="file-explorer-map-pane">
-              {mapPending && <div className="file-explorer__muted">Loading dependency map…</div>}
-              {!mapPending && mapResult && fileExplorerSamePath(mapResult.path, activePath) && (
-                <FileDependencyMap
-                  map={mapResult}
-                  workspaceCwd={workspaceCwd}
-                  onOpenFile={openFile}
-                />
-              )}
             </div>
           ) : (
             sourceSurfacePane
@@ -2377,6 +2382,42 @@ export function FileExplorerPanel({
           )}
         </div>
       </div>
+      {mapOpen && activePath != null && activeView === 'file' && (
+        <div
+          className="file-explorer__map-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Dependency map"
+          data-testid="file-explorer-map-dialog"
+        >
+          <div className="file-explorer__map-dialog-card">
+            <div className="file-explorer__map-dialog-head">
+              <span className="file-explorer__map-dialog-title">Map</span>
+              <button
+                type="button"
+                className="file-explorer__map-dialog-close"
+                aria-label="Close dependency map"
+                onClick={() => setMapOpen(false)}
+              >
+                {'\u00D7'}
+              </button>
+            </div>
+            <div className="file-explorer__map-pane" data-testid="file-explorer-map-pane">
+              {mapPending && <div className="file-explorer__muted">Loading dependency map…</div>}
+              {!mapPending && mapResult && fileExplorerSamePath(mapResult.path, activePath) && (
+                <FileDependencyMap
+                  map={mapResult}
+                  workspaceCwd={workspaceCwd}
+                  onOpenFile={(path) => {
+                    setMapOpen(false);
+                    openFile(path);
+                  }}
+                />
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }
