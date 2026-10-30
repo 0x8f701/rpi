@@ -3,7 +3,7 @@
  *
  * Frozen contract: local://file-explorer-contract.md
  * Commands (snake_case type, camelCase fields; sessionId at transport):
- *   file_explorer_list | read | changes | diff | blame | stage_download | map
+ *   file_explorer_list | file_explorer_search | read | changes | diff | blame | stage_download | map
  *
  * App stamps sessionId via sendCommand. This module never HTML-escapes —
  * the panel renders through React text + safeText().
@@ -195,6 +195,32 @@ export function fileExplorerListCommand(path?: string): Record<string, unknown> 
   const command: Record<string, unknown> = { type: 'file_explorer_list' };
   if (path != null && path !== '') command.path = path;
   return command;
+}
+
+/** Workspace search. Matches file and directory names and relative paths. */
+export function fileExplorerSearchCommand(query: string): Record<string, unknown> {
+  return { type: 'file_explorer_search', query };
+}
+
+/** `''` plus every ancestor through `path`, so a search hit can be expanded. */
+export function fileExplorerAncestorPaths(path: string): string[] {
+  const parts = path.split('/').filter((part) => part.length > 0 && part !== '.' && part !== '..');
+  const chain = [''];
+  let acc = '';
+  for (const part of parts) {
+    acc = acc ? `${acc}/${part}` : part;
+    chain.push(acc);
+  }
+  return chain;
+}
+
+export function fileExplorerExpandDirectoryChain(
+  expandedDirs: Record<string, true>,
+  path: string,
+): Record<string, true> {
+  const next = { ...expandedDirs };
+  for (const item of fileExplorerAncestorPaths(path)) next[item] = true;
+  return next;
 }
 
 export function fileExplorerReadCommand(

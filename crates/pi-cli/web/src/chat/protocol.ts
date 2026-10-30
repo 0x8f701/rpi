@@ -32,6 +32,7 @@ export type RunnerCommand =
   | { type: 'goal_journal' }
   | { type: 'job_list' }
   | { type: 'file_explorer_list'; path?: string; sessionId?: string }
+  | { type: 'file_explorer_search'; query: string; sessionId?: string }
   | { type: 'file_explorer_read'; path: string; cursor?: number; maxLines?: number; sessionId?: string }
   | { type: 'file_explorer_changes'; sessionId?: string }
   | { type: 'file_explorer_diff'; path: string; cursor?: number; maxLines?: number; sessionId?: string }

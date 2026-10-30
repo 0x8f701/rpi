@@ -92,7 +92,7 @@ function headerSlice(html: string): string {
   check('a11y: Refresh keeps its accessible name and has no text label', head.includes(`id="${FILE_EXPLORER_REFRESH_BTN_ID}"`) && head.includes('aria-label="Refresh"') && head.includes('title="Refresh"') && head.includes('aria-hidden="true"') && !head.includes('file-explorer__refresh-label') && !head.includes('Refreshing'));
   check('a11y: close button names Close file explorer', head.includes(`id="${FILE_EXPLORER_CLOSE_BTN_ID}"`) && head.includes('aria-label="Close file explorer"') && head.includes('title="Close file explorer"'));
   check('a11y: fullscreen is absent without onToggleExpanded', !head.includes('expand-btn'));
-  check('a11y: expanded search is the tree toolbar and precedes the only toggle', html.includes('data-testid="file-explorer-search"') && html.includes('aria-label="Search workspace files"') && !html.includes('file-explorer__tree-edge') && html.indexOf('data-testid="file-explorer-tree"') < html.indexOf('file-explorer-search') && html.indexOf('file-explorer-search') < html.indexOf(`id="${FILE_EXPLORER_TREE_TOGGLE_ID}"`) && html.includes('aria-label="Collapse file tree"') && (html.match(new RegExp(`id="${FILE_EXPLORER_TREE_TOGGLE_ID}"`, 'g')) ?? []).length === 1);
+  check('a11y: expanded search is the tree toolbar and precedes the only toggle', html.includes('data-testid="file-explorer-search"') && html.includes('aria-label="Search workspace files and folders"') && !html.includes('file-explorer__tree-edge') && html.indexOf('data-testid="file-explorer-tree"') < html.indexOf('file-explorer-search') && html.indexOf('file-explorer-search') < html.indexOf(`id="${FILE_EXPLORER_TREE_TOGGLE_ID}"`) && html.includes('aria-label="Collapse file tree"') && (html.match(new RegExp(`id="${FILE_EXPLORER_TREE_TOGGLE_ID}"`, 'g')) ?? []).length === 1);
   check('a11y: tree viewport starts visible', html.includes('data-testid="file-explorer-tree"') && !/data-testid="file-explorer-tree"[^>]*hidden/.test(html));
   check('a11y: desktop SSR layout stays split', html.includes('data-testid="file-explorer-layout"') && html.includes('data-layout="split"'));
 }
@@ -2168,6 +2168,111 @@ await withDelayHarness(async (doc, root) => {
 });
 
 
+
+await withDelayHarness(async (doc, root) => {
+  writeModuleFileExplorerPageCache(emptyFileExplorerPageCache());
+  updateFileExplorerDirCache(() => ({}));
+  fileExplorerSyncPageCacheWithSlots({ 'sess-search': emptyFileExplorerSlot() });
+  updateFileExplorerViewCache('sess-search', () => emptyFileExplorerViewState());
+  const opened: Array<{ path: string; view: string }> = [];
+  const commands: Array<Record<string, unknown>> = [];
+  const sendCommand = (command: Record<string, unknown>) => {
+    commands.push(command);
+    if (command.type === 'file_explorer_changes') {
+      return Promise.resolve({ files: [], isRepo: true, truncated: false });
+    }
+    if (command.type === 'file_explorer_search') {
+      return Promise.resolve({
+        entries: [
+          { name: 'nested', path: 'src/nested', kind: 'dir' },
+          { name: 'widget.rs', path: 'src/nested/widget.rs', kind: 'file' },
+        ],
+        truncated: true,
+      });
+    }
+    if (command.type === 'file_explorer_list') {
+      const path = typeof command.path === 'string' ? command.path : '';
+      if (path === 'src') {
+        return Promise.resolve({
+          entries: [{ name: 'nested', path: 'src/nested', kind: 'dir' }],
+          truncated: false,
+        });
+      }
+      if (path === 'src/nested') {
+        return Promise.resolve({
+          entries: [{ name: 'widget.rs', path: 'src/nested/widget.rs', kind: 'file' }],
+          truncated: false,
+        });
+      }
+      return Promise.resolve({
+        entries: [{ name: 'src', path: 'src', kind: 'dir' }],
+        truncated: false,
+      });
+    }
+    return Promise.resolve({});
+  };
+  await act(async () => {
+    root.render(createElement(FileExplorerPanel, {
+      ...panelProps,
+      sendCommand,
+      sessionId: 'sess-search',
+      slot: emptyFileExplorerSlot(),
+      onOpenPath: (path: string, _line?: number, view: 'file' | 'diff' = 'file') => {
+        opened.push({ path, view });
+      },
+    }));
+  });
+  await act(async () => {});
+  const input = doc.body.querySelector('[data-testid="file-explorer-search"]');
+  check('search box is mounted', input != null);
+  // Node has no native input event here, so React uses the keyup polyfill.
+  // That polyfill only watches the element after focusin, and focusin calls
+  // the legacy attachEvent hook.
+  await act(async () => {
+    if (!input) return;
+    const field = input as MiniNode & { value?: string; type?: string; attachEvent?: () => void; detachEvent?: () => void };
+    field.type = 'search';
+    field.attachEvent = () => {};
+    field.detachEvent = () => {};
+    field.dispatchEvent({ type: 'focusin' });
+    field.value = 'widget';
+    field.dispatchEvent({ type: 'keyup' });
+  });
+  await act(async () => { advanceClock(200); });
+  await act(async () => {});
+  const labels = [...doc.body.querySelectorAll('.file-explorer__row')]
+    .map((node) => (node.textContent ?? '').trim());
+  check(
+    'search lists the directory and the nested file',
+    labels.includes('src/nested') && labels.includes('src/nested/widget.rs'),
+    labels.join('|'),
+  );
+  check('search says it stopped early', (doc.body.textContent ?? '').includes('Search stopped early'));
+  const file = [...doc.body.querySelectorAll('.file-explorer__row')]
+    .find((node) => (node.textContent ?? '').includes('widget.rs'));
+  await act(async () => { file?.click(); });
+  check(
+    'clicking a search file opens it',
+    opened.some((entry) => entry.path === 'src/nested/widget.rs' && entry.view === 'file'),
+  );
+  const dir = [...doc.body.querySelectorAll('.file-explorer__row')]
+    .find((node) => (node.textContent ?? '').trim() === 'src/nested');
+  await act(async () => { dir?.click(); });
+  const view = fileExplorerViewForOwner(getFileExplorerViewCacheSnapshot(), 'sess-search');
+  check(
+    'clicking a search directory expands its parents',
+    view.expandedDirs.src === true && view.expandedDirs['src/nested'] === true,
+  );
+  check(
+    'clicking a search directory returns to the tree',
+    doc.body.querySelector('[data-testid="file-explorer-search-results"]') == null
+      && doc.body.querySelector('.file-explorer__row--dir') != null,
+  );
+  check(
+    'search command carried the query',
+    commands.some((command) => command.type === 'file_explorer_search' && command.query === 'widget'),
+  );
+});
 
 console.log(`\nFileExplorerPanel.test: ${ran} assertions, ${failures.length} failure(s)`);
 if (failures.length > 0) {

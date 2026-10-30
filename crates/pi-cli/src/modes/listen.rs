@@ -6336,6 +6336,9 @@ mod tests {
             uuid::Uuid::now_v7()
         );
         let selector = format!("={name}");
+        // A login shell inherits the operator prompt and can redraw slowly
+        // enough to coalesce later input into an earlier line. The order
+        // check needs a shell that executes each line as it arrives.
         let created = std::process::Command::new("tmux")
             .args([
                 "new-session",
@@ -6346,6 +6349,7 @@ mod tests {
                 "24",
                 "-s",
                 &name,
+                "exec env -i PATH=/usr/bin:/bin TERM=dumb HOME=/tmp PS1='$ ' bash --noprofile --norc",
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -6454,7 +6458,12 @@ mod tests {
                 Err(error) => last = error,
             }
             if Instant::now() >= wait_pane {
-                panic!("ordered input missing from pane last={last:?}");
+                let sample: Vec<&str> = last
+                    .lines()
+                    .filter(|line| line.contains("MARK"))
+                    .take(12)
+                    .collect();
+                panic!("ordered input missing from pane sample={sample:?}");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

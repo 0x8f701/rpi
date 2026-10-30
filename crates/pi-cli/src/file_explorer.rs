@@ -10,7 +10,7 @@
 //! directory listing without reopening a user-supplied absolute path.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read};
@@ -33,6 +33,10 @@ pub(crate) const DEFAULT_PAGE_LINES: usize = 400;
 pub(crate) const MAX_PAGE_LINES: usize = 2_000;
 pub(crate) const MAX_PAGE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_LIST_ENTRIES: usize = 5_000;
+/// Matches returned by one workspace search. Further matches set `truncated`.
+pub(crate) const MAX_SEARCH_MATCHES: usize = 200;
+/// Directories and files examined by one search. Hitting this stops the walk.
+const MAX_SEARCH_VISITED: usize = 20_000;
 pub(crate) const MAX_CHANGED_FILES: usize = 5_000;
 const MAX_GIT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -318,11 +322,9 @@ pub(crate) fn list_with_generation(
     path: &str,
 ) -> Result<ListResponse> {
     let (absolute, relative) = resolve_scoped_path(workspace_root, path, true)?;
-    generation.inspect_directory(&absolute)
-        .map_err(|error| {
-            let display = map_directory_error(&error).to_string();
-            error.context(display)
-        })?;
+    generation
+        .inspect_directory(&absolute)
+        .map_err(|error| map_directory_error(&error))?;
 
     let root = open_workspace_root(&workspace_root)?;
     let ignore = build_ignore_stack(&root, Path::new(&relative))?;
@@ -399,6 +401,124 @@ fn split_completion_input(input: &str) -> (&str, &str) {
         Some(index) => (&input[..=index], &input[index + 1..]),
         None => ("", input),
     }
+}
+
+/// Case-insensitive workspace search for files and directories.
+///
+/// The tree search box used to filter only directories the client had already
+/// listed, so a nested file never appeared until its parents were expanded,
+/// and a 5000-entry directory listing could drop the name before that filter
+/// ran. This walk uses the same ignore and no-follow rules as [`list`] and
+/// returns both files and directories. A directory the captured policy
+/// rejects is omitted and not walked, so a denied or secret subtree cannot
+/// leak through a match. `truncated` is set when the match cap or the visit
+/// cap stops the walk before the tree is exhausted.
+pub(crate) fn search(app: &Application, query: &str) -> Result<SearchResponse> {
+    if query.contains('\0') {
+        bail!("path is outside the workspace");
+    }
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(SearchResponse {
+            entries: Vec::new(),
+            truncated: false,
+        });
+    }
+    let workspace_root = app.session().cwd().to_path_buf();
+    app.inspect_generation_directory(&workspace_root)
+        .map_err(|error| map_directory_error(&error))?;
+    let root_dir = open_workspace_root(&workspace_root)?;
+    let mut queue = VecDeque::from([String::new()]);
+    let mut matches = Vec::new();
+    let mut visited = 0usize;
+    let mut truncated = false;
+    'walk: while let Some(relative) = queue.pop_front() {
+        let relative_path = PathBuf::from(&relative);
+        let ignore = build_ignore_stack(&root_dir, &relative_path)?;
+        let directory = match open_relative_directory(
+            root_dir
+                .try_clone()
+                .map_err(|_| anyhow!("directory is unavailable"))?,
+            &relative_path,
+        ) {
+            Ok(directory) => directory,
+            Err(error) if relative.is_empty() => return Err(error),
+            Err(_) => continue,
+        };
+        for entry in directory
+            .entries()
+            .map_err(|_| anyhow!("directory is unavailable"))?
+        {
+            if visited >= MAX_SEARCH_VISITED || matches.len() >= MAX_SEARCH_MATCHES {
+                truncated = true;
+                break 'walk;
+            }
+            visited = visited.saturating_add(1);
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name == ".git" {
+                continue;
+            }
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let is_dir = file_type.is_dir();
+            if !is_dir && !file_type.is_file() {
+                continue;
+            }
+            if ignore.is_ignored(&relative_path.join(&name), is_dir) {
+                continue;
+            }
+            let path = if relative.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative}/{name}")
+            };
+            if is_dir {
+                // Denied or secret directories stay out of the results and
+                // are not walked. An allowed directory is inspected once;
+                // files inside it follow the same listing rules as [`list`].
+                let child = workspace_root.join(&path);
+                if app.inspect_generation_directory(&child).is_err() {
+                    continue;
+                }
+                queue.push_back(path.clone());
+            }
+            if path.to_lowercase().contains(&needle) {
+                matches.push(ListEntry {
+                    name,
+                    path,
+                    kind: if is_dir { "dir" } else { "file" },
+                    size_bytes: None,
+                });
+            }
+        }
+    }
+    matches.sort_by(|left, right| {
+        let rank = |kind: &str| if kind == "dir" { 0 } else { 1 };
+        rank(left.kind)
+            .cmp(&rank(right.kind))
+            .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
+    });
+    Ok(SearchResponse {
+        entries: matches,
+        truncated,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct SearchResponse {
+    pub(crate) entries: Vec<ListEntry>,
+    pub(crate) truncated: bool,
 }
 
 /// Complete a user-typed path for the frontend path fields (session cwd,
@@ -3823,6 +3943,92 @@ mod tests {
         let error = parse_line_porcelain(porcelain.as_bytes(), "src/lib.rs", 1, &source)
             .expect_err("response budget");
         assert_eq!(error.to_string(), "blame selection exceeds the response limit");
+    }
+
+    #[tokio::test]
+    async fn search_finds_nested_files_and_directories_and_skips_ignored() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::create_dir_all(cwd.path().join("src/nested")).expect("nested");
+        std::fs::write(cwd.path().join("src/nested/widget.rs"), "fn widget() {}\n").expect("file");
+        std::fs::write(cwd.path().join("src/nested/other.txt"), "nope\n").expect("other");
+        std::fs::write(cwd.path().join(".gitignore"), "secret.txt\nignored_dir/\n").expect("ignore");
+        std::fs::write(cwd.path().join("secret.txt"), "hidden\n").expect("secret");
+        std::fs::create_dir_all(cwd.path().join("ignored_dir")).expect("ignored dir");
+        std::fs::write(cwd.path().join("ignored_dir/widget.rs"), "hidden\n").expect("ignored file");
+        let app = completion_application(cwd.path(), &[]).await;
+        let found = search(&app, "Widget").expect("search");
+        let paths: Vec<&str> = found.entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/nested/widget.rs"], "{paths:?}");
+        assert!(!found.truncated);
+        let dirs = search(&app, "nested").expect("directory search");
+        assert!(
+            dirs.entries.iter().any(|entry| entry.path == "src/nested" && entry.kind == "dir"),
+            "{:?}",
+            dirs.entries
+        );
+        assert!(
+            dirs.entries.iter().any(|entry| entry.path == "src/nested/widget.rs" && entry.kind == "file"),
+            "{:?}",
+            dirs.entries
+        );
+        let empty = search(&app, "   ").expect("blank query");
+        assert!(empty.entries.is_empty());
+        assert!(!empty.truncated);
+    }
+
+    #[tokio::test]
+    async fn search_reports_truncation_past_the_match_cap() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        for index in 0..(MAX_SEARCH_MATCHES + 5) {
+            std::fs::write(cwd.path().join(format!("hit-{index:03}.txt")), "x").expect("hit");
+        }
+        let app = completion_application(cwd.path(), &[]).await;
+        let found = search(&app, "hit-").expect("search");
+        assert_eq!(found.entries.len(), MAX_SEARCH_MATCHES);
+        assert!(found.truncated);
+        assert!(found.entries.iter().all(|entry| entry.kind == "file"));
+    }
+
+    #[tokio::test]
+    async fn search_skips_policy_denied_directories() -> anyhow::Result<()> {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::create_dir(cwd.path().join("blocked")).expect("blocked dir");
+        std::fs::write(cwd.path().join("blocked/secret.txt"), "i").expect("inner");
+        std::fs::write(cwd.path().join("open.txt"), "o").expect("open");
+        let settings = serde_json::json!({
+            "sandbox": {
+                "mode": "workspace-write",
+                "deniedPaths": [cwd.path().join("blocked")],
+            }
+        })
+        .to_string();
+        let app = match completion_application_with_settings(cwd.path(), &[], &settings).await {
+            Ok(app) => app,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("launcher") {
+                    eprintln!(
+                        "skipping confined search test: trusted sandbox launcher unavailable ({message})"
+                    );
+                    return Ok(());
+                }
+                anyhow::bail!("confined search fixture failed: {message}");
+            }
+        };
+        let secret = search(&app, "secret")?;
+        assert!(secret.entries.is_empty(), "{:?}", secret.entries);
+        let blocked = search(&app, "blocked")?;
+        assert!(
+            blocked.entries.iter().all(|entry| entry.path != "blocked" && !entry.path.starts_with("blocked/")),
+            "{:?}",
+            blocked.entries
+        );
+        let open = search(&app, "open.txt")?;
+        assert_eq!(
+            open.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+            vec!["open.txt"]
+        );
+        Ok(())
     }
 
 }

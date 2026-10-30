@@ -113,6 +113,9 @@ import {
   fileExplorerPeekRequestGeneration,
   fileExplorerPeekDirInflight,
   fileExplorerListCommand,
+  fileExplorerSearchCommand,
+  fileExplorerAncestorPaths,
+  fileExplorerExpandDirectoryChain,
   fileExplorerLoadedEnd,
   fileExplorerMergeTree,
   fileExplorerDiffStateAfter,
@@ -1118,6 +1121,9 @@ await (async () => {
     }) === false,
   );
   check('normalize trims and lowercases', fileExplorerNormalizeTreeQuery('  TsX ') === 'tsx');
+  check('search command names the workspace search', fileExplorerSearchCommand('Widget').type === 'file_explorer_search' && fileExplorerSearchCommand('Widget').query === 'Widget');
+  check('ancestor chain expands the file and each parent', JSON.stringify(fileExplorerAncestorPaths('src/nested/widget.rs')) === JSON.stringify(['', 'src', 'src/nested', 'src/nested/widget.rs']));
+  check('expand chain keeps the root and the opened directory', JSON.stringify(fileExplorerExpandDirectoryChain({ '': true }, 'src/nested')) === JSON.stringify({ '': true, src: true, 'src/nested': true }));
 }
 
 // ---- file conversation: strict snapshot, ask surface, draft close ack ----
@@ -2909,7 +2915,7 @@ await (async () => {
   check(
     'search is the tree column toolbar ahead of the scrolling list',
     searchIdx >= 0
-      && openHtml.includes('aria-label="Search workspace files"')
+      && openHtml.includes('aria-label="Search workspace files and folders"')
       && !openHtml.includes('file-explorer__tree-edge')
       && treeOpen >= 0
       && treeOpen < searchIdx

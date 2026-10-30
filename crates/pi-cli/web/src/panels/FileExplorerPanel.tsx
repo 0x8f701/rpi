@@ -1,6 +1,6 @@
 // Right-side file-explorer drawer.
 //
-// Wire: file_explorer_list | read | changes | diff | stage_download
+// Wire: file_explorer_list | file_explorer_search | read | changes | diff | stage_download
 // (crates/pi-cli/web/src/fileExplorer.ts — frozen contract).
 //
 // App owns per-session tabs / active tab / drawer mode so close and
@@ -99,6 +99,10 @@ import {
   fileExplorerCursorForLine,
   fileExplorerInflightKey,
   fileExplorerListCommand,
+  fileExplorerSearchCommand,
+  fileExplorerAncestorPaths,
+  fileExplorerExpandDirectoryChain,
+  type FileExplorerEntry,
   fileExplorerMergeTree,
   fileExplorerLoadedDescendantMatches,
   fileExplorerNormalizeTreeQuery,
@@ -674,6 +678,10 @@ export function FileExplorerPanel({
   const [changesGeneration, setChangesGeneration] = useState(0);
   const [treeQuery, setTreeQuery] = useState('');
   const treeNeedle = fileExplorerNormalizeTreeQuery(treeQuery);
+  const [searchHits, setSearchHits] = useState<FileExplorerEntry[]>([]);
+  const [searchTruncated, setSearchTruncated] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchLoading, setSearchLoading] = useState(false);
   const dirCache = useSyncExternalStore(
     subscribeFileExplorerDirCache,
     getFileExplorerDirCacheSnapshot,
@@ -1059,6 +1067,49 @@ export function FileExplorerPanel({
       });
   }, [connectionEpoch, currentSession, sendCommand, sessionId]);
 
+  useEffect(() => {
+    if (!sessionId || !treeNeedle) {
+      setSearchHits([]);
+      setSearchTruncated(false);
+      setSearchError(null);
+      setSearchLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setSearchHits([]);
+    setSearchTruncated(false);
+    setSearchLoading(true);
+    setSearchError(null);
+    const timer = window.setTimeout(() => {
+      sendCommand(fileExplorerCommandForSession(sessionId, fileExplorerSearchCommand(treeNeedle)))
+        .then((data) => {
+          if (cancelled || !currentSession()) return;
+          const parsed = normalizeList(data);
+          setSearchLoading(false);
+          if (!parsed) {
+            setSearchHits([]);
+            setSearchTruncated(false);
+            setSearchError('unusable search response');
+            return;
+          }
+          setSearchHits(parsed.entries);
+          setSearchTruncated(parsed.truncated);
+          setSearchError(null);
+        })
+        .catch((error: unknown) => {
+          if (cancelled || !currentSession()) return;
+          setSearchLoading(false);
+          setSearchHits([]);
+          setSearchTruncated(false);
+          setSearchError(isTransportError(error) ? 'Connection lost' : errorMessage(error));
+        });
+    }, 200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [currentSession, sendCommand, sessionId, treeNeedle]);
+
   const loadChanges = useCallback(() => {
     if (!sessionId) return;
     setChangesGeneration(nextFileExplorerRequestGeneration());
@@ -1234,6 +1285,18 @@ export function FileExplorerPanel({
   // the listing, and no App/Chat setState participates. loadDir starts only
   // after the write (one RPC on first expansion; collapse/re-expand of a
   // settled dir is zero-RPC).
+  const revealDirectory = useCallback((path: string) => {
+    const chain = fileExplorerAncestorPaths(path);
+    updateFileExplorerViewCache(viewOwnerKey, (view) => ({
+      ...view,
+      expandedDirs: fileExplorerExpandDirectoryChain(view.expandedDirs, path),
+    }));
+    for (const item of chain) {
+      if (!dirs[item]) loadDir(item);
+    }
+    setTreeQuery('');
+  }, [dirs, loadDir, viewOwnerKey]);
+
   const toggleDir = useCallback((path: string) => {
     let expanded = false;
     updateFileExplorerViewCache(viewOwnerKey, (view) => {
@@ -2089,8 +2152,8 @@ export function FileExplorerPanel({
                 className="file-explorer__search-input"
                 value={treeQuery}
                 onChange={(event) => setTreeQuery(event.target.value)}
-                placeholder="Search files…"
-                aria-label="Search workspace files"
+                placeholder="Search files and folders…"
+                aria-label="Search workspace files and folders"
                 data-testid="file-explorer-search"
               />
             </div>
@@ -2115,24 +2178,36 @@ export function FileExplorerPanel({
             )}
             {downloadError && <div className="file-explorer__error">{safeText(downloadError)}</div>}
             {deleteError && <div className="file-explorer__error">{safeText(deleteError)}</div>}
-            <WorkspaceTree
-              path=""
-              dirs={dirs}
-              expandedDirs={expandedDirs}
-              onToggleDir={toggleDir}
-              onRetryDir={loadDir}
-              onOpenFile={openFile}
-              onOpenDiff={openDiff}
-              onDownload={downloadPath}
-              changes={visibleChanges}
-              changeIndex={changeIndex}
-              activePath={activePath}
-              workspaceCwd={workspaceCwd}
-              treeQuery={treeNeedle}
-              onDeleteFile={deletePath}
-            />
-            {showChangesTruncated && <div className="file-explorer__muted">Changes truncated (5000-entry cap).</div>}
-            {root.truncated && <div className="file-explorer__muted">Listing truncated (5000-entry cap).</div>}
+            {treeNeedle ? (
+              <SearchResults
+                entries={searchHits}
+                truncated={searchTruncated}
+                loading={searchLoading}
+                error={searchError}
+                activePath={activePath}
+                workspaceCwd={workspaceCwd}
+                onOpenFile={openFile}
+                onOpenDir={revealDirectory}
+              />
+            ) : (
+              <WorkspaceTree
+                path=""
+                dirs={dirs}
+                expandedDirs={expandedDirs}
+                onToggleDir={toggleDir}
+                onRetryDir={loadDir}
+                onOpenFile={openFile}
+                onOpenDiff={openDiff}
+                onDownload={downloadPath}
+                changes={visibleChanges}
+                changeIndex={changeIndex}
+                activePath={activePath}
+                workspaceCwd={workspaceCwd}
+                onDeleteFile={deletePath}
+              />
+            )}
+            {!treeNeedle && showChangesTruncated && <div className="file-explorer__muted">Changes truncated (5000-entry cap).</div>}
+            {!treeNeedle && root.truncated && <div className="file-explorer__muted">Listing truncated (5000-entry cap).</div>}
           </div>
           {treeLoadingVisible && <FileExplorerPaneLoading pane="tree" />}
         </div>
@@ -2390,6 +2465,61 @@ function DirStatusBadge({
     >
       {fileExplorerStatusLetter(tone)}
     </span>
+  );
+}
+
+function SearchResults({
+  entries,
+  truncated,
+  loading,
+  error,
+  activePath,
+  workspaceCwd,
+  onOpenFile,
+  onOpenDir,
+}: {
+  entries: readonly FileExplorerEntry[];
+  truncated: boolean;
+  loading: boolean;
+  error: string | null;
+  activePath: string | null;
+  workspaceCwd?: string;
+  onOpenFile: (path: string) => void;
+  onOpenDir: (path: string) => void;
+}) {
+  if (error) return <div className="file-explorer__error">{safeText(error)}</div>;
+  if (!loading && entries.length === 0) {
+    return <div className="file-explorer__muted">No files or folders match your search.</div>;
+  }
+  return (
+    <>
+      <ul className="file-explorer__tree" data-testid="file-explorer-search-results">
+        {entries.map((entry) => {
+          const selected = entry.path === activePath;
+          const open = entry.kind === 'dir' ? () => onOpenDir(entry.path) : () => onOpenFile(entry.path);
+          return (
+            <li key={`${entry.kind}:${entry.path}`} className="file-explorer__item">
+              <button
+                type="button"
+                className={`file-explorer__row file-explorer__row--${entry.kind}${selected ? ' file-explorer__row--active' : ''}`}
+                onClick={open}
+                title={safeText(fileExplorerDisplayPath(entry.path, workspaceCwd))}
+                data-tone={entry.kind}
+              >
+                <FileTypeIcon tone={entry.kind === 'dir' ? 'dir' : fileExplorerTreeTone(entry.kind, entry.name)} />
+                <span className="file-explorer__row-path">{safeText(entry.path)}</span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {loading && <div className="file-explorer__muted">Searching…</div>}
+      {truncated && (
+        <div className="file-explorer__muted">
+          Search stopped early. Refine the query to see more files and folders.
+        </div>
+      )}
+    </>
   );
 }
 

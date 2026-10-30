@@ -23,6 +23,13 @@ All notable changes to `rpi` are documented in this file.
 
 ### Added
 
+- Web workspace search finds files and directories anywhere under the
+  workspace root, not only rows the file tree has already loaded. Matching
+  is case-insensitive on the relative path and uses the same ignore and
+  no-follow rules as listing. A policy-denied directory is omitted and not
+  walked. The walk stops at 200 matches or 20,000 visited entries and says
+  so. Choosing a file opens it; choosing a directory expands its parents
+  and returns to the tree.
 - Code-review gap expand on Web and TUI: unchanged context bands above,
   between, and below hunks load from the snapshot's pinned blobs in
   bounded 20-line windows (serialized on Web, selection-driven in the TUI),
@@ -46,6 +53,8 @@ All notable changes to `rpi` are documented in this file.
 
 ### Fixed
 
+- Listing a file-explorer directory that is unavailable returns the typed
+  directory-unavailable error, the same as read and path completion.
 - `SessionSidebar.runSwitch` returns the switch outcome again, so success
   repaints the active row and the pending-switch marker clears.
 - Persona create/edit reloads the resource catalog off the Tokio worker

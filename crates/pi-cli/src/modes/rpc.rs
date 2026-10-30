@@ -1392,6 +1392,13 @@ pub enum RpcCommand {
         #[serde(default)]
         path: Option<String>,
     },
+    /// Search workspace files and directories by name or relative path.
+    /// Wire: `{ "type":"file_explorer_search", "id"?:string, "query":string }`.
+    FileExplorerSearch {
+        #[serde(default)]
+        id: Option<String>,
+        query: String,
+    },
     /// Read one bounded page of a workspace-relative text file.
     /// Wire: `{ "type":"file_explorer_read", "id"?:string, "path":string, "cursor"?:number, "maxLines"?:number }`.
     FileExplorerRead {
@@ -2058,6 +2065,7 @@ impl RpcCommand {
             | Self::CodeReviewFileDiff { id, .. }
             | Self::CodeReviewFileContext { id, .. }
             | Self::FileExplorerList { id, .. }
+            | Self::FileExplorerSearch { id, .. }
             | Self::FileExplorerRead { id, .. }
             | Self::FileExplorerChanges { id }
             | Self::FileExplorerDiff { id, .. }
@@ -2248,6 +2256,7 @@ impl RpcCommand {
             Self::CodeReviewFileDiff { .. } => "code_review_file_diff",
             Self::CodeReviewFileContext { .. } => "code_review_file_context",
             Self::FileExplorerList { .. } => "file_explorer_list",
+            Self::FileExplorerSearch { .. } => "file_explorer_search",
             Self::FileExplorerRead { .. } => "file_explorer_read",
             Self::FileExplorerChanges { .. } => "file_explorer_changes",
             Self::FileExplorerDiff { .. } => "file_explorer_diff",
@@ -2991,6 +3000,7 @@ impl RpcDispatcher {
         if matches!(
             command,
             RpcCommand::FileExplorerList { .. }
+                | RpcCommand::FileExplorerSearch { .. }
                 | RpcCommand::FileExplorerRead { .. }
                 | RpcCommand::FileExplorerChanges { .. }
                 | RpcCommand::FileExplorerDiff { .. }
@@ -5195,6 +5205,9 @@ async fn handle_file_explorer_command(app: &Application, c: RpcCommand) -> RpcRe
                     &app,
                     path.as_deref().unwrap_or(""),
                 )?)?
+            }
+            RpcCommand::FileExplorerSearch { query, .. } => {
+                serde_json::to_value(crate::file_explorer::search(&app, &query)?)?
             }
             RpcCommand::FileExplorerRead {
                 path,
@@ -7485,6 +7498,7 @@ async fn handle_command_inner(
             unreachable!("code_review_* commands must be routed by dispatch_inner")
         }
         RpcCommand::FileExplorerList { .. }
+        | RpcCommand::FileExplorerSearch { .. }
         | RpcCommand::FileExplorerRead { .. }
         | RpcCommand::FileExplorerChanges { .. }
         | RpcCommand::FileExplorerDiff { .. }
@@ -8682,6 +8696,7 @@ mod tests {
             json!({"type":"code_review_file_context","snapshotId":"s1","path":"a.rs","oldStart":1,"newStart":1,"count":20}),
             json!({"type":"file_explorer_list"}),
             json!({"type":"file_explorer_list","path":"src"}),
+            json!({"type":"file_explorer_search","query":"widget"}),
             json!({"type":"file_explorer_read","path":"src/lib.rs"}),
             json!({"type":"file_explorer_read","path":"src/lib.rs","cursor":400,"maxLines":2000}),
             json!({"type":"file_explorer_changes"}),
